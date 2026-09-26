@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TipΔTask</title>
+<style>
+  /* C1006: STATIC splash. No @keyframes / animation / transition rules — the
+     main process is blocked for most of this window's lifetime, and a startup
+     animation is explicitly not wanted. Keep it that way.
+     C1171: background is the accent artwork (splash-bg.webp, derived from
+     ai/examples/splash/SPLASH-accent-14B8A6.png, aspect ~2.4353:1). The window
+     size in main.js matches that ratio exactly, so background-size:cover shows
+     the whole image with no crop. All text sits in the image's left paper
+     region (roughly the left half, above the ground hatching) — never widen
+     .splash-main or raise its vertical extent without re-checking that region.
+     C1380: .splash-main is a centered column (align-items/text-align:center,
+     width:50% + padding:0 6% -> content box spans 6%-44%, optical center 25%)
+     so the wordmark/status/copyright share one vertical centerline while
+     staying clear of the artwork past ~51%. Do NOT switch to margin:0 auto —
+     that centers on the whole window (~53%) and lands text on the artwork.
+     C1172: main.js's computeSplashBounds() now sizes the window as a fraction
+     (40%, clamped 560-960px) of the launch display's work area instead of a
+     fixed 640x263, so this layout must scale PURELY proportionally (vw/em) —
+     no fixed px sizes below the root font-size — or text stops growing once
+     the window passes whatever px value it was tuned at. */
+  :root {
+    --splash-paper: #f1f1ef;   /* left paper region of splash-bg.webp */
+    --splash-ink: #1e1e2e;     /* was --splash-bg in the pre-C1171 dark palette */
+    --splash-muted: #5c5f77;
+    --splash-accent: #14b8a6;   /* app-icon teal (scripts/gen-icon.js) */
+    --splash-border: rgba(30, 30, 46, 0.18);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* C1172: root font-size scales with viewport width (window is ratio-locked, so vw alone
+     tracks both dimensions together) — every text/spacing rule below is expressed in em/vw
+     off this, so the whole splash scales as one unit across the 560-960px window range.
+     The clamp() floor/ceiling are safety rails for sizes outside that range, not the
+     active scaling mechanism. */
+  html { font-size: clamp(8px, 2.05vw, 20px); }
+  html, body { height: 100%; }
+  body {
+    display: flex;
+    align-items: center;        /* vertical-center the text column in the window */
+    justify-content: flex-start;
+    background: var(--splash-paper) url('splash-bg.webp') center / cover no-repeat;
+    color: var(--splash-ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+    border: 1px solid var(--splash-border);
+    border-radius: 10px;
+    overflow: hidden;
+    cursor: default;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .splash-main {
+    display: flex;
+    flex-direction: column;
+    align-items: center;   /* C1380: was flex-start — centers logo/status/copyright as one column */
+    justify-content: center;
+    width: 50%;            /* C1380: was 42% width + padding-left:6% (left-aligned column) —
+                               50% + symmetric padding below gives a content box spanning
+                               6%-44%, optical center 25%, still clear of the artwork at ~51% */
+    padding: 0 6%;
+    text-align: center;    /* C1380: was left */
+    gap: 0.8vw;            /* C1172: was a fixed 0.5rem — vw keeps spacing proportional too */
+  }
+  /* TPT290: the website's TipΔTask lockup as inline SVG outlines (no font file, no
+     fetch). "Tip"/"Task" are Literata ExtraBold (wght 800, opsz 28) glyph outlines,
+     the Δ is the same solid slanted insignia path as scripts/gen-icon.js DELTA_PATH,
+     laid out exactly as website/public/css/marketing.css .tt-wordmark/.tt-brand-delta
+     (Δ at 1.35em, 0.06em side margins, -0.05em baseline shift, -0.01em tracking).
+     viewBox units are font units (1000 = 1em of the wordmark), so the SVG width
+     below is the lockup's advance in em of .splash-logo's own font-size. */
+  .splash-logo {
+    font-size: 2.15em;     /* C1172: em off the vw-scaled root — was clamp(1.5rem,6.5vw,2.75rem) */
+    line-height: 0;
+    color: var(--splash-ink);
+  }
+  .splash-logo svg { display: block; width: 5.372em; height: auto; }
+  .splash-logo-delta { fill: var(--splash-accent); }
+  .splash-status {
+    font-size: 0.72em;     /* C1172: was clamp(0.6875rem,2.2vw,0.9rem) */
+    color: var(--splash-muted);
+    letter-spacing: 0.04em;
+  }
+  .splash-copyright {
+    margin-top: 0.9vw;     /* C1172: was a fixed 0.5rem */
+    font-size: 0.63em;     /* C1172: was clamp(0.625rem,1.9vw,0.8rem) */
+    color: var(--splash-muted);
+  }
+</style>
+</head>
+<body>
+  <div class="splash-main">
+    <div class="splash-logo">
+      <svg viewBox="0 -890 5372 1120" role="img" aria-label="TipΔTask">
+        <path fill="currentColor" d="M174 0L174 -71L236 -78C249 -79 259 -84 263 -93C268 -102 270 -114 270 -130L270 -624L243 -624C225 -624 209 -621 196 -616C183 -611 172 -603 162 -591C152 -580 143 -564 135 -544C127 -524 120 -499 112 -469L15 -487L44 -707L703 -707L731 -487L635 -469C627 -499 619 -524 611 -544C603 -565 594 -580 584 -592C574 -604 563 -612 551 -617C538 -621 523 -624 506 -624L478 -624L478 -129C478 -114 480 -102 484 -93C488 -85 498 -79 513 -78L573 -71L573 0ZM766 0L766 -69L804 -75C815 -77 822 -81 826 -87C829 -93 830 -105 830 -123L830 -370C830 -392 828 -407 824 -415C820 -424 811 -429 795 -431L762 -436L768 -511L1014 -523L1029 -514L1029 -122C1029 -107 1030 -96 1033 -89C1036 -82 1044 -77 1056 -75L1093 -68L1093 0ZM916 -594C880 -594 851 -603 831 -619C811 -636 801 -660 801 -690C801 -720 810 -743 830 -760C849 -776 878 -785 916 -785C955 -785 984 -776 1003 -760C1022 -744 1032 -720 1032 -690C1032 -660 1021 -636 1001 -619C980 -603 952 -594 916 -594ZM1132 216L1132 147L1165 142C1175 141 1182 137 1186 131C1190 125 1192 113 1192 94L1192 -370C1192 -394 1190 -409 1185 -417C1181 -425 1172 -430 1158 -432L1126 -436L1131 -511L1355 -524L1370 -515L1376 -431L1379 -431C1390 -449 1403 -466 1418 -481C1434 -496 1452 -508 1473 -517C1494 -526 1520 -530 1548 -530C1592 -530 1630 -521 1662 -502C1693 -483 1718 -455 1735 -418C1752 -381 1760 -334 1760 -277C1760 -219 1751 -168 1733 -124C1714 -80 1686 -46 1649 -22C1611 2 1563 14 1505 14C1483 14 1462 12 1443 7C1423 3 1406 -3 1390 -12L1390 96C1390 112 1393 124 1397 130C1401 136 1410 140 1425 142L1483 148L1483 216ZM1468 -80C1488 -80 1504 -86 1516 -98C1529 -109 1538 -129 1543 -155C1549 -182 1552 -218 1552 -263C1552 -301 1549 -332 1543 -356C1536 -379 1527 -397 1515 -408C1503 -419 1488 -424 1470 -424C1453 -424 1439 -420 1427 -411C1415 -402 1406 -390 1400 -374C1394 -358 1390 -339 1390 -316L1390 -107C1400 -99 1411 -93 1426 -88C1441 -83 1455 -80 1468 -80ZM3028 0L3028 -71L3089 -78C3103 -79 3112 -84 3117 -93C3121 -102 3124 -114 3124 -130L3124 -624L3097 -624C3079 -624 3063 -621 3050 -616C3037 -611 3026 -603 3016 -591C3006 -580 2997 -564 2989 -544C2981 -524 2973 -499 2965 -469L2869 -487L2898 -707L3557 -707L3585 -487L3489 -469C3481 -499 3473 -524 3465 -544C3457 -565 3448 -580 3438 -592C3428 -604 3417 -612 3404 -617C3392 -621 3377 -624 3360 -624L3331 -624L3331 -129C3331 -114 3333 -102 3338 -93C3342 -85 3352 -79 3367 -78L3427 -71L3427 0ZM3739 14C3689 14 3650 2 3622 -23C3595 -47 3581 -81 3581 -123C3581 -163 3591 -195 3612 -217C3633 -239 3665 -256 3707 -266C3750 -276 3805 -282 3872 -285L3872 -364C3872 -388 3870 -407 3866 -422C3862 -437 3854 -448 3844 -455C3833 -462 3818 -466 3799 -466C3785 -466 3770 -464 3755 -460C3740 -456 3728 -450 3718 -443C3728 -431 3735 -420 3740 -411C3745 -402 3748 -394 3750 -388C3752 -382 3753 -376 3753 -371C3753 -355 3746 -342 3732 -331C3718 -320 3696 -315 3668 -315C3642 -315 3623 -321 3610 -333C3598 -346 3591 -362 3591 -381C3591 -408 3601 -433 3621 -456C3640 -478 3668 -496 3705 -510C3741 -523 3785 -530 3835 -530C3888 -530 3932 -523 3966 -509C4001 -496 4027 -474 4044 -445C4062 -416 4070 -378 4070 -331L4070 -130C4070 -115 4073 -103 4078 -96C4083 -89 4091 -85 4104 -85C4110 -85 4117 -86 4123 -87C4129 -88 4134 -90 4140 -92L4153 -36C4138 -22 4118 -10 4093 0C4069 9 4043 14 4016 14C3980 14 3952 6 3932 -10C3911 -25 3898 -45 3891 -69C3884 -54 3874 -41 3861 -28C3848 -16 3831 -5 3812 2C3792 10 3767 14 3739 14ZM3818 -78C3830 -78 3840 -80 3847 -85C3855 -90 3861 -97 3866 -106C3870 -116 3872 -127 3872 -140L3872 -222C3849 -222 3830 -219 3816 -214C3801 -209 3790 -200 3784 -189C3777 -177 3774 -162 3774 -143C3774 -122 3777 -106 3784 -95C3791 -83 3802 -78 3818 -78ZM4194 15L4179 -172L4258 -177C4269 -150 4282 -128 4296 -111C4310 -95 4327 -82 4345 -74C4363 -66 4383 -62 4405 -62C4431 -62 4450 -67 4462 -77C4475 -87 4482 -102 4482 -120C4482 -133 4477 -143 4469 -150C4461 -158 4449 -164 4432 -169C4416 -174 4395 -180 4370 -185C4348 -191 4326 -197 4304 -205C4281 -213 4261 -222 4243 -235C4224 -247 4210 -263 4199 -283C4188 -303 4182 -328 4182 -358C4182 -395 4191 -426 4209 -452C4226 -477 4251 -497 4282 -510C4314 -524 4350 -530 4391 -530C4419 -530 4445 -527 4467 -521C4490 -514 4509 -506 4525 -497L4534 -530L4600 -530L4611 -357L4533 -362C4519 -398 4501 -424 4479 -439C4456 -455 4431 -463 4403 -463C4380 -463 4363 -459 4351 -451C4338 -443 4332 -430 4332 -414C4332 -402 4336 -392 4344 -384C4352 -377 4365 -370 4381 -365C4397 -359 4418 -353 4442 -347C4469 -340 4494 -333 4517 -325C4540 -317 4561 -306 4578 -294C4596 -282 4609 -266 4619 -247C4629 -228 4634 -204 4634 -175C4634 -135 4625 -101 4607 -73C4588 -45 4563 -23 4531 -8C4498 7 4460 14 4417 14C4386 14 4358 10 4333 3C4309 -4 4288 -13 4270 -23L4258 15ZM5211 13C5192 13 5174 10 5157 5C5140 -1 5124 -10 5109 -22C5093 -35 5079 -52 5065 -74L4948 -255L4948 -273L5090 -402C5101 -412 5106 -420 5106 -428C5106 -435 5100 -439 5088 -441L5046 -447L5058 -516L5310 -516L5310 -444L5272 -439C5260 -437 5249 -433 5240 -429C5230 -424 5219 -415 5206 -403L5116 -319L5227 -157C5243 -133 5256 -116 5267 -106C5277 -96 5291 -90 5307 -90C5311 -90 5317 -91 5323 -92C5329 -94 5335 -96 5342 -98L5357 -41C5342 -26 5321 -13 5295 -3C5269 8 5241 13 5211 13ZM4676 0L4676 -69L4711 -75C4721 -77 4728 -80 4732 -86C4736 -92 4738 -103 4738 -121L4738 -616C4738 -638 4736 -653 4732 -661C4727 -670 4718 -675 4702 -677L4671 -681L4676 -756L4921 -768L4936 -758L4936 -121C4936 -105 4938 -95 4941 -88C4944 -82 4952 -77 4966 -74L4991 -69L4991 0Z"/>
+        <path class="splash-logo-delta" d="M2762 68L1901 68L1904 -31L2437 -879L2699 -879L2808 -30L2762 68ZM2462 -676L2115 -103L2508 -103L2466 -676L2462 -676Z"/>
+      </svg>
+    </div>
+    <div class="splash-status">Starting up…</div>
+    <div class="splash-copyright">© 2026 TipΔTask</div>
+  </div>
+</body>
+</html>

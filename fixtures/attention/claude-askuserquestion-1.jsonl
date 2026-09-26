@@ -1,0 +1,7 @@
+"\u001b[H\u001b[2K\u001b[1B\u001b[2K\u001b[1B\u001b[H\u001b[3;2HPick a deploy targe"
+"t for this release?\u001b[5;2H❯\u001b[5;4H1. Blue/green ("
+"Recommended)\u001b[6;6HRoutes traffic gradually and "
+"rolls back automatically on\u001b[7;6Herror spikes.\u001b"
+"[8;4H2. Rolling restart\u001b[9;4H3. Canary\u001b[10;2H──"
+"──────────────────────────────────────\u001b[11;4H4."
+" Chat about this"

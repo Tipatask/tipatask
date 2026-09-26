@@ -1,0 +1,255 @@
+name: Build installers
+
+# Release-build workflow for the Task App (Electron). Produces the same installers
+# `npm run electron:dist:*` produces on a dev machine, for all three desktop OSes at once,
+# and uploads them as run artifacts plus a draft GitHub Release.
+#
+# Triggers are deliberately narrow:
+#   - v* tags          -> the actual release build
+#   - workflow_dispatch -> dry runs, and debugging a packaging change before you tag
+# NOT on push-to-branch or pull_request. Hosted-runner minutes are free for a public repo,
+# but a full three-OS package (the mac leg alone builds two arches, ~420 MB of dmg, ~25
+# minutes) on every push would only pile up installers nobody asked for, and a pull_request
+# trigger would run packaging on untrusted fork code. Releases are cut by tag; use
+# workflow_dispatch for a dry run. (If this repo ever goes private again, GitHub bills macOS
+# runners at 10x and Windows at 2x the per-minute rate, so the narrow triggers matter more.)
+#
+# Sibling workflow: test.yml. Note what this file deliberately does NOT set —
+# ELECTRON_SKIP_BINARY_DOWNLOAD. test.yml sets it because `npm test` only needs node-pty
+# built against plain Node. Packaging needs the real Electron binaries (mac needs two: x64
+# AND arm64), so setting it here would starve electron-builder of what it's packaging.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Deliberately false, unlike test.yml. Tag refs never collide with each other, so the only
+  # thing this could ever cancel is a re-dispatched manual run -- throwing away 20+ minutes of
+  # nearly-finished cross-platform packaging to restart from zero is the wrong trade.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        # One shell on all three runners (Git Bash on Windows) so every `run:` block below is
+        # identical everywhere instead of needing a pwsh dialect for one leg. This does NOT
+        # change npm's own lifecycle-script shell -- that's the separate npm_config_script_shell
+        # some historical builds needed; scripts/postinstall.js is plain cross-platform
+        # Node now, so no such override is needed here.
+        shell: bash
+
+    strategy:
+      # A Windows NSIS failure must not vaporize a mac leg that already spent 20 minutes
+      # producing two good dmgs. Each leg is fully independent (separate runner, separate
+      # artifact) and expensive -- nothing is gained by aborting siblings.
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS (dmg, x64 + arm64)
+            script: electron:ci:mac
+            artifact: macos-dmg
+            # Allow-list, not deny-list. `dist-electron/*.dmg` structurally cannot match
+            # `*.dmg.blockmap` (a glob requires the name to END in .dmg), and never picks up
+            # builder-debug.yml, builder-effective-config.yaml, latest-mac.yml, or the
+            # multi-GB mac/ + mac-arm64/ unpacked app trees sitting beside the dmgs.
+            globs: |
+              dist-electron/*.dmg
+
+          - os: windows-latest
+            label: Windows (NSIS installer)
+            script: electron:ci:win
+            artifact: windows-nsis
+            # nsis oneClick per-user -> "TipATask Setup <version>.exe" (yes, with spaces).
+            # Excludes the .exe.blockmap, latest.yml, and win-unpacked/.
+            globs: |
+              dist-electron/*.exe
+
+          # Pinned to 22.04, NOT ubuntu-latest (24.04). node-pty ships no Linux prebuild, so
+          # node-gyp compiles pty.node right here and it links against the BUILD HOST's glibc.
+          # Building on 24.04 would silently raise the runtime glibc floor for every Linux user
+          # to 2.39; 22.04 gives 2.35. Revisit only when 22.04 is retired.
+          - os: ubuntu-22.04
+            label: Linux (AppImage + deb + pacman)
+            script: electron:ci:linux
+            artifact: linux-packages
+            # AppImage keeps its capital-I casing on disk and @actions/glob is case-SENSITIVE
+            # on Linux -- do not lowercase this. deb/pacman use electron-builder's default
+            # naming (tipatask-app_<version>_amd64.deb, tipatask-app-<version>-*.pkg.tar.*).
+            globs: |
+              dist-electron/*.AppImage
+              dist-electron/*.deb
+              dist-electron/*.pkg.tar.*
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # bsdtar (libarchive-tools) + zstd back electron-builder's pacman target (routed through
+      # its vendored fpm, same as deb). AppImage and deb need nothing beyond the base image.
+      - name: Install Linux packaging deps (pacman target)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libarchive-tools zstd
+
+      # Restored BEFORE npm ci on purpose: the `electron` package's own postinstall downloads
+      # its ~100 MB dist zip into this cache. electron-builder's own cache holds the tools it
+      # fetches at package time (nsis, appimage runtime, fpm, winCodeSign) plus the second mac
+      # Electron zip needed for the cross-arch leg. Six paths listed because each OS only has
+      # two of them -- actions/cache silently ignores the four that don't exist on a given runner.
+      - name: Cache Electron + electron-builder downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: electron-dl-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            electron-dl-${{ runner.os }}-
+
+      - name: Install
+        run: npm ci
+
+      # vendor/pi/node_modules is shipped verbatim via build.extraResources, gitignored.
+      # Exact hits skip the vendor npm ci after stage-pi-bundle.js checks the lockfile/platform
+      # fingerprint and installed package versions. Prefix hits are safe: a stale fingerprint
+      # triggers a clean vendor npm ci. Keep CPU architecture in the cache key because npm's
+      # optional Pi packages differ between x64 and arm64.
+      - name: Cache staged Pi bundle
+        uses: actions/cache@v4
+        with:
+          path: vendor/pi/node_modules
+          key: pi-bundle-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/pi/package.json', 'vendor/pi/package-lock.json') }}
+          restore-keys: |
+            pi-bundle-${{ runner.os }}-${{ runner.arch }}-
+
+      # MUST come after `npm ci` -- npm ci deletes node_modules/ wholesale, so restoring this
+      # first would just throw the restored tree away. stage-sherpa-bundle.js skips any platform
+      # package whose installed version already matches the pin, so a hit skips all six.
+      #
+      # The six paths are enumerated rather than globbed as node_modules/sherpa-onnx-*, which
+      # would ALSO match node_modules/sherpa-onnx-node -- a real lockfile-managed dependency.
+      # On a restore-keys partial hit that glob could quietly overwrite the version npm ci just
+      # installed with a stale cached one. Keep this list in sync with PLATFORM_PACKAGES in
+      # scripts/stage-sherpa-bundle.js.
+      - name: Cache staged sherpa-onnx platform packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules/sherpa-onnx-darwin-arm64
+            node_modules/sherpa-onnx-darwin-x64
+            node_modules/sherpa-onnx-linux-arm64
+            node_modules/sherpa-onnx-linux-x64
+            node_modules/sherpa-onnx-win-ia32
+            node_modules/sherpa-onnx-win-x64
+          key: sherpa-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            sherpa-${{ runner.os }}-
+
+      - name: Read app version
+        id: meta
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # scripts/bump-version.js is deliberately absent from the electron:ci:* chains (see
+      # package.json) -- in a 3-runner matrix it would bump three times, on three throwaway
+      # checkouts, and commit nothing. Consequence: the version baked into every installer is
+      # whatever package.json has COMMITTED, so it's possible to tag v0.8.50 on a tree that
+      # still says 0.8.49 and publish TipATask-0.8.49-arm64.dmg under a v0.8.50 release. Fail
+      # here instead, with an actionable message.
+      - name: Check tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="${{ steps.meta.outputs.version }}"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error title=Version mismatch::Tag $GITHUB_REF_NAME implies version $tag but package.json says $pkg. Bump package.json (scripts/bump-version.js), commit, then move the tag."
+            exit 1
+          fi
+
+      # Chain: stage-pi-bundle -> stage-sherpa-bundle -> build.js -> electron-builder --<os>.
+      # `--publish never` is appended (npm passes args after `--` on to electron-builder).
+      # electron-builder infers a GitHub publish provider from the git remote on a tag build;
+      # there is no build.publish config and no GH_TOKEN in this job's env so it cannot actually
+      # publish today, but this makes it impossible for a future secret to turn a build into an
+      # accidental release.
+      #
+      # Do NOT add a "git diff --exit-code" cleanliness check after this step. stage-pi-bundle.js
+      # unconditionally regenerates the tracked THIRD-PARTY-NOTICES.md. A dirty worktree here
+      # can therefore be expected.
+      - name: Build installers
+        run: npm run ${{ matrix.script }} -- --publish never
+
+      # stage-sherpa-bundle.js is non-fatal by design (a transient registry hiccup shouldn't
+      # block a dev building for just their own machine) -- so a green build here could still
+      # silently ship an installer missing local ASR for one platform. Catch that in CI, where
+      # "green" needs to mean "complete".
+      - name: Verify all sherpa-onnx platform packages staged
+        run: |
+          missing=0
+          for pkg in sherpa-onnx-darwin-arm64 sherpa-onnx-darwin-x64 sherpa-onnx-linux-arm64 sherpa-onnx-linux-x64 sherpa-onnx-win-ia32 sherpa-onnx-win-x64; do
+            if [ ! -d "node_modules/$pkg" ]; then
+              echo "::error title=Missing sherpa-onnx platform package::node_modules/$pkg was not staged -- stage-sherpa-bundle.js reported a failure earlier in this job's log."
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: List build output
+        if: always()
+        run: ls -lh dist-electron/ || true
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: TipATask-${{ steps.meta.outputs.version }}-${{ matrix.artifact }}
+          path: ${{ matrix.globs }}
+          # A silently empty artifact on a green run is the worst outcome here -- it means
+          # electron-builder changed its artifactName or output dir and nobody noticed until
+          # release day.
+          if-no-files-found: error
+          # dmg / exe / AppImage / deb / pacman are all already-compressed containers.
+          # Re-zipping ~400+ MB at the default compression level costs minutes for nothing.
+          compression-level: 0
+          overwrite: true
+          # Real releases get attached to a GitHub Release (see the release job below, free and
+          # permanent) -- this is just for pulling a build down to smoke-test it.
+          retention-days: 14
+
+  # Attaches every leg's installers to a draft GitHub Release on tag builds. Draft, never
+  # auto-published -- the maintainer writes release notes and presses publish by hand.
+  release:
+    name: Draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: TipATask-*
+          path: installers
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: installers/*

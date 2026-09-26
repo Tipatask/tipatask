@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>Third-Party Licenses</title>
+<style>
+  /* Same palette as about.html/splash.html (C1171) — see about.html's comment. */
+  :root {
+    --paper: #f1f1ef;
+    --ink: #1e1e2e;
+    --muted: #5c5f77;
+    --accent: #14b8a6;
+    --border: rgba(30, 30, 46, 0.14);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex;
+    flex-direction: column;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    flex: none;
+    padding: 0.9rem 1.2rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 1.05rem;
+    font-weight: 700;
+  }
+  main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem 1.4rem 2rem;
+  }
+  main :is(h1, h2, h3) { margin: 1.3em 0 0.5em; line-height: 1.3; }
+  main h1 { font-size: 1.3rem; }
+  main h2 { font-size: 1.1rem; color: var(--accent); }
+  main h3 { font-size: 1rem; }
+  main p, main li { font-size: 0.85rem; line-height: 1.55; color: var(--ink); }
+  main ul, main ol { padding-left: 1.4rem; margin: 0.4em 0; }
+  main a { color: var(--accent); }
+  main pre {
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    overflow-x: auto;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  main code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  main :not(pre) > code {
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0.05em 0.35em;
+    font-size: 0.82em;
+  }
+  .table-wrap { overflow-x: auto; margin: 0.6em 0; }
+  main table { border-collapse: collapse; font-size: 0.78rem; min-width: 100%; }
+  main th, main td { border: 1px solid var(--border); padding: 0.35em 0.6em; text-align: left; white-space: nowrap; }
+  main th { background: #fff; }
+  main hr { border: none; border-top: 1px solid var(--border); margin: 1.2em 0; }
+  .fallback { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.78rem; }
+</style>
+</head>
+<body>
+  <header id="title"></header>
+  <main id="content"></main>
+  <script>
+    window.aboutAPI.onData(({ strings, html, text }) => {
+      document.title = strings.title;
+      document.getElementById('title').textContent = strings.title;
+      const content = document.getElementById('content');
+      if (html) {
+        content.innerHTML = html;
+        // Wide package tables get a scroll container instead of overflowing the window.
+        content.querySelectorAll('table').forEach((table) => {
+          const wrap = document.createElement('div');
+          wrap.className = 'table-wrap';
+          table.replaceWith(wrap);
+          wrap.appendChild(table);
+        });
+      } else {
+        const pre = document.createElement('pre');
+        pre.className = 'fallback';
+        pre.textContent = text || '';
+        content.appendChild(pre);
+      }
+    });
+  </script>
+</body>
+</html>

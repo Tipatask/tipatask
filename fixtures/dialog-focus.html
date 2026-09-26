@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Dialog focus probe</title>
+<link rel="stylesheet" href="../dist/bundle.css">
+<script src="../node_modules/marked/marked.min.js"></script>
+<script>
+  window.fetch = async (input, options = {}) => {
+    const url = String(input);
+    const body = url.includes('/api/agents-config')
+      ? options.method === 'POST'
+        ? { ok: true, agents: { taskAgent: 'claude', taskAgentLabel: 'Claude', availableAgents: ['claude'] } }
+        : { selection: { taskAgent: 'claude', availableAgents: ['claude'], piModels: [] } }
+      : url.includes('/api/agent-config')
+        ? { agentStatuses: [{ id: 'claude', label: 'Claude', available: true }] }
+        : url.includes('/api/config') ? {} : { objectiveProviders: [] };
+    return { ok: true, status: 200, json: async () => body };
+  };
+</script></head>
+<body><div class="container" id="app"></div><div id="task-edit-modal" hidden></div>
+<div id="settings-modal" role="dialog" aria-modal="true" aria-label="Settings">
+  <div class="settings-panel"><button id="settings-agents-edit" type="button">Edit Agents</button></div>
+</div>
+<button id="background-button" type="button">Background</button>
+<script src="../dist/dialog-focus-probe.js"></script>
+</body></html>

@@ -1,0 +1,53 @@
+name: Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Tests stub PTY spawning and need no Electron runtime. postinstall.js treats
+  # electron-rebuild failure as best-effort and still checks the esbuild platform.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+jobs:
+  test:
+    name: Task App test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # node-pty ships prebuilds only for darwin/win32 — Linux always falls through to
+      # `node-gyp rebuild` here (python3/make/g++, all present on ubuntu-latest). If that
+      # toolchain ever regresses, the fallback is:
+      #   npm ci --ignore-scripts && npm rebuild node-pty
+      - name: Install
+        run: npm ci
+
+      - name: Unit tests and coverage floors
+        run: npm run test:coverage
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-app-coverage
+          path: |
+            coverage/
+            !coverage/tmp/**
+          retention-days: 14
+          if-no-files-found: warn

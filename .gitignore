@@ -1,0 +1,34 @@
+/node_modules/
+/dist/
+/dist-electron/
+/.worktrees/
+/vendor/pi/node_modules/
+# Downloaded sherpa-onnx voice models — 150-670 MB each, never committed. Ignore the
+# CONTENTS (/*), not the directory itself, so the negation below can re-include the committed
+# README (git won't re-include a file inside an excluded directory, only inside an excluded
+# directory's contents).
+/vendor/voice-models/*
+!/vendor/voice-models/README.md
+/.idea/
+/objective-result.md
+/.env
+/.tipatask/
+/chat-state*.json
+/chat-state*.json.tmp-*
+# Per-session objective-chat drafts — was exact-name-only (/.chat-draft.json), which
+# missed the .chat-draft-<hash>.json files the live app actually writes.
+/.chat-draft*.json
+/.chat-draft*.json.tmp-*
+/.file-tracks/
+/.task-images/
+.DS_Store
+# Local agent/editor state written when the Task App is run against its own checkout
+/.claude/settings.local.json
+/.codex/
+/.knowledge-versions.json
+*.log
+
+/coverage/
+
+# Written with machine-specific absolute paths when this checkout is opened as a project
+/.mcp.json

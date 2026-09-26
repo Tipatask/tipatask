@@ -1,0 +1,8 @@
+{
+  "name": "tipatask-pi-bundle",
+  "private": true,
+  "description": "Self-contained node_modules tree for the Pi coding agent CLI, staged by scripts/stage-pi-bundle.js and shipped into packaged builds via electron-builder extraResources (C1112). Kept separate from the main dependency tree because it ships as plain files under Resources/pi/node_modules, not inside app.asar — @earendil-works/pi-coding-agent is pure ESM with its own dependency closure, and electron-builder never packages node_modules/.bin or bin/** anyway.",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1"
+  }
+}

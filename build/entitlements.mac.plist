@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!-- electron-builder's stock defaults (was the implicit template before this file
+         existed — see app-builder-lib/templates/entitlements.mac.plist). Still required:
+         https://github.com/electron/electron-notarize#prerequisites -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <!-- (C1202) THE fix. Under the hardened runtime (on by default for a signed build),
+         macOS denies microphone capture to any process lacking this entitlement — but it
+         denies it SILENTLY: getUserMedia() resolves with a live-looking-but-muted/zero
+         track instead of throwing or ever showing a TCC prompt. That silence is why every
+         local-ASR "no speech detected" investigation before this looked at the model/VAD/
+         sherpa pipeline and found nothing wrong — the packaged app was never receiving real
+         audio in the first place. Missing here == missing everywhere: this plist is also
+         entitlementsInherit (package.json), so it applies to every helper process too,
+         including the renderer helper that actually opens the mic.
+         See ai/architecture/tt-audio-input.md § macOS microphone entitlement (C1202) and
+         tt-electron-app.md § Packaging. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+  </dict>
+</plist>

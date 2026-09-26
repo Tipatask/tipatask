@@ -1,0 +1,6 @@
+"Welcome to Claude Code!\nType /help for help, /status for your current setup.\n"
+"\u001b[H\u001b[2K\u001b[1B\u001b[2K\u001b[1B\u001b[H\u001b[3;2H╭──────────────────────────────────────────────╮\u001b[4;2H│ Do you trust the files in this folder?                    │\u001b[5;2H│ /Users/alice/Projects/new-project           │\u001b[7;2H│ ❯ 1. Yes, proceed                        │\u001b[8;2H│   2. No, exit                               │\u001b[9;2H╰──────────────────────────────────────────────╯\n"
+"\u001b[H\u001b[2K\u001b[1B\u001b[2K\u001b[1B\u001b[H\u001b[3;2H╭──────────────────────────────────────────────╮\u001b[4;2H│ Do you trust the files in this folder?                    │\u001b[5;2H│ /Users/alice/Projects/new-project           │\u001b[7;2H│ ❯ 1. Yes, proceed                        │\u001b[8;2H│   2. No, exit                               │\u001b[9;2H╰──────────────────────────────────────────────╯\n"
+"\u001b[H\u001b[2K\u001b[1B\u001b[2K\u001b[1B\u001b[H\u001b[3;2HHow can I help you today?\u001b[5;2H> \n"
+"\u001b[6;2HReading project files…\n"
+"\u001b[7;2HReady.\n"

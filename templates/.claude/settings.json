@@ -1,0 +1,73 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "_tipatask": true,
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p ~/.claude/plans && jq -r '.tool_input.plan' > ~/.claude/plans/${TIPATASK_TASK_ID:-plan}.md"
+          }
+        ]
+      },
+      {
+        "_tipatask": true,
+        "matcher": "Glob|Grep|mcp__tipatask__list_tasks|mcp__tipatask__get_tag_architecture|mcp__tipatask__get_tag_architectures|mcp__tipatask-local__batch_grep_tags",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/tool-result-cache.js\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "_tipatask": true,
+        "matcher": "Read|Edit|Write|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/track-file-access.js\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "_tipatask": true,
+        "matcher": "Glob|Grep|Read|Edit|Write|MultiEdit|NotebookEdit|mcp__tipatask__list_tasks|mcp__tipatask__get_tag_architecture|mcp__tipatask__get_tag_architectures|mcp__tipatask-local__batch_grep_tags",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/tool-result-cache.js\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "_tipatask": true,
+        "matcher": "mcp__tipatask__create_task|mcp__tipatask__update_task|mcp__tipatask__delete_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/tool-result-cache.js\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "_tipatask": true,
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/push-kb-on-write.js\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

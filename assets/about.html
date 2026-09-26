@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>TipΔTask</title>
+<style>
+  /* Palette matches splash.html's --splash-* tokens (C1171) so this window
+     reads as part of the same app, not a bolted-on dialog. Static, no theme
+     switching — this window has no preload access to the project's saved
+     theme (deliberately the small about-preload.js, not the big one). */
+  :root {
+    --paper: #f1f1ef;
+    --ink: #1e1e2e;
+    --muted: #5c5f77;
+    --accent: #14b8a6;
+    --border: rgba(30, 30, 46, 0.14);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.6rem;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    text-align: center;
+    padding: 1.5rem;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .icon { width: 72px; height: 72px; margin-bottom: 0.4rem; }
+  .name { font-size: 1.6rem; font-weight: 700; letter-spacing: 0.02em; }
+  .delta { color: var(--accent); }
+  .version { font-size: 0.85rem; color: var(--muted); }
+  .credit {
+    max-width: 30ch;
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-top: 0.4rem;
+    line-height: 1.4;
+  }
+  .licenses-btn {
+    margin-top: 1rem;
+    padding: 0.45rem 1.1rem;
+    font-size: 0.82rem;
+    color: var(--ink);
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .licenses-btn:hover { border-color: var(--accent); }
+</style>
+</head>
+<body>
+  <img class="icon" src="icon.png" alt="">
+  <div class="name">Tip<span class="delta">Δ</span>Task</div>
+  <div class="version" id="version"></div>
+  <div class="credit" id="credit"></div>
+  <button class="licenses-btn" id="licenses-btn"></button>
+  <script>
+    window.aboutAPI.onData(({ appVersion, strings }) => {
+      document.title = strings.title;
+      document.getElementById('version').textContent = strings.versionLabel + ' ' + appVersion;
+      document.getElementById('credit').textContent = strings.credit;
+      const btn = document.getElementById('licenses-btn');
+      btn.textContent = strings.licensesButton;
+      btn.addEventListener('click', () => window.aboutAPI.openLicenses());
+    });
+  </script>
+</body>
+</html>

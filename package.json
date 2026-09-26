@@ -1,0 +1,228 @@
+{
+  "name": "tipatask-app",
+  "version": "0.8.96",
+  "description": "TipΔTask — Electron desktop app: local task board, architecture knowledge base, and AI coding-agent orchestrator (Claude/Codex/Pi), with a CLI installer for the agent harness files.",
+  "license": "Apache-2.0",
+  "author": "Anton Matiienko, Apppixies",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tipatask/tipatask.git"
+  },
+  "homepage": "https://github.com/Tipatask/tipatask#readme",
+  "bugs": {
+    "url": "https://github.com/Tipatask/tipatask/issues"
+  },
+  "private": true,
+  "main": "main.js",
+  "engines": {
+    "node": ">=22.19.0",
+    "npm": ">=10"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.19.0",
+      "onFail": "error"
+    }
+  },
+  "bin": {
+    "tipatask-setup": "./src/cli/setup.js"
+  },
+  "scripts": {
+    "check:node": "node scripts/check-node-version.js",
+    "preinstall": "node scripts/check-node-version.js && node scripts/check-npm-platform-env.js",
+    "postinstall": "node scripts/postinstall.js",
+    "electron:rename": "node scripts/rename-dev-electron.js",
+    "test": "node scripts/run-tests.js",
+    "probe:paste": "node scripts/probe-image-paste.js",
+    "probe:design": "node scripts/probe-design-mode.js",
+    "probe:attention": "node scripts/probe-attention-prompts.js",
+    "probe:pi-approval": "node scripts/probe-pi-approval.js",
+    "probe:voice-model": "node scripts/probe-voice-model.js",
+    "probe:status-roles": "node scripts/probe-status-roles.js",
+    "probe:preset-seeding": "node scripts/probe-preset-seeding.js",
+    "probe:mcp-remote": "node scripts/probe-mcp-remote.js",
+    "probe:mcp-headers-helper": "node scripts/probe-mcp-headers-helper.js",
+    "probe:agent-models": "node scripts/probe-agent-models.js",
+    "probe:tag-descriptions": "node scripts/probe-tag-descriptions.js",
+    "probe:kb-reindex": "node scripts/probe-kb-reindex.js",
+    "probe:kb-lock": "node scripts/probe-kb-lock.js",
+    "probe:kb-lock:unit": "node scripts/probe-kb-lock.js --unit",
+    "probe:kb-conflict": "node scripts/probe-kb-conflict.js",
+    "probe:tag-doc-link": "node scripts/probe-tag-doc-link.js",
+    "probe:local-asr": "node scripts/probe-local-asr.js",
+    "probe:notif-registration": "node scripts/probe-notif-registration.js",
+    "probe:assemblyai": "node scripts/probe-assemblyai.js",
+    "probe:watchdog": "node scripts/probe-descendant-watchdog.js",
+    "probe:dialog-focus": "node build.js && node scripts/run-dialog-focus-probe.cjs",
+    "build": "node build.js",
+    "dev": "node build.js --watch",
+    "setup": "node src/cli/setup.js",
+    "set-agent": "node src/cli/set-agent.js",
+    "import": "node src/cli/migrate-tasks.js",
+    "export": "node src/cli/export-tasks.js",
+    "mcp": "node src/mcp/server.js",
+    "bench:cli": "for s in src/server/config.js src/cli/set-agent.js src/mcp/server.js; do printf '%s: ' $s; node src/cli/_bench.js $s 2>&1; done",
+    "build:arch-index": "node src/mcp/build-arch-index.js",
+    "migrate-tag-descriptions": "node scripts/migrate-tag-descriptions.js",
+    "backfill-kb-descriptions": "node scripts/backfill-kb-descriptions.js",
+    "electron": "node build.js && node scripts/rename-dev-electron.js && env -u ELECTRON_RUN_AS_NODE electron .",
+    "electron:dev": "node build.js --electron-dev",
+    "electron:pack": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --dir",
+    "electron:ci:mac": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --mac",
+    "electron:ci:win": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --win",
+    "electron:ci:linux": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --linux",
+    "electron:dist:mac": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --mac",
+    "electron:dist:win": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --win",
+    "electron:dist:linux": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --linux",
+    "electron:dist": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --mac --win --linux",
+    "test:coverage": "c8 node scripts/run-tests.js"
+  },
+  "build": {
+    "appId": "com.tipatask.app",
+    "productName": "TipATask",
+    "npmRebuild": true,
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/node-pty/build/Release/**",
+      "node_modules/node-pty/lib/**",
+      "node_modules/sherpa-onnx-node/**",
+      "node_modules/sherpa-onnx-darwin-arm64/**",
+      "node_modules/sherpa-onnx-darwin-x64/**",
+      "node_modules/sherpa-onnx-linux-x64/**",
+      "node_modules/sherpa-onnx-linux-arm64/**",
+      "node_modules/sherpa-onnx-win-x64/**",
+      "node_modules/sherpa-onnx-win-ia32/**"
+    ],
+    "files": [
+      "main.js",
+      "main/**/*",
+      "templates/**/*",
+      "preload.js",
+      "todo-server.js",
+      "assets/**/*",
+      ".env.example",
+      "src/**/*",
+      "dist/**/*",
+      "package.json",
+      "LICENSE",
+      "NOTICE",
+      "THIRD-PARTY-NOTICES.md",
+      "node_modules/**/*",
+      "!node_modules/node-pty/prebuilds/**",
+      "!node_modules/node-pty/src/**",
+      "!node_modules/node-pty/deps/**",
+      "!node_modules/node-pty/scripts/**",
+      "!node_modules/@earendil-works/**/*",
+      "!src/**/*.test.{js,cjs,mjs}",
+      "!main/**/*.test.{js,cjs,mjs}",
+      "!src/client/*-dom-runner.mjs",
+      "!src/server/git-merge/test-fixture.js",
+      "!coverage/**"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/pi/node_modules",
+        "to": "pi/node_modules"
+      }
+    ],
+    "directories": {
+      "buildResources": "assets",
+      "output": "dist-electron"
+    },
+    "mac": {
+      "target": {
+        "target": "dmg",
+        "arch": [
+          "x64",
+          "arm64"
+        ]
+      },
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "icon": "assets/icon.icns",
+      "category": "public.app-category.productivity",
+      "identity": "-",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Tipatask uses the microphone for voice-to-text task input."
+      },
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb",
+        "pacman"
+      ],
+      "icon": "assets/icon.png",
+      "category": "Development"
+    },
+    "afterPack": "scripts/check-packaged-tests.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "dompurify": "3.4.16",
+    "marked": "^15.0.0",
+    "node-pty": "^1.0.0",
+    "open": "^10.0.0",
+    "sherpa-onnx-node": "^1.13.6",
+    "toml": "4.2.0",
+    "transliteration": "^2.6.1",
+    "ws": "^8.21.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@electron/asar": "^3.4.1",
+    "@electron/rebuild": "^4.2.0",
+    "c8": "^12.0.0",
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.24.0",
+    "happy-dom": "^20.14.5",
+    "jsdom": "29.1.1",
+    "png2icons": "^2.0.1",
+    "sharp": "^0.34.5"
+  },
+  "c8": {
+    "all": true,
+    "include": [
+      "src/**/*.{js,cjs,mjs}",
+      "main/**/*.js",
+      "main.js",
+      "preload.js",
+      "todo-server.js",
+      "spawn-utils.js"
+    ],
+    "exclude": [
+      "**/*.test.{js,cjs,mjs}",
+      "src/client/*-dom-runner.mjs",
+      "src/server/git-merge/test-fixture.js",
+      "src/cli/_bench.js"
+    ],
+    "reporter": [
+      "text-summary",
+      "html",
+      "lcov",
+      "json-summary",
+      "json"
+    ],
+    "check-coverage": true,
+    "reports-dir": "coverage",
+    "lines": 50,
+    "branches": 78,
+    "functions": 72
+  }
+}

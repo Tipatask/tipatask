@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Finds a Node.js binary satisfying the engines.node requirement from package.json,
+# then execs it with all forwarded args. Set TIPATASK_NODE to override.
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PKG_JSON="$SCRIPT_DIR/../package.json"
+
+# Parse minimum major version from engines.node (e.g. ">=22.8.0" -> 22)
+REQ_MAJOR=$(grep -o '"node"[[:space:]]*:[[:space:]]*"[^"]*"' "$PKG_JSON" 2>/dev/null \
+  | grep -oE '[0-9]+' | head -1)
+REQ_MAJOR=${REQ_MAJOR:-22}
+
+check() {
+  local bin="$1"
+  [ -n "$bin" ] || return 1
+  [ -x "$bin" ] || return 1
+  local v
+  v=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+' | head -1) || return 1
+  [ "$v" -ge "$REQ_MAJOR" ]
+}
+
+try_exec() {
+  local bin="$1"
+  [ -n "$bin" ] || return 0
+  if check "$bin"; then
+    exec "$bin" "$@"
+  fi
+}
+
+# 1. Explicit override
+if [ -n "$TIPATASK_NODE" ]; then
+  if check "$TIPATASK_NODE"; then
+    exec "$TIPATASK_NODE" "$@"
+  else
+    echo "tipatask: TIPATASK_NODE=$TIPATASK_NODE does not satisfy node >=$REQ_MAJOR" >&2
+    exit 1
+  fi
+fi
+
+# 2. Current PATH node
+PATH_NODE="$(command -v node 2>/dev/null || true)"
+if check "$PATH_NODE"; then
+  exec "$PATH_NODE" "$@"
+fi
+
+# 3. nvm (via $NVM_DIR or default ~/.nvm), sorted descending by version number
+NVM_BASE="${NVM_DIR:-$HOME/.nvm}"
+if [ -d "$NVM_BASE/versions/node" ]; then
+  for cand in $(ls -dt "$NVM_BASE"/versions/node/v*/bin/node 2>/dev/null); do
+    if check "$cand"; then exec "$cand" "$@"; fi
+  done
+fi
+
+# 4. fnm (~/.fnm)
+if [ -d "$HOME/.fnm/node-versions" ]; then
+  for cand in $(ls -dt "$HOME"/.fnm/node-versions/v*/installation/bin/node 2>/dev/null); do
+    if check "$cand"; then exec "$cand" "$@"; fi
+  done
+fi
+
+# 5. Volta
+VOLTA_NODE="$HOME/.volta/bin/node"
+if check "$VOLTA_NODE"; then exec "$VOLTA_NODE" "$@"; fi
+
+# 6. Homebrew / common system paths
+for cand in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
+  if check "$cand"; then exec "$cand" "$@"; fi
+done
+
+echo "tipatask: no node >=$REQ_MAJOR found. Install via nvm/fnm/volta/brew or set TIPATASK_NODE=/path/to/node." >&2
+exit 1

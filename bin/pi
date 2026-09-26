@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# (C1112) Launcher for the bundled Pi coding agent CLI (@earendil-works/pi-coding-agent).
+#
+# Interpreter selection is delegated to bin/mcp-node (engines.node-aware) instead of trusting
+# the package's own `#!/usr/bin/env node` shebang: under Electron, spawn-utils.js's
+# AUGMENTED_PATH starts with PROBE_DIRS (no NODE_BIN_DIR — process.execPath is the Electron
+# binary, not a real node), and the first `node` found there can be a stale system install
+# (C1041: a root-owned Node 14 outranked nvm on one dev machine). Running the shebang directly
+# would resolve to that stale node and crash pi on startup.
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI="$SCRIPT_DIR/../node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+if [ ! -f "$CLI" ]; then
+  echo "tipatask: bundled pi missing — run 'npm install' in the Task App checkout" >&2
+  exit 127
+fi
+exec "$SCRIPT_DIR/mcp-node" "$CLI" "$@"
