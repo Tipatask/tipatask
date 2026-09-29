@@ -37,11 +37,11 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 This appendix lists every third-party package redistributed inside the packaged app, in two groups: TipΔTask's own production dependency closure (shipped inside `app.asar`) and the bundled Pi Coding Agent's full dependency closure (shipped as `vendor/pi/node_modules`, outside the asar — see `scripts/stage-pi-bundle.js`). All packages are under permissive licenses (no copyleft). Regenerate with `node scripts/gen-third-party-notices.js`; `--check` verifies it is current.
 
-### TipΔTask app dependencies (118 packages)
+### TipΔTask app dependencies (119 packages)
 
 | Package | License | Copyright |
 |---|---|---|
-| `@hono/node-server@1.19.13` | MIT | Copyright (c) 2022 - present, Yusuke Wada and Hono contributors |
+| `@hono/node-server@1.19.17` | MIT | Copyright (c) 2022 - present, Yusuke Wada and Hono contributors |
 | `@modelcontextprotocol/sdk@1.29.0` | MIT | Copyright (c) 2024 Anthropic, PBC |
 | `@types/trusted-types@2.0.7` | MIT | — |
 | `@xterm/addon-fit@0.10.0` | MIT | Copyright (c) 2019, The xterm.js authors (https://github.com/xtermjs/xterm.js) |
@@ -49,13 +49,14 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `accepts@2.0.0` | MIT | Copyright (c) 2014 Jonathan Ong <me@jongleberry.com> |
 | `ajv@8.18.0` | MIT | Copyright (c) 2015-2021 Evgeny Poberezkin |
 | `ajv-formats@3.0.1` | MIT | Copyright (c) 2020 Evgeny Poberezkin |
-| `body-parser@2.2.2` | MIT | Copyright (c) 2014 Jonathan Ong <me@jongleberry.com> |
+| `body-parser@2.3.0` | MIT | Copyright (c) 2014 Jonathan Ong <me@jongleberry.com> |
 | `bundle-name@4.1.0` | MIT | Sindre Sorhus |
 | `bytes@3.1.2` | MIT | Copyright (c) 2012-2014 TJ Holowaychuk <tj@vision-media.ca> |
 | `call-bind-apply-helpers@1.0.2` | MIT | Copyright (c) 2024 Jordan Harband |
 | `call-bound@1.0.4` | MIT | Copyright (c) 2024 Jordan Harband |
 | `content-disposition@1.1.0` | MIT | Copyright (c) 2014-2017 Douglas Christopher Wilson |
 | `content-type@1.0.5` | MIT | Copyright (c) 2015 Douglas Christopher Wilson |
+| `content-type@2.1.0` | MIT | Copyright (c) 2015 Douglas Christopher Wilson |
 | `cookie@0.7.2` | MIT | Copyright (c) 2012-2014 Roman Shtylman <shtylman@gmail.com> |
 | `cookie-signature@1.2.2` | MIT | Copyright (c) 2012–2024 LearnBoost <tj@learnboost.com> and other contributors; |
 | `cors@2.8.6` | MIT | Copyright (c) 2013 Troy Goode <troygoode@gmail.com> |
@@ -77,9 +78,9 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `eventsource@3.0.7` | MIT | Espen Hovlandsdal <espen@hovlandsdal.com> |
 | `eventsource-parser@3.0.6` | MIT | Copyright (c) 2025 Espen Hovlandsdal <espen@hovlandsdal.com> |
 | `express@5.2.1` | MIT | Copyright (c) 2009-2014 TJ Holowaychuk <tj@vision-media.ca> |
-| `express-rate-limit@8.3.2` | MIT | Copyright 2023 Nathan Friedly, Vedant K |
+| `express-rate-limit@8.7.0` | MIT | Copyright 2023 Nathan Friedly, Vedant K |
 | `fast-deep-equal@3.1.3` | MIT | Copyright (c) 2017 Evgeny Poberezkin |
-| `fast-uri@3.1.0` | BSD-3-Clause | Copyright (c) 2011-2021, Gary Court until https://github.com/garycourt/uri-js/commit/a1acf730b4bba3f1097c9f52e7d9d3aba8cdcaae |
+| `fast-uri@3.1.8` | BSD-3-Clause | Copyright (c) 2011-2021, Gary Court until https://github.com/garycourt/uri-js/commit/a1acf730b4bba3f1097c9f52e7d9d3aba8cdcaae |
 | `finalhandler@2.1.1` | MIT | Copyright (c) 2014-2022 Douglas Christopher Wilson <doug@somethingdoug.com> |
 | `forwarded@0.2.0` | MIT | Copyright (c) 2014-2017 Douglas Christopher Wilson |
 | `fresh@2.0.0` | MIT | Copyright (c) 2012 TJ Holowaychuk <tj@vision-media.ca> |
@@ -89,11 +90,11 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `gopd@1.2.0` | MIT | Copyright (c) 2022 Jordan Harband |
 | `has-symbols@1.1.0` | MIT | Copyright (c) 2016 Jordan Harband |
 | `hasown@2.0.4` | MIT | Jordan Harband <ljharb@gmail.com> |
-| `hono@4.12.12` | MIT | Copyright (c) 2021 - present, Yusuke Wada and Hono contributors |
+| `hono@4.13.11` | MIT | Copyright (c) 2021 - present, Yusuke Wada and Hono contributors |
 | `http-errors@2.0.1` | MIT | Copyright (c) 2014 Jonathan Ong me@jongleberry.com |
 | `iconv-lite@0.7.2` | MIT | Copyright (c) 2011 Alexander Shtuchkin |
 | `inherits@2.0.4` | ISC | — |
-| `ip-address@10.1.0` | MIT | Copyright (C) 2011 by Beau Gunderson |
+| `ip-address@10.7.2` | MIT | Copyright (C) 2011 by Beau Gunderson |
 | `ipaddr.js@1.9.1` | MIT | Copyright (C) 2011-2017 whitequark <whitequark@whitequark.org> |
 | `is-docker@3.0.0` | MIT | Sindre Sorhus |
 | `is-inside-container@1.0.0` | MIT | Sindre Sorhus |
@@ -123,7 +124,7 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `path-to-regexp@8.4.2` | MIT | Copyright (c) 2014 Blake Embrey (hello@blakeembrey.com) |
 | `pkce-challenge@5.0.1` | MIT | Copyright (c) 2019 |
 | `proxy-addr@2.0.7` | MIT | Copyright (c) 2014-2016 Douglas Christopher Wilson |
-| `qs@6.15.1` | BSD-3-Clause | Copyright (c) 2014, Nathan LaFreniere and other [contributors](https://github.com/ljharb/qs/graphs/contributors) |
+| `qs@6.16.0` | BSD-3-Clause | Copyright (c) 2014, Nathan LaFreniere and other [contributors](https://github.com/ljharb/qs/graphs/contributors) |
 | `range-parser@1.2.1` | MIT | Copyright (c) 2012-2014 TJ Holowaychuk <tj@vision-media.ca> |
 | `raw-body@3.0.2` | MIT | Copyright (c) 2013-2014 Jonathan Ong <me@jongleberry.com> |
 | `require-from-string@2.0.2` | MIT | Vsevolod Strukchinsky |
@@ -142,7 +143,7 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `sherpa-onnx-node@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
 | `sherpa-onnx-win-ia32@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
 | `sherpa-onnx-win-x64@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
-| `side-channel@1.1.0` | MIT | Copyright (c) 2019 Jordan Harband |
+| `side-channel@1.1.1` | MIT | Copyright (c) 2019 Jordan Harband |
 | `side-channel-list@1.0.1` | MIT | Copyright (c) 2024 Jordan Harband |
 | `side-channel-map@1.0.1` | MIT | Copyright (c) 2024 Jordan Harband |
 | `side-channel-weakmap@1.0.2` | MIT | Copyright (c) 2019 Jordan Harband |
@@ -150,7 +151,7 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `toidentifier@1.0.1` | MIT | Copyright (c) 2016 Douglas Christopher Wilson <doug@somethingdoug.com> |
 | `toml@4.2.0` | MIT | Copyright (c) 2012 Michelle Tilley |
 | `transliteration@2.6.1` | MIT | — |
-| `type-is@2.0.1` | MIT | Copyright (c) 2014 Jonathan Ong <me@jongleberry.com> |
+| `type-is@2.1.0` | MIT | Copyright (c) 2014 Jonathan Ong <me@jongleberry.com> |
 | `unpipe@1.0.0` | MIT | Copyright (c) 2015 Douglas Christopher Wilson <doug@somethingdoug.com> |
 | `vary@1.1.2` | MIT | Copyright (c) 2014-2017 Douglas Christopher Wilson |
 | `which@2.0.2` | ISC | Isaac Z. Schlueter <i@izs.me> (http://blog.izs.me) |

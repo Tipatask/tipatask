@@ -32,3 +32,14 @@
 
 # Written with machine-specific absolute paths when this checkout is opened as a project
 /.mcp.json
+
+# Credentials and code-signing material — never commit
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.provisionprofile
+*.mobileprovision
