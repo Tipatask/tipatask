@@ -23,6 +23,22 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    # Pick which legs a manual dry run builds. Tag pushes carry no inputs and always build all
+    # three (see the plan job). Defaults are all-true, so "Run workflow" with no changes is
+    # still the full three-OS build.
+    inputs:
+      macos:
+        description: Build macOS (dmg, x64 + arm64)
+        type: boolean
+        default: true
+      windows:
+        description: Build Windows (NSIS installer)
+        type: boolean
+        default: true
+      linux:
+        description: Build Linux (AppImage + deb + pacman)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -35,8 +51,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Decides which legs run. `if:` on a matrix job cannot see the matrix context, so the leg list
+  # is built here and handed to `build` through fromJSON. A tag push (no inputs) builds all
+  # three; a manual dispatch builds the legs ticked in the Run workflow form.
+  plan:
+    name: Plan build legs
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.legs.outputs.matrix }}
+    steps:
+      - id: legs
+        env:
+          WANT_MACOS: ${{ github.event_name != 'workflow_dispatch' || inputs.macos }}
+          WANT_WINDOWS: ${{ github.event_name != 'workflow_dispatch' || inputs.windows }}
+          WANT_LINUX: ${{ github.event_name != 'workflow_dispatch' || inputs.linux }}
+        run: |
+          # Leg definitions. Reasons for each glob / runner pin, which the upload step
+          # consumes unchanged:
+          #   macOS   dist-electron/*.dmg           allow-list, never *.dmg.blockmap or unpacked trees
+          #   Windows dist-electron/*.exe           "TipATask Setup <version>.exe", not .blockmap/latest.yml
+          #   Linux   ubuntu-22.04, NOT latest      node-pty links the build host's glibc: 22.04 = 2.35 floor
+          #           AppImage keeps its capital I; @actions/glob is case-sensitive on Linux
+          legs='[]'
+          add() { legs=$(jq -c --argjson leg "$1" '. + [$leg]' <<<"$legs"); }
+          [ "$WANT_MACOS" = "true" ] && add '{"os":"macos-latest","label":"macOS (dmg, x64 + arm64)","script":"electron:ci:mac","artifact":"macos-dmg","globs":"dist-electron/*.dmg"}'
+          [ "$WANT_WINDOWS" = "true" ] && add '{"os":"windows-latest","label":"Windows (NSIS installer)","script":"electron:ci:win","artifact":"windows-nsis","globs":"dist-electron/*.exe"}'
+          [ "$WANT_LINUX" = "true" ] && add '{"os":"ubuntu-22.04","label":"Linux (AppImage + deb + pacman)","script":"electron:ci:linux","artifact":"linux-packages","globs":"dist-electron/*.AppImage\ndist-electron/*.deb\ndist-electron/*.pkg.tar.*"}'
+          if [ "$legs" = "[]" ]; then
+            echo "::error title=No legs selected::Tick at least one of macOS / Windows / Linux."
+            exit 1
+          fi
+          echo "matrix={\"include\":$legs}" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.label }}
+    needs: plan
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
 
@@ -54,43 +103,7 @@ jobs:
       # producing two good dmgs. Each leg is fully independent (separate runner, separate
       # artifact) and expensive -- nothing is gained by aborting siblings.
       fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            label: macOS (dmg, x64 + arm64)
-            script: electron:ci:mac
-            artifact: macos-dmg
-            # Allow-list, not deny-list. `dist-electron/*.dmg` structurally cannot match
-            # `*.dmg.blockmap` (a glob requires the name to END in .dmg), and never picks up
-            # builder-debug.yml, builder-effective-config.yaml, latest-mac.yml, or the
-            # multi-GB mac/ + mac-arm64/ unpacked app trees sitting beside the dmgs.
-            globs: |
-              dist-electron/*.dmg
-
-          - os: windows-latest
-            label: Windows (NSIS installer)
-            script: electron:ci:win
-            artifact: windows-nsis
-            # nsis oneClick per-user -> "TipATask Setup <version>.exe" (yes, with spaces).
-            # Excludes the .exe.blockmap, latest.yml, and win-unpacked/.
-            globs: |
-              dist-electron/*.exe
-
-          # Pinned to 22.04, NOT ubuntu-latest (24.04). node-pty ships no Linux prebuild, so
-          # node-gyp compiles pty.node right here and it links against the BUILD HOST's glibc.
-          # Building on 24.04 would silently raise the runtime glibc floor for every Linux user
-          # to 2.39; 22.04 gives 2.35. Revisit only when 22.04 is retired.
-          - os: ubuntu-22.04
-            label: Linux (AppImage + deb + pacman)
-            script: electron:ci:linux
-            artifact: linux-packages
-            # AppImage keeps its capital-I casing on disk and @actions/glob is case-SENSITIVE
-            # on Linux -- do not lowercase this. deb/pacman use electron-builder's default
-            # naming (tipatask-app_<version>_amd64.deb, tipatask-app-<version>-*.pkg.tar.*).
-            globs: |
-              dist-electron/*.AppImage
-              dist-electron/*.deb
-              dist-electron/*.pkg.tar.*
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
