@@ -84,6 +84,21 @@ function walkFiles(dir, cb) {
  *
  * Returns { results, tagPatterns, totalHits, elapsedMs, crossRefs?, counts?, missingTags? }.
  */
+// `<nested>/src` for every nested git checkout (gitlink) the project records — a project that
+// vendors another repo (e.g. this Task App as a submodule) keeps that repo's source outside
+// the conventional roots above. Read from git's index via discoverNestedRepos(), so no
+// directory name is ever assumed. Never throws: no git / not a git checkout → [].
+function nestedSourceDirs(baseRoot) {
+  try {
+    const { discoverNestedRepos } = require('./git-worktree');
+    return discoverNestedRepos(baseRoot)
+      .map(n => path.join(n.path, 'src'))
+      .filter(p => { try { return fs.statSync(p).isDirectory(); } catch { return false; } });
+  } catch {
+    return [];
+  }
+}
+
 function runBatchGrep({ tagNames, paths, maxHitsPerTag, maxPatternsPerTag, symbols, crossRefs, validateOnly, projectRoot }) {
   const maxHits = maxHitsPerTag || DEFAULT_MAX_HITS;
   const maxPatterns = maxPatternsPerTag || DEFAULT_MAX_PATTERNS;
@@ -97,7 +112,12 @@ function runBatchGrep({ tagNames, paths, maxHitsPerTag, maxPatternsPerTag, symbo
     .map(p => (path.isAbsolute(p) ? p : path.join(baseRoot, p)))
     .filter(p => { try { fs.statSync(p); return true; } catch { return false; } });
   let searchPaths = resolveExisting(paths || DEFAULT_SEARCH_PATHS);
-  if (!paths && searchPaths.length === 0) searchPaths = resolveExisting(FALLBACK_SEARCH_PATHS);
+  if (!paths) {
+    for (const dir of nestedSourceDirs(baseRoot)) {
+      if (!searchPaths.some(p => dir === p || dir.startsWith(p + path.sep))) searchPaths.push(dir);
+    }
+    if (searchPaths.length === 0) searchPaths = resolveExisting(FALLBACK_SEARCH_PATHS);
+  }
 
   // Load arch docs — uses architecture-cache (mtime-cached, avoids redundant reads).
   const tagPatterns = {};
@@ -227,4 +247,4 @@ function runBatchGrep({ tagNames, paths, maxHitsPerTag, maxPatternsPerTag, symbo
   return out;
 }
 
-module.exports = { runBatchGrep, derivePatternsFromArchDoc, deriveFileListFromArchDoc, walkFiles, GENERIC_NAMES, REPO_ROOT, DEFAULT_SEARCH_PATHS };
+module.exports = { runBatchGrep, derivePatternsFromArchDoc, deriveFileListFromArchDoc, walkFiles, nestedSourceDirs, GENERIC_NAMES, REPO_ROOT, DEFAULT_SEARCH_PATHS };

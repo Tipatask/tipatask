@@ -1,6 +1,6 @@
 {
   "name": "tipatask-app",
-  "version": "0.8.96",
+  "version": "0.8.99",
   "description": "TipΔTask — Electron desktop app: local task board, architecture knowledge base, and AI coding-agent orchestrator (Claude/Codex/Pi), with a CLI installer for the agent harness files.",
   "license": "Apache-2.0",
   "author": "Anton Matiienko, Apppixies",
@@ -76,6 +76,7 @@
     "electron:dist:win": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --win",
     "electron:dist:linux": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --linux",
     "electron:dist": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --mac --win --linux",
+    "bump-version": "node scripts/bump-version.js",
     "test:coverage": "c8 node scripts/run-tests.js"
   },
   "build": {

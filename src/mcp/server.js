@@ -804,7 +804,7 @@ async function main() {
     'Scan codebase ONCE and group hits by tt-* tag. ALWAYS pass every tag in scope as one array — multiple invocations per turn is a bug. Single file scan replaces N tool round-trips (~30ms vs ~1.2s×N). Derives search patterns from each tag\'s KB doc. Returns { results: { tag: [{file,line,text,pattern}] }, tagPatterns, totalHits, elapsedMs }. Optional: symbols (extra identifiers → results.__symbols__), cross_refs (tag-file overlap map), validate_only (counts only).',
     {
       tag_names: z.array(z.string()).min(1).max(20).describe('tt-* tag names to search for, e.g. ["tt-api-tasks","tt-task-board"]'),
-      paths: z.array(z.string()).optional().describe('Paths to search (relative to the project root). Defaults to whichever of src, lib, app, api, packages, ai/architecture exist; the whole project when none does.'),
+      paths: z.array(z.string()).optional().describe('Paths to search (relative to the project root). Defaults to whichever of src, lib, app, api, packages, ai/architecture exist plus the src/ of every nested git checkout (gitlink); the whole project when none does.'),
       max_hits_per_tag: z.number().int().min(1).max(100).optional().describe('Max hits per tag (default 30)'),
       symbols: z.array(z.string()).optional().describe('Extra identifiers to search (e.g. function/class names). Hits returned under results.__symbols__[name].'),
       cross_refs: z.boolean().optional().describe('Compute cross-tag file overlap: which tagA patterns appear in files listed by tagB\'s arch doc. Adds crossRefs map to result.'),
