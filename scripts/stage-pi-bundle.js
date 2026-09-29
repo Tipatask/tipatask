@@ -127,8 +127,10 @@ function ensurePiInstalled({ serverRoot = SERVER_ROOT, platform = process.platfo
   // `npm install` in this package, whose postinstall (electron-rebuild for node-pty) IS wanted.
   const result = spawn(
     platform === 'win32' ? 'npm.cmd' : 'npm',
-    ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', vendorDir],
-    { stdio: 'inherit', cwd: serverRoot }
+    // shell:true on Windows is required (Node >=20.12 refuses to spawn a .cmd shim without it,
+    // spawnSync EINVAL), and it joins args unquoted, so quote the path that may hold spaces.
+    ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', platform === 'win32' ? `"${vendorDir}"` : vendorDir],
+    { stdio: 'inherit', cwd: serverRoot, shell: platform === 'win32' }
   );
   if (result.error || result.status !== 0) throw new Error(`npm ci failed${result.error ? `: ${result.error.message}` : ` (exit ${result.status})`}`);
   pruneForeignOptional(vendorDir, lock, platform, arch, log);

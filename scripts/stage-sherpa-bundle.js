@@ -69,7 +69,8 @@ for (const { name, os: targetOs, cpu } of PLATFORM_PACKAGES) {
     const result = spawnSync(
       process.platform === 'win32' ? 'npm.cmd' : 'npm',
       ['install', `${name}@${wanted}`, '--no-save', '--ignore-scripts', '--no-audit', '--no-fund', '--force', `--os=${targetOs}`, `--cpu=${cpu}`],
-      { cwd: scratchDir, stdio: 'inherit' }
+      // shell:true on Windows: Node >=20.12 refuses to spawn a .cmd shim without it (EINVAL).
+      { cwd: scratchDir, stdio: 'inherit', shell: process.platform === 'win32' }
     );
     if (result.status !== 0) {
       console.warn(`[stage-sherpa-bundle] failed to install ${name}@${wanted} — local streaming transcription will be unavailable in builds for that platform`);

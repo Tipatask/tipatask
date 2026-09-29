@@ -166,7 +166,8 @@
         "pacman"
       ],
       "icon": "assets/icon.png",
-      "category": "Development"
+      "category": "Development",
+      "maintainer": "Tipatask <reply@tipatask.com>"
     },
     "afterPack": "scripts/check-packaged-tests.js"
   },

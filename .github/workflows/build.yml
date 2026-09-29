@@ -253,4 +253,3 @@ jobs:
         with:
           draft: true
           files: installers/*
-
