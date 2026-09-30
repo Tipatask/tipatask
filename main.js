@@ -58,6 +58,7 @@ const windowRegistry = require('./main/window-registry');
 const { LOCALES, setMenuLocale, getMenuLocale, mt } = require('./main/menu-i18n');
 // (C1532) About + Third-Party Licenses windows — see about-window.js header.
 const { openAboutWindow, openNoticesWindow } = require('./main/about-window');
+const { resolveAppVersion } = require('./src/server/app-version');
 const { ensureBundleSignatureHealthy } = require('./src/server/bundle-signature');
 // (C1355) Duplicate-LaunchServices-claimant self-heal — see ls-registration.js's header comment.
 const { ensureLaunchServicesHealthy, reregisterBundle } = require('./src/server/ls-registration');
@@ -2018,7 +2019,16 @@ function createSplashWindow() {
   });
   // assets/** ships inside app.asar (package.json build.files) and loadFile reads
   // through Electron's asar shim, so this resolves in dev and packaged builds.
-  splashWindow.loadFile(path.join(__dirname, 'assets', 'splash.html'));
+  // TPT398: version travels as a `?v=` query (the splash has no preload). resolveAppVersion()
+  // never throws; '' → no query → splash renders the copyright alone.
+  const splashVersion = resolveAppVersion({
+    getVersion: () => app.getVersion(),
+    readPackageVersion: () => require('./package.json').version,
+  });
+  splashWindow.loadFile(
+    path.join(__dirname, 'assets', 'splash.html'),
+    splashVersion ? { query: { v: splashVersion } } : undefined
+  );
   splashWindow.on('closed', () => { splashWindow = null; });
 
   // Safety net: the splash is frameless with no close button. Never strand it if

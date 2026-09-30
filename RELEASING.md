@@ -57,11 +57,14 @@ Use it to check a packaging change before tagging.
 
 ## Signing
 
-CI does not sign yet. The macOS app is ad-hoc signed (`build.mac.identity: "-"`) and not
-notarized, and the Windows installer is unsigned, so the OSes warn on first launch (see the
-README's Download section). Signing certificates and the secrets that carry them are set up
-as described in [`ELECTRON_BUILD.md`](ELECTRON_BUILD.md) §2–§3; store them as secrets of a
-GitHub environment restricted to `v*` tags, never in the repository.
+The macOS installers are Developer ID signed and notarized when the `release` GitHub
+environment holds all five secrets (`CSC_LINK`, `CSC_KEY_PASSWORD`, `APPLE_ID`,
+`APPLE_APP_SPECIFIC_PASSWORD`, `APPLE_TEAM_ID`); the workflow then verifies each dmg with
+`codesign`, `spctl` and `stapler`. With none set, macOS is ad-hoc signed and the OS warns on first
+launch. Windows and Linux installers are unsigned. Setting all five is required, a partial set
+fails the build. The environment must allow `v*` tags and the `master` branch. Certificate and
+secret setup: [`ELECTRON_BUILD.md`](ELECTRON_BUILD.md) §2–§3; never store them in the repository.
+Each release also carries a `SHA256SUMS` file covering every installer.
 
 ## Repository settings that support releases
 

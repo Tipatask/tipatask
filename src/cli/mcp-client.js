@@ -43,6 +43,10 @@ async function spawnMcpClient(opts = {}) {
     async callTool(name, args) {
       const result = await client.callTool({ name, arguments: args || {} });
       const first = Array.isArray(result.content) ? result.content[0] : null;
+      // TPT394: a rejected tool call (isError) must not look like success to seeders.
+      if (result.isError) {
+        throw new Error(first && typeof first.text === 'string' ? first.text : `MCP tool ${name} failed`);
+      }
       if (first && first.type === 'text' && typeof first.text === 'string') {
         try {
           return JSON.parse(first.text);

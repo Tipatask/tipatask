@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawnMcpClient } = require('./mcp-client');
 const { request } = require('./http');
-const { isValidTaskKey } = require('../server/task-key-format');
+const { taskKeyFormatError } = require('../server/task-key-format');
 
 const GREEN = '\x1b[32m';
 const YELLOW = '\x1b[33m';
@@ -103,7 +103,8 @@ async function reserveKeysViaMcp(mcp, count) {
     throw new Error(`reserve_task_keys returned ${keys.length} key(s), expected ${count}`);
   }
   for (const k of keys) {
-    if (!isValidTaskKey(k)) throw new Error(`reserve_task_keys returned malformed key "${k}"`);
+    const keyErr = taskKeyFormatError(k);
+    if (keyErr) throw new Error(`reserve_task_keys returned a malformed key. ${keyErr}`);
   }
   return keys;
 }
@@ -127,7 +128,8 @@ async function reserveKeysViaHttp({ apiBaseUrl, token, projectId, count }) {
     throw new Error(`reserve endpoint returned ${keys.length} key(s), expected ${count}`);
   }
   for (const k of keys) {
-    if (!isValidTaskKey(k)) throw new Error(`reserve endpoint returned malformed key "${k}"`);
+    const keyErr = taskKeyFormatError(k);
+    if (keyErr) throw new Error(`reserve endpoint returned a malformed key. ${keyErr}`);
   }
   return keys;
 }
@@ -935,7 +937,9 @@ module.exports = {
   runSeedSetupTasks, buildAgentInstructionTask, buildGeneralMdTask, buildAuditAiIdeConfigTask,
   seedPresetTasks, seedSyncTasks, applyPresetTemplate,
   // TPT200 — tag pre-registration before finalize, exported for src/cli/seed-setup-tasks.test.js
-  SEED_TAG_DESCRIPTIONS, registerSeedTags,
+  SEED_TAG_DESCRIPTIONS, registerSeedTags, keepKnownTags,
+  // TPT394 — reused by discover.js's discovery-task seeding
+  reserveKeysViaMcp,
   // TPT203 — finalize-body/response assertions, exported so every rejection branch is unit-testable
   finalizeBodyError, finalizedTaskError, describePresetSeedProblem,
   // C1065 — exported for src/cli/seed-setup-tasks.test.js

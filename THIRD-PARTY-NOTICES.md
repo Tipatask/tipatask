@@ -42,7 +42,7 @@ This appendix lists every third-party package redistributed inside the packaged 
 | Package | License | Copyright |
 |---|---|---|
 | `@hono/node-server@1.19.17` | MIT | Copyright (c) 2022 - present, Yusuke Wada and Hono contributors |
-| `@modelcontextprotocol/sdk@1.29.0` | MIT | Copyright (c) 2024 Anthropic, PBC |
+| `@modelcontextprotocol/sdk@1.31.0` | MIT | Copyright (c) 2024 Anthropic, PBC |
 | `@types/trusted-types@2.0.7` | MIT | — |
 | `@xterm/addon-fit@0.10.0` | MIT | Copyright (c) 2019, The xterm.js authors (https://github.com/xtermjs/xterm.js) |
 | `@xterm/xterm@5.5.0` | MIT | Copyright (c) 2017-2019, The xterm.js authors (https://github.com/xtermjs/xterm.js) |
@@ -136,13 +136,13 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `setprototypeof@1.2.0` | ISC | Copyright (c) 2015, Wes Todd |
 | `shebang-command@2.0.0` | MIT | Kevin Mårtensson |
 | `shebang-regex@3.0.0` | MIT | Sindre Sorhus |
-| `sherpa-onnx-darwin-arm64@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
-| `sherpa-onnx-darwin-x64@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
-| `sherpa-onnx-linux-arm64@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
-| `sherpa-onnx-linux-x64@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
-| `sherpa-onnx-node@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
-| `sherpa-onnx-win-ia32@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
-| `sherpa-onnx-win-x64@1.13.6` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-darwin-arm64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-darwin-x64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-linux-arm64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-linux-x64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-node@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-win-ia32@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-win-x64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
 | `side-channel@1.1.1` | MIT | Copyright (c) 2019 Jordan Harband |
 | `side-channel-list@1.0.1` | MIT | Copyright (c) 2024 Jordan Harband |
 | `side-channel-map@1.0.1` | MIT | Copyright (c) 2024 Jordan Harband |
@@ -156,9 +156,9 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `vary@1.1.2` | MIT | Copyright (c) 2014-2017 Douglas Christopher Wilson |
 | `which@2.0.2` | ISC | Isaac Z. Schlueter <i@izs.me> (http://blog.izs.me) |
 | `wrappy@1.0.2` | ISC | Isaac Z. Schlueter <i@izs.me> (http://blog.izs.me/) |
-| `ws@8.21.3` | MIT | Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com> |
+| `ws@8.22.0` | MIT | Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com> |
 | `wsl-utils@0.1.0` | MIT | Sindre Sorhus |
-| `zod@4.3.6` | MIT | Copyright (c) 2025 Colin McDonnell |
+| `zod@4.6.5` | MIT | Copyright (c) 2025 Colin McDonnell |
 | `zod-to-json-schema@3.25.2` | ISC | Copyright (c) 2020, Stefan Terdell |
 
 ### Pi Coding Agent bundle (136 packages)
@@ -296,7 +296,7 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `undici-types@6.21.0` | MIT | — |
 | `web-streams-polyfill@3.3.3` | MIT | Copyright (c) 2024 Mattias Buelens |
 | `which@2.0.2` | ISC | Isaac Z. Schlueter <i@izs.me> (http://blog.izs.me) |
-| `ws@8.21.3` | MIT | Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com> |
+| `ws@8.22.0` | MIT | Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com> |
 | `xml-naming@0.1.0` | MIT | Amit Gupta (https://solothought.com) |
 | `yaml@2.9.0` | ISC | Eemeli Aro <eemeli@gmail.com> |
 | `zod@3.25.76` | MIT | Copyright (c) 2025 Colin McDonnell |

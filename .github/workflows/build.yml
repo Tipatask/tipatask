@@ -88,6 +88,9 @@ jobs:
     needs: plan
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # Holds the macOS signing secrets. The environment's deployment policy (repo setting) must
+    # allow `v*` tags AND the master branch, so a dispatch from master can test signing.
+    environment: release
 
     defaults:
       run:
@@ -207,8 +210,46 @@ jobs:
       # Do NOT add a "git diff --exit-code" cleanliness check after this step. stage-pi-bundle.js
       # unconditionally regenerates the tracked THIRD-PARTY-NOTICES.md. A dirty worktree here
       # can therefore be expected.
+      #
+      # macOS signing is opt-in: the five secrets below are passed to the macOS leg only (empty on
+      # Windows/Linux, which stay unsigned). With none set the build is ad-hoc signed, as in
+      # package.json (`build.mac.identity: "-"`). With all five, the CLI overrides pick the
+      # Developer ID cert from the temporary keychain by Team ID (a substring of its name; the
+      # "Developer ID Application:" prefix must NOT be passed, electron-builder rejects it),
+      # force signing to fail loudly if it is missing, and turn notarization on. Some but not
+      # all five is a misconfiguration and fails the job. Needs electron-builder >= 26.17.0.
       - name: Build installers
-        run: npm run ${{ matrix.script }} -- --publish never
+        id: build
+        env:
+          CSC_LINK: ${{ runner.os == 'macOS' && secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ runner.os == 'macOS' && secrets.CSC_KEY_PASSWORD || '' }}
+          APPLE_ID: ${{ runner.os == 'macOS' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
+        run: |
+          set_count=0
+          for v in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!v}" ] && set_count=$((set_count + 1))
+          done
+          extra=()
+          if [ "$set_count" -eq 5 ]; then
+            echo "::notice title=macOS signing::Developer ID signing + notarization enabled."
+            extra=(-c.mac.identity="$APPLE_TEAM_ID" -c.mac.notarize=true -c.forceCodeSigning=true)
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$set_count" -eq 0 ]; then
+            echo "::notice title=Unsigned build::No signing secrets; packaging as-is (macOS ad-hoc signed)."
+            unset CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
+          else
+            echo "::error title=Partial signing secrets::Set all five of CSC_LINK, CSC_KEY_PASSWORD, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID in the release environment, or none."
+            exit 1
+          fi
+          npm run ${{ matrix.script }} -- --publish never "${extra[@]}"
+
+      # Only when the build signed: mount each dmg and check the app inside is Developer ID
+      # signed, notarized and stapled. An ad-hoc/unsigned artifact fails this step.
+      - name: Verify macOS signature and notarization
+        if: runner.os == 'macOS' && steps.build.outputs.signed == 'true'
+        run: bash scripts/verify-mac-signature.sh dist-electron/*.dmg
 
       # stage-sherpa-bundle.js is non-fatal by design (a transient registry hiccup shouldn't
       # block a dev building for just their own machine) -- so a green build here could still
@@ -261,6 +302,17 @@ jobs:
           pattern: TipATask-*
           path: installers
           merge-multiple: true
+
+      # Checksums for every installer in the release; fails on an empty set or a missing entry.
+      - name: Generate SHA256SUMS
+        working-directory: installers
+        run: |
+          shopt -s nullglob
+          files=(*)
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no installers downloaded"; exit 1; }
+          sha256sum -- "${files[@]}" > SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" -eq "${#files[@]}" ] || { echo "::error::SHA256SUMS does not list every installer"; exit 1; }
+          cat SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
         with:

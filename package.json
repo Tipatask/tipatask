@@ -1,6 +1,6 @@
 {
   "name": "tipatask-app",
-  "version": "0.8.99",
+  "version": "0.9.0",
   "description": "TipΔTask — Electron desktop app: local task board, architecture knowledge base, and AI coding-agent orchestrator (Claude/Codex/Pi), with a CLI installer for the agent harness files.",
   "license": "Apache-2.0",
   "author": "Anton Matiienko, Apppixies",
@@ -143,6 +143,7 @@
       "icon": "assets/icon.icns",
       "category": "public.app-category.productivity",
       "identity": "-",
+      "notarize": false,
       "extendInfo": {
         "NSMicrophoneUsageDescription": "Tipatask uses the microphone for voice-to-text task input."
       },
@@ -173,25 +174,25 @@
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
     "dompurify": "3.4.16",
     "marked": "^15.0.0",
     "node-pty": "^1.0.0",
     "open": "^10.0.0",
-    "sherpa-onnx-node": "^1.13.6",
+    "sherpa-onnx-node": "^1.13.8",
     "toml": "4.2.0",
     "transliteration": "^2.6.1",
-    "ws": "^8.21.3",
-    "zod": "^4.3.6"
+    "ws": "^8.22.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@electron/asar": "^3.4.1",
     "@electron/rebuild": "^4.2.0",
     "c8": "^12.0.0",
-    "electron": "^43.4.0",
-    "electron-builder": "^26.15.3",
+    "electron": "^43.7.6",
+    "electron-builder": "^26.17.0",
     "esbuild": "^0.24.0",
     "happy-dom": "^20.14.5",
     "jsdom": "29.1.1",

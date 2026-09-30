@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
-const { createPackage } = require('@electron/asar');
+const { createPackage, uncache } = require('@electron/asar');
 const { FileMatcher } = require('app-builder-lib/out/fileMatcher');
 const afterPack = require('../../scripts/check-packaged-tests');
 const { discoverTests } = require('../../scripts/run-tests');
@@ -132,7 +132,17 @@ test('actual Electron file matcher keeps runtime files and excludes tests and he
   }
 });
 
-test('release hook accepts a runtime-only archive and rejects leaked test files', async t => {
+// A packaged tree whose versions all agree with package-lock.json: asar (source files plus one
+// package.json per production dependency), app.asar.unpacked (sherpa platform prebuilds) and the
+// resources/pi bundle. Tests then break one thing at a time.
+const lock = require('../../package-lock.json');
+const lockVersion = name => lock.packages[`node_modules/${name}`].version;
+const writeJson = (file, data) => {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(data));
+};
+
+function packagedFixture(t) {
   const dir = scratch(t);
   const source = path.join(dir, 'source');
   const resources = path.join(dir, 'resources');
@@ -146,15 +156,77 @@ test('release hook accepts a runtime-only archive and rejects leaked test files'
     fs.mkdirSync(path.dirname(path.join(source, file)), { recursive: true });
     fs.copyFileSync(path.resolve(__dirname, '../..', file), path.join(source, file));
   }
-  await createPackage(source, path.join(resources, 'app.asar'));
-  await afterPack({ appOutDir: dir, electronPlatformName: 'linux' });
-  fs.mkdirSync(path.join(source, 'src'), { recursive: true });
-  fs.writeFileSync(path.join(source, 'src', 'leak.test.js'), '');
-  const badResources = path.join(dir, 'Bad.app', 'Contents', 'Resources');
+  for (const name of Object.keys(pkg.dependencies)) {
+    if (name === afterPack.PI_PACKAGE) continue;
+    writeJson(path.join(source, 'node_modules', name, 'package.json'), { name, version: lockVersion(name) });
+  }
+  for (const platform of afterPack.SHERPA_PLATFORMS) {
+    writeJson(path.join(resources, 'app.asar.unpacked', 'node_modules', `sherpa-onnx-${platform}`, 'package.json'),
+      { name: `sherpa-onnx-${platform}`, version: lockVersion('sherpa-onnx-node') });
+  }
+  const piModules = path.join(resources, 'pi', 'node_modules');
+  writeJson(path.join(piModules, afterPack.PI_PACKAGE, 'package.json'),
+    { name: afterPack.PI_PACKAGE, version: pkg.dependencies[afterPack.PI_PACKAGE].replace(/^[\^~]/, '') });
+  writeJson(path.join(piModules, afterPack.PI_PACKAGE, 'node_modules', 'ws', 'package.json'), { name: 'ws', version: lockVersion('ws') });
+  // @electron/asar caches each archive's header by path, so a rebuilt archive must be dropped from it.
+  const repack = async () => {
+    const archive = path.join(resources, 'app.asar');
+    await createPackage(source, archive);
+    uncache(archive);
+  };
+  const electronVersion = require('electron/package.json').version;
+  const check = (overrides = {}) => afterPack.assertPackagedVersions({
+    resources, sourceRoot: path.resolve(__dirname, '../..'), electronVersion, ...overrides });
+  return { dir, source, resources, piModules, repack, check, electronVersion };
+}
+
+test('release hook accepts a runtime-only archive and rejects leaked test files', async t => {
+  const f = packagedFixture(t);
+  await f.repack();
+  await afterPack({ appOutDir: f.dir, electronPlatformName: 'linux',
+    packager: { info: { framework: { version: f.electronVersion } } } });
+  fs.mkdirSync(path.join(f.source, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(f.source, 'src', 'leak.test.js'), '');
+  const badResources = path.join(f.dir, 'Bad.app', 'Contents', 'Resources');
   fs.mkdirSync(badResources, { recursive: true });
-  await createPackage(source, path.join(badResources, 'app.asar'));
-  await assert.rejects(afterPack({ appOutDir: dir, electronPlatformName: 'darwin',
+  await createPackage(f.source, path.join(badResources, 'app.asar'));
+  await assert.rejects(afterPack({ appOutDir: f.dir, electronPlatformName: 'darwin',
     packager: { appInfo: { productFilename: 'Bad' } } }), /leak\.test\.js/);
+});
+
+test('packaged versions pass when consistent and each mismatch is reported by name', async t => {
+  const f = packagedFixture(t);
+  await f.repack();
+  f.check();
+
+  const rejects = (fn, pattern) => assert.throws(fn, err => pattern.test(err.message));
+
+  writeJson(path.join(f.source, 'node_modules', 'zod', 'package.json'), { name: 'zod', version: '0.0.1' });
+  await f.repack();
+  rejects(() => f.check(), /dependency zod: found 0\.0\.1, expected /);
+  writeJson(path.join(f.source, 'node_modules', 'zod', 'package.json'), { name: 'zod', version: lockVersion('zod') });
+
+  const asarPkg = JSON.parse(fs.readFileSync(path.join(f.source, 'package.json'), 'utf8'));
+  writeJson(path.join(f.source, 'package.json'), { ...asarPkg, version: '9.9.9' });
+  await f.repack();
+  rejects(() => f.check(), /app\.asar package\.json version: found 9\.9\.9/);
+  writeJson(path.join(f.source, 'package.json'), asarPkg);
+  await f.repack();
+  f.check();
+
+  const sherpa = platform => path.join(f.resources, 'app.asar.unpacked', 'node_modules', `sherpa-onnx-${platform}`);
+  writeJson(path.join(sherpa('win-x64'), 'package.json'), { version: '0.0.1' });
+  rejects(() => f.check(), /sherpa-onnx-win-x64: found 0\.0\.1, expected /);
+  fs.rmSync(sherpa('linux-arm64'), { recursive: true });
+  rejects(() => f.check(), /sherpa-onnx-linux-arm64: found nothing, expected /);
+
+  const piPkg = path.join(f.piModules, afterPack.PI_PACKAGE, 'package.json');
+  writeJson(piPkg, { version: '9.9.9' });
+  rejects(() => f.check(), /Pi bundle @earendil-works\/pi-coding-agent: found 9\.9\.9, expected /);
+  writeJson(path.join(f.piModules, afterPack.PI_PACKAGE, 'node_modules', 'ws', 'package.json'), { version: '0.0.1' });
+  rejects(() => f.check(), /Pi bundle ws: found 0\.0\.1, expected /);
+
+  rejects(() => f.check({ electronVersion: '1.0.0' }), /Electron runtime: found 1\.0\.0, expected /);
 });
 
 test('coverage includes never-imported source and fails on assertions or each coverage floor', t => {

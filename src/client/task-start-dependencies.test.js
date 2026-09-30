@@ -63,6 +63,21 @@ test('edit modal renders and rechecks dependency blocking before save or launch'
   assert.match(handler, /_syncModalStartDependencyState\(modal, draft\);\s*return;/);
 });
 
+test('edit modal Stop persists a dirty draft before terminating the session', () => {
+  const source = readSource('task-edit-modal.js');
+  const handlerStart = source.indexOf("} else if (action === 'stop') {");
+  const handlerEnd = source.indexOf("} else if (action === 'reiterate')", handlerStart);
+  assert.ok(handlerStart !== -1 && handlerEnd > handlerStart, 'stop handler must be found');
+  const handler = source.slice(handlerStart, handlerEnd);
+  const dirtyAt = handler.indexOf('_isModalDirty()');
+  const saveAt = handler.indexOf('await persistDraft()');
+  const abortAt = handler.indexOf('if (!saved) return;');
+  const stopAt = handler.indexOf('terminateSessionFromCard');
+  assert.ok(dirtyAt !== -1 && dirtyAt < saveAt, 'dirty check must precede the save');
+  assert.ok(saveAt !== -1 && saveAt < abortAt, 'save failure must abort the stop');
+  assert.ok(abortAt < stopAt, 'save and abort guard must run before the stop call');
+});
+
 test('edit modal preloads full project tasks and provides localized disabled styling', () => {
   const board = readSource('task-board.js');
   const editor = readSource('task-edit-modal.js');

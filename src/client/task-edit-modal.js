@@ -2056,6 +2056,14 @@ function _attachModalHandlers(modal) {
       closeTaskEditModal(true);
       if (callbacks.onStart) await callbacks.onStart(draft);
     } else if (action === 'stop') {
+      // (TPT395) Same save-first path as Start (C1316): persist a dirty draft before
+      // stopping so edits made while the session ran are not discarded by the close.
+      if (_isModalDirty()) {
+        btn.disabled = true; // re-entrancy guard while the save is in flight
+        let saved = false;
+        try { saved = await persistDraft(); } finally { btn.disabled = false; }
+        if (!saved) return; // persistDraft() already toasted; modal stays open, session untouched
+      }
       clearAttention(taskId, 'session-ended');
       commands.terminateSessionFromCard(taskId);
       closeTaskEditModal(true);

@@ -3,7 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { TASK_KEY_RE, isValidTaskKey, parseTaskKey, isTaskKeyLike, maxNumbersByPrefix, resolveCodingPrefix, HUMAN_TASK_PREFIX, EPIC_KEY_RE } = require('./task-key-format');
+const { isLegacyTaskKey, TASK_KEY_RE, isValidTaskKey, parseTaskKey, isTaskKeyLike, maxNumbersByPrefix, resolveCodingPrefix, HUMAN_TASK_PREFIX, EPIC_KEY_RE } = require('./task-key-format');
 
 test('isValidTaskKey accepts prefix+number keys (legacy C/H and per-project prefixes)', () => {
   for (const key of ['C214', 'H3', 'TPT214', 'TSK1', 'A0']) {
@@ -65,4 +65,34 @@ test('resolveCodingPrefix returns the project prefix when valid, else degrades t
 test('HUMAN_TASK_PREFIX and EPIC_KEY_RE match the api/src/lib twin', () => {
   assert.equal(HUMAN_TASK_PREFIX, 'H');
   assert.equal(EPIC_KEY_RE.source, '^[A-Z]{1,8}-[0-9]+$');
+});
+
+test('isLegacyTaskKey accepts existing slug keys but create-time validation stays strict', () => {
+  for (const key of ['C-kb-docs-site', 'C-kb-dev-scripts', 'C-foo_bar']) {
+    assert.equal(isLegacyTaskKey(key), true, `expected "${key}" legacy`);
+    assert.equal(isValidTaskKey(key), false, `expected "${key}" rejected at create time`);
+  }
+});
+
+test('isLegacyTaskKey rejects strict keys, unsafe ref names and non-strings', () => {
+  for (const key of ['TPT214', 'H3', 'TIPA-1', '', 'a/b', '../x', 'a..b', 'has space', '-lead', 'task/C1', null, undefined, 42, {}]) {
+    assert.equal(isLegacyTaskKey(key), false, `expected ${JSON.stringify(key)} not legacy`);
+  }
+});
+
+// ── TPT394: taskKeyFormatError ──
+
+test('taskKeyFormatError returns null for a valid key', () => {
+  const { taskKeyFormatError } = require('./task-key-format');
+  for (const key of ['C214', 'H3', 'TPT394']) assert.equal(taskKeyFormatError(key), null);
+});
+
+test('taskKeyFormatError names the offending slug and the contract regex', () => {
+  const { taskKeyFormatError } = require('./task-key-format');
+  for (const key of ['C-kb-docs-site', '', undefined, 42]) {
+    const msg = taskKeyFormatError(key);
+    assert.equal(typeof msg, 'string');
+    assert.ok(msg.includes(JSON.stringify(key)), `message should name ${JSON.stringify(key)}`);
+    assert.ok(msg.includes('^(H|[A-Z]{1,6})[0-9]+$'));
+  }
 });

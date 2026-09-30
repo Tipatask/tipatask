@@ -7,9 +7,12 @@ const { confirm, prompt } = require('./prompts');
 const { substitute } = require('./placeholders');
 const { spawnMcpClient } = require('./mcp-client');
 const { pushFile } = require('./knowledge-sync');
+const { registerSeedTags, keepKnownTags, reserveKeysViaMcp } = require('./seed-setup-tasks');
+const { taskKeyFormatError } = require('../server/task-key-format');
 
 // ANSI
 const DIM = '\x1b[2m';
+const RED = '\x1b[31m';
 const GREEN = '\x1b[32m';
 const YELLOW = '\x1b[33m';
 const CYAN = '\x1b[36m';
@@ -383,6 +386,59 @@ function writeTagMdIfMissing(projectRoot, tagName, content) {
   return { written: true, path: filePath };
 }
 
+// TPT394: discovery tasks never mint their own keys. Keys come from reserve_task_keys
+// (prefix+number), each reserved row is finalized in place via update_task (create_task
+// would 409 against the reservation row), and a model-supplied id/task_key is always
+// overwritten. taskKeyFormatError() gates every write so a slug key fails loudly.
+async function seedDiscoveryTasks(mcp, tagNames, { apiBaseUrl, token, projectId } = {}) {
+  const defs = tagNames.map((tag) => ({
+    title: `Explore ${tag} and enrich ai/architecture/${tag}.md`,
+    description: buildDiscoveryTaskDesc(tag),
+    category: 'CODING',
+    status: 'pending',
+    priority: 1,
+    tags: [tag, 'feature', 'db-schema'],
+  }));
+  if (!defs.length) return { seeded: 0, failed: 0, keys: [] };
+
+  // The finalize PATCH 400s wholesale on one unregistered tag (TPT200).
+  let known = null;
+  if (apiBaseUrl && token && projectId != null) {
+    ({ known } = await registerSeedTags({ apiBaseUrl, token, projectId, tagNames: defs.flatMap((d) => d.tags) }));
+  }
+
+  let keys;
+  try {
+    keys = await reserveKeysViaMcp(mcp, defs.length);
+  } catch (err) {
+    console.log(`  ${RED}Could not reserve task keys for discovery tasks: ${err.message}${RESET}`);
+    return { seeded: 0, failed: defs.length, keys: [] };
+  }
+
+  let seeded = 0;
+  let failed = 0;
+  const stranded = [];
+  for (let i = 0; i < defs.length; i++) {
+    const def = defs[i];
+    const body = { ...def, tags: keepKnownTags(def.tags, known), task_key: keys[i] };
+    delete body.id;
+    try {
+      const keyErr = taskKeyFormatError(body.task_key);
+      if (keyErr) throw new Error(keyErr);
+      await mcp.callTool('update_task', body);
+      seeded++;
+    } catch (err) {
+      console.log(`  ${RED}Failed to seed "${def.title}" (${keys[i]}): ${err.message}${RESET}`);
+      stranded.push(keys[i]);
+      failed++;
+    }
+  }
+  if (stranded.length) {
+    console.log(`  ${RED}${stranded.length} discovery task(s) left as blank placeholders: ${stranded.join(', ')}${RESET}`);
+  }
+  return { seeded, failed, keys };
+}
+
 async function runDiscovery({ projectRoot, apiBaseUrl, token, projectId }) {
   if (!projectRoot) throw new Error('runDiscovery: projectRoot required');
 
@@ -519,22 +575,9 @@ async function runDiscovery({ projectRoot, apiBaseUrl, token, projectId }) {
 
     let seededCount = 0;
     if (result.created.length) {
-      for (const c of result.created) {
-        try {
-          await mcp.callTool('create_task', {
-            title: `Explore ${c.tag} and enrich ai/architecture/${c.tag}.md`,
-            description: buildDiscoveryTaskDesc(c.tag),
-            category: 'CODING',
-            status: 'pending',
-            priority: 1,
-            tags: [c.tag, 'feature', 'db-schema'],
-          });
-          seededCount++;
-        } catch (err) {
-          console.log(`  ${YELLOW}Failed to seed task for ${c.tag}: ${err.message}${RESET}`);
-        }
-      }
-      console.log(`  ${GREEN}Seeded ${seededCount} discovery task(s)${RESET}`);
+      const seed = await seedDiscoveryTasks(mcp, result.created.map((c) => c.tag), { apiBaseUrl, token, projectId });
+      seededCount = seed.seeded;
+      console.log(`  ${GREEN}Seeded ${seededCount} discovery task(s)${RESET}${seed.failed ? `, ${seed.failed} failed` : ''}`);
     }
     return { ...result, seededCount };
   } finally {
@@ -544,6 +587,7 @@ async function runDiscovery({ projectRoot, apiBaseUrl, token, projectId }) {
 
 module.exports = {
   runDiscovery,
+  seedDiscoveryTasks,
   parseArchitectureMd,
   buildGeneralFromSections,
   buildTagProposalsFromSections,

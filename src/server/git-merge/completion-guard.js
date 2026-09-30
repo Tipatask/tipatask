@@ -10,6 +10,7 @@ const { parseTaskBranch } = require('./task-branch');
 const { parseWorktreePorcelain, parseGitlinks } = require('../../mcp/git-worktree');
 const { runGit } = require('./git-runner');
 const { readVcsContext } = require('../vcs-context');
+const { isTaskKeyLike, isLegacyTaskKey } = require('../task-key-format');
 const path = require('node:path');
 
 // Read-only and strict: unlike the merge panel's best-effort inventory, a failed Git
@@ -21,9 +22,29 @@ async function verifyTaskCompletion({ backend, projectRoot, taskId, git = runGit
     result.blockers.push({ code: context.reason });
     return result;
   }
-  if (!/^[A-Z]+\d+$/.test(taskId || '')) {
+  if (typeof taskId !== 'string' || !taskId.trim()) {
     result.blockers.push({ code: 'invalid_task_key' });
     return result;
+  }
+  // Legacy slug keys (e.g. "C-kb-docs-site") predate the strict prefix+number contract but
+  // exist in the API; accept them only when the project actually returns the task.
+  const legacyKey = !isTaskKeyLike(taskId);
+  if (legacyKey) {
+    if (!isLegacyTaskKey(taskId)) {
+      result.blockers.push({ code: 'invalid_task_key' });
+      return result;
+    }
+    let found = null;
+    try {
+      found = await backend.getTask(taskId);
+    } catch {
+      result.blockers.push({ code: 'task_lookup_failed' });
+      return result;
+    }
+    if (!found) {
+      result.blockers.push({ code: 'unknown_task_key' });
+      return result;
+    }
   }
   if (context.vcs.type !== 'git' || !context.vcs.merge) {
     result.ready = true;
@@ -53,7 +74,9 @@ async function verifyTaskCompletion({ backend, projectRoot, taskId, git = runGit
         children.push({ link, child });
       }
       const refs = (await read(cwd, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/task/'])).stdout.trim().split('\n');
-      const branches = refs.filter(b => parseTaskBranch(b)?.taskKey === taskId);
+      // parseTaskBranch only understands prefix+number keys; a slug key's branch is the
+      // exact `task/<key>` (no suffix matching, so "C-kb-docs" never claims "C-kb-docs-site").
+      const branches = refs.filter(b => (legacyKey ? b === `task/${taskId}` : parseTaskBranch(b)?.taskKey === taskId));
       const participates = branches.length > 0 || children.some(c => c.child.participates);
       const repo = { path: cwd, target, head, branches: [], participates };
       if (participates) {

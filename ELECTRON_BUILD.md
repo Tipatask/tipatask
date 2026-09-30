@@ -4,7 +4,7 @@
 
 This guide covers everything needed to produce a signed, notarized, and auto-updating **Electron desktop app** installer for TipATask — the desktop app is the product; everything else in this repo exists to build and support it. It covers macOS (signed + notarized DMG), Windows (unsigned now, signing path documented), and Linux (AppImage, no signing required).
 
-**Shipped state today (differs from the target this guide walks toward):** macOS builds are ad-hoc signed and **not notarized**; the Windows installer is **unsigned** (SmartScreen warns); Linux has no signing; there is **no auto-update** on any platform; Windows and Linux ship **x64 only**; and the release job only creates a **draft** GitHub Release that a maintainer publishes.
+**Shipped state today (differs from the target this guide walks toward):** macOS builds are ad-hoc signed and not notarized locally, and signed + notarized in CI when the `release` environment holds the five Apple secrets; the Windows installer is **unsigned** (SmartScreen warns); Linux has no signing; there is **no auto-update** on any platform; Windows and Linux ship **x64 only**; and the release job only creates a **draft** GitHub Release that a maintainer publishes.
 
 **CI does this for you now**: `.github/workflows/build.yml` builds all three platforms in parallel on a `v*` tag push or manual dispatch and drafts a GitHub Release with every installer attached. The manual steps below remain the reference for what the workflow's `electron:ci:*` scripts actually run, for local iteration, and for the signing/notarization setup CI does not do (no certs are configured there yet).
 

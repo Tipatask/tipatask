@@ -100,7 +100,19 @@
       </svg>
     </div>
     <div class="splash-status">Starting up…</div>
-    <div class="splash-copyright">© 2026 TipΔTask</div>
+    <div class="splash-copyright">© 2026 TipΔTask<span class="splash-version" hidden></span></div>
   </div>
+  <script>
+    /* TPT398: version arrives as ?v= from main.js (no preload here). Sync + textContent
+       only; any failure leaves the span hidden so the copyright renders alone. */
+    try {
+      var v = new URLSearchParams(location.search).get('v');
+      if (v && /^[0-9A-Za-z.+-]{1,32}$/.test(v)) {
+        var el = document.querySelector('.splash-version');
+        el.textContent = ' · v' + v;
+        el.hidden = false;
+      }
+    } catch (e) {}
+  </script>
 </body>
 </html>
