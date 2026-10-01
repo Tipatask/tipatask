@@ -119,3 +119,35 @@ test('emptyKeys and visibleKeys are always disjoint and, with the (unrevealed) p
   assert.deepEqual(r.visibleKeys, [6]);
   assert.equal(r.hiddenCount, 2); // 2 and 4 sit in the unrevealed pool
 });
+
+for (const extraStepsLoaded of [0, 1, 10, 100]) {
+  test(`revealAll draws every matching tier without pool gaps (extra=${extraStepsLoaded})`, () => {
+    const keys = Array.from({ length: 12 }, (_, i) => 355 + i);
+    const r = computeTierWindow(keys, {
+      revealAll: true,
+      extraStepsLoaded,
+      hasActiveMatch: k => k === 356 || k === 365,
+      hasAnyMatch: k => k >= 356 && k <= 365,
+    });
+    assert.deepEqual(r.visibleKeys, keys.slice(1, -1));
+    assert.deepEqual(r.emptyKeys, [355, 366]);
+    assert.equal(r.hiddenCount, 0);
+  });
+}
+
+test('revealAll includes all closed-only search matches, excluding nonmatches and empty tiers', () => {
+  const r = computeTierWindow([1, 2, 3, 4, 5], {
+    revealAll: true,
+    hasActiveMatch: () => false,
+    hasAnyMatch: k => k === 2 || k === 4,
+  });
+  assert.deepEqual(r, { visibleKeys: [2, 4], emptyKeys: [1, 3, 5], hiddenCount: 0 });
+});
+
+test('clearing revealAll restores the default active-tier window', () => {
+  const options = { hasActiveMatch: k => k === 3, hasAnyMatch: () => true };
+  assert.deepEqual(computeTierWindow([1, 2, 3], { ...options, revealAll: true }).visibleKeys, [1, 2, 3]);
+  assert.deepEqual(computeTierWindow([1, 2, 3], options), {
+    visibleKeys: [3], emptyKeys: [], hiddenCount: 2,
+  });
+});

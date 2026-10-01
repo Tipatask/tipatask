@@ -4,15 +4,20 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
+const scratch = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'tt-crash-guard-'));
+process.env.TIPATASK_USER_DATA = scratch;
+test.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
 const { installCrashGuard, isNetworkError, networkErrorCode } = require('./crash-guard');
 
 const netErr = (code, message = 'socket hang up') => Object.assign(new Error(message), { code });
 
-function harness() {
+function harness(opts = {}) {
   const proc = new EventEmitter();
   const lines = [];
   const exits = [];
-  installCrashGuard({ proc, exit: (code) => exits.push(code), log: { error: (line) => lines.push(line) } });
+  installCrashGuard({ proc, exit: (code) => exits.push(code), log: { error: (line) => lines.push(line) }, ...opts });
   return { proc, lines, exits };
 }
 
@@ -55,10 +60,46 @@ test('any other uncaught exception is fatal: logged, then exit(1)', () => {
   assert.match(lines[0], /boom/);
 });
 
-test('EPIPE stays fatal so a dead stderr pipe cannot be swallowed in a log loop', () => {
+test('EPIPE stays fatal with no live sessions', () => {
   const { proc, exits } = harness();
   proc.emit('uncaughtException', netErr('EPIPE', 'write EPIPE'));
   assert.deepEqual(exits, [1]);
+});
+
+test('live-session callback preserves sessions for all error classes and rechecks before exit', () => {
+  let live = true;
+  const records = [];
+  const { proc, lines, exits } = harness({ hasLiveSessions: () => live, recordExit: r => records.push(r) });
+  for (const err of [new TypeError('bad poll'), netErr('EPIPE'), netErr('ENOENT'), netErr('ECONNRESET')]) {
+    proc.emit('uncaughtException', err);
+    assert.ok(lines.at(-1).includes(err.stack));
+  }
+  assert.deepEqual(exits, []);
+  assert.deepEqual(records, []);
+  live = false;
+  proc.emit('uncaughtException', new Error('no sessions left'));
+  assert.deepEqual(exits, [1]);
+  assert.equal(records.length, 1);
+});
+
+test('registry fallback checks alive === true across projects, not starting or retained sessions', () => {
+  const sessions = new Map([['a/project-a', { alive: false }], ['b/project-b', { alive: true }]]);
+  const { proc, exits } = harness({ sessions, recordExit() {} });
+  proc.emit('uncaughtException', new Error('preserve project-b'));
+  assert.deepEqual(exits, []);
+  sessions.get('b/project-b').alive = false;
+  sessions.set('starting', { _starting: true });
+  proc.emit('uncaughtException', new Error('no live sessions'));
+  assert.deepEqual(exits, [1]);
+});
+
+test('a throwing registry check or logger cannot turn recovery into termination', () => {
+  const { proc, exits } = harness({
+    hasLiveSessions() { throw new Error('registry unavailable'); },
+    log: { error() { throw new Error('stderr closed'); } },
+  });
+  assert.doesNotThrow(() => proc.emit('uncaughtException', netErr('EPIPE')));
+  assert.deepEqual(exits, []);
 });
 
 test('once fatal, later exceptions do not re-report or re-exit', () => {
@@ -91,13 +132,13 @@ test('a throwing logger cannot break the handler', () => {
 
 // ── Real processes: the guard against Node's actual default crash behaviour ──
 
-function runChild(body) {
+function runChild(body, guardOptions = '', aliveAfter = 80) {
   const script = `
     const { installCrashGuard } = require(${JSON.stringify(require.resolve('./crash-guard'))});
     const { EventEmitter } = require('node:events');
-    installCrashGuard();
+    installCrashGuard(${guardOptions});
     ${body}
-    setTimeout(() => console.log('alive'), 80);
+    setTimeout(() => console.log('alive'), ${aliveAfter});
   `;
   return spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', timeout: 15000 });
 }
@@ -110,6 +151,27 @@ test('process: a listener-less ECONNRESET "error" emit — the production crash 
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /alive/);
   assert.match(r.stderr, /uncaught network error ECONNRESET \(kept alive\)/);
+});
+
+test('process: a non-network error thrown by a 10s timer preserves a live session', () => {
+  const r = runChild(`
+    const poll = setInterval(() => {
+      clearInterval(poll);
+      throw new TypeError('10s poll failed');
+    }, 10000);
+  `, '{ hasLiveSessions: () => true }', 10080);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /alive/);
+  assert.match(r.stderr, /kept alive to preserve live sessions/);
+  assert.match(r.stderr, /TypeError: 10s poll failed/);
+});
+
+test('process: an async polling error is an unhandled rejection and preserves live sessions', () => {
+  const r = runChild(`setImmediate(async () => { throw new TypeError('async poll failed'); });`,
+    '{ hasLiveSessions: () => true }');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /alive/);
+  assert.match(r.stderr, /unhandled rejection.*async poll failed/s);
 });
 
 test('process: a thrown ETIMEDOUT is survived', () => {

@@ -11588,3 +11588,23 @@ input.sma-cb, input.sma-radio {
   .merge-branch-table { grid-template-columns: 24px 1fr 90px; }
   .merge-branch-head > span:nth-child(n+4), .merge-branch-row > .merge-ab, .merge-branch-row > .merge-wt, .merge-branch-row > .merge-conf { display: none; }
 }
+
+/* Lost terminal sessions remain reachable without a live/attention indicator. */
+.card.session-lost,
+.active-session-item.session-lost {
+  border-color: var(--c-text-muted);
+  box-shadow: 0 0 0 1px var(--c-text-muted);
+}
+.card.session-lost::before,
+.active-session-item.session-lost .active-session-icon::after { display: none; }
+.terminal-session-lost {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  color: var(--c-text);
+  background: var(--c-bg-card);
+  border-bottom: 1px solid var(--c-border);
+}
+.terminal-session-lost button { flex-shrink: 0; }

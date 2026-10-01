@@ -3,7 +3,8 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const { listPackage, extractFile } = require('@electron/asar');
+const { listPackage, extractFile, statFile } = require('@electron/asar');
+const { collectRelativeRequires } = require('../src/server/require-graph');
 
 // @electron/asar splits the requested path on path.sep, so a forward-slash path is "not found"
 // on Windows for anything below the archive root. Normalize before every lookup.
@@ -108,6 +109,24 @@ function assertPackagedVersions({ resources, sourceRoot, electronVersion }) {
   if (problems.length) throw new Error(`Packaged versions do not match the lockfile:\n  ${problems.join('\n  ')}`);
 }
 
+function assertPackagedRequires(archive) {
+  const files = new Set(listPackage(archive)
+    .map(file => file.replace(/\\/g, '/').replace(/^\//, '')));
+  const entries = ['main.js', 'preload.js', 'todo-server.js',
+    ...[...files].filter(file => /^main\/.*\.js$/.test(file) && !file.endsWith('.test.js')).sort()];
+  const { missing } = collectRelativeRequires(entries, {
+    readFile(file) {
+      // listPackage includes directories, including empty ones. Never let a
+      // directory or checkout file satisfy an absent archive dependency.
+      if (!files.has(file) || 'files' in statFile(archive, path.normalize(file))) return null;
+      return extractPackaged(archive, file);
+    },
+  });
+  if (missing.length) {
+    throw new Error(`Unresolved packaged requires in ${archive}:\n${missing.map(({ from, spec }) => `${from}: ${spec}`).join('\n')}`);
+  }
+}
+
 function assertNoPackagedTests(archive) {
   const forbidden = listPackage(archive).filter(entry => {
     const file = entry.replace(/\\/g, '/').replace(/^\//, '');
@@ -128,6 +147,7 @@ module.exports = async function afterPack(context) {
     : path.join(context.appOutDir, 'resources');
   const projectDir = context.packager?.projectDir || path.resolve(__dirname, '..');
   assertNoPackagedTests(path.join(resources, 'app.asar'));
+  assertPackagedRequires(path.join(resources, 'app.asar'));
   assertPackagedVcs(path.join(resources, 'app.asar'), projectDir);
   assertPackagedVersions({
     resources,
@@ -136,6 +156,7 @@ module.exports = async function afterPack(context) {
   });
 };
 module.exports.assertNoPackagedTests = assertNoPackagedTests;
+module.exports.assertPackagedRequires = assertPackagedRequires;
 module.exports.assertPackagedVcs = assertPackagedVcs;
 module.exports.assertPackagedVersions = assertPackagedVersions;
 module.exports.PI_PACKAGE = PI_PACKAGE;

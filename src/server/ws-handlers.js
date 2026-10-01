@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn: spawnChild } = require('node:child_process');
 const config = require('./config');
+const { readLastExitSince, readLostSessions, forgetLostSession } = require('./last-exit');
 const { applyRehashIntent, spawnObjectiveTurn, killObjectiveProc, escalateKill, clearRetryTimers, clearTurnDeadline, prewarmObjective, killPrewarm, teardownObjectiveSession, trackHelperProc, clearHeartbeat, prewarmObjectiveCold, killColdPrewarm, startSleepWatchdog, objectiveCacheActivity, ensureSessionStartName, computeTurnSpans } = require('./claude-session');
 const { spawnTurn, providerSessionId, clearProviderSessionId, applyModelSelection } = require('./providers/dispatch');
 const { listObjectiveProviders, listVisibleObjectiveProviders, clampSelectionToProviders, formatSelection, currentSelection, configForProject } = require('./providers/registry');
@@ -90,6 +91,17 @@ function sessionListBucket(s) {
   if (s.alive || s._starting) return 'active';
   if (s.pending) return null; // created, waiting for a `start` message — neither live nor exited
   return 'exited';
+}
+
+// (C1144/TPT413) One GET /api/sessions `sessionMeta` row. `agent` is read LIVE off the session
+// object every time — never a cached launch value. session.taskAgent is mutable: seeded by
+// createSession() (project default), overridden by the validated WS ?agent= param at connect
+// (handleConnection, together with taskAgentLabel/planApprovalCommand), and rewritten by
+// spawnTerminal() after pty.spawn from the agent that actually launched. The left-nav
+// active-sessions row icon (task-board.js syncActiveSessionsNav()) is painted from this field.
+function sessionMetaRow(s) {
+  return { agent: s.taskAgent || null, label: s.taskAgentLabel || '', type: s.type || 'terminal', alive: !!s.alive,
+    ...(s.startedAt ? { startedAt: s.startedAt } : {}) };
 }
 
 // Blocks starting a task assigned to someone else. Replaces the guard that used to sit
@@ -1060,10 +1072,19 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
           attention.push(id);
           if (s._attentionLastBroadcast) attentionDetails[id] = s._attentionLastBroadcast;
         }
-        sessionMeta[id] = { agent: s.taskAgent || null, label: s.taskAgentLabel || '', type: s.type || 'terminal', alive: !!s.alive };
+        sessionMeta[id] = sessionMetaRow(s);
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ sessions: active, exited, attention, attentionDetails, sessionMeta }));
+      const lost = [];
+      const lostDetails = {};
+      for (const row of readLostSessions(reqPath || config.PROJECT_ROOT, config.USER_DATA_ROOT)) {
+        if (sessionMeta[row.taskId] || lostDetails[row.taskId]) continue;
+        lost.push(row.taskId);
+        lostDetails[row.taskId] = { reason: row.reason, at: row.at };
+        sessionMeta[row.taskId] = { agent: row.agent, label: row.label, type: 'terminal',
+          alive: false, startedAt: row.startedAt };
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify({ projectPath: reqPath || config.PROJECT_ROOT, sessions: active, exited, lost, lostDetails, attention, attentionDetails, sessionMeta }));
     }
 
     // GET /api/agent-config — agent availability snapshot for startup population
@@ -3335,7 +3356,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
 
     // Serve TODO.md — synthesized from the api backend (C1352: file backend retired,
     // no more disk-read leg here). Supports ?status=pending,in_progress,on_fire filter
-    // for objective prompt efficiency. Branch order: parentKey -> scope=all -> window=active
+    // for objective prompt efficiency. Branch order: parentKey -> scope=all -> board fetch
     // -> status -> default
     if (req.method === 'GET' && urlPath === '/TODO.md') {
       try {
@@ -3346,11 +3367,12 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         const parentKey = qs ? qs.get('parentKey') : null;
         const scopeAll = qs ? qs.get('scope') === 'all' : false;
         const windowParam = qs ? qs.get('window') : null;
+        const fullWindow = qs ? qs.get('full_window') === 'true' : false;
         const extendSprintsParam = qs ? qs.get('extend_sprints') : null;
         // (C1407) Task App board People-filter "All Tasks" mode. Named `assignees`
         // (plural) — deliberately distinct from the upstream API's own singular
         // `?assignee=<id>` param — so the two are never confused while reading a URL.
-        // Only honored on the parentKey (drill-down) and window=active (board) branches
+        // Only honored on the parentKey (drill-down) and board-fetch branches
         // below, both of which already run the C1407 owner-exemption filter by default;
         // an unrecognized value (or this param on any other branch) falls through as
         // scoped — same "unknown value, no crash" contract as ?scope=bogus.
@@ -3387,19 +3409,20 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
 
         // ?window=active (C1259) — board sprint window: oldest sprint holding an open
         // task onward, plus backlog. ?extend_sprints=N ("Load More") walks the floor N
-        // more distinct sprints back. See api-backend.js's getBoardTasks() for the
-        // { tasks, window } contract.
+        // more distinct sprints back. ?full_window=true selects the same board read
+        // without a sprint floor, for search. See getBoardTasks() for { tasks, window }.
         // Kept as a separate opt-in branch (not folded into the default `b.getTasks()`
         // branch below) so every existing caller of the unwindowed board fetch is
         // byte-for-byte unaffected.
-        if (windowParam === 'active' && typeof b.getBoardTasks === 'function') {
+        if ((windowParam === 'active' || fullWindow) && typeof b.getBoardTasks === 'function') {
           const t0 = config.OBJECTIVE_TIMING_VERBOSE ? Date.now() : 0;
           const extendSprintsNum = extendSprintsParam ? parseInt(extendSprintsParam, 10) : 0;
           const { tasks, window } = await b.getBoardTasks({
             extendSprints: Number.isFinite(extendSprintsNum) ? extendSprintsNum : 0,
             unscoped: wantAllAssignees,
+            fullWindow,
           });
-          if (config.OBJECTIVE_TIMING_VERBOSE) console.log(`[objective:timing:endpoint] GET /TODO.md?window=active backend=${Date.now() - t0}ms`);
+          if (config.OBJECTIVE_TIMING_VERBOSE) console.log(`[objective:timing:endpoint] GET /TODO.md?${fullWindow ? 'full_window=true' : 'window=active'} backend=${Date.now() - t0}ms`);
           enrichPlans(tasks);
           const payload = wantAllAssignees ? { assignees: 'all', tasks, window } : { tasks, window };
           const json = JSON.stringify(payload, null, 2);
@@ -4034,6 +4057,12 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
 
   // ── Reconnect to existing non-objective session (terminal pty) ──
   if (existing && existing.alive && existing.type !== 'objective' && existing.type !== 'specChat') {
+    // (TPT413) A resume never respawns: the running pty keeps its agent. A picker choice on a
+    // resume (merge-branches "Resolve with agent" on a live session) reaches here as ?agent= and
+    // is deliberately ignored — say so, instead of silently letting the client believe it switched.
+    if (agentParam && agentParam !== existing.taskAgent) {
+      console.log(`[terminal] agent=${agentParam} ignored on reattach — session ${sessionKey} is already running under ${existing.taskAgent}`);
+    }
     if (projectPath) existing.projectPath = projectPath;
     if (existing.ws && existing.ws.readyState === existing.ws.OPEN) {
       existing.ws.send(JSON.stringify({ type: 'detached', tabId: existing.tabId, message: 'Another client attached' }));
@@ -4161,6 +4190,18 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     return;
   }
 
+  // A retained natural exit is not evidence of server loss. Check before deleting
+  // any existing entry; a promptless reconnect must never discard retained history.
+  if (!prompt && !taskId.startsWith('obj-') && !taskId.startsWith('specChat:')) {
+    const lastExit = !existing && readLastExitSince(url.searchParams.get('startedAt'), config.USER_DATA_ROOT);
+    ws.send(JSON.stringify(lastExit
+      ? { type: 'error', code: 'ESESSION_LOST', ...lastExit,
+          message: `Terminal session for ${taskId} was lost when the server exited (${lastExit.reason}, ${lastExit.at}).` }
+      : { type: 'error', message: `No active terminal session for ${taskId}` }));
+    ws.close();
+    return;
+  }
+
   // ── Spawn new session ──
   if (existing) {
     if (existing.type === 'objective') {
@@ -4170,12 +4211,6 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
       clearContext(existing, taskId);
     }
     sessions.delete(sessionKey);
-  }
-
-  if (!prompt && !taskId.startsWith('obj-') && !taskId.startsWith('specChat:')) {
-    ws.send(JSON.stringify({ type: 'error', message: `No active terminal session for ${taskId}` }));
-    ws.close();
-    return;
   }
 
   const session = createSession(ws, !prompt, tabId || taskId, projectPath);
@@ -4189,7 +4224,13 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
   if (planOnly) session.planOnly = true;
   if (discussionMode) session.discussionMode = true;
   if (agentParam && (await getAvailableAgents(configForProject(projectPath))).includes(agentParam)) {
-    session.taskAgent = agentParam;
+    // (TPT413) Label + approval command move with the id — spawnTerminal() rewrites all three
+    // after pty.spawn, but GET /api/sessions (sessionMetaRow) and the "Failed to start" message
+    // below read them during the multi-second _starting window, and must name the chosen agent.
+    const _chosen = getTaskAgentInfo(agentParam);
+    session.taskAgent = _chosen.id;
+    session.taskAgentLabel = _chosen.label;
+    session.planApprovalCommand = _chosen.approvalCommand;
   }
   // C1122 — Pi launch-time model pick, validated against the PROJECT's own configured
   // PI_MODELS rows (never the global env-default list — those have no apiKey behind
@@ -4259,6 +4300,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
       // C1122 — _piModelParam prefixed so the validated launch-time pick survives even
       // when the getTask() try/catch above swallowed an error before _taskModel was set.
       await spawnTerminal(session, prompt, taskId, taskTags, { initialCols, initialRows, backend, model: _piModelParam || _taskModel, discovery, designMode: _designMode, task: _task });
+      if (session.alive) forgetLostSession(taskId, projectPath || config.PROJECT_ROOT, config.USER_DATA_ROOT);
       if (session._terminated || sessions.get(sessionKey) !== session) {
         try { ws.close(); } catch { /* already closed */ }
         return;
@@ -5111,7 +5153,7 @@ module.exports = {
   normalizeProjectMember,
   assertTaskStartable,
   claimUnassignedTaskOnStart,
-  sessionListBucket,
+  sessionListBucket, sessionMetaRow,
   parsePiModelList,
   queryPiModels,
   listPiModels,

@@ -39,6 +39,7 @@ function reapLlmChildren(sessions, reason, { claude, headless }) {
 /**
  * @param {object} opts
  * @param {Map} opts.sessions            index.js's sessions map
+ * @param {Function} [opts.recordExit]  Synchronous best-effort exit recorder
  * @param {object} [opts.claude]         TEST SEAM — defaults to claude-session.js
  * @param {object} [opts.headless]       TEST SEAM — defaults to headless-claude.js
  * @param {EventEmitter} [opts.proc]     TEST SEAM — defaults to `process`
@@ -49,6 +50,7 @@ function reapLlmChildren(sessions, reason, { claude, headless }) {
  */
 function installShutdownReaper({
   sessions,
+  recordExit = require('./last-exit').writeLastExit,
   claude = require('./claude-session'),
   headless = require('./headless-claude'),
   proc = process,
@@ -60,6 +62,9 @@ function installShutdownReaper({
   const shutdown = (reason) => {
     if (started) return; // quitting delivers SIGTERM and then 'disconnect' — reap once
     started = true;
+    try {
+      recordExit({ reason: SHUTDOWN_SIGNALS.includes(reason) ? `signal:${reason}` : reason, sessions });
+    } catch { /* exit and child cleanup must still run */ }
     try {
       const killed = reapLlmChildren(sessions, reason, { claude, headless });
       // A proc Node already saw exit is gone. The rest may be dead but unreaped (the blocked loop

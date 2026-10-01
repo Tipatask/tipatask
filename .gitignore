@@ -14,6 +14,7 @@
 /.env
 /.tipatask/
 /chat-state*.json
+/last-exit.json
 /chat-state*.json.tmp-*
 # Per-session objective-chat drafts — was exact-name-only (/.chat-draft.json), which
 # missed the .chat-draft-<hash>.json files the live app actually writes.

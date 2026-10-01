@@ -14,6 +14,7 @@ function createSession(ws, pending, tabId, projectPath) {
   const taskAgent = getTaskAgentInfo(resolveTaskAgentId(projectPath, null));
   return {
     tabId: tabId || null,
+    startedAt: Date.now(), // stable across reattachments; server clock, epoch milliseconds
     pty: null,
     ptyPid: null,             // (C1565) pty leader pid == pgid (forkpty implies setsid) —
                                // stashed separately because terminateTerminalSession() nulls

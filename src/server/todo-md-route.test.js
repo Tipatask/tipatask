@@ -51,7 +51,7 @@ function makeStub({ withUnfiltered = true } = {}) {
       stub._lastBoardOpts = opts;
       return {
         tasks: opts && opts.unscoped ? [mine, teammates] : [mine],
-        window: { floor: 1, has_older: false, extended: 0 },
+        window: opts && opts.fullWindow ? null : { floor: 1, has_older: false, extended: 0 },
       };
     },
   };
@@ -139,6 +139,18 @@ test('GET /TODO.md?window=active&assignees=all — unscoped: every assignee, ass
   assert.equal(stub._lastBoardOpts.unscoped, true, 'getBoardTasks() must be called with unscoped:true');
   assert.equal(data.assignees, 'all');
   assert.ok(data.window, 'window must still pass through untouched');
+});
+
+test('GET /TODO.md?full_window=true uses the board backend with an unwindowed response', async () => {
+  const stub = makeStub();
+  const res = await run(stub, '/TODO.md?full_window=true&assignees=all&_=123');
+  assert.equal(res.statusCode, 200);
+  const data = parseBody(res.body);
+  assert.deepEqual(data.tasks.map(t => t.id).sort(), ['C1', 'C2']);
+  assert.equal(data.window, null);
+  assert.equal(data.assignees, 'all');
+  assert.equal(stub._lastBoardOpts.fullWindow, true);
+  assert.equal(stub._lastBoardOpts.unscoped, true);
 });
 
 test('GET /TODO.md?parentKey=X&assignees=all — drill-down obeys the same filter as the board', async () => {

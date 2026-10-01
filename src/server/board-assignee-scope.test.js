@@ -129,6 +129,41 @@ test('scoped and unscoped getBoardTasks() calls at the same extendSprints do not
   });
 });
 
+test('full board fetch includes a sprint below the active floor and keeps scoped/windowed caches separate', async () => {
+  const state = { urls: [] };
+  const older = { id: 4, project_id: 1, task_key: 'C4', title: 'Older search hit', category: 'CODING', status: 'completed', priority: 350, assignee: 7 };
+  const handler = (req, res) => {
+    if (req.url === '/api/auth/me') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ user: { id: 7 } }));
+    }
+    state.urls.push(req.url);
+    const windowed = new URL(req.url, 'http://localhost').searchParams.has('window');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      tasks: windowed ? [RAW_TASKS[0]] : [RAW_TASKS[0], older, RAW_TASKS[1]],
+      window: windowed ? { floor: 365, has_older: true, extended: 0 } : null,
+    }));
+  };
+  await withFakeApiServer(handler, async (backend) => {
+    await backend.init();
+    state.urls.length = 0;
+    const limited = await backend.getBoardTasks();
+    const full = await backend.getBoardTasks({ fullWindow: true, extendSprints: 10 });
+    const limitedAgain = await backend.getBoardTasks();
+    assert.deepStrictEqual(limited.tasks.map(t => t.id), ['C1']);
+    assert.deepStrictEqual(full.tasks.map(t => t.id), ['C1', 'C4']);
+    assert.strictEqual(full.window, null);
+    assert.deepStrictEqual(limitedAgain.tasks.map(t => t.id), ['C1']);
+    assert.equal(state.urls.length, 2, 'full and windowed reads use separate cache entries');
+    const fullParams = new URL(state.urls[1], 'http://localhost').searchParams;
+    assert.equal(fullParams.get('assignee'), '7');
+    assert.equal(fullParams.get('include_reservations'), 'true');
+    assert.equal(fullParams.has('window'), false);
+    assert.equal(fullParams.has('extend_sprints'), false);
+  });
+});
+
 test('getChildren() filters by default, opts.unscoped:true returns every assignee', async () => {
   const state = {};
   await withFakeApiServer(makeOwnerExemptHandler(state), async (backend) => {

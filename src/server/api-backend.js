@@ -111,15 +111,15 @@ let _listInflight = null; // Promise<Task[]> | null
 let _scopedEntry = null;    // { rows: Task[], at: number } — assignee==me OR NULL
 let _scopedInflight = null; // Promise<Task[]> | null
 
-// ── Board sprint-window cache (C1259) — keyed by `${extendSprints}|${scope}` ──
+// ── Board sprint-window cache (C1259) — keyed by `${windowMode}|${scope}` ──
 // Separate from _scopedEntry: the board's default view only needs the active-sprint
 // window, not the full assignee-scoped list. Cleared by the same _cacheInvalidate().
 // (C1407) Rows in a 'me'-scoped entry are filterToOwnOrUnassigned()-filtered for the
 // same owner-exemption reason as _scopedEntry above. The key includes the scope
 // ('me' vs 'all', see getBoardTasks()'s `unscoped` option) so a People-filter toggle
 // between My Tasks and All Tasks can never alias one cached result onto the other.
-let _boardEntries = new Map();   // "${extendSprints}|${scope}" -> { rows, windowInfo, at }
-let _boardInflight = new Map();  // "${extendSprints}|${scope}" -> Promise<{rows,windowInfo}>|null
+let _boardEntries = new Map();   // "${windowMode}|${scope}" -> { rows, windowInfo, at }
+let _boardInflight = new Map();  // "${windowMode}|${scope}" -> Promise<{rows,windowInfo}>|null
 
 // ── Current user ──
 // Resolved once in init() via GET /api/auth/me; stamped onto every task created
@@ -1040,10 +1040,11 @@ const backend = {
   },
 
   // Request the API's active sprint window (plus backlog); extendSprints loads
-  // older tiers. API owns the completed-only fallback. Missing user id falls
+  // older tiers. fullWindow fetches every sprint for search. API owns the
+  // completed-only fallback for windowed reads. Missing user id falls
   // back to getTasks(). unscoped skips both API and local assignee filters;
   // cache keys separate 'me' and 'all' results.
-  async getBoardTasks({ extendSprints = 0, unscoped = false } = {}) {
+  async getBoardTasks({ extendSprints = 0, unscoped = false, fullWindow = false } = {}) {
     _syncCredentialWatch();
     const n = Number.isFinite(extendSprints) && extendSprints > 0 ? Math.floor(extendSprints) : 0;
     if (_currentUserId == null && !unscoped) {
@@ -1052,7 +1053,7 @@ const backend = {
     }
 
     const scope = unscoped ? 'all' : 'me';
-    const cacheKey = `${n}|${scope}`;
+    const cacheKey = `${fullWindow ? 'full' : n}|${scope}`;
     const t0 = TASKS_CACHE_LOG ? Date.now() : 0;
     const cached = _boardEntries.get(cacheKey);
     if (cached && (Date.now() - cached.at) < TASKS_CACHE_TTL_MS) {
@@ -1067,7 +1068,7 @@ const backend = {
     }
 
     const assigneeQs = unscoped ? '' : `assignee=${_currentUserId}&`;
-    const qs = `${assigneeQs}include_reservations=true&window=active${n > 0 ? `&extend_sprints=${n}` : ''}`;
+    const qs = `${assigneeQs}include_reservations=true${fullWindow ? '' : `&window=active${n > 0 ? `&extend_sprints=${n}` : ''}`}`;
     const req = apiRequest('GET', `/tasks?${qs}`).then(data => {
       const mapped = _mapRawTasks(data.tasks || []);
       // (C1407) unscoped → skip the owner-exemption filter too, this IS the "show

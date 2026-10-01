@@ -151,7 +151,7 @@ async function main() {
       const snapshot = await snapshotProcesses();
       if (snapshot) {
         const count = countDescendants(snapshot, rootPid);
-        const { alert, kill } = evaluateRunaway(state, count);
+        const { alert, kill } = evaluateRunaway(state, count, { killEnabled: true });
         if (alert && warnedAt == null) {
           warnedAt = count;
           console.log(`[probe:watchdog] warn at ${count} descendants (>= threshold ${DESCENDANT_ALERT_THRESHOLD}).`);

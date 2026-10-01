@@ -16,7 +16,7 @@ import { t } from './i18n.js';
 import { isInProgressName, isClosedName, isCompleteName, inProgressName, loadStatuses } from './status-registry.js';
 import { replayProgressLog, progressStatusLine } from './objective-progress-log.js';
 import { getAgentDisplayLabel } from './agent-select.js';
-import { clearAttention, mergeSessionsSnapshot } from './attention-state.js';
+import { clearAttention, markSessionLost, dismissLostSession, mergeSessionsSnapshot } from './attention-state.js';
 import { _isPinnedToBottom, createTerminalOutputWriter } from './terminal-output.js';
 
 const CONSOLE_STATUS_TICK_MS = 500;
@@ -172,6 +172,29 @@ function applyTaskAgentConfig(msg) {
   if (msg.supportsPlanMode !== undefined) state.supportsPlanMode = msg.supportsPlanMode;
   if (Array.isArray(msg.availableAgents)) state.availableAgents = msg.availableAgents;
   if (Array.isArray(msg.agentStatuses)) state.agentStatuses = msg.agentStatuses;
+}
+
+// (TPT413) The live session object's agent id — shipped by the per-session `config` and
+// `terminal-state` frames as `msg.taskAgent` (ws-handlers.js wireClient() builds both from
+// session.taskAgent) and by GET /api/sessions as sessionMeta[id].agent — is the ONE source for
+// the left-nav row icon (task-board.js syncActiveSessionsNav()). This writes it into
+// state.sessionMeta so a row painted from a launch-time guess (or a resume that guessed nothing)
+// converges on the agent actually running, without waiting for the next /api/sessions refetch.
+// Never seeds from the global state.taskAgent: applyTaskAgentConfig() overwrites that global on
+// every session frame, so it names whichever terminal was opened last, not this task's agent.
+function adoptSessionAgent(taskId, msg) {
+  if (!taskId || !msg || typeof msg.taskAgent !== 'string' || !msg.taskAgent) return false;
+  const prev = state.sessionMeta.get(taskId) || {};
+  const changed = prev.agent !== msg.taskAgent;
+  state.sessionMeta.set(taskId, {
+    ...prev,
+    agent: msg.taskAgent,
+    label: msg.taskAgentLabel || prev.label || '',
+    type: prev.type || 'terminal',
+    alive: true,
+  });
+  if (changed) updateClaudeButtons(); // nav repaint is a no-op on identical markup (TPT360)
+  return changed;
 }
 
 export function agentNotice(text) {
@@ -442,11 +465,17 @@ export function cleanupChat(targetCs, { force = false } = {}) {
 
 export async function fetchActiveSessions() {
   try {
-    const res = await fetch('/api/sessions');
+    const headers = projectHeader();
+    const res = await fetch('/api/sessions', { headers, cache: 'no-store' });
     // (C1387) Merge, never wholesale-replace — a snapshot must not silently drop an
     // attention-needed frame that landed while this request was in flight, nor resurrect a
     // flag the user already dismissed by opening the terminal. See attention-state.js.
-    if (res.ok) mergeSessionsSnapshot(await res.json());
+    if (res.ok) {
+      const data = await res.json();
+      if (JSON.stringify(headers) !== JSON.stringify(projectHeader())) return;
+      mergeSessionsSnapshot(data);
+      state.activeTerminal?.syncLostSession?.();
+    }
   } catch { /* ignore */ }
 }
 
@@ -494,9 +523,16 @@ function buildTaskSessionPrompt(taskId, title, desc, opts = {}) {
     : isObjective ? truncDesc : `Work on task ${taskId}: ${title}. ${truncDesc}`;
 }
 
+function adoptSessionStart(taskId, msg) {
+  if (!Number.isFinite(msg?.startedAt) || msg.startedAt <= 0) return;
+  state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), startedAt: msg.startedAt });
+}
+
 function buildTaskSessionWsExtra(taskId, title, desc, opts = {}) {
   const isResume = state.activeSessions.has(taskId);
-  const wsExtra = isResume ? (opts.agent ? { agent: opts.agent } : null) : { prompt: buildTaskSessionPrompt(taskId, title, desc, opts) };
+  const wsExtra = isResume ? {} : { prompt: buildTaskSessionPrompt(taskId, title, desc, opts) };
+  const startedAt = state.sessionMeta.get(taskId)?.startedAt;
+  if (isResume && Number.isFinite(startedAt) && startedAt > 0) wsExtra.startedAt = startedAt;
   if (wsExtra && opts.planOnly) wsExtra.planOnly = '1';
   if (wsExtra && opts.agent) wsExtra.agent = opts.agent;
   if (wsExtra && opts.model) wsExtra.model = opts.model; // C1122 — Pi launch-time model pick
@@ -509,12 +545,18 @@ export function startTaskSession(taskId, title, desc, taskStatus, opts = {}) {
   return startTerminalSession(taskId, wsExtra, { timeoutMs: opts.timeoutMs || 15000 }).then((result) => {
     if (result.ok) {
       if (result.message) applyTaskAgentConfig(result.message);
+      dismissLostSession(taskId);
       state.activeSessions.add(taskId);
       state.exitedSessions.delete(taskId);
       clearAttention(taskId, 'opened'); // a fresh launch has nothing pending to be attentive about
       // (C1144) Known immediately from launch opts — no need to wait on a /api/sessions refetch
-      // for the left-nav row's icon to be correct.
-      state.sessionMeta.set(taskId, { agent: opts.agent || state.taskAgent, label: state.taskAgentLabel, type: 'terminal', alive: true });
+      // for the left-nav row's icon to be correct. (TPT413) The server's `config` reply names the
+      // agent the session was actually created with (result.message.taskAgent) — prefer it over
+      // the launch guess, which the server may have rejected (unavailable agent → project default).
+      const launchedAgent = (result.message && typeof result.message.taskAgent === 'string' && result.message.taskAgent)
+        ? result.message.taskAgent : (opts.agent || state.taskAgent);
+      state.sessionMeta.set(taskId, { agent: launchedAgent, label: state.taskAgentLabel, type: 'terminal', alive: true });
+      adoptSessionStart(taskId, result.message);
       const card = document.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
       if (card) card.classList.remove('needs-attention');
       updateClaudeButtons();
@@ -552,7 +594,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   if (state.activeTerminal) {
-    if (state.activeTerminal.taskId === taskId) {
+    if (state.activeTerminal.taskId === taskId && !opts.restartLost) {
       _markAttentionSeen(taskId); // (C1387) refocusing an already-open terminal counts as seen
       state.activeTerminal.refresh?.({ send: true, focus: true });
       return;
@@ -575,6 +617,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     _detachedCodexTerminals.delete(taskId);
   }
 
+  const knownLoss = state.lostSessions.get(taskId);
   const isResume = state.activeSessions.has(taskId);
   _markAttentionSeen(taskId); // (C1387) the single, complete clear trigger
   const terminalOpenContext = captureOpenContext();
@@ -673,6 +716,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   term.loadAddon(fitAddon);
 
   let processRunning = true;
+  let restartingLoss = !!opts.restartLost;
   let terminalPhase = 'planning';
   let terminalOpened = false;
   let terminalClosing = false;
@@ -866,6 +910,45 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     scheduleTerminalRefresh({ send: true });
   }
 
+  function showLostSession(detail = {}) {
+    processRunning = false;
+    setCodexPlanReady(false);
+    markSessionLost(taskId, detail);
+    statusDot.className = 'status-dot disconnected';
+    statusDot.title = t('terminal.sessionLostTitle');
+    terminateBtn.textContent = t('btn.close');
+    removeMcpAuthDialog();
+    let notice = overlay.querySelector('.terminal-session-lost');
+    if (!notice) {
+      notice = document.createElement('div');
+      notice.className = 'terminal-session-lost';
+      notice.setAttribute('role', 'status');
+      const message = document.createElement('span');
+      const restart = document.createElement('button');
+      restart.type = 'button';
+      restart.className = 'btn-restart-session';
+      restart.textContent = t('terminal.restart');
+      restart.addEventListener('click', async () => {
+        if (restart.disabled) return;
+        restart.disabled = true;
+        try {
+          await window.TipTask.taskCard.startTaskById(taskId, { ...opts, restartLost: true });
+        } finally {
+          restart.disabled = false;
+        }
+      });
+      notice.append(message, restart);
+      overlay.querySelector('.terminal-header').after(notice);
+    }
+    const at = Date.parse(detail.at);
+    notice.querySelector('span').textContent = t('terminal.sessionLost', {
+      reason: detail.reason || t('terminal.sessionMissing'),
+      time: Number.isFinite(at) ? new Date(at).toLocaleString() : t('terminal.timeUnknown'),
+    });
+    updateClaudeButtons();
+    scheduleTerminalRefresh();
+  }
+
   function connectWebSocket() {
     ws = new WebSocket(buildWsUrl(taskId, wsExtra));
     terminalController.ws = ws;
@@ -882,9 +965,19 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       // the server-side attention-seen handler (ws-handlers.js) for the full reasoning.
       ws.send(JSON.stringify({ type: 'attention-seen' }));
       state.activeSessions.add(taskId);
-      // (C1144) Known immediately — no need to wait on a /api/sessions refetch for the
-      // left-nav row's icon to be correct.
-      state.sessionMeta.set(taskId, { agent: opts.agent || state.taskAgent, label: state.taskAgentLabel, type: 'terminal', alive: true });
+      // (C1144) Fresh launch: known immediately from launch opts — no need to wait on a
+      // /api/sessions refetch for the left-nav row's icon to be correct. (TPT413) Resume: a
+      // reattach never changes the running agent (the server ignores ?agent= there), and
+      // state.taskAgent is whichever terminal was opened last — so never overwrite a resumed
+      // row's agent with either; keep the snapshot's value and let the `config` frame that
+      // follows (adoptSessionAgent) confirm it. A resumed row not yet seen by any snapshot
+      // is left agent-less until that frame lands a few ms later.
+      if (!isResume) {
+        state.sessionMeta.set(taskId, { agent: opts.agent || state.taskAgent, label: state.taskAgentLabel, type: 'terminal', alive: true });
+      } else {
+        const prevMeta = state.sessionMeta.get(taskId) || { type: 'terminal' };
+        state.sessionMeta.set(taskId, { ...prevMeta, alive: true });
+      }
       updateClaudeButtons();
 
       // Auto-set → in_progress role for new sessions (skip for plan-only and discussion
@@ -904,6 +997,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       if (msg.type === 'config') {
         state.showAiStats = msg.showAiStats;
         applyTaskAgentConfig(msg);
+        adoptSessionAgent(taskId, msg); // (TPT413) live session agent → left-nav row icon
         if (!isResume && 'planApprovalCommand' in msg) {
           terminalPlanApprovalCommand = msg.planApprovalCommand;
           terminalPlanApprovalCommandKnown = true;
@@ -912,6 +1006,16 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         maybeSendCodexResumeRedraw();
       } else if (msg.type === 'terminal-state') {
         applyTaskAgentConfig(msg);
+        adoptSessionAgent(taskId, msg); // (TPT413) spawnTerminal() rewrites session.taskAgent after pty.spawn
+        adoptSessionStart(taskId, msg);
+        restartingLoss = false;
+        processRunning = true;
+        terminateBtn.textContent = t('btn.terminate');
+        dismissLostSession(taskId);
+        overlay.querySelector('.terminal-session-lost')?.remove();
+        state.activeSessions.add(taskId);
+        state.exitedSessions.delete(taskId);
+        updateClaudeButtons();
         applyCodexPlanReady(msg);
         if ('planApprovalCommand' in msg) {
           terminalPlanApprovalCommand = msg.planApprovalCommand;
@@ -988,13 +1092,18 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         updateClaudeButtons();
         document.dispatchEvent(new Event('tiptask:sync-nav-statuses'));
       } else if (msg.type === 'error') {
+        if (msg.code === 'ESESSION_LOST') {
+          showLostSession({ reason: msg.reason, at: msg.at });
+          return;
+        }
+        if (restartingLoss && knownLoss) showLostSession(knownLoss);
         processRunning = false;
         setCodexPlanReady(false);
         statusDot.className = 'status-dot disconnected';
         statusDot.title = 'Error';
         term.write(`\r\n\x1b[31mError: ${msg.message}\x1b[0m\r\n`);
         term.scrollToBottom();
-        clearTaskSessionState();
+        if (!state.lostSessions.has(taskId)) clearTaskSessionState();
       } else if (msg.type === 'session-ended' && (!msg.taskId || msg.taskId === taskId)) {
         processRunning = false;
         setCodexPlanReady(false);
@@ -1150,6 +1259,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   function clearTaskSessionState() {
+    dismissLostSession(taskId);
     state.activeSessions.delete(taskId);
     state.exitedSessions.delete(taskId);
     clearAttention(taskId, 'session-ended');
@@ -1236,6 +1346,10 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     reattach: reattachTerminal,
     dispose: disposeTerminal,
     detach: detachTerminal,
+    syncLostSession() {
+      const detail = state.lostSessions.get(taskId);
+      if (detail && !terminalClosing && !restartingLoss) showLostSession(detail);
+    },
     get processRunning() { return processRunning; },
   };
   state.activeTerminal = terminalController;
@@ -1295,7 +1409,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       wsExtra.cols = term.cols;
       wsExtra.rows = term.rows;
     }
-    connectWebSocket();
+    if (knownLoss && !opts.restartLost) showLostSession(knownLoss);
+    else connectWebSocket();
 
     const scrollY = window.scrollY;
     focusTerminalWithoutScrollJump();
@@ -1357,6 +1472,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // second click impossible by blocking the event loop; an async one doesn't, so a second
   // click must be rejected explicitly, and cleared again if the user cancels.
   async function terminateSession() {
+    if (state.lostSessions.has(taskId)) { finishTerminalEnded(); return; }
     if (terminationInFlight) return;
     terminationInFlight = true;
     if (!(await requestSessionClose(taskStatus, taskId))) {

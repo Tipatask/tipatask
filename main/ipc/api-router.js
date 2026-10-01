@@ -55,7 +55,8 @@ function registerApiHandlers() {
   });
 
   // (C1259) Sprint-windowed board list — oldest sprint holding an open task onward, plus
-  // backlog. `opts.extendSprints` walks the floor further back ("Load More"). See
+  // backlog. `opts.extendSprints` walks the floor further back ("Load More");
+  // `opts.fullWindow` fetches every sprint while searching. See
   // api-backend.js's getBoardTasks() for the { tasks, window } contract; `api:tasks.list`
   // above is left untouched so no existing caller of the unwindowed list breaks.
   // (C1407) opts.unscoped — Task App board's People-filter "All Tasks" mode. No preload
@@ -65,7 +66,7 @@ function registerApiHandlers() {
     const backend = b(event);
     if (!backend) return { tasks: [], window: null };
     if (typeof backend.getBoardTasks !== 'function') return { tasks: await backend.getTasks(), window: null };
-    return backend.getBoardTasks({ extendSprints: (opts && opts.extendSprints) || 0, unscoped: !!(opts && opts.unscoped) });
+    return backend.getBoardTasks({ extendSprints: (opts && opts.extendSprints) || 0, unscoped: !!(opts && opts.unscoped), fullWindow: !!(opts && opts.fullWindow) });
   });
 
   // All project tasks (cross-assignee), slim key+title+status+dependencies — deps

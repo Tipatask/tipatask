@@ -788,26 +788,24 @@ function _serializeTagDescriptions(map) {
     .sort(([a], [b]) => a.localeCompare(b));
 }
 
-// (C1259) Keyed ONLY on what actually changes the fetch: project, subtask drill-down,
-// how far "Load More" has widened the server-side sprint window, and — since C1407 —
-// the People filter's My-Tasks-vs-All-Tasks scope (that IS a fetch-affecting dimension,
-// unlike the member sub-selection below it, which is a pure client-side pass over the
-// already-fetched unscoped rows and deliberately stays OUT of this key). Tab/search/tag/
-// status/human/member-selection state used to be part of this key even though
-// fetchTasksForCurrentBoard() never varies by any of them — every toggle was a guaranteed
-// cache MISS, forcing a full network refetch for a purely client-side filter. Those
-// filters are now applied entirely client-side (applySearchFilter() / render-time
-// predicates) against whatever window is already cached, so toggling them never touches
-// the network.
+// Fetch dimensions: project, subtask drill-down, sprint-window extension, People scope,
+// and whether search must fetch past the active window's floor. Search text itself and
+// tag/status/human/member filters stay client-side and do not change the task-list key.
+// A full response has window:null, so retain its mode until search clears; otherwise
+// the next render would revert to the smaller active window.
+let _searchFullWindowActive = false;
 function _boardTaskCacheContext() {
   const parentKey = state.subtaskStack.length > 0
     ? state.subtaskStack[state.subtaskStack.length - 1].taskKey
     : null;
+  const searching = state.searchQuery.trim().length > 0;
+  if (!searching) _searchFullWindowActive = false;
   return {
     project: window.electronAPI?.getProjectPath?.() || 'browser',
     parentKey,
     sprintWindowExtend: parentKey ? 0 : state.sprintWindowExtend,
     assigneeScope: state.assigneeScope || 'me',
+    fullWindow: !parentKey && searching && (!!state.boardWindow?.has_older || _searchFullWindowActive),
   };
 }
 
@@ -843,14 +841,13 @@ function _boardSnapshotFingerprint(snapshot) {
   });
 }
 
-// (C1259) Adopts a fetch's `window` info into state, shared by every path that lands a
-// new task array (fresh fetch, cache restore, background-refresh snapshot). Once the
-// server reports no older sprints left (has_older: false), flip allStepsLoaded so
-// computeVisibleTiers() (task-board.js) stops hiding any fetched tier behind a cutoff —
-// there is nothing further to reveal either locally or over the network.
-function _applyBoardWindow(win) {
+// Adopt the response's window and fetch mode for fresh, cached, and background snapshots.
+// A full search response has window:null and all tiers loaded; a windowed response with
+// has_older:false also has nothing left to reveal.
+function _applyBoardWindow(win, fullWindow = false) {
   state.boardWindow = win || null;
-  if (state.boardWindow && state.boardWindow.has_older === false) state.allStepsLoaded = true;
+  _searchFullWindowActive = !!fullWindow;
+  if (fullWindow || (state.boardWindow && state.boardWindow.has_older === false)) state.allStepsLoaded = true;
 }
 
 // Rebuild breadcrumbs from the snapshot's canonical ancestor chain. Verify
@@ -880,7 +877,7 @@ function _restoreBoardCacheEntry(entry) {
   if (Array.isArray(entry.tagDescriptions)) {
     state.tagDescriptions = new Map(entry.tagDescriptions);
   }
-  _applyBoardWindow(entry.window);
+  _applyBoardWindow(entry.window, entry.context?.fullWindow);
   // (C1461) Parent detail pane — cached alongside the rest of a drill-down's snapshot so a
   // cache-hit render (tab switch, filter toggle) doesn't blank the pane while a background
   // refresh is pending. null on every root-board entry.
@@ -1133,17 +1130,19 @@ async function hydrateTagDescriptions() {
 // (C1407) unscoped: true — People-filter "All Tasks" mode. Threaded into BOTH the root
 // board fetch and the parentKey (subtask drill-down) fetch, so drill-down obeys the same
 // filter the board does. false/omitted keeps today's My-Tasks-scoped behavior.
-async function fetchBoardWindow(parentKey, extendSprints, unscoped = false) {
+async function fetchBoardWindow(parentKey, extendSprints, unscoped = false, fullWindow = false) {
   if (window.electronAPI?.api) {
     // Electron IPC path — per-window backend, no fetch
     if (parentKey) return { tasks: await window.electronAPI.api.tasks.children(parentKey, { unscoped }), window: null };
-    return window.electronAPI.api.tasks.board({ extendSprints, unscoped });
+    return window.electronAPI.api.tasks.board({ extendSprints, unscoped, fullWindow });
   }
 
   // Browser fetch path
   let url = './TODO.md?_=' + Date.now();
   if (parentKey) {
     url += '&parentKey=' + encodeURIComponent(parentKey);
+  } else if (fullWindow) {
+    url += '&full_window=true';
   } else {
     url += '&window=active';
     if (extendSprints > 0) url += '&extend_sprints=' + extendSprints;
@@ -1208,7 +1207,7 @@ async function fetchBoardSnapshot(context = _boardTaskCacheContext()) {
   // (stack-top taskKey/title only) for exactly this case.
   const [tagDescriptions, boardResult, sprints, parentTask] = await Promise.all([
     hydrateTagDescriptions(),
-    fetchBoardWindow(context.parentKey || null, context.sprintWindowExtend || 0, context.assigneeScope === 'all'),
+    fetchBoardWindow(context.parentKey || null, context.sprintWindowExtend || 0, context.assigneeScope === 'all', !!context.fullWindow),
     hydrateSprints(),
     context.parentKey ? _fetchTaskForHandoff(context.parentKey).catch(() => null) : Promise.resolve(null),
   ]);
@@ -2066,7 +2065,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       _larDataSource = 'snapshot';
       tasks = _cloneBoardJson(options.snapshot.tasks, []);
       _applyBoardSnapshotMetadata(options.snapshot);
-      _applyBoardWindow(options.snapshot.window);
+      _applyBoardWindow(options.snapshot.window, cacheContext.fullWindow);
       if (cacheKey) _rememberBoardSnapshot(cacheKey, options.snapshot, cacheContext);
     } else if (cachedEntry) {
       _larDataSource = 'cache';
@@ -2086,7 +2085,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       }
       tasks = _cloneBoardJson(snapshot.tasks, []);
       _applyBoardSnapshotMetadata(snapshot);
-      _applyBoardWindow(snapshot.window);
+      _applyBoardWindow(snapshot.window, cacheContext.fullWindow);
       if (cacheKey) _rememberBoardSnapshot(cacheKey, snapshot, cacheContext);
     }
   } catch (err) {
@@ -2507,10 +2506,8 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       clearTimeout(searchDebounceTimer);
       searchDebounceTimer = setTimeout(() => {
         state.searchQuery = searchInput.value;
-        state.extraStepsLoaded = 0;
         state.allStepsLoaded = false;
-        onBoardFiltersChanged();
-        applySearchFilter();
+        refreshBoardForFilters(loadAndRender);
       }, 150);
     });
     searchInput.addEventListener('focus', updateSearchInputWidth);
@@ -2518,13 +2515,12 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     searchInput.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         e.preventDefault();
+        clearTimeout(searchDebounceTimer);
         state.searchQuery = '';
         searchInput.value = '';
         searchInput.blur();
-        state.extraStepsLoaded = 0;
         state.allStepsLoaded = false;
-        onBoardFiltersChanged();
-        applySearchFilter();
+        refreshBoardForFilters(loadAndRender);
       }
     });
   }
@@ -2534,13 +2530,17 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   // leaving tag/human/status filters untouched.
   const searchClearBtn = app.querySelector('.search-clear-btn');
   if (searchClearBtn) {
-    searchClearBtn.addEventListener('click', () => clearSearchQuery(loadAndRender));
+    searchClearBtn.addEventListener('click', () => {
+      clearTimeout(searchDebounceTimer);
+      clearSearchQuery(loadAndRender);
+    });
   }
 
   // ── Search reset button ──
   const resetBtn = document.getElementById('search-reset-btn');
   if (resetBtn) {
     resetBtn.addEventListener('click', () => {
+      clearTimeout(searchDebounceTimer);
       state.searchQuery = '';
       state.activeTagFilters.clear();
       state.humanFilterActive = false;
@@ -2775,22 +2775,17 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
             item.classList.add('active');
           }
           changed = true;
-          state.extraStepsLoaded = 0;
           state.allStepsLoaded = false;
-          onBoardFiltersChanged();
-          applySearchFilter();
-          tagFilterBtn.classList.toggle('active', state.activeTagFilters.size > 0);
-          perfEnd(_h);
+          refreshBoardForFilters(loadAndRender).finally(() => perfEnd(_h));
         });
       });
 
       // Close modal
-      // (C1259) applySearchFilter() already ran on every toggle inside the modal (above);
-      // the tag chips already reflect the selection. Only the nav bar's own chip list +
-      // status counts need a chrome patch on close — no fetch, no board rebuild.
+      // Each toggle already rerenders the cached board. Refresh chrome on close and
+      // keep rebuilt tag chips wired to that same rerender callback.
       const closeModal = () => {
         overlay.remove();
-        if (changed) refreshFilterBarChrome();
+        if (changed) refreshFilterBarChrome(app, loadAndRender);
       };
       overlay.querySelector('.tag-cloud-close').addEventListener('click', closeModal);
       overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
@@ -2804,7 +2799,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   }
 
   // ── Tag filter chip removal ──
-  // (C1259) Was loadAndRender(); refreshFilterBarChrome() rebuilds this same chip bar
+  // refreshFilterBarChrome() rebuilds this same chip bar
   // (and rebinds its own click listeners — see task-board.js) whenever state.activeTagFilters
   // changes, so the initial binding here only has to cover the very first paint.
   app.querySelectorAll('.tag-filter-chips .tag-chip').forEach(chip => {
@@ -2812,12 +2807,8 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       const _h = perfStart('tag-filter-chip-remove');
       const tag = chip.dataset.tag;
       state.activeTagFilters.delete(tag);
-      state.extraStepsLoaded = 0;
       state.allStepsLoaded = false;
-      onBoardFiltersChanged();
-      applySearchFilter();
-      refreshFilterBarChrome();
-      perfEnd(_h);
+      refreshBoardForFilters(loadAndRender).finally(() => perfEnd(_h));
     });
   });
 
@@ -4513,6 +4504,7 @@ if (window.electronAPI) {
     state.expandedTiers.clear();
     state.extraStepsLoaded = 0;
     state.allStepsLoaded = false;
+    _searchFullWindowActive = false;
     // (C1462) Project A's objective tabs point at parentKeys that don't exist in project B —
     // must not render/navigate across a project switch.
     state.objectiveTabs = [];

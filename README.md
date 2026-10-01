@@ -85,7 +85,7 @@ install succeeds.
 | Script | What it does |
 |---|---|
 | `npm run electron` | Build the client and open the app from source. No installer. |
-| `npm run electron:pack` | Build an unpacked app directory (`electron-builder --dir`). Fast smoke test. |
+| `npm run electron:pack` | Build an unpacked app directory (`electron-builder --dir`) for the OS and CPU you are on, for example `dist-electron/mac-arm64/TipATask.app` or `dist-electron/linux-unpacked/`. No installer, **does not change the version.** Fast smoke test. |
 | `npm run electron:ci:mac` / `:win` / `:linux` | Stage the Pi and sherpa-onnx bundles, build the client, then package for that OS. **Does not change the version.** This is what CI runs. |
 | `npm run electron:dist:mac` / `:win` / `:linux` | Same as `electron:ci:*`, but first bumps the patch version in `package.json` and `package-lock.json` (`scripts/bump-version.js`). |
 | `npm run electron:dist` | The bumping build for macOS, Windows and Linux in one command. See the cross-build notes below before using it on a Mac. |

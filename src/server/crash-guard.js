@@ -8,15 +8,15 @@
 // and every open terminal/agent session with it. src/cli/http.js and api-backend.js now turn
 // those into rejected calls, so this is the backstop for the next one that slips through:
 //   - network-class errors are logged and the server keeps running;
-//   - any other uncaught exception is still fatal (logged, then exit 1 — main.js reports a
-//     non-zero exit to the user), because process state after an unknown throw is not trusted;
+//   - other uncaught exceptions are logged and survived while any session is live;
+//     with no live sessions, record the fatal cause and exit 1;
 //   - unhandled rejections never exit (see the note on onUnhandledRejection).
 //
 // Kept out of index.js so it is unit-testable: requiring index.js stands up a real HTTP server.
 
 // Transport-level failures that say "the network dropped this", not "this code is broken".
-// EPIPE is deliberately absent: a broken stderr/IPC pipe means the parent is gone, and
-// swallowing it here would make this guard's own log line re-trigger it forever.
+// EPIPE is deliberately absent: a broken pipe is not a recoverable network failure.
+// Like other non-network errors, it is fatal only when no sessions are live.
 const NETWORK_ERROR_CODES = new Set([
   'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ECONNABORTED',
   'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN', 'ENOTFOUND', 'EAI_AGAIN',
@@ -47,12 +47,18 @@ function describe(err) {
 
 /**
  * @param {object} [opts]
+ * @param {Map} [opts.sessions]      Shared registry for the pre-exit live count
+ * @param {Function} [opts.hasLiveSessions] Live registry check, evaluated on each exception
+ * @param {Function} [opts.recordExit] Synchronous best-effort exit recorder
  * @param {EventEmitter} [opts.proc]  TEST SEAM — defaults to `process`
  * @param {Function} [opts.exit]      TEST SEAM — defaults to process.exit
  * @param {{error: Function}} [opts.log] TEST SEAM — defaults to console
  * @returns {{ onUncaughtException: Function, onUnhandledRejection: Function }}
  */
 function installCrashGuard({
+  sessions,
+  hasLiveSessions = () => [...(sessions?.values() || [])].some(session => session?.alive === true),
+  recordExit = require('./last-exit').writeLastExit,
   proc = process,
   exit = (code) => process.exit(code),
   log = console,
@@ -68,7 +74,18 @@ function installCrashGuard({
       report(`[server] uncaught network error ${code} (kept alive): ${describe(err)}`);
       return;
     }
+    let live;
+    try { live = hasLiveSessions(); } catch (checkError) {
+      // An unavailable registry must not turn an unrelated error into session teardown.
+      report(`[server] live-session check failed (kept alive): ${describe(checkError)}`);
+      live = true;
+    }
+    if (live) {
+      report(`[server] uncaught exception (kept alive to preserve live sessions): ${describe(err)}`);
+      return;
+    }
     fatal = true;
+    try { recordExit({ reason: 'uncaught-exception', stack: describe(err), sessions }); } catch { /* exit must still run */ }
     report(`[server] fatal uncaught exception: ${describe(err)}`);
     exit(1);
   };

@@ -33,7 +33,7 @@ import { groupNoun, groupTitle, groupShowMore, groupLoadMore, groupEmpty, groupP
 import { renderComposerHeader } from './composer-header.js';
 import { showActionConfirm } from './action-confirm.js';
 export { showActionConfirm };
-import { clearAttention, mergeSessionsSnapshot, syncAttentionClasses } from './attention-state.js';
+import { clearAttention, dismissLostSession, mergeSessionsSnapshot, syncAttentionClasses } from './attention-state.js';
 import { syncActivityChips } from './task-activity.js';
 import { taskHasNullSprint, tasksForActiveTab, taskHiddenByGrouping, tasksVisibleUnderGrouping } from './board-count-domain.js';
 import { VCS_TYPES, VCS_GIT_FLAGS, buildVcsPatchBody } from './vcs-form.js';
@@ -422,6 +422,7 @@ export function renderPeopleFilter(counts) {
 export function computeVisibleTiers(tierKeys, tiers) {
   return computeTierWindow(tierKeys, {
     allStepsLoaded: state.allStepsLoaded,
+    revealAll: anyNarrowingFilterActive(),
     extraStepsLoaded: state.extraStepsLoaded,
     hasActiveMatch: k => (tiers[k] || []).some(t => isActiveName(t.status) && matchesFilters(t)),
     hasAnyMatch: k => (tiers[k] || []).some(t => matchesFilters(t)),
@@ -1088,8 +1089,8 @@ let _typeToFilterBound = false;
 // (C1502) Document-level keydown: with the Project Board in view and nothing focused, typing a
 // plain printable character focuses the board's search input, appends the character, and fires
 // the exact same `input` event the field's own listener (template.html) already handles — the
-// 150ms debounce, state.searchQuery write, onBoardFiltersChanged() persistence, and
-// applySearchFilter() repaint all run unchanged, so none of that is duplicated here.
+// 150ms debounce and state.searchQuery write feed refreshBoardForFilters() for
+// persistence and a cached rerender, so none of that is duplicated here.
 //
 // Bound once at bundle-eval time (index.js), same reasoning as registerVoiceShortcut()/
 // ensureFileLinkHandler() there — loadAndRender() has early-return paths a render-bound listener
@@ -1170,16 +1171,15 @@ function updateShowMoreButton() {
 
 // (C1259) Patches the top-nav filter bar chrome (status-filter trigger label + per-row
 // counts/checked state, tag-filter-chips bar, tag/human filter button active classes)
-// in place — no fetch, no #app.innerHTML rebuild. Paired with applySearchFilter() (which
-// already re-hides/re-shows cards+tiers without a re-render) by every filter-toggle
-// handler in template.html that used to call loadAndRender() for a purely client-side
-// filter change. Reads state._lastVisibleTasks (set once per real loadAndRender()) for
+// in place — no fetch, no #app.innerHTML rebuild. The rerender callback lets rebuilt
+// tag chips reveal newly matching tiers through the same cached filter refresh.
+// Reads state._lastVisibleTasks (set once per real loadAndRender()) for
 // facet counts — never re-fetches or re-derives it.
-export function refreshFilterBarChrome(app = document.getElementById('app')) {
+export function refreshFilterBarChrome(app = document.getElementById('app'), rerender) {
   if (!app) return;
 
   // (C1442/C1460) Same two-stage domain the full render computes at template.html — a
-  // DOM-only filter toggle (search/tag) must not re-inflate counts back to "every fetched
+  // filter chrome refresh must not re-inflate counts back to "every fetched
   // row" including backlog the active tab can't draw, or subtasks/parents the objective
   // grouping filter hides. state._lastVisibleTasks stays unfiltered by design (see its
   // declaration in template.html), so grouping is re-derived here rather than read off state.
@@ -1228,9 +1228,8 @@ export function refreshFilterBarChrome(app = document.getElementById('app')) {
       chipsHost.querySelectorAll('.tag-filter-chips .tag-chip').forEach(chip => {
         chip.addEventListener('click', () => {
           state.activeTagFilters.delete(chip.dataset.tag);
-          onBoardFiltersChanged();
-          applySearchFilter();
-          refreshFilterBarChrome(app);
+          state.allStepsLoaded = false;
+          refreshBoardForFilters(rerender, { app });
         });
       });
     }
@@ -1270,11 +1269,12 @@ export function refreshFilterBarChrome(app = document.getElementById('app')) {
   }
 }
 
-// Status and assignee filters exclude tasks during render, so DOM-only search cannot
-// reveal newly matching tasks. Rerender on those changes; the board-task cache is reused.
+// Filters affect tier visibility at render time, so a DOM-only pass cannot reveal
+// newly matching tiers. Rerender on filter changes; the board-task cache is reused.
 // Caller supplies rerender to avoid a template.html import cycle.
 export function refreshBoardForFilters(rerender, opts = {}) {
   const app = opts.app || document.getElementById('app');
+  state.extraStepsLoaded = 0;
   // Persist first: the selection is durable even if the render below gets superseded by a
   // newer one (rapid clicking) or throws. (C1452) Also clears the bulk selection/bar —
   // status/human/people are the render-time-baked filters, so this must happen before
@@ -1292,7 +1292,7 @@ export function refreshBoardForFilters(rerender, opts = {}) {
   // deferral in loadAndRender()). Never wrong, only incomplete for the widen/list/todo cases
   // this helper exists to fix — the render that follows completes those.
   applySearchFilter();
-  refreshFilterBarChrome(app);
+  refreshFilterBarChrome(app, rerender);
 
   if (typeof rerender !== 'function') return Promise.resolve();
 
@@ -1302,6 +1302,9 @@ export function refreshBoardForFilters(rerender, opts = {}) {
   // checkbox click focuses the input in Chromium/Firefox but not in Safari, and mirroring
   // activeElement means never stealing focus the browser itself didn't grant.
   const active = document.activeElement;
+  const searchSelection = active && active.matches('.search-input')
+    ? { start: active.selectionStart, end: active.selectionEnd, direction: active.selectionDirection }
+    : null;
   const focusStatus = active && active.matches('input[type="checkbox"][data-status]')
     ? active.dataset.status
     : null;
@@ -1320,7 +1323,13 @@ export function refreshBoardForFilters(rerender, opts = {}) {
   return Promise.resolve(rerender()).then(() => {
     const freshApp = opts.app || document.getElementById('app');
     if (!freshApp) return;
-    if (focusStatus != null) {
+    if (searchSelection) {
+      const input = freshApp.querySelector('.search-input');
+      if (input) {
+        input.focus({ preventScroll: true });
+        input.setSelectionRange(searchSelection.start, searchSelection.end, searchSelection.direction);
+      }
+    } else if (focusStatus != null) {
       // Find by dataset.status rather than an attribute-selector template string: statuses
       // are user-creatable per project (C1181/C1184), and a custom name containing a quote
       // would otherwise break the selector.
@@ -2614,7 +2623,7 @@ const SESSION_DONE_BADGE = '<span class="session-check" aria-hidden="true">'
   + 'stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>'
   + '</svg></span>';
 
-// One row per RUNNING terminal session, rendered into #active-sessions-list in the left nav.
+// One row per running or lost terminal session in the left nav.
 // `sessions` entries: { taskId, agent, title, isOpen, needsAttention }. `collapsed` mirrors
 // document.body.classList.contains('left-nav-collapsed') — the row markup is identical either
 // way (CSS hides the key/title spans when collapsed, same pattern as .left-nav-label), but the
@@ -2628,18 +2637,18 @@ export function renderActiveSessionsList(sessions, collapsed) {
     const done = isCompleteName(s.status); // (C1152) row styling + (C1157) check badge
     const cls = 'active-session-item'
       + (s.isOpen ? ' active' : '')
-      + (s.needsAttention ? ' needs-attention' : '')
+      + (s.lost ? ' session-lost' : s.needsAttention ? ' needs-attention' : '')
       + (done ? ' session-completed' : '')
       + (collapsed ? ' collapsed' : '');
     // Falls back to the bare task key when title is unknown (session's task fell outside the
     // current fetch — subtask drill-in / assignee scoping) so the tooltip never dangles a
     // trailing "KEY — " with nothing after it.
     const base = s.title ? t('nav.sessionTooltip', { key: s.taskId, title: s.title }) : String(s.taskId);
-    const tip = escapeAttr(s.needsAttention ? t('nav.sessionNeedsAttention', { label: base }) : base);
+    const tip = escapeAttr(s.lost ? t('nav.sessionLost', { label: base }) : s.needsAttention ? t('nav.sessionNeedsAttention', { label: base }) : base);
     // (C1152) Close control — nested <span role="button"> since .active-session-item is
     // itself a <button> (nested <button> invalid HTML). Mirrors .chat-tab-close (chat-ui.js),
     // plus keyboard support that precedent lacks.
-    const closeTip = escapeAttr(t('tooltip.terminateSession'));
+    const closeTip = escapeAttr(t(s.lost ? 'btn.close' : 'tooltip.terminateSession'));
     const closeBtn = `<span class="active-session-close" role="button" tabindex="0" `
       + `data-close-task-id="${key}" title="${closeTip}" aria-label="${closeTip}">&#x2715;</span>`;
     return `<button type="button" class="${cls}" data-task-id="${key}" title="${tip}" aria-label="${tip}">`
@@ -2669,7 +2678,7 @@ export function syncActiveSessionsNav() {
   if (!host) return;
   const collapsed = document.body.classList.contains('left-nav-collapsed');
   const openId = state.activeTerminal?.taskId || null;
-  const rows = [...state.activeSessions]
+  const rows = [...new Set([...state.activeSessions, ...state.lostSessions.keys()])]
     // /api/sessions does not filter by session type — keep objective/spec-chat sessions
     // (and their 'obj-'-prefixed synthetic ids) out of what is meant to be a terminal list.
     .filter((id) => (state.sessionMeta.get(id)?.type || 'terminal') === 'terminal')
@@ -2677,11 +2686,16 @@ export function syncActiveSessionsNav() {
     .sort()
     .map((id) => ({
       taskId: id,
+      // (TPT413) sessionMeta is authoritative — GET /api/sessions ships the live session's
+      // taskAgent and console-modal.js adoptSessionAgent() mirrors each session's own
+      // config/terminal-state frame into it. The state.taskAgent fallback only covers a row
+      // that no snapshot or frame has described yet; it is NOT "this session's agent".
       agent: state.sessionMeta.get(id)?.agent || state.taskAgent,
       title: state.taskTitleById.get(id) || '',
       status: state.taskStatusById.get(id) || '', // (C1152) drives .session-completed styling
       isOpen: id === openId,
-      needsAttention: state.attentionSessions.has(id),
+      needsAttention: state.attentionSessions.has(id) && !state.lostSessions.has(id),
+      lost: state.lostSessions.has(id),
     }));
   const html = renderActiveSessionsList(rows, collapsed);
   host.hidden = rows.length === 0;
@@ -2719,6 +2733,13 @@ export function syncActiveSessionsNav() {
       const id = x.dataset.closeTaskId;
       const status = state.taskStatusById.get(id) || '';
       x.dataset.busy = '1';
+      if (state.lostSessions.has(id)) {
+        dismissLostSession(id);
+        if (state.activeTerminal?.taskId === id) state.activeTerminal.detach?.({ refreshBoard: false });
+        state.sessionMeta.delete(id);
+        syncActiveSessionsNav();
+        return;
+      }
       if (!(await window.TipTask?.requestSessionClose?.(status, id))) {
         delete x.dataset.busy;
         return;

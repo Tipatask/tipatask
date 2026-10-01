@@ -7,6 +7,9 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { createRequire } = require('node:module');
 const { EventEmitter } = require('node:events');
+const scratch = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'tt-shutdown-reaper-'));
+process.env.TIPATASK_USER_DATA = scratch;
+test.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
 const { installShutdownReaper, defaultSleepSync, SHUTDOWN_KILL_GRACE_MS } = require('./shutdown-reaper');
 
 // TPT295 — the server shutdown reaper. Runs the real claude-session.js and headless-claude.js in

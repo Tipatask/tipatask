@@ -696,6 +696,7 @@ function emitTerminalState(session) {
     session.ws.send(JSON.stringify({
       type: 'terminal-state',
       tabId: session.tabId,
+      startedAt: session.startedAt,
       phase: session.terminalPhase,
       taskAgent: session.taskAgent,
       taskAgentLabel: session.taskAgentLabel,

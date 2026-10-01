@@ -230,6 +230,38 @@ function fakeRes() {
   };
 }
 
+test('terminal reconnect reports a newer server exit only for a missing registry entry', async t => {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'tt-reconnect-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const h = harness();
+  h.config.USER_DATA_ROOT = root;
+  const at = new Date(Date.now() - 1000).toISOString();
+  const before = Date.parse(at) - 1000;
+  const recordPath = path.join(root, 'last-exit.json');
+  fs.writeFileSync(recordPath, JSON.stringify({ at, reason: 'signal:SIGTERM', stack: 'private', liveSessionCount: 2 }));
+  async function connect(start, existing) {
+    const ws = fakeWs();
+    const sessions = new Map(existing ? [['TPT415', existing]] : []);
+    await h.exports.handleConnection(ws, {
+      url: `/?taskId=TPT415${start == null ? '' : `&startedAt=${start}`}`, headers: { host: 'localhost' },
+    }, sessions, () => null);
+    assert.equal(ws.closed, true);
+    assert.equal(sessions.size, existing ? 1 : 0);
+    return ws.frames.find(f => f.type === 'error');
+  }
+  const frame = await connect(before);
+  assert.deepEqual(frame, { type: 'error', code: 'ESESSION_LOST', reason: 'signal:SIGTERM', at,
+    message: `Terminal session for TPT415 was lost when the server exited (signal:SIGTERM, ${at}).` });
+  for (const start of [null, '', 'bad', Date.parse(at), Date.parse(at) + 1000]) {
+    assert.equal((await connect(start)).code, undefined);
+  }
+  const exited = { type: 'terminal', alive: false, buffer: 'retained history' };
+  assert.equal((await connect(before, exited)).code, undefined);
+  assert.equal(exited.buffer, 'retained history');
+  fs.writeFileSync(recordPath, '{');
+  assert.equal((await connect(before)).code, undefined);
+});
+
 test('DELETE /api/objective/prewarm kills the cold spare', async () => {
   const h = harness();
   const handler = h.exports.createHttpHandler(new Map(), () => ({}), null);

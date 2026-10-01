@@ -323,9 +323,24 @@ function freshState() {
   return { threshold: 50, lastCount: 0, lastAlertCount: 0, alerted: false, growthStreak: 0, killed: false };
 }
 
+test('evaluateRunaway defaults to warnings through sustained growth and above the ceiling', () => {
+  const state = freshState();
+  const results = [52, 68, 86, 150, 300].map(count => evaluateRunaway(state, count));
+  assert.ok(results.every(result => result.kill === false));
+  assert.deepEqual(results.map(result => result.alert), [true, false, false, true, true]);
+  assert.equal(state.killed, false);
+});
+
+test('disabling kills overrides a previous kill latch and restores warnings', () => {
+  const state = freshState();
+  assert.equal(evaluateRunaway(state, 160, { killEnabled: true }).kill, true);
+  assert.deepEqual(evaluateRunaway(state, 220, { killEnabled: false }), { alert: true, kill: false, count: 220 });
+  assert.equal(state.killed, false);
+});
+
 test('evaluateRunaway warns on the first sweep at/above threshold and does not kill', () => {
   const state = freshState();
-  const first = evaluateRunaway(state, 60);
+  const first = evaluateRunaway(state, 60, { killEnabled: true });
   assert.deepEqual(first, { alert: true, kill: false, count: 60 });
   // The first sample of a session can never itself count as growth (lastCount starts at 0).
   assert.equal(state.growthStreak, 0);
@@ -336,7 +351,7 @@ test('evaluateRunaway: a stable count (54, 10 sweeps) warns exactly once and nev
   let alerts = 0;
   let kills = 0;
   for (let i = 0; i < 10; i++) {
-    const { alert, kill } = evaluateRunaway(state, 54);
+    const { alert, kill } = evaluateRunaway(state, 54, { killEnabled: true });
     if (alert) alerts++;
     if (kill) kills++;
   }
@@ -347,23 +362,23 @@ test('evaluateRunaway: a stable count (54, 10 sweeps) warns exactly once and nev
 test('evaluateRunaway: jitter around the threshold (54, 58, 53, 60) never kills', () => {
   const state = freshState();
   for (const count of [54, 58, 53, 60]) {
-    assert.equal(evaluateRunaway(state, count).kill, false);
+    assert.equal(evaluateRunaway(state, count, { killEnabled: true }).kill, false);
   }
 });
 
 test('evaluateRunaway: a burst that does not sustain (54 -> 79 -> 55) never kills', () => {
   const state = freshState();
-  evaluateRunaway(state, 54);
-  assert.equal(evaluateRunaway(state, 79).kill, false); // growthStreak 1
-  assert.equal(evaluateRunaway(state, 55).kill, false); // shrank — streak resets
+  evaluateRunaway(state, 54, { killEnabled: true });
+  assert.equal(evaluateRunaway(state, 79, { killEnabled: true }).kill, false); // growthStreak 1
+  assert.equal(evaluateRunaway(state, 55, { killEnabled: true }).kill, false); // shrank — streak resets
 });
 
 test('evaluateRunaway: a shrinking tree (127 -> 69) warns once but never kills', () => {
   const state = freshState();
-  const first = evaluateRunaway(state, 127);
+  const first = evaluateRunaway(state, 127, { killEnabled: true });
   assert.equal(first.alert, true);
   assert.equal(first.kill, false);
-  const second = evaluateRunaway(state, 69);
+  const second = evaluateRunaway(state, 69, { killEnabled: true });
   assert.equal(second.kill, false);
   assert.equal(second.alert, false); // still latched-alerted from the first sweep
   assert.equal(state.growthStreak, 0);
@@ -371,34 +386,34 @@ test('evaluateRunaway: a shrinking tree (127 -> 69) warns once but never kills',
 
 test('evaluateRunaway: sustained growth (52 -> 68 -> 86) warns at sweep 1, kills at sweep 3', () => {
   const state = freshState();
-  const first = evaluateRunaway(state, 52);
+  const first = evaluateRunaway(state, 52, { killEnabled: true });
   assert.equal(first.alert, true);
   assert.equal(first.kill, false);
-  const second = evaluateRunaway(state, 68); // +16 — growthStreak 1
+  const second = evaluateRunaway(state, 68, { killEnabled: true }); // +16 — growthStreak 1
   assert.equal(second.kill, false);
-  const third = evaluateRunaway(state, 86); // +18 — growthStreak 2 -> kill
+  const third = evaluateRunaway(state, 86, { killEnabled: true }); // +18 — growthStreak 2 -> kill
   assert.equal(third.kill, true);
   assert.equal(third.alert, false); // the kill supersedes the warning
 });
 
 test('evaluateRunaway: a rise from below the threshold does not count as growth (34 -> 52 -> 68)', () => {
   const state = freshState();
-  evaluateRunaway(state, 34); // below threshold — no alert, no streak
-  const second = evaluateRunaway(state, 52); // crosses threshold, but prior sweep was below it
+  evaluateRunaway(state, 34, { killEnabled: true }); // below threshold — no alert, no streak
+  const second = evaluateRunaway(state, 52, { killEnabled: true }); // crosses threshold, but prior sweep was below it
   assert.equal(second.kill, false);
   assert.equal(state.growthStreak, 0);
-  const third = evaluateRunaway(state, 68); // first sweep that can count as growth
+  const third = evaluateRunaway(state, 68, { killEnabled: true }); // first sweep that can count as growth
   assert.equal(third.kill, false);
   assert.equal(state.growthStreak, 1);
 });
 
 test('evaluateRunaway: a flat sweep breaks the growth streak (52, 68, 68, 86 never kills)', () => {
   const state = freshState();
-  evaluateRunaway(state, 52);
-  evaluateRunaway(state, 68); // growthStreak 1
-  assert.equal(evaluateRunaway(state, 68).kill, false); // flat — streak resets to 0
+  evaluateRunaway(state, 52, { killEnabled: true });
+  evaluateRunaway(state, 68, { killEnabled: true }); // growthStreak 1
+  assert.equal(evaluateRunaway(state, 68, { killEnabled: true }).kill, false); // flat — streak resets to 0
   assert.equal(state.growthStreak, 0);
-  assert.equal(evaluateRunaway(state, 86).kill, false); // growthStreak back to 1, not yet 2
+  assert.equal(evaluateRunaway(state, 86, { killEnabled: true }).kill, false); // growthStreak back to 1, not yet 2
 });
 
 test('evaluateRunaway: a slow climb under the growth threshold (+9/sweep) never kills below the ceiling', () => {
@@ -406,57 +421,57 @@ test('evaluateRunaway: a slow climb under the growth threshold (+9/sweep) never 
   let count = 52;
   for (let i = 0; i < 10; i++) {
     count += 9;
-    assert.equal(evaluateRunaway(state, count).kill, false);
+    assert.equal(evaluateRunaway(state, count, { killEnabled: true }).kill, false);
   }
   assert.ok(count < 150);
 });
 
 test('evaluateRunaway kills at once at the ceiling, even on the first sweep', () => {
   const state = freshState();
-  const result = evaluateRunaway(state, 150);
+  const result = evaluateRunaway(state, 150, { killEnabled: true });
   assert.equal(result.kill, true);
   assert.equal(result.alert, false);
 });
 
 test('evaluateRunaway does not kill just under the ceiling on a first sweep', () => {
   const state = freshState();
-  const result = evaluateRunaway(state, 149);
+  const result = evaluateRunaway(state, 149, { killEnabled: true });
   assert.equal(result.kill, false);
   assert.equal(result.alert, true);
 });
 
 test('evaluateRunaway honors a per-state killCeiling override', () => {
   const state = { ...freshState(), killCeiling: 80 };
-  assert.equal(evaluateRunaway(state, 79).kill, false);
-  assert.equal(evaluateRunaway(state, 80).kill, true);
+  assert.equal(evaluateRunaway(state, 79, { killEnabled: true }).kill, false);
+  assert.equal(evaluateRunaway(state, 80, { killEnabled: true }).kill, true);
 });
 
 test('evaluateRunaway: a dip below threshold resets the growth streak (60 -> 40 -> 60 never kills)', () => {
   const state = freshState();
-  const a = evaluateRunaway(state, 60);
+  const a = evaluateRunaway(state, 60, { killEnabled: true });
   assert.equal(a.alert, true);
   assert.equal(a.kill, false);
-  const b = evaluateRunaway(state, 40); // >= threshold/2 (25): alerted latch stays set
+  const b = evaluateRunaway(state, 40, { killEnabled: true }); // >= threshold/2 (25): alerted latch stays set
   assert.equal(b.alert, false);
   assert.equal(b.kill, false);
   assert.equal(state.growthStreak, 0);
-  const c = evaluateRunaway(state, 60); // back up, but the sweep before it (40) was below threshold
+  const c = evaluateRunaway(state, 60, { killEnabled: true }); // back up, but the sweep before it (40) was below threshold
   assert.equal(c.kill, false);
   assert.equal(state.growthStreak, 0);
 });
 
 test('evaluateRunaway latches a kill — a surviving tree reports kill again on later sweeps even if growth stops', () => {
   const state = freshState();
-  evaluateRunaway(state, 52);
-  assert.equal(evaluateRunaway(state, 68).kill, false);
-  assert.equal(evaluateRunaway(state, 86).kill, true); // growthStreak reaches 2
-  assert.equal(evaluateRunaway(state, 86).kill, true); // flat — still reports kill (latched)
-  assert.equal(evaluateRunaway(state, 10).kill, true); // even a big drop still reports kill (latched)
+  evaluateRunaway(state, 52, { killEnabled: true });
+  assert.equal(evaluateRunaway(state, 68, { killEnabled: true }).kill, false);
+  assert.equal(evaluateRunaway(state, 86, { killEnabled: true }).kill, true); // growthStreak reaches 2
+  assert.equal(evaluateRunaway(state, 86, { killEnabled: true }).kill, true); // flat — still reports kill (latched)
+  assert.equal(evaluateRunaway(state, 10, { killEnabled: true }).kill, true); // even a big drop still reports kill (latched)
 });
 
 test('evaluateRunaway tolerates a legacy state with no growthStreak/killed fields', () => {
   const state = { threshold: 50, lastCount: 0, lastAlertCount: 0, alerted: false };
-  assert.equal(evaluateRunaway(state, 60).kill, false);
+  assert.equal(evaluateRunaway(state, 60, { killEnabled: true }).kill, false);
   assert.equal(state.growthStreak, 0);
   assert.equal(state.killed, false);
 });
@@ -493,9 +508,14 @@ test('buildRunawayWarning states the session keeps running and appends a summary
   const bare = buildRunawayWarning(54, 50, '');
   assert.match(bare, /^54 descendant processes/);
   assert.match(bare, /keeps running/);
+  assert.match(bare, /Automatic termination is disabled/);
+  assert.doesNotMatch(bare, /kill after|killed automatically/);
   assert.equal(bare.includes('Top processes'), false);
   const withSummary = buildRunawayWarning(54, 50, 'npm ×24');
   assert.match(withSummary, /Top processes: npm ×24\./);
+  const enabled = buildRunawayWarning(54, 50, '', { killEnabled: true });
+  assert.match(enabled, /Automatic termination enabled/);
+  assert.ok(enabled.includes(describeKillPolicy(50)));
 });
 
 // ── sweepDescendantWatchdog() — the 30s watchdog tick, deps stubbed (TPT370) ──
@@ -523,6 +543,25 @@ function makeSweepDeps() {
   };
 }
 
+test('sweepDescendantWatchdog defaults to warn-only even with sustained growth or 160 descendants', () => {
+  const session = makeSweepSession();
+  const sessions = new Map([['k1', session]]);
+  const { notices, kills, emits, deps } = makeSweepDeps();
+  for (const n of [52, 68, 86, 160]) {
+    const snapshot = parsePsOutput(['  10  10  1  S  bash',
+      ...Array.from({ length: n }, (_, i) => `  10  ${1000 + i}  10  S  npm`)].join('\n'));
+    sweepDescendantWatchdog(sessions, snapshot, deps);
+  }
+  assert.equal(kills.length, 0);
+  assert.equal(notices.length, 2);
+  assert.equal(emits.length, 2);
+  assert.ok(emits.every(frame => frame.detail.killed !== true));
+  assert.equal(emits[1].detail.count, 160);
+  assert.match(emits[1].detail.promptText, /Automatic termination is disabled/);
+  assert.equal(session.alive, true);
+  assert.equal(session.descendantWatchdog.killed, false);
+});
+
 test('sweepDescendantWatchdog: a stable count over several sweeps warns once, never kills, session stays alive', () => {
   const session = makeSweepSession();
   const sessions = new Map([['k1', session]]);
@@ -542,6 +581,7 @@ test('sweepDescendantWatchdog: sustained growth kills once, with killed:true on 
   const session = makeSweepSession();
   const sessions = new Map([['k1', session]]);
   const { kills, emits, deps } = makeSweepDeps();
+  deps.killEnabled = true;
   const snapshotFor = (n) => parsePsOutput(['  10  10  1  S  bash', ...Array.from({ length: n }, (_, i) => `  10  ${100 + i}  10  S  npm`)].join('\n'));
   sweepDescendantWatchdog(sessions, snapshotFor(52), deps);
   sweepDescendantWatchdog(sessions, snapshotFor(68), deps);
@@ -558,6 +598,7 @@ test('sweepDescendantWatchdog kills immediately at the ceiling', () => {
   const session = makeSweepSession();
   const sessions = new Map([['k1', session]]);
   const { kills, deps } = makeSweepDeps();
+  deps.killEnabled = true;
   const snapshot = parsePsOutput(['  10  10  1  S  bash', ...Array.from({ length: 160 }, (_, i) => `  10  ${1000 + i}  10  S  npm`)].join('\n'));
   sweepDescendantWatchdog(sessions, snapshot, deps);
   assert.equal(kills.length, 1);

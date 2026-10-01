@@ -29,13 +29,14 @@ export const HIDE_CLASS = 'tier--empty';
 //   hiddenCount — exactly the size of what's left in the reveal pool (all-closed tiers, NOT
 //                 emptyKeys) after extraStepsLoaded — so a "Show More" click never reveals
 //                 nothing.
-export function computeTierWindow(tierKeys, { allStepsLoaded, extraStepsLoaded, hasActiveMatch, hasAnyMatch } = {}) {
+// revealAll bypasses the local reveal pool for narrowing filters; empty tiers stay separate.
+export function computeTierWindow(tierKeys, { allStepsLoaded, revealAll = false, extraStepsLoaded, hasActiveMatch, hasAnyMatch } = {}) {
   const keys = Array.isArray(tierKeys) ? tierKeys : [];
   if (keys.length === 0) return { visibleKeys: [], emptyKeys: [], hiddenCount: 0 };
 
   const emptyKeys = keys.filter(k => !hasAnyMatch(k));
 
-  if (allStepsLoaded) return { visibleKeys: keys.filter(hasAnyMatch), emptyKeys, hiddenCount: 0 };
+  if (allStepsLoaded || revealAll) return { visibleKeys: keys.filter(hasAnyMatch), emptyKeys, hiddenCount: 0 };
 
   let visibleKeys = keys.filter(hasActiveMatch);
   let pool = keys.filter(k => !hasActiveMatch(k) && hasAnyMatch(k));

@@ -149,6 +149,8 @@ function packagedFixture(t) {
   fs.mkdirSync(source);
   fs.mkdirSync(resources);
   fs.writeFileSync(path.join(source, 'main.js'), 'module.exports = {};');
+  fs.writeFileSync(path.join(source, 'preload.js'), '');
+  fs.writeFileSync(path.join(source, 'todo-server.js'), '');
   for (const file of ['package.json', 'src/server/vcs-settings.js', 'src/server/vcs-context.js',
     'src/server/vcs-runtime.js', 'src/server/task-agent/base-agent.js', 'src/server/task-agent/codex-agent.js',
     'src/server/terminal-session.js', 'src/server/ws-handlers.js', 'src/server/index.js', 'src/server/api-backend.js',
@@ -192,6 +194,33 @@ test('release hook accepts a runtime-only archive and rejects leaked test files'
   await createPackage(f.source, path.join(badResources, 'app.asar'));
   await assert.rejects(afterPack({ appOutDir: f.dir, electronPlatformName: 'darwin',
     packager: { appInfo: { productFilename: 'Bad' } } }), /leak\.test\.js/);
+});
+
+test('packaged require guard checks archive entry points and all main modules recursively', async t => {
+  const f = packagedFixture(t);
+  fs.mkdirSync(path.join(f.source, 'main', 'nested'), { recursive: true });
+  fs.mkdirSync(path.join(f.source, 'lib'));
+  fs.writeFileSync(path.join(f.source, 'main.js'), "require('./lib');");
+  fs.writeFileSync(path.join(f.source, 'lib', 'index.js'), "require('../main.js'); require('../package.json');");
+  fs.writeFileSync(path.join(f.source, 'main', 'nested', 'entry.js'), "require('../../lib');");
+  await f.repack();
+  afterPack.assertPackagedRequires(path.join(f.resources, 'app.asar'));
+
+  // This source exists in the checkout but must never satisfy an archive import.
+  fs.writeFileSync(path.join(f.source, 'main.js'), "require('./src/server/app-version');");
+  fs.mkdirSync(path.join(f.source, 'empty'));
+  fs.writeFileSync(path.join(f.source, 'main', 'nested', 'entry.js'), "require('../../missing'); require('../../empty');");
+  fs.unlinkSync(path.join(f.source, 'preload.js'));
+  await f.repack();
+  assert.throws(() => afterPack.assertPackagedRequires(path.join(f.resources, 'app.asar')), error => {
+    assert.match(error.message, /main\.js: \.\/src\/server\/app-version/);
+    assert.match(error.message, /main\/nested\/entry\.js: \.\.\/\.\.\/missing/);
+    assert.match(error.message, /main\/nested\/entry\.js: \.\.\/\.\.\/empty/);
+    assert.match(error.message, /preload\.js: preload\.js/);
+    return true;
+  });
+  await assert.rejects(afterPack({ appOutDir: f.dir, electronPlatformName: 'linux', packager: {} }),
+    /Unresolved packaged requires/);
 });
 
 test('packaged versions pass when consistent and each mismatch is reported by name', async t => {

@@ -12,9 +12,8 @@
 //
 // killProcessGroup() fixes teardown (kill the whole group, not just the leader).
 // countDescendants()/evaluateRunaway() back a periodic watchdog (index.js) that first
-// raises an attention-style alert, then — when the runaway persists or grows fast —
-// kills the whole tree (killProcessTree()). Warning alone let a 127-descendant tree keep
-// growing until it starved the machine, so the watchdog now escalates from warn to kill.
+// raises an attention-style alert. Automatic tree killing is opt-in only, enabled by
+// index.js when TIPATASK_WATCHDOG_KILL=1; the default never terminates sessions.
 
 const { execFile } = require('node:child_process');
 
@@ -23,7 +22,7 @@ const DESCENDANT_ALERT_THRESHOLD = 50;
 // descendants — Codex keeps a pool of long-lived "unified exec" background terminals open)
 // was killed by the old rule (kill on the 2nd consecutive sweep at/above the threshold,
 // regardless of trend). A stable or shrinking count at/above the threshold now only ever
-// warns. Kill fires on either:
+// warns. With killEnabled, kill fires on either:
 //   - DESCENDANT_KILL_CONSECUTIVE consecutive sweeps that are each at/above the threshold
 //     AND rose by at least DESCENDANT_KILL_GROWTH over the sweep before, or
 //   - any single sweep at/above DESCENDANT_KILL_CEILING (3x the warn threshold) — unchanged,
@@ -181,7 +180,7 @@ function countDescendants(snapshot, rootPid) {
 // Pure decision function over a session's watchdog state (session-state.js's
 // `descendantWatchdog` shape: { pid, lastCount, lastAlertCount, threshold, alerted,
 // growthStreak, killed }). Returns { alert, kill, count }: `alert` = warn now, `kill` =
-// terminate the tree now.
+// terminate the tree now. killEnabled defaults to false; warning state still advances.
 // (TPT370) Warn-then-kill, growth-gated: a sweep only counts toward `growthStreak` when it
 // is at/above `threshold` AND rose by at least DESCENDANT_KILL_GROWTH over the PREVIOUS
 // sweep (which must itself have been at/above threshold — `state.lastCount` going in). A
@@ -198,7 +197,7 @@ function countDescendants(snapshot, rootPid) {
 // broadcastAttentionFor()'s _attentionLastBroadcast dedup in index.js), and resets the
 // alerted latch once the count falls back under half the threshold so a genuine build
 // spike that resolves can trip the alert again later instead of going silent forever.
-function evaluateRunaway(state, count) {
+function evaluateRunaway(state, count, { killEnabled = false } = {}) {
   const threshold = state.threshold || DESCENDANT_ALERT_THRESHOLD;
   const grew = count >= threshold && state.lastCount >= threshold
     && count - state.lastCount >= DESCENDANT_KILL_GROWTH;
@@ -211,7 +210,9 @@ function evaluateRunaway(state, count) {
   } else if (count < threshold / 2) {
     state.alerted = false;
   }
-  if (!state.killed) {
+  if (!killEnabled) {
+    state.killed = false;
+  } else if (!state.killed) {
     state.killed = count >= (state.killCeiling || DESCENDANT_KILL_CEILING)
       || state.growthStreak >= DESCENDANT_KILL_CONSECUTIVE;
   }
@@ -253,10 +254,12 @@ function describeKillPolicy(threshold, growth = DESCENDANT_KILL_GROWTH, ceiling 
     + `≥${growth}, or immediately at ≥${ceiling}`;
 }
 
-function buildRunawayWarning(count, threshold, summary) {
+function buildRunawayWarning(count, threshold, summary, { killEnabled = false } = {}) {
   const base = `${count} descendant processes under this session — possible runaway; the `
-    + `session keeps running. It will be killed automatically if this keeps growing `
-    + `(${describeKillPolicy(threshold)}).`;
+    + `session keeps running. `
+    + (killEnabled
+      ? `Automatic termination enabled (${describeKillPolicy(threshold)}).`
+      : `Automatic termination is disabled.`);
   return summary ? `${base} Top processes: ${summary}.` : base;
 }
 
@@ -268,14 +271,14 @@ function buildRunawayWarning(count, threshold, summary) {
 // injected: `killRunawaySession`/`emitTerminalNotice` (terminal-session.js),
 // `emitSessionRunaway` (websocket.js), `log` (default console.warn). Never throws — a bad
 // session shape is skipped, same fail-soft spirit as the rest of this module.
-function sweepDescendantWatchdog(sessions, snapshot, { killRunawaySession, emitTerminalNotice, emitSessionRunaway, log = console.warn } = {}) {
+function sweepDescendantWatchdog(sessions, snapshot, { killEnabled = false, killRunawaySession, emitTerminalNotice, emitSessionRunaway, log = console.warn } = {}) {
   for (const [, session] of sessions) {
     if (!session || session.type !== 'terminal' || !session.alive || !session.ptyPid) continue;
     const state = session.descendantWatchdog;
     if (!state) continue;
     const descendants = listDescendants(snapshot, session.ptyPid);
     const summary = summarizeDescendants(snapshot, descendants);
-    const { alert, kill, count } = evaluateRunaway(state, descendants.size);
+    const { alert, kill, count } = evaluateRunaway(state, descendants.size, { killEnabled });
     const label = session.taskId || session.tabId;
     if (kill) {
       log(`[watchdog] Task ${label}: ${count} descendant processes (threshold ${state.threshold}) `
@@ -288,7 +291,7 @@ function sweepDescendantWatchdog(sessions, snapshot, { killRunawaySession, emitT
     }
     if (!alert) continue;
     log(`[watchdog] Task ${label}: ${count} descendant processes (threshold ${state.threshold}) — possible runaway.`);
-    const noticeText = buildRunawayWarning(count, state.threshold, summary);
+    const noticeText = buildRunawayWarning(count, state.threshold, summary, { killEnabled });
     emitTerminalNotice(session, noticeText);
     emitSessionRunaway(session.projectPath, { taskId: session.tabId, pid: session.ptyPid, count, threshold: state.threshold, promptText: noticeText });
   }

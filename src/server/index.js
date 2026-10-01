@@ -378,9 +378,12 @@ server.on('error', (err) => {
 // Request failures are handled by createHttpHandler()'s per-request boundary. This is the
 // process-level backstop for everything that has no request to answer (see crash-guard.js): a
 // network-class uncaught exception (ECONNRESET / ETIMEDOUT / ...) is logged and the server keeps
-// running, any other uncaught exception is still fatal (exit 1), and unhandled rejections from
-// background work are logged and never exit.
-installCrashGuard();
+// running; other uncaught exceptions exit 1 only with no live sessions across any project.
+// Unhandled rejections from background work are logged and never exit.
+installCrashGuard({
+  sessions,
+  hasLiveSessions: () => [...sessions.values()].some(session => session?.alive === true),
+});
 
 // (TPT295) Objective LLM children and KB re-index runs are spawned detached — their own process
 // groups — so the SIGTERM that stops this server (Electron quit → serverChild.kill()), a Ctrl+C
@@ -660,12 +663,9 @@ if (process.platform === 'win32') {
   setInterval(async () => {
     const snapshot = await snapshotProcesses();
     if (!snapshot) return; // ps failed/timed out — skip this tick, never throw
-    // (TPT370) Sweep body lives in process-group.js — growth-gated warn-then-kill decision
-    // (evaluateRunaway) plus the console/notice/emit wiring, injected here so it can be unit
-    // tested with fake sessions instead of this real WS/pty stack. See that module for the
-    // policy this now applies: a stable or shrinking count above the warn threshold never
-    // kills; only sustained growth or the hard ceiling does.
+    // Warn-only by default. Explicit opt-in enables the growth/ceiling kill policy.
     sweepDescendantWatchdog(sessions, snapshot, {
+      killEnabled: process.env.TIPATASK_WATCHDOG_KILL === '1',
       killRunawaySession,
       emitTerminalNotice,
       emitSessionRunaway: websocket.emitSessionRunaway,

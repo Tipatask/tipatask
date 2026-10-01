@@ -193,3 +193,44 @@ test('syncAttentionClasses strips the ring from a card whose flag was cleared', 
 test('syncAttentionClasses is a no-op with no host and does not throw', () => {
   assert.doesNotThrow(() => syncAttentionClasses(null));
 });
+
+test('missing terminals retain metadata and lose attention across repeated snapshots', () => {
+  state.activeSessions.add('T1');
+  state.sessionMeta.set('T1', { agent: 'codex', type: 'terminal', startedAt: 123, alive: true });
+  raiseAttention('T1', { promptText: 'old prompt' });
+  mergeSessionsSnapshot({ sessions: [], exited: [] });
+  mergeSessionsSnapshot({ sessions: [], exited: [] });
+  assert.equal(state.activeSessions.size, 0);
+  assert.equal(state.lostSessions.has('T1'), true);
+  assert.equal(state.sessionMeta.get('T1').agent, 'codex');
+  assert.equal(state.sessionMeta.get('T1').alive, false);
+  assert.equal(isAttentionRaised('T1'), false);
+  assert.equal(attentionClass('T1'), ' session-lost');
+  const card = makeCard('T1');
+  syncAttentionClasses(makeHost([card]));
+  assert.equal(card.classList.contains('session-lost'), true);
+  assert.equal(card.classList.contains('needs-attention'), false);
+});
+
+test('server loss records hydrate cold clients; live/exited sessions win and clear loss', () => {
+  const loss = { reason: 'signal:SIGTERM', at: '2026-09-30T12:00:00.000Z' };
+  const snapshot = { projectPath: '/a', sessions: [], lost: ['T1'], lostDetails: { T1: loss },
+    sessionMeta: { T1: { agent: 'claude', type: 'terminal' } } };
+  mergeSessionsSnapshot(snapshot);
+  assert.deepEqual(state.lostSessions.get('T1'), loss);
+  mergeSessionsSnapshot({ ...snapshot, sessions: ['T1'] });
+  assert.equal(state.lostSessions.size, 0);
+  assert.equal(state.activeSessions.has('T1'), true);
+  mergeSessionsSnapshot({ ...snapshot, sessions: [], exited: ['T1'] });
+  assert.equal(state.lostSessions.size, 0);
+  mergeSessionsSnapshot(snapshot);
+  assert.equal(state.lostSessions.size, 0, 'old record cannot resurrect after recovery');
+});
+
+test('project changes clear lost rows and missing objective sessions never become terminal losses', () => {
+  mergeSessionsSnapshot({ projectPath: '/a', sessions: ['T1', 'obj-1'], sessionMeta: { 'obj-1': { type: 'objective' } } });
+  mergeSessionsSnapshot({ projectPath: '/a', sessions: [] });
+  assert.deepEqual([...state.lostSessions.keys()], ['T1']);
+  mergeSessionsSnapshot({ projectPath: '/b', sessions: [] });
+  assert.equal(state.lostSessions.size, 0);
+});

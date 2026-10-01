@@ -74,5 +74,5 @@ test('console-modal.js honours opts.prompt as a verbatim kickoff override, only 
   const body = src.slice(start, src.indexOf('function buildTaskSessionWsExtra('));
   assert.match(body, /if \(typeof opts\.prompt === 'string' && opts\.prompt\.trim\(\)\) return opts\.prompt;/);
   const extra = src.slice(src.indexOf('function buildTaskSessionWsExtra('), src.indexOf('export function startTaskSession('));
-  assert.match(extra, /isResume \? \(opts\.agent \? \{ agent: opts\.agent \} : null\) : \{ prompt: buildTaskSessionPrompt\(/);
+  assert.match(extra, /isResume \? \{\} : \{ prompt: buildTaskSessionPrompt\(/);
 });
