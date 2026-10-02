@@ -25,6 +25,7 @@ import { collectFamilyIds } from './related-cards.js';
 import { HIDE_CLASS } from './sprint-tier-visibility.js';
 import { cardVariant, cardMaxWidthPx, estimateTextWidth, TITLE_CHAR_PX } from './card-width.js';
 import { hasUnmetDeps, unmetDependencyKeys } from './dependency-status.js';
+import { expandedCardMaxHeight, clampExpandedTop } from './card-placement.js';
 export { isDragStateStale, resolveDropTier, shouldDeferForDrag };
 export { hasUnmetDeps, unmetDependencyKeys };
 // (C1483) Shape check for "is this a real task key" (prefix+number or dashed epic form)
@@ -347,6 +348,8 @@ export const CODEX_BADGE_SVG = '<svg viewBox="0 0 24 24" width="18" height="18" 
 export const PI_BADGE_SVG = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M4 7h16v2.2h-2.6l-.9 9.4a1.6 1.6 0 0 1-3.18-.16l.68-9.24H9.9l-.7 9.3a1.6 1.6 0 0 1-3.18-.18l.68-9.12H4V7z"/></svg>';
 
 const _WAND_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 14l7-7"/><path d="M11 1.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6z"/><path d="M14 7l.4 1 1 .4-1 .4-.4 1-.4-1-1-.4 1-.4z"/></svg>';
+// Speech bubble — opens the task chat window (task-chat.js).
+const _CHAT_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.5a1.5 1.5 0 0 1-1.5 1.5H5.5l-3 2.5V4A1.5 1.5 0 0 1 4 2.5h8A1.5 1.5 0 0 1 13.5 4z"/><path d="M5.5 6h5"/><path d="M5.5 8.25h3"/></svg>';
 // (C1340) Subtasks glyph — stem branching into two rows, shared by the objective
 // card's yellow "Create Subtasks" and green "Subtasks N/M" buttons (C1436).
 const _SUBTASKS_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 2h3"/><path d="M3.5 2v9.5a1 1 0 0 0 1 1H6"/><path d="M3.5 7H6"/><rect x="6" y="5" width="8" height="4" rx="1"/><rect x="6" y="10.5" width="8" height="4" rx="1"/></svg>';
@@ -533,6 +536,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
     : '';
   const chainBtn = `<button class="btn-chain-deps" data-task-id="${escapeAttr(t.id)}" data-tip="${escapeAttr(translate('tooltip.chain'))}" aria-label="${escapeAttr(translate('tooltip.chain'))}"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 9.5l3-3"/><path d="M9 10.5a2.5 2.5 0 0 1-3.536 0l-1.5-1.5a2.5 2.5 0 0 1 3.536-3.536l.5.5"/><path d="M7 5.5a2.5 2.5 0 0 1 3.536 0l1.5 1.5a2.5 2.5 0 0 1-3.536 3.536l-.5-.5"/></svg></button>`;
   const editBtn = `<button class="card-edit-btn" type="button" data-task-id="${escapeAttr(t.id)}" data-tip="${escapeAttr(translate('card.editTask'))}" aria-label="${escapeAttr(translate('card.editTask'))}"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 13h10"/><path d="M4 10.5V12h1.5l7-7-1.5-1.5-7 7Z"/><path d="m10.5 4 1.5-1.5 1.5 1.5L12 5.5"/></svg></button>`;
+  const chatBtn = `<button class="btn-task-chat" type="button" data-task-id="${escapeAttr(t.id)}" data-tip="${escapeAttr(translate('tooltip.taskChat'))}" aria-label="${escapeAttr(translate('tooltip.taskChat'))}">${_CHAT_SVG}</button>`;
   const reiterateBtn = `<button class="btn-reiterate" data-task-id="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" data-tip="${escapeAttr(translate('tooltip.reiterate'))}" aria-label="${escapeAttr(translate('tooltip.reiterate'))}">${_WAND_SVG}</button>`;
   const inlineChildren = preview ? [] : (state.childrenByParent?.get(t.id) || []); // radios mutate status — never in a preview
   const hasInlineChildren = inlineChildren.length > 0;
@@ -589,7 +593,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
           ${activityChip}
           <span class="card-title${proposal ? ' preview-title' : ''}"${proposal ? ' data-field="title" contenteditable="false"' : ''} ${idAttr}="${escapeAttr(t.id)}" title="${escapeAttr(t.title)}"><span class="card-title-inner">${escapeAttr(t.title)}</span></span>
           ${preview ? '' : `<div class="card-btn-group">
-            ${selectBtn}<div class="card-action-menu" role="group" aria-label="${escapeAttr(translate('card.actionsMenu'))}">${editBtn}${chainBtn}${reiterateBtn}${deleteBtn}${mergeBtn}</div>
+            ${selectBtn}<div class="card-action-menu" role="group" aria-label="${escapeAttr(translate('card.actionsMenu'))}">${editBtn}${chatBtn}${chainBtn}${reiterateBtn}${deleteBtn}${mergeBtn}</div>
           </div>`}
         </div>
         ${preview ? previewMetaHtml : `<div class="task-card-hover-controls">
@@ -640,6 +644,12 @@ function unlockBodyScroll() {
   document.body.style.paddingRight = '';
 }
 
+// (TPT456) Detaches the expanded overlay's placement listeners (ResizeObserver, window resize +
+// scroll). The scroll handler also stays on state.hoverScrollHandler for collapseCard()'s
+// existing removal, but setupCardInteractions() blanks that field on re-render without removing
+// the listener, so the teardown owns its removal too.
+let expandedPlacementTeardown = null;
+
 export function expandCard(card, mode = 'pinned') {
   collapseCard();
   state.expandedCardMode = mode;
@@ -688,35 +698,51 @@ export function expandCard(card, mode = 'pinned') {
   // (C1433) kept in sync with .card.chain-hl's z-index: 100 in styles.css — an
   // expanded objective card must stack above the ringed subtask cards behind it.
   card.style.zIndex = '101';
-  // (TPT303) A chat proposal overlay may use the whole viewport height (10px margins, same as
-  // the top clamp below) so most proposals open without scrolling; board cards keep 80vh.
-  const maxHeight = card.classList.contains('preview-card')
-    ? window.innerHeight - 20
-    : window.innerHeight * 0.8;
-  const idealTop = rect.top;
-  // (TPT344) A board card's root no longer overflows — its .card-desc is the only scroller, so
-  // the card's own scrollHeight under-reports by however much the description is clipped. Add
-  // that hidden part back or a tall card would be positioned as if it were short and run off
-  // the bottom of the viewport. Preview overlays still scroll as a whole (inline overflowY).
+  // (TPT303) A chat proposal overlay may use the whole viewport height (10px margins) so most
+  // proposals open without scrolling; board cards keep 80vh. Preview overlays still scroll as a
+  // whole (inline overflowY); a board card's .card-desc is its only scroller (TPT344).
   const isPreviewOverlay = card.matches('.card--preview, .preview-card');
-  const desc = card.querySelector(':scope > .card-desc');
-  const clippedDesc = desc ? Math.max(0, desc.scrollHeight - desc.clientHeight) : 0;
-  const cardHeight = Math.min(card.scrollHeight + clippedDesc, maxHeight);
-  const top = Math.max(10, Math.min(idealTop, window.innerHeight - cardHeight - 10));
-  card.style.top = top + 'px';
-  card.style.maxHeight = maxHeight + 'px';
   if (isPreviewOverlay) card.style.overflowY = 'auto';
 
+  // (TPT456) Placement is re-run whenever the card's real height can change — its own size
+  // (late images, the title marquee, anything still settling), a window resize, or a window
+  // scroll — instead of being estimated once at expand time. Measuring the laid-out
+  // offsetHeight (already capped by max-height) means the overlay is never left hanging off
+  // the bottom of the viewport; ResizeObserver callbacks run after layout and before paint,
+  // so a correction never shows a frame offscreen.
+  const anchorTop = rect.top;
   const scrollYAtExpand = window.scrollY;
-  const initialTop = top;
-  state.hoverScrollHandler = () => {
-    card.style.top = (initialTop - (window.scrollY - scrollYAtExpand)) + 'px';
+  const placeExpanded = () => {
+    if (!card.isConnected || !card.classList.contains('card-expanded')) return;
+    const viewportHeight = window.innerHeight;
+    card.style.maxHeight = expandedCardMaxHeight({ viewportHeight, isPreview: card.classList.contains('preview-card') }) + 'px';
+    const top = clampExpandedTop({
+      anchorTop: anchorTop - (window.scrollY - scrollYAtExpand),
+      height: card.offsetHeight,
+      viewportHeight,
+    });
+    card.style.top = top + 'px';
   };
-  window.addEventListener('scroll', state.hoverScrollHandler, { passive: true });
+  placeExpanded();
+
+  state.hoverScrollHandler = placeExpanded;
+  window.addEventListener('scroll', placeExpanded, { passive: true });
+  window.addEventListener('resize', placeExpanded);
+  const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(placeExpanded) : null;
+  if (resizeObserver) resizeObserver.observe(card);
+  expandedPlacementTeardown = () => {
+    window.removeEventListener('resize', placeExpanded);
+    window.removeEventListener('scroll', placeExpanded);
+    if (resizeObserver) resizeObserver.disconnect();
+  };
 }
 
 export function collapseCard() {
   state.expandedCardMode = null;
+  if (expandedPlacementTeardown) {
+    expandedPlacementTeardown();
+    expandedPlacementTeardown = null;
+  }
   if (state.hoverScrollHandler) {
     window.removeEventListener('scroll', state.hoverScrollHandler);
     state.hoverScrollHandler = null;
@@ -2132,6 +2158,25 @@ export function setupCardInteractions(appEl) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       if (_onOpenTaskEditModal) _onOpenTaskEditModal(btn.dataset.taskId, btn);
+    });
+  });
+
+  // ── Task chat button → chat window for this task (one persisted session per task) ──
+  // Reached through window.TipTask rather than an import: task-chat.js imports renderCard
+  // from this module.
+  appEl.querySelectorAll('.btn-task-chat').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const taskId = btn.dataset.taskId;
+      // (TPT272/TPT283) Locked by Rehash → Discuss/Split: the chat agent can change the task,
+      // which would race the open proposal — same rule as the edit modal.
+      if (isTaskDiscussing(state, taskId)) {
+        showToast(translate(lockMessageKey(lockIntentOf(state, taskId))));
+        return;
+      }
+      if (btn.closest('.card')?.classList.contains('pending-sync')) return; // no server task yet
+      collapseCard();
+      window.TipTask?.taskChat?.open(taskId);
     });
   });
   appEl.querySelectorAll('.card[data-id]').forEach(card => {

@@ -79,6 +79,7 @@ export function activateDialogFocus({ root, initialFocus, returnFocus, portals }
   let closed = false;
   return {
     focusFirst: () => { if (top() === layer) focusFirst(layer); },
+    isTop: () => top() === layer,
     close() {
       if (closed) return;
       closed = true;

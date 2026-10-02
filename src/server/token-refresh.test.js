@@ -1,8 +1,9 @@
 'use strict';
 
 // TPT349 — refreshProjectToken(): silent exchange of a still-valid project token for a fresh
-// 7-day one through POST /api/auth/project-token, persisted to .tipatask/config.json and the
-// .claude/settings.local.json env copy. Runs against a fake HTTP API + scratch project dirs.
+// 7-day one through POST /api/auth/project-token, persisted to the app-level account store
+// (never to .tipatask/config.json) and mirrored into the .claude/settings.local.json env copy.
+// Runs against a fake HTTP API + scratch project dirs.
 
 const { test } = require('node:test');
 const assert = require('node:assert');
@@ -11,7 +12,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+// The account store defaults to USER_DATA_ROOT; keep this file's tokens in a private dir.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-refresh-userdata-'));
 const { refreshProjectToken } = require('./token-refresh');
+const { readAccount, writeAccountToken } = require('./account-store');
 const { tokenExpiryMs } = require('./auth-guard');
 const { projectEnvExtras } = require('./spawn-utils');
 
@@ -41,15 +45,19 @@ async function withApi(handler, run) {
   }
 }
 
+// `cfg.API_TOKEN` is the signed-in account's token: it goes to the account store, as in the
+// app; config.json gets only the project target.
 function makeProject(cfg) {
+  const { API_TOKEN: token, ...fileCfg } = cfg;
+  if (token) writeAccountToken(cfg.API_BASE_URL, token);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-refresh-'));
   fs.mkdirSync(path.join(root, '.tipatask'), { recursive: true });
-  fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify(cfg, null, 2));
+  fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify(fileCfg, null, 2));
   return root;
 }
 const readCfg = (root) => JSON.parse(fs.readFileSync(path.join(root, '.tipatask', 'config.json'), 'utf8'));
 
-test('refreshProjectToken: posts the current token, writes the fresh one, keeps every other key', async (t) => {
+test('refreshProjectToken: posts the current token, stores the fresh one in the account store, keeps config.json untouched', async (t) => {
   const oldTok = makeJwt(nowSec() + 300);
   const newTok = makeJwt(nowSec() + 7 * 86400);
   await withApi((req, res) => {
@@ -69,7 +77,8 @@ test('refreshProjectToken: posts the current token, writes the fresh one, keeps 
     assert.deepStrictEqual(JSON.parse(requests[0].body), { project_id: 2 });
 
     const cfg = readCfg(root);
-    assert.strictEqual(cfg.API_TOKEN, newTok);
+    assert.ok(!Object.hasOwn(cfg, 'API_TOKEN'), 'config.json must never get API_TOKEN written');
+    assert.strictEqual(readAccount(baseUrl).token, newTok);
     assert.strictEqual(cfg.CLAUDE_MODEL, 'opus');
     assert.ok(!('theme' in cfg) && !('language' in cfg), 'reader defaults must not be persisted');
   });
@@ -107,7 +116,7 @@ test('refreshProjectToken: rewrites the settings.local.json env copy and gitigno
   });
 });
 
-test('refreshProjectToken: concurrent callers for one project share a single request', async (t) => {
+test('refreshProjectToken: concurrent callers on one API server (even two projects) share a single request', async (t) => {
   const oldTok = makeJwt(nowSec() + 300);
   const newTok = makeJwt(nowSec() + 7 * 86400);
   await withApi((req, res) => {
@@ -115,8 +124,10 @@ test('refreshProjectToken: concurrent callers for one project share a single req
   }, async (baseUrl, requests) => {
     const root = makeProject({ API_BASE_URL: baseUrl, API_TOKEN: oldTok, API_PROJECT_ID: '2' });
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const root2 = makeProject({ API_BASE_URL: baseUrl, API_PROJECT_ID: '3' });
+    t.after(() => fs.rmSync(root2, { recursive: true, force: true }));
     const args = { projectRoot: root, baseUrl, token: oldTok, projectId: '2' };
-    const [a, b] = await Promise.all([refreshProjectToken(args), refreshProjectToken(args)]);
+    const [a, b] = await Promise.all([refreshProjectToken(args), refreshProjectToken({ ...args, projectRoot: root2, projectId: '3' })]);
     assert.strictEqual(requests.length, 1);
     assert.deepStrictEqual(a, b);
     // The in-flight slot is released, so a later refresh issues a new request.
@@ -125,7 +136,7 @@ test('refreshProjectToken: concurrent callers for one project share a single req
   });
 });
 
-test('refreshProjectToken: a token rotated in config.json meanwhile (re-auth) is never overwritten', async (t) => {
+test('refreshProjectToken: a token rotated in the account store meanwhile (re-auth) is never overwritten', async (t) => {
   const oldTok = makeJwt(nowSec() + 300);
   const reauthTok = makeJwt(nowSec() + 6 * 86400);
   const serverTok = makeJwt(nowSec() + 7 * 86400);
@@ -134,18 +145,19 @@ test('refreshProjectToken: a token rotated in config.json meanwhile (re-auth) is
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const out = await refreshProjectToken({ projectRoot: root, baseUrl, token: oldTok, projectId: '2' });
     assert.deepStrictEqual(out, { token: reauthTok, rotated: true });
-    assert.strictEqual(readCfg(root).API_TOKEN, reauthTok);
+    assert.strictEqual(readAccount(baseUrl).token, reauthTok);
   });
 });
 
-test('refreshProjectToken: a deliberate blank token (mid re-auth) stays blank', async (t) => {
+test('refreshProjectToken: a signed-out account (cleared mid re-auth) stays signed out', async (t) => {
   const oldTok = makeJwt(nowSec() + 300);
   await withApi((req, res) => { res.writeHead(200); res.end(JSON.stringify({ token: makeJwt(nowSec() + 86400) })); }, async (baseUrl) => {
     const root = makeProject({ API_BASE_URL: baseUrl, API_TOKEN: '', API_PROJECT_ID: '2' });
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const out = await refreshProjectToken({ projectRoot: root, baseUrl, token: oldTok, projectId: '2' });
     assert.strictEqual(out.rotated, true);
-    assert.strictEqual(readCfg(root).API_TOKEN, '');
+    assert.strictEqual(readAccount(baseUrl), null);
+    assert.ok(!Object.hasOwn(readCfg(root), 'API_TOKEN'));
   });
 });
 
@@ -162,7 +174,7 @@ test('refreshProjectToken: non-2xx and unusable bodies reject with token-free me
       await assert.rejects(
         () => refreshProjectToken({ projectRoot: root, baseUrl, token: oldTok, projectId: '2' }),
         (err) => { assert.match(err.message, expected); assert.ok(!err.message.includes(oldTok)); return true; });
-      assert.strictEqual(readCfg(root).API_TOKEN, oldTok);
+      assert.strictEqual(readAccount(baseUrl).token, oldTok);
     });
   }
 });

@@ -167,7 +167,7 @@ test('PiAgent.buildPrompt: blank description uses PUT /tags/:name wording (no MC
   try {
     const agent = new PiAgent();
     // A long tag list on top of a blank one exercises the MAX_LISTED_TAGS cap alongside
-    // the existing 9000-char budget in the same pass.
+    // the existing 9300-char budget in the same pass.
     const manyTags = Array.from({ length: 20 }, (_, i) => `tt-tag-${i}`);
     const taskTags = ['tt-pi-session', ...manyTags];
     const tagDescriptions = { 'tt-pi-session': '' };
@@ -189,10 +189,10 @@ test('PiAgent.buildPrompt: blank description uses PUT /tags/:name wording (no MC
     assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*plan ready[.!]?\s*$/im);
     assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*questions ready[.!]?\s*$/im);
 
-    // Ceiling raised 8500 -> 9000 for C1542's unconditional compact KB-hygiene directive
-    // — see pi-agent.test.js's own comment on the same change.
-    t.diagnostic(`Pi blank-tag fixture: ${prompt.length} / 9000`);
-    assert.ok(prompt.length < 9000, `prompt grew to ${prompt.length} chars`);
+    // Shared Pi ceiling, raised for each unconditional compact directive — see
+    // pi-agent.test.js's own comment.
+    t.diagnostic(`Pi blank-tag fixture: ${prompt.length} / 9300`);
+    assert.ok(prompt.length < 9300, `prompt grew to ${prompt.length} chars`);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

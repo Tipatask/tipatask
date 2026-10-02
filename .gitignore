@@ -27,6 +27,9 @@
 /.claude/settings.local.json
 /.codex/
 /.knowledge-versions.json
+# Signed-in account token store (account-store.js) — USER_DATA_ROOT is this checkout in dev
+/.tipatask-account.json
+/.tipatask-account.json.tmp.*
 *.log
 
 /coverage/

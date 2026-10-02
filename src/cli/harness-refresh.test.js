@@ -5,6 +5,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const toml = require('toml');
+// The account store defaults to USER_DATA_ROOT; keep this file's tokens in a private dir.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-harness-userdata-'));
+const { readAccount } = require('../server/account-store');
 const { installTemplates, refreshHarnessTemplates } = require('./install-templates');
 const { readManifest, writeManifest, computeFileHash } = require('./manifest');
 const { writeProjectSkillsConfig, writeProjectConfig, writeProjectMcpConfig } = require('../server/project-config');
@@ -176,7 +179,9 @@ test('sync keeps provider settings, merges remote agents and only calls device e
   for (let i = 0; i < 2; i++) await runSyncSetupStep({ env: { values: { TASK_AGENT: 'claude' } }, projectRoot: root, requestFn, deviceIdPath });
   const saved = JSON.parse(read(root, '.tipatask/config.json'));
   assert.equal(saved.AVAILABLE_AGENTS, 'pi,claude,codex');
-  for (const key of Object.keys(cfg).filter(k => k !== 'AVAILABLE_AGENTS')) assert.deepEqual(saved[key], cfg[key]);
+  for (const key of Object.keys(cfg).filter(k => k !== 'AVAILABLE_AGENTS' && k !== 'API_TOKEN')) assert.deepEqual(saved[key], cfg[key]);
+  assert.ok(!Object.hasOwn(saved, 'API_TOKEN'), 'config.json never carries the token');
+  assert.equal(readAccount(cfg.API_BASE_URL).token, cfg.API_TOKEN);
   assert.equal(calls.length, 4);
   assert.equal(fs.existsSync(path.join(root, '.env')), false);
 });

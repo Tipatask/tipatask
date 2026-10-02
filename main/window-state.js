@@ -15,7 +15,11 @@ const _windows = new Map();
 const _backendCache = new Map();
 
 function _sig(cfg) {
-  return JSON.stringify([cfg?.TASK_BACKEND, cfg?.API_BASE_URL, cfg?.API_PROJECT_ID, cfg?.API_TOKEN]);
+  // The token is the signed-in account's, held in the app-level account store rather than in
+  // the project's config.json; fingerprint it so a re-auth still invalidates the cached backend.
+  let token = cfg?.API_TOKEN;
+  try { token = require('../src/server/account-store').readAccount(cfg?.API_BASE_URL)?.token || token; } catch { /* store unreadable */ }
+  return JSON.stringify([cfg?.TASK_BACKEND, cfg?.API_BASE_URL, cfg?.API_PROJECT_ID, token]);
 }
 
 function _safeSend(webContentsId, channel, payload) {

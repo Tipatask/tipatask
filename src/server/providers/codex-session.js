@@ -12,6 +12,10 @@ const { buildTurnPrompt, buildNudgeMessage } = require('./transcript');
 const { localizeAttachments } = require('../task-agent/attachments');
 const { shouldTrimContext, trimContext } = require('../context-manager');
 const throttle = require('../objective-throttle');
+const { toolProfileFor, codexProfileConfigArgs } = require('./tool-profiles');
+const { CODEX_TASK_CHAT_FENCE } = require('../task-chat');
+const { listProjectMcpServerNames } = require('../../codex-mcp-config');
+const taskChatWidgets = require('../task-chat-widgets');
 
 // Codex has no --disallowedTools equivalent — `-s read-only` blocks filesystem/shell
 // mutation but NOT MCP tool calls (the project's .codex/config.toml registers the full
@@ -56,13 +60,19 @@ function extractLocalImagePaths(text, max = MAX_IMAGE_ATTACH) {
   return out;
 }
 
-function buildCodexArgs(session, { cwd, model, imagePaths }) {
+// `otherMcpServers` only matters for a session under a tool profile (task chat): the names of
+// every other MCP server in the project's Codex config, which the profile switches off.
+function buildCodexArgs(session, { cwd, model, imagePaths, otherMcpServers = [] }) {
   const imgFlags = imagePaths.flatMap(p => ['-i', p]);
   const effortFlags = codexEffortArgs(toCodexEffort(config.OBJECTIVE_EFFORT));
+  const profile = toolProfileFor(session, 'codex');
   if (session.codexSessionId) {
     return [
       'exec', 'resume', session.codexSessionId,
       ...effortFlags,
+      // `resume` takes no -s; a profiled chat re-states its sandbox as a config override
+      // instead of trusting the resumed thread to have kept it.
+      ...codexProfileConfigArgs(profile, { resume: true, otherMcpServers }),
       ...(model ? ['-m', model] : []),
       '--json', '--skip-git-repo-check',
       ...imgFlags,
@@ -72,6 +82,7 @@ function buildCodexArgs(session, { cwd, model, imagePaths }) {
   return [
     'exec',
     ...effortFlags,
+    ...codexProfileConfigArgs(profile, { otherMcpServers }),
     ...(model ? ['-m', model] : []),
     '--json', '-s', 'read-only', '--skip-git-repo-check', '-C', cwd,
     ...imgFlags,
@@ -189,7 +200,10 @@ function finalizeCodexTurn(session, taskId, code, emit, usage) {
     session.timingMilestones.firstChunk = session.timingMilestones.resultAt || Date.now();
   }
 
-  const cardResult = extractCards(session, emit);
+  // A task chat answers in prose: no proposal cards to extract and no "emit JSON" nudge.
+  const plainTurn = session.type === 'taskChat';
+  const cardResult = plainTurn ? null : extractCards(session, emit);
+  if (plainTurn) taskChatWidgets.emitDialogs(session, emit);
   const assistantMsg = {
     role: 'assistant',
     content: session.turnBuffer,
@@ -203,7 +217,7 @@ function finalizeCodexTurn(session, taskId, code, emit, usage) {
 
   // Nudge loop (shared with claude-session.js) — Codex is markedly more likely than
   // Claude to answer with prose/headers instead of a fenced ```json block.
-  if (!cardResult && code === 0 && !session._aborted && (session._nudgeAttempt || 0) < config.OBJECTIVE_MAX_NUDGES) {
+  if (!plainTurn && !cardResult && code === 0 && !session._aborted && (session._nudgeAttempt || 0) < config.OBJECTIVE_MAX_NUDGES) {
     session._nudgeAttempt = (session._nudgeAttempt || 0) + 1;
     session.messages.push({ role: 'assistant', content: session.turnBuffer, timestamp: Date.now() });
     session.messages.push({ role: 'user', content: buildNudgeMessage(session.turnBuffer), timestamp: Date.now() });
@@ -218,6 +232,7 @@ function finalizeCodexTurn(session, taskId, code, emit, usage) {
     return;
   }
 
+  if (plainTurn) taskChatWidgets.attachTaskChatWidgets(session, assistantMsg);
   session.messages.push(assistantMsg);
 
   const tokens = usage ? {
@@ -294,6 +309,7 @@ function spawnCodexTurn(session, taskId) {
   session.turnBuffer = '';
   session.turnRawSse = '';
   session._lastEmittedCardsJson = null;
+  taskChatWidgets.resetTaskChatTurn(session);
   session._resultFinalized = false;
   session._aborted = false;
 
@@ -308,7 +324,8 @@ function spawnCodexTurn(session, taskId) {
     includeSystemPrompt: true,
     hasProviderSession,
   });
-  const withFence = promptMode === 'resume' ? basePrompt : `${CODEX_TOOL_FENCE}\n\n${basePrompt}`;
+  const fence = toolProfileFor(session, 'codex') ? CODEX_TASK_CHAT_FENCE : CODEX_TOOL_FENCE;
+  const withFence = promptMode === 'resume' ? basePrompt : `${fence}\n\n${basePrompt}`;
   if (promptMode === 'handoff') {
     console.log(`[objective:handoff] task=${taskId} switching to codex model=${model} — sending full transcript (${withFence.length} chars)`);
   }
@@ -355,7 +372,8 @@ function spawnCodexTurn(session, taskId) {
 
     let env;
     try {
-      ({ env } = buildCodexEnv({ projectRoot: session.projectPath || config.PROJECT_ROOT, taskId }));
+      // Profiled project chats have no task key to stamp into TIPATASK_TASK_ID.
+      ({ env } = buildCodexEnv({ projectRoot: session.projectPath || config.PROJECT_ROOT, taskId: session.toolProfile ? session.taskKey : taskId }));
     } catch (err) {
       session._spawning = false;
       console.error(`[codex] env build failed task=${taskId}: ${err.message}`);
@@ -363,7 +381,9 @@ function spawnCodexTurn(session, taskId) {
       return;
     }
 
-    const args = buildCodexArgs(session, { cwd, model, imagePaths });
+    // Read after buildCodexEnv(): it has just refreshed the project's .codex/config.toml.
+    const otherMcpServers = toolProfileFor(session, 'codex') ? listProjectMcpServerNames(cwd) : [];
+    const args = buildCodexArgs(session, { cwd, model, imagePaths, otherMcpServers });
     const proc = cpSpawn(config.CODEX_BIN, args, {
       cwd,
       env,
@@ -426,6 +446,13 @@ function spawnCodexTurn(session, taskId) {
         } else if (event.type === 'turn.started') {
           emit({ type: 'objective-progress', stage: 'model-thinking' });
 
+        } else if (event.type === 'item.started') {
+          // Only a task chat draws tool widgets; every other chat waits for item.completed.
+          const item = event.item || {};
+          if (session.type === 'taskChat' && item.type === 'mcp_tool_call') {
+            taskChatWidgets.toolStarted(session, emit, { id: item.id, server: item.server, tool: item.tool, input: item.arguments });
+          }
+
         } else if (event.type === 'item.completed') {
           const item = event.item || {};
           if (item.type === 'agent_message' && typeof item.text === 'string') {
@@ -435,13 +462,24 @@ function spawnCodexTurn(session, taskId) {
             }
             session.turnBuffer += item.text;
             emit({ type: 'data', data: item.text });
-            extractCards(session, emit);
+            if (session.type === 'taskChat') taskChatWidgets.emitDialogs(session, emit);
+            else extractCards(session, emit);
           } else {
             // Reasoning/tool/command items — Codex's only pre-answer signal (no deltas).
             if (config.OBJECTIVE_TIMING_ENABLED && !session.timingMilestones.firstChunk) {
               session.timingMilestones.firstChunk = Date.now();
             }
             emit({ type: 'objective-progress', stage: 'tool', name: item.type || 'tool' });
+            if (session.type === 'taskChat' && item.type === 'mcp_tool_call') {
+              taskChatWidgets.toolFinished(session, emit, {
+                id: item.id,
+                server: item.server,
+                tool: item.tool,
+                input: item.arguments,
+                isError: item.status === 'failed' || !!item.error,
+                result: item.error || item.result,
+              });
+            }
           }
 
         } else if (event.type === 'turn.completed') {

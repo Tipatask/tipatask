@@ -17,6 +17,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+// The account store defaults to USER_DATA_ROOT; keep this file's tokens in a private dir.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-auth-fc-userdata-'));
+const { clearAccountToken } = require('./account-store');
 const { createApiBackend, AuthCorruptedError } = require('./api-backend');
 const { createPerProjectBackend } = require('./task-backend');
 
@@ -34,6 +37,9 @@ async function withFakeApiServer(handler, token, run) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-auth-fail-closed-'));
+  // Ephemeral ports get reused between tests: start each from a signed-out account so the
+  // inline token written below is the only one in play.
+  clearAccountToken(`http://127.0.0.1:${port}`);
   fs.mkdirSync(path.join(projectRoot, '.tipatask'));
   fs.writeFileSync(path.join(projectRoot, '.tipatask', 'config.json'), JSON.stringify({
     TASK_BACKEND: 'api',

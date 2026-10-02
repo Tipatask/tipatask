@@ -155,6 +155,8 @@ const state = {
   activeSessions: new Set(), // taskIds with running server-side sessions
   lostSessions: new Map(), // taskId -> { reason?, at? }; not running, retained for recovery
   exitedSessions: new Set(), // taskIds with exited server-side sessions (alive=false)
+  queueInfo: { running: null, cap: null }, // (TPT444) latest start-queue snapshot numbers
+  queuedSessions: new Map(), // (TPT444) taskId -> FIFO position in the server's session start queue (not running yet)
   // (C1144) taskId -> { agent, label, type, alive } from GET /api/sessions —
   // the only source of a session's agent id; the left-nav active-sessions list needs it for the icon.
   sessionMeta: new Map(),

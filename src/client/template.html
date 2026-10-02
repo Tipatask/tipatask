@@ -364,7 +364,8 @@ const {
   registerTaskEditNavigation,
   initSettingsModal, openSettingsModal, applyProjectTheme, applyProjectLanguage, syncKb, reindexKb,
   applyProjectBoardFilters, persistBoardFilters, onBoardFiltersChanged,
-  refreshFilterBarChrome, refreshBoardForFilters, computeVisibleTiers,
+  refreshFilterBarChrome, refreshBoardForFilters, computeVisibleTiers, anyNarrowingFilterActive,
+  FILTERED_TIER_PAGE_SIZE,
   applyProjectDebugPerfLog, writeDebugPerfLog,
   applyProjectBrowserTools, writeProjectBrowserTools,
   handleVoiceModelMessage,
@@ -556,6 +557,10 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
           <span class="left-nav-icon"></span>
           <span class="left-nav-label">${escapeAttr(t('nav.create'))}</span>
         </button>
+        <button class="left-nav-btn left-nav-btn--chat" data-action="start-chat" type="button" title="${escapeAttr(t('nav.startChat'))}">
+          <span class="left-nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.6A8 8 0 1 1 21 12z"/><path d="M13 9v6M10 12h6"/></svg></span>
+          <span class="left-nav-label">${escapeAttr(t('nav.startChat'))}</span>
+        </button>
         <div class="sidebar-divider" id="active-sessions-divider" hidden></div>
         <div id="active-sessions-list" class="active-sessions-list" role="group" aria-label="Active agent sessions" hidden></div>
       </div>
@@ -573,7 +578,14 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
     // later fetch is a refresh-button click or a real project switch (resetAgentQuota()).
     initializeAgentQuotaSidebar(panel.querySelector('#agent-quota-sidebar'));
 
-    panel.querySelectorAll('.left-nav-btn').forEach(btn => {
+    // (C1292) Start Chat opens the project chat window over whatever is showing — it is not a
+    // section, so it stays out of the navigation loop below (no loadAndRender, no terminal detach:
+    // the chat window stacks above .terminal-overlay).
+    panel.querySelector('[data-action="start-chat"]').addEventListener('click', () => {
+      window.TipTask?.taskChat?.openProjectChat?.();
+    });
+
+    panel.querySelectorAll('.left-nav-btn[data-section]').forEach(btn => {
       btn.addEventListener('click', () => {
         const section = btn.dataset.section;
         // (TPT360) The rail is no longer covered by an open task terminal, so a Project Board /
@@ -655,6 +667,7 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
   tasksBtn?.classList.toggle('active', isTasksSection);
   const newBtn = panel.querySelector('[data-section="new"]');
   applyNavLabel(newBtn, 'nav.create');
+  applyNavLabel(panel.querySelector('[data-action="start-chat"]'), 'nav.startChat');
   newBtn?.classList.toggle('active', isNewSection);
   newBtn?.classList.toggle('loading', isStreaming);
   newBtn?.classList.toggle('ready', isReady);
@@ -2814,7 +2827,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
 
   // ── Show More button ──
   // (C1259) Two modes, chosen fresh on every click (state can change between clicks):
-  // - local tiers already fetched but hidden behind the cutoff → reveal 10 more, no fetch
+  // - local tiers already fetched but hidden behind the cutoff → reveal one page, no fetch
   // - nothing left to reveal locally, but the server-side sprint window (window.has_older)
   //   says older sprints exist → widen the window (extend the floor 10 sprints further
   //   back) and refetch. Once the server reports has_older:false, _applyBoardWindow()
@@ -2850,7 +2863,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
         ? computeVisibleTiers(state.tierKeys, state.tiers)
         : { hiddenCount: 0 };
       if (hiddenCount > 0) {
-        state.extraStepsLoaded += 10;
+        state.extraStepsLoaded += anyNarrowingFilterActive() ? FILTERED_TIER_PAGE_SIZE : 10;
       } else {
         state.sprintWindowExtend += 10;
       }
@@ -4216,7 +4229,9 @@ if (window.electronAPI) {
   // ask Connect-existing vs Create-new (only then, since the folder is now known).
   async function openOrCreateProject() {
     const pick = await window.electronAPI.pickAndOpenProject();
-    const alreadyOpen = !!(pick && (await window.electronAPI.focusProjectWindow(pick.path))?.ok);
+    const focusResult = pick && await window.electronAPI.focusProjectWindow(pick.path);
+    if (focusResult?.canceled) return;
+    const alreadyOpen = !!focusResult?.ok;
     const d = window.TipTask.projectOpenFlow.decideOpenAction({ pick, alreadyOpen });
     if (d.action === 'none' || d.action === 'focused') return;
     if (d.action === 'open-new') { window.electronAPI.openProject(d.path, 'new'); return; }

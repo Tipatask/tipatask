@@ -11,6 +11,8 @@
 // calls serverChild.disconnect() itself). Deliberately NOT SIGHUP: a listener would override the
 // ignore `nohup` hands down, so closing that terminal would stop a server meant to outlive it.
 
+const { isAgentChatType } = require('./session-state');
+
 const SHUTDOWN_SIGNALS = ['SIGTERM', 'SIGINT'];
 // Time a SIGTERM'd child gets to exit cleanly before its group is SIGKILLed.
 const SHUTDOWN_KILL_GRACE_MS = 500;
@@ -21,13 +23,13 @@ function defaultSleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-// Tears down every objective/spec chat and kills every warm prewarm, the cold spare and every live
+// Tears down every objective/spec/task chat and kills every warm prewarm, the cold spare and every live
 // headless run. Terminal (PTY) sessions are left alone: they are not detached, and exiting closes
 // their pty masters, which hangs each pty session up. Returns the procs signalled.
 function reapLlmChildren(sessions, reason, { claude, headless }) {
   const killed = [];
   for (const [key, session] of sessions) {
-    if (session?.type !== 'objective' && session?.type !== 'specChat') continue;
+    if (!isAgentChatType(session?.type)) continue;
     // Warm prewarms are keyed by the unscoped tab/task id, not the composite Map key.
     killed.push(...claude.teardownObjectiveSession(session, session.tabId || String(key).split('\0')[0], reason));
   }

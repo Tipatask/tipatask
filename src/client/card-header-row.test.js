@@ -73,8 +73,18 @@ test('renderCard puts Select + the action menu at the end of .card-top', () => {
   assert.match(cardJs.slice(menu, controls), /<\/div>\s*<\/div>`\}\s*<\/div>\s*\$\{preview \? previewMetaHtml/);
 });
 
-test('action menu holds Edit, Highlight Related, Rehash, Delete and conditional Merge', () => {
-  assert.match(cardJs, /<div class="card-action-menu" role="group" aria-label="\$\{escapeAttr\(translate\('card\.actionsMenu'\)\)\}">\$\{editBtn\}\$\{chainBtn\}\$\{reiterateBtn\}\$\{deleteBtn\}\$\{mergeBtn\}<\/div>/);
+test('action menu holds Edit, Chat, Highlight Related, Rehash, Delete and conditional Merge', () => {
+  assert.match(cardJs, /<div class="card-action-menu" role="group" aria-label="\$\{escapeAttr\(translate\('card\.actionsMenu'\)\)\}">\$\{editBtn\}\$\{chatBtn\}\$\{chainBtn\}\$\{reiterateBtn\}\$\{deleteBtn\}\$\{mergeBtn\}<\/div>/);
+});
+
+// The chat button has no rule of its own: like Edit it is sized and tinted by the shared
+// `.card-btn-group button` rule, so it cannot drift from its neighbours in the tray.
+test('.btn-task-chat is a labelled tray button styled by the shared group rule', () => {
+  const m = cardJs.match(/const chatBtn = `<button class="btn-task-chat" type="button" data-task-id="\$\{escapeAttr\(t\.id\)\}" data-tip="\$\{escapeAttr\(translate\('tooltip\.taskChat'\)\)\}" aria-label="\$\{escapeAttr\(translate\('tooltip\.taskChat'\)\)\}">\$\{_CHAT_SVG\}<\/button>`;/);
+  assert.ok(m, 'chatBtn markup not found');
+  assert.match(cardJs, /const _CHAT_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor"[^']*aria-hidden="true"/);
+  assert.doesNotMatch(css, /\.btn-task-chat/);
+  assert.match(ruleBody(/\n\s*\.card-btn-group button/), /width:\s*32px;\s*height:\s*32px/);
 });
 
 test('the lower action row and the dead hamburger are gone', () => {
@@ -285,7 +295,10 @@ test('proposal meta keeps status + sprint on one line and the overlay stays alig
   assert.match(expanded, /scrollbar-width:\s*none/);
   assert.match(css, /\.preview-card\.card-expanded::-webkit-scrollbar \{ display: none; \}/);
   assert.doesNotMatch(css, /\.preview-card\.card-expanded \{[^}]*min\(380px/);
-  assert.match(cardJs, /card\.classList\.contains\('preview-card'\)\s*\?\s*window\.innerHeight - 20/);
+  // (TPT456) The full-viewport cap for proposals now lives in card-placement.js.
+  assert.match(cardJs, /expandedCardMaxHeight\(\{ viewportHeight, isPreview: card\.classList\.contains\('preview-card'\) \}\)/);
+  const placement = readFileSync(new URL('./card-placement.js', import.meta.url), 'utf8');
+  assert.match(placement, /return isPreview \? full :/);
 });
 
 test('proposal accept/reject match the board .card-btn-group button pill', () => {

@@ -24,7 +24,7 @@ function buildTipataskRestRecipe(opts = {}) {
     ? opts.statusNames
     : LEGACY_STATUSES.map(s => s.name);
   // Cap the displayed list — a project with dozens of statuses shouldn't blow the
-  // prompt-size budget (pi-agent.test.js asserts the whole prompt stays under 9000 chars).
+  // prompt-size budget (pi-agent.test.js asserts the whole prompt stays under 9300 chars).
   const cleanNames = rawNames.map(sanitizeStatusName).filter(Boolean);
   const namesLine = cleanNames.length > 12
     ? `${cleanNames.slice(0, 12).join(' | ')} | … (${cleanNames.length - 12} more — GET /statuses for the full list)`
@@ -88,13 +88,13 @@ function piDiscoveryMandateLines() {
 // ── Parent-task block budget (C1575) ──
 // Pi is the only agent that caps opts.parentTaskBlock — Claude/Codex thread it through
 // uncapped (see their buildPrompt()s). Pi's kickoff prompt is echoed verbatim into a
-// small/cheap OpenRouter model's own TUI (same reasoning as the 9000-char ceiling on every
+// small/cheap OpenRouter model's own TUI (same reasoning as the 9300-char ceiling on every
 // other directive here — see pi-agent.test.js), so total prompt size still needs a hard
-// ceiling even with the parent block now in the mix. Raised from 9000 to 12000 here (not the
+// ceiling even with the parent block now in the mix. Set to 12000 here (above the
 // other directives' shared ceiling) because the parent block is task DATA, not fixed
 // boilerplate — it can legitimately be large (a whole objective's chat history), and a Pi
 // spawn that never had a parent (the common case, parentTaskBlock null) is byte-identical to
-// pre-C1575 and still well under the old 9000/9600 ceilings other tests assert.
+// pre-C1575 and still under the 9300/9900 ceilings other tests assert.
 const PI_PROMPT_BUDGET = 12000;
 const PI_PARENT_BLOCK_MAX_CHARS = 2000;
 
@@ -115,7 +115,7 @@ class PiAgent extends BaseTaskAgent {
   }
 
   // C1215 — Pi's kickoff prompt is echoed verbatim into its own TUI and budgeted under
-  // 9000 chars (pi-agent.test.js), and Pi has no MCP support at all — the base directive's
+  // 9300 chars (pi-agent.test.js), and Pi has no MCP support at all — the base directive's
   // MCP-specific caveat doesn't apply here. See buildVcsDirective's opts.compact doc in
   // vcs-settings.js for what compact mode drops/shortens. C1561: same absent-key '' guard
   // as base-agent.js's resolveVcsDirective() — buildVcsDirective() itself no longer has a
@@ -167,7 +167,7 @@ class PiAgent extends BaseTaskAgent {
     const grepNote = ttTags.length >= 2
       ? `Cross-reference scan for [${ttTags.join(', ')}] is already complete in startup context. Use shell grep/rg only for identifiers absent from that section.`
       : 'Use rg for source search.';
-    // Shared directives (VCS, tag-description backfill, process safety, KB hygiene, task status) plus the
+    // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status) plus the
     // separate clarify slot — see base-agent.js#buildSharedPreamble. All compact by policy
     // (getPreamblePolicy() above): plain prose/bullet lines with no dialog-shaped phrasing, so
     // they stay safe under the HARD RULE above (no bare "Plan ready.", no "❯ n." prefix, no

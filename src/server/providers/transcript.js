@@ -6,6 +6,7 @@
 
 const config = require('../config');
 const { codingPriorityBaseline } = require('../sprint-assign');
+const { ASK_USER_REMINDER } = require('../task-chat-widgets');
 
 // Read only the server-prefetched metadata section, never proposal JSON from the
 // conversation. Legacy drafts lack priorityBaseline but still carry active rows.
@@ -120,7 +121,11 @@ function buildTurnPrompt(session, { includeSystemPrompt, hasProviderSession } = 
   const result = (prompt, mode) => ({ prompt: baseline ? `${baseline}\n\n${prompt}` : prompt, mode });
 
   if (hasProviderSession) {
-    return result(lastMsg ? lastMsg.content : '', 'resume');
+    const content = lastMsg ? lastMsg.content : '';
+    // A provider that takes the system prompt on stdin (Codex, Pi) last saw the task chat's
+    // `ask_user` contract on its first turn; a resumed turn restates it in one line.
+    const remind = includeSystemPrompt && session.type === 'taskChat' && content;
+    return result(remind ? `${content}\n\n${ASK_USER_REMINDER}` : content, 'resume');
   }
 
   if (session._providerSwitchPending && messages.length > 1) {

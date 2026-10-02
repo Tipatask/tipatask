@@ -24,6 +24,13 @@ function processSafety(text) {
   once(text, /PID or process group[^\n]*never[^\n]*pkill -f/, 'abort by PID/group, never command matching, exactly once');
 }
 
+function resourceLimits(text, cap = 3) {
+  once(text, /at most \d+ sub-agents or background commands in parallel/, 'parallel sub-agent/background cap stated exactly once');
+  assert.match(text, new RegExp(`at most ${cap} sub-agents or background commands in parallel`), `cap must be ${cap}`);
+  once(text, /test (?:and|or) build commands[^\n]*(?:one at a time[^\n]*never in parallel|in parallel[^\n]*one at a time)/, 'test/build runs are serial exactly once');
+  once(text, /(?:Stop all background work you started before finishing|Before finishing, stop every background command)/, 'background work is stopped before finishing exactly once');
+}
+
 function kbHygiene(text) {
   once(text, /ai\/architecture\/\*\.md[^\n]*standing/, 'KB holds standing system facts exactly once');
   once(text, /(?:Never put task-specific|Task-specific material never)[^\n]*investigation[^\n]*(?:resolution|create_task_comment)/, 'task investigation belongs in resolution comments exactly once');
@@ -57,4 +64,4 @@ function vcsOff(text) {
   assert.match(text, /Never[^\n]*(?:attribution|Co-Authored-By)/);
 }
 
-module.exports = { projectFixture, once, processSafety, kbHygiene, taskStatus, tagBackfill, vcsOff };
+module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, taskStatus, tagBackfill, vcsOff };

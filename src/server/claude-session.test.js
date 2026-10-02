@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { normalizeProposals, classifyNoJsonTurn, buildSplitDirective } = require('./claude-session');
+const { normalizeProposals, classifyNoJsonTurn, buildSplitDirective, tryEmitTaskChatWidgets } = require('./claude-session');
 
 test('normalizeProposals forces status to pending on new tasks only', () => {
   const parsed = normalizeProposals({
@@ -279,4 +279,55 @@ test('buildSplitDirective carries the 2+ steps numbered-list rule', () => {
   const directive = buildSplitDirective('{}');
   assert.match(directive, /numbered list in a child description only when it holds 2 or more steps/);
   assert.match(directive, /never a lone "1\." item/);
+});
+
+// ── tryEmitTaskChatWidgets ──
+
+function taskChatSession() {
+  const frames = [];
+  const session = { type: 'taskChat', taskKey: 'TPT1', tabId: 'chat-tab', turnBuffer: '', messages: [],
+    ws: { OPEN: 1, readyState: 1, send: raw => frames.push(JSON.parse(raw)) } };
+  return { session, frames, ofType: type => frames.filter(f => f.type === type) };
+}
+
+test('tryEmitTaskChatWidgets: a fenced ask_user block becomes one task-chat-dialog frame', () => {
+  const { session, ofType } = taskChatSession();
+  session.turnBuffer = 'Two ways to do it.\n\n```ask_user\n{"question": "Which one?", "options": [{"label": "A", "description": "first"}, {"label": "B"}], "multi": true}\n```';
+  tryEmitTaskChatWidgets(session);
+  tryEmitTaskChatWidgets(session);
+  const dialogs = ofType('task-chat-dialog');
+  assert.equal(dialogs.length, 1, 'a second scan of the same text sends nothing');
+  assert.equal(dialogs[0].tabId, 'chat-tab');
+  assert.equal(dialogs[0].taskKey, 'TPT1');
+  assert.equal(dialogs[0].dialog.question, 'Which one?');
+  assert.equal(dialogs[0].dialog.multi, true);
+  assert.deepEqual(dialogs[0].dialog.options, [{ label: 'A', description: 'first' }, { label: 'B', description: '' }]);
+});
+
+test('tryEmitTaskChatWidgets: stream-json tool_use events become task-chat-tool frames, deduped by tool id', () => {
+  const { session, ofType } = taskChatSession();
+  const start = { type: 'stream_event', event: { type: 'content_block_start', content_block: { type: 'tool_use', id: 'toolu_9', name: 'Read', input: {} } } };
+  const full = { type: 'assistant', message: { content: [{ type: 'text', text: 'Reading.' }, { type: 'tool_use', id: 'toolu_9', name: 'Read', input: { file_path: 'README.md' } }] } };
+  const result = { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_9', content: '# Readme' }] } };
+  for (const event of [start, start, full, full, result, result]) tryEmitTaskChatWidgets(session, event);
+  const tools = ofType('task-chat-tool').map(f => f.tool);
+  assert.deepEqual(tools.map(t => [t.id, t.status, t.input ? t.input.file_path : null]), [
+    ['toolu_9', 'running', null],
+    ['toolu_9', 'running', 'README.md'],
+    ['toolu_9', 'done', 'README.md'],
+  ]);
+  assert.equal(ofType('task-chat-dialog').length, 0);
+  // Events that carry no tool are ignored.
+  tryEmitTaskChatWidgets(session, { type: 'result', result: 'done' });
+  tryEmitTaskChatWidgets(session, { type: 'stream_event', event: { type: 'content_block_start', content_block: { type: 'text' } } });
+  assert.equal(ofType('task-chat-tool').length, 3);
+});
+
+test('tryEmitTaskChatWidgets: a failed tool_result closes the tool as an error', () => {
+  const { session, ofType } = taskChatSession();
+  tryEmitTaskChatWidgets(session, { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_3', name: 'mcp__tipatask__update_task', input: { task_key: 'TPT1', status: 'nope' } }] } });
+  tryEmitTaskChatWidgets(session, { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_3', is_error: true, content: [{ type: 'text', text: 'Invalid status' }] }] } });
+  const last = ofType('task-chat-tool').at(-1).tool;
+  assert.equal(last.status, 'error');
+  assert.equal(last.error, 'Invalid status');
 });

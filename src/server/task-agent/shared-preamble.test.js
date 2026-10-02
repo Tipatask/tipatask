@@ -15,7 +15,7 @@ const { buildVcsDirective } = require('../vcs-settings');
 
 const GIT_ALL_ON = { type: 'git', worktree: true, commit: true, pr: true };
 const BLANK_TAG_OPTS = { taskTags: ['tt-foo'], tagDescriptions: { 'tt-foo': '' } };
-const ALL_OPTS = { vcsSettings: GIT_ALL_ON, ...BLANK_TAG_OPTS };
+const ALL_OPTS = { vcsSettings: GIT_ALL_ON, agentLimits: { maxSubagents: 5 }, ...BLANK_TAG_OPTS };
 
 function bareAgent() {
   return new (class extends BaseTaskAgent { constructor() { super('x', 'X'); } })();
@@ -30,7 +30,7 @@ test('buildSharedPreamble: absent optional data emits no empty directive', () =>
     const p = agent.buildSharedPreamble({});
     assert.equal(p.vcs, '');
     assert.equal(p.tagDesc, '');
-    assert.deepEqual(p.directives, [p.processSafety, p.kbHygiene, p.taskStatus]);
+    assert.deepEqual(p.directives, [p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus]);
     assert.ok(p.directives.every(d => typeof d === 'string' && d.trim().length > 0));
   }
 });
@@ -40,11 +40,11 @@ test('buildSharedPreamble: called with no argument at all -> same as empty opts'
   assert.deepEqual(agent.buildSharedPreamble(), agent.buildSharedPreamble({}));
 });
 
-test('buildSharedPreamble: fixed order vcs -> tagDesc -> processSafety -> kbHygiene -> taskStatus', () => {
+test('buildSharedPreamble: fixed order vcs -> tagDesc -> processSafety -> resourceLimits -> kbHygiene -> taskStatus', () => {
   for (const agent of [bareAgent(), new ClaudeAgent(), new CodexAgent(), new PiAgent()]) {
     const p = agent.buildSharedPreamble(ALL_OPTS);
     assert.ok(p.vcs && p.tagDesc, 'both optional directives must render for this fixture');
-    assert.deepEqual(p.directives, [p.vcs, p.tagDesc, p.processSafety, p.kbHygiene, p.taskStatus]);
+    assert.deepEqual(p.directives, [p.vcs, p.tagDesc, p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus]);
   }
 });
 
@@ -70,6 +70,7 @@ test('buildSharedPreamble: Claude and Codex get the full wording; Claude gets no
   for (const agent of [claude, codex]) {
     const p = agent.buildSharedPreamble(ALL_OPTS);
     assert.equal(p.processSafety, agent.buildProcessSafetyDirective());
+    assert.equal(p.resourceLimits, agent.buildResourceLimitsDirective(ALL_OPTS.agentLimits));
     assert.equal(p.kbHygiene, agent.buildKbHygieneDirective());
     assert.equal(p.taskStatus, agent.buildTaskStatusDirective());
     assert.equal(p.vcs, buildVcsDirective(GIT_ALL_ON));
@@ -82,6 +83,7 @@ test('buildSharedPreamble: Pi gets compact wording everywhere, subclass override
   const pi = new PiAgent();
   const p = pi.buildSharedPreamble(ALL_OPTS);
   assert.equal(p.processSafety, pi.buildProcessSafetyDirective({ compact: true }));
+  assert.equal(p.resourceLimits, pi.buildResourceLimitsDirective(ALL_OPTS.agentLimits, { compact: true }));
   assert.equal(p.kbHygiene, pi.buildKbHygieneDirective({ compact: true }));
   assert.equal(p.taskStatus, pi.buildTaskStatusDirective({ compact: true }));
   assert.equal(p.clarify, pi.buildClarifyDirective({ compact: true }));
@@ -98,20 +100,22 @@ test('buildSharedPreamble: a policy override alone switches the variant', () => 
   })();
   const p = agent.buildSharedPreamble({});
   assert.equal(p.processSafety, agent.buildProcessSafetyDirective({ compact: true }));
+  assert.equal(p.resourceLimits, agent.buildResourceLimitsDirective(undefined, { compact: true }));
   assert.equal(p.kbHygiene, agent.buildKbHygieneDirective({ compact: true }));
   assert.equal(p.taskStatus, agent.buildTaskStatusDirective({ compact: true }));
   assert.equal(p.clarify, '');
 });
 
 test('buildPrompt: independently specified semantic contracts reach every agent once', (t) => {
-  const { projectFixture, processSafety, kbHygiene, taskStatus, tagBackfill, vcsOff } = require('./prompt-contract-assertions');
+  const { projectFixture, processSafety, resourceLimits, kbHygiene, taskStatus, tagBackfill, vcsOff } = require('./prompt-contract-assertions');
   const opts = {
-    projectPath: projectFixture(t), vcsSettings: { type: 'off' },
+    projectPath: projectFixture(t), vcsSettings: { type: 'off' }, agentLimits: { maxSubagents: 5 },
     taskTags: ['tt-fixture'], tagDescriptions: { 'tt-fixture': '' },
   };
   for (const agent of [new ClaudeAgent(), new CodexAgent(), new PiAgent()]) {
     const prompt = agent.buildPrompt('Do the thing', opts);
     processSafety(prompt);
+    resourceLimits(prompt, 5);
     kbHygiene(prompt);
     taskStatus(prompt);
     tagBackfill(prompt, agent.id);

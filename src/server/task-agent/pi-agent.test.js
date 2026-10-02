@@ -510,10 +510,11 @@ test('PiAgent.buildPrompt: no line of the kickoff prompt can false-trigger the a
       // PTY-echoed prompt for small/cheap OpenRouter models — keep growth bounded. Ceiling
       // raised 8000 -> 8500 for C1566's compact process-safety directive, then 8500 -> 9000
       // for C1542's unconditional compact KB-hygiene directive (same reasoning: always
-      // present, pushing the discovery/blank-tag variants past the old ceiling); still
-      // leaves headroom (worst measured case ~8800 chars) without inviting unbounded growth.
-      t.diagnostic(`Pi basic/discovery=${discovery}: ${prompt.length} / 9000`);
-      assert.ok(prompt.length < 9000, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
+      // present, pushing the discovery/blank-tag variants past the old ceiling), then
+      // 9000 -> 9300 for the unconditional compact resource-limits directive; still leaves
+      // headroom (worst measured case ~9100 chars) without inviting unbounded growth.
+      t.diagnostic(`Pi basic/discovery=${discovery}: ${prompt.length} / 9300`);
+      assert.ok(prompt.length < 9300, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -783,6 +784,6 @@ test('Pi assembled kickoff uses REST and compact rules without embedding the sta
     assert.match(prompt, /PATCH .*tasks/);
     assert.doesNotMatch(prompt, /ensure_project_tag|list_task_resolutions|thousands of runaway/);
     assert.doesNotMatch(prompt, /━━ STATIC CONTEXT/);
-    assert.ok(prompt.length < 9000);
+    assert.ok(prompt.length < 9300);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

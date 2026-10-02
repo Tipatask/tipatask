@@ -1182,6 +1182,21 @@
     color: var(--left-nav-active-fg);
   }
 
+  .active-session-item.session-paused .active-session-icon { opacity: 0.7; }
+  .active-session-watchdog-actions { display: flex; gap: 0.25rem; margin-left: auto; flex-shrink: 0; }
+  .active-session-watchdog-actions [role="button"] {
+    border: 1px solid var(--c-border);
+    border-radius: 4px;
+    padding: 0.15rem 0.3rem;
+    color: var(--c-text-muted);
+    font-size: 0.7rem;
+    line-height: 1.2;
+  }
+  .active-session-watchdog-actions [role="button"]:hover,
+  .active-session-watchdog-actions [role="button"]:focus-visible { color: var(--c-text); border-color: var(--c-primary); }
+  .active-session-watchdog-actions [data-busy] { opacity: 0.5; pointer-events: none; }
+  body.left-nav-collapsed .active-session-watchdog-actions { display: none; }
+
   /* (C1152) Completed session — retired-but-reopenable. Icon svg dims (see .session-check
      below for what covers it), key/title fade to --c-text-faint; hover brightens to
      --c-text-muted so the row still reads as clickable (without this the child-span color
@@ -2869,7 +2884,9 @@
        the ringed subtask cards behind it, not under them. Kept in sync with the inline
        card.style.zIndex set in expandCard() (task-card.js), which wins over this rule. */
     z-index: 101;
-    max-height: 80vh;
+    /* (TPT456) Fallback until expandCard() sets the inline cap (expandedCardMaxHeight() in
+       card-placement.js): never taller than the viewport minus its 10px margins. */
+    max-height: min(80vh, calc(100vh - 20px));
     box-shadow: 0 8px 32px rgba(0,0,0,0.18);
     transition: none;
   }
@@ -3068,8 +3085,17 @@
 
   .card.card-peek .card-desc,
   .card.card-hover-expanded .card-desc,
+  .card.card-expanded .card-desc,
   .card.has-active-session .card-desc {
     margin-top: 12px;
+  }
+
+  /* (TPT456) An expanded card snaps straight to its full layout — the controls row and the
+     description margin don't animate open after expandCard() has measured and placed the
+     overlay, which would push its bottom past the viewport edge. */
+  .card.card-expanded .task-card-hover-controls,
+  .card.card-expanded > .card-desc {
+    transition: none;
   }
 
   .card-deps-label {
@@ -5130,6 +5156,11 @@
     background: var(--c-text-faint);
   }
 
+  /* (TPT443) Watchdog-paused session (SIGSTOPped tree) — amber, not red: nothing died. */
+  .terminal-header .status-dot.paused {
+    background: var(--c-warning);
+  }
+
   /* Actions cluster — mirrors `.bulk-group + .bulk-group` (divider + gap) */
   .terminal-header-actions {
     display: flex;
@@ -6051,6 +6082,22 @@
   .tt-saving-indicator--toast {
     z-index: 9999; /* above #tt-saving-indicator (9998), below api-status-banner (10000) */
     transition: opacity 0.3s ease, bottom 0.2s ease;
+  }
+
+  /* An error toast can carry a server message: cap its width and let it wrap. 1rem equals
+     the one-line pill's half-height, so a short message still renders as the same capsule
+     and only a wrapped one becomes a rounded box. */
+  .tt-saving-indicator--toast.tt-toast--error {
+    max-width: min(34rem, calc(100vw - 3rem));
+    border-radius: 1rem;
+    align-items: flex-start;
+  }
+  .tt-toast--error .tt-saving-label {
+    overflow-wrap: anywhere;
+  }
+  .tt-toast--error .tt-toast-icon {
+    flex: none;
+    line-height: 1.2;
   }
 
   /* Stack above the saving badge while a background save is still in flight —
@@ -8004,6 +8051,892 @@
   .files-addressed-label {
     font-size: 0.8rem;
     font-weight: 600;
+  /* ── Task Chat window ── (task-chat.js)
+     A conversation view for one task: un-bubbled assistant prose in a centred reading column,
+     right-aligned user turns, composer docked at the bottom. Palette tokens only, so every
+     [data-theme] recolours it with no per-theme rules. */
+
+  .task-chat-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 3100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .task-chat-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(2px);
+    cursor: pointer;
+  }
+
+  .task-chat-panel {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: min(880px, 94vw);
+    height: min(86vh, 900px);
+    background: var(--c-bg-card);
+    color: var(--c-text);
+    border: 1px solid var(--c-border);
+    border-radius: 14px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.35);
+    overflow: hidden;
+  }
+
+  .task-chat-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.7rem 0.9rem 0.7rem 1.25rem;
+    border-bottom: 1px solid var(--c-border);
+    flex-shrink: 0;
+  }
+
+  .task-chat-heading {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+
+  .task-chat-eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--c-success);
+    flex-shrink: 0;
+  }
+
+  .task-chat-panel--running .task-chat-dot {
+    background: var(--c-primary);
+    animation: task-chat-pulse 1.2s ease-in-out infinite;
+  }
+
+  @keyframes task-chat-pulse {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.6); opacity: 0.45; }
+  }
+
+  .task-chat-title {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .task-chat-key {
+    font-family: 'SF Mono', Monaco, Consolas, monospace;
+    font-size: 0.8rem;
+    color: var(--c-text-muted);
+    flex-shrink: 0;
+  }
+
+  .task-chat-title-text {
+    font-size: 0.98rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .task-chat-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.15rem;
+    flex-shrink: 0;
+  }
+
+  .task-chat-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    border: 0;
+    border-radius: 8px;
+    background: none;
+    color: var(--c-text-muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .task-chat-icon-btn svg { width: 16px; height: 16px; }
+  .task-chat-icon-btn:hover:not(:disabled) { background: var(--c-bg-sub-nav); color: var(--c-text); }
+  .task-chat-icon-btn:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 1px; }
+  .task-chat-icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .task-chat-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 1.25rem 1.25rem 0.75rem;
+  }
+
+  .task-chat-messages {
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+    max-width: 720px;
+    min-height: 100%;
+    margin: 0 auto;
+  }
+
+  .task-chat-empty {
+    margin: auto;
+    max-width: 30rem;
+    padding: 2rem 1rem;
+    text-align: center;
+    font-size: 0.9rem;
+    line-height: 1.55;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-msg {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    min-width: 0;
+    font-size: 0.92rem;
+    line-height: 1.6;
+  }
+
+  .task-chat-author {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--left-nav-active-fg);
+  }
+
+  .task-chat-msg--assistant .task-chat-body {
+    color: var(--c-text);
+    overflow-wrap: anywhere;
+  }
+
+  .task-chat-msg--user { align-items: flex-end; }
+
+  .task-chat-msg--user .task-chat-body {
+    max-width: 85%;
+    padding: 0.55rem 0.85rem;
+    border: 1px solid color-mix(in srgb, var(--c-primary) 22%, transparent);
+    border-radius: 14px 14px 4px 14px;
+    background: var(--c-primary-light);
+    color: var(--c-text);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .task-chat-msg--system {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--c-border);
+    border-radius: 10px;
+    background: var(--c-bg-sub-nav);
+    color: var(--c-text-secondary);
+    font-size: 0.84rem;
+  }
+
+  .task-chat-msg--system .task-chat-body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+
+  .task-chat-msg--error {
+    border-color: var(--c-danger-border);
+    background: var(--c-danger-bg);
+    color: var(--c-danger);
+  }
+
+  .task-chat-retry {
+    flex-shrink: 0;
+    padding: 0.25rem 0.7rem;
+    border: 1px solid currentColor;
+    border-radius: 6px;
+    background: none;
+    color: inherit;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .task-chat-retry:hover { background: color-mix(in srgb, currentColor 12%, transparent); }
+
+  .task-chat-status {
+    font-size: 0.8rem;
+    font-style: italic;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-status[hidden],
+  .task-chat-widgets:empty { display: none; }
+
+  .task-chat-widgets {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  /* Widgets of a turn (task-chat.js paintWidgets()): a wrapping row of tool chips, then the
+     cards of the tasks it created or updated, then the dialogs it asked. Every flex child
+     carries min-width: 0 so a long path, title or option label wraps or ellipsizes instead
+     of widening the transcript. */
+  .task-chat-tools,
+  .task-chat-tasks,
+  .task-chat-dialogs {
+    display: flex;
+    min-width: 0;
+  }
+
+  .task-chat-tools {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 0.35rem;
+  }
+
+  .task-chat-tasks,
+  .task-chat-dialogs {
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .task-chat-widget {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  /* Tool chip — what the agent read or called. An expanded chip takes the whole row. */
+  .task-chat-widget--tool {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+
+  .task-chat-widget--tool.task-chat-widget--open { flex-basis: 100%; }
+
+  .task-chat-tool-chip {
+    display: inline-flex;
+    align-items: center;
+    align-self: flex-start;
+    gap: 0.4rem;
+    min-width: 0;
+    max-width: 100%;
+    padding: 0.2rem 0.6rem;
+    border: 1px solid var(--c-border);
+    border-radius: 999px;
+    background: var(--c-bg-sub-nav);
+    color: var(--c-text-secondary);
+    font: inherit;
+    font-size: 0.76rem;
+    line-height: 1.4;
+  }
+
+  button.task-chat-tool-chip { cursor: pointer; }
+
+  button.task-chat-tool-chip::after {
+    content: '';
+    flex-shrink: 0;
+    width: 0.32rem;
+    height: 0.32rem;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform 0.12s;
+  }
+
+  button.task-chat-tool-chip[aria-expanded="true"]::after { transform: rotate(45deg); }
+  button.task-chat-tool-chip:hover { border-color: var(--c-border-input); color: var(--c-text); }
+  button.task-chat-tool-chip:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 1px; }
+
+  .task-chat-tool-dot {
+    flex-shrink: 0;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--c-success);
+  }
+
+  .task-chat-widget--tool[data-status="running"] .task-chat-tool-dot {
+    background: var(--c-primary);
+    animation: task-chat-pulse 1.2s ease-in-out infinite;
+  }
+
+  .task-chat-widget--tool[data-status="error"] .task-chat-tool-dot { background: var(--c-danger); }
+
+  .task-chat-widget--tool[data-status="error"] .task-chat-tool-chip {
+    border-color: var(--c-danger-border);
+    color: var(--c-danger);
+  }
+
+  .task-chat-tool-label,
+  .task-chat-tool-status {
+    flex-shrink: 0;
+    font-weight: 600;
+  }
+
+  .task-chat-tool-target {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-tool-detail {
+    min-width: 0;
+    padding: 0.5rem 0.7rem;
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    background: var(--c-bg-sub-nav);
+    color: var(--c-text-secondary);
+    font-size: 0.78rem;
+    line-height: 1.45;
+  }
+
+  .task-chat-tool-detail[hidden] { display: none; }
+
+  .task-chat-tool-name {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--c-text-muted);
+    overflow-wrap: anywhere;
+  }
+
+  .task-chat-tool-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    margin-top: 0.35rem;
+  }
+
+  .task-chat-tool-row {
+    display: grid;
+    grid-template-columns: minmax(0, 7rem) minmax(0, 1fr);
+    gap: 0.6rem;
+  }
+
+  .task-chat-tool-row dt {
+    color: var(--c-text-muted);
+    overflow-wrap: anywhere;
+  }
+
+  .task-chat-tool-row dd {
+    max-height: 8rem;
+    overflow-y: auto;
+    color: var(--c-text);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .task-chat-tool-error {
+    margin-top: 0.35rem;
+    color: var(--c-danger);
+    overflow-wrap: anywhere;
+  }
+
+  /* Task card — the board's own card in its inert preview form; the whole widget is the
+     click target that opens the Task Edit Modal. */
+  .task-chat-widget--task {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    border-radius: 10px;
+    cursor: pointer;
+  }
+
+  .task-chat-widget--task:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+
+  .task-chat-task-badge {
+    align-self: flex-start;
+    padding: 0.05rem 0.5rem;
+    border-radius: 999px;
+    background: var(--c-primary-light);
+    color: var(--c-primary);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .task-chat-widget--task[data-action="created"] .task-chat-task-badge {
+    background: color-mix(in srgb, var(--c-success) 16%, transparent);
+    color: var(--c-success);
+  }
+
+  .task-chat-widget--task .card--preview {
+    width: 100%;
+    max-width: none;
+    margin-bottom: 0;
+    padding: 0.75rem 0.9rem;
+    border: 1px solid var(--c-border);
+    box-shadow: none;
+    cursor: pointer;
+  }
+
+  .task-chat-widget--task:hover .card--preview {
+    border-color: var(--c-border-input);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  }
+
+  .task-chat-widget--task .card--preview .id-badge,
+  .task-chat-widget--task .card--preview .card-title,
+  .task-chat-widget--task .card--preview .card-desc { cursor: pointer; }
+
+  /* The board keeps a title on one line; in a transcript it wraps. */
+  .task-chat-widget--task .card--preview .card-title {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  /* A card must not eat the conversation: the full description is one click away. */
+  .task-chat-widget--task .card--preview .card-desc {
+    max-height: 6.4em;
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(black 70%, transparent);
+    mask-image: linear-gradient(black 70%, transparent);
+  }
+
+  .task-chat-task-fallback {
+    padding: 0.6rem 0.8rem;
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    overflow-wrap: anywhere;
+  }
+
+  /* Dialog — the agent's question as a form. A <fieldset>, so locking it is one `disabled`;
+     min-width: 0 undoes the fieldset default (min-content), which would overflow when narrow. */
+  .task-chat-widget--dialog {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    min-width: 0;
+    padding: 0.75rem 0.85rem;
+    border: 1px solid var(--c-border);
+    border-left: 3px solid var(--c-primary);
+    border-radius: 10px;
+    background: var(--c-bg-sub-nav);
+  }
+
+  .task-chat-widget--dialog:not([data-state="open"]) { border-left-color: var(--c-border-input); }
+
+  .task-chat-dialog-question {
+    font-weight: 600;
+    color: var(--c-text);
+    overflow-wrap: anywhere;
+  }
+
+  .task-chat-dialog-hint {
+    margin-top: -0.3rem;
+    font-size: 0.76rem;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-dialog-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    min-width: 0;
+  }
+
+  .task-chat-widget--dialog[data-state="waiting"] .task-chat-dialog-options,
+  .task-chat-widget--dialog[data-state="skipped"] .task-chat-dialog-options { opacity: 0.6; }
+
+  .task-chat-dialog-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.55rem;
+    min-width: 0;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    background: var(--c-bg-card);
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+  }
+
+  .task-chat-dialog-option:hover { border-color: var(--c-border-input); }
+
+  .task-chat-widget--dialog:disabled .task-chat-dialog-option { cursor: default; }
+  .task-chat-widget--dialog:disabled .task-chat-dialog-option:hover { border-color: var(--c-border); }
+
+  .task-chat-dialog-option:has(> input:checked),
+  .task-chat-widget--dialog:disabled .task-chat-dialog-option:has(> input:checked):hover {
+    border-color: var(--c-primary);
+    background: var(--c-primary-light);
+  }
+
+  .task-chat-dialog-option:has(> input:focus-visible) { outline: 2px solid var(--c-primary); outline-offset: 1px; }
+
+  .task-chat-dialog-option > input {
+    flex-shrink: 0;
+    margin-top: 0.3em;
+    accent-color: var(--c-primary);
+  }
+
+  .task-chat-dialog-text {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+  }
+
+  .task-chat-dialog-label {
+    color: var(--c-text);
+    overflow-wrap: anywhere;
+  }
+
+  .task-chat-dialog-desc {
+    font-size: 0.8rem;
+    color: var(--c-text-muted);
+    overflow-wrap: anywhere;
+  }
+
+  .task-chat-dialog-other {
+    width: 100%;
+    min-width: 0;
+    margin-top: 0.25rem;
+    padding: 0.3rem 0.5rem;
+    border: 1px solid var(--c-border-input);
+    border-radius: 6px;
+    background: var(--c-bg-card);
+    color: var(--c-text);
+    font: inherit;
+    font-size: 0.85rem;
+  }
+
+  .task-chat-dialog-other:focus { outline: none; border-color: var(--c-primary); }
+
+  .task-chat-dialog-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    min-width: 0;
+  }
+
+  .task-chat-dialog-state {
+    min-width: 0;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-dialog-state:empty { display: none; }
+
+  .task-chat-widget--dialog[data-state="answered"] .task-chat-dialog-state { color: var(--c-success); }
+
+  .task-chat-dialog-submit {
+    margin-left: auto;
+    padding: 0.35rem 0.9rem;
+    border: 1px solid var(--c-primary);
+    border-radius: 8px;
+    background: var(--c-primary);
+    color: var(--c-on-primary);
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .task-chat-dialog-submit:hover { background: var(--c-primary-hover); }
+  .task-chat-dialog-submit:disabled { opacity: 0.4; cursor: not-allowed; }
+  .task-chat-dialog-submit[hidden] { display: none; }
+
+  /* The Task Edit Modal opened from a task widget sits above this window (3100) and below its
+     own portaled dropdowns (3200) and the confirm dialogs (3400). */
+  body.task-chat-open .task-edit-overlay { z-index: 3150; }
+
+  /* Markdown inside a reply — the global `* { margin: 0; padding: 0 }` reset strips all of it. */
+  .task-chat-md > * + * { margin-top: 0.65em; }
+  .task-chat-md h1, .task-chat-md h2, .task-chat-md h3, .task-chat-md h4 {
+    margin-top: 1.1em;
+    font-weight: 650;
+    line-height: 1.3;
+  }
+  .task-chat-md > :first-child { margin-top: 0; }
+  .task-chat-md h1 { font-size: 1.2rem; }
+  .task-chat-md h2 { font-size: 1.08rem; }
+  .task-chat-md h3, .task-chat-md h4 { font-size: 0.98rem; }
+  .task-chat-md ul, .task-chat-md ol { padding-left: 1.5em; }
+  .task-chat-md ul { list-style: disc; }
+  .task-chat-md ol { list-style: decimal; }
+  .task-chat-md li + li { margin-top: 0.2em; }
+  .task-chat-md li > ul, .task-chat-md li > ol { margin-top: 0.2em; }
+  .task-chat-md a { color: var(--left-nav-active-fg); text-decoration: underline; }
+  .task-chat-md code {
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+    background: var(--c-bg-tier);
+    color: var(--c-text-secondary);
+    font-family: 'SF Mono', Monaco, Consolas, monospace;
+    font-size: 0.85em;
+  }
+  .task-chat-md pre {
+    padding: 0.7rem 0.85rem;
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    background: var(--c-bg-sub-nav);
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  .task-chat-md pre code { padding: 0; background: none; color: var(--c-text); }
+  .task-chat-md blockquote {
+    padding-left: 0.85rem;
+    border-left: 3px solid var(--c-border-input);
+    color: var(--c-text-secondary);
+  }
+  .task-chat-md hr { border: 0; border-top: 1px solid var(--c-border); }
+  .task-chat-md table { border-collapse: collapse; font-size: 0.86rem; display: block; overflow-x: auto; }
+  .task-chat-md th, .task-chat-md td { padding: 0.3rem 0.6rem; border: 1px solid var(--c-border); text-align: left; }
+  .task-chat-md th { background: var(--c-bg-sub-nav); font-weight: 600; }
+  .task-chat-md img { max-width: 100%; border-radius: 6px; }
+
+  .task-chat-footer {
+    position: relative;
+    flex-shrink: 0;
+    padding: 0.5rem 1.25rem 1rem;
+  }
+
+  .task-chat-jump {
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 0.4rem);
+    transform: translateX(-50%);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.3rem 0.75rem;
+    border: 1px solid var(--c-border-input);
+    border-radius: 999px;
+    background: var(--c-bg-card);
+    color: var(--c-text-secondary);
+    box-shadow: 0 4px 14px var(--c-shadow);
+    font-size: 0.76rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .task-chat-jump svg { width: 13px; height: 13px; }
+  .task-chat-jump:hover { border-color: var(--c-primary); color: var(--c-text); }
+  .task-chat-jump[hidden] { display: none; }
+
+  .task-chat-composer {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0.6rem 0.65rem 0.55rem 0.85rem;
+    border: 1px solid var(--c-border-input);
+    border-radius: 14px;
+    background: var(--c-bg-card);
+    box-shadow: 0 2px 10px var(--c-shadow);
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+
+  .task-chat-composer:focus-within {
+    border-color: var(--c-primary);
+    box-shadow: 0 0 0 3px var(--c-primary-light);
+  }
+
+  .task-chat-input {
+    display: block;
+    width: 100%;
+    min-height: 1.6rem;
+    border: 0;
+    outline: none;
+    resize: none;
+    background: none;
+    color: var(--c-text);
+    font: inherit;
+    font-size: 0.92rem;
+    line-height: 1.5;
+  }
+
+  .task-chat-input::placeholder { color: var(--c-text-faint); }
+
+  .task-chat-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 0.45rem;
+  }
+
+  .task-chat-actions [hidden] { display: none; }
+  .task-chat-selector-slot { min-width: 0; }
+
+  .task-chat-hint {
+    flex: 1;
+    min-width: 0;
+    text-align: right;
+    font-size: 0.72rem;
+    color: var(--c-text-faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* ── Start gate (C1292) ── A fresh chat (task or project) waits here until the user picks a
+     model and presses Start. The composer and transcript stay hidden behind it, and also while
+     the first connect is still deciding between restore and the gate. */
+  .task-chat-panel--gated .task-chat-messages,
+  .task-chat-panel--gated .task-chat-footer,
+  .task-chat-panel--connecting .task-chat-footer { display: none; }
+
+  .task-chat-panel--gated .task-chat-scroll {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .task-chat-start {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+    width: 100%;
+    max-width: 27rem;
+    margin: auto;
+    padding: 2rem 1.75rem 1.6rem;
+    border: 1px solid var(--c-border);
+    border-radius: 16px;
+    background: var(--c-bg-card);
+    box-shadow: 0 10px 30px var(--c-shadow);
+    text-align: center;
+    animation: task-chat-start-in 0.18s ease-out;
+  }
+
+  .task-chat-start[hidden] { display: none; }
+
+  @keyframes task-chat-start-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+  }
+
+  .task-chat-start-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 3rem;
+    height: 3rem;
+    border-radius: 14px;
+    background: var(--c-primary-light);
+    color: var(--c-primary);
+  }
+
+  .task-chat-start-mark svg { width: 24px; height: 24px; }
+
+  .task-chat-start-title {
+    font-size: 1.1rem;
+    font-weight: 650;
+    line-height: 1.3;
+    color: var(--c-text);
+  }
+
+  .task-chat-start-lead {
+    font-size: 0.88rem;
+    line-height: 1.55;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-start-model {
+    display: flex;
+    justify-content: center;
+    width: 100%;
+    margin-top: 0.35rem;
+  }
+
+  .task-chat-start-model:empty { display: none; }
+  .task-chat-start-model .chat-model-selector { max-width: 100%; }
+
+  .task-chat-start-note {
+    font-size: 0.82rem;
+    line-height: 1.5;
+    color: var(--c-danger);
+  }
+
+  .task-chat-start-note[hidden] { display: none; }
+
+  .task-chat-start-actions {
+    display: flex;
+    justify-content: center;
+    gap: 0.6rem;
+    width: 100%;
+    margin-top: 0.5rem;
+  }
+
+  .task-chat-start-cancel,
+  .task-chat-start-go {
+    min-width: 7.5rem;
+    padding: 0.5rem 1.1rem;
+    border-radius: 9px;
+    font: inherit;
+    font-size: 0.86rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+
+  .task-chat-start-cancel {
+    border: 1px solid var(--c-border-input);
+    background: none;
+    color: var(--c-text-secondary);
+  }
+
+  .task-chat-start-cancel:hover { background: var(--c-bg-sub-nav); color: var(--c-text); }
+
+  .task-chat-start-go {
+    border: 1px solid var(--c-primary);
+    background: var(--c-primary);
+    color: var(--c-on-primary);
+  }
+
+  .task-chat-start-go:hover:not(:disabled) { background: var(--c-primary-hover); }
+  .task-chat-start-go:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .task-chat-start-cancel:focus-visible,
+  .task-chat-start-go:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+
+  @media (max-width: 640px) {
+    .task-chat-panel {
+      width: 100vw;
+      height: 100vh;
+      border: 0;
+      border-radius: 0;
+    }
+    .task-chat-start { padding: 1.5rem 1rem 1.25rem; border: 0; box-shadow: none; }
+    .task-chat-start-actions { flex-direction: column-reverse; }
+    .task-chat-start-cancel, .task-chat-start-go { width: 100%; }
+    .task-chat-scroll { padding: 1rem 0.85rem 0.5rem; }
+    .task-chat-footer { padding: 0.5rem 0.85rem 0.85rem; }
+    .task-chat-hint { display: none; }
+    .task-chat-selector-slot { flex: 1; }
+    .task-chat-widget--dialog { padding: 0.6rem 0.65rem; }
+    .task-chat-dialog-actions { flex-direction: column; align-items: stretch; }
+    .task-chat-dialog-submit { margin-left: 0; }
+    .task-chat-tool-row { grid-template-columns: minmax(0, 1fr); gap: 0; }
+    .task-chat-widget--task .card--preview { padding: 0.6rem 0.7rem; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .task-chat-panel--running .task-chat-dot,
+    .task-chat-widget--tool[data-status="running"] .task-chat-tool-dot,
+    .task-chat-start { animation: none; }
+  }
+
+  /* ── end Task Chat window ── */
+
     color: var(--c-text-muted);
   }
 
@@ -9455,9 +10388,14 @@ img.agent-picker-icon {
 .modal-top-bar button { padding: 0 14px; height: var(--modal-ctrl-h); border-radius: 6px; border: 1px solid var(--c-border); font-size: 0.82rem; font-weight: 600; cursor: pointer; background: var(--c-bg-card); color: var(--c-text); box-shadow: 0 1px 2px var(--c-shadow); transition: color 120ms ease, background 120ms ease, border-color 120ms ease; }
 /* Cancel and Reset are ghost actions; Save remains the filled primary action. */
 .modal-top-bar button.btn-modal-cancel,
+.modal-top-bar button.btn-modal-chat,
 .modal-top-bar button.btn-modal-reset { background: transparent; box-shadow: none; color: var(--c-text-secondary); }
 .modal-top-bar button.btn-modal-cancel:hover,
+.modal-top-bar button.btn-modal-chat:hover:not([disabled]),
 .modal-top-bar button.btn-modal-reset:hover:not([disabled]) { color: var(--c-primary); border-color: var(--c-primary); background: var(--c-primary-light); }
+/* Opens the task chat window: speech bubble + caption, ghost like Cancel/Reset. */
+.modal-top-bar button.btn-modal-chat { display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; }
+.modal-top-bar button.btn-modal-chat svg { width: 15px; height: 15px; flex-shrink: 0; }
 .modal-top-bar button:focus-visible { outline: none; border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-light); }
 .modal-top-bar button.btn-modal-save { background: var(--c-primary); color: var(--c-on-primary); border-color: var(--c-primary); }
 .modal-top-bar button.btn-modal-save:hover { background: var(--c-primary-hover); border-color: var(--c-primary-hover); }
@@ -10013,6 +10951,9 @@ img.agent-picker-icon {
   .modal-task-id { padding: 0 10px; }
   .modal-top-bar .modal-status-select { padding: 0 22px 0 10px; background-position: right 0.5rem center; }
   .modal-top-bar button { padding: 0 10px; }
+  /* Icon only on a phone — the caption would push Reset/Save onto a second row. */
+  .modal-top-bar button.btn-modal-chat { padding: 0 9px; }
+  .modal-top-bar button.btn-modal-chat span { display: none; }
   .modal-scroll-body { padding: 0 12px 12px; }
   .modal-context-btns { padding: 8px 12px 10px; }
   .task-edit-panel .modal-field-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
@@ -11608,3 +12549,23 @@ input.sma-cb, input.sma-radio {
   border-bottom: 1px solid var(--c-border);
 }
 .terminal-session-lost button { flex-shrink: 0; }
+/* Compact paused controls leave terminal output visible. */
+.terminal-watchdog-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  padding: 0.2rem 0.75rem;
+  color: var(--c-text-muted);
+  background: var(--c-bg-card);
+  border-bottom: 1px solid var(--c-border);
+}
+.terminal-watchdog-label { margin-right: auto; font-size: 0.75rem; }
+.terminal-watchdog-buttons { display: flex; gap: 0.4rem; flex-shrink: 0; }
+.terminal-watchdog-buttons button { flex-shrink: 0; padding: 0.2rem 0.45rem; font-size: 0.75rem; }
+.terminal-watchdog-buttons .btn-resume-paused {
+  border-color: var(--c-primary);
+  color: var(--c-primary);
+  background: var(--c-primary-lighter, var(--c-bg-card));
+}
+.terminal-watchdog-buttons .btn-resume-paused:not(:disabled):hover { background: var(--c-primary-light, var(--c-primary-lighter)); }

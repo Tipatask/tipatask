@@ -44,10 +44,12 @@ function getJson(port, route, headers = {}) {
   });
 }
 
-test('sessionMetaRow: shape is { agent, label, type, alive } read from the session object', () => {
+test('sessionMetaRow includes the current paused summary for reconnecting clients', () => {
   assert.equal(sessionMetaRow(fakeSession({ startedAt: 1790780000000 })).startedAt, 1790780000000);
-  assert.deepEqual(sessionMetaRow(fakeSession()), { agent: 'claude', label: 'Claude Code', type: 'terminal', alive: true });
-  assert.deepEqual(sessionMetaRow({ tabId: 'X' }), { agent: null, label: '', type: 'terminal', alive: false });
+  assert.deepEqual(sessionMetaRow(fakeSession()), { agent: 'claude', label: 'Claude Code', type: 'terminal', alive: true, paused: null });
+  assert.deepEqual(sessionMetaRow({ tabId: 'X' }), { agent: null, label: '', type: 'terminal', alive: false, paused: null });
+  const paused = sessionMetaRow(fakeSession({ _pause: { at: 123, reason: 'memory', count: 35, threshold: 50, rssMb: 6400, limitMb: 3072 } }));
+  assert.deepEqual(paused.paused, { at: 123, reason: 'memory', count: 35, threshold: 50, rssMb: 6400, limitMb: 3072 });
 });
 
 test('session creation, terminal-state replies and snapshots share one stable start timestamp', () => {
@@ -91,7 +93,7 @@ test('GET /api/sessions reports the live session agent — a rewritten taskAgent
     sessions.set('TPT2', fakeSession({ tabId: 'TPT2', alive: false, _starting: true, taskAgent: 'pi', taskAgentLabel: 'Pi Coding Agent' }));
     r = await getJson(port, '/api/sessions');
     assert.deepEqual(r.json.sessions.sort(), ['TPT1', 'TPT2']);
-    assert.deepEqual(r.json.sessionMeta.TPT2, { agent: 'pi', label: 'Pi Coding Agent', type: 'terminal', alive: false });
+    assert.deepEqual(r.json.sessionMeta.TPT2, { agent: 'pi', label: 'Pi Coding Agent', type: 'terminal', alive: false, paused: null });
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));

@@ -31,6 +31,10 @@ const {
   bgAgentsBusy,
   BG_AGENTS_BUSY_MAX_MS,
   killRunawaySession,
+  pauseRunawaySession,
+  resumeRunawaySession,
+  resumeAllRunawaySessions,
+  killPausedTargets,
   buildTerminalExitFrame,
   exitReasonFields,
   spawnTerminal,
@@ -2065,6 +2069,217 @@ test('killRunawaySession falls back to pty.kill() when the process tree yields n
   });
 });
 
+test('killRunawaySession words a memory kill around the limit and records the figures', () => {
+  runWithStubbedKill(() => {
+    const { session } = makeRunawaySession();
+    const result = killRunawaySession(session, { count: 12, threshold: 50, rssMb: 4800, limitMb: 3072, reason: 'memory', snapshot: RUNAWAY_SNAPSHOT });
+    assert.match(result.text, /^Watchdog killed this session: its process tree used 4800 MB, over the 3072 MB memory limit/);
+    assert.match(result.text, /12 descendant processes/);
+    assert.equal(session._exitReason.kind, 'runaway-killed');
+    assert.equal(session._exitReason.rssMb, 4800);
+    assert.equal(session._exitReason.limitMb, 3072);
+  });
+});
+
+// ── pauseRunawaySession() / resumeRunawaySession() — process.kill stubbed, nothing real is signaled ──
+
+const PAUSE_ARGS = { count: 12, threshold: 50, rssMb: 3300, limitMb: 3072, reason: 'memory', snapshot: RUNAWAY_SNAPSHOT };
+
+test('pauseRunawaySession is a no-op returning null when the session is not alive or has no ptyPid', () => {
+  runWithStubbedKill((calls) => {
+    const dead = makeRunawaySession({ alive: false });
+    assert.equal(pauseRunawaySession(dead.session, PAUSE_ARGS), null);
+    const noPid = makeRunawaySession({ ptyPid: null });
+    assert.equal(pauseRunawaySession(noPid.session, PAUSE_ARGS), null);
+    assert.equal(pauseRunawaySession(null, {}), null);
+    assert.equal(dead.session._pause, undefined);
+    assert.equal(dead.session.buffer, 'agent output\r\n');
+    assert.deepEqual(calls, []);
+  });
+});
+
+test('pauseRunawaySession SIGSTOPs the whole tree, never kills, and writes one [Task App] notice', () => {
+  runWithStubbedKill((calls) => {
+    const { session, sent, ptyCalls } = makeRunawaySession();
+    const result = pauseRunawaySession(session, { ...PAUSE_ARGS, summary: 'node ×9' });
+
+    assert.equal(result.first, true);
+    assert.match(result.text, /^Watchdog paused this session: its process tree uses 3300 MB, over the 3072 MB memory limit/);
+    assert.match(result.text, /Nothing was killed/);
+    assert.match(result.text, /Resume the session/);
+    assert.match(result.text, /Top processes: node ×9\.$/);
+    // The pty leader's group plus the setsid()'d descendant-led group 555 — SIGSTOP only.
+    assert.deepEqual(calls, [[-424242, 'SIGSTOP'], [-555, 'SIGSTOP']]);
+    assert.deepEqual(ptyCalls, []);
+    test.mock.timers.tick(5000); // no SIGKILL follow-up is ever scheduled
+    assert.deepEqual(calls, [[-424242, 'SIGSTOP'], [-555, 'SIGSTOP']]);
+    // Not an exit: no reason recorded, session still alive.
+    assert.equal(session._exitReason, null);
+    assert.equal(session.alive, true);
+    assert.deepEqual(session._pause.targets, { pgids: [424242, 555], pids: [] });
+    assert.equal(session._pause.reason, 'memory');
+    assert.equal(session._pause.rssMb, 3300);
+    // Buffer (reconnect replay) and the live socket both carry the notice.
+    assert.ok(session.buffer.startsWith('agent output\r\n'));
+    assert.ok(session.buffer.includes(`[Task App] ${result.text}`));
+    assert.equal(sent.length, 2);
+    assert.equal(sent[0].type, 'data');
+    assert.ok(sent[0].data.includes(`[Task App] ${result.text}`));
+    // (TPT443) followed by a terminal-state frame carrying the paused-banner summary — figures
+    // only, never the signal target set.
+    assert.equal(sent[1].type, 'terminal-state');
+    assert.deepEqual(Object.keys(sent[1].paused).sort(), ['at', 'count', 'limitMb', 'reason', 'rssMb', 'threshold']);
+    assert.equal(sent[1].paused.rssMb, 3300);
+    assert.equal(sent[1].paused.limitMb, 3072);
+    assert.equal(sent[1].paused.reason, 'memory');
+  });
+});
+
+test('pauseRunawaySession words a count pause around the process growth', () => {
+  runWithStubbedKill(() => {
+    const { session } = makeRunawaySession();
+    const result = pauseRunawaySession(session, { count: 86, threshold: 50, rssMb: 700, limitMb: 3072, reason: 'count', snapshot: RUNAWAY_SNAPSHOT });
+    assert.match(result.text, /^Watchdog paused this session: 86 descendant processes using 700 MB and growing/);
+    assert.match(result.text, /warn ≥50/);
+    assert.equal(session._pause.reason, 'count');
+  });
+});
+
+test('pauseRunawaySession on a repeat sweep re-signals and folds in new targets, with no second notice', () => {
+  runWithStubbedKill((calls) => {
+    const { session, sent } = makeRunawaySession();
+    const first = pauseRunawaySession(session, PAUSE_ARGS);
+    const bufferAfterFirst = session.buffer;
+    // A member that forked just before the first SIGSTOP now leads its own group (777).
+    const later = parsePsOutput('  424242  424242  1\n  424242  424243  424242\n  555  555  424243\n  777  777  424243\n');
+    const second = pauseRunawaySession(session, { ...PAUSE_ARGS, count: 13, rssMb: 3400, snapshot: later });
+
+    assert.equal(second.first, false);
+    assert.equal(second.text, first.text);
+    assert.equal(session.buffer, bufferAfterFirst);
+    assert.equal(sent.filter(m => m.type === 'data').length, 1);
+    // (TPT443) each sweep refreshes the paused banner's figures
+    assert.equal(sent.at(-1).type, 'terminal-state');
+    assert.equal(sent.at(-1).paused.rssMb, 3400);
+    assert.deepEqual(calls.slice(2), [[-424242, 'SIGSTOP'], [-555, 'SIGSTOP'], [-777, 'SIGSTOP']]);
+    assert.deepEqual(session._pause.targets, { pgids: [424242, 555, 777], pids: [] });
+    assert.equal(session._pause.rssMb, 3400); // latest figures, used as the resume base
+    assert.equal(session._pause.count, 13);
+  });
+});
+
+test('pauseRunawaySession returns null, and records no pause, when nothing could be signaled', () => {
+  runWithStubbedKill((calls) => {
+    const { session, sent } = makeRunawaySession({ ptyPid: 1 }); // pid 1 is never signaled
+    assert.equal(pauseRunawaySession(session, { ...PAUSE_ARGS, snapshot: null }), null);
+    assert.equal(session._pause, undefined);
+    assert.equal(session.buffer, 'agent output\r\n');
+    assert.equal(sent.length, 0);
+    assert.deepEqual(calls, []);
+  });
+});
+
+test('resumeRunawaySession SIGCONTs exactly the stopped set, clears the pause and re-arms the watchdog', () => {
+  runWithStubbedKill((calls) => {
+    const { session, sent } = makeRunawaySession({
+      descendantWatchdog: { threshold: 50, lastCount: 12, paused: true, actReason: 'memory', growthStreak: 1, rssStreak: 4, pauseFailed: true },
+    });
+    pauseRunawaySession(session, PAUSE_ARGS);
+    calls.length = 0;
+    const result = resumeRunawaySession(session);
+
+    assert.equal(result.resumed, true);
+    assert.match(result.text, /^Session resumed\./);
+    assert.deepEqual(calls, [[-424242, 'SIGCONT'], [-555, 'SIGCONT']]);
+    assert.equal(session._pause, null);
+    assert.equal(session._exitReason, null);
+    assert.deepEqual(session.descendantWatchdog, {
+      threshold: 50, lastCount: 12, paused: false, actReason: null, growthStreak: 0, rssStreak: 0, pauseFailed: false,
+      resumeBase: { count: 12, rssMb: 3300 },
+    });
+    assert.ok(session.buffer.includes(`[Task App] ${result.text}`));
+    assert.equal(sent.filter(m => m.type === 'data').length, 2); // pause notice + resume notice
+    // (TPT443) the attached client's banner goes away: last frame is terminal-state, paused null
+    assert.equal(sent.at(-1).type, 'terminal-state');
+    assert.equal(sent.at(-1).paused, null);
+    // Not paused any more: a second resume is a no-op.
+    assert.equal(resumeRunawaySession(session), null);
+    assert.equal(calls.length, 2);
+  });
+});
+
+test('resumeRunawaySession is a no-op for a session that was never paused', () => {
+  runWithStubbedKill((calls) => {
+    const { session } = makeRunawaySession();
+    assert.equal(resumeRunawaySession(session), null);
+    assert.equal(resumeRunawaySession(null), null);
+    assert.deepEqual(calls, []);
+    assert.equal(session.buffer, 'agent output\r\n');
+  });
+});
+
+test('resumeRunawaySession falls back to the pty leader group when the stored set no longer answers', () => {
+  const calls = [];
+  const origKill = process.kill;
+  // Stored members are gone (ESRCH); the leader's group still exists.
+  process.kill = (pid, sig) => { calls.push([pid, sig]); if (pid !== -424242) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); };
+  try {
+    const { session } = makeRunawaySession({ _pause: { count: 3, rssMb: 10, targets: { pgids: [555], pids: [9001] } } });
+    const result = resumeRunawaySession(session);
+    assert.equal(result.resumed, true);
+    assert.deepEqual(calls, [[-555, 'SIGCONT'], [9001, 'SIGCONT'], [-424242, 'SIGCONT']]);
+  } finally {
+    process.kill = origKill;
+  }
+});
+
+test('resumeAllRunawaySessions resumes every paused session and leaves the others alone', () => {
+  runWithStubbedKill((calls) => {
+    const a = makeRunawaySession({ tabId: 'A' });
+    const b = makeRunawaySession({ tabId: 'B', ptyPid: 525252 });
+    const c = makeRunawaySession({ tabId: 'C', ptyPid: 626262 });
+    pauseRunawaySession(a.session, PAUSE_ARGS);
+    pauseRunawaySession(c.session, { ...PAUSE_ARGS, snapshot: parsePsOutput('  626262  626262  1\n') });
+    calls.length = 0;
+    const sessions = new Map([['a', a.session], ['b', b.session], ['c', c.session], ['gone', null]]);
+
+    assert.deepEqual(resumeAllRunawaySessions(sessions), ['A', 'C']);
+    assert.deepEqual(calls, [[-424242, 'SIGCONT'], [-555, 'SIGCONT'], [-626262, 'SIGCONT']]);
+    assert.equal(a.session._pause, null);
+    assert.equal(c.session._pause, null);
+    assert.deepEqual(resumeAllRunawaySessions(sessions), []); // all resumable, none left paused
+    assert.deepEqual(resumeAllRunawaySessions(null), []);
+  });
+});
+
+test('killRunawaySession continues a paused tree before terminating it', () => {
+  runWithStubbedKill((calls) => {
+    const { session } = makeRunawaySession();
+    pauseRunawaySession(session, PAUSE_ARGS);
+    calls.length = 0;
+    killRunawaySession(session, { count: 12, threshold: 50, snapshot: RUNAWAY_SNAPSHOT });
+    assert.deepEqual(calls, [[-424242, 'SIGCONT'], [-555, 'SIGCONT'], [-424242, 'SIGTERM'], [-555, 'SIGTERM']]);
+    assert.equal(session._pause, null);
+  });
+});
+
+test('killPausedTargets continues, SIGTERMs, then SIGKILLs the stored set; no-op when not paused', () => {
+  runWithStubbedKill((calls) => {
+    const { session } = makeRunawaySession();
+    assert.equal(killPausedTargets(session), false);
+    assert.equal(killPausedTargets(null), false);
+    assert.deepEqual(calls, []);
+
+    pauseRunawaySession(session, PAUSE_ARGS);
+    calls.length = 0;
+    assert.equal(killPausedTargets(session), true);
+    assert.equal(session._pause, null);
+    assert.deepEqual(calls, [[-424242, 'SIGCONT'], [-555, 'SIGCONT'], [-424242, 'SIGTERM'], [-555, 'SIGTERM']]);
+    test.mock.timers.tick(1500);
+    assert.deepEqual(calls.slice(4), [[-424242, 'SIGKILL'], [-555, 'SIGKILL']]);
+  });
+});
+
 test('exitReasonFields is empty without a reason and carries reason/reasonText with one', () => {
   assert.deepEqual(exitReasonFields({ _exitReason: null }), {});
   assert.deepEqual(exitReasonFields({}), {});
@@ -2105,7 +2320,7 @@ const SPINNER = '✻ Crafting… (3s · esc to interrupt)\n';
 const TURN_OUTPUT = `${'●'.repeat(1)} Reply with the single word READY.\n${'.'.repeat(SUBMIT_MARKER_TRAILING_MAX + 100)}\n${SPINNER}`;
 
 // One spawn on a fresh session. Returns handles to feed PTY output and inspect PTY input.
-async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364' } = {}) {
+async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364', kickoffTypedLine } = {}) {
   const writes = [];
   const sent = [];
   let dataCb = null;
@@ -2122,6 +2337,7 @@ async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364' } =
   t.mock.method(agent, 'cachedDetect', async () => ({ id: 'claude', label: 'Claude Code', available: true }));
   t.mock.method(agent, 'getSpawnSpec', async () => ({
     command: 'claude', args: [], cwd: os.tmpdir(), env: {}, initialPrompt, model: 'test-model',
+    ...(kickoffTypedLine ? { kickoffTypedLine } : {}),
   }));
   const session = createSession(null, false, 'TPT364-tab', '');
   session.taskAgent = 'claude';
@@ -2190,6 +2406,26 @@ test('TPT364 control: a submit the TUI accepts is sent exactly once, never re-se
   k.advanceWithOutput(30_000);
   assert.equal(k.enters(), 1);
   assert.deepEqual(k.notices().filter((n) => /not submitted/.test(n)), []);
+});
+
+test('TPT445: kickoffTypedLine is typed as a separate write after the paste, then Enter after another silence', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const LINE = 'Please carry out the task brief pasted above.';
+  const k = await startClaudeKickoff(t, { kickoffTypedLine: LINE });
+  k.feed(BOOT_OUTPUT);
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+  k.feed(CHIP);
+  assert.equal(k.advanceUntil(() => k.writes.includes(LINE)), true, 'the typed line must follow the settled paste');
+  assert.equal(k.enters(), 0, 'Enter must wait one more silence after the typed line');
+  const pasteIdx = k.writes.findIndex((w) => typeof w === 'string' && w.startsWith(PASTE_OPEN));
+  const lineIdx = k.writes.indexOf(LINE);
+  assert.ok(lineIdx > pasteIdx, 'typed line comes after the paste');
+  assert.ok(!LINE.includes(PASTE_OPEN) && !/[\r\n]/.test(LINE));
+  assert.equal(k.advanceUntil(() => k.enters() >= 1), true, 'Enter follows the typed line');
+  assert.ok(k.writes.lastIndexOf(SUBMIT) > lineIdx);
+  k.feed(TURN_OUTPUT);
+  k.advanceWithOutput(30_000);
+  assert.equal(k.enters(), 1);
 });
 
 test('TPT364 regression: stop then restart — a restarted kickoff whose Enter is dropped is re-submitted', async (t) => {

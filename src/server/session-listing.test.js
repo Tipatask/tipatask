@@ -34,3 +34,8 @@ test('sessionListBucket: no session is null', () => {
   assert.equal(sessionListBucket(null), null);
   assert.equal(sessionListBucket(undefined), null);
 });
+
+test('sessionListBucket: a queued session (TPT444) is its own bucket, never exited or active', () => {
+  assert.equal(sessionListBucket({ alive: false, pending: false, _starting: false, _queued: true }), 'queued');
+  assert.equal(sessionListBucket({ alive: false, pending: false, _starting: false, _launching: true }), 'active');
+});

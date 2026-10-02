@@ -47,6 +47,11 @@ export function startTerminalSession(taskId, extraParams, opts = {}) {
       } else if (msg.type === 'terminal-state') {
         terminalState = msg;
         if (sawConfig) finish(true, msg);
+      } else if (msg.type === 'session-queued') {
+        // (TPT444) The server accepted the start and parked it in its start queue (no free slot
+        // right now). That is a successful start from Play All's point of view — closing the
+        // socket is fine, the server starts the session itself when a slot frees.
+        finish(true, msg);
       } else if (msg.type === 'error' || msg.type === 'session-ended') {
         finish(false, msg);
       }
@@ -126,6 +131,32 @@ export function terminateTaskSession(taskId, opts = {}) {
   });
 }
 
+// One-shot control for the active-sessions rail. The server handles this before terminal
+// reattachment, so a visible modal keeps its socket and the action never spawns a session.
+export function resumePausedTaskSession(taskId) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(buildWsUrl(taskId, { resumePaused: '1' }));
+    let done = false;
+    const timeout = setTimeout(() => finish(false), 5000);
+    function finish(ok) {
+      if (done) return;
+      done = true;
+      clearTimeout(timeout);
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+      resolve(ok);
+    }
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'resume-paused-result') finish(msg.ok === true);
+        else if (msg.type === 'error') finish(false);
+      } catch { finish(false); }
+    };
+    ws.onerror = () => finish(false);
+    ws.onclose = () => finish(false);
+  });
+}
+
 // (C1463) Objective tab close — teardown of every running terminal session under an
 // objective's whole descendant tree, gated server-side by a fresh, unscoped, role-derived
 // "every descendant closed" check (see ws-handlers.js's terminateChildren connect branch;
@@ -180,6 +211,12 @@ export const WS_SEND_TYPES = {
   START_SPEC_CHAT: 'start-spec-chat',
   SPEC_CHAT_MESSAGE: 'spec-chat-message',
   APPLY_SPEC_UPDATE: 'apply-spec-update',
+  // Task chat (task-chat.js) — session id `taskChat:<taskKey>`
+  START_TASK_CHAT: 'start-task-chat',
+  START_PROJECT_CHAT: 'start-project-chat', // project chat, session id `projectChat:<API_PROJECT_ID>`
+  TASK_CHAT_MESSAGE: 'task-chat-message',
+  TASK_CHAT_ANSWER: 'task-chat-answer',
+  TASK_CHAT_TASK_EDITED: 'task-chat-task-edited', // the user saved a task from one of the chat's cards
 };
 
 // ── api-status subscription ──
@@ -215,6 +252,11 @@ export const WS_RECV_TYPES = {
   SPEC_SUGGESTION: 'spec-suggestion',
   SPEC_APPLIED: 'spec-applied',
   SPEC_APPLY_ERROR: 'spec-apply-error',
+  // Task chat widget frames (task-chat.js)
+  TASK_CHAT_DIALOG: 'task-chat-dialog',
+  TASK_CHAT_TOOL: 'task-chat-tool',
+  TASK_CHAT_TASK: 'task-chat-task',
+  TASK_CHAT_TASK_EDITED: 'task-chat-task-edited',
   // Granular task mutation events
   TASK_CREATED: 'task:created',
   TASK_UPDATED: 'task:updated',

@@ -125,6 +125,24 @@ test('ClaudeAgent.getSpawnSpec: designMode false/absent -> normal preamble, no p
   }
 });
 
+test('TPT445 ClaudeAgent.getSpawnSpec: kickoffTypedLine set for a normal spawn, omitted for designMode', async () => {
+  const dir = makeProjectDir({ CLAUDE_MODEL: 'opusplan' });
+  try {
+    const agent = new ClaudeAgent();
+    const normal = await agent.getSpawnSpec(FAKE_CONFIG, 'Do the thing', 'TPT445', { projectPath: dir });
+    const line = normal.kickoffTypedLine;
+    assert.strictEqual(line, ClaudeAgent.KICKOFF_TYPED_LINE);
+    assert.ok(line && line.length > 0);
+    assert.ok(!/[\r\n]/.test(line), 'must be newline-free so it cannot submit early');
+    assert.ok(!line.startsWith('/'), 'must not read as a slash command');
+
+    const design = await agent.getSpawnSpec(FAKE_CONFIG, 'Do the thing', 'TPT445', { projectPath: dir, designMode: true });
+    assert.ok(!('kickoffTypedLine' in design), 'design mode must carry no typed line');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('ClaudeAgent.getSpawnSpec: designMode wins over SIMPLE_MODE ordering', async () => {
   const dir = makeProjectDir({ CLAUDE_MODEL: 'opusplan' });
   try {

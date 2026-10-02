@@ -67,6 +67,8 @@ const _COMMENTS_TAB_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentC
 // (TPT17) Notifications tab — bell icon, same stroke style as the other tab icons.
 const _NOTIF_TAB_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M8 1.5c-2 0-3.5 1.5-3.5 3.5v2.3c0 .5-.2 1-.6 1.4L3 9.7c-.3.3-.1.8.3.8h9.4c.4 0 .6-.5.3-.8l-.9-1c-.4-.4-.6-.9-.6-1.4V5c0-2-1.5-3.5-3.5-3.5z"/><path d="M6.5 12.5a1.5 1.5 0 0 0 3 0"/></svg>';
 const _WAND_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M2 14l7-7"/><path d="M11 1.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6z"/><path d="M14 7l.4 1 1 .4-1 .4-.4 1-.4-1-1-.4 1-.4z"/></svg>';
+// Speech bubble — same glyph as the board card's .btn-task-chat (task-card.js).
+const _CHAT_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.5a1.5 1.5 0 0 1-1.5 1.5H5.5l-3 2.5V4A1.5 1.5 0 0 1 4 2.5h8A1.5 1.5 0 0 1 13.5 4z"/><path d="M5.5 6h5"/><path d="M5.5 8.25h3"/></svg>';
 
 function _modalUnmetDependencyKeys(task) {
   return commands.unmetDependencyKeys(task, commands._projectTaskIndex());
@@ -95,7 +97,12 @@ function _modalSessionButton(task) {
   const savedStatus = _modalState?.lastSaved?.status ?? task?.status;
   const active = !!task && state.activeSessions.has(task.id);
   const exited = !!task && state.exitedSessions.has(task.id);
-  const mode = sessionButtonMode(savedStatus, { active, exited });
+  const queuedPosition = task ? state.queuedSessions.get(task.id) : undefined;
+  const mode = sessionButtonMode(savedStatus, { active, exited, queued: queuedPosition !== undefined });
+  if (mode === SESSION_BUTTON_MODES.QUEUED) {
+    // (TPT444) Waiting in the server's start queue — clicking re-attaches to the wait.
+    return { mode, icon: _START_SVG, label: t('queue.badge', { position: queuedPosition ?? '?' }), title: t('tooltip.queuedSession') };
+  }
   if (mode === SESSION_BUTTON_MODES.RUNNING) {
     return { mode, icon: '<span class="session-spinner" aria-hidden="true"></span>', label: t('btn.show'), title: t('tooltip.showRunningSession') };
   }
@@ -727,6 +734,12 @@ async function _openTaskEditModalImpl(taskId, callbacks = {}) {
   //   same surfaces as a teammate's task (commands.isTaskReadOnly, C1407) and additionally hides Start,
   //   with its own banner. Used by the objective chat's pinned discuss card, where a direct edit
   //   would race the "modified" proposal whose baseline is hydrated from the live task.
+  // callbacks.hideActions: optional boolean — fully editable, but without the footer actions
+  //   (Start/Resume/Show, Stop, Reiterate, Delete). For an opener stacked above the board (the
+  //   task chat window): each of those opens a terminal or a board-level dialog that would land
+  //   underneath it.
+  // callbacks.onSaved: optional (taskId) => void — fired after each successful save of a real
+  //   (non-preview) task, so the opener can react to a hand-made edit.
   // (TPT272/TPT283) A task locked by an open Rehash → Discuss/Split tab can't be edited from the
   // board or the terminal bridge until the chat is saved or closed. The chat's own read-only view
   // and in-memory proposals (preloadedTask) stay openable. The toast names the lock's mode.
@@ -1149,7 +1162,8 @@ function _renderTaskEditModal() {
         : t('modal.readOnlyDiscuss'))}</div>`
     : '';
 
-  const showStart = !isPreviewTask && !readOnly && draft.category === 'CODING' && draft.agentAssignee !== 'human' && commands.canStartTaskCard(draft);
+  const hideActions = !!_modalState.callbacks.hideActions;
+  const showStart = !isPreviewTask && !readOnly && !hideActions && draft.category === 'CODING' && draft.agentAssignee !== 'human' && commands.canStartTaskCard(draft);
   const hasActiveSession = state.activeSessions.has(draft.id);
   // (TPT374) mode/icon/label/title for the footer Start/Resume/Show button — see
   // _modalSessionButton() just below _syncModalStartDependencyState().
@@ -1174,6 +1188,13 @@ function _renderTaskEditModal() {
   // throws, and Reset/Save need no diff-mode awareness. ──
   const openLiveBtnHtml = (isDiffMode && _modalState.callbacks.onOpenLiveTask)
     ? `<button type="button" class="btn-diff-open-live">${escapeAttr(t('diff.openLiveTask'))}</button>`
+    : '';
+  // Task chat entry point — real, live tasks only. Not for a proposal (no server task), the
+  // locked discuss view, or a modal stacked above the chat window itself (hideActions), where
+  // opening the chat would replace the window underneath this modal.
+  const showChat = !isPreviewTask && !isDiffMode && !hideActions && !_modalState.callbacks.readOnly;
+  const chatBtnHtml = showChat
+    ? `<button type="button" class="btn-modal-chat" title="${escapeAttr(t('tooltip.taskChat'))}" aria-label="${escapeAttr(t('tooltip.taskChat'))}">${_CHAT_SVG}<span>${escapeAttr(t('btn.taskChat'))}</span></button>`
     : '';
   const titleDescHtml = isDiffMode ? `
     <div class="diff-header-row">
@@ -1205,6 +1226,7 @@ function _renderTaskEditModal() {
             <select class="modal-status-select" style="--status-color:${statusColor(draft.status)}" aria-label="${escapeAttr(t('field.status'))}" title="${escapeAttr(t('field.status'))}"${readOnly ? ' disabled' : ''}>${statusOptions}</select>
           </div>
           ${openLiveBtnHtml}
+          ${chatBtnHtml}
           <div class="modal-primary-actions">
             <button class="btn-modal-cancel" type="button">${t('btn.cancel')}</button>
             <button class="btn-modal-reset"${!dirty || readOnly ? ' disabled' : ''}>${t('btn.reset')}</button>
@@ -1271,7 +1293,7 @@ function _renderTaskEditModal() {
           ${showStart ? `<button type="button" data-action="start" data-session-mode="${sessionBtn.mode}" class="${startBlocked ? 'deps-blocked' : ''}" title="${escapeAttr(startTitle)}"${startBlocked ? ' disabled' : ''}>${sessionBtn.icon}<span class="btn-label">${startLabel}</span></button>` : ''}
           ${showStart && hasActiveSession ? `<button type="button" data-action="stop" title="${escapeAttr(t('tooltip.stopSession'))}">${commands.STOP_ICON}<span class="btn-label">${t('btn.stop')}</span></button>` : ''}
           </div>
-          ${readOnly ? '' : `<div class="modal-actions-manage">
+          ${readOnly || hideActions ? '' : `<div class="modal-actions-manage">
           <button type="button" data-action="reiterate" title="${escapeAttr(t('tooltip.reiterate'))}">${_WAND_SVG}<span class="btn-label">${t('btn.reiterate')}</span></button>
           <button type="button" data-action="delete" title="${escapeAttr(t('tooltip.deleteTask'))}">${_DELETE_SVG}<span class="btn-label">${t('btn.delete')}</span></button>
           </div>`}
@@ -1969,6 +1991,8 @@ function _attachModalHandlers(modal) {
     try {
       updateResult = await api.tasks.update(taskId, patch);
     } catch (err) { console.error('[modal] Task update failed:', err); showToast(t('common.networkError', { msg: err.message }), 'error'); return false; }
+    // Before the staleness check below: the write landed whether or not this modal is still open.
+    try { callbacks.onSaved?.(taskId); } catch (err) { console.warn('[modal] onSaved callback failed:', err); }
     // (C1316) The modal may have been closed/replaced by the time the PATCH resolves
     // (e.g. Start already tore it down while awaiting persistDraft()) — the write itself
     // succeeded, so report success, but skip the board-DOM/baseline bookkeeping below
@@ -2015,6 +2039,26 @@ function _attachModalHandlers(modal) {
 
   // Save
   saveBtn.addEventListener('click', () => { persistDraft(); });
+
+  // Task chat — same save-first path as Start (C1316): the chat's agent reads the task from
+  // the server, so a dirty draft is written before the window opens. The modal closes first
+  // because the open chat window lifts this overlay above itself (body.task-chat-open).
+  // Reached through window.TipTask: importing task-chat.js would pull task-card.js in here.
+  const chatBtn = modal.querySelector('.btn-modal-chat');
+  if (chatBtn) {
+    chatBtn.addEventListener('click', async () => {
+      const taskId = _modalState.taskId;
+      if (_isModalDirty()) {
+        chatBtn.disabled = true; // re-entrancy guard while the save is in flight
+        let saved = false;
+        try { saved = await persistDraft(); } finally { chatBtn.disabled = false; }
+        if (!saved) return; // persistDraft() already reported the failure; modal stays open
+        if (!_modalState || _modalState.taskId !== taskId) return; // closed or switched meanwhile
+      }
+      closeTaskEditModal(true);
+      window.TipTask?.taskChat?.open(taskId);
+    });
+  }
 
   // Reset
   resetBtn.addEventListener('click', () => {

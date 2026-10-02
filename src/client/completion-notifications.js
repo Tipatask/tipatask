@@ -18,7 +18,8 @@ import { notify, debugNotifyLog, isNotifyEnabled } from './notifications.js';
 import { t } from './i18n.js';
 import { pushNotification, dismissNotification } from './notification-center.js';
 import { isCompleteName } from './status-registry.js';
-import { buildNotificationTitle, isTaskInUserFocus } from './attention-notifications.js';
+import { buildNotificationTitle, isTaskInUserFocus, openTaskTerminalFromNotification } from './attention-notifications.js';
+import state from './state.js';
 
 // (C1355) "Already notified this completion" ledger — three separate code paths in template.html
 // converge on the same completion event (browser board WS, Electron task-state event, and the
@@ -43,8 +44,11 @@ function _projectPath() {
 
 // Both notification surfaces share this action. The native transport has already focused the
 // originating project window; the path check also protects an in-app card left behind after a
-// project switch. The board's navigation bridge fetches the task by key even when no card is
-// currently rendered, and opens details without starting a terminal.
+// project switch. (TPT439) A click opens the task's console on the finished session (scrolled to
+// the bottom by openTerminal()), like an attention click. Only when no session is known client-side
+// does it fall back to the task edit modal — openTerminal() on a session-less task would spawn a
+// brand-new agent run. The board's navigation bridge fetches the task by key even when no card is
+// currently rendered.
 function _completionAction(taskId, tag) {
   const originPath = _projectPath();
   return () => {
@@ -53,8 +57,12 @@ function _completionAction(taskId, tag) {
       dismissNotification(tag);
       return;
     }
-    try { window.electronAPI?.focusSelf?.(); } catch (_) {}
     dismissNotification(tag);
+    if (state.activeSessions?.has(taskId) || state.exitedSessions?.has(taskId)) {
+      openTaskTerminalFromNotification(taskId, state.taskStatusById?.get(taskId));
+      return;
+    }
+    try { window.electronAPI?.focusSelf?.(); } catch (_) {}
     const modal = typeof document !== 'undefined' && document.getElementById?.('task-edit-modal');
     if (modal && !modal.hidden && modal.dataset?.taskId === taskId) return;
     if (_openingTasks.has(taskId)) return;

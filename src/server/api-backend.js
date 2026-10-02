@@ -137,7 +137,14 @@ let _statusesEntry = null; // { rows, at }
 // ── Project settings cache (C1215) — same invalidation discipline as _statusesEntry ──
 let _projectSettingsEntry = null; // { row, at, fallback }
 
+// Bumped by every _cacheInvalidate(). A list request captures it when it starts and may
+// only install its result (or clear the in-flight slot) while it is unchanged — a response
+// that was already in flight when a write invalidated the caches predates that write, and
+// caching it would hand the next reader rows the write has since replaced.
+let _cacheGeneration = 0;
+
 function _cacheInvalidate() {
+  _cacheGeneration++;
   _listEntry = null;
   _listInflight = null;
   _scopedEntry = null;
@@ -742,6 +749,77 @@ function applyIdRemapToTaskPayload(tasks, idRemap) {
   }
 }
 
+// ── Save-path error annotations (overwriteRawWithRemap / overwriteRaw) ──
+// `saveStep` names the phase that threw and `code` classifies a local rejection; the
+// PUT /api/todo handler turns both into its status and response body (todo-save-error.js).
+// Neither is a `statusCode`: that field stays reserved for a real HTTP status from the API.
+async function _saveStep(name, fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err && typeof err === 'object' && !err.saveStep) err.saveStep = name;
+    throw err;
+  }
+}
+
+function _codedError(code, message, saveStep) {
+  const err = new Error(message);
+  err.code = code;
+  if (saveStep) err.saveStep = saveStep;
+  return err;
+}
+
+function _parseTodoPayload(content) {
+  const match = content.match(TODO_REGEX);
+  if (!match) throw _codedError('TODO_PAYLOAD_INVALID', 'No JSON block found in content', 'parse-payload');
+  let parsed;
+  try {
+    parsed = JSON.parse(match[1]);
+  } catch (e) {
+    throw _codedError('TODO_PAYLOAD_INVALID', `Invalid JSON in TODO content: ${e.message}`, 'parse-payload');
+  }
+  if (!parsed.tasks || !Array.isArray(parsed.tasks)) {
+    throw _codedError('TODO_PAYLOAD_INVALID', 'Invalid task data: missing tasks array', 'parse-payload');
+  }
+  return parsed;
+}
+
+// Tags a save registers itself: legacy `parsed.tags` (migration JSON) + `parsed.new_tags`
+// (objective proposals). C1038: no silent auto-registration with a placeholder description —
+// a `new_tags` entry missing its description is a hard error, which forces the planner
+// prompt (see client/utils.js) to supply a real description for every new tag, plain tags
+// included. ttHints: tag name -> architecture_hint, tt-* new_tags entries only. Never sent
+// to POST /tags (that payload stays byte-identical to before C1237) — feeds local stub
+// generation for the KB-doc-link step instead.
+function _collectTagRegistrations(parsed) {
+  const tagRegistrations = [];
+  const ttHints = new Map();
+  if (Array.isArray(parsed.tags) && parsed.tags.length > 0) {
+    tagRegistrations.push(...parsed.tags);
+  }
+  if (Array.isArray(parsed.new_tags) && parsed.new_tags.length > 0) {
+    const missingDescription = parsed.new_tags.filter(t => t && t.name && !(t.description && t.description.trim()));
+    if (missingDescription.length > 0) {
+      throw _codedError(
+        'NEW_TAG_DESCRIPTION_MISSING',
+        `new_tags missing a description for: ${missingDescription.map(t => `"${t.name}"`).join(', ')} — ` +
+        'every new tag needs a real one-line description before it can be registered.',
+        'tag-registry'
+      );
+    }
+    for (const t of parsed.new_tags) {
+      // C1439: trim the name — the API trims on write (api/src/routes/tags.js:104), so
+      // an untrimmed push here used to register under the trimmed spelling while this
+      // save's own gate matched against the padded one.
+      tagRegistrations.push({ name: String(t.name).trim(), description: t.description.trim() });
+      if (t.name.startsWith('tt-') && typeof t.architecture_hint === 'string' && t.architecture_hint.trim()) {
+        ttHints.set(t.name, t.architecture_hint.trim());
+      }
+    }
+  }
+  return { tagRegistrations, ttHints };
+}
+
 // isReservationPlaceholder (shared with id-remap.js — see reservation-placeholder.js)
 // replaces the old locally-defined isReservedPlaceholder/RESERVED_PLACEHOLDER_DESCRIPTION
 // pair (C1017) — same check, now also considers the is_reservation flag column.
@@ -979,14 +1057,17 @@ const backend = {
     // checks, finalize-in-place matching in overwriteRaw, list_task_id_meta max-id
     // computation) must keep seeing unfinalized reservation placeholders even though
     // the API excludes them by default. Rendering hides them — see template.html.
+    const gen = _cacheGeneration;
     _listInflight = apiRequest('GET', '/tasks?include_reservations=true').then(data => {
       const rows = _mapRawTasks(data.tasks || []);
-      _listEntry = { rows, at: Date.now() };
-      _listInflight = null;
+      if (gen === _cacheGeneration) {
+        _listEntry = { rows, at: Date.now() };
+        _listInflight = null;
+      }
       if (TASKS_CACHE_LOG) process.stderr.write(`[api-backend:cache] op=list outcome=fetch ms=${Date.now() - t0}\n`);
       return rows;
     }).catch(err => {
-      _listInflight = null;
+      if (gen === _cacheGeneration) _listInflight = null;
       if (err.networkError && _listEntry !== null) {
         if (TASKS_CACHE_LOG) process.stderr.write(`[api-backend:cache] op=list outcome=stale-fallback\n`);
         return _listEntry.rows;
@@ -1020,16 +1101,19 @@ const backend = {
 
     // include_reservations=true — see comment on getTasksUnfiltered() above; the
     // board renderer (template.html) filters reservations out for display.
+    const gen = _cacheGeneration;
     _scopedInflight = apiRequest('GET', `/tasks?assignee=${_currentUserId}&include_reservations=true`).then(data => {
       // (C1407) filterToOwnOrUnassigned() closes the project-owner exemption gap —
       // see the _scopedEntry comment above.
       const rows = filterToOwnOrUnassigned(_mapRawTasks(data.tasks || []), _currentUserId);
-      _scopedEntry = { rows, at: Date.now() };
-      _scopedInflight = null;
+      if (gen === _cacheGeneration) {
+        _scopedEntry = { rows, at: Date.now() };
+        _scopedInflight = null;
+      }
       if (TASKS_CACHE_LOG) process.stderr.write(`[api-backend:cache] op=scoped outcome=fetch ms=${Date.now() - t0}\n`);
       return rows;
     }).catch(err => {
-      _scopedInflight = null;
+      if (gen === _cacheGeneration) _scopedInflight = null;
       if (err.networkError && _scopedEntry !== null) {
         if (TASKS_CACHE_LOG) process.stderr.write(`[api-backend:cache] op=scoped outcome=stale-fallback\n`);
         return _scopedEntry.rows;
@@ -1069,18 +1153,21 @@ const backend = {
 
     const assigneeQs = unscoped ? '' : `assignee=${_currentUserId}&`;
     const qs = `${assigneeQs}include_reservations=true${fullWindow ? '' : `&window=active${n > 0 ? `&extend_sprints=${n}` : ''}`}`;
+    const gen = _cacheGeneration;
     const req = apiRequest('GET', `/tasks?${qs}`).then(data => {
       const mapped = _mapRawTasks(data.tasks || []);
       // (C1407) unscoped → skip the owner-exemption filter too, this IS the "show
       // everyone" mode.
       const rows = unscoped ? mapped : filterToOwnOrUnassigned(mapped, _currentUserId);
       const windowInfo = data.window || null;
-      _boardEntries.set(cacheKey, { rows, windowInfo, at: Date.now() });
-      _boardInflight.delete(cacheKey);
+      if (gen === _cacheGeneration) {
+        _boardEntries.set(cacheKey, { rows, windowInfo, at: Date.now() });
+        _boardInflight.delete(cacheKey);
+      }
       if (TASKS_CACHE_LOG) process.stderr.write(`[api-backend:cache] op=board outcome=fetch n=${n} scope=${scope} ms=${Date.now() - t0}\n`);
       return { tasks: rows, window: windowInfo };
     }).catch(err => {
-      _boardInflight.delete(cacheKey);
+      if (gen === _cacheGeneration) _boardInflight.delete(cacheKey);
       if (err.networkError && cached) {
         if (TASKS_CACHE_LOG) process.stderr.write(`[api-backend:cache] op=board outcome=stale-fallback n=${n} scope=${scope}\n`);
         return { tasks: cached.rows, window: cached.windowInfo };
@@ -1615,12 +1702,12 @@ const backend = {
     // "no keys available" from "server is out of date" — it just retried and gave up.
     // Fail loud instead so the real cause reaches the caller/planner.
     if (data && data._notFound) {
-      throw new Error('reserve failed: POST /tasks/reserve returned 404 — the API server is missing the reserve route (C980) or this project was not found. Update/redeploy the API, or verify project access.');
+      throw _codedError('RESERVE_FAILED', 'reserve failed: POST /tasks/reserve returned 404 — the API server is missing the reserve route (C980) or this project was not found. Update/redeploy the API, or verify project access.');
     }
     _cacheInvalidate();
     const tasks = (data.tasks || []).map(fromApi);
     if (tasks.length === 0) {
-      throw new Error('reserve failed: API returned no tasks for a reserve request (unexpected response shape).');
+      throw _codedError('RESERVE_FAILED', 'reserve failed: API returned no tasks for a reserve request (unexpected response shape).');
     }
     return { keys: tasks.map(t => t.id), tasks };
   },
@@ -1665,19 +1752,10 @@ const backend = {
     try { lockKey = `api:${getCredentials().projectId}`; } catch { lockKey = `api:${config.API_PROJECT_ID}`; }
     return withProjectLock(lockKey, async () => {
       let idRemap = new Map();
+      let existingTagRows = null;
       _cacheInvalidate();
 
-      const match = content.match(TODO_REGEX);
-      if (!match) throw new Error('No JSON block found in content');
-      let parsed;
-      try {
-        parsed = JSON.parse(match[1]);
-      } catch (e) {
-        throw new Error(`Invalid JSON in TODO content: ${e.message}`);
-      }
-      if (!parsed.tasks || !Array.isArray(parsed.tasks)) {
-        throw new Error('Invalid task data: missing tasks array');
-      }
+      const parsed = _parseTodoPayload(content);
 
       const taskIdsInPayload = new Set(parsed.tasks.map(t => String(t.id || '')).filter(Boolean));
       const newTaskIds = Array.isArray(parsed.newTaskIds)
@@ -1685,11 +1763,25 @@ const backend = {
         : [];
 
       if (newTaskIds.length > 0) {
-        // Must be unfiltered — ID assignment needs to see all existing task keys
-        const liveTasks = await this.getTasksUnfiltered();
         const newIdSet = new Set(newTaskIds);
         const incomingNewTasks = parsed.tasks.filter(t => newIdSet.has(String(t.id || '')));
-        idRemap = await assignIncomingNewTaskIds(this, incomingNewTasks, liveTasks);
+
+        // Validate before reserving. A reserved key is a real row the API never takes
+        // back, so everything that can reject this save without writing — the new_tags
+        // description rule and the tag gate for the new tasks, which are always written —
+        // runs first. overwriteRaw() repeats the gate for every task it writes (edited
+        // existing tasks included) off the same registry rows.
+        const { tagRegistrations } = _collectTagRegistrations(parsed);
+        existingTagRows = await _saveStep('tag-registry', () => _readTagRegistry());
+        const newTaskTagNames = incomingNewTasks.flatMap(t => (Array.isArray(t.tags) ? t.tags : []));
+        await _saveStep('tag-registry', () => _assertTagsRegistered(newTaskTagNames, {
+          primaryRows: existingTagRows,
+          extraKnown: tagRegistrations,
+        }));
+
+        // Must be unfiltered — ID assignment needs to see all existing task keys
+        const liveTasks = await _saveStep('read-live', () => this.getTasksUnfiltered());
+        idRemap = await _saveStep('reserve-keys', () => assignIncomingNewTaskIds(this, incomingNewTasks, liveTasks));
         // After assignIncomingNewTaskIds, incomingNewTasks[i].id is already the
         // final key (mutated in place). Collect all assigned ids — this correctly
         // captures dup-source-id tasks that diverged to distinct final keys.
@@ -1701,27 +1793,19 @@ const backend = {
         }
       }
 
-      await this.overwriteRaw(content);
+      await this.overwriteRaw(content, { existingTagRows });
       return idRemap;
     });
   },
 
-  async overwriteRaw(content) {
+  // opts.existingTagRows: a tag-registry read the caller already made for this same save
+  // (overwriteRawWithRemap's pre-reserve validation) — reused instead of reading again.
+  async overwriteRaw(content, opts = {}) {
     // Invalidate the task-list cache before any reads so we see the latest DB
     // state — critical when two save requests are serialized by the lock above.
     _cacheInvalidate();
 
-    const match = content.match(TODO_REGEX);
-    if (!match) throw new Error('No JSON block found in content');
-    let parsed;
-    try {
-      parsed = JSON.parse(match[1]);
-    } catch (e) {
-      throw new Error(`Invalid JSON in TODO content: ${e.message}`);
-    }
-    if (!parsed.tasks || !Array.isArray(parsed.tasks)) {
-      throw new Error('Invalid task data: missing tasks array');
-    }
+    const parsed = _parseTodoPayload(content);
     const originalSpec = typeof parsed.originalSpec === 'string' ? parsed.originalSpec.trim() : '';
     const taskIdsInPayload = new Set(parsed.tasks.map(t => String(t.id || '')).filter(Boolean));
     const newTaskIds = Array.isArray(parsed.newTaskIds)
@@ -1747,45 +1831,18 @@ const backend = {
         }
       }
     }
-    // Pre-register tags before persisting — legacy `parsed.tags` (migration JSON) + `parsed.new_tags` (objective proposals).
-    // C1038: no more silent auto-registration with a placeholder description — a
-    // `new_tags` entry missing its description, or a task tag not covered by `tags`/
-    // `new_tags` at all, is a hard error now instead of a best-effort warning. Forces
-    // the planner prompt (see client/utils.js) to always supply a real description for
-    // every new tag before save, plain tags included.
-    const tagRegistrations = [];
-    if (Array.isArray(parsed.tags) && parsed.tags.length > 0) {
-      tagRegistrations.push(...parsed.tags);
-    }
-    // ttHints: tag name -> architecture_hint, tt-* new_tags entries only. Never sent to
-    // POST /tags (that payload stays byte-identical to before C1237) — feeds local stub
-    // generation for the KB-doc-link step below instead.
-    const ttHints = new Map();
-    if (Array.isArray(parsed.new_tags) && parsed.new_tags.length > 0) {
-      const missingDescription = parsed.new_tags.filter(t => t && t.name && !(t.description && t.description.trim()));
-      if (missingDescription.length > 0) {
-        throw new Error(
-          `new_tags missing a description for: ${missingDescription.map(t => `"${t.name}"`).join(', ')} — ` +
-          'every new tag needs a real one-line description before it can be registered.'
-        );
-      }
-      for (const t of parsed.new_tags) {
-        // C1439: trim the name — the API trims on write (api/src/routes/tags.js:104), so
-        // an untrimmed push here used to register under the trimmed spelling while this
-        // save's own gate matched against the padded one.
-        tagRegistrations.push({ name: String(t.name).trim(), description: t.description.trim() });
-        if (t.name.startsWith('tt-') && typeof t.architecture_hint === 'string' && t.architecture_hint.trim()) {
-          ttHints.set(t.name, t.architecture_hint.trim());
-        }
-      }
-    }
+    // Pre-register tags before persisting — see _collectTagRegistrations(). A task tag not
+    // covered by `tags`/`new_tags` or the live registry is rejected by the gate further down.
+    const { tagRegistrations, ttHints } = _collectTagRegistrations(parsed);
 
     // Moved up from after the POST /tags call below — same call, reused for both the
     // KB-doc-link candidate selection (C1237) and the tag gate further down.
     // C1439: _readTagRegistry() (not this.getProjectTags()) — throws TAG_REGISTRY_UNREADABLE
     // on a malformed/404 response instead of silently degrading to `[]`, so a bad read
     // can't be mistaken for "this project genuinely has zero tags" by either consumer.
-    const existingTagRows = await _readTagRegistry();
+    const existingTagRows = Array.isArray(opts.existingTagRows)
+      ? opts.existingTagRows
+      : await _saveStep('tag-registry', () => _readTagRegistry());
 
     // C1237 — best-effort: link new tt-* tags to their KB doc atomically at save time.
     // Never touches the POST /tags payload (no file_key sent there — that endpoint has
@@ -1809,7 +1866,7 @@ const backend = {
     }
 
     if (tagRegistrations.length > 0) {
-      await apiRequest('POST', '/tags', { tags: tagRegistrations });
+      await _saveStep('register-tags', () => apiRequest('POST', '/tags', { tags: tagRegistrations }));
     }
 
     if (docPlan.linkable.length > 0) {
@@ -1835,7 +1892,7 @@ const backend = {
     // still interleave so one's stale read missed the other's brand-new task, and the
     // bulk PUT then deleted it. PATCHing only the tasks actually touched this save
     // can never delete or clobber anything it doesn't name, regardless of staleness.
-    const liveTasks = await this.getTasksUnfiltered();
+    const liveTasks = await _saveStep('read-live', () => this.getTasksUnfiltered());
     const liveById = new Map(liveTasks.map(t => [String(t.id), t]));
 
     // Belt-and-suspenders: deduplicate parsed.tasks by id. This guards against any
@@ -1873,10 +1930,10 @@ const backend = {
     // primaryRows reuses the existingTagRows read from above (no extra network on the
     // happy path); extraKnown folds in tagRegistrations (tags/new_tags this same save
     // just registered via POST /tags) so they count as known without another round trip.
-    const canonicalTagNames = await _assertTagsRegistered(writtenTagNames, {
+    const canonicalTagNames = await _saveStep('tag-registry', () => _assertTagsRegistered(writtenTagNames, {
       primaryRows: existingTagRows,
       extraKnown: tagRegistrations,
-    });
+    }));
     // Rewrite each written task's tags to the registry's canonical spelling — see
     // tag-registry-gate.js's resolveTagNames for why this matters (the API's own
     // resolveTagIds matches case-insensitively in SQL but then filters case-sensitively
@@ -1898,21 +1955,23 @@ const backend = {
       const isNew = newTaskIdSet.has(id);
       if (isNew && t.assignee == null) t.assignee = _currentUserId ?? null;
 
-      if (isNew || !liveTask) {
-        if (liveTask) {
-          // Expected path: id is a real reservation placeholder row (booked live via
-          // reserve_task_keys or a web-frontend create form) — finalize it in place.
-          await this.updateTask(id, t);
+      await _saveStep(`write-task:${id}`, async () => {
+        if (isNew || !liveTask) {
+          if (liveTask) {
+            // Expected path: id is a real reservation placeholder row (booked live via
+            // reserve_task_keys or a web-frontend create form) — finalize it in place.
+            await this.updateTask(id, t);
+          } else {
+            // Defensive fallback only — assignIncomingNewTaskIds should already have
+            // guaranteed every "new" id is a live row by this point. Create directly
+            // rather than silently dropping the task if that guarantee ever breaks.
+            console.warn(`[overwriteRaw] "new" task ${id} has no live placeholder row — creating directly`);
+            await this.createTask(t);
+          }
         } else {
-          // Defensive fallback only — assignIncomingNewTaskIds should already have
-          // guaranteed every "new" id is a live row by this point. Create directly
-          // rather than silently dropping the task if that guarantee ever breaks.
-          console.warn(`[overwriteRaw] "new" task ${id} has no live placeholder row — creating directly`);
-          await this.createTask(t);
+          await this.updateTask(id, t);
         }
-      } else {
-        await this.updateTask(id, t);
-      }
+      });
     }
     _cacheInvalidate();
     if (originalSpec && newTaskIds.length > 0) {

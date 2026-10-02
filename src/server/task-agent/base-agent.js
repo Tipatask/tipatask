@@ -1,7 +1,7 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
-const { killProcessGroup } = require('../process-group');
+const { killProcessGroup, AGENT_LIMIT_DEFAULTS } = require('../process-group');
 const { buildLanguageDirective } = require('../project-config');
 const { matchPromptLine, GENERIC_PROMPT_PATTERNS } = require('./prompt-detect');
 const { localizeAttachments } = require('./attachments');
@@ -236,6 +236,29 @@ class BaseTaskAgent {
     ].join('\n');
   }
 
+  // Spawn-side half of the agent resource limits: states the same sub-agent cap the descendant
+  // watchdog enforces (process-group.js#resolveAgentLimits), so an agent stays inside it instead
+  // of being caught after the fact. `limits` is the resolved object terminal-session.js threads
+  // through as opts.agentLimits; a missing or invalid maxSubagents falls back to the default, so
+  // the directive is always present. Pure — no env or config read here.
+  buildResourceLimitsDirective(limits, opts = {}) {
+    const raw = limits && limits.maxSubagents;
+    const cap = Number.isSafeInteger(raw) && raw > 0 ? raw : AGENT_LIMIT_DEFAULTS.maxSubagents;
+    if (opts.compact) {
+      return [
+        'Resource limits:',
+        `- Run at most ${cap} sub-agents or background commands in parallel, counted together; run test and build commands one at a time, never in parallel.`,
+        '- Stop all background work you started before finishing.',
+      ].join('\n');
+    }
+    return [
+      'Resource limits:',
+      `- Run at most ${cap} sub-agents or background commands in parallel, counted together. Wait for one to finish before starting another, and do the work in this session when it fits here instead of delegating it. Task App watches this session's process tree and may pause or stop a session that goes past its limits.`,
+      '- Never run test or build commands in parallel — one at a time, each finished before the next starts, and never a second run of a suite that is still running.',
+      '- Before finishing, stop every background command and sub-agent you started (by the PID or process group you captured) and confirm nothing is left running.',
+    ].join('\n');
+  }
+
   // A question batch precedes the plan and uses a separate sentinel: plan readiness is
   // latched once per session, and planReady outranks attention in a shared output tail.
   // Keep the directive safe when echoed into agent output: no bare sentinel line,
@@ -296,9 +319,10 @@ class BaseTaskAgent {
   // (Claude joins with blank lines inside one template, Codex/Pi splice array lines, and Pi
   // places the directives after its grep note where Codex places them before), so each
   // buildPrompt() keeps ownership of where the slots land.
-  //   directives — [vcs, tagDesc, processSafety, kbHygiene, taskStatus] in that fixed order, empties
-  //                dropped, so absent optional data (no opts.vcsSettings, nothing blank in
-  //                opts.tagDescriptions) emits no directive and no stray separator.
+  //   directives — [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus] in that
+  //                fixed order, empties dropped, so absent optional data (no opts.vcsSettings,
+  //                nothing blank in opts.tagDescriptions) emits no directive and no stray
+  //                separator. resourceLimits reads opts.agentLimits and is never empty.
   //   clarify    — deliberately NOT part of `directives`: it must sit directly beside the
   //                adapter's own plan-ready instruction (see buildClarifyDirective's ORDERING
   //                note). '' when the policy says the agent has a native question tool.
@@ -313,6 +337,7 @@ class BaseTaskAgent {
     const vcs = this.resolveVcsDirective(opts);
     const tagDesc = this.buildTagDescriptionDirective(opts);
     const processSafety = this.buildProcessSafetyDirective(variant);
+    const resourceLimits = this.buildResourceLimitsDirective(opts.agentLimits, variant);
     const kbHygiene = this.buildKbHygieneDirective(variant);
     const taskStatus = this.buildTaskStatusDirective(variant);
     const clarify = policy.clarify ? this.buildClarifyDirective(variant) : '';
@@ -320,9 +345,10 @@ class BaseTaskAgent {
       vcs,
       tagDesc,
       processSafety,
+      resourceLimits,
       kbHygiene,
       taskStatus,
-      directives: [vcs, tagDesc, processSafety, kbHygiene, taskStatus].filter(Boolean),
+      directives: [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus].filter(Boolean),
       clarify,
     };
   }

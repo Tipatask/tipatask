@@ -68,7 +68,7 @@ class CodexAgent extends BaseTaskAgent {
       ? `Cross-reference scan for [${ttTags.join(', ')}] is already complete — see "Pre-computed Cross-References" below. Use Grep only for identifiers absent from that section. For new batch lookups: \`batch_grep_tags(tag_names=[...], symbols=[...])\`.`
       : 'Symbol/file search across ≥2 tt-* tags: call `batch_grep_tags(tag_names=[...])` ONCE — single file scan (~30ms) replaces N sequential Grep/rg calls (~1.2s each).';
     const staticBundle = getStaticBundle(projectRoot);
-    // Shared directives (VCS, tag-description backfill, process safety, KB hygiene, task status) plus the
+    // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status) plus the
     // separate clarify slot — see base-agent.js#buildSharedPreamble. Codex inherits the base
     // policy: full wording, text clarifying questions.
     const { directives, clarify } = this.buildSharedPreamble(opts);

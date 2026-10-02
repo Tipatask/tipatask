@@ -71,7 +71,14 @@ function claudeBinFingerprint(bin) {
 
 const DESIGN_NO_ASK_SUFFIX = 'Build it this turn: do not ask follow-up questions — if the aesthetic, direction, or mockup-vs-prototype choice is unspecified, pick one that matches this app and proceed.';
 
+// ── Kickoff typed line (TPT445) ──
+// Claude Code refuses a message that is only a bracketed paste ("Message is only pasted block, no
+// words from you"). terminal-session.js types this one newline-free sentence after the paste.
+const KICKOFF_TYPED_LINE = 'Please carry out the task brief pasted above.';
+
 class ClaudeAgent extends BaseTaskAgent {
+  static KICKOFF_TYPED_LINE = KICKOFF_TYPED_LINE;
+
   getQuotaStatus(config, opts = {}) {
     return require('./claude-quota').readClaudeQuota(config, opts);
   }
@@ -164,7 +171,7 @@ class ClaudeAgent extends BaseTaskAgent {
     // of the hardcoded literal "completed" — a renamed status must still be reachable.
     const completeStatus = this.resolveStatusForRole('complete', opts);
     const resolutionNote = `\n\nMANDATORY before marking this task \`${completeStatus}\`: post ONE self-authored resolution comment via \`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")\`. \`content\` must be a real report, written in plain English prose — do NOT use caveman style for this comment, even though the rest of this session runs in caveman mode. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). This is separate from and required IN ADDITION TO the auto-posted terminal-tail resolution comment (a raw log dump with no explanation, posted on session exit) — that one does not satisfy this step. Post it in the SAME tool-call batch as the final \`update_task(status="${completeStatus}")\`.`;
-    // Shared directives (VCS, tag-description backfill, process safety, KB hygiene, task status) — see
+    // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status) — see
     // base-agent.js#buildSharedPreamble. Each is its own blank-line-separated block between
     // the resolution note and the task tail; absent optional ones leave no gap. The clarify
     // slot is unused here by policy (getPreamblePolicy() above).
@@ -226,13 +233,13 @@ class ClaudeAgent extends BaseTaskAgent {
       if (await ClaudeAgent._cliSupportsEffortFlag(config)) args.push('--effort', effort);
     }
     // TPT349 — when the CLI supports headersHelper, hand it a derived copy of .mcp.json whose
-    // `tipatask` entry re-reads API_TOKEN from .tipatask/config.json on every (re)connect, so a
+    // `tipatask` entry re-reads the account-store token on every (re)connect, so a
     // refreshed/re-authed token reaches the remote MCP without restarting the session. See
     // mcp-spawn-config.js. Falls back to the project's own .mcp.json (token frozen at launch).
     let mcpConfigPath = path.join(projectRoot, '.mcp.json');
     let mcpHeadersHelper = false;
     if (await ClaudeAgent._cliSupportsHeadersHelper(config)) {
-      const helperCommand = buildHeadersHelperCommand({ projectRoot });
+      const helperCommand = buildHeadersHelperCommand({ projectRoot, userDataRoot: config.USER_DATA_ROOT });
       const derived = helperCommand
         ? writeSpawnMcpConfig({ projectRoot, userDataRoot: config.USER_DATA_ROOT, helperCommand })
         : null;
@@ -278,6 +285,9 @@ class ClaudeAgent extends BaseTaskAgent {
       model,
     };
     if (preludePrompt) spec.preludePrompt = preludePrompt;
+    // TPT445 — typed after the bracketed paste so the message holds real typed words; omitted for
+    // design mode, where extra text would land inside the /design brief.
+    if (!opts.designMode) spec.kickoffTypedLine = KICKOFF_TYPED_LINE;
     // TPT349 — lets terminal-session.js word its mid-session token-expiry notice (reconnect vs
     // restart). Like `model`, never persisted.
     spec.mcpHeadersHelper = mcpHeadersHelper;

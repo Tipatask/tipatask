@@ -102,6 +102,12 @@ function getRecentAssignments() {
   return result;
 }
 
+// (TPT444) Task-session start-queue snapshot: { queued: [{ taskId, position }], running, cap }.
+// Project-scoped like session-ended (task keys collide across Electron project windows).
+function emitSessionQueueState(projectPath, snapshot) {
+  broadcastToProject(projectPath || '', 'session-queue-state', snapshot);
+}
+
 function emitObjectiveQueueState({ active, pending, circuitState }) {
   broadcast('objective-queue-depth', { active, pending, circuitState });
 }
@@ -127,8 +133,20 @@ function emitApiStatus(state, message, pendingCount = 0, pendingTaskIds = []) {
 // attention-seen dismissal semantics all actively fight a "still running, growing"
 // alert. Rides the same __attention__/__board__ sockets for free (broadcastToProject),
 // same route voice-model:* took (C1193) — see tt-websocket.md.
-function emitSessionRunaway(projectPath, { taskId, pid, count, threshold, promptText, killed }) {
-  broadcastToProject(projectPath || '', 'session-runaway', { taskId, pid, count, threshold, promptText: promptText || '', killed: !!killed });
+// (TPT443) `paused` marks the frame sent when the watchdog SIGSTOPped the tree, `resumed` the
+// one sent when the user continued it (ws-handlers.js `resume-paused`); `rssMb`/`limitMb`/
+// `reason` carry the memory figures the console-modal paused banner shows.
+function emitSessionRunaway(projectPath, { taskId, pid, count, threshold, promptText, killed, paused, resumed, rssMb, limitMb, reason }) {
+  broadcastToProject(projectPath || '', 'session-runaway', {
+    taskId, pid, count, threshold,
+    promptText: promptText || '',
+    killed: !!killed,
+    paused: !!paused,
+    resumed: !!resumed,
+    rssMb: Number(rssMb) || 0,
+    limitMb: Number(limitMb) || 0,
+    reason: reason || 'count',
+  });
 }
 
 // (C1176) Voice-model download progress. Deliberately unscoped broadcast(), NOT
@@ -161,4 +179,4 @@ function emitMergeDone(projectPath, payload) { broadcastToProject(projectPath ||
 function emitMergeError(projectPath, payload) { broadcastToProject(projectPath || '', 'merge:error', { projectPath: projectPath || '', ...payload }); }
 function emitWorktreeDirtyOnComplete(projectPath, payload) { broadcastToProject(projectPath || '', 'worktree-dirty-on-complete', { projectPath: projectPath || '', ...payload }); }
 
-module.exports = { init, broadcast, broadcastToProject, emitMergeProgress, emitMergeConflict, emitMergeDone, emitMergeError, emitWorktreeDirtyOnComplete, emitTaskCreated, emitTaskUpdated, emitTaskDeleted, emitTasksFinalized, recordAssignment, getRecentAssignments, emitObjectiveQueueState, emitApiStatus, emitVoiceModelProgress, emitVoiceModelComplete, emitVoiceModelError, emitVoiceModelDeleted, broadcastKbReindexResult, emitSessionRunaway };
+module.exports = { init, broadcast, broadcastToProject, emitMergeProgress, emitMergeConflict, emitMergeDone, emitMergeError, emitWorktreeDirtyOnComplete, emitTaskCreated, emitTaskUpdated, emitTaskDeleted, emitTasksFinalized, recordAssignment, getRecentAssignments, emitObjectiveQueueState, emitSessionQueueState, emitApiStatus, emitVoiceModelProgress, emitVoiceModelComplete, emitVoiceModelError, emitVoiceModelDeleted, broadcastKbReindexResult, emitSessionRunaway };

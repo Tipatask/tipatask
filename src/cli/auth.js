@@ -238,4 +238,14 @@ async function exchangeProjectToken(apiBaseUrl, userToken, projectId) {
   return token;
 }
 
-module.exports = { authenticate, exchangeProjectToken, startCallbackServer, resolveCallbackPort };
+// Project-open recovery needs an account-wide handoff token, even when the chosen
+// account still cannot access the requested project. Never exchange it for that
+// project's token or copy it into the project's config.
+async function authenticateAndStore(apiBaseUrl, deps = {}) {
+  const result = await authenticate(apiBaseUrl, { ...deps, chooseAccount: true });
+  const save = deps.writeAccountToken || require('../server/account-store').writeAccountToken;
+  save(apiBaseUrl, result.token);
+  return result;
+}
+
+module.exports = { authenticate, authenticateAndStore, exchangeProjectToken, startCallbackServer, resolveCallbackPort };

@@ -154,7 +154,10 @@ test('non-applyOnly save writes AVAILABLE_AGENTS with codex and keeps credential
     assert.equal(res.statusCode, 200);
     const onDisk = JSON.parse(fs.readFileSync(path.join(root, '.tipatask', 'config.json'), 'utf8'));
     assert.deepEqual(onDisk.AVAILABLE_AGENTS.split(','), ['pi', 'codex']);
-    for (const k of Object.keys(CREDS)) assert.equal(onDisk[k], CREDS[k], `${k} preserved`);
+    for (const k of Object.keys(CREDS).filter((key) => key !== 'API_TOKEN')) assert.equal(onDisk[k], CREDS[k], `${k} preserved`);
+    // The token is the account's: moved to the app-level store, never rewritten into config.json.
+    assert.ok(!Object.hasOwn(onDisk, 'API_TOKEN'));
+    assert.equal(require('./account-store').readAccount(CREDS.API_BASE_URL).token, CREDS.API_TOKEN, 'API_TOKEN preserved');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

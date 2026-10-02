@@ -14,6 +14,9 @@ const { buildTurnPrompt } = require('./transcript');
 const { resolveProviderModel, configForProject } = require('./registry');
 const { readProjectConfig, piEntryForModel, piDefaultEntry, piKeyEnvVars } = require('../project-config');
 const { piSpawnProvider, preparePiCustomEndpoint } = require('../pi-custom-endpoint');
+const { toolProfileFor } = require('./tool-profiles');
+const { materializePiTaskTools } = require('./pi-task-tools');
+const taskChatWidgets = require('../task-chat-widgets');
 
 // Prepend the current node binary's bin/ directory to the spawn PATH so that
 // the pi shebang (#!/usr/bin/env node) resolves to the same Node version
@@ -57,14 +60,23 @@ function piEntryFor(session) {
 // (TPT189) For a `custom` row that is the generated models.json block id (piSpawnProvider). This
 // stays a pure argv builder — the file itself is written by spawnPiTurn() via
 // preparePiCustomEndpoint(), so calling this directly never touches disk.
-function buildPiArgs(session) {
+// A session under a tool profile (task chat) swaps the read-only `--tools read` for the
+// profile's allowlist and loads exactly one extension — `extensionPath`, the staged copy of
+// providers/pi-ext/task-tools.mjs — with extension discovery off, so no project or user
+// extension can add a tool or hook the turn.
+function buildPiArgs(session, { extensionPath } = {}) {
+  const profile = toolProfileFor(session, 'pi');
   const args = [
     '--mode', 'json',
     '--provider', piSpawnProvider(piEntryFor(session)),
     // (C1030) session.selectedModel (chat-model-selector) wins over config.PI_MODEL.
     '--model', piModelFor(session),
-    '--tools', 'read',
+    '--tools', profile ? profile.tools.join(',') : 'read',
   ];
+  if (profile) {
+    args.push('--no-extensions');
+    if (extensionPath) args.push('-e', extensionPath);
+  }
   if (session.piSessionId) {
     args.push('--session', session.piSessionId);
   }
@@ -203,8 +215,9 @@ function finalizePiTurn(session, taskId, code, emit, stats) {
 
   const turnIndex = session.messages.filter(m => m.role === 'assistant').length;
 
-  // Parse cards from turnBuffer; push assistant message
-  const cardResult = extractCards(session, emit);
+  // Parse cards from turnBuffer; push assistant message. A task chat answers in prose.
+  const cardResult = session.type === 'taskChat' ? null : extractCards(session, emit);
+  if (session.type === 'taskChat') taskChatWidgets.emitDialogs(session, emit);
   const assistantMsg = {
     role: 'assistant',
     content: session.turnBuffer,
@@ -215,6 +228,7 @@ function finalizePiTurn(session, taskId, code, emit, stats) {
     objectiveSummary: cardResult ? cardResult.objectiveSummary : null, // C1339
     timestamp: Date.now(),
   };
+  if (session.type === 'taskChat') taskChatWidgets.attachTaskChatWidgets(session, assistantMsg);
   session.messages.push(assistantMsg);
 
   // Build tokens summary from the turn_end assistant message's usage block.
@@ -294,6 +308,7 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
   session.turnBuffer = '';
   session.turnRawSse = '';
   session._lastEmittedCardsJson = null;
+  taskChatWidgets.resetTaskChatTurn(session);
   session._resultFinalized = false;
   session._aborted = false;
   session._piStderrTail = '';
@@ -330,7 +345,18 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
   const piEntry = piEntryFor(session);
   Object.assign(env, piKeyEnvVars(piEntry), preparePiCustomEndpoint(cwd, piEntry, env).env);
 
-  const args = buildPiArgs(session);
+  // A profiled chat's only task tool is the staged extension — without it the turn could
+  // read but silently never change a task, so refuse instead of spawning.
+  let extensionPath = null;
+  if (toolProfileFor(session, 'pi')) {
+    extensionPath = materializePiTaskTools(config.USER_DATA_ROOT);
+    if (!extensionPath) {
+      emitPiError(session, taskId, null, emit, 'spawn-error:task-tools-unavailable', session._retryAttempt || 0);
+      return;
+    }
+    if (session.taskKey) env.TIPATASK_TASK_ID = session.taskKey;
+  }
+  const args = buildPiArgs(session, { extensionPath });
   const isFirstTurn = !session.piSessionId;
 
   // Build the prompt text to write to stdin.
@@ -488,21 +514,33 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
           }
           session.turnBuffer += text;
           emit({ type: 'data', data: text });
-          // Attempt incremental card extraction on each chunk
-          extractCards(session, emit);
+          // Attempt incremental extraction on each chunk: dialogs in a task chat, cards otherwise
+          if (session.type === 'taskChat') taskChatWidgets.emitDialogs(session, emit);
+          else extractCards(session, emit);
         }
 
       } else if (event.type === 'tool_execution_start') {
         // Tool call start
-        const toolName = event.name || '';
+        const toolName = event.toolName || event.name || '';
         emit({ type: 'objective-progress', stage: 'tool', name: toolName, elapsedMs: elapsed() });
         if (config.OBJECTIVE_TIMING_ENABLED) {
           session.timingMilestones.toolCalls.push({ name: toolName, startAt: Date.now() });
+        }
+        if (session.type === 'taskChat') {
+          taskChatWidgets.toolStarted(session, emit, { id: event.toolCallId, name: toolName, input: event.args });
         }
 
       } else if (event.type === 'tool_execution_end') {
         // Tool call end
         emit({ type: 'objective-progress', stage: 'tool-end', elapsedMs: elapsed() });
+        if (session.type === 'taskChat') {
+          taskChatWidgets.toolFinished(session, emit, {
+            id: event.toolCallId,
+            name: event.toolName || event.name || '',
+            isError: event.isError === true,
+            result: event.result,
+          });
+        }
 
       } else if (event.type === 'message_end' || event.type === 'agent_end' || event.type === 'turn_end') {
         // A failed provider request only shows up here (stopReason:"error", exit code 0).

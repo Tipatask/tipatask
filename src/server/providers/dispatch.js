@@ -5,6 +5,8 @@
 // chat-model-selector — see applyModelSelection() below — not just frozen at creation).
 // Falls back to config.OBJECTIVE_PROVIDER for any pre-existing sessions without the field.
 // spec-chat sessions are always routed to Claude (no Gemini/Pi/Codex spec-chat support in v1).
+// A session carrying a tool profile (task chat — providers/tool-profiles.js) only runs on a
+// provider that can enforce that profile; anything else falls back to Claude.
 
 const config = require('../config');
 const { spawnObjectiveTurn, killPrewarm, killColdPrewarm } = require('../claude-session');
@@ -13,13 +15,22 @@ const { spawnPiTurn } = require('./pi-session');
 const { spawnCodexTurn } = require('./codex-session');
 const registry = require('./registry');
 const { listTaskAgentStatuses } = require('../task-agent');
+const { providerSupportsProfile } = require('./tool-profiles');
 
 /**
  * Provider-agnostic objective-turn entry point.
  * Drop-in replacement for spawnObjectiveTurn(session, taskId) — same signature.
  */
 function spawnTurn(session, taskId) {
-  const provider = session.providerType || config.OBJECTIVE_PROVIDER;
+  let provider = session.providerType || config.OBJECTIVE_PROVIDER;
+  if (!providerSupportsProfile(session, provider)) {
+    // Never run a fenced chat on a provider with no fence. Reachable only through a server
+    // default (OBJECTIVE_PROVIDER) — applyModelSelection() rejects an explicit pick.
+    console.warn(`[${session.type}] provider "${provider}" cannot enforce the ${session.toolProfile} tool profile — using claude for task ${taskId}`);
+    provider = 'claude';
+    session.providerType = 'claude';
+    session.selectedModel = null;
+  }
   if (provider === 'gemini' && session.type !== 'specChat') {
     return spawnGeminiTurn(session, taskId);
   }
@@ -69,6 +80,10 @@ async function applyModelSelection(session, raw, { taskId } = {}) {
     return { changed: false };
   }
   const { providerId, model } = registry.parseSelection(raw);
+  if (!providerSupportsProfile(session, providerId)) {
+    const label = (registry.PROVIDER_META[providerId] && registry.PROVIDER_META[providerId].label) || providerId;
+    return { error: 'provider-unavailable', reason: `${label} is not available in this chat` };
+  }
   if (session.proc || session._spawning) return { error: 'turn-in-progress' };
   const selectionEpoch = (session._modelSelectionEpoch || 0) + 1;
   session._modelSelectionEpoch = selectionEpoch;

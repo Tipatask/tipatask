@@ -8,6 +8,11 @@ const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { installCrashGuard } = require('./crash-guard');
 
+// Stand-ins the mocked modules export, so the sweep wiring can be asserted by identity.
+const resolveAgentLimits = () => ({});
+const killRunawaySession = () => null;
+const pauseRunawaySession = () => null;
+
 // Execute the real bootstrap and timer callbacks without opening sockets, reading
 // credentials, running agents, or touching the user's process tree.
 async function harness(killEnv) {
@@ -30,14 +35,14 @@ async function harness(killEnv) {
       PROJECT_ROOT: '/project-a', TASK_BACKEND: 'api' },
     './spawn-utils': { augmentPathEnv: () => ({}), isAsarPath: () => false },
     './task-backend': { createBackend: () => backend, coerceBackendType: () => 'api' },
-    './ws-handlers': { createHttpHandler: () => () => {} },
+    './ws-handlers': { createHttpHandler: () => () => {}, drainSessionQueue() {} },
     './ws-upgrade': { createWebSocketGate: () => ({ clients: new Set([{ _boardWatcher: true }]) }) },
     './websocket': { init() {} },
     './task-agent': { preloadAgentDetection: async () => {}, listAllAgentModels: async () => [] },
     './status-roles': {},
     './task-change-poll': { createTaskChangePoll: () => ({ tick: async () => { throw new TypeError('poll failed'); } }) },
-    './terminal-session': {},
-    './process-group': { snapshotProcesses: async () => ({}),
+    './terminal-session': { killRunawaySession, pauseRunawaySession },
+    './process-group': { snapshotProcesses: async () => ({}), resolveAgentLimits,
       sweepDescendantWatchdog: (...args) => sweeps.push(args) },
     './shutdown-reaper': { installShutdownReaper() {} },
     './crash-guard': { installCrashGuard: opts => installCrashGuard({ ...opts,
@@ -90,11 +95,18 @@ test('actual 10s poll callback rejects safely without changing live sessions', a
   assert.match(h.lines.at(-1), /unhandled rejection.*poll failed/s);
 });
 
-test('bootstrap enables watchdog killing only for the exact environment value 1', async () => {
+// The watchdog's action is a per-project limit, not a boot-time switch: whatever the legacy
+// env var says, the sweep is handed the shared limits resolver (which maps the exact value
+// '1' to 'kill' — covered in process-group.test.js) plus both the pause and the kill handler.
+test('bootstrap hands the watchdog sweep the limits resolver and both action handlers', async () => {
   for (const value of [undefined, '', '0', 'true', '1']) {
     const h = await harness(value);
     await h.timers.get(30000)();
     assert.equal(h.sweeps.length, 1);
-    assert.equal(h.sweeps[0][2].killEnabled, value === '1');
+    const deps = h.sweeps[0][2];
+    assert.equal(deps.resolveLimits, resolveAgentLimits);
+    assert.equal(deps.killRunawaySession, killRunawaySession);
+    assert.equal(deps.pauseRunawaySession, pauseRunawaySession);
+    assert.equal('killEnabled' in deps, false);
   }
 });

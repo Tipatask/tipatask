@@ -18,6 +18,7 @@ const {
   writeProjectMcpConfig,
   writeProjectClaudeMcpApproval,
 } = require('../server/project-config');
+const { readAccount } = require('../server/account-store');
 const {
   TIPATASK_MCP_NAME,
   ensureProjectCodexHome,
@@ -262,6 +263,9 @@ function readEnv(filePath, projectRoot = PROJECT_ROOT, { readOnly = false } = {}
         values[key] = projectConfig[key];
       }
     }
+    // The token is the signed-in account's, held in the app-level account store.
+    const account = readAccount(values.API_BASE_URL);
+    if (account) values.API_TOKEN = account.token;
   }
 
   return { lines, values };
@@ -554,7 +558,7 @@ async function runSyncSetupStep({ env, apiBaseUrl, token, deviceId, projectRoot 
   const values = { ...env.values, ...(currentConfig || {}) };
   if (currentConfig) {
     apiBaseUrl = currentConfig.API_BASE_URL;
-    token = currentConfig.API_TOKEN;
+    token = readAccount(currentConfig.API_BASE_URL)?.token || currentConfig.API_TOKEN;
     deviceId = currentConfig.DEVICE_ID;
   }
   let machineId;
@@ -646,7 +650,9 @@ function inspectHarnessConfiguration(projectRoot) {
       && value.mcpServers?.['tipatask-local']?.env?.TIPATASK_MCP_LOCAL_ONLY === '1'],
     ['.claude/settings.local.json', JSON.parse, value => ['tipatask', 'tipatask-local'].every(name =>
       value.enabledMcpjsonServers?.includes(name)) && (!cfg || API_CREDENTIAL_FIELDS.every(key =>
-      value.env?.[key] === String(cfg[key] ?? '')))],
+      value.env?.[key] === (key === 'API_TOKEN'
+        ? (readAccount(cfg.API_BASE_URL)?.token ?? String(cfg[key] ?? ''))
+        : String(cfg[key] ?? ''))))],
     ['.codex/config.toml', require('toml').parse, value => {
       const opts = { projectRoot, mcpServerPath: path.join(serverRoot, 'src/mcp/server.js') };
       const parse = require('toml').parse;

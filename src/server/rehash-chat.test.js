@@ -10,6 +10,7 @@ const { applyRehashIntent } = require('./claude-session');
 const { buildTurnPrompt } = require('./providers/transcript');
 const { createHttpHandler } = require('./ws-handlers');
 const config = require('./config');
+const { isAgentChatType, isAgentChatId } = require('./session-state');
 
 // Execute the real WS routing closure while replacing provider processes and
 // metadata lookups. This checks the boundary between wire payload and model input.
@@ -35,6 +36,7 @@ function wire(backend, { simpleMode = true } = {}) {
     providerSessionId: () => 'fixture', killPrewarm() {},
     clearContext: s => { s.messages = []; s._providerSwitchPending = false; },
     throttle: { recordAbort() {} },
+    isAgentChatType, isAgentChatId,
   };
   vm.createContext(env);
   vm.runInContext(source.slice(start, source.indexOf('\n}', start) + 2), env);

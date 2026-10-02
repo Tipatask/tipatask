@@ -553,6 +553,14 @@ function mcpServerNames(parsed) {
   return Object.keys(servers);
 }
 
+// Names of every MCP server the project's .codex/config.toml registers (app-owned tables,
+// browser presets, servers inherited from the user's own config). [] when the file is missing
+// or not valid TOML.
+function listProjectMcpServerNames(projectRoot) {
+  if (!projectRoot) return [];
+  return mcpServerNames(parseTomlOptional(readOptional(getCodexPaths(projectRoot).projectConfigPath)));
+}
+
 // Preserve user formatting/comments by using the TOML parser only for validation and
 // logical server-name discovery, then copy the matching raw table blocks. A server is the
 // whole subtree rooted at mcp_servers.<name>; when the project defines any part of that
@@ -984,6 +992,7 @@ module.exports = {
   CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE,
   ensureProjectCodexHome,
   getCodexPaths,
+  listProjectMcpServerNames,
   mcpSectionHasCommand,
   mergeGlobalMcpServerTables,
   mergeGlobalCodexPreferences,

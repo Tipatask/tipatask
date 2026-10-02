@@ -16,13 +16,15 @@ export const SESSION_BUTTON_MODES = Object.freeze({
   START: 'start',     // no session — click starts a fresh one
   RESUME: 'resume',   // a session exists but this task isn't actively running right now
   RUNNING: 'running',  // in-progress status AND the agent process is live right now
+  QUEUED: 'queued',   // (TPT444) start accepted, waiting in the server's start queue for a free slot
 });
 
 // `status` is a role name from the project's live status registry (never a hardcoded legacy
 // literal) — isInProgressName()/isCompleteName() resolve it against the current role map.
 // `active` = state.activeSessions has this task (process live); `exited` = process gone but
 // session/scrollback kept (state.exitedSessions).
-export function sessionButtonMode(status, { active = false, exited = false } = {}) {
+export function sessionButtonMode(status, { active = false, exited = false, queued = false } = {}) {
+  if (queued) return SESSION_BUTTON_MODES.QUEUED;
   if (isInProgressName(status)) return active ? SESSION_BUTTON_MODES.RUNNING : SESSION_BUTTON_MODES.RESUME;
   if (isCompleteName(status) && active) return SESSION_BUTTON_MODES.RESUME;
   return (active || exited) ? SESSION_BUTTON_MODES.RESUME : SESSION_BUTTON_MODES.START;

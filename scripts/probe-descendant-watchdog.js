@@ -11,6 +11,10 @@
 // rule must NOT kill (see process-group.test.js's stable-count tests). MAX_DEPTH caps growth
 // even if assertions fail. The single-sweep DESCENDANT_KILL_CEILING path is covered by
 // process-group.test.js.
+// Before the kill, the same live tree goes through the default pause action for real:
+// pauseRunawaySession() must leave every process stopped (`ps` state T, including the escaped
+// sleeper) and the still-growing chain frozen, and resumeRunawaySession() must set them all
+// running again — the unit tests only see a stubbed process.kill.
 // Usage: npm run probe:watchdog
 
 const fs = require('node:fs');
@@ -24,21 +28,29 @@ const {
   countDescendants,
   evaluateRunaway,
 } = require('../src/server/process-group');
-const { killRunawaySession } = require('../src/server/terminal-session');
+const { execFileSync } = require('node:child_process');
+const { killRunawaySession, pauseRunawaySession, resumeRunawaySession } = require('../src/server/terminal-session');
 
 const MAX_DEPTH = 120; // comfortably above DESCENDANT_ALERT_THRESHOLD (50), below DESCENDANT_KILL_CEILING (150)
 const LEVEL_DELAY_S = '0.1'; // per-level sleep before recursing — see the growth-cadence note above
 const POLL_MS = 2000; // wide enough that ~20 new levels (~LEVEL_DELAY_S apart) appear between samples
 const GROW_TIMEOUT_MS = 30000;
 const SLEEPER_WAIT_MS = 5000;
+const STOP_SETTLE_MS = 500; // SIGSTOP/SIGCONT are delivered asynchronously — let ps catch up
+const FREEZE_WATCH_MS = 1500; // ~15 chain levels' worth: a tree that is not stopped visibly grows
 const KILL_SETTLE_MS = 2500; // must outlast killRunawaySession()'s 1500ms SIGKILL follow-up
-const HARD_CEILING_MS = 60000; // absolute wall-clock backstop — see the top-level guard below
+const HARD_CEILING_MS = 75000; // absolute wall-clock backstop — see the top-level guard below
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 function fail(message) {
   console.error(`[probe:watchdog] FAIL — ${message}`);
   process.exitCode = 1;
+}
+
+// `ps` process state for one pid ('T…' = stopped), or '' when it is gone.
+function psState(pid) {
+  try { return execFileSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 5000 }).trim(); } catch { return ''; }
 }
 
 function pidAlive(pid) {
@@ -151,7 +163,7 @@ async function main() {
       const snapshot = await snapshotProcesses();
       if (snapshot) {
         const count = countDescendants(snapshot, rootPid);
-        const { alert, kill } = evaluateRunaway(state, count, { killEnabled: true });
+        const { alert, kill } = evaluateRunaway(state, count, { watchdogAction: 'kill' });
         if (alert && warnedAt == null) {
           warnedAt = count;
           console.log(`[probe:watchdog] warn at ${count} descendants (>= threshold ${DESCENDANT_ALERT_THRESHOLD}).`);
@@ -172,7 +184,6 @@ async function main() {
       console.log(`[probe:watchdog] PASS — warned at ${warnedAt}, then kill decision at ${killedAt} descendants (< 100, warn came first).`);
     }
 
-    // ── Step 2: kill via the production path; zero survivors, escaped sleeper gone ──
     const waitStart = Date.now();
     while (!(sleeperPid = readSleeperPid()) && Date.now() - waitStart < SLEEPER_WAIT_MS) await sleep(50);
     if (!sleeperPid) {
@@ -181,18 +192,54 @@ async function main() {
       console.log(`[probe:watchdog] Escaped detached sleeper pid ${sleeperPid} (leads its own process group).`);
     }
 
+    const session = { tabId: 'PROBE', alive: true, ptyPid: rootPid, pty: ptyProcess, buffer: '', ws: null, _exitReason: null, descendantWatchdog: state };
+
+    // ── Step 2: pause, then resume, via the production path — nothing may die ──
+    const pauseSnapshot = await snapshotProcesses();
+    if (!pauseSnapshot) {
+      fail('could not take a ps snapshot to drive the pause.');
+    } else {
+      const before = countDescendants(pauseSnapshot, rootPid);
+      const paused = pauseRunawaySession(session, { count: before, threshold: state.threshold, reason: 'count', snapshot: pauseSnapshot });
+      await sleep(STOP_SETTLE_MS);
+      const frozenAt = countDescendants(await snapshotProcesses() || pauseSnapshot, rootPid);
+      await sleep(FREEZE_WATCH_MS);
+      const stillAt = countDescendants(await snapshotProcesses() || pauseSnapshot, rootPid);
+      const rootState = psState(rootPid);
+      const sleeperState = sleeperPid ? psState(sleeperPid) : '';
+      if (!paused || !paused.first) fail('pauseRunawaySession() did not act on a live session.');
+      else if (!session._pause || session._exitReason) fail('pauseRunawaySession() did not record a pause, or recorded an exit reason.');
+      else if (!rootState.startsWith('T')) fail(`pty leader ${rootPid} is not stopped after the pause (ps state "${rootState}").`);
+      else if (sleeperPid && !sleeperState.startsWith('T')) fail(`escaped sleeper ${sleeperPid} is not stopped after the pause (ps state "${sleeperState}") — it is outside the leader's group.`);
+      else if (stillAt !== frozenAt) fail(`the paused tree kept changing (${frozenAt} -> ${stillAt} descendants in ${FREEZE_WATCH_MS}ms).`);
+      else if (frozenAt < before) fail(`the pause lost processes (${before} -> ${frozenAt} descendants) — it must never kill.`);
+      else console.log(`[probe:watchdog] PASS — paused: leader and escaped sleeper stopped (T), tree frozen at ${frozenAt} descendants, nothing killed.`);
+
+      const resumed = resumeRunawaySession(session);
+      await sleep(STOP_SETTLE_MS);
+      const rootAfter = psState(rootPid);
+      const sleeperAfter = sleeperPid ? psState(sleeperPid) : '';
+      if (!resumed || !resumed.resumed) fail('resumeRunawaySession() did not continue the paused session.');
+      else if (session._pause) fail('resumeRunawaySession() left the session marked paused.');
+      else if (!rootAfter || rootAfter.startsWith('T')) fail(`pty leader ${rootPid} is not running after the resume (ps state "${rootAfter}").`);
+      else if (sleeperPid && (!sleeperAfter || sleeperAfter.startsWith('T'))) fail(`escaped sleeper ${sleeperPid} is not running after the resume (ps state "${sleeperAfter}").`);
+      else if (!state.resumeBase || state.paused) fail('resumeRunawaySession() did not re-arm the watchdog state (resumeBase / paused latch).');
+      else console.log('[probe:watchdog] PASS — resumed: leader and escaped sleeper running again, watchdog re-armed.');
+    }
+
+    // ── Step 3: kill via the production path; zero survivors, escaped sleeper gone ──
+
     // Fresh snapshot so the escaped subtree is certainly in it (production kills with the same
     // sweep's snapshot the count came from; here the count came from an earlier poll).
     const killSnapshot = await snapshotProcesses();
     if (!killSnapshot) {
       fail('could not take a ps snapshot to drive the kill.');
     } else {
-      const session = { tabId: 'PROBE', alive: true, ptyPid: rootPid, pty: ptyProcess, buffer: '', ws: null, _exitReason: null };
       console.log('[probe:watchdog] Killing the tree via killRunawaySession() (killProcessTree: SIGTERM, then SIGKILL follow-up)...');
       const result = killRunawaySession(session, { count: killedAt, threshold: state.threshold, snapshot: killSnapshot });
       if (!result || !result.first) fail('killRunawaySession() did not act on a live session.');
       else if (!session._exitReason || session._exitReason.kind !== 'runaway-killed') fail('killRunawaySession() did not record the runaway-killed exit reason.');
-      else if (!session.buffer.includes('[Task App]')) fail('killRunawaySession() did not write its notice into the session buffer.');
+      else if (!session.buffer.includes(`[Task App] ${result.text}`)) fail('killRunawaySession() did not write its notice into the session buffer.');
       else console.log('[probe:watchdog] PASS — exit reason recorded (runaway-killed) and notice written to the session buffer.');
     }
     await sleep(KILL_SETTLE_MS);

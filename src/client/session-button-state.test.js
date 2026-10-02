@@ -88,7 +88,7 @@ test('task-board.js updateClaudeButtons() computes the card button from sessionB
   const start = src.indexOf('export function updateClaudeButtons(');
   const end = src.indexOf('\ndocument.querySelectorAll(\'.btn-start-discussion\')', start);
   const body = src.slice(start, end);
-  assert.match(body, /const mode = sessionButtonMode\(card\?\.dataset\.status, \{ active: isActive, exited: isExited \}\);/);
+  assert.match(body, /const mode = sessionButtonMode\(card\?\.dataset\.status, \{ active: isActive, exited: isExited, queued: queuedPosition !== undefined \}\);/);
   assert.match(body, /mode === SESSION_BUTTON_MODES\.RUNNING/);
   assert.match(body, /session-spinner/);
 });
@@ -97,7 +97,7 @@ test('task-edit-modal.js resolves the footer button from _modalSessionButton()/s
   const src = readSource('task-edit-modal.js');
   assert.match(src, /import \{ sessionButtonMode, SESSION_BUTTON_MODES \} from '\.\/session-button-state\.js';/);
   assert.match(src, /function _modalSessionButton\(task\)/);
-  assert.match(src, /const mode = sessionButtonMode\(savedStatus, \{ active, exited \}\);/);
+  assert.match(src, /const mode = sessionButtonMode\(savedStatus, \{ active, exited, queued: queuedPosition !== undefined \}\);/);
   // reads the SAVED status, not the unsaved draft, so an unsubmitted status-select edit can't
   // flip the button ahead of what clicking Start would actually do (C1316).
   assert.match(src, /const savedStatus = _modalState\?\.lastSaved\?\.status \?\? task\?\.status;/);
@@ -124,4 +124,40 @@ test('i18n.js: btn.show / tooltip.showRunningSession are defined for both locale
   const i18n = readSource('i18n.js');
   assert.equal((i18n.match(/'btn\.show':/g) || []).length, 2);
   assert.equal((i18n.match(/'tooltip\.showRunningSession':/g) || []).length, 2);
+});
+
+// ── (TPT444) QUEUED mode ──
+
+test('sessionButtonMode: a queued start reads QUEUED regardless of status or session flags', () => {
+  assert.equal(sessionButtonMode('pending', { queued: true }), SESSION_BUTTON_MODES.QUEUED);
+  assert.equal(sessionButtonMode('in_progress', { queued: true, active: true }), SESSION_BUTTON_MODES.QUEUED);
+  assert.equal(sessionButtonMode('completed', { queued: true, exited: true }), SESSION_BUTTON_MODES.QUEUED);
+  assert.equal(sessionButtonMode('pending', { queued: false }), SESSION_BUTTON_MODES.START);
+});
+
+test('task-board.js paints a Queued #N chip with Stop for QUEUED, and the edit modal mirrors it', () => {
+  const board = readSource('task-board.js');
+  assert.match(board, /queued: queuedPosition !== undefined/);
+  assert.match(board, /mode === SESSION_BUTTON_MODES\.QUEUED/);
+  assert.match(board, /t\('queue\.badge', \{ position: queuedPosition/);
+  assert.match(board, /state\.queuedSessions\.delete\(taskId\); \/\/ \(TPT444\)/);
+  const modal = readSource('task-edit-modal.js');
+  assert.match(modal, /queued: queuedPosition !== undefined/);
+  assert.match(modal, /SESSION_BUTTON_MODES\.QUEUED/);
+});
+
+test('i18n.js: queue strings exist in both locales', () => {
+  const i18n = readSource('i18n.js');
+  for (const key of ['terminal.queued', 'queue.badge', 'tooltip.queuedSession']) {
+    assert.equal((i18n.match(new RegExp(`'${key.replace('.', '\\.')}':`, 'g')) || []).length, 2, key);
+  }
+});
+
+test('ws-client treats session-queued as an accepted start; console-modal handles the frame', () => {
+  const wsClient = readSource('ws-client.js');
+  assert.match(wsClient, /msg\.type === 'session-queued'[\s\S]{0,400}finish\(true, msg\)/);
+  const modal = readSource('console-modal.js');
+  assert.match(modal, /msg\.type === 'session-queued'/);
+  assert.match(modal, /state\.queuedSessions\.set\(taskId, msg\.position\)/);
+  assert.match(modal, /state\.queuedSessions\.delete\(taskId\)\) state\.activeSessions\.add\(taskId\)/);
 });

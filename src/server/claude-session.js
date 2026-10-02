@@ -27,6 +27,9 @@ const { buildTurnPrompt, buildNudgeMessage } = require('./providers/transcript')
 const { fetchStatusContext } = require('./status-roles');
 const { isTaskKeyLike } = require('./task-key-format');
 const { clearAllProviderSessionIds } = require('./providers/registry');
+const { toolProfileFor } = require('./providers/tool-profiles');
+const { writeScopedMcpConfig } = require('./mcp-spawn-config');
+const taskChatWidgets = require('./task-chat-widgets');
 
 // Rehash modes a chat can carry. 'split' proposes children for the task; 'discuss'
 // refines the task itself via a "modified" proposal for the same id.
@@ -275,6 +278,33 @@ function tryEmitSpecSuggestion(session) {
   return null;
 }
 
+// Task chat's counterpart of the two scanners above: instead of proposal JSON it turns a turn's
+// output into widget frames (task-chat-widgets.js). With no `event` it scans the turn text for
+// fenced `ask_user` blocks -> `task-chat-dialog`. With a parsed stream-json event it follows
+// the tool calls -> `task-chat-tool`: announced by `content_block_start`, completed (input) by
+// the full `assistant` message, closed by the `tool_result` in the following `user` message.
+// The same tool id arriving through two of those never produces a second identical frame.
+function tryEmitTaskChatWidgets(session, event) {
+  if (!event) return taskChatWidgets.emitDialogs(session);
+  const send = taskChatWidgets.sessionSender(session);
+  const inner = (event.type === 'stream_event' && event.event) ? event.event : event;
+  if (inner.type === 'content_block_start' && inner.content_block?.type === 'tool_use') {
+    const { id, name, input } = inner.content_block;
+    taskChatWidgets.toolStarted(session, send, { id, name, input });
+  } else if (event.type === 'assistant' && Array.isArray(event.message?.content)) {
+    for (const block of event.message.content) {
+      if (block && block.type === 'tool_use') taskChatWidgets.toolStarted(session, send, { id: block.id, name: block.name, input: block.input });
+    }
+  } else if (event.type === 'user' && Array.isArray(event.message?.content)) {
+    for (const block of event.message.content) {
+      if (block && block.type === 'tool_result') {
+        taskChatWidgets.toolFinished(session, send, { id: block.tool_use_id, isError: block.is_error === true, result: block.content });
+      }
+    }
+  }
+  return null;
+}
+
 // ── Pre-warm pool — one idle proc per session to eliminate proc_startup latency ──
 // Key: taskId → { proc, spawnedAt, sessionId, ttlTimer }
 const _prewarmedProcs = new Map();
@@ -290,7 +320,29 @@ const SLEEP_WAKE_GAP_MS = 45000;
 let _sleepWatchdogTimer = null;
 let _sleepSessionsSource = () => null;
 
+// Argv for a session running under a tool profile (task chat). The profile, not the objective
+// read-only fence, decides the tool lists; the system prompt is always appended (it carries
+// the chat's rules, and SIMPLE_MODE's "no static bundle" reason does not apply to it).
+function buildProfileArgs(session, profile) {
+  const args = [
+    '--model', resolveClaudeModel(session),
+    '--effort', config.OBJECTIVE_EFFORT,
+    '-p', '--verbose',
+    '--output-format', 'stream-json',
+    '--include-partial-messages',
+    '--allowedTools', profile.allowedTools.join(','),
+    '--disallowedTools', profile.disallowedTools.join(','),
+    '--permission-mode', 'default',
+    '--exclude-dynamic-system-prompt-sections',
+  ];
+  if (session.systemPrompt) args.push('--append-system-prompt', session.systemPrompt);
+  if (session.claudeSessionId) args.push('--resume', session.claudeSessionId);
+  return args;
+}
+
 function buildObjectiveArgs(session) {
+  const profile = toolProfileFor(session, 'claude');
+  if (profile) return buildProfileArgs(session, profile);
   const args = [
     '--model', resolveClaudeModel(session),
     '--effort', config.OBJECTIVE_EFFORT,
@@ -474,6 +526,7 @@ function prewarmObjective(session, taskId) {
   if (!config.OBJECTIVE_PREWARM_ENABLED) return;
   if (config.SIMPLE_MODE) return;
   if ((session.providerType || 'claude') !== 'claude') return; // C1029: proc prewarm is Claude-binary-only
+  if (session.toolProfile) return; // a profiled chat spawns with its own argv + MCP config — never pooled
   if (!session.claudeSessionId) return; // need --resume session to prewarm for
   if (_prewarmedProcs.has(taskId)) return; // already warming
   if (session.proc) return; // turn active
@@ -836,7 +889,7 @@ function spawnHeartbeat(session, taskId) {
 // is attached. A turn that finishes inside a detach grace window (ws.on('close') mid-turn) only
 // buffers pendingResult for a possible reattach; a reattached client re-warms via objective-typing.
 function armIdleCacheWork(session, taskId) {
-  if (session.type === 'specChat') return;
+  if (session.type === 'specChat' || session.type === 'taskChat') return;
   if (!session.ws || session.ws.readyState !== session.ws.OPEN) return;
   armHeartbeat(session, taskId);
   // Pre-warm next proc immediately after turn — eliminates proc_startup on follow-up turns
@@ -909,20 +962,33 @@ function spawnObjectiveTurn(session, taskId) {
   // so the spawned Claude process and its MCP tipatask server use the correct project identity.
   // These extras override process.env (which carries the startup/global project) in augmentPathEnv.
   const _projExtras = projectEnvExtras(session);
+  // A task chat is scoped to a real task: the bare key (not the `taskChat:<key>` session id)
+  // is what the MCP servers resolve create_task's inherited sprint from.
+  const profile = toolProfileFor(session, 'claude');
+  const sessionTaskId = (profile && session.taskKey) || taskId;
+  const _taskEnv = profile && session.taskKey ? { TIPATASK_TASK_ID: session.taskKey } : {};
   const env = config.SIMPLE_MODE
-    ? augmentPathEnv({ TERM: 'dumb', ..._projExtras })
+    ? augmentPathEnv({ TERM: 'dumb', ..._taskEnv, ..._projExtras })
     : config.OBJECTIVE_DEBUG_STARTUP
-      ? augmentPathEnv({ TERM: 'dumb', DEBUG: '*', TIPATASK_TURN_ID: turnId, TIPATASK_OBJECTIVE_TASK_ID: taskId, ..._projExtras })
-      : augmentPathEnv({ TERM: 'dumb', TIPATASK_TURN_ID: turnId, TIPATASK_OBJECTIVE_TASK_ID: taskId, ..._projExtras });
+      ? augmentPathEnv({ TERM: 'dumb', DEBUG: '*', TIPATASK_TURN_ID: turnId, TIPATASK_OBJECTIVE_TASK_ID: sessionTaskId, ..._taskEnv, ..._projExtras })
+      : augmentPathEnv({ TERM: 'dumb', TIPATASK_TURN_ID: turnId, TIPATASK_OBJECTIVE_TASK_ID: sessionTaskId, ..._taskEnv, ..._projExtras });
   const args = buildObjectiveArgs(session);
+  if (profile) {
+    // Only the profile's MCP servers exist for this turn — no other project or user-level
+    // server is loaded. Without a derived file (no .mcp.json) the tool lists are the fence.
+    const scopedMcp = writeScopedMcpConfig({ projectRoot: cwd, userDataRoot: config.USER_DATA_ROOT, servers: profile.mcpServers, label: session.toolProfile });
+    if (scopedMcp) args.push('--mcp-config', scopedMcp, '--strict-mcp-config');
+  }
 
   // Try to adopt a pre-warmed proc (eliminates proc_startup latency on follow-up and first turns)
+  // — never for a profiled chat: pooled procs were spawned with the objective argv.
   let proc;
-  let pw = config.OBJECTIVE_PREWARM_ENABLED ? _prewarmedProcs.get(taskId) : null;
+  const prewarmEnabled = config.OBJECTIVE_PREWARM_ENABLED && !profile;
+  let pw = prewarmEnabled ? _prewarmedProcs.get(taskId) : null;
 
   // Cold path: first turn with no claudeSessionId — try the global cold prewarm slot.
   // consumeColdPrewarm() rejects and kills a slot whose model or project root differs.
-  if (!pw && !session.claudeSessionId && config.OBJECTIVE_PREWARM_ENABLED && !session.rehashIntent) {
+  if (!pw && !session.claudeSessionId && prewarmEnabled && !session.rehashIntent) {
     const cpw = consumeColdPrewarm(resolveClaudeModel(session), cwd);
     if (cpw) pw = { ...cpw, sessionId: null };
   }
@@ -974,6 +1040,7 @@ function spawnObjectiveTurn(session, taskId) {
   session.turnRawSse = '';
   session._lastEmittedCardsJson = null;
   session._lastEmittedSpecJson = null;
+  taskChatWidgets.resetTaskChatTurn(session);
   session.turnTokens = null;
   session._retrying = false;
   session._resultFinalized = false;
@@ -1125,6 +1192,9 @@ function spawnObjectiveTurn(session, taskId) {
   // Parse stream-json (SSE) events
   let sseLineBuffer = '';
   let _firstStdoutSeen = false;
+  // Text deltas seen this turn. Gates the full-assistant-message fallback below on what was
+  // actually streamed, not on a timing milestone that only exists when timing is enabled.
+  let _textStreamed = false;
   // Track accumulated input JSON for get_tag_architecture(s) tool calls this turn
   let _archToolBuf = null;   // string being accumulated, or null if not tracking
   let _archToolName = null;  // tool name being tracked
@@ -1168,6 +1238,8 @@ function spawnObjectiveTurn(session, taskId) {
           }
           console.log(`[objective] Claude session: ${event.session_id}`);
         }
+
+        if (session.type === 'taskChat') tryEmitTaskChatWidgets(session, event);
 
         // Tool-use start — record name + start timestamp + emit progress to client
         if (inner.type === 'content_block_start' && inner.content_block?.type === 'tool_use') {
@@ -1242,6 +1314,7 @@ function spawnObjectiveTurn(session, taskId) {
             session.timingMilestones.lastSignalAt = now; // C1255
           }
           const text = inner.delta.text;
+          _textStreamed = true;
           session.turnBuffer += text;
           session.buffer += text;
           if (session.buffer.length > config.MAX_SCROLLBACK) {
@@ -1251,6 +1324,7 @@ function spawnObjectiveTurn(session, taskId) {
             session.ws.send(JSON.stringify({ type: 'data', tabId: session.tabId, data: text }));
           }
           if (session.type === 'specChat') tryEmitSpecSuggestion(session);
+          else if (session.type === 'taskChat') tryEmitTaskChatWidgets(session);
           else tryEmitTaskCards(session);
         }
 
@@ -1269,12 +1343,13 @@ function spawnObjectiveTurn(session, taskId) {
         // Full assistant message (fallback when no streaming deltas arrived)
         if (event.type === 'assistant' && event.message?.content) {
           for (const block of event.message.content) {
-            if (block.type === 'text' && block.text && !session.timingMilestones.firstChunk) {
+            if (block.type === 'text' && block.text && !_textStreamed && !session.timingMilestones.firstChunk) {
               session.turnBuffer += block.text;
               session.buffer += block.text;
               if (session.ws && session.ws.readyState === session.ws.OPEN) {
                 session.ws.send(JSON.stringify({ type: 'data', tabId: session.tabId, data: block.text }));
               }
+              if (session.type === 'taskChat') tryEmitTaskChatWidgets(session);
             }
           }
         }
@@ -1567,6 +1642,11 @@ async function finalizeCloseTurn(session, code, taskId, resultPath) {
   // Single-pass extraction: branch on session type
   if (session.type === 'specChat') {
     tryEmitSpecSuggestion(session);
+  } else if (session.type === 'taskChat') {
+    // Prose turn: no proposal JSON to extract, so no card scan and no nudge retry — only the
+    // closing dialog scan, and the turn's widgets kept on the message for history.
+    tryEmitTaskChatWidgets(session);
+    taskChatWidgets.attachTaskChatWidgets(session, assistantMsg);
   } else {
     const extracted = tryEmitTaskCards(session);
     if (extracted) {
@@ -1597,7 +1677,7 @@ async function finalizeCloseTurn(session, code, taskId, resultPath) {
   const cleaned = session.turnBuffer.replace(/<tool_call>[\s\S]*?<\/tool_result>/g, '').trim();
 
   // Populate response cache on first-turn success (C481) — skip for spec-chat sessions.
-  if (session.type !== 'specChat' && session._objectiveCacheKey
+  if (session.type !== 'specChat' && session.type !== 'taskChat' && session._objectiveCacheKey
       && session._objectiveCacheTaskId === taskId
       && session.messages.length === 2   // user[0] + assistant[1] = first turn
       && !session._aborted
@@ -1666,7 +1746,7 @@ async function finalizeCloseTurn(session, code, taskId, resultPath) {
 
   // Deferred efficiency analysis — objective-mode only; skip for spec-chat.
   // SIMPLE_MODE: skip — no timing analysis, no Haiku sub-spawn.
-  if (session.type !== 'specChat' && !config.SIMPLE_MODE && config.OBJECTIVE_TIMING_ENABLED && totalMs > config.OBJECTIVE_SLOW_TURN_MS) {
+  if (session.type !== 'specChat' && session.type !== 'taskChat' && !config.SIMPLE_MODE && config.OBJECTIVE_TIMING_ENABLED && totalMs > config.OBJECTIVE_SLOW_TURN_MS) {
     const efficiencyStart = Date.now();
     const doEfficiency = () => spawnEfficiencyAnalysis(session, totalMs)
       .then(hintCards => {
@@ -1805,6 +1885,7 @@ module.exports = {
   buildObjectiveArgs,
   spawnObjectiveTurn,
   tryEmitTaskCards,
+  tryEmitTaskChatWidgets,
   classifyNoJsonTurn,
   normalizeProposals,
   killObjectiveProc,

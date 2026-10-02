@@ -619,6 +619,11 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
 
   const knownLoss = state.lostSessions.get(taskId);
   const isResume = state.activeSessions.has(taskId);
+  // (TPT443) Read before the clear below wipes it: a watchdog-paused session shows its banner at
+  // once instead of waiting for the terminal-state round-trip that confirms (or clears) it.
+  const seedRunaway = state.attentionDetails.get(taskId);
+  const seedPaused = state.sessionMeta.get(taskId)?.paused
+    || (seedRunaway?.kind === 'runaway' && seedRunaway.paused ? seedRunaway : null);
   _markAttentionSeen(taskId); // (C1387) the single, complete clear trigger
   const terminalOpenContext = captureOpenContext();
   state.pendingRestoreContext = terminalOpenContext;
@@ -726,6 +731,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   let openRaf = 0;
   // Connect WebSocket — include prompt only for new sessions
   let firstReplayCleared = !isResume;
+  let pendingExitedReplayScroll = !isResume && state.exitedSessions.has(taskId);
   let firstResumeDataSeen = !isResume;
   let firstResumeDataWritten = !isResume;
   let codexResumeRedrawSent = !isResume;
@@ -910,9 +916,58 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     scheduleTerminalRefresh({ send: true });
   }
 
+  // A compact action strip keeps a paused session recoverable without covering terminal output.
+  function renderWatchdogActions(paused) {
+    let banner = overlay.querySelector('.terminal-watchdog-actions');
+    if (!paused || typeof paused !== 'object') {
+      if (!banner) return;
+      banner.remove();
+      // Every caller sets its own dot title (terminal-state just did) or class right after.
+      if (statusDot.classList.contains('paused')) statusDot.className = 'status-dot';
+      scheduleTerminalRefresh({ send: true });
+      return;
+    }
+    const added = !banner;
+    if (added) {
+      banner = document.createElement('div');
+      banner.className = 'terminal-watchdog-actions';
+      banner.setAttribute('role', 'status');
+      banner.innerHTML = `
+        <span class="terminal-watchdog-label"></span>
+        <div class="terminal-watchdog-buttons">
+          <button type="button" class="btn-show-task btn-resume-paused"></button>
+          <button type="button" class="btn-terminate-terminal btn-terminate-paused"></button>
+        </div>`;
+      const resumeBtn = banner.querySelector('.btn-resume-paused');
+      resumeBtn.addEventListener('click', () => {
+        if (resumeBtn.disabled || !wsIsOpen()) return;
+        resumeBtn.disabled = true;
+        resumeBtn.textContent = t('terminal.resuming');
+        ws.send(JSON.stringify({ type: 'resume-paused' }));
+      });
+      banner.querySelector('.btn-terminate-paused').addEventListener('click', () => terminateSession());
+      overlay.querySelector('.terminal-header').after(banner);
+    }
+    const rss = Number(paused.rssMb) || 0;
+    const limit = Number(paused.limitMb) || 0;
+    const count = Number(paused.count) || 0;
+    banner.querySelector('.terminal-watchdog-label').textContent = t('terminal.pausedShort');
+    banner.title = limit > 0
+      ? t('terminal.pausedMemory', { rss, limit, count })
+      : t('terminal.pausedMemoryNoLimit', { rss, count });
+    const resumeBtn = banner.querySelector('.btn-resume-paused');
+    resumeBtn.disabled = false; // a fresh paused summary re-arms a Resume that did not take
+    resumeBtn.textContent = t('terminal.resume');
+    banner.querySelector('.btn-terminate-paused').textContent = t('btn.terminate');
+    statusDot.className = 'status-dot paused';
+    statusDot.title = t('terminal.pausedTitle');
+    if (added) scheduleTerminalRefresh({ send: true });
+  }
+
   function showLostSession(detail = {}) {
     processRunning = false;
     setCodexPlanReady(false);
+    renderWatchdogActions(null);
     markSessionLost(taskId, detail);
     statusDot.className = 'status-dot disconnected';
     statusDot.title = t('terminal.sessionLostTitle');
@@ -994,7 +1049,15 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
 
-      if (msg.type === 'config') {
+      if (msg.type === 'session-queued') {
+        // (TPT444) No free slot — the server parked this start and will launch it, oldest first,
+        // when a running task completes. Not a live session yet, so keep it out of activeSessions.
+        state.queuedSessions.set(taskId, msg.position);
+        state.activeSessions.delete(taskId);
+        term.write(`\r\n\x1b[90m${t('terminal.queued', { position: msg.position ?? '?', cap: msg.cap ?? '?' })}\x1b[0m\r\n`);
+        updateClaudeButtons();
+      } else if (msg.type === 'config') {
+        if (state.queuedSessions.delete(taskId)) state.activeSessions.add(taskId); // (TPT444) queue → running
         state.showAiStats = msg.showAiStats;
         applyTaskAgentConfig(msg);
         adoptSessionAgent(taskId, msg); // (TPT413) live session agent → left-nav row icon
@@ -1028,6 +1091,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
               ? `Planning — type ${state.planApprovalCommand} to continue`
               : 'Planning — awaiting approval dialog')
           : 'Executing';
+        state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), paused: msg.paused || null });
+        renderWatchdogActions(msg.paused);
+        syncActiveSessionsNav();
         terminalController.phase = terminalPhase;
         terminalController.taskAgentLabel = state.taskAgentLabel;
         terminalController.taskAgentModel = msg.taskAgentModel || ''; // (C1118) parity with taskAgentLabel
@@ -1043,6 +1109,17 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
           term.clear();
         }
         outputWriter.write(msg.data, () => {
+          // (TPT439) Finished-session reattach: the replay lands in one frame, and the pin check
+          // in refreshTerminalViewport() can lose the bottom after fit() reflows — force it once.
+          if (pendingExitedReplayScroll) {
+            pendingExitedReplayScroll = false;
+            requestAnimationFrame(() => {
+              if (terminalDisposed || terminalClosing) return;
+              refreshTerminalViewport();
+              term.scrollToBottom();
+              if (term.rows > 0) term.refresh(0, term.rows - 1);
+            });
+          }
           if (isFirstResumeData) {
             firstResumeDataWritten = true;
             // Repaints the local xterm canvas over the replayed buffer. Pairs with the
@@ -1060,6 +1137,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       } else if (msg.type === 'exit') {
         processRunning = false;
         setCodexPlanReady(false);
+        renderWatchdogActions(null);
         statusDot.className = 'status-dot exited';
         if (msg.reason === 'runaway-killed') {
           // (TPT357) The descendant-process watchdog ended this session — say so, in red,
@@ -1107,6 +1185,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       } else if (msg.type === 'session-ended' && (!msg.taskId || msg.taskId === taskId)) {
         processRunning = false;
         setCodexPlanReady(false);
+        renderWatchdogActions(null);
         removeMcpAuthDialog();
         clearTaskSessionState();
         if (!terminationInFlight) finishTerminalEnded();
@@ -1410,7 +1489,10 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       wsExtra.rows = term.rows;
     }
     if (knownLoss && !opts.restartLost) showLostSession(knownLoss);
-    else connectWebSocket();
+    else {
+      if (seedPaused) renderWatchdogActions(seedPaused);
+      connectWebSocket();
+    }
 
     const scrollY = window.scrollY;
     focusTerminalWithoutScrollJump();

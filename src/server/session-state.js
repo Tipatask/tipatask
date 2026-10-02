@@ -20,8 +20,12 @@ function createSession(ws, pending, tabId, projectPath) {
                                // stashed separately because terminateTerminalSession() nulls
                                // session.pty before the group-kill needs the pid
     descendantWatchdog: null, // (C1565/TPT370) { pid, lastCount, lastAlertCount, threshold,
-                               // alerted, growthStreak, killed } — set at spawn, nulled on
-                               // exit — see process-group.js
+                               // alerted, growthStreak, rssStreak, rssAlerted, lastAlertRssMb,
+                               // paused, killed, actReason, resumeBase } — set at spawn,
+                               // nulled on exit — see process-group.js evaluateRunaway()
+    _pause: null,             // { at, reason, count, threshold, rssMb, limitMb, text, targets }
+                               // while the watchdog holds the tree SIGSTOPped — see
+                               // terminal-session.js pauseRunawaySession()/resumeRunawaySession()
     proc: null,
     type: 'terminal',
     buffer: '',
@@ -30,6 +34,8 @@ function createSession(ws, pending, tabId, projectPath) {
     // /api/sessions must report this window as active, not exited (see ws-handlers.js
     // sessionListBucket()). spawnTerminal() awaits several remote round-trips (KB pull,
     // task comments, status/VCS settings) before pty.spawn, so this window can run seconds.
+    _queued: false,     // (TPT444) parked in the task-session start queue (session-queue.js)
+    _launching: false,  // (TPT444) admitted by the queue, spawn preparation in flight — counts as running
     _starting: false,
     cols: 0,
     rows: 0,
@@ -67,6 +73,16 @@ function createSession(ws, pending, tabId, projectPath) {
     _interceptingApprovalCommand: false,
     // Per-project scoping (Electron multi-window)
     projectPath: '',
+    // Task chat fields (taskChat / projectChat)
+    taskKey: null,            // bare task key for task chats; null for project chats
+    chatProjectId: null,      // API project id for a project chat; never taken from a Start payload
+    _projectChatStarting: false, // Start is fetching context; reconnect must retain this session
+    toolProfile: null,        // providers/tool-profiles.js profile name; null = the provider's objective (read-only planner) fence
+    pendingResult: null,      // turn result finished while no client was attached — flushed on reconnect
+    _taskChatTurn: null,      // the running turn's dialogs/tools/task events (task-chat-widgets.js); reset per turn
+    onTaskChatMutation: null, // set by ws-handlers.js at start-task-chat: a create/update tool call succeeded
+    pendingTaskEdits: null,   // Map taskKey -> { task, changed, prev }: tasks the user edited by hand, told to the agent with the next user turn
+    _drainedTaskEdits: null,  // the edits the running turn's user message carried — put back if that turn is aborted
     // Multi-turn objective fields
     claudeSessionId: null,
     geminiSessionId: null,
@@ -137,4 +153,18 @@ function createSession(ws, pending, tabId, projectPath) {
   };
 }
 
-module.exports = { createSession };
+// Headless agent-chat sessions (one CLI process per turn, no pty). Everything else is a
+// terminal session. The id prefixes are how a chat is recognised before its `start-*` message
+// has set session.type — a promptless connect, the pre-spawn lifecycle wiring, GET /api/sessions.
+const AGENT_CHAT_TYPES = Object.freeze(['objective', 'specChat', 'taskChat']);
+const AGENT_CHAT_ID_PREFIXES = Object.freeze(['obj-', 'specChat:', 'taskChat:', 'projectChat:']);
+
+function isAgentChatType(type) {
+  return AGENT_CHAT_TYPES.includes(type);
+}
+
+function isAgentChatId(id) {
+  return typeof id === 'string' && AGENT_CHAT_ID_PREFIXES.some(prefix => id.startsWith(prefix));
+}
+
+module.exports = { createSession, isAgentChatType, isAgentChatId, AGENT_CHAT_TYPES, AGENT_CHAT_ID_PREFIXES };

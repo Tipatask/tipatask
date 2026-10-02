@@ -19,6 +19,18 @@
 //     before any project (hence any locale) is known.
 
 const en = {
+  // Project access dialog, shared with the native/renderer translation table.
+  "projectAccess.title": "Cannot open project",
+  "projectAccess.denied": "This project is not available to the current account.",
+  "projectAccess.signin": "Sign in again to open this project.",
+  "projectAccess.detail": "The project may belong to another account or may no longer exist. Re-authenticate with an account that has access, then TipATask will try opening it again.",
+  "projectAccess.retryDetail": "The project was not opened. Please try opening it again.",
+  "projectAccess.reauthenticate": "Re-authenticate",
+  "projectAccess.cancel": "Cancel",
+  "projectAccess.close": "Close",
+  "projectAccess.unavailable": "Could not check project access. Check your connection and try again.",
+  "projectAccess.signinFailed": "Sign-in did not finish successfully. Please try again.",
+
   'menu.openOrCreateProject': 'Open / Create Project…',
   'menu.recentProjects': 'Recent Projects',
   'menu.noRecentProjects': 'No Recent Projects',
@@ -57,6 +69,18 @@ const en = {
 };
 
 const uk = {
+  // Project access dialog, shared with the native/renderer translation table.
+  "projectAccess.title": "Не вдалося відкрити проєкт",
+  "projectAccess.denied": "Цей проєкт недоступний для поточного акаунта.",
+  "projectAccess.signin": "Увійдіть знову, щоб відкрити цей проєкт.",
+  "projectAccess.detail": "Проєкт може належати іншому акаунту або більше не існувати. Повторно автентифікуйтеся через акаунт із доступом, і TipATask знову спробує відкрити проєкт.",
+  "projectAccess.retryDetail": "Проєкт не відкрито. Спробуйте відкрити його ще раз.",
+  "projectAccess.reauthenticate": "Повторна автентифікація",
+  "projectAccess.cancel": "Скасувати",
+  "projectAccess.close": "Закрити",
+  "projectAccess.unavailable": "Не вдалося перевірити доступ до проєкту. Перевірте з’єднання та спробуйте ще раз.",
+  "projectAccess.signinFailed": "Не вдалося завершити вхід. Спробуйте ще раз.",
+
   'menu.openOrCreateProject': 'Відкрити / Створити проєкт…',
   'menu.recentProjects': 'Останні проєкти',
   'menu.noRecentProjects': 'Немає останніх проєктів',

@@ -59,9 +59,15 @@ const {
   CONFIG_FIELDS,
   API_CREDENTIAL_FIELDS,
   migrateFromLegacy,
+  migrateLegacyApiToken,
 } = require('./project-config');
+const { readAccount } = require('./account-store');
 migrateFromLegacy(PROJECT_ROOT_EARLY);
+// Lift an inline config.json API_TOKEN into the app-level account store (no-op when absent).
+migrateLegacyApiToken(PROJECT_ROOT_EARLY);
 const _startupProjectCfg = readProjectConfig(PROJECT_ROOT_EARLY) || {};
+// The signed-in account's token lives in the account store, keyed by the project's API server.
+const _startupToken = readAccount(_startupProjectCfg.API_BASE_URL)?.token || _startupProjectCfg.API_TOKEN || '';
 
 // Merge per-project config BEFORE legacy .env so project config wins.
 // parseEnvFile skips keys already in process.env, so order determines precedence:
@@ -91,6 +97,14 @@ const _CONFIG_ENV_SEED_SKIP = new Set([
   // dropdown. Consuming the array's rows is C1122+ (registry.js configForProject()) —
   // this task only guards against the collision.
   'PI_MODELS',
+  // TPT440 — agent resource limits are resolved per project by process-group.js
+  // resolveAgentLimits() (env > config.json > default). Seeding the startup project's
+  // values into process.env would make them win over every other project's config.
+  'AGENT_LIMITS_MAX_CONCURRENT_SESSIONS',
+  'AGENT_LIMITS_MAX_SUBAGENTS',
+  'AGENT_LIMITS_WARN_DESCENDANTS',
+  'AGENT_LIMITS_MAX_TREE_RSS_MB',
+  'AGENT_LIMITS_WATCHDOG_ACTION',
   ...API_CREDENTIAL_FIELDS,
 ]);
 for (const [key, val] of Object.entries(_startupProjectCfg)) {
@@ -107,7 +121,7 @@ for (const [key, val] of Object.entries(_startupProjectCfg)) {
 // but config.json is their only source. Missing/blank config values clear any
 // stale value inherited from the parent shell.
 for (const key of API_CREDENTIAL_FIELDS) {
-  const val = _startupProjectCfg[key];
+  const val = key === 'API_TOKEN' ? _startupToken : _startupProjectCfg[key];
   if (val != null && val !== '') process.env[key] = String(val);
   else delete process.env[key];
 }
@@ -232,7 +246,7 @@ const config = {
   // config, which task-backend.js's coerceBackendType() coerces to "api" at the factory.
   TASK_BACKEND: process.env.TASK_BACKEND || 'api',
   API_BASE_URL: _startupProjectCfg.API_BASE_URL || '',
-  API_TOKEN: _startupProjectCfg.API_TOKEN || '',
+  API_TOKEN: _startupToken,
   API_PROJECT_ID: _startupProjectCfg.API_PROJECT_ID || '',
   USER_NAME: process.env.USER_NAME || '',
   USER_ID: parseInt(process.env.USER_ID, 10) || 1,

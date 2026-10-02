@@ -25,6 +25,18 @@ function _taskCard(taskId) {
   return app?.querySelector?.(`.card[data-id="${_cssEscape(taskId)}"]`) || null;
 }
 
+// Shared notification-click action (attention + completion): focus the app and open the task's
+// console. Title/status are re-read at click time — the card may have re-rendered since the
+// banner was raised. openTerminal() itself reattaches a live or exited session.
+export function openTaskTerminalFromNotification(taskId, fallbackStatus) {
+  try { window.electronAPI?.focusSelf?.(); } catch (_) {}
+  const card = _taskCard(taskId);
+  const title = card?.querySelector?.('.card-title-inner')?.textContent?.trim()
+    || state.taskTitleById?.get(taskId) || taskId;
+  const status = card?.dataset?.status || fallbackStatus;
+  window.TipTask?.openTerminal?.(taskId, title, '', status);
+}
+
 function _windowHasUserFocus() {
   if (typeof document === 'undefined') return false;
   if (document.visibilityState !== 'visible') return false;
@@ -60,7 +72,7 @@ export function buildAttentionBody(detail) {
     case 'mcpTrust': return t('attention.mcpTrust');
     case 'planReady': return t('attention.planReady');
     case 'idle': return t('attention.idle');
-    case 'runaway': return t(detail.killed ? 'attention.runawayKilled' : 'attention.runaway'); // (C1565, TPT357) fallback only — server always sends promptText
+    case 'runaway': return t(detail.killed ? 'attention.runawayKilled' : detail.paused ? 'attention.runawayPaused' : 'attention.runaway'); // (C1565, TPT357, TPT443) fallback only — server always sends promptText
     default: return t('attention.default');
   }
 }
@@ -100,14 +112,7 @@ export function notifyTaskNeedsAttention(taskId, detail = state.attentionDetails
     || state.taskTitleById?.get(taskId) || taskId;
   const status = card?.dataset?.status || inProgressName();
   const body = buildAttentionBody(detail);
-  const onClick = () => {
-    try { window.electronAPI?.focusSelf?.(); } catch (_) {}
-    const currentCard = _taskCard(taskId);
-    const currentTitle = currentCard?.querySelector?.('.card-title-inner')?.textContent?.trim()
-      || state.taskTitleById?.get(taskId) || taskId;
-    const currentStatus = currentCard?.dataset?.status || status;
-    window.TipTask?.openTerminal?.(taskId, currentTitle, '', currentStatus);
-  };
+  const onClick = () => openTaskTerminalFromNotification(taskId, status);
 
   // (C1137) In-app stacked card — persists until dismissed, independent of the OS banner's
   // own 30s debounce/platform auto-dismiss (see notification-center.js). Tag-keyed upsert, so

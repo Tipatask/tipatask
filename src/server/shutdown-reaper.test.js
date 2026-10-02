@@ -10,7 +10,7 @@ const { EventEmitter } = require('node:events');
 const scratch = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'tt-shutdown-reaper-'));
 process.env.TIPATASK_USER_DATA = scratch;
 test.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
-const { installShutdownReaper, defaultSleepSync, SHUTDOWN_KILL_GRACE_MS } = require('./shutdown-reaper');
+const { installShutdownReaper, reapLlmChildren, defaultSleepSync, SHUTDOWN_KILL_GRACE_MS } = require('./shutdown-reaper');
 
 // TPT295 — the server shutdown reaper. Runs the real claude-session.js and headless-claude.js in
 // sandboxes whose process.kill only records [pid, signal] (no real signal is ever sent), then fires
@@ -187,4 +187,20 @@ test('defaultSleepSync blocks the thread for the requested time', () => {
   defaultSleepSync(20);
   const ms = Number(process.hrtime.bigint() - start) / 1e6;
   assert.ok(ms >= 19, `blocked only ${ms}ms`);
+});
+
+test('reapLlmChildren tears down task chats alongside objective and spec chats, never terminals', () => {
+  const tornDown = [];
+  const claude = {
+    teardownObjectiveSession: (session, id) => { tornDown.push([session.type, id]); return []; },
+    killAllPrewarms: () => [],
+  };
+  const sessions = new Map([
+    ['obj-a', { type: 'objective', tabId: 'obj-a' }],
+    ['specChat:TPT1\0/proj', { type: 'specChat', tabId: null }],
+    ['taskChat:TPT2\0/proj', { type: 'taskChat', tabId: 'taskChat:TPT2' }],
+    ['TPT3\0/proj', { type: 'terminal', tabId: 'TPT3' }],
+  ]);
+  reapLlmChildren(sessions, 'SIGTERM', { claude, headless: { killAllHeadlessProcs: () => [] } });
+  assert.deepEqual(tornDown, [['objective', 'obj-a'], ['specChat', 'specChat:TPT1'], ['taskChat', 'taskChat:TPT2']]);
 });

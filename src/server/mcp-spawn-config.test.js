@@ -10,7 +10,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const { buildHeadersHelperCommand, writeSpawnMcpConfig, HELPER_SCRIPT } = require('./mcp-spawn-config');
+const { buildHeadersHelperCommand, writeSpawnMcpConfig, writeScopedMcpConfig, HELPER_SCRIPT } = require('./mcp-spawn-config');
 
 function tmp(t, prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -127,6 +127,51 @@ test('auth-header-helper: prints the live config token as an Authorization heade
   assert.deepStrictEqual(JSON.parse(r.stdout), { Authorization: 'Bearer second.token.value' });
 });
 
+test('auth-header-helper: prints the account-store token (config.json holds only the project target)', (t) => {
+  const root = tmp(t, 'tt-helper-store-');
+  const userData = tmp(t, 'tt-helper-store-ud-');
+  fs.mkdirSync(path.join(root, '.tipatask'));
+  fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify({ API_BASE_URL: 'https://Helper.example.test/', API_PROJECT_ID: '2' }));
+  const { writeAccountToken, clearAccountToken } = require('./account-store');
+  writeAccountToken('https://helper.example.test', 'store.token.value', { userDataRoot: userData });
+
+  // --user-data wins; TIPATASK_USER_DATA is the fallback the MCP/agent env supplies.
+  let r = runHelper(['--project-root', root, '--user-data', userData], { env: { ...process.env, TIPATASK_USER_DATA: '' } });
+  assert.strictEqual(r.status, 0);
+  assert.deepStrictEqual(JSON.parse(r.stdout), { Authorization: 'Bearer store.token.value' });
+  assert.strictEqual(r.stderr, '');
+  r = runHelper(['--project-root', root], { env: { ...process.env, TIPATASK_USER_DATA: userData } });
+  assert.deepStrictEqual(JSON.parse(r.stdout), { Authorization: 'Bearer store.token.value' });
+
+  // A refresh / re-auth rewrites the store: the very next run (an MCP reconnect) sees it.
+  writeAccountToken('https://helper.example.test', 'second.token.value', { userDataRoot: userData });
+  r = runHelper(['--project-root', root, '--user-data', userData]);
+  assert.deepStrictEqual(JSON.parse(r.stdout), { Authorization: 'Bearer second.token.value' });
+
+  // The store beats a stale inline config.json token; another server's account is never used.
+  fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify({ API_BASE_URL: 'https://helper.example.test', API_TOKEN: 'stale.inline.token' }));
+  r = runHelper(['--project-root', root, '--user-data', userData]);
+  assert.deepStrictEqual(JSON.parse(r.stdout), { Authorization: 'Bearer second.token.value' });
+  fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify({ API_BASE_URL: 'https://other.example.test' }));
+  r = runHelper(['--project-root', root, '--user-data', userData]);
+  assert.strictEqual(r.status, 1);
+  assert.strictEqual(r.stdout, '');
+
+  // Signed out: nothing to print.
+  fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify({ API_BASE_URL: 'https://helper.example.test' }));
+  clearAccountToken('https://helper.example.test', { userDataRoot: userData });
+  r = runHelper(['--project-root', root, '--user-data', userData]);
+  assert.strictEqual(r.status, 1);
+});
+
+test('buildHeadersHelperCommand: userDataRoot adds --user-data (quoted) so the helper finds the account store', () => {
+  const posix = buildHeadersHelperCommand({ execPath: '/n', scriptPath: '/s.js', projectRoot: '/p', userDataRoot: "/Users/me/Library/Application Support/Tip'a", electron: false, platform: 'darwin' });
+  assert.strictEqual(posix, "'/n' '/s.js' --project-root '/p' --user-data '/Users/me/Library/Application Support/Tip'\\''a'");
+  const win = buildHeadersHelperCommand({ execPath: 'C:\\a.exe', scriptPath: 'C:\\h.js', projectRoot: 'D:\\p', userDataRoot: 'C:\\Users\\me\\AppData', electron: false, platform: 'win32' });
+  assert.strictEqual(win, '"C:\\a.exe" "C:\\h.js" --project-root "D:\\p" --user-data "C:\\Users\\me\\AppData"');
+  assert.strictEqual(buildHeadersHelperCommand({ execPath: 'a', scriptPath: 'b', projectRoot: 'c', userDataRoot: 'd"e', electron: false, platform: 'win32' }), null);
+});
+
 test('auth-header-helper: TIPATASK_PROJECT_ROOT / cwd fallbacks, --project-root wins', (t) => {
   const a = tmp(t, 'tt-helper-a-');
   const b = tmp(t, 'tt-helper-b-');
@@ -153,4 +198,42 @@ test('auth-header-helper: no token / unreadable config → exit 1 with empty std
   r = runHelper(['--project-root', root]);
   assert.strictEqual(r.status, 1);
   assert.strictEqual(r.stdout, '');
+});
+
+// ── writeScopedMcpConfig ──
+
+test('writeScopedMcpConfig: keeps only the named servers, verbatim, in its own file', (t) => {
+  const projectRoot = tmp(t, 'tt-mcp-scoped-proj-');
+  const userDataRoot = tmp(t, 'tt-mcp-scoped-data-');
+  fs.writeFileSync(path.join(projectRoot, '.mcp.json'), JSON.stringify(MCP_JSON));
+  const out = writeScopedMcpConfig({ projectRoot, userDataRoot, servers: ['tipatask', 'tipatask-local'], label: 'taskChat' });
+  assert.ok(out.startsWith(path.join(userDataRoot, 'mcp-spawn') + path.sep), out);
+  assert.match(path.basename(out), /^[0-9a-f]{12}\.taskChat\.json$/);
+  const written = JSON.parse(fs.readFileSync(out, 'utf8'));
+  assert.deepStrictEqual(Object.keys(written.mcpServers), ['tipatask', 'tipatask-local']);
+  assert.deepStrictEqual(written.mcpServers.tipatask, MCP_JSON.mcpServers.tipatask);
+  assert.deepStrictEqual(written.mcpServers['tipatask-local'], MCP_JSON.mcpServers['tipatask-local']);
+  // The project's own file is never touched, and the full derived config keeps its own name.
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(projectRoot, '.mcp.json'), 'utf8')), MCP_JSON);
+  const full = writeSpawnMcpConfig({ projectRoot, userDataRoot, helperCommand: 'helper' });
+  assert.notStrictEqual(full, out);
+  // Unchanged content is not rewritten.
+  const before = fs.statSync(out).mtimeMs;
+  assert.strictEqual(writeScopedMcpConfig({ projectRoot, userDataRoot, servers: ['tipatask', 'tipatask-local'], label: 'taskChat' }), out);
+  assert.strictEqual(fs.statSync(out).mtimeMs, before);
+});
+
+test('writeScopedMcpConfig: null when there is nothing to scope to', (t) => {
+  const projectRoot = tmp(t, 'tt-mcp-scoped-none-');
+  const userDataRoot = tmp(t, 'tt-mcp-scoped-none-data-');
+  const args = { projectRoot, userDataRoot, servers: ['tipatask'], label: 'taskChat' };
+  assert.strictEqual(writeScopedMcpConfig(args), null, 'no .mcp.json');
+  fs.writeFileSync(path.join(projectRoot, '.mcp.json'), '{not json');
+  assert.strictEqual(writeScopedMcpConfig(args), null, 'invalid .mcp.json');
+  fs.writeFileSync(path.join(projectRoot, '.mcp.json'), JSON.stringify({ mcpServers: { other: { type: 'http', url: 'x' } } }));
+  assert.strictEqual(writeScopedMcpConfig(args), null, 'none of the named servers is registered');
+  fs.writeFileSync(path.join(projectRoot, '.mcp.json'), JSON.stringify(MCP_JSON));
+  assert.strictEqual(writeScopedMcpConfig({ ...args, label: '' }), null);
+  assert.strictEqual(writeScopedMcpConfig({ ...args, servers: null }), null);
+  assert.strictEqual(fs.existsSync(path.join(userDataRoot, 'mcp-spawn')), false);
 });

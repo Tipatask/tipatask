@@ -6,33 +6,23 @@
 // can keep a session's credentials alive without sending the user back through sign-in.
 // An already-expired token cannot be renewed here; that path stays interactive.
 //
-// The new token is persisted in the same two places a re-auth writes: the project's
-// .tipatask/config.json (read live by getApiCredentials(), projectEnvExtras() and the
-// headers helper that feeds the remote MCP server) and the `env` copy in
-// .claude/settings.local.json. Token values are never logged.
+// The new token is persisted in the app-level account store (account-store.js, read live by
+// getApiCredentials(), projectEnvExtras() and the headers helper that feeds the remote MCP
+// server) and mirrored into the `env` copy in .claude/settings.local.json. It is never
+// written to the project's config.json. Because the token is account-wide (TPT449), one
+// renewal serves every project on that API server, so in-flight requests are joined per
+// server, not per project. Token values are never logged.
 
-const fs = require('node:fs');
-const path = require('node:path');
 const { tokenExpiryMs } = require('./auth-guard');
-const { writeProjectConfig, writeProjectClaudeMcpApproval } = require('./project-config');
+const { writeProjectClaudeMcpApproval } = require('./project-config');
+const { readAccount, writeAccountToken, normalizeBaseUrl } = require('./account-store');
 
-const CONFIG_REL = path.join('.tipatask', 'config.json');
 const DEFAULT_TIMEOUT_MS = 5000;
 
-// projectRoot -> Promise. A second caller for the same project (launch preflight racing the
-// expiry watch, or two tasks starting together) joins the request already in flight.
+// normalized API base URL -> Promise. A second caller on the same server (launch preflight
+// racing the expiry watch, two tasks starting together, or two projects of one account)
+// joins the request already in flight.
 const _inflight = new Map();
-
-// Raw parse, deliberately not readProjectConfig(): that one injects theme/language defaults
-// which must not be persisted back as if the user had chosen them.
-function readRawConfig(projectRoot) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(projectRoot, CONFIG_REL), 'utf8'));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
 
 async function requestFreshToken({ baseUrl, token, projectId, fetchImpl, timeoutMs }) {
   let res;
@@ -57,13 +47,11 @@ async function requestFreshToken({ baseUrl, token, projectId, fetchImpl, timeout
 
 async function doRefresh({ projectRoot, baseUrl, token, projectId, fetchImpl, timeoutMs }) {
   const fresh = await requestFreshToken({ baseUrl, token, projectId, fetchImpl, timeoutMs });
-  const cfg = readRawConfig(projectRoot);
-  if (!cfg) throw new Error('.tipatask/config.json is unreadable');
   // Re-auth (or another window's refresh) may have replaced the token while the request was in
-  // flight — including the deliberate blank a re-auth writes. Never clobber that.
-  if (cfg.API_TOKEN !== token) return { token: cfg.API_TOKEN || '', rotated: true };
-  cfg.API_TOKEN = fresh;
-  writeProjectConfig(projectRoot, cfg);
+  // flight — including a sign-out that cleared it. Never clobber that.
+  const current = readAccount(baseUrl);
+  if (!current || current.token !== token) return { token: current ? current.token : '', rotated: true };
+  writeAccountToken(baseUrl, fresh);
   try {
     writeProjectClaudeMcpApproval(projectRoot);
   } catch (err) {
@@ -80,7 +68,8 @@ function refreshProjectToken({ projectRoot, baseUrl, token, projectId, fetchImpl
   }
   const impl = fetchImpl || globalThis.fetch;
   if (typeof impl !== 'function') return Promise.reject(new Error('fetch is unavailable'));
-  const existing = _inflight.get(projectRoot);
+  const flightKey = normalizeBaseUrl(baseUrl);
+  const existing = _inflight.get(flightKey);
   if (existing) return existing;
   const run = doRefresh({
     projectRoot,
@@ -89,8 +78,8 @@ function refreshProjectToken({ projectRoot, baseUrl, token, projectId, fetchImpl
     projectId,
     fetchImpl: impl,
     timeoutMs,
-  }).finally(() => { _inflight.delete(projectRoot); });
-  _inflight.set(projectRoot, run);
+  }).finally(() => { _inflight.delete(flightKey); });
+  _inflight.set(flightKey, run);
   return run;
 }
 

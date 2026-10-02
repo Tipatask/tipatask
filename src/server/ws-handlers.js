@@ -8,9 +8,13 @@ const { readLastExitSince, readLostSessions, forgetLostSession } = require('./la
 const { applyRehashIntent, spawnObjectiveTurn, killObjectiveProc, escalateKill, clearRetryTimers, clearTurnDeadline, prewarmObjective, killPrewarm, teardownObjectiveSession, trackHelperProc, clearHeartbeat, prewarmObjectiveCold, killColdPrewarm, startSleepWatchdog, objectiveCacheActivity, ensureSessionStartName, computeTurnSpans } = require('./claude-session');
 const { spawnTurn, providerSessionId, clearProviderSessionId, applyModelSelection } = require('./providers/dispatch');
 const { listObjectiveProviders, listVisibleObjectiveProviders, clampSelectionToProviders, formatSelection, currentSelection, configForProject } = require('./providers/registry');
-const { createSession } = require('./session-state');
-const { killProcessGroup } = require('./process-group');
-const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh } = require('./terminal-session');
+const { createSession, isAgentChatType, isAgentChatId } = require('./session-state');
+const { TASK_CHAT, isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFromChatId, buildTaskChatSeed, buildTaskChatSystemPrompt } = require('./task-chat');
+const { providerSupportsProfile } = require('./providers/tool-profiles');
+const { findOpenDialog, resolveDialogAnswer, replayTaskChatTurn, taskFrame, changedTaskFields, buildTaskEditNote } = require('./task-chat-widgets');
+const { killProcessGroup, resolveAgentLimits } = require('./process-group');
+const { createSessionQueue } = require('./session-queue');
+const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary } = require('./terminal-session');
 const { buildExitResolutionComment, hasSelfAuthoredResolution, waitForFinalMessage, selectFinalMessage } = require('./exit-resolution');
 const { getTaskAgentInfo, getTaskAgentLabels, getAvailableAgents, getAvailableAgentsPeek, listTaskAgentStatuses, listTaskAgentStatusesPeek, refreshAgentDetection, resolveTaskAgentId, listAgentModels, listAllAgentModels } = require('./task-agent');
 const { isModelAllowed } = require('./task-agent/model-registry');
@@ -18,7 +22,7 @@ const { getAgentQuotaStatus, getTaskAgent } = require('./task-agent');
 const { ensureArchitectureDocsForChanges } = require('./architecture-docs');
 const { clearContext, resetTurnBuffers } = require('./context-manager');
 const { highestActiveCodingPriority } = require('./sprint-assign');
-const { maxNumbersByPrefix, resolveCodingPrefix } = require('./task-key-format');
+const { maxNumbersByPrefix, resolveCodingPrefix, isValidTaskKey } = require('./task-key-format');
 const { readChatDraft, writeChatDraft, deleteChatDraft, readChatState, writeChatState, deleteChatState } = require('./chat-persistence');
 const { readProjectConfig, readVoiceSettings, buildLanguageDirective, piEntryForModel, recordLastUsedAgent, readPiEntries, buildAgentsConfigPatch, summarizeAgents, PI_PROVIDERS, piProviderEnv, piKeyEnvVars } = require('./project-config');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolvePiLaunch } = require('./spawn-utils');
@@ -39,6 +43,7 @@ const { summarizeOldTurns } = require('./objective-summarizer');
 const { postPlanComments } = require('./plan-comment');
 const { forcePendingProposalStatuses, forcePendingTodoPayloadNewTasks } = require('./objective-proposal-status');
 const { promoteSplitOriginInTodo } = require('./split-origin-save');
+const { classifySaveError } = require('./todo-save-error');
 const { applyReopenToPatch } = require('./reopen-closed-task');
 const { fetchStatusContext } = require('./status-roles');
 const { VOICE_MODEL_IDS, VOICE_MODEL_ERRORS, listVoiceModels, getVoiceModelStatus, downloadVoiceModel, abortVoiceModelDownload, deleteVoiceModel } = require('./voice-model-manager');
@@ -50,6 +55,55 @@ const { decodeRequestComponent, wrapHttpHandler } = require('./http-request-boun
 // duplicate intervals.
 let sleepWatchdogSessions = null;
 startSleepWatchdog(() => sleepWatchdogSessions);
+
+// (TPT444) Device-wide FIFO start queue for task terminal sessions (session-queue.js). The
+// limits come from resolveAgentLimits(): a hardware-derived cap, optionally lowered per project.
+const sessionQueue = createSessionQueue({
+  getSessions: () => sleepWatchdogSessions,
+  defaultProject: config.PROJECT_ROOT,
+  resolveLimits: (projectPath) => resolveAgentLimits(projectPath),
+  onChange: (projectPath, snapshot) => websocket.emitSessionQueueState(projectPath, snapshot),
+});
+
+// Safe to call from anywhere a slot may have freed (task completed, pty exited, session
+// terminated, failed start, watchdog tick); never throws.
+function drainSessionQueue() {
+  try { sessionQueue.drain(); } catch (err) { console.warn(`[session-queue] drain failed: ${err.message}`); }
+}
+
+function _sendIfOpen(ws, payload) {
+  if (ws && ws.readyState === ws.OPEN) {
+    try { ws.send(JSON.stringify(payload)); } catch { /* socket went away */ }
+  }
+}
+
+// A queued session has no wireClient() yet; this is its minimal socket handling: a Stop/kill
+// cancels the queue entry, a close just detaches (a headless Play All start closes on purpose).
+function announceQueuedClient(ws, session, taskId, sessionKey, sessions, backend) {
+  detachQueuedClient(session);
+  if (!ws) return;
+  session.ws = ws;
+  const snap = sessionQueue.snapshot(session.projectPath);
+  _sendIfOpen(ws, { type: 'session-queued', tabId: session.tabId, taskId, position: sessionQueue.position(sessionKey), running: snap.running, cap: snap.cap });
+  const onMessage = (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    if (msg.type === 'kill' || msg.type === 'terminate' || msg.type === 'stop') {
+      terminateTerminalSession(session, taskId, sessionKey, sessions, 'terminated', { ackWs: ws, backend });
+    }
+  };
+  const onClose = () => { if (session.ws === ws) session.ws = null; };
+  ws.on('message', onMessage);
+  ws.on('close', onClose);
+  session._queuedClient = { ws, onMessage, onClose };
+}
+
+function detachQueuedClient(session) {
+  const c = session && session._queuedClient;
+  if (!c) return;
+  session._queuedClient = null;
+  try { c.ws.off('message', c.onMessage); c.ws.off('close', c.onClose); } catch { /* no-op */ }
+}
 
 async function _fetchTaskTags(backend, taskId) {
   try {
@@ -72,11 +126,11 @@ async function _syncAgentAssignee(backend, taskId, agent) {
   }
 }
 
-// C1408 — start-time assignee gate. `obj-*`/`specChat:` ids are chat sessions, never PTY
-// task spawns, and are excluded from both helpers the same way the old inline guard
+// C1408 — start-time assignee gate. `obj-*`/`specChat:`/`taskChat:` ids are chat sessions,
+// never PTY task spawns, and are excluded from both helpers the same way the old inline guard
 // skipped them (it only ran when opts.backend was present, which chat spawns never pass).
 function _isRealTaskKey(taskId) {
-  return !!taskId && !taskId.startsWith('obj-') && !taskId.startsWith('specChat:');
+  return !!taskId && !isAgentChatId(taskId);
 }
 
 // (C1444) GET /api/sessions bucketing. spawnTerminal() (terminal-session.js) awaits
@@ -88,7 +142,8 @@ function _isRealTaskKey(taskId) {
 // drop its left-nav row until the next refetch saw it alive. `_starting` closes the gap.
 function sessionListBucket(s) {
   if (!s) return null;
-  if (s.alive || s._starting) return 'active';
+  if (s._queued) return 'queued'; // (TPT444) parked in the start queue — not live, not exited
+  if (s.alive || s._starting || s._launching) return 'active';
   if (s.pending) return null; // created, waiting for a `start` message — neither live nor exited
   return 'exited';
 }
@@ -101,6 +156,7 @@ function sessionListBucket(s) {
 // active-sessions row icon (task-board.js syncActiveSessionsNav()) is painted from this field.
 function sessionMetaRow(s) {
   return { agent: s.taskAgent || null, label: s.taskAgentLabel || '', type: s.type || 'terminal', alive: !!s.alive,
+    paused: pausedSummary(s),
     ...(s.startedAt ? { startedAt: s.startedAt } : {}) };
 }
 
@@ -161,7 +217,7 @@ async function claimUnassignedTaskOnStart(backend, taskId, task, me, projectPath
 // spawnTerminal() (terminal-session.js) right before pty.spawn succeeds. Synchronous and
 // swallows its own errors (recordLastUsedAgent never throws) — never awaited by callers.
 function _recordLastUsedAgent(session) {
-  if (!session || session.type === 'objective' || session.type === 'specChat') return;
+  if (!session || isAgentChatType(session.type)) return;
   recordLastUsedAgent(session.projectPath || config.PROJECT_ROOT, session.taskAgent, session.taskAgentModel);
 }
 
@@ -588,8 +644,8 @@ function dropObjectiveSession(sessions, sessionKey, session, taskId, reason) {
   // entry/slot and its stall watchdog — which would later drain into a spawn or count a timeout.
   if (session.type === 'objective') throttle.recordAbort(taskId);
   // The cold spare is global and only ever wanted by a chat that is being started; the next
-  // composer keystroke re-warms it.
-  killColdPrewarm(reason);
+  // composer keystroke re-warms it. A task chat never uses the pool, so ending one leaves it.
+  if (session.type !== 'taskChat') killColdPrewarm(reason);
   if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
 }
 
@@ -612,6 +668,8 @@ function killTerminalPty(ptyProcess) {
 
 function terminateTerminalSession(session, taskId, sessionKey, sessions, reason = 'terminated', opts = {}) {
   let attachedWs = null;
+  sessionQueue.remove(sessionKey); // (TPT444) cancelling a queued start
+  detachQueuedClient(session);
   if (session?._planIdleTimer) {
     clearTimeout(session._planIdleTimer);
     session._planIdleTimer = null;
@@ -637,6 +695,8 @@ function terminateTerminalSession(session, taskId, sessionKey, sessions, reason 
     const ptyProcess = session.pty;
     session.alive = false;
     session.pending = false;
+    session._queued = false;
+    session._launching = false;
     session._starting = false; // (C1444) terminate mid-spawn — throwIfTerminated() inside
                                 // spawnTerminal() will abort it, but clear the flag now so
                                 // GET /api/sessions doesn't call it 'active' in the meantime
@@ -647,6 +707,9 @@ function terminateTerminalSession(session, taskId, sessionKey, sessions, reason 
     session._attentionState = null;
     session.codexPlanReady = false;
     session.agentPlanReady = false;
+    // A watchdog-paused tree is SIGSTOPped: continue and signal the stored set first, or its
+    // members outside the pty leader's group would stay stopped, holding their memory.
+    killPausedTargets(session);
     killTerminalPty(ptyProcess);
     // (C1565) After the kill, not before — killTerminalPty() reads ptyProcess.pid directly
     // (captured above), but leave ptyPid on the session until the signal is actually sent.
@@ -657,6 +720,7 @@ function terminateTerminalSession(session, taskId, sessionKey, sessions, reason 
   deleteDeviceSession(taskId, opts.backend);
   sendSessionEnded(opts.ackWs, taskId, session, reason);
   broadcastSessionEnded(taskId, session, reason);
+  drainSessionQueue(); // (TPT444) the freed slot goes to the oldest queued start
   if (opts.closeAck !== false && opts.ackWs && opts.ackWs.readyState === opts.ackWs.OPEN) {
     setTimeout(() => {
       try { opts.ackWs.close(); } catch { /* already closed */ }
@@ -1058,6 +1122,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       const reqPath = req.headers['x-tipatask-project'] || '';
       const active = [];
       const exited = [];
+      const queued = []; // (TPT444) [{ taskId, position }] — start-queue entries, FIFO position
       const attention = [];
       const attentionDetails = {}; // (C1057) taskId -> { kind, promptText, agent }
       const sessionMeta = {}; // (C1144) taskId -> { agent, label, type, alive } — left-nav active-sessions list needs the agent id per session
@@ -1068,6 +1133,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         const bucket = sessionListBucket(s); // (C1444) 'active' covers alive || _starting
         if (bucket === 'active') active.push(id);
         else if (bucket === 'exited') exited.push(id);
+        else if (bucket === 'queued') queued.push({ taskId: id, position: sessionQueue.position(sessKey(id, s.projectPath || '')) });
         if (s._attentionBroadcasted) {
           attention.push(id);
           if (s._attentionLastBroadcast) attentionDetails[id] = s._attentionLastBroadcast;
@@ -1084,7 +1150,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
           alive: false, startedAt: row.startedAt };
       }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      return res.end(JSON.stringify({ projectPath: reqPath || config.PROJECT_ROOT, sessions: active, exited, lost, lostDetails, attention, attentionDetails, sessionMeta }));
+      return res.end(JSON.stringify({ projectPath: reqPath || config.PROJECT_ROOT, sessions: active, exited, queued, lost, lostDetails, attention, attentionDetails, sessionMeta }));
     }
 
     // GET /api/agent-config — agent availability snapshot for startup population
@@ -2887,6 +2953,9 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
     // Delegates to backend.overwriteRawWithRemap which holds the per-project lock,
     // reads live state, assigns final C##/H## keys for newTaskIds, then writes atomically.
     // Returns { ok: true, idRemap } so the client can update stale references.
+    // A failure answers { error, step, code } with the status classifySaveError() picks
+    // (todo-save-error.js): the write is not idempotent, so the client sends it once and
+    // shows this body as-is — it has to carry the real reason.
     if (req.method === 'PUT' && req.url === '/api/todo') {
       let body = await readTextBody(req, res, BULK_BODY_MAX_BYTES);
       if (body === null) return;
@@ -2896,12 +2965,18 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'Body cannot be empty' }));
       }
 
+      let _todoStep = 'resolve-backend';
       try {
         const _todoBackend = resolveBackend(req);
+        _todoStep = 'status-context';
         const _todoStart = (await fetchStatusContext(_todoBackend)).roles.start;
+        _todoStep = 'force-pending';
         body = forcePendingTodoPayloadNewTasks(body, 'todo-write', _todoStart);
+        _todoStep = 'normalize-priorities';
         body = await require('./sprint-assign').normalizeObjectiveTodoPriorities(body, _todoBackend, config);
+        _todoStep = 'promote-split-origin';
         body = await promoteSplitOriginInTodo(body, _todoBackend);
+        _todoStep = 'persist';
         const idRemap = await _todoBackend.overwriteRawWithRemap(body);
         const idRemapObj = Object.fromEntries(idRemap);
         if (Object.keys(idRemapObj).length > 0) {
@@ -2910,10 +2985,15 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, idRemap: idRemapObj }));
       } catch (err) {
-        const status = err.statusCode || 500;
-        console.error(`[todo] PUT /api/todo failed (${status}):`, err.message);
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
+        const failure = classifySaveError(err, _todoStep);
+        // The stack matters for a failure nobody classified (or one behind this server);
+        // a rejected payload is fully described by its message.
+        console.error(
+          `[todo] PUT /api/todo failed at ${failure.body.step} (${failure.status}${failure.body.code ? ` ${failure.body.code}` : ''}):`,
+          failure.status >= 500 ? (err && err.stack) || failure.body.error : failure.body.error
+        );
+        res.writeHead(failure.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(failure.body));
       }
       return;
     }
@@ -3755,6 +3835,126 @@ function sessKey(id, projectPath) {
   return id + (projectPath ? '\0' + projectPath : '');
 }
 
+// (TPT444) Everything a NEW terminal task session does once it holds a start slot: resolve
+// the task, claim it, spawn the pty, wire the client. Runs inline when a slot was free, or later
+// from the start queue (drainSessionQueue) — in which case the connecting socket may already be
+// gone (headless Play All start closes it), so every client touch goes through the live
+// `session.ws`, and a session whose socket is gone is simply left running unattached, exactly
+// like one minimized after start.
+async function launchNewTerminalSession(ctx) {
+  const { session, prompt, taskId, sessionKey, sessions, backend, projectPath, initialCols, initialRows, _piModelParam } = ctx;
+  detachQueuedClient(session);
+  let ws = session.ws && session.ws.readyState === session.ws.OPEN ? session.ws : null;
+  try {
+  if (prompt) {
+    try {
+      // Fetch full task once — derive tt-* tags, discovery flag, AND per-task model override together.
+      let taskTags = [];
+      let discovery = false;
+      let _taskModel;
+      let _designMode = false; // C1207 — per-task /design opt-in (claude only)
+      let _task = null; // C1408 — hoisted so assertTaskStartable()/claimUnassignedTaskOnStart() can reuse this fetch
+      if (taskId) {
+        try {
+          _task = await backend.getTask(taskId);
+          const _rawTags = _task?.tags || [];
+          taskTags = _rawTags.filter(t => t.startsWith('tt-'));
+          // (C1134) Raw tag, read before the tt-* filter above — PiAgent's discovery-mandate
+          // directive gates on it (buildPrompt()'s PI_DISCOVERY_MANDATE); it is not a tt-* tag
+          // so it would otherwise never reach getSpawnSpec()'s opts.
+          discovery = _rawTags.includes('discovery');
+          const _activeAgent = session.taskAgent || config.TASK_AGENT;
+          if (_activeAgent === 'claude') {
+            _taskModel = _task?.claudeModel || undefined;
+            _designMode = !!_task?.claudeDesignMode; // C1207
+          }
+          else if (_activeAgent === 'codex') _taskModel = _task?.codexModel || undefined;
+          else if (_activeAgent === 'pi') {
+            if (_piModelParam) {
+              _taskModel = _piModelParam;
+            } else if (_task?.piModel) {
+              // C1133 — saved per-task pi pin, revalidated the same way _piModelParam is
+              // above: the project's PI_MODELS may have dropped this row since it was
+              // saved, and spawning a stale id would run row 0's API key against the
+              // wrong model.
+              const _piCfgForTask = readProjectConfig(projectPath || config.PROJECT_ROOT);
+              if (piEntryForModel(_piCfgForTask, _task.piModel)) {
+                _taskModel = _task.piModel;
+              } else {
+                console.warn(`[ws] task ${taskId}'s saved pi_model "${_task.piModel}" not in this project's PI_MODELS — falling back to default`);
+              }
+            }
+          }
+          // C982: baseline status at spawn — the completion poller only auto-posts on a
+          // genuine transition INTO completed, not when resuming an already-done task.
+          session._spawnStatus = _task?.status ?? null;
+        } catch { /* ignore — tags, discovery, and model fall back to empty/false/config default */ }
+      }
+      // C1408 — must start blocking; a caught EASSIGNEE below cancels the whole start.
+      const _me = await assertTaskStartable(backend, taskId, _task);
+      _task = await claimUnassignedTaskOnStart(backend, taskId, _task, _me, projectPath);
+      // C1122 — _piModelParam prefixed so the validated launch-time pick survives even
+      // when the getTask() try/catch above swallowed an error before _taskModel was set.
+      await spawnTerminal(session, prompt, taskId, taskTags, { initialCols, initialRows, backend, model: _piModelParam || _taskModel, discovery, designMode: _designMode, task: _task });
+      if (session.alive) forgetLostSession(taskId, projectPath || config.PROJECT_ROOT, config.USER_DATA_ROOT);
+      if (session._terminated || sessions.get(sessionKey) !== session) {
+        try { ws && ws.close(); } catch { /* already closed */ }
+        return;
+      }
+      postDeviceSession(taskId, backend);
+      await _syncAgentAssignee(backend, taskId, session.taskAgent);
+      _recordLastUsedAgent(session);
+      if (session._terminated || sessions.get(sessionKey) !== session) {
+        try { ws && ws.close(); } catch { /* already closed */ }
+        return;
+      }
+    } catch (err) {
+      if (err.code === 'ETERMINATED') {
+        try { ws && ws.close(); } catch { /* already closed */ }
+        sessions.delete(sessionKey);
+        if (!ws) broadcastSessionEnded(taskId, session, 'start-failed');
+        return;
+      }
+      if (err.code === 'EASSIGNEE') {
+        _sendIfOpen(ws, { type: 'error', code: 'EASSIGNEE', message: 'Cannot start a task assigned to another member.' });
+        try { ws && ws.close(); } catch { /* already closed */ }
+        sessions.delete(sessionKey);
+        if (!ws) broadcastSessionEnded(taskId, session, 'start-failed');
+        return;
+      }
+      if (err.code === 'ECLAIM') {
+        _sendIfOpen(ws, { type: 'error', code: 'ECLAIM', message: 'Could not assign this task to you. Task start canceled.' });
+        try { ws && ws.close(); } catch { /* already closed */ }
+        sessions.delete(sessionKey);
+        if (!ws) broadcastSessionEnded(taskId, session, 'start-failed');
+        return;
+      }
+      if (err.code === 'EAUTH') {
+        // (C1383) Pre-spawn credential check tripped — expired/invalid API_TOKEN.
+        _sendIfOpen(ws, { type: 'error', code: 'EAUTH', message: eauthClientMessage(err) });
+        try { ws && ws.close(); } catch { /* already closed */ }
+        sessions.delete(sessionKey);
+        if (!ws) broadcastSessionEnded(taskId, session, 'start-failed');
+        return;
+      }
+      _sendIfOpen(ws, { type: 'error', message: `Failed to start ${session.taskAgentLabel}: ${err.message}` });
+      try { ws && ws.close(); } catch { /* already closed */ }
+      sessions.delete(sessionKey);
+      if (!ws) {
+        console.warn(`[terminal] Queued start of ${taskId} failed: ${err.message}`);
+        broadcastSessionEnded(taskId, session, 'start-failed');
+      }
+      return;
+    }
+  }
+
+  if (ws && ws.readyState === ws.OPEN) wireClient(ws, session, taskId, sessionKey, sessions, backend);
+  } finally {
+    session._launching = false;
+    drainSessionQueue();
+  }
+}
+
 async function handleConnection(ws, req, sessions, getActiveBackend, onAttentionNeeded, onAttentionCleared, getBackendForPath = null) {
   sleepWatchdogSessions = sessions;
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -3763,9 +3963,10 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
   // The entry-point guard validates the URL hint against the authenticated window or
   // browser scope before upgrade. Only the normalized, authorized header chooses backend.
   const projectPath = req.headers['x-tiptask-project-path'] || '';
-  const sessionKey = sessKey(tabId || taskId, projectPath);
+  const sessionKey = sessKey(isProjectChatId(taskId) ? taskId : (tabId || taskId), projectPath);
   const prompt = url.searchParams.get('prompt') || '';
   const terminateOnConnect = url.searchParams.get('terminate') === '1';
+  const resumePausedOnConnect = url.searchParams.get('resumePaused') === '1';
   const reconnectOnly = url.searchParams.get('reconnect') === '1'; // objective chat reattach — never starts a session
   const planOnly = url.searchParams.get('planOnly') === '1';
   const agentParam = url.searchParams.get('agent') || '';
@@ -3787,6 +3988,23 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     ws.send(JSON.stringify({ type: 'error', message: 'Missing taskId parameter' }));
     ws.close();
     return;
+  }
+
+  // The URL names a project chat for the authenticated backend's project only. The tab id
+  // cannot select a different session, and neither Start nor reconnect may switch backends.
+  if (taskId.startsWith('projectChat:')) {
+    let selectedProjectId = '';
+    try { selectedProjectId = String(backend.getCredentials().projectId || ''); } catch { /* reject below */ }
+    if (!isProjectChatId(taskId) || projectIdFromChatId(taskId) !== selectedProjectId) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Project chat does not match the selected project.' }));
+      ws.close();
+      return;
+    }
+    if (prompt) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Project chat starts only with start-project-chat.' }));
+      ws.close();
+      return;
+    }
   }
 
   // ── Attention watcher (C1057) — narrow, project-scoped, side-effect-free ──
@@ -4055,8 +4273,16 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     return;
   }
 
+  // One-shot nav action. It must not reattach and displace the terminal modal's socket.
+  if (resumePausedOnConnect) {
+    const resumed = existing?.type === 'terminal' ? resumeRunawaySession(existing) : null;
+    if (resumed) websocket.emitSessionRunaway(existing.projectPath, { taskId: existing.tabId, pid: existing.ptyPid, resumed: true, promptText: resumed.text });
+    ws.send(JSON.stringify({ type: 'resume-paused-result', ok: !!resumed, paused: pausedSummary(existing) }), () => ws.close());
+    return;
+  }
+
   // ── Reconnect to existing non-objective session (terminal pty) ──
-  if (existing && existing.alive && existing.type !== 'objective' && existing.type !== 'specChat') {
+  if (existing && existing.alive && !isAgentChatType(existing.type)) {
     // (TPT413) A resume never respawns: the running pty keeps its agent. A picker choice on a
     // resume (merge-branches "Resolve with agent" on a live session) reaches here as ?agent= and
     // is deliberately ignored — say so, instead of silently letting the client believe it switched.
@@ -4170,6 +4396,49 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     return;
   }
 
+  // ── Reconnect to task-chat session ──
+  // The session outlives its socket (idle or mid-turn), so opening the chat again lands here:
+  // the client gets the whole history back instead of sending `start-task-chat` a second time.
+  if (existing && existing.type === 'taskChat') {
+    if (projectPath) existing.projectPath = projectPath;
+    if (existing.ws && existing.ws.readyState === existing.ws.OPEN) {
+      existing.ws.send(JSON.stringify({ type: 'detached', tabId: existing.tabId, message: 'Another client attached' }));
+      existing.ws.close();
+    }
+    existing.ws = ws;
+    const _chatSel = currentSelection(existing, configForProject(existing.projectPath));
+    ws.send(JSON.stringify({
+      type: 'chat-history-reset',
+      tabId: existing.tabId,
+      taskKey: existing.taskKey,
+      projectId: existing.chatProjectId || null,
+      messages: existing.messages,
+      historyWindowStart: 0,
+      historyTotalCount: existing.messages.length,
+      hasOlderHistory: false,
+      running: !!(existing.proc || existing._spawning || existing._projectChatStarting),
+      objectiveSelection: _chatSel ? formatSelection(_chatSel.providerId, _chatSel.model) : '',
+    }));
+    if (existing.proc && existing.turnBuffer.length > 0) {
+      ws.send(JSON.stringify({ type: 'data', tabId: existing.tabId, data: existing.turnBuffer }));
+    }
+    // Widgets of the running turn are not in `messages` yet — a finished turn's are.
+    if (existing.proc || existing._spawning) replayTaskChatTurn(existing);
+    if (existing.pendingResult) {
+      // A turn finished while nobody was attached. Its text is already in `messages` above;
+      // these frames close the turn for the client (tokens, chat-ready).
+      const pr = existing.pendingResult;
+      ws.send(JSON.stringify({ type: 'objective-result', tabId: existing.tabId, content: pr.content, tokens: pr.tokens, timingMilestones: pr.timingMilestones }));
+      ws.send(JSON.stringify({ type: 'chat-ready', tabId: existing.tabId, turnIndex: pr.turnIndex }));
+      ws.send(JSON.stringify({ type: 'exit', tabId: existing.tabId, code: pr.code, chatContinues: true, showAiStats: config.SHOW_AI_STATS }));
+      existing.pendingResult = null;
+    } else if (!existing.proc && !existing._spawning && existing.messages.length > 0) {
+      ws.send(JSON.stringify({ type: 'chat-ready', tabId: existing.tabId, turnIndex: existing.messages.length - 1 }));
+    }
+    wireClient(ws, existing, taskId, sessionKey, sessions, backend);
+    return;
+  }
+
   // A reconnect-only objective socket (chat-ui.js sends ?reconnect=1 and never a `start`) whose
   // session is gone — torn down after its detach grace, or never here. Falling through would
   // create a pending session nobody starts, and the client would spin forever.
@@ -4184,7 +4453,19 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
   // so the reconnect branch above didn't catch it — but it's not a stale/dead session
   // either. Falling through to "Spawn new session" below would sessions.delete() it out
   // from under the in-flight spawnTerminal() call, orphaning the pty it's about to create.
-  if (existing && existing._starting && existing.type !== 'objective' && existing.type !== 'specChat') {
+  // (TPT444) A queued session is parked until a slot frees; a reconnect re-attaches to the wait
+  // instead of falling through to "Spawn new session", which would delete it from the queue.
+  if (existing && existing._queued && !isAgentChatType(existing.type)) {
+    if (projectPath) existing.projectPath = projectPath;
+    if (existing.ws && existing.ws !== ws && existing.ws.readyState === existing.ws.OPEN) {
+      _sendIfOpen(existing.ws, { type: 'detached', tabId: existing.tabId, message: 'Another client attached' });
+      try { existing.ws.close(); } catch { /* already closed */ }
+    }
+    announceQueuedClient(ws, existing, taskId, sessionKey, sessions, backend);
+    return;
+  }
+
+  if (existing && (existing._starting || existing._launching) && !isAgentChatType(existing.type)) {
     ws.send(JSON.stringify({ type: 'error', message: `Session for ${taskId} is still starting — try again in a moment.` }));
     ws.close();
     return;
@@ -4192,7 +4473,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
 
   // A retained natural exit is not evidence of server loss. Check before deleting
   // any existing entry; a promptless reconnect must never discard retained history.
-  if (!prompt && !taskId.startsWith('obj-') && !taskId.startsWith('specChat:')) {
+  if (!prompt && !isAgentChatId(taskId)) {
     const lastExit = !existing && readLastExitSince(url.searchParams.get('startedAt'), config.USER_DATA_ROOT);
     ws.send(JSON.stringify(lastExit
       ? { type: 'error', code: 'ESESSION_LOST', ...lastExit,
@@ -4207,7 +4488,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     if (existing.type === 'objective') {
       clearContext(existing, taskId);
       throttle.recordAbort(taskId);
-    } else if (existing.type === 'specChat') {
+    } else if (existing.type === 'specChat' || existing.type === 'taskChat') {
       clearContext(existing, taskId);
     }
     sessions.delete(sessionKey);
@@ -4250,101 +4531,18 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
   // fires onExit before wireClient() below would run.
   wireSessionLifecycle(session, taskId, backend);
 
-  if (prompt) {
-    try {
-      // Fetch full task once — derive tt-* tags, discovery flag, AND per-task model override together.
-      let taskTags = [];
-      let discovery = false;
-      let _taskModel;
-      let _designMode = false; // C1207 — per-task /design opt-in (claude only)
-      let _task = null; // C1408 — hoisted so assertTaskStartable()/claimUnassignedTaskOnStart() can reuse this fetch
-      if (taskId) {
-        try {
-          _task = await backend.getTask(taskId);
-          const _rawTags = _task?.tags || [];
-          taskTags = _rawTags.filter(t => t.startsWith('tt-'));
-          // (C1134) Raw tag, read before the tt-* filter above — PiAgent's discovery-mandate
-          // directive gates on it (buildPrompt()'s PI_DISCOVERY_MANDATE); it is not a tt-* tag
-          // so it would otherwise never reach getSpawnSpec()'s opts.
-          discovery = _rawTags.includes('discovery');
-          const _activeAgent = session.taskAgent || config.TASK_AGENT;
-          if (_activeAgent === 'claude') {
-            _taskModel = _task?.claudeModel || undefined;
-            _designMode = !!_task?.claudeDesignMode; // C1207
-          }
-          else if (_activeAgent === 'codex') _taskModel = _task?.codexModel || undefined;
-          else if (_activeAgent === 'pi') {
-            if (_piModelParam) {
-              _taskModel = _piModelParam;
-            } else if (_task?.piModel) {
-              // C1133 — saved per-task pi pin, revalidated the same way _piModelParam is
-              // above: the project's PI_MODELS may have dropped this row since it was
-              // saved, and spawning a stale id would run row 0's API key against the
-              // wrong model.
-              const _piCfgForTask = readProjectConfig(projectPath || config.PROJECT_ROOT);
-              if (piEntryForModel(_piCfgForTask, _task.piModel)) {
-                _taskModel = _task.piModel;
-              } else {
-                console.warn(`[ws] task ${taskId}'s saved pi_model "${_task.piModel}" not in this project's PI_MODELS — falling back to default`);
-              }
-            }
-          }
-          // C982: baseline status at spawn — the completion poller only auto-posts on a
-          // genuine transition INTO completed, not when resuming an already-done task.
-          session._spawnStatus = _task?.status ?? null;
-        } catch { /* ignore — tags, discovery, and model fall back to empty/false/config default */ }
-      }
-      // C1408 — must start blocking; a caught EASSIGNEE below cancels the whole start.
-      const _me = await assertTaskStartable(backend, taskId, _task);
-      _task = await claimUnassignedTaskOnStart(backend, taskId, _task, _me, projectPath);
-      // C1122 — _piModelParam prefixed so the validated launch-time pick survives even
-      // when the getTask() try/catch above swallowed an error before _taskModel was set.
-      await spawnTerminal(session, prompt, taskId, taskTags, { initialCols, initialRows, backend, model: _piModelParam || _taskModel, discovery, designMode: _designMode, task: _task });
-      if (session.alive) forgetLostSession(taskId, projectPath || config.PROJECT_ROOT, config.USER_DATA_ROOT);
-      if (session._terminated || sessions.get(sessionKey) !== session) {
-        try { ws.close(); } catch { /* already closed */ }
-        return;
-      }
-      postDeviceSession(taskId, backend);
-      await _syncAgentAssignee(backend, taskId, session.taskAgent);
-      _recordLastUsedAgent(session);
-      if (session._terminated || sessions.get(sessionKey) !== session) {
-        try { ws.close(); } catch { /* already closed */ }
-        return;
-      }
-    } catch (err) {
-      if (err.code === 'ETERMINATED') {
-        try { ws.close(); } catch { /* already closed */ }
-        sessions.delete(sessionKey);
-        return;
-      }
-      if (err.code === 'EASSIGNEE') {
-        ws.send(JSON.stringify({ type: 'error', code: 'EASSIGNEE', message: 'Cannot start a task assigned to another member.' }));
-        ws.close();
-        sessions.delete(sessionKey);
-        return;
-      }
-      if (err.code === 'ECLAIM') {
-        ws.send(JSON.stringify({ type: 'error', code: 'ECLAIM', message: 'Could not assign this task to you. Task start canceled.' }));
-        ws.close();
-        sessions.delete(sessionKey);
-        return;
-      }
-      if (err.code === 'EAUTH') {
-        // (C1383) Pre-spawn credential check tripped — expired/invalid API_TOKEN.
-        ws.send(JSON.stringify({ type: 'error', code: 'EAUTH', message: eauthClientMessage(err) }));
-        ws.close();
-        sessions.delete(sessionKey);
-        return;
-      }
-      ws.send(JSON.stringify({ type: 'error', message: `Failed to start ${session.taskAgentLabel}: ${err.message}` }));
-      ws.close();
-      sessions.delete(sessionKey);
-      return;
-    }
+  const launchCtx = { session, prompt, taskId, sessionKey, sessions, backend, projectPath, initialCols, initialRows, _piModelParam };
+  if (!prompt || isAgentChatId(taskId)) {
+    // Promptless / chat starts never hold a terminal slot.
+    await launchNewTerminalSession(launchCtx);
+    return;
   }
-
-  wireClient(ws, session, taskId, sessionKey, sessions, backend);
+  const admitted = sessionQueue.submit({ key: sessionKey, session, taskId, start: () => launchNewTerminalSession(launchCtx) });
+  if (admitted.queued) {
+    announceQueuedClient(ws, session, taskId, sessionKey, sessions, backend);
+    return;
+  }
+  await admitted.done;
 }
 
 // ── Client message routing ──
@@ -4440,16 +4638,126 @@ async function maybeCompressHistory(session, taskId) {
   console.log(`[objective:compress] task=${taskId} compressed ${toCompress.length} pair(s) (through=${eligiblePairs}, tailKept=${TAIL_TURNS})`);
 }
 
+// Task chat's system prompt names the provider's own tools (MCP for Claude/Codex, the REST
+// tool for Pi), so it is rebuilt when the provider changes — and only then: Claude appends
+// fetched tag docs to session.systemPrompt and relies on that prefix staying stable.
+function ensureTaskChatSystemPrompt(session) {
+  const provider = session.providerType || config.OBJECTIVE_PROVIDER;
+  if (session._taskChatPromptProvider === provider && session.systemPrompt) return;
+  session.systemPrompt = buildTaskChatSystemPrompt({
+    provider,
+    task: session.chatProjectId ? null : (session._taskChatTask || { id: session.taskKey }),
+    project: session._taskChatProject || null,
+    langDirective: buildLanguageDirective(session.projectPath || config.PROJECT_ROOT),
+  });
+  session._taskChatPromptProvider = provider;
+  session._cachedTagsSerialized = new Set();
+}
+
+// A task-chat agent created or updated a task (session.onTaskChatMutation, called from
+// task-chat-widgets.js when the tool call returns). The agent's write went to the API directly,
+// so the task is read back here: the chat gets a `task-chat-task` frame and every board on this
+// project gets the same broadcast a local edit sends. Returns the event kept in chat history,
+// or null — a failed read costs the widget, never the turn.
+async function handleTaskChatMutation(session, { action, taskKey, toolId }) {
+  try {
+    const task = session.backend ? await session.backend.getTask(taskKey) : null;
+    if (!task) return null;
+    const projectPath = session.projectPath || undefined;
+    if (action === 'created') websocket.emitTaskCreated(task, projectPath);
+    else websocket.emitTaskUpdated(task, null, projectPath);
+    const event = { action, toolId, task };
+    if (!session._closed && session.ws && session.ws.readyState === session.ws.OPEN) {
+      session.ws.send(JSON.stringify({ ...taskFrame(session, event), tabId: session.tabId }));
+    }
+    return event;
+  } catch (err) {
+    console.warn(`[task-chat] Could not read back ${taskKey} after ${action}: ${err.message}`);
+    return null;
+  }
+}
+
+// Every task event this chat holds, oldest first: finished turns' (on their assistant message)
+// and the running turn's (attached to its message only when the turn ends).
+function taskChatEvents(session) {
+  const events = [];
+  for (const m of session.messages || []) {
+    if (m && Array.isArray(m.taskEvents)) events.push(...m.taskEvents);
+  }
+  const turn = session._taskChatTurn;
+  if (turn && Array.isArray(turn.taskEvents)) {
+    for (const event of turn.taskEvents) if (!events.includes(event)) events.push(event);
+  }
+  return events;
+}
+
+// The user saved a task in the task editor opened from this chat (`task-chat-task-edited`).
+// The agent has no way to notice that, so the task is read back and queued: the next user turn
+// opens with a `task_edits` block (takeTaskChatEdits()). Allowed mid-turn — it only queues.
+// The chat's own copies of the task are refreshed and the client gets the task back to redraw
+// its cards. A failed read is dropped: the edit itself already succeeded.
+async function handleTaskChatUserEdit(session, rawKey) {
+  const taskKey = typeof rawKey === 'string' ? rawKey.trim() : '';
+  if (!isValidTaskKey(taskKey)) return;
+  let task;
+  try {
+    task = session.backend ? await session.backend.getTask(taskKey) : null;
+  } catch (err) {
+    console.warn(`[task-chat] Could not read back ${taskKey} after a user edit: ${err.message}`);
+    return;
+  }
+  if (!task || session._closed) return;
+  if (!session.pendingTaskEdits) session.pendingTaskEdits = new Map();
+  const events = taskChatEvents(session).filter(event => event && event.task && event.task.id === taskKey);
+  const queued = session.pendingTaskEdits.get(taskKey);
+  // What the agent last saw: the copy from before the first still-untold edit, else the latest
+  // copy this chat showed. Unknown when the chat never held the task.
+  const prev = queued ? queued.prev : (events.length ? events[events.length - 1].task : null);
+  const changed = changedTaskFields(prev, task);
+  if (changed.length) session.pendingTaskEdits.set(taskKey, { task, changed, prev });
+  else session.pendingTaskEdits.delete(taskKey);
+  for (const event of events) event.task = task;
+  if (session.ws && session.ws.readyState === session.ws.OPEN) {
+    session.ws.send(JSON.stringify({ type: 'task-chat-task-edited', tabId: session.tabId, taskKey: session.taskKey, task, changed }));
+  }
+}
+
+// Hand-made task edits not yet told to the agent -> [{ task, changed, prev }], and forget them.
+// Kept on the session until the turn they ride on survives: an abort puts them back.
+function takeTaskChatEdits(session) {
+  const edits = session.pendingTaskEdits ? [...session.pendingTaskEdits.values()] : [];
+  if (session.pendingTaskEdits) session.pendingTaskEdits.clear();
+  session._drainedTaskEdits = edits.length ? edits : null;
+  return edits;
+}
+
+function restoreTaskChatEdits(session) {
+  const edits = session._drainedTaskEdits;
+  session._drainedTaskEdits = null;
+  if (!edits) return;
+  if (!session.pendingTaskEdits) session.pendingTaskEdits = new Map();
+  for (const edit of edits) {
+    // A newer edit of the same task, queued while the turn ran, keeps its task but still
+    // compares against what the agent saw before the aborted turn.
+    const newer = session.pendingTaskEdits.get(edit.task.id);
+    if (!newer) { session.pendingTaskEdits.set(edit.task.id, edit); continue; }
+    const changed = changedTaskFields(edit.prev, newer.task);
+    if (changed.length) session.pendingTaskEdits.set(edit.task.id, { task: newer.task, changed, prev: edit.prev });
+    else session.pendingTaskEdits.delete(edit.task.id);
+  }
+}
+
 // C948: lifecycle callbacks shared by wireClient() and the pre-spawn wiring in
 // handleConnection() — wiring must exist before spawnTerminal() so an agent that
 // dies during boot still posts its resolution comment.
 function wireSessionLifecycle(session, taskId, backend) {
-  if (!taskId || taskId.startsWith('obj-') || taskId.startsWith('specChat:')) return;
+  if (!taskId || isAgentChatId(taskId)) return;
   // C982: stashed for the index.js completion poller — the sessions Map key is
   // sessKey(tabId||taskId, projectPath), so taskId is not recoverable from the key,
   // and per-project (Electron multi-window) sessions need their own backend.
   session.taskId = taskId;
   session.backend = backend;
+  session.onSlotFreed = drainSessionQueue; // (TPT444) pty exit frees a start slot
   session.onTokensReady = (tokens) => {
     backend.addTokenUsage(taskId, tokens).catch(err =>
       console.error(`[ws] Failed to persist tokens for ${taskId}:`, err.message));
@@ -4546,7 +4854,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
     objectiveProviders: _clientVisibleProviders,
     objectiveSelection: _clientSel ? formatSelection(_clientSel.providerId, _clientSel.model) : '',
   }));
-  if (session.type !== 'objective' && session.type !== 'specChat') {
+  if (!isAgentChatType(session.type)) {
     emitTerminalState(session);
   }
   wireSessionLifecycle(session, taskId, backend);
@@ -4556,7 +4864,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
 
     // A torn-down chat (kill, save, socket close) takes no further turns — and restart must not
     // resurrect it: clearContext() would re-open a session that is no longer in the map.
-    if (session._closed && ['chat', 'revise', 'restart'].includes(msg.type)) {
+    if (session._closed && ['chat', 'revise', 'restart', 'task-chat-message', 'task-chat-answer'].includes(msg.type)) {
       _sendSessionGone(ws, session.tabId, session.providerType || config.OBJECTIVE_PROVIDER);
       return;
     }
@@ -4857,6 +5165,175 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       session.messages.push({ role: 'user', content, timestamp: Date.now() });
       spawnObjectiveTurn(session, taskId);
 
+    } else if (msg.type === 'start-project-chat' && session.pending && isProjectChatId(taskId)) {
+      session.pending = false;
+      // Mark this as a chat before any backend await. A reconnect while project context is
+      // loading must reattach to this session instead of replacing its map entry.
+      session.type = 'taskChat';
+      session.taskKey = null;
+      session.chatProjectId = projectIdFromChatId(taskId);
+      session._projectChatStarting = true;
+      try {
+        const projectId = session.chatProjectId;
+        const [settings, tasks] = await Promise.all([
+          backend.getProjectSettings ? backend.getProjectSettings({ strict: true }) : null,
+          backend.getTasksUnfiltered ? backend.getTasksUnfiltered() : backend.getTasks(),
+        ]);
+        if (sessions.get(sessionKey) !== session || session._closed) return;
+        if (settings?.id != null && String(settings.id) !== projectId) {
+          throw new Error('Project settings do not match the selected project.');
+        }
+        const localConfig = readProjectConfig(session.projectPath || config.PROJECT_ROOT) || {};
+        const project = {
+          id: projectId,
+          name: settings?.name || localConfig.projectName || config.projectName || `Project ${projectId}`,
+          description: settings?.description || '',
+          language: settings?.language || localConfig.language || '',
+          task_group_label: settings?.task_group_label || '',
+          sprints_enabled: settings?.sprints_enabled ?? null,
+        };
+        session.toolProfile = TASK_CHAT;
+        session.backend = backend;
+        session.onTaskChatMutation = info => handleTaskChatMutation(session, info);
+        session._taskChatProject = project;
+        if (!providerSupportsProfile(session, session.providerType || config.OBJECTIVE_PROVIDER)) {
+          session.providerType = 'claude';
+          session.selectedModel = null;
+        }
+        const _sel = await applyModelSelection(session, msg.model, { taskId });
+        if (_sel.error) {
+          if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+          if (session.ws && session.ws.readyState === session.ws.OPEN) {
+            session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId, reason: _sel.error, status: 409, detail: _sel.reason }));
+          }
+          return;
+        }
+        if (sessions.get(sessionKey) !== session || session._closed) return;
+        ensureTaskChatSystemPrompt(session);
+        const seed = buildTaskChatSeed({ project, tasks, openingMessage: typeof msg.openingMessage === 'string' ? msg.openingMessage : '' });
+        session.messages.push({ role: 'user', content: seed, seed: true, timestamp: Date.now() });
+        session.firstPrompt = seed;
+        if (!session._aborted) spawnTurn(session, taskId);
+      } catch (err) {
+        if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+        if (session.ws && session.ws.readyState === session.ws.OPEN) {
+          session.ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Failed to start project chat: ${err.message}` }));
+        }
+      } finally {
+        session._projectChatStarting = false;
+      }
+
+    } else if (msg.type === 'start-task-chat' && session.pending && isTaskChatId(taskId)) {
+      session.pending = false;
+      try {
+        const taskKey = taskKeyFromChatId(taskId);
+        const [task, comments] = await Promise.all([
+          backend.getTask(taskKey),
+          // Comment history is context, not a precondition — a failed read starts the chat without it.
+          Promise.resolve().then(() => backend.getTaskComments(taskKey)).catch(() => []),
+        ]);
+        if (!task) {
+          if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+          if (session.ws && session.ws.readyState === session.ws.OPEN) {
+            session.ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Task not found: ${taskKey}` }));
+          }
+          return;
+        }
+        session.type = 'taskChat';
+        session.taskKey = taskKey;
+        session.toolProfile = TASK_CHAT;
+        session.backend = backend;
+        session.onTaskChatMutation = info => handleTaskChatMutation(session, info);
+        session._taskChatTask = { id: task.id || taskKey, title: task.title || '' };
+        // A server-wide default the profile cannot run on (gemini) must not be advertised
+        // back to the client as this chat's provider.
+        if (!providerSupportsProfile(session, session.providerType || config.OBJECTIVE_PROVIDER)) {
+          session.providerType = 'claude';
+          session.selectedModel = null;
+        }
+        const _sel = await applyModelSelection(session, msg.model, { taskId });
+        if (_sel.error) {
+          if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+          if (session.ws && session.ws.readyState === session.ws.OPEN) {
+            session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId, reason: _sel.error, status: 409, detail: _sel.reason }));
+          }
+          return;
+        }
+        ensureTaskChatSystemPrompt(session);
+        const seed = buildTaskChatSeed({ task, comments, openingMessage: typeof msg.openingMessage === 'string' ? msg.openingMessage : '' });
+        // `seed: true` marks the generated first message so a client can leave it out of the transcript.
+        session.messages.push({ role: 'user', content: seed, seed: true, timestamp: Date.now() });
+        session.firstPrompt = seed;
+        console.log(`[task-chat] Started for task ${taskKey} provider=${session.providerType} comments=${Array.isArray(comments) ? comments.length : 0}`);
+        spawnTurn(session, taskId);
+      } catch (err) {
+        if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+        if (session.ws && session.ws.readyState === session.ws.OPEN) {
+          session.ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Failed to start task chat: ${err.message}` }));
+        }
+      }
+
+    } else if ((msg.type === 'task-chat-message' || msg.type === 'task-chat-answer') && session.type === 'taskChat') {
+      const _chatError = (message) => {
+        if (session.ws && session.ws.readyState === session.ws.OPEN) {
+          session.ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message }));
+        }
+      };
+      // session._spawning covers Codex's async image-localize window (see the `chat` handler).
+      if (session.proc || session._spawning || session._projectChatStarting) {
+        _chatError('A turn is still in progress. Wait for chat-ready.');
+        return;
+      }
+      // An answer to a dialog is a user turn like any other; what differs is where its text
+      // comes from — the options picked, checked against the dialog the agent actually asked.
+      let content;
+      let _answered = null;
+      if (msg.type === 'task-chat-answer') {
+        const open = findOpenDialog(session.messages, msg.dialogId);
+        if (open.error) { _chatError(open.error); return; }
+        const resolved = resolveDialogAnswer(open.dialog, { selected: msg.selected, other: msg.other });
+        if (resolved.error) { _chatError(resolved.error); return; }
+        content = resolved.content;
+        _answered = { dialog: open.dialog, answer: resolved.answer };
+      } else {
+        content = typeof msg.content === 'string' ? msg.content.trim() : '';
+        if (!content) {
+          _chatError('task-chat-message needs a non-empty `content` string.');
+          return;
+        }
+      }
+      {
+        const _sel = await applyModelSelection(session, msg.model, { taskId });
+        if (_sel.error) {
+          if (session.ws && session.ws.readyState === session.ws.OPEN) {
+            session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId, reason: _sel.error, status: 409, detail: _sel.reason }));
+          }
+          return;
+        }
+      }
+      // Torn down or restarted while the selection was being validated.
+      if (session._closed || (session._epoch || 0) !== epochAtReceipt) return;
+      ensureTaskChatSystemPrompt(session);
+      console.log(`[task-chat] Follow-up for ${taskId}: "${content.slice(0, 80)}"`);
+      const _userMsg = { role: 'user', content, timestamp: Date.now() };
+      if (_answered) {
+        // Re-checked after the await above: a second answer may have raced this one.
+        if (_answered.dialog.answer) { _chatError('That dialog is already answered.'); return; }
+        _answered.dialog.answer = { ..._answered.answer, at: _userMsg.timestamp };
+        _userMsg.dialogAnswer = { dialogId: _answered.dialog.id, ..._answered.answer };
+      }
+      // Tasks the user edited by hand since the last turn ride at the top of this one.
+      const _edits = takeTaskChatEdits(session);
+      if (_edits.length) {
+        _userMsg.content = `${buildTaskEditNote(_edits)}\n\n${content}`;
+        _userMsg.taskEdits = _edits.map(e => ({ taskKey: e.task.id, changed: e.changed }));
+      }
+      session.messages.push(_userMsg);
+      spawnTurn(session, taskId);
+
+    } else if (msg.type === 'task-chat-task-edited' && session.type === 'taskChat') {
+      await handleTaskChatUserEdit(session, msg.taskKey);
+
     } else if (msg.type === 'apply-spec-update' && session.type === 'specChat') {
       const update = msg.update || {};
       const patch = {};
@@ -5007,7 +5484,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         session.pty.resize(session.cols, session.rows);
       }
     } else if (msg.type === 'session-status') {
-      if (session.type !== 'objective' && session.type !== 'specChat') {
+      if (!isAgentChatType(session.type)) {
         emitTerminalState(session);
         maybeRefirePlanReady(session, ws);
       }
@@ -5020,7 +5497,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       await applyModelSelection(session, msg.model, { taskId }); // advisory warm hint — ignore errors, no user message involved
       if (session.providerType === 'claude') prewarmObjective(session, taskId);
 
-    } else if (msg.type === 'abort' && (session.type === 'objective' || session.type === 'specChat')) {
+    } else if (msg.type === 'abort' && isAgentChatType(session.type)) {
       console.log(`[objective] Abort requested for task ${taskId}`);
       killPrewarm(taskId, 'abort');
       session._aborted = true;
@@ -5037,8 +5514,19 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         killObjectiveProc(session, 'SIGTERM');
         escalateKill(session, taskId);
       }
-      if (session.messages.length > 0 && session.messages[session.messages.length - 1].role === 'user') {
+      // The aborted turn's user message is dropped — except a task chat's generated seed, which
+      // is the chat's context, not something the user typed and can retype.
+      const _lastMsg = session.messages[session.messages.length - 1];
+      if (_lastMsg && _lastMsg.role === 'user' && !_lastMsg.seed) {
         session.messages.pop();
+        // A dropped dialog answer re-opens its dialog.
+        if (_lastMsg.dialogAnswer) {
+          const _asked = session.messages[session.messages.length - 1];
+          const _dialog = _asked && Array.isArray(_asked.dialogs) && _asked.dialogs.find(d => d.id === _lastMsg.dialogAnswer.dialogId);
+          if (_dialog) delete _dialog.answer;
+        }
+        // Hand-made task edits that rode on it go back in the queue for the next turn.
+        if (_lastMsg.taskEdits) restoreTaskChatEdits(session);
       }
       resetTurnBuffers(session);
       if (session.type === 'objective') throttle.recordAbort(taskId);
@@ -5046,7 +5534,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         session.ws.send(JSON.stringify({ type: 'generation-aborted', tabId: session.tabId }));
       }
 
-    } else if (msg.type === 'restart' && (session.type === 'objective' || session.type === 'specChat')) {
+    } else if (msg.type === 'restart' && isAgentChatType(session.type)) {
       killPrewarm(taskId, 'restart');
       console.log(`[${session.type}] Restart requested for task ${taskId}`);
       if (!session.messages || session.messages.length === 0) {
@@ -5076,13 +5564,16 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       }
       if (session.type === 'specChat') {
         spawnObjectiveTurn(session, taskId);
+      } else if (session.type === 'taskChat') {
+        ensureTaskChatSystemPrompt(session);
+        spawnTurn(session, taskId);
       } else {
         _throttledSpawn(taskId, session, () => spawnTurn(session, taskId));
       }
 
     } else if (msg.type === 'kill' || msg.type === 'terminate' || msg.type === 'stop') {
       console.log(`[terminal] Kill requested for task ${taskId}`);
-      if (session.type === 'objective' || session.type === 'specChat') {
+      if (isAgentChatType(session.type)) {
         // Timers + prewarm + turn proc + _closed guard; also resets _spawning (C1030) for any
         // in-flight closure still holding a reference to this discarded session.
         dropObjectiveSession(sessions, sessionKey, session, taskId, 'kill');
@@ -5095,12 +5586,23 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       } else {
         terminateTerminalSession(session, taskId, sessionKey, sessions, 'terminated', { ackWs: ws, closeAck: false, backend });
       }
+    } else if (msg.type === 'resume-paused' && session.type === 'terminal') {
+      // (TPT443) The paused banner's Resume button. SIGCONTs the tree the watchdog stopped;
+      // resumeRunawaySession() itself re-sends terminal-state (banner off on this socket) and the
+      // session-runaway `resumed` frame clears the board ring in every window of this project.
+      const resumed = resumeRunawaySession(session);
+      if (resumed) {
+        console.log(`[watchdog] Task ${taskId}: resumed by the user`);
+        websocket.emitSessionRunaway(session.projectPath, { taskId: session.tabId, pid: session.ptyPid, resumed: true, promptText: resumed.text });
+      } else {
+        emitTerminalState(session); // already running — resync a stale banner
+      }
     } else if (msg.type === 'plan-approve') {
       if (session.type !== 'objective') approvePlan(session);
     } else if (msg.type === 'paste-image') {
       // Terminal image paste (C809, C1003): save clipboard image locally, inject as a
       // bracketed-paste bare path so Claude Code attaches it as native [Image #N].
-      if (session.type !== 'objective' && session.type !== 'specChat') {
+      if (!isAgentChatType(session.type)) {
         try {
           const localPath = injectPastedImage(session, msg.mimeType, msg.data);
           sendWsJson(ws, { type: 'paste-image-done', path: localPath });
@@ -5115,7 +5617,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
     console.log(`[terminal] Client detached from task ${taskId}`);
     const isCurrentWs = session.ws === ws;
     if (session.ws === ws) session.ws = null;
-    if (isCurrentWs && session.type !== 'objective' && session.type !== 'specChat' && !taskId.startsWith('obj-')) {
+    if (isCurrentWs && !isAgentChatType(session.type) && !isAgentChatId(taskId)) {
       deleteDeviceSession(taskId, backend);
     }
     if (session.pending) {
@@ -5141,6 +5643,11 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
     } else if (session.type === 'specChat' && !session.proc) {
       console.log(`[spec-chat] Detaching client from idle session ${taskId} (kept for reconnect)`);
       // Not deleted — persists until Cancel (kill msg) or server restart.
+    } else if (session.type === 'taskChat') {
+      // Kept whether idle or mid-turn: a running turn finishes on its own and buffers its
+      // result (session.pendingResult) for the reconnect branch in handleConnection(). Ends only
+      // on `kill` or server shutdown.
+      console.log(`[task-chat] Client detached from ${taskId} (${session.proc || session._spawning ? 'turn still running' : 'idle'}) — session kept for reconnect`);
     }
   });
 }
@@ -5154,6 +5661,7 @@ module.exports = {
   assertTaskStartable,
   claimUnassignedTaskOnStart,
   sessionListBucket, sessionMetaRow,
+  drainSessionQueue, sessionQueue,
   parsePiModelList,
   queryPiModels,
   listPiModels,

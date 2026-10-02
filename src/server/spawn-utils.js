@@ -485,6 +485,11 @@ function projectEnvExtras(projectPath) {
     for (const k of CONFIG_FIELDS) {
       if (k !== 'projectName' && cfg[k] != null && cfg[k] !== '') extras[k] = String(cfg[k]);
     }
+    // The token is the signed-in account's, held app-level (account-store.js); a legacy
+    // inline config.json value (copied by the loop above) is only the fallback.
+    let account = null;
+    try { account = require('./account-store').readAccount(cfg.API_BASE_URL); } catch { /* unreadable store: no token */ }
+    if (account) extras.API_TOKEN = account.token;
     // C1121 — PI_MODELS (array of {model,apiKey} rows) is now the sole source for
     // Pi's OpenRouter key; the flat OPENROUTER_API_KEY config.json field the loop above
     // reads is legacy-only (pre-C1121 projects). Row 0 wins when both are present — a

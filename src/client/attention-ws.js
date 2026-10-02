@@ -7,7 +7,7 @@ import { buildWsUrl } from './ws-client.js';
 import { clearDebounce, debugNotifyLog } from './notifications.js';
 import { notifyTaskNeedsAttention, forgetTaskAttention } from './attention-notifications.js';
 import { dismissNotification } from './notification-center.js';
-import { raiseAttention, clearAttention, isTerminalOpenFor } from './attention-state.js';
+import { raiseAttention, clearAttention, isTerminalOpenFor, applyQueueSnapshot } from './attention-state.js';
 import { applyActivitySnapshot, syncActivityChips } from './task-activity.js';
 import { notifyTaskActivity } from './activity-notifications.js';
 
@@ -54,6 +54,18 @@ export function handleAttentionMessage(msg) {
     dismissNotification(msg.taskId);
     return true;
   }
+  // (TPT444) Start-queue snapshot. Tasks that left the queue were started (or cancelled) by the
+  // server with no socket of ours attached — pick up their live state from /api/sessions.
+  if (msg.type === 'session-queue-state') {
+    const left = applyQueueSnapshot(msg);
+    const repaint = () => window.TipTask?.taskBoard?.updateClaudeButtons?.();
+    if (left.length) {
+      Promise.resolve(window.TipTask?.fetchActiveSessions?.()).then(repaint).catch(() => {});
+    } else {
+      repaint();
+    }
+    return true;
+  }
   if (msg.type === 'session-ended') {
     if (msg.taskId) {
       clearAttention(msg.taskId, 'session-ended');
@@ -78,11 +90,46 @@ export function handleAttentionMessage(msg) {
   // session-ended frame, so this ring survives until the user opens the terminal).
   if (msg.type === 'session-runaway') {
     debugNotifyLog('session-runaway', msg.taskId, msg.count, msg.threshold);
+    // (TPT443) The user resumed a watchdog-paused session (in any window): the pause's ring is
+    // answered, so put it out everywhere — no notification, nothing needs the user any more.
+    if (msg.resumed) {
+      const meta = state.sessionMeta.get(msg.taskId);
+      if (meta) state.sessionMeta.set(msg.taskId, { ...meta, paused: null });
+      clearAttention(msg.taskId, 'server');
+      forgetTaskAttention(msg.taskId);
+      dismissNotification(msg.taskId);
+      window.TipTask?.taskBoard?.updateClaudeButtons?.();
+      return true;
+    }
+    // Paused state has its own compact controls in the rail/modal. Retire the earlier
+    // budget warning ring instead of turning a recoverable pause into an urgent alert.
+    if (msg.paused) {
+      const meta = state.sessionMeta.get(msg.taskId) || { type: 'terminal', alive: true };
+      state.sessionMeta.set(msg.taskId, { ...meta, paused: {
+        reason: msg.reason || 'count', count: Number(msg.count) || 0,
+        rssMb: Number(msg.rssMb) || 0, limitMb: Number(msg.limitMb) || 0,
+      } });
+      clearAttention(msg.taskId, 'server');
+      forgetTaskAttention(msg.taskId);
+      dismissNotification(msg.taskId);
+      window.TipTask?.taskBoard?.updateClaudeButtons?.();
+      return true;
+    }
     // (TPT357) The kill frame lands one 30s sweep after the warn frame — exactly notify()'s own
     // 30s per-task debounce — so without this the kill's OS banner can be dropped as a repeat of
     // the warn's. Same rationale as the attention-needed branch's promptText-changed clear above.
     if (msg.killed) clearDebounce(msg.taskId);
-    raiseAttention(msg.taskId, { kind: 'runaway', promptText: msg.promptText, agent: msg.agent, killed: !!msg.killed });
+    raiseAttention(msg.taskId, {
+      kind: 'runaway',
+      promptText: msg.promptText,
+      agent: msg.agent,
+      killed: !!msg.killed,
+      paused: !!msg.paused,
+      rssMb: Number(msg.rssMb) || 0,
+      limitMb: Number(msg.limitMb) || 0,
+      count: Number(msg.count) || 0,
+      reason: msg.reason || 'count',
+    });
     window.TipTask?.taskBoard?.updateClaudeButtons?.();
     try { notifyTaskNeedsAttention(msg.taskId); } catch (err) { debugNotifyLog('notifyTaskNeedsAttention threw', msg.taskId, err); }
     return true;

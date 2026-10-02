@@ -600,7 +600,8 @@ export function attachCardHandlers() {
           checkAllCardsHandled(cs);
         } catch (err) {
           buttons.forEach(b => b.disabled = false);
-          showToast(translate('chat.errSaveTask', { msg: err.message }), 'error');
+          console.error('[save] single-card save failed:', err);
+          showToast(translate('chat.errSaveTask', { msg: err.message }), 'error', { durationMs: SAVE_ERROR_TOAST_MS });
         }
       } else {
         // Reject
@@ -871,7 +872,7 @@ export function attachCardHandlers() {
 
           const jsonStr = JSON.stringify(data, null, 2);
           const newTodoText = text.replace(/```json\s*[\s\S]*```/, () => '```json\n' + jsonStr + '\n```');
-          const putRes = await fetchWithRetry('/api/todo', { method: 'PUT', headers: { 'Content-Type': 'text/plain', ...projectHeader() }, body: newTodoText, label: 'todo-write' });
+          const putRes = await fetchWithRetry('/api/todo', { method: 'PUT', headers: { 'Content-Type': 'text/plain', ...projectHeader() }, body: newTodoText, label: 'todo-write', retries: TODO_WRITE_ATTEMPTS });
           if (!putRes.ok) throw new Error(await readErrorBody(putRes));
           // Apply server-side ID remap to accepted cards so confirmedMask / later references stay consistent
           try {
@@ -896,7 +897,8 @@ export function attachCardHandlers() {
         } catch (err) {
           msg._inFlight = false;
           saveBtn.disabled = false;
-          showToast(translate('chat.errSaveTasks', { msg: err.message }), 'error');
+          console.error('[save] bulk save failed:', err);
+          showToast(translate('chat.errSaveTasks', { msg: err.message }), 'error', { durationMs: SAVE_ERROR_TOAST_MS });
           return;
         }
 
@@ -974,12 +976,23 @@ export function attachCardHandlers() {
   });
 }
 
+// PUT /api/todo is sent exactly once. The write is not idempotent — each attempt can
+// reserve fresh task keys, and a resend after a partially applied save writes the same
+// tasks again under new keys — so a failure goes straight to the user with the server's
+// own message instead of being retried behind their back.
+const TODO_WRITE_ATTEMPTS = 1;
+// A save failure carries a server message worth reading; the default 2s toast is too short.
+const SAVE_ERROR_TOAST_MS = 10000;
+
 // ── Read error body from response ──
+// A save failure body is { error, step, code } (ws-handlers.js PUT /api/todo) — the step
+// that threw is appended so the message says where the save stopped.
 async function readErrorBody(res) {
   try {
     const text = await res.text();
     try {
       const body = JSON.parse(text);
+      if (body.error && body.step) return `${body.error} (${body.step})`;
       return body.error || text;
     } catch {
       return text || `HTTP ${res.status}`;
@@ -1179,6 +1192,7 @@ export async function saveTaskChange(change, { msg } = {}) {
     headers: { 'Content-Type': 'text/plain', ...projectHeader() },
     body: newTodoText,
     label: 'todo-write-single',
+    retries: TODO_WRITE_ATTEMPTS,
   });
   if (!putRes.ok) throw new Error(await readErrorBody(putRes));
   // Apply any server-side ID remap from PUT (last-chance collision detection)

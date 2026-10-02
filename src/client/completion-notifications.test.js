@@ -17,6 +17,7 @@ let projectPath = '/project/A';
 let focusSelfCount = 0;
 let openedTasks = [];
 let terminalStarts = 0;
+let terminalOpens = [];
 
 class MockDocument extends EventTarget {
   get visibilityState() { return visibilityState; }
@@ -84,6 +85,9 @@ beforeEach(() => {
   state.activeTerminal = null;
   state.selectedCardId = null;
   state.taskTitleById = new Map();
+  state.activeSessions = new Set();
+  state.exitedSessions = new Set();
+  state.taskStatusById = new Map();
   state.projectName = '';
   appNode = { querySelector: () => makeCard() };
   modalNode = { hidden: true, dataset: {} };
@@ -94,8 +98,9 @@ beforeEach(() => {
   window.electronAPI = { focusSelf() { focusSelfCount++; }, getProjectPath: () => projectPath };
   window.TipTask = {
     openTaskEditModal(id) { openedTasks.push(id); },
-    openTerminal() { terminalStarts++; },
+    openTerminal(...args) { terminalStarts++; terminalOpens.push(args); },
   };
+  terminalOpens = [];
   clearAllNotifications();
   resetStatuses();
   // notifications.js's 30s per-tag debounce is module-singleton state, shared across every test
@@ -159,7 +164,7 @@ test('the in-app notification-center card is pushed under the "completed" catego
   assert.equal(entries[0].category, 'completed');
 });
 
-test('in-app completion click opens off-screen task details once without starting a terminal', async () => {
+test('in-app completion click (no known session) opens off-screen task details once without starting a terminal', async () => {
   hasFocus = false;
   appNode = { querySelector: () => null }; // task is filtered out of the board window
   notifyTaskCompleted('C1', { title: 'Off-screen task' });
@@ -171,6 +176,19 @@ test('in-app completion click opens off-screen task details once without startin
   assert.deepEqual(openedTasks, ['C1']);
   assert.equal(terminalStarts, 0);
   assert.equal(focusSelfCount, 2);
+  assert.equal(getNotificationEntries().length, 0);
+});
+
+test('in-app completion click with a finished session opens the console, not the edit modal', async () => {
+  hasFocus = false;
+  state.exitedSessions.add('C1');
+  state.taskStatusById.set('C1', 'completed');
+  notifyTaskCompleted('C1', { title: 'Done task' });
+  getNotificationEntries()[0].onClick();
+  await new Promise(setImmediate);
+  assert.deepEqual(openedTasks, []);
+  assert.equal(terminalStarts, 1);
+  assert.deepEqual(terminalOpens[0].slice(0, 4), ['C1', 'Task Title', '', 'in_progress']);
   assert.equal(getNotificationEntries().length, 0);
 });
 
@@ -193,7 +211,7 @@ test('completion action rejects a stale project card with the same-looking task 
   assert.equal(terminalStarts, 0);
 });
 
-test('native completion click uses the existing project-scoped bridge and shared action', async () => {
+test('native completion click (finished session) uses the existing project-scoped bridge and shared action', async () => {
   hasFocus = false;
   let nativeClick;
   const nativeSends = [];
@@ -203,32 +221,36 @@ test('native completion click uses the existing project-scoped bridge and shared
     notify(payload) { nativeSends.push(payload); return Promise.resolve({ ok: true }); },
     onNotificationClick(cb) { nativeClick = cb; },
   };
+  state.exitedSessions.add('C1');
   notifyTaskCompleted('C1', { title: 'Finished task' });
   assert.equal(nativeSends.length, 1);
   assert.equal(nativeSends[0].tag, 'completed-C1');
   assert.equal(typeof nativeClick, 'function');
   nativeClick({ tag: 'completed-C1', projectPath: '/project/B' });
   await new Promise(setImmediate);
-  assert.deepEqual(openedTasks, []);
+  assert.equal(terminalStarts, 0);
   nativeClick({ tag: 'completed-C1', projectPath: '/project/A' });
   await new Promise(setImmediate);
-  assert.deepEqual(openedTasks, ['C1']);
-  assert.equal(terminalStarts, 0);
+  assert.deepEqual(openedTasks, []);
+  assert.equal(terminalStarts, 1);
+  assert.equal(terminalOpens[0][0], 'C1');
   assert.equal(getNotificationEntries().length, 0);
 });
 
-test('web notification fallback click opens details and keeps browser focus behavior', async () => {
+test('web notification fallback click opens the console and keeps browser focus behavior', async () => {
   hasFocus = false;
   let browserFocusCount = 0;
   window.focus = () => { browserFocusCount++; };
   window.electronAPI = undefined;
+  state.activeSessions.add('C1');
   notifyTaskCompleted('C1', { title: 'Browser task' });
   assert.equal(typeof lastNotification.onclick, 'function');
   lastNotification.onclick();
   await new Promise(setImmediate);
   assert.equal(browserFocusCount, 1);
-  assert.deepEqual(openedTasks, ['C1']);
-  assert.equal(terminalStarts, 0);
+  assert.deepEqual(openedTasks, []);
+  assert.equal(terminalStarts, 1);
+  assert.equal(terminalOpens[0][0], 'C1');
 });
 
 // ── maybeNotifyCompletion — the transition helper the WS wiring points actually call ──

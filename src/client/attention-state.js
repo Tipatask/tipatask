@@ -92,6 +92,9 @@ export function mergeSessionsSnapshot(data, project = data?.projectPath || '') {
   const details = data.attentionDetails || {};
   const sessions = new Set(data.sessions || []);
   const exited = new Set(data.exited || []);
+  // (TPT444) Start-queue entries are neither active nor exited, but they are NOT gone — without
+  // this they would be marked lost below.
+  const queued = new Map((data.queued || []).map(q => [q.taskId, q.position]));
 
   for (const id of attention) {
     if (_suppressed.has(id)) continue; // user already dismissed this — needs a fresh raise
@@ -99,24 +102,24 @@ export function mergeSessionsSnapshot(data, project = data?.projectPath || '') {
     if (details[id]) state.attentionDetails.set(id, details[id]); // never blank a live detail
   }
   for (const id of [...state.attentionSessions]) {
-    if (sessions.has(id) || exited.has(id)) continue; // session still known to the server — keep
+    if (sessions.has(id) || exited.has(id) || queued.has(id)) continue; // session still known to the server — keep
     clearAttention(id, 'gone');
   }
   for (const id of [..._suppressed]) {
-    if (!sessions.has(id) && !exited.has(id)) _suppressed.delete(id); // session gone — GC the ledger
+    if (!sessions.has(id) && !exited.has(id) && !queued.has(id)) _suppressed.delete(id); // session gone — GC the ledger
   }
 
   const meta = new Map(Object.entries(data.sessionMeta || {}));
   for (const id of new Set([...state.activeSessions, ...(data.lost || [])])) {
-    if (sessions.has(id) || exited.has(id)) continue;
+    if (sessions.has(id) || exited.has(id) || queued.has(id)) continue;
     const oldMeta = meta.get(id) || state.sessionMeta.get(id);
-    if ((oldMeta?.type || 'terminal') !== 'terminal' || /^(obj-|specChat:)/.test(id)) continue;
+    if ((oldMeta?.type || 'terminal') !== 'terminal' || /^(obj-|specChat:|taskChat:|projectChat:)/.test(id)) continue;
     const detail = data.lostDetails?.[id] || state.lostSessions.get(id) || {};
     if (!state.activeSessions.has(id) && _dismissedLosses.get(id) === (detail.at || 'unknown')) continue;
     markSessionLost(id, detail);
   }
   for (const id of [...state.lostSessions.keys()]) {
-    if (sessions.has(id) || exited.has(id)) {
+    if (sessions.has(id) || exited.has(id) || queued.has(id)) {
       dismissLostSession(id);
       continue;
     }
@@ -126,7 +129,20 @@ export function mergeSessionsSnapshot(data, project = data?.projectPath || '') {
   }
   state.activeSessions = sessions;
   state.exitedSessions = exited;
+  state.queuedSessions = queued;
   state.sessionMeta = meta;
+}
+
+// (TPT444) Applies a `session-queue-state` frame ({ queued: [{ taskId, position }], running, cap }).
+// The frame is project-scoped server-side, so it replaces this window's queue wholesale. Returns
+// the task ids that LEFT the queue — they were just started by the server (or cancelled), which
+// the caller resolves with a /api/sessions refetch.
+export function applyQueueSnapshot(snap) {
+  const next = new Map(((snap && snap.queued) || []).map(q => [q.taskId, q.position]));
+  const left = [...state.queuedSessions.keys()].filter(id => !next.has(id));
+  state.queuedSessions = next;
+  state.queueInfo = { running: snap?.running ?? null, cap: snap?.cap ?? null };
+  return left;
 }
 
 // Guarded replacement for the inline "delete attentionSessions for closed tasks" loops that

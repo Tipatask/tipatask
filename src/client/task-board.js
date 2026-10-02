@@ -12,7 +12,7 @@ import {
 import { escapeAttr, insertAtCursor, markTruncatedCards, loadDraft, saveDraft, clearDraft, getObjectiveDraftKey, renderMarkdown, renderSprintCombobox, initSprintCombobox, refreshSprintComboboxItems, showToast, showProgressToast, sprintRecordMax, showSavingIndicator, hideSavingIndicator, shortModelName, pushSubtaskCrumb, renderTagBadge } from './utils.js';
 import { computeTierWindow, HIDE_CLASS } from './sprint-tier-visibility.js';
 import { isStatusRowChecked } from './status-filter-select.js';
-import { buildWsUrl, terminateTaskSession } from './ws-client.js';
+import { buildWsUrl, terminateTaskSession, resumePausedTaskSession } from './ws-client.js';
 import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys } from './task-card.js';
 import { buildSubtasksLabel, closedDelta, applyChildStatusDelta, countChildProgress } from './subtask-count.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
@@ -419,14 +419,24 @@ export function renderPeopleFilter(counts) {
 // server-side sprint window instead — see updateShowMoreButton()'s canFetchMore logic.
 // Thin adapter over the pure computeTierWindow() (sprint-tier-visibility.js) — supplies
 // live-state predicates so the reveal-pool math itself stays unit-testable with no DOM.
+export const FILTERED_TIER_PAGE_SIZE = 20;
+
 export function computeVisibleTiers(tierKeys, tiers) {
-  return computeTierWindow(tierKeys, {
+  const filtering = anyNarrowingFilterActive();
+  const tierWindow = computeTierWindow(tierKeys, {
     allStepsLoaded: state.allStepsLoaded,
-    revealAll: anyNarrowingFilterActive(),
+    revealAll: filtering,
     extraStepsLoaded: state.extraStepsLoaded,
     hasActiveMatch: k => (tiers[k] || []).some(t => isActiveName(t.status) && matchesFilters(t)),
     hasAnyMatch: k => (tiers[k] || []).some(t => matchesFilters(t)),
   });
+  if (!filtering) return tierWindow;
+
+  // The helper gathers every matching tier in ascending order. Keep the newest page;
+  // this local cutoff still applies when a full search fetch set allStepsLoaded.
+  const count = FILTERED_TIER_PAGE_SIZE + state.extraStepsLoaded;
+  const hiddenCount = Math.max(0, tierWindow.visibleKeys.length - count);
+  return { ...tierWindow, visibleKeys: tierWindow.visibleKeys.slice(-count), hiddenCount };
 }
 
 // ── Empty state for fresh/empty projects ──
@@ -1274,6 +1284,8 @@ export function refreshFilterBarChrome(app = document.getElementById('app'), rer
 // Caller supplies rerender to avoid a template.html import cycle.
 export function refreshBoardForFilters(rerender, opts = {}) {
   const app = opts.app || document.getElementById('app');
+  // Every changed filter starts at its newest matching page, including when the
+  // previous filter had already revealed older tiers or fetched the full window.
   state.extraStepsLoaded = 0;
   // Persist first: the selection is durable even if the render below gets superseded by a
   // newer one (rapid clicking) or throws. (C1452) Also clears the bulk selection/bar —
@@ -2426,6 +2438,7 @@ const SESSION_SPINNER_HTML = '<span class="session-spinner" aria-hidden="true"><
 export function forgetLocalSession(taskId) {
   state.activeSessions.delete(taskId);
   state.exitedSessions.delete(taskId);
+  state.queuedSessions.delete(taskId); // (TPT444)
   clearAttention(taskId, 'session-ended');
   state.sessionMeta.delete(taskId); // (C1144)
 }
@@ -2490,9 +2503,33 @@ export function updateClaudeButtons() {
     // (TPT374) mode is role-derived from the card's live status, not a literal name — an
     // in-progress task with the agent process still running reads as RUNNING (spinner), while
     // RESUME covers both "interrupted, no process" and "done but the agent kept going".
-    const mode = sessionButtonMode(card?.dataset.status, { active: isActive, exited: isExited });
+    const queuedPosition = state.queuedSessions.get(taskId);
+    const mode = sessionButtonMode(card?.dataset.status, { active: isActive, exited: isExited, queued: queuedPosition !== undefined });
 
-    if (mode === SESSION_BUTTON_MODES.RUNNING) {
+    if (mode === SESSION_BUTTON_MODES.QUEUED) {
+      // (TPT444) The server accepted this start but has no free slot (device-derived cap) — it
+      // is parked FIFO and starts by itself when a running task completes. Not a live session:
+      // no spinner, a "Queued #N" label, and Stop (terminate) doubles as "cancel the queued start".
+      btn.textContent = t('queue.badge', { position: queuedPosition ?? '?' });
+      btn.title = t('tooltip.queuedSession');
+      btn.classList.remove('session-running');
+      btn.classList.add('resumable');
+      if (card) card.classList.add('has-active-session');
+      if (!existingTermBtn) {
+        const termBtn = document.createElement('button');
+        termBtn.className = 'btn-terminate card-ctl';
+        termBtn.innerHTML = STOP_ICON;
+        termBtn.title = t('tooltip.terminateSession');
+        termBtn.dataset.taskId = taskId;
+        termBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          termBtn.disabled = true;
+          termBtn.innerHTML = '...';
+          terminateSessionFromCard(taskId);
+        });
+        btn.insertAdjacentElement('afterend', termBtn);
+      }
+    } else if (mode === SESSION_BUTTON_MODES.RUNNING) {
       // In-progress with a live process — busy, not actionable. Same spinner recipe as the
       // left-nav "+ Create" loading ring. Only mount the span once: rewriting innerHTML on
       // every repaint (attention events fire often) would restart the CSS animation.
@@ -2623,6 +2660,15 @@ const SESSION_DONE_BADGE = '<span class="session-check" aria-hidden="true">'
   + 'stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>'
   + '</svg></span>';
 
+function renderWatchdogActions(taskId) {
+  const resume = escapeAttr(t('terminal.resume'));
+  const terminate = escapeAttr(t('btn.terminate'));
+  return `<span class="active-session-watchdog-actions">`
+    + `<span class="active-session-resume" role="button" tabindex="0" data-resume-task-id="${taskId}" aria-label="${resume}">${resume}</span>`
+    + `<span class="active-session-terminate" role="button" tabindex="0" data-close-task-id="${taskId}" aria-label="${terminate}">${terminate}</span>`
+    + `</span>`;
+}
+
 // One row per running or lost terminal session in the left nav.
 // `sessions` entries: { taskId, agent, title, isOpen, needsAttention }. `collapsed` mirrors
 // document.body.classList.contains('left-nav-collapsed') — the row markup is identical either
@@ -2637,20 +2683,25 @@ export function renderActiveSessionsList(sessions, collapsed) {
     const done = isCompleteName(s.status); // (C1152) row styling + (C1157) check badge
     const cls = 'active-session-item'
       + (s.isOpen ? ' active' : '')
-      + (s.lost ? ' session-lost' : s.needsAttention ? ' needs-attention' : '')
+      + (s.lost ? ' session-lost' : s.paused ? '' : s.needsAttention ? ' needs-attention' : '')
       + (done ? ' session-completed' : '')
+      + (s.paused ? ' session-paused' : '')
       + (collapsed ? ' collapsed' : '');
     // Falls back to the bare task key when title is unknown (session's task fell outside the
     // current fetch — subtask drill-in / assignee scoping) so the tooltip never dangles a
     // trailing "KEY — " with nothing after it.
     const base = s.title ? t('nav.sessionTooltip', { key: s.taskId, title: s.title }) : String(s.taskId);
-    const tip = escapeAttr(s.lost ? t('nav.sessionLost', { label: base }) : s.needsAttention ? t('nav.sessionNeedsAttention', { label: base }) : base);
+    const tip = escapeAttr(s.lost ? t('nav.sessionLost', { label: base })
+      : s.paused ? t('nav.sessionPaused', { label: base })
+        : s.needsAttention ? t('nav.sessionNeedsAttention', { label: base }) : base);
+
     // (C1152) Close control — nested <span role="button"> since .active-session-item is
     // itself a <button> (nested <button> invalid HTML). Mirrors .chat-tab-close (chat-ui.js),
     // plus keyboard support that precedent lacks.
     const closeTip = escapeAttr(t(s.lost ? 'btn.close' : 'tooltip.terminateSession'));
-    const closeBtn = `<span class="active-session-close" role="button" tabindex="0" `
-      + `data-close-task-id="${key}" title="${closeTip}" aria-label="${closeTip}">&#x2715;</span>`;
+    const closeBtn = s.paused ? renderWatchdogActions(key)
+      : `<span class="active-session-close" role="button" tabindex="0" `
+        + `data-close-task-id="${key}" title="${closeTip}" aria-label="${closeTip}">&#x2715;</span>`;
     return `<button type="button" class="${cls}" data-task-id="${key}" title="${tip}" aria-label="${tip}">`
       + `<span class="active-session-icon">${_sessionAgentIcon(s.agent)}${done ? SESSION_DONE_BADGE : ''}</span>`
       + `<span class="active-session-key">${key}</span>`
@@ -2695,6 +2746,7 @@ export function syncActiveSessionsNav() {
       status: state.taskStatusById.get(id) || '', // (C1152) drives .session-completed styling
       isOpen: id === openId,
       needsAttention: state.attentionSessions.has(id) && !state.lostSessions.has(id),
+      paused: state.sessionMeta.get(id)?.paused || null,
       lost: state.lostSessions.has(id),
     }));
   const html = renderActiveSessionsList(rows, collapsed);
@@ -2725,7 +2777,27 @@ export function syncActiveSessionsNav() {
   // the await, not after, so a second Enter/click during the confirm can't fire this twice
   // (a native confirm() used to make that impossible by blocking the event loop); clear it
   // again on cancel so the row is retryable.
-  host.querySelectorAll('.active-session-close[data-close-task-id]').forEach((x) => {
+  host.querySelectorAll('.active-session-resume[data-resume-task-id]').forEach((x) => {
+    const resume = async (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      if (x.dataset.busy) return;
+      x.dataset.busy = '1';
+      const id = x.dataset.resumeTaskId;
+      const ok = await resumePausedTaskSession(id);
+      if (ok) {
+        const meta = state.sessionMeta.get(id);
+        if (meta) state.sessionMeta.set(id, { ...meta, paused: null });
+        syncActiveSessionsNav();
+      } else {
+        delete x.dataset.busy;
+        window.TipTask?.fetchActiveSessions?.();
+      }
+    };
+    x.addEventListener('click', resume);
+    x.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') resume(e); });
+  });
+  host.querySelectorAll('.active-session-close[data-close-task-id], .active-session-terminate[data-close-task-id]').forEach((x) => {
     const kill = async (e) => {
       e.stopPropagation(); // never let the click reach the row → openTerminal
       e.preventDefault();

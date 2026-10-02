@@ -30,9 +30,12 @@ const { resolveAttachmentDir } = require('./attachment-paths');
 const {
   killProcessGroup,
   killProcessTree,
+  resolveTreeTargets,
   signalTargets,
   DESCENDANT_ALERT_THRESHOLD,
-  describeKillPolicy,
+  describeActPolicy,
+  describeTree,
+  resolveAgentLimits,
 } = require('./process-group');
 
 const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]/g;
@@ -707,8 +710,17 @@ function emitTerminalState(session) {
       ...(session._codexPlan?.repainting && session._planReadySent ? {} : {
         codexPlanReady: session.codexPlanReady === true && codexPlanReadyIsFresh(session),
       }),
+      paused: pausedSummary(session),
     }));
   }
+}
+
+// (TPT443) What a client needs to render the watchdog-paused banner — never the signal
+// target set or the notice text. null while the session is not paused.
+function pausedSummary(session) {
+  const p = session && session._pause;
+  if (!p) return null;
+  return { at: p.at, reason: p.reason, count: p.count, threshold: p.threshold, rssMb: p.rssMb || 0, limitMb: p.limitMb || 0 };
 }
 
 function emitTerminalNotice(session, text) {
@@ -848,18 +860,30 @@ const RUNAWAY_FORCE_KILL_MS = 1500; // SIGTERM -> SIGKILL follow-up delay, same 
 // sweeps: a tree that survives is signaled again next sweep, but the reason/notice are
 // written once. `summary` (process-group.js's summarizeDescendants(), optional) names what
 // was actually running, e.g. "npm \u00d724, node \u00d718, 3 other" \u2014 the 54-descendant false-kill
-// this closes (TPT370) could not be diagnosed after the fact without it. Returns
-// { text, first }, or null when there is nothing live to kill.
-function killRunawaySession(session, { count, threshold, snapshot, summary } = {}) {
+// this closes (TPT370) could not be diagnosed after the fact without it. `reason: 'memory'`
+// (with `rssMb`/`limitMb`) words the text around the memory limit instead of the process
+// count. A session the watchdog had paused is continued first \u2014 a stopped process does not
+// act on SIGTERM until it runs again. Returns { text, first }, or null when there is nothing
+// live to kill.
+function killRunawaySession(session, { count, threshold, rssMb = 0, limitMb = 0, reason, snapshot, summary } = {}) {
   if (!session || !session.alive || !session.ptyPid) return null;
   const first = !session._exitReason;
-  const text = `Descendant watchdog killed this session: ${count} descendant processes `
-    + `(warn \u2265${threshold}; ${describeKillPolicy(threshold)}).`
+  const policy = `kill ${describeActPolicy(threshold, { limitMb })}`;
+  const byMemory = reason === 'memory' && limitMb > 0;
+  const text = (byMemory
+    ? `Watchdog killed this session: its process tree used ${rssMb} MB, over the ${limitMb} MB memory limit `
+      + `(${count} descendant processes; ${policy}).`
+    : `Descendant watchdog killed this session: ${count} descendant processes `
+      + `(warn \u2265${threshold}; ${policy}).`)
     + (summary ? ` Top processes: ${summary}.` : '');
   if (first) {
-    session._exitReason = { kind: 'runaway-killed', count, threshold, text };
+    session._exitReason = { kind: 'runaway-killed', count, threshold, text, ...(byMemory ? { rssMb, limitMb } : {}) };
     session.buffer += `\r\n\x1b[90m[Task App] ${text}\x1b[0m\r\n`;
     emitTerminalNotice(session, text);
+  }
+  if (session._pause) {
+    signalTargets(session._pause.targets, 'SIGCONT');
+    session._pause = null;
   }
   const ptyProcess = session.pty;
   const targets = killProcessTree(snapshot, session.ptyPid, 'SIGTERM');
@@ -873,6 +897,121 @@ function killRunawaySession(session, { count, threshold, snapshot, summary } = {
   }, RUNAWAY_FORCE_KILL_MS);
   if (forceTimer.unref) forceTimer.unref();
   return { text, first };
+}
+
+// ── Watchdog pause / resume ──
+//
+// The watchdog's default action on a session over its limits (process-group.js's
+// evaluateRunaway() reporting `pause`): SIGSTOP the WHOLE tree — the pty leader's group, every
+// descendant-led group, and lone descendants in foreign groups (resolveTreeTargets()) — so it
+// stops consuming CPU and stops growing, while every process keeps its state. Nothing is
+// killed and nothing is recorded as an exit reason: resumeRunawaySession() continues exactly
+// the processes that were stopped, at any later time. The stopped set is kept on the session
+// (`_pause.targets`) for that, since a ps snapshot taken at resume time could no longer find
+// members whose parent was reparented.
+//
+// A paused tree keeps its memory. Ending the session (killPausedTargets() below) is what
+// frees it.
+
+function unionTargets(a, b) {
+  return {
+    pgids: [...new Set([...(a && a.pgids || []), ...(b && b.pgids || [])])],
+    pids: [...new Set([...(a && a.pids || []), ...(b && b.pids || [])])],
+  };
+}
+
+// Called by the 30s sweep on every sweep that reports `pause`. The first call writes the
+// reason into the replay buffer (so reconnect replay carries it) and emits it live; later
+// calls only re-signal — catching a member that forked between the snapshot and the first
+// SIGSTOP — and fold any new targets into the stored set. Returns { text, first }, or null
+// when there is no live session or nothing could be signaled (the caller then falls back to
+// a warning rather than reporting a pause that did not happen).
+function pauseRunawaySession(session, { count, threshold, rssMb = 0, limitMb = 0, reason, snapshot, summary } = {}) {
+  if (!session || !session.alive || !session.ptyPid) return null;
+  const signaled = signalTargets(resolveTreeTargets(snapshot, session.ptyPid), 'SIGSTOP');
+  const first = !session._pause;
+  if (!signaled.signaled) return first ? null : { text: session._pause.text, first: false };
+  if (!first) {
+    session._pause.targets = unionTargets(session._pause.targets, signaled);
+    session._pause.count = count;
+    session._pause.rssMb = rssMb;
+    emitTerminalState(session); // (TPT443) keep the paused banner's figures current
+    return { text: session._pause.text, first: false };
+  }
+  const why = reason === 'memory' && limitMb > 0
+    ? `its process tree uses ${rssMb} MB, over the ${limitMb} MB memory limit (${count} descendant processes)`
+    : `${describeTree(count, rssMb)} and growing (warn ≥${threshold}; pause ${describeActPolicy(threshold, { limitMb, action: 'pause' })})`;
+  const text = `Watchdog paused this session: ${why}. Nothing was killed — every process is stopped `
+    + `and keeps its state. Resume the session to continue, or terminate it to free its memory.`
+    + (summary ? ` Top processes: ${summary}.` : '');
+  session._pause = {
+    at: Date.now(),
+    reason: reason || 'count',
+    count,
+    threshold,
+    rssMb,
+    limitMb,
+    text,
+    targets: { pgids: signaled.pgids, pids: signaled.pids },
+  };
+  session.buffer += `\r\n\x1b[33m[Task App] ${text}\x1b[0m\r\n`;
+  emitTerminalWarning(session, text);
+  emitTerminalState(session); // (TPT443) an already-open terminal shows the paused banner
+  return { text, first: true };
+}
+
+// Continues a session pauseRunawaySession() stopped. SIGCONT goes to the exact stored target
+// set (falling back to the pty leader's group), the watchdog's pause latch is cleared, and
+// `resumeBase` is stamped so evaluateRunaway() acts again only on further growth instead of
+// re-pausing the still-large tree at the next sweep. Returns { text, resumed }, or null when
+// the session is not paused.
+function resumeRunawaySession(session) {
+  const pause = session && session._pause;
+  if (!pause) return null;
+  session._pause = null;
+  let resumed = signalTargets(pause.targets, 'SIGCONT').signaled;
+  if (!resumed) resumed = killProcessGroup(session.ptyPid, 'SIGCONT');
+  const state = session.descendantWatchdog;
+  if (state) {
+    state.paused = false;
+    state.actReason = null;
+    state.pauseFailed = false;
+    state.growthStreak = 0;
+    state.rssStreak = 0;
+    state.resumeBase = { count: pause.count || 0, rssMb: pause.rssMb || 0 };
+  }
+  const text = 'Session resumed. The watchdog pauses it again only if it keeps growing.';
+  session.buffer += `\r\n\x1b[90m[Task App] ${text}\x1b[0m\r\n`;
+  emitTerminalNotice(session, text);
+  emitTerminalState(session); // (TPT443) clears the paused banner on the attached client
+  return { text, resumed };
+}
+
+// Resumes every watchdog-paused session in the `sessions` Map; returns their tab ids.
+function resumeAllRunawaySessions(sessions) {
+  const resumed = [];
+  if (!sessions) return resumed;
+  for (const [, session] of sessions) {
+    if (!session || !session._pause) continue;
+    if (resumeRunawaySession(session)) resumed.push(session.tabId);
+  }
+  return resumed;
+}
+
+// Teardown of a paused session (user Terminate/Restart). The ordinary pty group kill is not
+// enough here: a stopped process does not act on SIGTERM until continued, and a member
+// outside the pty leader's group would otherwise stay stopped — and keep its memory — after
+// the session is gone. Continues, then SIGTERMs the stored set, with the same SIGKILL
+// follow-up as every other kill path. Returns false when the session was not paused.
+function killPausedTargets(session) {
+  const pause = session && session._pause;
+  if (!pause) return false;
+  session._pause = null;
+  signalTargets(pause.targets, 'SIGCONT');
+  signalTargets(pause.targets, 'SIGTERM');
+  const forceTimer = setTimeout(() => { signalTargets(pause.targets, 'SIGKILL'); }, RUNAWAY_FORCE_KILL_MS);
+  if (forceTimer.unref) forceTimer.unref();
+  return true;
 }
 
 // ── Resume force-repaint (C966) ──
@@ -1075,7 +1214,10 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   // can read task.effort through BaseTaskAgent#resolveEffort().
   const vcsSettings = vcsContext.vcs;
   console.log(`[vcs] ${taskId}: ${JSON.stringify(vcsContext)}`);
-  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode, task: opts.task || null, agentSessionId });
+  // The agent is told the same sub-agent cap the descendant watchdog enforces — see
+  // base-agent.js#buildResourceLimitsDirective. Sync, never throws (process-group.js).
+  const agentLimits = resolveAgentLimits(session.projectPath || config.PROJECT_ROOT);
+  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode, task: opts.task || null, agentSessionId });
   throwIfTerminated(session);
   const spawnedAt = Date.now(); // (TPT354) lower bound for locating this run's transcript file
   const ptyProcess = pty.spawn(spec.command, spec.args, {
@@ -1107,13 +1249,20 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     pid: ptyProcess.pid,
     lastCount: 0,
     lastAlertCount: 0,
-    threshold: DESCENDANT_ALERT_THRESHOLD,
+    threshold: agentLimits.warnDescendants || DESCENDANT_ALERT_THRESHOLD, // refreshed each sweep
     alerted: false,
     growthStreak: 0,                // (TPT370) consecutive sweeps that both cleared threshold
-                                     // AND grew by >=10 over the sweep before — kill trigger
+                                     // AND grew by >=10 over the sweep before — count trigger
+    rssStreak: 0,                   // consecutive sweeps at/above the memory limit
+    rssAlerted: false,
+    lastAlertRssMb: 0,
+    paused: false,                  // latches on a pause decision; resumeRunawaySession() clears it
     killed: false,                  // (TPT370) latches true once a kill decision fires
+    actReason: null,                // 'memory' | 'count' — what the latched action fired on
+    resumeBase: null,               // { count, rssMb } at resume — re-act only on growth past it
   };
   session._exitReason = null;      // (TPT357) set by killRunawaySession(), read by onExit
+  session._pause = null;           // set by pauseRunawaySession() while the tree is SIGSTOPped
   session.cols = opts.initialCols || 120;
   session.rows = opts.initialRows || 40;
   session.alive = true;
@@ -1178,13 +1327,15 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   // ── Idle-silence paste injection (C947) ──
   // Paste + Enter key off PTY quiescence, not a cumulative byte count + fixed Enter gap.
   // Phases: awaitReady (wait for boot to settle) -> awaitPasteAck (verify paste echo
-  // settled, then Enter) -> done. (C1260) When spec.preludePrompt is set (Claude's
+  // settled, then (TPT445) type spec.kickoffTypedLine + one more silence, then Enter) -> done. (C1260) When spec.preludePrompt is set (Claude's
   // /design mode), a slash-command prelude must land as its OWN submission or it never
   // executes as a command — two extra phases splice in before the task prompt:
   // awaitReady -> awaitPreludeAck (verify prelude paste echo, Enter) -> awaitPreludeRun
   // (poll until /design goes quiet) -> awaitPasteAck (task prompt, unchanged) -> done.
   const initialPrompt = spec.initialPrompt;
   const preludePrompt = spec.preludePrompt || '';
+  const kickoffTypedLine = spec.kickoffTypedLine || '';  // (TPT445) typed after the paste, before Enter
+  let typedLineSent = false;
   let injectDone = !initialPrompt;
   session._injectDone = injectDone;  // (C1386) mirrored for shouldHoldAttention()/index.js's sweep — see onData()
   let injectPhase = injectDone ? 'done' : 'awaitReady';
@@ -1447,6 +1598,15 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       return;
     }
     if (injectPhase === 'awaitPasteAck') {
+      // (TPT445) Type the agent's short kickoff line as its own write, then wait one more silence
+      // window before Enter — a message that is only a paste is refused as "no words from you".
+      if (kickoffTypedLine && !typedLineSent) {
+        typedLineSent = true;
+        session.pty.write(kickoffTypedLine);
+        injectPhaseStartAt = Date.now();
+        armInjectTimer(agent.getPasteSilenceMs());
+        return;
+      }
       injectDone = true;
       injectPhase = 'done';
       session.pty.write('\r');
@@ -1600,6 +1760,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     // counting a stranger's process tree against this session.
     session.descendantWatchdog = null;
     session.ptyPid = null;
+    session._pause = null;
     const filesRead = readTrackedFiles(taskId);
     if (filesRead.length > 0) {
       console.log(`[terminal:${agent.id}] Task ${taskId} read ${filesRead.length} file path(s)`);
@@ -1608,6 +1769,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       session.ws.send(JSON.stringify(buildTerminalExitFrame(session, exitCode, filesRead)));
     }
     session.onSessionExit?.({ exitCode, buffer: session.buffer, ...exitReasonFields(session) });
+    try { session.onSlotFreed?.(); } catch { /* queue drain must never break exit handling */ } // (TPT444)
   });
 }
 
@@ -1805,6 +1967,11 @@ module.exports = {
   buildTokenExpiryNotice,
   TOKEN_WATCH_LEAD_MS,
   killRunawaySession,
+  pauseRunawaySession,
+  resumeRunawaySession,
+  pausedSummary,
+  resumeAllRunawaySessions,
+  killPausedTargets,
   buildTerminalExitFrame,
   exitReasonFields,
   handleTerminalInput,

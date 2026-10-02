@@ -8,6 +8,10 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { execFileSync } = require('node:child_process');
 
+// The account store defaults to USER_DATA_ROOT; keep this file's writes in a private dir.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-pc-userdata-'));
+const { readAccount } = require('./account-store');
+
 const { migrateFromLegacy, readProjectConfig, writeProjectConfig, writeProjectMcpConfig, writeProjectClaudeMcpApproval, PI_MAX_MODELS, PI_PROVIDERS, PI_DEFAULT_PROVIDER, PI_CUSTOM_PROVIDER, PI_CUSTOM_APIS, PI_CUSTOM_DEFAULT_API, normalizePiProvider, normalizePiBaseUrl, normalizePiApi, isPiCustomEntry, piProviderEnv, piKeyEnvVars, piConfiguredModelIds, sanitizePiModels, readPiEntries, piDefaultEntry, piEntryForModel, recordLastUsedAgent, buildAgentsConfigPatch, summarizeAgents, rendererProjectConfig, rendererPiModels, mergeRendererProjectConfig } = require('./project-config');
 
 test('plain Node project config import never loads the Electron package', () => {
@@ -57,7 +61,8 @@ test('migrateFromLegacy creates config and removes credential keys from legacy .
   assert.ok(migrated);
   const cfg = readProjectConfig(root);
   assert.strictEqual(cfg.API_BASE_URL, 'https://example.test/');
-  assert.strictEqual(cfg.API_TOKEN, 'legacy-token');
+  assert.ok(!Object.hasOwn(cfg, 'API_TOKEN'), 'the token goes to the account store, never config.json');
+  assert.strictEqual(readAccount('https://example.test').token, 'legacy-token');
   assert.strictEqual(cfg.API_PROJECT_ID, '7');
   assert.strictEqual(cfg.TASK_AGENT, 'codex');
 
@@ -117,7 +122,8 @@ test('existing config backfills absent credentials before sanitizing legacy .env
   const cfg = readProjectConfig(root);
   assert.strictEqual(cfg.API_BASE_URL, 'https://example.test');
   assert.strictEqual(cfg.API_PROJECT_ID, '3');
-  assert.strictEqual(cfg.API_TOKEN, '', 'explicit blank token must block stale fallback');
+  assert.ok(!Object.hasOwn(cfg, 'API_TOKEN'));
+  assert.strictEqual(readAccount('https://example.test'), null, 'explicit blank token must block stale fallback');
   assert.strictEqual(
     fs.readFileSync(path.join(root, 'ai', 'todo', 'server', '.env'), 'utf8').trim(),
     ''
@@ -968,4 +974,40 @@ test('model-id de-dupe is id-only across providers, custom included', () => {
     ]),
     [{ model: 'gpt-4o', apiKey: 'k', provider: 'openai' }],
   );
+});
+
+test('writeProjectConfig routes API_TOKEN to the account store and never writes it to config.json', (t) => {
+  const root = makeRoot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  writeProjectConfig(root, { API_BASE_URL: 'https://route.example.test/', API_PROJECT_ID: '5', API_TOKEN: 'route-token', language: 'uk' });
+  const onDisk = JSON.parse(fs.readFileSync(path.join(root, '.tipatask', 'config.json'), 'utf8'));
+  assert.deepStrictEqual(onDisk, { API_BASE_URL: 'https://route.example.test/', API_PROJECT_ID: '5', language: 'uk' });
+  assert.strictEqual(readAccount('https://route.example.test').token, 'route-token');
+
+  // A second project on the same server shares the account.
+  const other = makeRoot();
+  t.after(() => fs.rmSync(other, { recursive: true, force: true }));
+  writeProjectConfig(other, { API_BASE_URL: 'https://route.example.test', API_PROJECT_ID: '6' });
+  assert.strictEqual(readAccount('https://route.example.test').token, 'route-token');
+
+  // A blank token signs that server out.
+  writeProjectConfig(root, { API_BASE_URL: 'https://route.example.test', API_PROJECT_ID: '5', API_TOKEN: '' });
+  assert.strictEqual(readAccount('https://route.example.test'), null);
+  assert.ok(!Object.hasOwn(JSON.parse(fs.readFileSync(path.join(root, '.tipatask', 'config.json'), 'utf8')), 'API_TOKEN'));
+});
+
+test('writeProjectConfig keeps the token inline when the config has no API_BASE_URL to key the store', (t) => {
+  const root = makeRoot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  writeProjectConfig(root, { API_TOKEN: 'orphan-token', API_PROJECT_ID: '1' });
+  assert.strictEqual(readProjectConfig(root).API_TOKEN, 'orphan-token');
+});
+
+test('rendererProjectConfig reports hasApiToken from the account store', (t) => {
+  const root = makeRoot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  writeProjectConfig(root, { API_BASE_URL: 'https://flag.example.test', API_PROJECT_ID: '1', API_TOKEN: 'flag-token' });
+  const safe = rendererProjectConfig(readProjectConfig(root));
+  assert.strictEqual(safe.hasApiToken, true);
+  assert.ok(!Object.hasOwn(safe, 'API_TOKEN'));
 });

@@ -227,9 +227,12 @@ function configureMarked() {
 const MARKDOWN_CACHE_LIMIT = 1000;
 const _markdownCache = new Map();
 
-export function renderMarkdown(text) {
+// `opts.cache === false` renders without reading or writing the memo — for text that changes
+// on every call (a reply still streaming), which would otherwise evict the entries that matter.
+export function renderMarkdown(text, opts) {
   if (!text) return '';
-  const cached = _markdownCache.get(text);
+  const useCache = !(opts && opts.cache === false);
+  const cached = useCache ? _markdownCache.get(text) : undefined;
   if (cached !== undefined) {
     // Refresh recency (Map preserves insertion order — delete+set moves this key to the end).
     _markdownCache.delete(text);
@@ -258,6 +261,7 @@ export function renderMarkdown(text) {
     // Keep this last: every prior HTML rewrite must pass through the same DOM and
     // URL policy before callers insert the result with innerHTML.
     html = sanitizeMarkdownHtml(html);
+    if (!useCache) return html;
     _markdownCache.set(text, html);
     if (_markdownCache.size > MARKDOWN_CACHE_LIMIT) {
       _markdownCache.delete(_markdownCache.keys().next().value);
@@ -1101,7 +1105,9 @@ export function hideBoardLoader({ force = false } = {}) {
 // ── Toast notification (C1050) — shares the #tt-saving-indicator pill layout ──
 // Same fixed corner anchor, padding, border-radius, and font as the Saving…
 // badge; only the leading glyph + glyph color vary by variant.
-function showCornerBadge({ glyph, text, variant, alert = false }) {
+const TOAST_DEFAULT_MS = 2000;
+
+function showCornerBadge({ glyph, text, variant, alert = false, durationMs = TOAST_DEFAULT_MS }) {
   const el = document.createElement('div');
   el.className = `tt-saving-indicator tt-saving-indicator--toast ${variant}`;
   el.setAttribute('role', alert ? 'alert' : 'status');
@@ -1116,7 +1122,7 @@ function showCornerBadge({ glyph, text, variant, alert = false }) {
   el.append(icon, label);
   document.body.appendChild(el);
   requestAnimationFrame(() => { el.style.opacity = '1'; });
-  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 2000);
+  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, durationMs);
 }
 
 export function showSaveToast(count) {
@@ -1124,10 +1130,13 @@ export function showSaveToast(count) {
 }
 
 // type: 'success' → green check, 'error' → red cross, default → gray info
-export function showToast(message, type) {
+// opts.durationMs: how long the toast stays up (default 2s) — pass a longer hold for a
+// message the user has to read, e.g. a server error.
+export function showToast(message, type, opts = {}) {
   const glyph = type === 'success' ? '✓' : type === 'error' ? '✕' : 'ℹ';
   const variant = type === 'success' ? 'tt-toast--success' : type === 'error' ? 'tt-toast--error' : 'tt-toast--info';
-  showCornerBadge({ glyph, text: message, variant, alert: type === 'error' });
+  const durationMs = Number.isFinite(opts.durationMs) && opts.durationMs > 0 ? opts.durationMs : TOAST_DEFAULT_MS;
+  showCornerBadge({ glyph, text: message, variant, alert: type === 'error', durationMs });
 }
 
 // Persistent toast with a handle to update its text and dismiss explicitly (C1040).

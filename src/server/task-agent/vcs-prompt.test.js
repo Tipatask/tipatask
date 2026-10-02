@@ -321,8 +321,8 @@ test('PiAgent.buildPrompt: every VCS directive shape cannot false-trigger the at
       assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*questions ready[.!]?\s*$/im);
 
       // Keep the existing ceiling for merge-on/off and commit-disabled prompts too.
-      t.diagnostic(`Pi vcs=${vcsSettings.type}, merge=${vcsSettings.merge}, commit=${vcsSettings.commit}, discovery=${discovery}: ${prompt.length} / 9600`);
-      assert.ok(prompt.length < 9600, `prompt grew to ${prompt.length} chars (scenario: vcs=${vcsSettings.type}, discovery=${discovery})`);
+      t.diagnostic(`Pi vcs=${vcsSettings.type}, merge=${vcsSettings.merge}, commit=${vcsSettings.commit}, discovery=${discovery}: ${prompt.length} / 9900`);
+      assert.ok(prompt.length < 9900, `prompt grew to ${prompt.length} chars (scenario: vcs=${vcsSettings.type}, discovery=${discovery})`);
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

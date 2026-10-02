@@ -144,9 +144,9 @@ test('PiAgent.buildPrompt: process-safety directive cannot false-trigger the att
       assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*plan ready[.!]?\s*$/im);
       assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*questions ready[.!]?\s*$/im);
 
-      // Ceiling raised 8500 -> 9000 for C1542's unconditional compact KB-hygiene directive
-      // — see pi-agent.test.js's own comment on the same change.
-      assert.ok(prompt.length < 9000, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
+      // Shared Pi ceiling, raised for each unconditional compact directive — see
+      // pi-agent.test.js's own comment.
+      assert.ok(prompt.length < 9300, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

@@ -15,13 +15,13 @@ const { createWebSocketGate } = require('./ws-upgrade');
 const config = require('./config');
 const { augmentPathEnv, isAsarPath } = require('./spawn-utils');
 const { createBackend, createPerProjectBackend, coerceBackendType } = require('./task-backend');
-const { createHttpHandler, handleConnection } = require('./ws-handlers');
+const { createHttpHandler, handleConnection, drainSessionQueue } = require('./ws-handlers');
 const websocket = require('./websocket');
 const { preloadAgentDetection, listAllAgentModels } = require('./task-agent');
 const { fetchStatusRoles } = require('./status-roles');
 const { createTaskChangePoll } = require('./task-change-poll');
-const { getAttentionPromptMatch, shouldHoldAttention, bgAgentsBusy, emitTerminalNotice, killRunawaySession } = require('./terminal-session'); // (C1386, C1565, TPT348, TPT357)
-const { snapshotProcesses, sweepDescendantWatchdog } = require('./process-group'); // (C1565, TPT357/TPT370)
+const { getAttentionPromptMatch, shouldHoldAttention, bgAgentsBusy, emitTerminalNotice, killRunawaySession, pauseRunawaySession } = require('./terminal-session'); // (C1386, C1565, TPT348, TPT357)
+const { snapshotProcesses, sweepDescendantWatchdog, resolveAgentLimits } = require('./process-group'); // (C1565, TPT357/TPT370)
 const { installShutdownReaper } = require('./shutdown-reaper'); // (TPT295)
 const { installCrashGuard } = require('./crash-guard'); // (TPT356)
 
@@ -580,6 +580,7 @@ async function detectCompletedTerminalSessions() {
       // alive and hasn't exited on its own (interactive TUIs never exit by themselves, C982).
       Promise.resolve(session.onSessionExit({ exitCode: null, reason: 'completed', buffer: session.buffer }))
         .catch(err => console.error(`[completion] resolution comment failed for ${session.taskId}:`, err.message));
+      drainSessionQueue(); // (TPT444) a completed task releases its slot to the oldest queued start
     }
   }
 }
@@ -649,8 +650,8 @@ setInterval(() => {
   }
 }, 1000);
 
-// ── Descendant-count watchdog (C1565) ──
-// One shared `ps -Ao pgid=,pid=,ppid=` per tick serves every live terminal session
+// ── Process-tree watchdog (C1565) ──
+// One shared `ps -Ao pgid=,pid=,ppid=,rss=,stat=,comm=` per tick serves every live terminal session
 // (~32ms measured for ~860 processes) instead of one ps spawn per session. Runs
 // headless — no hasWatcher gate — same reasoning as detectCompletedTerminalSessions()
 // below: a runaway process tree must be caught whether or not a board/attention client
@@ -661,12 +662,15 @@ if (process.platform === 'win32') {
   console.log('[watchdog] Descendant-count watchdog disabled on win32 (no POSIX process groups).');
 } else {
   setInterval(async () => {
+    drainSessionQueue(); // (TPT444) safety net — a missed slot-freed trigger never strands a queued start
     const snapshot = await snapshotProcesses();
     if (!snapshot) return; // ps failed/timed out — skip this tick, never throw
-    // Warn-only by default. Explicit opt-in enables the growth/ceiling kill policy.
+    // Count + memory limits and the action (warn / pause / kill) come from each session's
+    // project — resolveAgentLimits(); the default action pauses, killing is an explicit opt-in.
     sweepDescendantWatchdog(sessions, snapshot, {
-      killEnabled: process.env.TIPATASK_WATCHDOG_KILL === '1',
+      resolveLimits: resolveAgentLimits,
       killRunawaySession,
+      pauseRunawaySession,
       emitTerminalNotice,
       emitSessionRunaway: websocket.emitSessionRunaway,
     });

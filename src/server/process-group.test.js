@@ -8,22 +8,40 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
   DESCENDANT_ALERT_THRESHOLD,
   DESCENDANT_KILL_CONSECUTIVE,
   DESCENDANT_KILL_GROWTH,
   DESCENDANT_KILL_CEILING,
+  RSS_WARN_FRACTION,
+  RSS_ACT_CONSECUTIVE,
+  RSS_ACT_IMMEDIATE_FACTOR,
+  RSS_PAUSE_CONSECUTIVE,
+  RSS_PAUSE_FACTOR,
+  RESUME_RSS_GRACE_FRACTION,
+  WATCHDOG_ACTIONS,
+  AGENT_LIMIT_DEFAULTS,
+  AGENT_LIMIT_KEYS,
+  DEVICE_SESSION_CAP_MAX,
+  computeDeviceSessionCap,
+  resolveAgentLimits,
   killProcessGroup,
   parsePsOutput,
   snapshotProcesses,
   listDescendants,
   countDescendants,
+  sumTreeRss,
   evaluateRunaway,
   summarizeDescendants,
+  describeActPolicy,
   describeKillPolicy,
   buildRunawayWarning,
   sweepDescendantWatchdog,
+  resolveTreeTargets,
   signalTargets,
   killProcessTree,
 } = require('./process-group');
@@ -175,9 +193,48 @@ test('parsePsOutput drops zombie rows (stat starting with Z) but keeps their liv
 });
 
 test('parsePsOutput still works on legacy 3-column rows (no stat/comm)', () => {
-  const { byPgid, commOf } = parsePsOutput('  10  10  1\n  10  11  10\n');
+  const { byPgid, commOf, rssOf } = parsePsOutput('  10  10  1\n  10  11  10\n');
   assert.deepEqual(byPgid.get(10), [10, 11]);
   assert.equal(commOf.size, 0);
+  assert.equal(rssOf.size, 0);
+});
+
+// ── parsePsOutput() — rss column / sumTreeRss() ──
+
+test('parsePsOutput reads rss (KB) from the column before stat, keeping stat and comm aligned', () => {
+  const text = '  10  10  1  204800  Ss  node\n  10  11  10  51200  S  /usr/local/bin/npm\n'
+    + '  10  12  10  1024  S  Google Chrome Helper\n  10  13  10  0  Z  defunct\n';
+  const { rssOf, commOf, parents } = parsePsOutput(text);
+  assert.equal(rssOf.get(10), 204800);
+  assert.equal(rssOf.get(11), 51200);
+  assert.equal(commOf.get(11), 'npm');
+  assert.equal(commOf.get(12), 'Google Chrome Helper');
+  assert.equal(parents.has(13), false); // zombie still dropped with the rss column present
+  assert.equal(rssOf.has(13), false);
+});
+
+test('parsePsOutput leaves rss undefined on rows without the column (stat is never numeric)', () => {
+  const { rssOf, commOf } = parsePsOutput('  10  10  1  S  bash\n  10  11  10  S  123\n');
+  assert.equal(rssOf.size, 0);
+  assert.equal(commOf.get(11), '123'); // a numeric comm is not mistaken for rss
+});
+
+test('sumTreeRss adds the root and every descendant, including an escaped subtree, in KB', () => {
+  const snapshot = parsePsOutput([
+    '  10  10  1  1000  Ss  claude',
+    '  10  11  10  200  S  node',
+    '  20  20  11  300  Ss  node', // setsid()'d child of 11
+    '  20  21  20  50  S  sh',
+    '  99  99  1  9999  S  unrelated',
+  ].join('\n'));
+  assert.equal(sumTreeRss(snapshot, 10), 1550);
+  assert.equal(sumTreeRss(snapshot, 10, new Set([11])), 1200); // caller-supplied member set
+});
+
+test('sumTreeRss returns 0 without rss data, a snapshot, or a root', () => {
+  assert.equal(sumTreeRss(parsePsOutput('  10  10  1\n  10  11  10\n'), 10), 0);
+  assert.equal(sumTreeRss(null, 10), 0);
+  assert.equal(sumTreeRss(parsePsOutput('  10  10  1  500  S  node\n'), 0), 0);
 });
 
 // ── snapshotProcesses() — injectable exec, never spawns a real ps in this suite ──
@@ -323,25 +380,43 @@ function freshState() {
   return { threshold: 50, lastCount: 0, lastAlertCount: 0, alerted: false, growthStreak: 0, killed: false };
 }
 
+// Limits as resolveAgentLimits() returns them; the count-only cases leave the memory limit out.
+const KILL = { watchdogAction: 'kill' };
+const PAUSE = { watchdogAction: 'pause' };
+const LIMIT_MB = 3072;
+const withMemory = (action) => ({ warnDescendants: 50, maxTreeRssMb: LIMIT_MB, watchdogAction: action });
+
 test('evaluateRunaway defaults to warnings through sustained growth and above the ceiling', () => {
   const state = freshState();
   const results = [52, 68, 86, 150, 300].map(count => evaluateRunaway(state, count));
-  assert.ok(results.every(result => result.kill === false));
+  assert.ok(results.every(result => result.kill === false && result.pause === false));
   assert.deepEqual(results.map(result => result.alert), [true, false, false, true, true]);
+  assert.equal(state.killed, false);
+});
+
+test('the explicit warn action never pauses or kills, on count or on memory', () => {
+  const state = freshState();
+  for (const sample of [{ count: 160, rssMb: 100 }, { count: 10, rssMb: 9000 }, { count: 300, rssMb: 9000 }]) {
+    const result = evaluateRunaway(state, sample, withMemory('warn'));
+    assert.equal(result.kill, false);
+    assert.equal(result.pause, false);
+  }
+  assert.equal(state.paused, undefined);
   assert.equal(state.killed, false);
 });
 
 test('disabling kills overrides a previous kill latch and restores warnings', () => {
   const state = freshState();
-  assert.equal(evaluateRunaway(state, 160, { killEnabled: true }).kill, true);
-  assert.deepEqual(evaluateRunaway(state, 220, { killEnabled: false }), { alert: true, kill: false, count: 220 });
+  assert.equal(evaluateRunaway(state, 160, KILL).kill, true);
+  assert.deepEqual(evaluateRunaway(state, 220, { watchdogAction: 'warn' }),
+    { alert: true, pause: false, kill: false, count: 220, rssMb: 0, reason: 'count' });
   assert.equal(state.killed, false);
 });
 
 test('evaluateRunaway warns on the first sweep at/above threshold and does not kill', () => {
   const state = freshState();
-  const first = evaluateRunaway(state, 60, { killEnabled: true });
-  assert.deepEqual(first, { alert: true, kill: false, count: 60 });
+  const first = evaluateRunaway(state, 60, KILL);
+  assert.deepEqual(first, { alert: true, pause: false, kill: false, count: 60, rssMb: 0, reason: 'count' });
   // The first sample of a session can never itself count as growth (lastCount starts at 0).
   assert.equal(state.growthStreak, 0);
 });
@@ -351,7 +426,7 @@ test('evaluateRunaway: a stable count (54, 10 sweeps) warns exactly once and nev
   let alerts = 0;
   let kills = 0;
   for (let i = 0; i < 10; i++) {
-    const { alert, kill } = evaluateRunaway(state, 54, { killEnabled: true });
+    const { alert, kill } = evaluateRunaway(state, 54, KILL);
     if (alert) alerts++;
     if (kill) kills++;
   }
@@ -362,23 +437,23 @@ test('evaluateRunaway: a stable count (54, 10 sweeps) warns exactly once and nev
 test('evaluateRunaway: jitter around the threshold (54, 58, 53, 60) never kills', () => {
   const state = freshState();
   for (const count of [54, 58, 53, 60]) {
-    assert.equal(evaluateRunaway(state, count, { killEnabled: true }).kill, false);
+    assert.equal(evaluateRunaway(state, count, KILL).kill, false);
   }
 });
 
 test('evaluateRunaway: a burst that does not sustain (54 -> 79 -> 55) never kills', () => {
   const state = freshState();
-  evaluateRunaway(state, 54, { killEnabled: true });
-  assert.equal(evaluateRunaway(state, 79, { killEnabled: true }).kill, false); // growthStreak 1
-  assert.equal(evaluateRunaway(state, 55, { killEnabled: true }).kill, false); // shrank — streak resets
+  evaluateRunaway(state, 54, KILL);
+  assert.equal(evaluateRunaway(state, 79, KILL).kill, false); // growthStreak 1
+  assert.equal(evaluateRunaway(state, 55, KILL).kill, false); // shrank — streak resets
 });
 
 test('evaluateRunaway: a shrinking tree (127 -> 69) warns once but never kills', () => {
   const state = freshState();
-  const first = evaluateRunaway(state, 127, { killEnabled: true });
+  const first = evaluateRunaway(state, 127, KILL);
   assert.equal(first.alert, true);
   assert.equal(first.kill, false);
-  const second = evaluateRunaway(state, 69, { killEnabled: true });
+  const second = evaluateRunaway(state, 69, KILL);
   assert.equal(second.kill, false);
   assert.equal(second.alert, false); // still latched-alerted from the first sweep
   assert.equal(state.growthStreak, 0);
@@ -386,34 +461,34 @@ test('evaluateRunaway: a shrinking tree (127 -> 69) warns once but never kills',
 
 test('evaluateRunaway: sustained growth (52 -> 68 -> 86) warns at sweep 1, kills at sweep 3', () => {
   const state = freshState();
-  const first = evaluateRunaway(state, 52, { killEnabled: true });
+  const first = evaluateRunaway(state, 52, KILL);
   assert.equal(first.alert, true);
   assert.equal(first.kill, false);
-  const second = evaluateRunaway(state, 68, { killEnabled: true }); // +16 — growthStreak 1
+  const second = evaluateRunaway(state, 68, KILL); // +16 — growthStreak 1
   assert.equal(second.kill, false);
-  const third = evaluateRunaway(state, 86, { killEnabled: true }); // +18 — growthStreak 2 -> kill
+  const third = evaluateRunaway(state, 86, KILL); // +18 — growthStreak 2 -> kill
   assert.equal(third.kill, true);
   assert.equal(third.alert, false); // the kill supersedes the warning
 });
 
 test('evaluateRunaway: a rise from below the threshold does not count as growth (34 -> 52 -> 68)', () => {
   const state = freshState();
-  evaluateRunaway(state, 34, { killEnabled: true }); // below threshold — no alert, no streak
-  const second = evaluateRunaway(state, 52, { killEnabled: true }); // crosses threshold, but prior sweep was below it
+  evaluateRunaway(state, 34, KILL); // below threshold — no alert, no streak
+  const second = evaluateRunaway(state, 52, KILL); // crosses threshold, but prior sweep was below it
   assert.equal(second.kill, false);
   assert.equal(state.growthStreak, 0);
-  const third = evaluateRunaway(state, 68, { killEnabled: true }); // first sweep that can count as growth
+  const third = evaluateRunaway(state, 68, KILL); // first sweep that can count as growth
   assert.equal(third.kill, false);
   assert.equal(state.growthStreak, 1);
 });
 
 test('evaluateRunaway: a flat sweep breaks the growth streak (52, 68, 68, 86 never kills)', () => {
   const state = freshState();
-  evaluateRunaway(state, 52, { killEnabled: true });
-  evaluateRunaway(state, 68, { killEnabled: true }); // growthStreak 1
-  assert.equal(evaluateRunaway(state, 68, { killEnabled: true }).kill, false); // flat — streak resets to 0
+  evaluateRunaway(state, 52, KILL);
+  evaluateRunaway(state, 68, KILL); // growthStreak 1
+  assert.equal(evaluateRunaway(state, 68, KILL).kill, false); // flat — streak resets to 0
   assert.equal(state.growthStreak, 0);
-  assert.equal(evaluateRunaway(state, 86, { killEnabled: true }).kill, false); // growthStreak back to 1, not yet 2
+  assert.equal(evaluateRunaway(state, 86, KILL).kill, false); // growthStreak back to 1, not yet 2
 });
 
 test('evaluateRunaway: a slow climb under the growth threshold (+9/sweep) never kills below the ceiling', () => {
@@ -421,59 +496,207 @@ test('evaluateRunaway: a slow climb under the growth threshold (+9/sweep) never 
   let count = 52;
   for (let i = 0; i < 10; i++) {
     count += 9;
-    assert.equal(evaluateRunaway(state, count, { killEnabled: true }).kill, false);
+    assert.equal(evaluateRunaway(state, count, KILL).kill, false);
   }
   assert.ok(count < 150);
 });
 
 test('evaluateRunaway kills at once at the ceiling, even on the first sweep', () => {
   const state = freshState();
-  const result = evaluateRunaway(state, 150, { killEnabled: true });
+  const result = evaluateRunaway(state, 150, KILL);
   assert.equal(result.kill, true);
   assert.equal(result.alert, false);
 });
 
 test('evaluateRunaway does not kill just under the ceiling on a first sweep', () => {
   const state = freshState();
-  const result = evaluateRunaway(state, 149, { killEnabled: true });
+  const result = evaluateRunaway(state, 149, KILL);
   assert.equal(result.kill, false);
   assert.equal(result.alert, true);
 });
 
 test('evaluateRunaway honors a per-state killCeiling override', () => {
   const state = { ...freshState(), killCeiling: 80 };
-  assert.equal(evaluateRunaway(state, 79, { killEnabled: true }).kill, false);
-  assert.equal(evaluateRunaway(state, 80, { killEnabled: true }).kill, true);
+  assert.equal(evaluateRunaway(state, 79, KILL).kill, false);
+  assert.equal(evaluateRunaway(state, 80, KILL).kill, true);
 });
 
 test('evaluateRunaway: a dip below threshold resets the growth streak (60 -> 40 -> 60 never kills)', () => {
   const state = freshState();
-  const a = evaluateRunaway(state, 60, { killEnabled: true });
+  const a = evaluateRunaway(state, 60, KILL);
   assert.equal(a.alert, true);
   assert.equal(a.kill, false);
-  const b = evaluateRunaway(state, 40, { killEnabled: true }); // >= threshold/2 (25): alerted latch stays set
+  const b = evaluateRunaway(state, 40, KILL); // >= threshold/2 (25): alerted latch stays set
   assert.equal(b.alert, false);
   assert.equal(b.kill, false);
   assert.equal(state.growthStreak, 0);
-  const c = evaluateRunaway(state, 60, { killEnabled: true }); // back up, but the sweep before it (40) was below threshold
+  const c = evaluateRunaway(state, 60, KILL); // back up, but the sweep before it (40) was below threshold
   assert.equal(c.kill, false);
   assert.equal(state.growthStreak, 0);
 });
 
 test('evaluateRunaway latches a kill — a surviving tree reports kill again on later sweeps even if growth stops', () => {
   const state = freshState();
-  evaluateRunaway(state, 52, { killEnabled: true });
-  assert.equal(evaluateRunaway(state, 68, { killEnabled: true }).kill, false);
-  assert.equal(evaluateRunaway(state, 86, { killEnabled: true }).kill, true); // growthStreak reaches 2
-  assert.equal(evaluateRunaway(state, 86, { killEnabled: true }).kill, true); // flat — still reports kill (latched)
-  assert.equal(evaluateRunaway(state, 10, { killEnabled: true }).kill, true); // even a big drop still reports kill (latched)
+  evaluateRunaway(state, 52, KILL);
+  assert.equal(evaluateRunaway(state, 68, KILL).kill, false);
+  assert.equal(evaluateRunaway(state, 86, KILL).kill, true); // growthStreak reaches 2
+  assert.equal(evaluateRunaway(state, 86, KILL).kill, true); // flat — still reports kill (latched)
+  assert.equal(evaluateRunaway(state, 10, KILL).kill, true); // even a big drop still reports kill (latched)
 });
 
 test('evaluateRunaway tolerates a legacy state with no growthStreak/killed fields', () => {
   const state = { threshold: 50, lastCount: 0, lastAlertCount: 0, alerted: false };
-  assert.equal(evaluateRunaway(state, 60, { killEnabled: true }).kill, false);
+  assert.equal(evaluateRunaway(state, 60, KILL).kill, false);
   assert.equal(state.growthStreak, 0);
   assert.equal(state.killed, false);
+});
+
+test('limits.warnDescendants overrides the state threshold and scales the ceiling', () => {
+  const state = freshState();
+  const limits = { warnDescendants: 20, watchdogAction: 'kill' };
+  assert.deepEqual(evaluateRunaway(state, 25, limits), { alert: true, pause: false, kill: false, count: 25, rssMb: 0, reason: 'count' });
+  assert.equal(evaluateRunaway(state, 59, limits).kill, false);
+  assert.equal(evaluateRunaway(freshState(), 60, limits).kill, true); // 3 x 20
+});
+
+// ── evaluateRunaway() — memory rules and the pause action ──
+
+test('RSS_* constants match the documented memory policy', () => {
+  assert.equal(RSS_WARN_FRACTION, 1);
+  assert.equal(RSS_ACT_CONSECUTIVE, 2);
+  assert.equal(RSS_ACT_IMMEDIATE_FACTOR, 1.5);
+  assert.equal(RSS_PAUSE_CONSECUTIVE, 3);
+  assert.equal(RSS_PAUSE_FACTOR, 2);
+  assert.equal(RESUME_RSS_GRACE_FRACTION, 0.25);
+});
+
+test('a steady 54-process low-memory tree is never paused or killed, in either acting mode', () => {
+  for (const action of ['pause', 'kill']) {
+    const state = freshState();
+    let alerts = 0;
+    for (let i = 0; i < 20; i++) {
+      const result = evaluateRunaway(state, { count: 54, rssMb: 900 }, withMemory(action));
+      assert.equal(result.pause, false, `${action} sweep ${i}`);
+      assert.equal(result.kill, false, `${action} sweep ${i}`);
+      if (result.alert) alerts++;
+    }
+    assert.equal(alerts, 1); // warned once about the count, nothing more
+    assert.equal(state.paused, undefined);
+    assert.equal(state.killed, false);
+  }
+});
+
+test('memory warns at the budget, re-alerts after another budget of growth, and re-arms below half', () => {
+  const state = freshState();
+  const limits = withMemory('pause');
+  assert.equal(evaluateRunaway(state, { count: 5, rssMb: 3071 }, limits).alert, false);
+  const warned = evaluateRunaway(state, { count: 5, rssMb: 3072 }, limits);
+  assert.deepEqual(warned, { alert: true, pause: false, kill: false, count: 5, rssMb: 3072, reason: 'memory' });
+  assert.equal(evaluateRunaway(state, { count: 5, rssMb: 6000 }, limits).alert, false);
+  assert.equal(evaluateRunaway(state, { count: 5, rssMb: 6144 }, limits).alert, true);
+  assert.equal(evaluateRunaway(state, { count: 5, rssMb: 1500 }, limits).alert, false);
+  assert.equal(evaluateRunaway(state, { count: 5, rssMb: 3072 }, limits).alert, true);
+});
+
+test('without a memory limit the rss figure is carried but never judged', () => {
+  const state = freshState();
+  const result = evaluateRunaway(state, { count: 5, rssMb: 99999 }, PAUSE);
+  assert.deepEqual(result, { alert: false, pause: false, kill: false, count: 5, rssMb: 99999, reason: null });
+});
+
+test('6000 MB with 35 processes stays running at a 3072 MB budget', () => {
+  const state = freshState();
+  for (let i = 0; i < 8; i++) {
+    const result = evaluateRunaway(state, { count: 35, rssMb: 6000 }, withMemory('pause'));
+    assert.equal(result.pause, false);
+    assert.equal(result.kill, false);
+  }
+});
+
+test('pause needs three consecutive sweeps strictly above twice the budget', () => {
+  const state = freshState();
+  const limits = withMemory('pause');
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6145 }, limits).pause, false);
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6145 }, limits).pause, false);
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6144 }, limits).pause, false);
+  assert.equal(state.rssStreak, 0);
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6200 }, limits).pause, false);
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6300 }, limits).pause, false);
+  const sustained = evaluateRunaway(state, { count: 12, rssMb: 6400 }, limits);
+  assert.deepEqual(sustained, { alert: false, pause: true, kill: false, count: 12, rssMb: 6400, reason: 'memory' });
+  assert.equal(state.paused, true);
+});
+
+test('explicit kill mode keeps the immediate 1.5x memory rule', () => {
+  assert.equal(evaluateRunaway(freshState(), { count: 12, rssMb: 4607 }, withMemory('kill')).kill, false);
+  const killed = evaluateRunaway(freshState(), { count: 12, rssMb: 4608 }, withMemory('kill'));
+  assert.deepEqual(killed, { alert: false, pause: false, kill: true, count: 12, rssMb: 4608, reason: 'memory' });
+});
+
+test('the pause action never kills, whatever the tree does — and stays latched until resumed', () => {
+  const state = freshState();
+  const limits = withMemory('pause');
+  for (const sample of [{ count: 12, rssMb: 6200 }, { count: 12, rssMb: 6300 }, { count: 12, rssMb: 6400 }, { count: 400, rssMb: 20000 }, { count: 2, rssMb: 10 }]) {
+    const result = evaluateRunaway(state, sample, limits);
+    assert.equal(result.kill, false);
+    if (sample.rssMb >= 6400 || state.paused) {
+      assert.equal(result.pause, true); // latched after sweep three
+      assert.equal(result.alert, false);
+      assert.equal(result.reason, 'memory');
+    }
+  }
+  assert.equal(state.killed, false);
+});
+
+test('a count runaway pauses in pause mode: sustained growth, and the ceiling', () => {
+  const state = freshState();
+  assert.equal(evaluateRunaway(state, { count: 52, rssMb: 300 }, withMemory('pause')).alert, true);
+  assert.equal(evaluateRunaway(state, { count: 68, rssMb: 300 }, withMemory('pause')).pause, false);
+  const grown = evaluateRunaway(state, { count: 86, rssMb: 300 }, withMemory('pause'));
+  assert.deepEqual(grown, { alert: false, pause: true, kill: false, count: 86, rssMb: 300, reason: 'count' });
+  const atCeiling = evaluateRunaway(freshState(), { count: 150, rssMb: 300 }, withMemory('pause'));
+  assert.equal(atCeiling.pause, true);
+  assert.equal(atCeiling.reason, 'count');
+});
+
+test('after a resume the still-large tree is left running; only fresh growth pauses it again', () => {
+  const state = freshState();
+  const limits = withMemory('pause');
+  for (const rssMb of [6400, 6500, 6600]) evaluateRunaway(state, { count: 12, rssMb }, limits);
+  assert.equal(state.paused, true);
+  // What resumeRunawaySession() does to the watchdog state:
+  Object.assign(state, { paused: false, actReason: null, growthStreak: 0, rssStreak: 0, resumeBase: { count: 12, rssMb: 5000 } });
+  for (let i = 0; i < 5; i++) assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6100 }, limits).pause, false);
+  // Resume base 5000 + 25% grace is below 2x budget, so 2x still governs.
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6144 }, limits).pause, false);
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6145 }, limits).pause, false);
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6145 }, limits).pause, false);
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6145 }, limits).pause, true);
+});
+
+test('the resume base is dropped once the tree is back under the limit, re-arming the normal rule', () => {
+  const state = { ...freshState(), resumeBase: { count: 12, rssMb: 5000 } };
+  const limits = withMemory('pause');
+  evaluateRunaway(state, { count: 12, rssMb: 2000 }, limits);
+  assert.equal(state.resumeBase, null);
+  for (let i = 0; i < 2; i++) assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6145 }, limits).pause, false);
+  assert.equal(evaluateRunaway(state, { count: 12, rssMb: 6145 }, limits).pause, true);
+});
+
+test('after resuming a count pause the ceiling moves a full threshold past the resume count', () => {
+  const state = { ...freshState(), lastCount: 160, alerted: true, lastAlertCount: 160, resumeBase: { count: 160, rssMb: 300 } };
+  const limits = withMemory('pause');
+  assert.equal(evaluateRunaway(state, { count: 165, rssMb: 300 }, limits).pause, false);
+  assert.equal(evaluateRunaway(state, { count: 172, rssMb: 300 }, limits).pause, false); // +7, no growth streak
+  assert.equal(evaluateRunaway(state, { count: 210, rssMb: 300 }, limits).pause, true); // 160 + 50
+});
+
+test('switching the action to kill while paused escalates to a kill', () => {
+  const state = freshState();
+  for (let i = 0; i < 3; i++) evaluateRunaway(state, { count: 12, rssMb: 6200 }, withMemory('pause'));
+  const result = evaluateRunaway(state, { count: 12, rssMb: 5000 }, withMemory('kill'));
+  assert.equal(result.kill, true);
+  assert.equal(result.pause, false);
 });
 
 // ── summarizeDescendants() / describeKillPolicy() / buildRunawayWarning() (TPT370) ──
@@ -502,20 +725,41 @@ test('describeKillPolicy names the threshold, growth step and ceiling', () => {
   assert.match(text, /≥50/);
   assert.match(text, /≥10/);
   assert.match(text, /≥150/);
+  assert.doesNotMatch(text, /MB/); // no memory limit given — no memory clause
+});
+
+test('describeActPolicy scales the ceiling with the threshold and adds the memory clause when a limit is set', () => {
+  assert.match(describeActPolicy(20), /≥20 each growing by ≥10, or immediately at ≥60$/);
+  const withLimit = describeActPolicy(50, { limitMb: 3072 });
+  assert.match(withLimit, /≥150 processes/);
+  assert.match(withLimit, /memory stays ≥3072 MB for 2 checks/);
+  assert.match(withLimit, /immediately at ≥4608 MB/);
+  assert.equal(describeKillPolicy(50, undefined, undefined, 3072), `kill ${withLimit}`);
+  assert.match(describeActPolicy(50, { limitMb: 3072, action: 'pause' }), /memory stays >6144 MB for 3 checks/);
 });
 
 test('buildRunawayWarning states the session keeps running and appends a summary when given one', () => {
   const bare = buildRunawayWarning(54, 50, '');
   assert.match(bare, /^54 descendant processes/);
   assert.match(bare, /keeps running/);
-  assert.match(bare, /Automatic termination is disabled/);
+  assert.match(bare, /only warns: automatic pause and termination are disabled/);
   assert.doesNotMatch(bare, /kill after|killed automatically/);
   assert.equal(bare.includes('Top processes'), false);
   const withSummary = buildRunawayWarning(54, 50, 'npm ×24');
   assert.match(withSummary, /Top processes: npm ×24\./);
-  const enabled = buildRunawayWarning(54, 50, '', { killEnabled: true });
+  const enabled = buildRunawayWarning(54, 50, '', { action: 'kill' });
   assert.match(enabled, /Automatic termination enabled/);
   assert.ok(enabled.includes(describeKillPolicy(50)));
+});
+
+test('buildRunawayWarning names the memory figures and what the pause action will do', () => {
+  const byMemory = buildRunawayWarning(12, 50, '', { rssMb: 2300, limitMb: 3072, action: 'pause', reason: 'memory' });
+  assert.match(byMemory, /uses 2300 MB of its 3072 MB memory limit \(12 descendant processes\)/);
+  assert.match(byMemory, /keeps running/);
+  assert.match(byMemory, /will pause it — nothing is killed and it can be resumed/);
+  assert.doesNotMatch(byMemory, /Automatic termination enabled/);
+  const byCount = buildRunawayWarning(54, 50, '', { rssMb: 900, limitMb: 3072, action: 'pause', reason: 'count' });
+  assert.match(byCount, /^54 descendant processes using 900 MB under this session/);
 });
 
 // ── sweepDescendantWatchdog() — the 30s watchdog tick, deps stubbed (TPT370) ──
@@ -531,16 +775,30 @@ function makeSweepSession(overrides = {}) {
 function makeSweepDeps() {
   const notices = [];
   const kills = [];
+  const pauses = [];
   const emits = [];
   return {
-    notices, kills, emits,
+    notices, kills, pauses, emits,
     deps: {
       emitTerminalNotice: (session, text) => notices.push({ session, text }),
       killRunawaySession: (session, opts) => { kills.push({ session, opts }); session.alive = false; return { text: 'killed', first: true }; },
+      // Same contract as terminal-session.js's: first call reports first:true, repeats do not.
+      pauseRunawaySession: (session, opts) => {
+        pauses.push({ session, opts });
+        const first = !session._pause;
+        session._pause = session._pause || { text: 'paused' };
+        return { text: 'paused', first };
+      },
       emitSessionRunaway: (projectPath, detail) => emits.push({ projectPath, detail }),
       log: () => {},
     },
   };
+}
+
+// `n` descendants of pty leader 10, each with `rssKb` resident memory (leader: 0).
+function treeSnapshot(n, rssKb = 0) {
+  return parsePsOutput(['  10  10  1  0  S  bash',
+    ...Array.from({ length: n }, (_, i) => `  10  ${1000 + i}  10  ${rssKb}  S  node`)].join('\n'));
 }
 
 test('sweepDescendantWatchdog defaults to warn-only even with sustained growth or 160 descendants', () => {
@@ -557,7 +815,7 @@ test('sweepDescendantWatchdog defaults to warn-only even with sustained growth o
   assert.equal(emits.length, 2);
   assert.ok(emits.every(frame => frame.detail.killed !== true));
   assert.equal(emits[1].detail.count, 160);
-  assert.match(emits[1].detail.promptText, /Automatic termination is disabled/);
+  assert.match(emits[1].detail.promptText, /only warns: automatic pause and termination are disabled/);
   assert.equal(session.alive, true);
   assert.equal(session.descendantWatchdog.killed, false);
 });
@@ -581,7 +839,7 @@ test('sweepDescendantWatchdog: sustained growth kills once, with killed:true on 
   const session = makeSweepSession();
   const sessions = new Map([['k1', session]]);
   const { kills, emits, deps } = makeSweepDeps();
-  deps.killEnabled = true;
+  deps.resolveLimits = () => KILL;
   const snapshotFor = (n) => parsePsOutput(['  10  10  1  S  bash', ...Array.from({ length: n }, (_, i) => `  10  ${100 + i}  10  S  npm`)].join('\n'));
   sweepDescendantWatchdog(sessions, snapshotFor(52), deps);
   sweepDescendantWatchdog(sessions, snapshotFor(68), deps);
@@ -598,7 +856,7 @@ test('sweepDescendantWatchdog kills immediately at the ceiling', () => {
   const session = makeSweepSession();
   const sessions = new Map([['k1', session]]);
   const { kills, deps } = makeSweepDeps();
-  deps.killEnabled = true;
+  deps.resolveLimits = () => KILL;
   const snapshot = parsePsOutput(['  10  10  1  S  bash', ...Array.from({ length: 160 }, (_, i) => `  10  ${1000 + i}  10  S  npm`)].join('\n'));
   sweepDescendantWatchdog(sessions, snapshot, deps);
   assert.equal(kills.length, 1);
@@ -616,6 +874,133 @@ test('sweepDescendantWatchdog skips dead, non-terminal, and state-less sessions'
   sweepDescendantWatchdog(sessions, snapshot, deps);
   assert.equal(notices.length, 0);
   assert.equal(kills.length, 0);
+});
+
+// ── sweepDescendantWatchdog() — memory + the pause action ──
+
+test('sweepDescendantWatchdog: a steady 54-process low-memory tree is warned about once and never paused or killed', () => {
+  const session = makeSweepSession();
+  const sessions = new Map([['k1', session]]);
+  const { notices, kills, pauses, emits, deps } = makeSweepDeps();
+  deps.resolveLimits = () => withMemory('pause');
+  for (let i = 0; i < 12; i++) sweepDescendantWatchdog(sessions, treeSnapshot(54, 16 * 1024), deps); // 864 MB
+  assert.equal(pauses.length, 0);
+  assert.equal(kills.length, 0);
+  assert.equal(notices.length, 1);
+  assert.equal(emits.length, 1);
+  assert.equal(emits[0].detail.rssMb, 864);
+  assert.equal(emits[0].detail.limitMb, LIMIT_MB);
+  assert.equal(emits[0].detail.paused, undefined);
+  assert.equal(session._pause, undefined);
+  assert.equal(session.alive, true);
+});
+
+test('sweepDescendantWatchdog: a tree above twice its memory budget pauses on third sweep and re-signals quietly', () => {
+  const session = makeSweepSession();
+  const sessions = new Map([['k1', session]]);
+  const { notices, kills, pauses, emits, deps } = makeSweepDeps();
+  deps.resolveLimits = () => withMemory('pause');
+  const over = treeSnapshot(8, 800 * 1024); // 6400 MB in 8 processes
+  sweepDescendantWatchdog(sessions, over, deps); // sweep 1: warn only (not yet sustained)
+  assert.equal(pauses.length, 0);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].text, /uses 6400 MB of its 3072 MB memory limit/);
+  assert.equal(emits[0].detail.reason, 'memory');
+  sweepDescendantWatchdog(sessions, over, deps); // sweep 2: still running
+  assert.equal(pauses.length, 0);
+  sweepDescendantWatchdog(sessions, over, deps); // sweep 3: pause
+  assert.equal(pauses.length, 1);
+  assert.deepEqual(
+    { count: pauses[0].opts.count, rssMb: pauses[0].opts.rssMb, limitMb: pauses[0].opts.limitMb, reason: pauses[0].opts.reason },
+    { count: 8, rssMb: 6400, limitMb: LIMIT_MB, reason: 'memory' },
+  );
+  assert.equal(pauses[0].opts.snapshot, over);
+  assert.equal(emits.length, 2);
+  assert.equal(emits[1].detail.paused, true);
+  assert.equal(emits[1].detail.killed, undefined);
+  assert.equal(emits[1].detail.promptText, 'paused');
+  sweepDescendantWatchdog(sessions, over, deps); // sweep 4: latched — re-signal
+  assert.equal(pauses.length, 2);
+  assert.equal(emits.length, 2);
+  assert.equal(notices.length, 1);
+  assert.equal(kills.length, 0);
+  assert.equal(session.alive, true);
+});
+
+test('sweepDescendantWatchdog: a count runaway pauses in pause mode instead of killing', () => {
+  const session = makeSweepSession();
+  const sessions = new Map([['k1', session]]);
+  const { kills, pauses, emits, deps } = makeSweepDeps();
+  deps.resolveLimits = () => withMemory('pause');
+  for (const n of [52, 68, 86]) sweepDescendantWatchdog(sessions, treeSnapshot(n, 1024), deps);
+  assert.equal(kills.length, 0);
+  assert.equal(pauses.length, 1);
+  assert.equal(pauses[0].opts.reason, 'count');
+  assert.equal(emits.at(-1).detail.paused, true);
+});
+
+test('sweepDescendantWatchdog: kill mode kills on sustained memory and passes the memory figures', () => {
+  const session = makeSweepSession();
+  const sessions = new Map([['k1', session]]);
+  const { kills, pauses, emits, deps } = makeSweepDeps();
+  deps.resolveLimits = () => withMemory('kill');
+  sweepDescendantWatchdog(sessions, treeSnapshot(8, 600 * 1024), deps); // 4800 MB >= 1.5x — at once
+  assert.equal(pauses.length, 0);
+  assert.equal(kills.length, 1);
+  assert.equal(kills[0].opts.reason, 'memory');
+  assert.equal(kills[0].opts.rssMb, 4800);
+  assert.equal(kills[0].opts.limitMb, LIMIT_MB);
+  assert.equal(emits.at(-1).detail.killed, true);
+});
+
+test('sweepDescendantWatchdog resolves limits once per project per sweep and applies them per session', () => {
+  const a1 = makeSweepSession({ tabId: 'A1', projectPath: '/a' });
+  const a2 = makeSweepSession({ tabId: 'A2', ptyPid: 20, projectPath: '/a' });
+  const b1 = makeSweepSession({ tabId: 'B1', ptyPid: 30, projectPath: '/b' });
+  const sessions = new Map([['a1', a1], ['a2', a2], ['b1', b1]]);
+  const { notices, deps } = makeSweepDeps();
+  const asked = [];
+  deps.resolveLimits = (projectPath) => {
+    asked.push(projectPath);
+    return { warnDescendants: projectPath === '/b' ? 5 : 50, maxTreeRssMb: LIMIT_MB, watchdogAction: 'pause' };
+  };
+  const rows = ['  10  10  1  0  S  bash', '  20  20  1  0  S  bash', '  30  30  1  0  S  bash'];
+  for (const root of [10, 20, 30]) {
+    for (let i = 0; i < 6; i++) rows.push(`  ${root}  ${root * 100 + i}  ${root}  1024  S  node`);
+  }
+  sweepDescendantWatchdog(sessions, parsePsOutput(rows.join('\n')), deps);
+  assert.deepEqual(asked, ['/a', '/b']);
+  assert.equal(b1.descendantWatchdog.threshold, 5); // live limits refresh the session threshold
+  assert.equal(a1.descendantWatchdog.threshold, 50);
+  assert.deepEqual(notices.map(n => n.session.tabId), ['B1']); // 6 >= 5 only in project /b
+});
+
+test('sweepDescendantWatchdog: a throwing or missing limits resolver degrades to warn-only', () => {
+  for (const resolveLimits of [undefined, () => { throw new Error('config unreadable'); }]) {
+    const session = makeSweepSession();
+    const { kills, pauses, notices, deps } = makeSweepDeps();
+    deps.resolveLimits = resolveLimits;
+    sweepDescendantWatchdog(new Map([['k1', session]]), treeSnapshot(200, 100 * 1024), deps);
+    assert.equal(kills.length, 0);
+    assert.equal(pauses.length, 0);
+    assert.equal(notices.length, 1);
+  }
+});
+
+test('sweepDescendantWatchdog: a failed pause adds one fallback warning, never a paused frame', () => {
+  const session = makeSweepSession();
+  const sessions = new Map([['k1', session]]);
+  const { notices, emits, deps } = makeSweepDeps();
+  deps.resolveLimits = () => withMemory('pause');
+  deps.pauseRunawaySession = () => null;
+  const bomb = treeSnapshot(8, 800 * 1024);
+  sweepDescendantWatchdog(sessions, bomb, deps);
+  sweepDescendantWatchdog(sessions, bomb, deps);
+  sweepDescendantWatchdog(sessions, bomb, deps);
+  assert.equal(notices.length, 2); // initial budget warning plus one failed-pause warning
+  assert.equal(emits.length, 2);
+  assert.equal(emits[1].detail.paused, undefined);
+  assert.equal(session.descendantWatchdog.paused, false);
 });
 
 // ── killProcessTree() / signalTargets() — process.kill is always stubbed ──
@@ -722,4 +1107,205 @@ test('signalTargets is a no-op on win32 and for a missing target set', () => {
     Object.defineProperty(process, 'platform', { value: origPlatform });
   }
   assert.equal(signalTargets(null, 'SIGTERM').signaled, false);
+});
+
+test('resolveTreeTargets resolves the whole tree without signaling anything', () => {
+  // Same shape as the killProcessTree case above: root group 10, escaped group 20, lone 30.
+  const snapshot = parsePsOutput([
+    '  10  10  1', '  10  11  10', '  20  20  11', '  20  21  20', '  999  30  11',
+  ].join('\n'));
+  const { result, calls } = withStubbedKill(() => resolveTreeTargets(snapshot, 10));
+  assert.deepEqual(calls, []);
+  assert.deepEqual(result.pgids.sort((a, b) => a - b), [10, 20]);
+  assert.deepEqual(result.pids, [30]);
+  assert.deepEqual(resolveTreeTargets(null, 10), { pgids: [10], pids: [] });
+  assert.deepEqual(resolveTreeTargets(snapshot, 0), { pgids: [], pids: [] });
+});
+
+test('a resolved tree can be stopped and continued: SIGSTOP then SIGCONT reach the same set', () => {
+  const snapshot = parsePsOutput(['  10  10  1', '  10  11  10', '  20  20  11', '  999  30  11'].join('\n'));
+  const { result, calls } = withStubbedKill(() => {
+    const stopped = signalTargets(resolveTreeTargets(snapshot, 10), 'SIGSTOP');
+    signalTargets(stopped, 'SIGCONT');
+    return stopped;
+  });
+  assert.equal(result.signaled, true);
+  assert.deepEqual(calls.filter(([, sig]) => sig === 'SIGSTOP').map(([pid]) => pid), [-10, -20, 30]);
+  assert.deepEqual(calls.filter(([, sig]) => sig === 'SIGCONT').map(([pid]) => pid), [-10, -20, 30]);
+  assert.ok(calls.every(([, sig]) => sig === 'SIGSTOP' || sig === 'SIGCONT')); // nothing lethal
+});
+
+// ── resolveAgentLimits() (TPT440) — env/config stubbed, never touches the real environment ──
+
+const K = AGENT_LIMIT_KEYS;
+const GB = 1024 ** 3;
+const HW_48 = { totalMemBytes: 48 * GB, cores: 12 }; // device cap 6 at the default 6144 MB budget
+const limits = (cfg, env = {}, hardware = HW_48) => resolveAgentLimits('/p', { env, readConfig: () => cfg, hardware });
+
+test('resolveAgentLimits returns the defaults with no config and no env', () => {
+  assert.deepEqual(limits(null), {
+    maxConcurrentSessions: 6, deviceSessionCap: 6, sessionCapSource: 'device',
+    maxSubagents: 3, warnDescendants: 50, maxTreeRssMb: 6144, watchdogAction: 'pause',
+  });
+  assert.equal(AGENT_LIMIT_DEFAULTS.warnDescendants, DESCENDANT_ALERT_THRESHOLD);
+  assert.deepEqual(WATCHDOG_ACTIONS, ['warn', 'pause', 'kill']);
+});
+
+test('evaluateRunaway warns at 6144 MB for both the default and a configured 6 GB budget', () => {
+  for (const resolved of [limits(null), limits({ [K.maxTreeRssMb]: '6144' })]) {
+    assert.equal(resolved.maxTreeRssMb, 6144);
+    const state = freshState();
+    for (const rssMb of [3072, 6143]) {
+      assert.equal(evaluateRunaway(state, { count: 5, rssMb }, resolved).alert, false);
+    }
+    assert.deepEqual(evaluateRunaway(state, { count: 5, rssMb: 6144 }, resolved), {
+      alert: true, pause: false, kill: false, count: 5, rssMb: 6144, reason: 'memory',
+    });
+  }
+});
+
+test('sweepDescendantWatchdog displays the resolved 6144 MB limit when it warns', () => {
+  const session = makeSweepSession();
+  const { notices, emits, deps } = makeSweepDeps();
+  deps.resolveLimits = () => limits(null);
+  const sessions = new Map([['k1', session]]);
+  sweepDescendantWatchdog(sessions, treeSnapshot(8, 384 * 1024), deps); // 3072 MB
+  assert.equal(notices.length, 0);
+  sweepDescendantWatchdog(sessions, treeSnapshot(8, 768 * 1024), deps); // 6144 MB
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].text, /uses 6144 MB of its 6144 MB memory limit/);
+  assert.equal(emits[0].detail.limitMb, 6144);
+  assert.equal(emits[0].detail.reason, 'memory');
+});
+
+test('resolveAgentLimits reads every config.json key (numbers and numeric strings)', () => {
+  const result = limits({
+    [K.maxConcurrentSessions]: 8, [K.maxSubagents]: '6', [K.warnDescendants]: 90,
+    [K.maxTreeRssMb]: '2048', [K.watchdogAction]: 'warn',
+  });
+  assert.equal(result.sessionCapSource, 'config');
+  assert.equal(result.deviceSessionCap, 12);
+  assert.deepEqual({ ...result, deviceSessionCap: undefined, sessionCapSource: undefined }, {
+    maxConcurrentSessions: 8, deviceSessionCap: undefined, sessionCapSource: undefined,
+    maxSubagents: 6, warnDescendants: 90, maxTreeRssMb: 2048, watchdogAction: 'warn',
+  });
+});
+
+test('resolveAgentLimits: env beats config per key, other keys still come from config', () => {
+  const result = limits(
+    { [K.maxSubagents]: 6, [K.maxConcurrentSessions]: 8, [K.maxTreeRssMb]: 2048, [K.watchdogAction]: 'warn' },
+    { [K.maxSubagents]: '2', [K.watchdogAction]: 'kill' },
+  );
+  assert.equal(result.maxSubagents, 2);
+  assert.equal(result.maxConcurrentSessions, 8);
+  assert.equal(result.watchdogAction, 'kill');
+});
+
+test('resolveAgentLimits: TIPATASK_WATCHDOG_KILL=1 maps to kill, above config, below the explicit env action', () => {
+  assert.equal(limits({ [K.watchdogAction]: 'warn' }, { TIPATASK_WATCHDOG_KILL: '1' }).watchdogAction, 'kill');
+  assert.equal(limits(null, { TIPATASK_WATCHDOG_KILL: '1' }).watchdogAction, 'kill');
+  assert.equal(limits(null, { TIPATASK_WATCHDOG_KILL: '1', [K.watchdogAction]: 'warn' }).watchdogAction, 'warn');
+  assert.equal(limits(null, { TIPATASK_WATCHDOG_KILL: '0' }).watchdogAction, 'pause');
+  assert.equal(limits({ [K.watchdogAction]: 'warn' }, { TIPATASK_WATCHDOG_KILL: 'true' }).watchdogAction, 'warn');
+});
+
+test('resolveAgentLimits: invalid numeric values fall back to the default', () => {
+  for (const bad of [0, -5, 1.5, 'abc', '', '  ', '1e3', '-2', '3.5', {}, [], null, true, NaN, Infinity]) {
+    const result = limits({ [K.maxSubagents]: bad, [K.maxTreeRssMb]: bad });
+    assert.equal(result.maxSubagents, AGENT_LIMIT_DEFAULTS.maxSubagents, `bad value ${String(bad)}`);
+    assert.equal(result.maxTreeRssMb, 6144);
+  }
+});
+
+test('resolveAgentLimits: a bad env value falls through to a good config value, a bad config to the default', () => {
+  assert.equal(limits({ [K.maxSubagents]: 6 }, { [K.maxSubagents]: 'lots' }).maxSubagents, 6);
+  assert.equal(limits({ [K.maxSubagents]: -1 }, { [K.maxSubagents]: '0' }).maxSubagents, 3);
+});
+
+test('resolveAgentLimits: invalid or non-string watchdog action falls back; valid action is case/space-insensitive', () => {
+  assert.equal(limits({ [K.watchdogAction]: 'nuke' }).watchdogAction, 'pause');
+  assert.equal(limits({ [K.watchdogAction]: 7 }).watchdogAction, 'pause');
+  assert.equal(limits({ [K.watchdogAction]: 'warn' }, { [K.watchdogAction]: 'nuke' }).watchdogAction, 'warn');
+  assert.equal(limits(null, { [K.watchdogAction]: ' KILL ' }).watchdogAction, 'kill');
+});
+
+test('resolveAgentLimits never throws: throwing reader, falsy root, non-object config, missing env', () => {
+  const boom = () => { throw new Error('read failed'); };
+  assert.equal(resolveAgentLimits('/p', { env: {}, readConfig: boom }).maxSubagents, 3);
+  assert.equal(resolveAgentLimits('', { env: {}, readConfig: () => ({ [K.maxSubagents]: 9 }) }).maxSubagents, 3);
+  assert.equal(limits('garbage').watchdogAction, 'pause');
+  assert.equal(resolveAgentLimits('/p', { env: null, readConfig: () => null, hardware: HW_48 }).maxConcurrentSessions, 6);
+  // real hardware detection path never throws and yields at least one slot
+  assert.ok(resolveAgentLimits('/p', { env: {}, readConfig: () => null }).maxConcurrentSessions >= 1);
+});
+
+test('resolveAgentLimits returns a fresh object each call', () => {
+  const a = limits(null);
+  a.maxSubagents = 99;
+  assert.equal(limits(null).maxSubagents, 3);
+});
+
+test('resolveAgentLimits reads .tipatask/config.json from disk through the shared resolver', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tpt440-'));
+  try {
+    fs.mkdirSync(path.join(root, '.tipatask'));
+    fs.writeFileSync(path.join(root, '.tipatask', 'config.json'),
+      JSON.stringify({ [K.maxSubagents]: 7, [K.watchdogAction]: 'warn', [K.maxTreeRssMb]: 'bogus' }));
+    const result = resolveAgentLimits(root, { env: {} });
+    assert.equal(result.maxSubagents, 7);
+    assert.equal(result.watchdogAction, 'warn');
+    assert.equal(result.maxTreeRssMb, 6144);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('config.js excludes every AGENT_LIMITS_* key from the config.json -> process.env seed', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'config.js'), 'utf8');
+  for (const key of Object.values(K)) assert.ok(src.includes(`'${key}'`), `${key} missing from seed-skip list`);
+});
+
+// ── computeDeviceSessionCap() / hardware-derived maxConcurrentSessions (TPT444) ──
+
+test('computeDeviceSessionCap follows reserve + per-session budget across machine sizes', () => {
+  const cap = (gb, cores, sessionBudgetMb = 3072) => computeDeviceSessionCap({ totalMemBytes: gb * GB, cores, sessionBudgetMb });
+  assert.equal(cap(8, 4), 1);          // 8GB: reserve 6GB, 2GB left -> 0 slots -> floored to 1
+  assert.equal(cap(16, 8), 3);         // reserve 6GB -> 10GB / 3GB
+  assert.equal(cap(32, 10), 8);        // reserve 6.4GB -> 25.6GB / 3GB
+  assert.equal(cap(48, 12), 12);       // reserve 9.6GB -> 38.4GB / 3GB = 12.8 -> 12
+  assert.equal(cap(64, 16), 16);       // reserve 12.8GB -> 51.2GB / 3GB = 17 RAM slots, CPU-bound at 16
+  assert.equal(cap(128, 64), DEVICE_SESSION_CAP_MAX);
+});
+
+test('computeDeviceSessionCap is CPU-bound on a slow multi-GB machine and floors at one slot', () => {
+  assert.equal(computeDeviceSessionCap({ totalMemBytes: 64 * GB, cores: 4, sessionBudgetMb: 3072 }), 4);
+  assert.equal(computeDeviceSessionCap({ totalMemBytes: 4 * GB, cores: 2, sessionBudgetMb: 3072 }), 1);
+});
+
+test('computeDeviceSessionCap uses the budget argument and survives bad hardware numbers', () => {
+  const big = computeDeviceSessionCap({ totalMemBytes: 48 * GB, cores: 32, sessionBudgetMb: 6144 });
+  const small = computeDeviceSessionCap({ totalMemBytes: 48 * GB, cores: 32, sessionBudgetMb: 1536 });
+  assert.ok(small > big);
+  for (const bad of [{}, undefined, { totalMemBytes: NaN, cores: 8 }, { totalMemBytes: 16 * GB, cores: 0 }, { totalMemBytes: -1, cores: 8 }]) {
+    assert.equal(computeDeviceSessionCap(bad), 1);
+  }
+});
+
+test('resolveAgentLimits derives maxConcurrentSessions from hardware and the resolved RSS budget', () => {
+  assert.equal(limits(null, {}, { totalMemBytes: 16 * GB, cores: 8 }).maxConcurrentSessions, 1);
+  assert.equal(limits(null, {}, HW_48).maxConcurrentSessions, 6);
+  // A smaller explicit memory budget still increases the cap on the same machine.
+  assert.equal(limits({ [K.maxTreeRssMb]: 3072 }, {}, HW_48).maxConcurrentSessions, 12);
+});
+
+test('resolveAgentLimits: an explicit session cap can lower but never raise the device cap', () => {
+  const lowered = limits({ [K.maxConcurrentSessions]: 2 });
+  assert.equal(lowered.maxConcurrentSessions, 2);
+  assert.equal(lowered.deviceSessionCap, 6);
+  assert.equal(lowered.sessionCapSource, 'config');
+  const raised = limits({ [K.maxConcurrentSessions]: 100 });
+  assert.equal(raised.maxConcurrentSessions, 6);
+  assert.equal(limits({ [K.maxConcurrentSessions]: 5 }, { [K.maxConcurrentSessions]: '1' }).sessionCapSource, 'env');
+  assert.equal(limits({ [K.maxConcurrentSessions]: 5 }, { [K.maxConcurrentSessions]: '1' }).maxConcurrentSessions, 1);
+  assert.equal(limits({ [K.maxConcurrentSessions]: 'junk' }).sessionCapSource, 'device');
 });

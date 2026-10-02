@@ -227,10 +227,32 @@ test('server loss records hydrate cold clients; live/exited sessions win and cle
   assert.equal(state.lostSessions.size, 0, 'old record cannot resurrect after recovery');
 });
 
-test('project changes clear lost rows and missing objective sessions never become terminal losses', () => {
+test('project changes clear lost rows and missing chat sessions never become terminal losses', () => {
   mergeSessionsSnapshot({ projectPath: '/a', sessions: ['T1', 'obj-1'], sessionMeta: { 'obj-1': { type: 'objective' } } });
+  state.activeSessions.add('projectChat:2');
   mergeSessionsSnapshot({ projectPath: '/a', sessions: [] });
   assert.deepEqual([...state.lostSessions.keys()], ['T1']);
   mergeSessionsSnapshot({ projectPath: '/b', sessions: [] });
   assert.equal(state.lostSessions.size, 0);
+});
+
+// ── (TPT444) start-queue entries ──
+
+test('mergeSessionsSnapshot keeps queued sessions out of lost/active and records their positions', () => {
+  state.queuedSessions = new Map();
+  state.activeSessions = new Set(['T1']); // optimistic add from a just-opened console
+  mergeSessionsSnapshot({ projectPath: '/q', sessions: [], exited: [], queued: [{ taskId: 'T1', position: 2 }], lost: [] });
+  assert.equal(state.queuedSessions.get('T1'), 2);
+  assert.equal(state.activeSessions.has('T1'), false);
+  assert.equal(state.lostSessions.has('T1'), false);
+});
+
+test('applyQueueSnapshot replaces the queue and returns the tasks that left it', async () => {
+  const { applyQueueSnapshot } = await import('./attention-state.js');
+  state.queuedSessions = new Map([['A', 1], ['B', 2]]);
+  const left = applyQueueSnapshot({ queued: [{ taskId: 'B', position: 1 }], running: 3, cap: 3 });
+  assert.deepEqual(left, ['A']);
+  assert.equal(state.queuedSessions.get('B'), 1);
+  assert.deepEqual(state.queueInfo, { running: 3, cap: 3 });
+  assert.deepEqual(applyQueueSnapshot(null), ['B']);
 });

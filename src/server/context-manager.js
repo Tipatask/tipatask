@@ -92,6 +92,7 @@ function resetTurnBuffers(session) {
   session.turnBuffer = '';
   session.turnRawSse = '';
   session._lastEmittedCardsJson = null;
+  session._taskChatTurn = null;
 }
 
 module.exports = { clearContext, trimContext, shouldTrimContext, resetTurnBuffers };

@@ -81,3 +81,23 @@ test('broadcastKbReindexResult: no projectPath falls through to every client, sa
   assert.equal(b.sent.length, 1);
   assert.equal(a.sent[0].error, 'boom');
 });
+
+// (TPT443) The paused banner needs the pause/resume flags and the memory figures on the frame.
+test('emitSessionRunaway: forwards paused, resumed and memory figures, project-scoped', () => {
+  const a = fakeClient(1, '/projects/a');
+  const b = fakeClient(1, '/projects/b');
+  websocket.init({ clients: new Set([a, b]) });
+
+  websocket.emitSessionRunaway('/projects/a', { taskId: 'T1', pid: 42, count: 12, threshold: 50, rssMb: 3300, limitMb: 3072, reason: 'memory', promptText: 'paused', paused: true });
+  assert.equal(b.sent.length, 0);
+  assert.deepEqual(a.sent[0], {
+    type: 'session-runaway', taskId: 'T1', pid: 42, count: 12, threshold: 50, promptText: 'paused',
+    killed: false, paused: true, resumed: false, rssMb: 3300, limitMb: 3072, reason: 'memory',
+  });
+
+  websocket.emitSessionRunaway('/projects/a', { taskId: 'T1', pid: 42, resumed: true, promptText: 'Session resumed.' });
+  assert.equal(a.sent[1].resumed, true);
+  assert.equal(a.sent[1].paused, false);
+  assert.equal(a.sent[1].rssMb, 0);
+  assert.equal(a.sent[1].reason, 'count');
+});

@@ -25,23 +25,26 @@ function shQuote(value) {
 
 // Claude executes the helper through a shell (sh on posix, cmd on win32). `electron` marks a
 // process whose execPath is the Electron binary, which needs ELECTRON_RUN_AS_NODE=1 to act as
-// plain Node. Returns null for input it cannot quote safely (a double quote in a Windows
+// plain Node. `userDataRoot` (optional) tells the helper where the account store lives. Returns null for input it cannot quote safely (a double quote in a Windows
 // path is not a legal filename character anyway).
 function buildHeadersHelperCommand({
   execPath = process.execPath,
   scriptPath = HELPER_SCRIPT,
   projectRoot,
+  userDataRoot,
   electron = !!process.versions.electron,
   platform = process.platform,
 } = {}) {
   if (!execPath || !scriptPath || !projectRoot) return null;
   if (platform === 'win32') {
-    if ([execPath, scriptPath, projectRoot].some((p) => String(p).includes('"'))) return null;
+    if ([execPath, scriptPath, projectRoot, userDataRoot || ''].some((p) => String(p).includes('"'))) return null;
     const prefix = electron ? 'set "ELECTRON_RUN_AS_NODE=1" && ' : '';
-    return `${prefix}"${execPath}" "${scriptPath}" --project-root "${projectRoot}"`;
+    const userData = userDataRoot ? ` --user-data "${userDataRoot}"` : '';
+    return `${prefix}"${execPath}" "${scriptPath}" --project-root "${projectRoot}"${userData}`;
   }
   const prefix = electron ? 'ELECTRON_RUN_AS_NODE=1 ' : '';
-  return `${prefix}${shQuote(execPath)} ${shQuote(scriptPath)} --project-root ${shQuote(projectRoot)}`;
+  const userData = userDataRoot ? ` --user-data ${shQuote(userDataRoot)}` : '';
+  return `${prefix}${shQuote(execPath)} ${shQuote(scriptPath)} --project-root ${shQuote(projectRoot)}${userData}`;
 }
 
 // Writes the derived config and returns its path, or null when there is nothing to derive
@@ -79,4 +82,44 @@ function writeSpawnMcpConfig({ projectRoot, userDataRoot, helperCommand }) {
   return outPath;
 }
 
-module.exports = { REMOTE_SERVER_NAME, HELPER_SCRIPT, buildHeadersHelperCommand, writeSpawnMcpConfig };
+// Writes a copy of the project's .mcp.json holding only the named servers and returns its
+// path, for a spawn that pairs it with --strict-mcp-config so no other MCP server (project or
+// user-level) is reachable. Returns null when .mcp.json is missing/invalid or defines none of
+// them — the caller then spawns without the flag and relies on its tool allowlist alone.
+function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label }) {
+  if (!projectRoot || !userDataRoot || !Array.isArray(servers) || !label) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(path.join(projectRoot, '.mcp.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+  const all = parsed && parsed.mcpServers;
+  if (!all || typeof all !== 'object') return null;
+  const mcpServers = {};
+  for (const name of servers) {
+    if (all[name] && typeof all[name] === 'object') mcpServers[name] = all[name];
+  }
+  if (Object.keys(mcpServers).length === 0) return null;
+
+  const dir = path.join(userDataRoot, 'mcp-spawn');
+  const id = crypto.createHash('sha1').update(path.resolve(projectRoot)).digest('hex').slice(0, 12);
+  const outPath = path.join(dir, `${id}.${String(label).replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
+  const content = JSON.stringify({ mcpServers }, null, 2) + '\n';
+  try {
+    let unchanged = false;
+    try { unchanged = fs.readFileSync(outPath, 'utf8') === content; } catch { /* absent */ }
+    if (!unchanged) {
+      fs.mkdirSync(dir, { recursive: true });
+      const tmp = `${outPath}.tmp.${process.pid}`;
+      fs.writeFileSync(tmp, content, 'utf8');
+      fs.renameSync(tmp, outPath);
+    }
+  } catch (err) {
+    console.warn(`[mcp-spawn-config] could not write scoped MCP config: ${err.message}`);
+    return null;
+  }
+  return outPath;
+}
+
+module.exports = { REMOTE_SERVER_NAME, HELPER_SCRIPT, buildHeadersHelperCommand, writeSpawnMcpConfig, writeScopedMcpConfig };

@@ -496,6 +496,21 @@ test('applyModelSelection is a no-op for specChat sessions', async () => {
   assert.equal(session.providerType, 'claude');
 });
 
+test('applyModelSelection refuses a provider that cannot enforce a task chat\'s tool profile', async () => {
+  const session = makeSession({ type: 'taskChat', toolProfile: 'taskChat', providerType: 'claude', selectedModel: 'keep-me' });
+  const result = await applyModelSelection(session, 'gemini:' + config.GEMINI_MODELS[0], { taskId: 'taskChat:TPT1' });
+  assert.equal(result.error, 'provider-unavailable');
+  assert.match(result.reason, /not available in this chat/);
+  assert.equal(session.providerType, 'claude');
+  assert.equal(session.selectedModel, 'keep-me');
+  assert.equal(session._providerSwitchPending, false);
+});
+
+test('applyModelSelection leaves a task chat alone when no model is sent', async () => {
+  const session = makeSession({ type: 'taskChat', toolProfile: 'taskChat' });
+  assert.deepEqual(await applyModelSelection(session, undefined, { taskId: 'taskChat:TPT1' }), { changed: false });
+});
+
 test('applyModelSelection ignores an absent selection', async () => {
   const session = makeSession();
   assert.deepEqual(await applyModelSelection(session, null, { taskId: 't1' }), { changed: false });

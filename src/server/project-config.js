@@ -262,7 +262,7 @@ function rendererProjectConfig(cfg = {}) {
   ]) {
     if (cfg[key] !== undefined) safe[key] = cfg[key];
   }
-  safe.hasApiToken = !!cfg.API_TOKEN;
+  safe.hasApiToken = !!cfg.API_TOKEN || !!require('./account-store').readAccount(cfg.API_BASE_URL);
   safe.hasAssemblyaiKey = !!cfg.ASSEMBLYAI_API_KEY;
   safe.PI_MODELS = rendererPiModels(cfg);
   return safe;
@@ -554,7 +554,27 @@ function buildLanguageDirective(projectRoot, opts = {}) {
   return directive;
 }
 
+// The signed-in account's token lives in the app-level account store (account-store.js),
+// not in any project's config.json. Every writer — re-auth, open-existing, the creation
+// wizard, token refresh, CLI setup — funnels through writeProjectConfig(), so the routing is
+// done once, here: a non-blank API_TOKEN is saved to the store under this config's
+// API_BASE_URL, a blank one signs that server out, and the key never reaches disk.
+// A config with no API_BASE_URL has no store key; the token then stays in the file rather
+// than being lost.
+function _routeTokenToAccountStore(config) {
+  if (!config || typeof config !== 'object' || !Object.hasOwn(config, 'API_TOKEN')) return config;
+  const { API_TOKEN: token, ...rest } = config;
+  const baseUrl = rest.API_BASE_URL;
+  const accountStore = require('./account-store');
+  if (!accountStore.normalizeBaseUrl(baseUrl)) return config;
+  const value = typeof token === 'string' ? token.trim() : '';
+  if (value) accountStore.writeAccountToken(baseUrl, value);
+  else accountStore.clearAccountToken(baseUrl);
+  return rest;
+}
+
 function writeProjectConfig(projectRoot, config) {
+  config = _routeTokenToAccountStore(config);
   const dir = path.join(projectRoot, '.tipatask');
   fs.mkdirSync(dir, { recursive: true });
   const configPath = path.join(dir, 'config.json');
@@ -564,6 +584,36 @@ function writeProjectConfig(projectRoot, config) {
   // (C1259) Evict the read cache above so an immediate same-process readProjectConfig()
   // never serves stale data on a low-resolution mtime clock.
   _readConfigCache.delete(projectRoot);
+}
+
+// One-time move of a legacy per-project config.json API_TOKEN into the account store.
+// A project written before the account store still carries the token inline; the first
+// getApiCredentials() read lifts it into the store (unless the store already holds a token
+// that outlives it) and strips the key so config.json stops being a credential file.
+// A legacy blank is only stripped — it never signs the account out of other projects.
+// Never throws: a read-only checkout just keeps working off the inline token.
+function migrateLegacyApiToken(projectRoot) {
+  try {
+    const configPath = path.join(projectRoot, CONFIG_REL);
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !Object.hasOwn(raw, 'API_TOKEN')) return false;
+    const accountStore = require('./account-store');
+    if (!accountStore.normalizeBaseUrl(raw.API_BASE_URL)) return false;
+    const legacy = typeof raw.API_TOKEN === 'string' ? raw.API_TOKEN.trim() : '';
+    if (legacy) {
+      const expOf = (t) => Number((accountStore.decodeTokenPayload(t) || {}).exp) || 0;
+      const stored = accountStore.readAccount(raw.API_BASE_URL);
+      // >= so an inline token written by an older Task App build (same or later expiry) wins.
+      if (!stored || expOf(legacy) >= expOf(stored.token)) accountStore.writeAccountToken(raw.API_BASE_URL, legacy);
+    }
+    delete raw.API_TOKEN;
+    writeProjectConfig(projectRoot, raw);
+    return true;
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return false; // no config.json yet: nothing to migrate
+    console.warn(`[project-config] legacy API_TOKEN migration skipped: ${e.message}`);
+    return false;
+  }
 }
 
 function _parseEnvFile(filePath) {
@@ -727,8 +777,13 @@ function writeProjectClaudeMcpApproval(projectRoot) {
   if (_ensureGitignoreLine(projectRoot, '.claude/settings.local.json')) {
     const cfg = readProjectConfig(projectRoot);
     const wanted = {};
-    for (const k of ['API_BASE_URL', 'API_PROJECT_ID', 'API_TOKEN']) {
+    for (const k of ['API_BASE_URL', 'API_PROJECT_ID']) {
       if (cfg) wanted[k] = cfg[k] == null ? '' : String(cfg[k]);
+    }
+    // The token comes from the account store; a legacy config.json token is the fallback.
+    if (cfg) {
+      const account = require('./account-store').readAccount(cfg.API_BASE_URL);
+      wanted.API_TOKEN = account ? account.token : (cfg.API_TOKEN == null ? '' : String(cfg.API_TOKEN));
     }
     if (Object.keys(wanted).length > 0) {
       const beforeEnv = JSON.stringify(settings.env || {});
@@ -763,6 +818,9 @@ function writeProjectClaudeMcpApproval(projectRoot) {
 function writeProjectMcpConfig(projectRoot, serverRoot) {
   const absProjectRoot = path.resolve(projectRoot);
   const absServerRoot = path.resolve(serverRoot);
+  // Same rule as config.js USER_DATA_ROOT: TIPATASK_USER_DATA, else the server root. Handed
+  // to the stdio server so a `claude` launched from a plain shell still finds the account store.
+  const userDataRoot = path.resolve(process.env.TIPATASK_USER_DATA || absServerRoot);
 
   // Pre-approve both MCP servers in Claude's local project settings so the "New MCP
   // server found" trust dialog never appears on a task's first spawn (C1047), and (C1382)
@@ -794,6 +852,7 @@ function writeProjectMcpConfig(projectRoot, serverRoot) {
         ELECTRON_RUN_AS_NODE: '1',
         TIPATASK_PROJECT_ROOT: absProjectRoot,
         TIPATASK_SERVER_ROOT: asarRoot,                                  // …/Contents/Resources/app.asar
+        TIPATASK_USER_DATA: userDataRoot,                                // account store + .file-tracks live here
         TIPATASK_MCP_LOCAL_ONLY: '1',
       },
     };
@@ -806,6 +865,7 @@ function writeProjectMcpConfig(projectRoot, serverRoot) {
       env: {
         TIPATASK_PROJECT_ROOT: absProjectRoot,
         TIPATASK_SERVER_ROOT: absServerRoot,
+        TIPATASK_USER_DATA: userDataRoot,
         TIPATASK_MCP_LOCAL_ONLY: '1',
       },
     };
@@ -880,6 +940,7 @@ module.exports = {
   migrateFromLegacy,
   CONFIG_FIELDS,
   API_CREDENTIAL_FIELDS,
+  migrateLegacyApiToken,
   readProjectMeta,
   writeProjectMeta,
   buildLanguageDirective,

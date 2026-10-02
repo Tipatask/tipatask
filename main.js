@@ -45,7 +45,9 @@ const { loadWorkspace, saveWorkspace } = require('./src/server/workspace-state')
 // require (does not violate the C1173 no-module-scope-I/O rule below).
 const { shouldRestoreFromDevice, resolveStartupProjectPaths } = require('./src/server/window-session');
 const { readProjectConfig, writeProjectMcpConfig, writeProjectSkillsConfig } = require('./src/server/project-config');
-const { getApiCredentials } = require('./src/server/api-credentials');
+const { getApiCredentials, getAccountUserId } = require('./src/server/api-credentials');
+const { normalizeBaseUrl, readAccount } = require('./src/server/account-store');
+const recentProjectsModel = require('./src/server/recent-projects');
 const { writeProjectCodexConfig } = require('./src/codex-mcp-config');
 const { bindWindowToProject, getWindowState, dropWindow, reconfigureWindowBackend, setServerMessenger } = require('./main/window-state');
 const { shouldOpenExternally } = require('./main/external-links');
@@ -58,6 +60,7 @@ const windowRegistry = require('./main/window-registry');
 const { LOCALES, setMenuLocale, getMenuLocale, mt } = require('./main/menu-i18n');
 // (C1532) About + Third-Party Licenses windows — see about-window.js header.
 const { openAboutWindow, openNoticesWindow } = require('./main/about-window');
+const { createProjectAccessGate, projectAccessDialog } = require('./main/project-access');
 const { resolveAppVersion } = require('./src/server/app-version');
 const { ensureBundleSignatureHealthy } = require('./src/server/bundle-signature');
 // (C1355) Duplicate-LaunchServices-claimant self-heal — see ls-registration.js's header comment.
@@ -264,7 +267,6 @@ let _notifyLiveSeq = 0;
 let workspaceState = null;
 const SESSION_FILE = 'session.json';
 const RECENT_PROJECTS_FILE = 'recent-projects.json';
-const RECENT_PROJECTS_LIMIT = 10;
 
 let _confirmingQuit = false;
 let _quitConfirmed = false;
@@ -276,48 +278,117 @@ let _forceReauthInFlight = false;
 // closed once, so no explicit cleanup needed.
 const _closeConfirmed = new WeakSet();
 
+// Access must be checked before binding a backend (which starts task/KB requests).
+const ensureProjectAccess = createProjectAccessGate({
+  readConfig: (dir) => readProjectConfig(dir)
+    || require('./src/server/project-config').migrateFromLegacy(dir),
+  getCredentials: getApiCredentials,
+  request: (...args) => require('./src/cli/http').request(...args),
+  reauthenticate: async (baseUrl) => {
+    if (_forceReauthInFlight) throw new Error('Sign-in already in progress');
+    _forceReauthInFlight = true;
+    try {
+      await require('./src/cli/auth').authenticateAndStore(baseUrl);
+    } finally {
+      _forceReauthInFlight = false;
+    }
+  },
+  prompt: async (config, dir, kind) => {
+    closeSplash();
+    const { response } = await dialog.showMessageBox(projectAccessDialog(config, dir, kind));
+    return response === 0;
+  },
+  showError: async (config, dir, kind) => {
+    closeSplash();
+    await dialog.showMessageBox(projectAccessDialog(config, dir, kind));
+  },
+  onAccountChanged: () => {
+    if (app.isReady()) createMenu();
+    reconcileRecentProjectsWithAccounts();
+  },
+});
+
 // ── Recent projects menu state ────────────────────────────────────────────────
 function getRecentProjectsPath() {
   return path.join(app.getPath('userData'), RECENT_PROJECTS_FILE);
 }
 
-function normalizeProjectPaths(paths) {
-  const seen = new Set();
-  const result = [];
-  for (const projectPath of paths || []) {
-    if (typeof projectPath !== 'string' || !projectPath.trim()) continue;
-    if (seen.has(projectPath)) continue;
-    seen.add(projectPath);
-    result.push(projectPath);
-    if (result.length >= RECENT_PROJECTS_LIMIT) break;
-  }
-  return result;
-}
-
-function loadRecentProjects() {
+// Raw entries as stored: { path, userId, apiBaseUrl } (legacy files hold bare path strings).
+function loadRecentEntries() {
   try {
     const raw = fs.readFileSync(getRecentProjectsPath(), 'utf8');
-    return normalizeProjectPaths(JSON.parse(raw));
+    return recentProjectsModel.normalizeRecentEntries(JSON.parse(raw));
   } catch {
     return [];
   }
 }
 
-function saveRecentProjects(projectPaths) {
+function saveRecentEntries(entries) {
   const filePath = getRecentProjectsPath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(normalizeProjectPaths(projectPaths), null, 2) + '\n', 'utf8');
+  fs.writeFileSync(tmp, JSON.stringify(recentProjectsModel.normalizeRecentEntries(entries), null, 2) + '\n', 'utf8');
   fs.renameSync(tmp, filePath);
+}
+
+// (TPT451) Paths the CURRENTLY signed-in account may see: each entry is matched against the
+// account-store user id of its own API server. Signed out -> empty list.
+function loadRecentProjects() {
+  return recentProjectsModel.visibleRecentPaths(loadRecentEntries(), (base) => getAccountUserId(base));
 }
 
 function updateRecentProjects(projectPath) {
   if (!projectPath) return;
   try {
-    const recent = loadRecentProjects().filter(p => p !== projectPath);
-    saveRecentProjects([projectPath, ...recent]);
+    const apiBaseUrl = normalizeBaseUrl(readProjectConfig(projectPath)?.API_BASE_URL);
+    const entry = { path: projectPath, userId: apiBaseUrl ? getAccountUserId(apiBaseUrl) : null, apiBaseUrl };
+    saveRecentEntries(recentProjectsModel.upsertRecentEntry(loadRecentEntries(), entry));
   } catch (e) {
     console.warn('[recent-projects] save failed', e.message);
+  }
+}
+
+// (TPT451) Pre-per-user entries carry no owner. Once the signed-in user's own project list is
+// fetched, keep the ones whose project that user can access (stamping them) and drop the rest.
+// Best-effort: offline/failed fetches leave legacy entries on disk (hidden) for the next run.
+async function reconcileRecentProjectsWithAccounts() {
+  try {
+    let entries = loadRecentEntries();
+    const bases = new Set();
+    const infoCache = new Map();
+    const projectInfoFor = (p) => {
+      if (!infoCache.has(p)) {
+        const cfg = readProjectConfig(p);
+        const apiBaseUrl = normalizeBaseUrl(cfg?.API_BASE_URL);
+        infoCache.set(p, cfg && apiBaseUrl && cfg.API_PROJECT_ID != null ? { apiBaseUrl, projectId: cfg.API_PROJECT_ID } : null);
+      }
+      return infoCache.get(p);
+    };
+    for (const e of entries) {
+      if (e.userId != null) continue;
+      const info = projectInfoFor(e.path);
+      if (info) bases.add(info.apiBaseUrl);
+    }
+    let changed = false;
+    for (const apiBaseUrl of bases) {
+      const account = readAccount(apiBaseUrl);
+      const userId = getAccountUserId(apiBaseUrl);
+      if (!account || userId == null) continue;
+      const res = await fetch(`${apiBaseUrl}/api/projects`, { headers: { Authorization: `Bearer ${account.token}` } });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : (data?.projects || data?.data || []);
+      entries = recentProjectsModel.reconcileLegacyEntries(entries, {
+        apiBaseUrl, userId, projectIds: list.map((p) => p.id), projectInfoFor,
+      });
+      changed = true;
+    }
+    if (changed) {
+      saveRecentEntries(entries);
+      if (app.isReady()) createMenu();
+    }
+  } catch (e) {
+    console.warn('[recent-projects] reconcile failed', e.message);
   }
 }
 
@@ -569,7 +640,8 @@ function getOrCreateMachineId() {
 //   { adopted: true }                                    — sender adopted normally
 //   { adopted: false, focused: true, healed, reloaded }  — refused; owner focused instead
 //   { adopted: false, focused: false, reason: 'sender-gone' }
-function adoptProjectIntoWindow(senderWebContents, projectRoot) {
+async function adoptProjectIntoWindow(senderWebContents, projectRoot) {
+  if (!await ensureProjectAccess(projectRoot)) return { adopted: false, focused: false, reason: 'access-denied' };
   const w = BrowserWindow.fromWebContents(senderWebContents);
   if (!w || w.isDestroyed()) return { adopted: false, focused: false, reason: 'sender-gone' };
 
@@ -778,42 +850,40 @@ function registerIpcHandlers() {
   };
 
   ipcMain.handle('project:open', async (event, { dir, target }) => {
-    addToWorkspace(dir, getDisplayName(dir));
-
-    if (target === 'current') {
-      rememberRecentProject(dir);
-      const w = BrowserWindow.fromWebContents(event.sender);
-      if (!w || w.isDestroyed()) { createProjectWindow(dir); return; }
-
-      // Another window already owns this project — focus it, leave caller intact.
-      const owner = ownerOf(dir);
-      if (owner && owner !== w) {
-        if (focusWindow(owner)) return;
-      }
-
-      const wcId = w.webContents.id;
-      const oldDir = projectDirs.get(wcId);
-      releaseProject(oldDir, w);
-      releaseSetup(w);
-
-      dropWindow(wcId);
-      projectDirs.set(wcId, dir);
-      claimProject(dir, w);
-      scheduleOpenProjectsSync();
-      bindWindowToProject(wcId, dir);
-      w.setTitle(getWindowTitle(getDisplayName(dir)));
-
-      w.webContents.once('did-finish-load', () => {
-        if (w.isDestroyed()) return;
-        w.webContents.send('workspace-loaded', workspaceState);
-        w.webContents.send('project:changed', dir, getDisplayName(dir));
-      });
-      w.loadURL(`http://127.0.0.1:${PORT}/todo.html${dir ? '?projectPath=' + encodeURIComponent(dir) : ''}`);
+    if (target !== 'current') {
+      await createProjectWindow(dir);
       return;
     }
+    if (!await ensureProjectAccess(dir)) return;
+    const w = BrowserWindow.fromWebContents(event.sender);
+    if (!w || w.isDestroyed()) return;
+    addToWorkspace(dir, getDisplayName(dir));
+    rememberRecentProject(dir);
 
-    // target === 'new' (default) — open/focus project's OS window.
-    createProjectWindow(dir);
+    // Another window already owns this project — focus it, leave caller intact.
+    const owner = ownerOf(dir);
+    if (owner && owner !== w) {
+      if (focusWindow(owner)) return;
+    }
+
+    const wcId = w.webContents.id;
+    const oldDir = projectDirs.get(wcId);
+    releaseProject(oldDir, w);
+    releaseSetup(w);
+
+    dropWindow(wcId);
+    projectDirs.set(wcId, dir);
+    claimProject(dir, w);
+    scheduleOpenProjectsSync();
+    bindWindowToProject(wcId, dir);
+    w.setTitle(getWindowTitle(getDisplayName(dir)));
+
+    w.webContents.once('did-finish-load', () => {
+      if (w.isDestroyed()) return;
+      w.webContents.send('workspace-loaded', workspaceState);
+      w.webContents.send('project:changed', dir, getDisplayName(dir));
+    });
+    w.loadURL(`http://127.0.0.1:${PORT}/todo.html${dir ? '?projectPath=' + encodeURIComponent(dir) : ''}`);
   });
 
   ipcMain.handle('project:get-current', (event) => {
@@ -881,17 +951,12 @@ function registerIpcHandlers() {
     return { ok: true };
   });
 
-  ipcMain.handle('project:switch', (_event, projectPath) => {
+  ipcMain.handle('project:switch', async (_event, projectPath) => {
     if (!workspaceState?.openProjects?.some(p => p.path === projectPath)) return { ok: false, error: 'Not in workspace' };
+    // The shared opener checks access before focusing or creating the owner window.
+    if (!await createProjectWindow(projectPath)) return { ok: false, canceled: true };
     workspaceState.activeProjectPath = projectPath;
     persistWorkspace();
-    // Each project lives in its own OS window — focus it instead of swapping in-place.
-    const owner = ownerOf(projectPath);
-    if (owner) {
-      focusWindow(owner);
-    } else {
-      createProjectWindow(projectPath);
-    }
     return { ok: true };
   });
 
@@ -899,7 +964,9 @@ function registerIpcHandlers() {
   // switchProject()/focusProjectWindow() (client) and the notification-click router
   // both share this channel; "focus a setup window" is meaningless for either. The
   // unified open flow's setup-window dedupe lives in project:open-setup-window instead.
-  ipcMain.handle('project:focus-window', (_event, projectPath) => {
+  ipcMain.handle('project:focus-window', async (_event, projectPath) => {
+    if (!ownerOf(projectPath)) return { ok: false };
+    if (!await ensureProjectAccess(projectPath)) return { ok: false, canceled: true };
     return { ok: focusWindow(ownerOf(projectPath)) };
   });
 
@@ -1139,7 +1206,7 @@ function registerIpcHandlers() {
   // (C1388) No live renderer caller today — kept for API symmetry with
   // project:open-existing. Same adopt-refusal handling applied for consistency should
   // a future caller reappear.
-  ipcMain.handle('save-project-config', (event, { projectRoot, config }) => {
+  ipcMain.handle('save-project-config', async (event, { projectRoot, config }) => {
     const { writeProjectConfig } = require('./src/server/project-config');
     writeProjectConfig(projectRoot, config);
     try { writeProjectMcpConfig(projectRoot, __dirname); } catch (e) {
@@ -1152,8 +1219,8 @@ function registerIpcHandlers() {
       console.warn('[codex-config] save-project-config write failed:', e.message);
     }
 
-    const r = adoptProjectIntoWindow(event.sender, projectRoot);
-    return { ok: true, adopted: r.adopted, focusedExisting: !r.adopted };
+    const r = await adoptProjectIntoWindow(event.sender, projectRoot);
+    return { ok: r.adopted || r.focused, adopted: r.adopted, focusedExisting: !!r.focused };
   });
 
   // Full open-existing-project setup: device register + associate + token exchange +
@@ -1272,7 +1339,7 @@ function registerIpcHandlers() {
       // project window must never be closed here.
       const senderWin = BrowserWindow.fromWebContents(event.sender);
       const wasSetupWindow = senderWin && setupFor(projectPath) === senderWin;
-      const r = adoptProjectIntoWindow(event.sender, projectPath);
+      const r = await adoptProjectIntoWindow(event.sender, projectPath);
       if (!r.adopted && r.focused && wasSetupWindow) {
         // Deferred: closing event.sender's window inside this handler would destroy
         // the webContents this reply is addressed to before it flushes.
@@ -1281,7 +1348,7 @@ function registerIpcHandlers() {
         }, 0);
       }
 
-      return { ok: true, projectPath, adopted: r.adopted, focusedExisting: !r.adopted };
+      return { ok: r.adopted || r.focused, projectPath, adopted: r.adopted, focusedExisting: !!r.focused };
     } catch (err) {
       console.error('[open-existing] project:open-existing failed:', err.message);
       return { ok: false, error: err.message };
@@ -1401,6 +1468,9 @@ function registerIpcHandlers() {
       } catch (e) {
         console.warn('[caveman-plugin] force-reauth install failed:', e.message);
       }
+      // (TPT451) Account may have changed: re-filter Recent Projects for the new user.
+      if (app.isReady()) createMenu();
+      reconcileRecentProjectsWithAccounts();
       return { ok: state === 'connected', state };
     } catch (err) {
       console.error('[force-reauth] failed:', err.message);
@@ -2138,7 +2208,9 @@ function createSetupWindow(projectPath) {
   return w;
 }
 
-function createProjectWindow(projectDir, { deferShow = false } = {}) {
+async function createProjectWindow(projectDir, { deferShow = false } = {}) {
+  if (!await ensureProjectAccess(projectDir)) return null;
+  if (projectDir) addToWorkspace(projectDir, getDisplayName(projectDir));
   rememberRecentProject(projectDir);
 
   // Focus existing window rather than opening a duplicate. ownerOf() purges a
@@ -2262,8 +2334,8 @@ function createProjectWindow(projectDir, { deferShow = false } = {}) {
 // so 'open-objective' would arrive before the renderer's listener is registered. Guard
 // with isLoading() (true only for the fresh-window path — an existing focused window is
 // already loaded) and defer to 'did-finish-load' in that case.
-function focusAndSeedObjective(projectPath, taskKey, { warning, originTaskKey, title, description } = {}) {
-  const w = createProjectWindow(projectPath);
+async function focusAndSeedObjective(projectPath, taskKey, { warning, originTaskKey, title, description } = {}) {
+  const w = await createProjectWindow(projectPath);
   if (!w || w.isDestroyed()) return;
   const send = () => {
     if (w.isDestroyed()) return;
@@ -2282,8 +2354,8 @@ function focusAndSeedObjective(projectPath, taskKey, { warning, originTaskKey, t
 // the renderer picks which one to start (see template.html's 'start-task' listener →
 // startTaskById()) because it alone holds the live board status map isDepsBlocked()
 // needs — this function and the server route are deliberately status-map-free.
-function focusAndStartTask(projectPath, taskKey, { children } = {}) {
-  const w = createProjectWindow(projectPath);
+async function focusAndStartTask(projectPath, taskKey, { children } = {}) {
+  const w = await createProjectWindow(projectPath);
   if (!w || w.isDestroyed()) return;
   const send = () => {
     if (w.isDestroyed()) return;
@@ -2301,14 +2373,18 @@ function focusAndStartTask(projectPath, taskKey, { children } = {}) {
 // projects.length===0 branch fires → exactly one blank unbound window; non-empty array →
 // one window per path. No live caller passes a non-array after this task — kept as a
 // defensive default, not because anything currently relies on it.
-function createInitialWindows(projectPaths = null, opts = {}) {
+async function createInitialWindows(projectPaths = null, opts = {}) {
   const projects = Array.isArray(projectPaths)
     ? projectPaths
     : (workspaceState?.openProjects || []).map(entry => entry.path);
   if (projects.length === 0) {
-    createProjectWindow(null, opts);
+    await createProjectWindow(null, opts);
   } else {
-    for (const projectPath of projects) createProjectWindow(projectPath, opts);
+    let opened = false;
+    for (const projectPath of projects) {
+      if (await createProjectWindow(projectPath, opts)) opened = true;
+    }
+    if (!opened) await createProjectWindow(null, opts);
   }
 }
 
@@ -2400,12 +2476,13 @@ app.whenReady()
       credits: mt('about.credit'),
     });
     createMenu();
+    reconcileRecentProjectsWithAccounts(); // (TPT451) fire-and-forget; rebuilds the menu when done
     // (C1430) session.json === [] (user closed every project window before quitting) must
     // NOT trigger cross-device restore — only a missing/unreadable file (null) does. See
     // loadWindowSession()'s contract comment and window-session.js.
     const sessionPaths = loadWindowSession();
     const restoredPaths = shouldRestoreFromDevice(sessionPaths) ? await restoreFromLastUsedDevice() : [];
-    createInitialWindows(resolveStartupProjectPaths(sessionPaths, restoredPaths), { deferShow: true });
+    await createInitialWindows(resolveStartupProjectPaths(sessionPaths, restoredPaths), { deferShow: true });
     _initialWindowsCreated = true; // C1006: real windows exist; quit guards released
   })
   .catch((err) => {

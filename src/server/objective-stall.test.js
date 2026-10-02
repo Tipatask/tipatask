@@ -151,3 +151,27 @@ test('throwing stall cleanup still frees slot without crashing timer callback', 
   t.mock.timers.tick(120000);
   assert.equal(throttle.getStatus().active, 0);
 });
+
+// Streamed text and the closing full `assistant` message carry the same words. The full message
+// is a fallback for a turn that streamed nothing — it must never be appended on top of deltas,
+// whether or not turn timing is enabled.
+for (const timing of [false, true]) {
+  test(`Claude reply text is recorded once when deltas and the full message both arrive (timing=${timing})`, t => {
+    const h = harness(t, { OBJECTIVE_TIMING_ENABLED: timing });
+    h.start();
+    const delta = text => h.out({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } });
+    delta('Hello ');
+    delta('world.');
+    h.out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Hello world.' }] } });
+    assert.equal(h.session.turnBuffer, 'Hello world.');
+    assert.deepEqual(h.frames.filter(f => f.type === 'data').map(f => f.data), ['Hello ', 'world.']);
+  });
+
+  test(`Claude full-message fallback still delivers a turn that streamed no deltas (timing=${timing})`, t => {
+    const h = harness(t, { OBJECTIVE_TIMING_ENABLED: timing });
+    h.start();
+    h.out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Only message.' }] } });
+    assert.equal(h.session.turnBuffer, 'Only message.');
+    assert.deepEqual(h.frames.filter(f => f.type === 'data').map(f => f.data), ['Only message.']);
+  });
+}

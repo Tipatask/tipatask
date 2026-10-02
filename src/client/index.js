@@ -17,6 +17,7 @@ import * as recipeSidebar from './recipe-sidebar.js';
 import * as chatUI from './chat-ui.js';
 import * as chatTaskPreview from './chat-task-preview.js';
 import * as specChat from './spec-chat.js';
+import * as taskChat from './task-chat.js';
 import * as setupModal from './setup-modal.js';
 import * as notifications from './notifications.js';
 import * as attentionNotifications from './attention-notifications.js';
@@ -41,7 +42,7 @@ import * as mergeBranchesModal from './merge-branches-modal.js'; // (TPT345) Mer
 notifications.requestPermission();
 
 // Expose modules globally so the inline <script> in template.html can access them.
-window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, ...consoleModal, ...recipeSidebar, chatUI, chatTaskPreview, specChat, setupModal, notifications, attentionNotifications, completionNotifications, attentionWs, attentionState, taskActivity, activityNotifications, notificationCenter, projectCreationWizard, projectOpenFlow, audioRecorder, perfLog, tagMatch, statusFilterSelect, agentQuota, mergeBranchesModal };
+window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, ...consoleModal, ...recipeSidebar, chatUI, chatTaskPreview, specChat, taskChat, setupModal, notifications, attentionNotifications, completionNotifications, attentionWs, attentionState, taskActivity, activityNotifications, notificationCenter, projectCreationWizard, projectOpenFlow, audioRecorder, perfLog, tagMatch, statusFilterSelect, agentQuota, mergeBranchesModal };
 // Terminal task-title links need a page-level bridge: task-board.js owns the modal,
 // while template.html owns loadAndRender() and can select Project Board first.
 window.TipTask.openTaskEditModal = taskBoard.openTaskEditModalFromTerminal;

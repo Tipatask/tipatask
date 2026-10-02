@@ -317,3 +317,30 @@ for (const { id, includeSystemPrompt } of PROVIDERS) {
     }
   });
 }
+
+// ── Task chat: the ask_user contract on resumed turns ──
+
+const { ASK_USER_REMINDER } = require('../task-chat-widgets');
+
+for (const { id, includeSystemPrompt } of PROVIDERS) {
+  test(`${id}: a resumed task-chat turn ${includeSystemPrompt ? 'restates' : 'does not restate'} the ask_user contract`, () => {
+    const session = startedSession({ type: 'taskChat', messages: conversation(2, 'LATEST') });
+    const { prompt, mode } = buildTurnPrompt(session, { includeSystemPrompt, hasProviderSession: true });
+    assert.equal(mode, 'resume');
+    assert.ok(prompt.startsWith('LATEST'));
+    assert.equal(count(prompt, ASK_USER_REMINDER), includeSystemPrompt ? 1 : 0);
+    assert.ok(!prompt.includes(SYSTEM));
+  });
+
+  test(`${id}: fresh and handoff task-chat turns rely on the system prompt, not the reminder`, () => {
+    const fresh = buildTurnPrompt(startedSession({ type: 'taskChat' }), { includeSystemPrompt, hasProviderSession: false });
+    const handoff = buildTurnPrompt(startedSession({ type: 'taskChat', messages: conversation(2, 'LATEST'), _providerSwitchPending: true }), { includeSystemPrompt, hasProviderSession: false });
+    for (const { prompt } of [fresh, handoff]) assert.equal(count(prompt, ASK_USER_REMINDER), 0);
+  });
+}
+
+test('an objective turn never carries the task-chat reminder', () => {
+  const session = startedSession({ type: 'objective', messages: conversation(2, 'LATEST') });
+  const { prompt } = buildTurnPrompt(session, { includeSystemPrompt: true, hasProviderSession: true });
+  assert.equal(prompt, 'LATEST');
+});

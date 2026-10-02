@@ -74,10 +74,13 @@ function resolveTagNames(wanted, index) {
 
 function unregisteredTagError(unknown, { projectId, registrySize } = {}) {
   const sizeNote = registrySize != null ? ` (registry has ${registrySize} tag${registrySize === 1 ? '' : 's'})` : '';
-  return new Error(
+  const err = new Error(
     `Unregistered tag(s) ${unknown.map(n => `"${n}"`).join(', ')} in project ${projectId ?? '?'}${sizeNote} — register each ` +
     'with a real one-line description first (MCP ensure_project_tag for plain tags, create_system_tag for tt-* tags), then retry.'
   );
+  err.code = 'TAGS_UNREGISTERED';
+  err.missing = [...unknown];
+  return err;
 }
 
 // Pure selector mirroring overwriteRaw()'s write-loop skip rule — used to narrow the

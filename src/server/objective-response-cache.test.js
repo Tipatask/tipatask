@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const objectiveResponseCache = require('./objective-response-cache');
+const { isAgentChatType, isAgentChatId } = require('./session-state');
 
 const { buildKey } = objectiveResponseCache;
 
@@ -51,6 +52,7 @@ function wire({ session: sessionOverrides = {}, config: configOverrides = {}, en
     providerSessionId: () => 'fixture', killPrewarm() {},
     clearContext: s => { s.messages = []; s._providerSwitchPending = false; },
     throttle: { recordAbort() {} },
+    isAgentChatType, isAgentChatId,
   };
   vm.createContext(env);
   vm.runInContext(source.slice(start, source.indexOf('\n}', start) + 2), env);

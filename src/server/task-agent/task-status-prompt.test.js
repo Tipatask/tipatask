@@ -110,8 +110,8 @@ test('Pi combined kickoff keeps compact status semantics, echo safety, and the e
     if (agents && !agents.includes('pi')) continue;
     assert.ok(!re.test(prompt), String(re));
   }
-  t.diagnostic(`Pi task-status combined fixture: ${prompt.length} / 9600`);
-  assert.ok(prompt.length < 9600);
+  t.diagnostic(`Pi task-status combined fixture: ${prompt.length} / 9900`);
+  assert.ok(prompt.length < 9900);
 });
 
 test('installed guide templates agree on task-local status, caveats, and relevant blockers', () => {

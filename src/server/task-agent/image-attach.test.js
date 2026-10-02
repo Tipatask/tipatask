@@ -7,6 +7,8 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
+// The account store defaults to USER_DATA_ROOT; keep this file's tokens in a private dir.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-attach-userdata-'));
 const config = require('../config');
 const { localizeImageRefs } = require('./image-attach');
 
@@ -29,6 +31,8 @@ function taskImageListingPath(taskKey) {
 }
 
 async function withConfig(overrides, run) {
+  // Each case starts from the account it declares: a blank API_TOKEN means signed out.
+  require('../account-store').clearAccountToken(overrides.API_BASE_URL);
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-image-project-'));
   fs.mkdirSync(path.join(projectRoot, '.tipatask'));
   fs.writeFileSync(path.join(projectRoot, '.tipatask', 'config.json'), JSON.stringify({

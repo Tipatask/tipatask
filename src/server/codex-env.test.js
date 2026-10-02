@@ -170,7 +170,7 @@ test('terminal agent and objective provider both delegate Codex environment setu
   const objectiveSource = fs.readFileSync(path.join(__dirname, 'providers', 'codex-session.js'), 'utf8');
 
   assert.match(terminalSource, /buildCodexEnv\(\{ projectRoot, taskId, term: 'xterm-256color' \}\)/);
-  assert.match(objectiveSource, /buildCodexEnv\(\{ projectRoot: session\.projectPath \|\| config\.PROJECT_ROOT, taskId \}\)/);
+  assert.match(objectiveSource, /buildCodexEnv\(\{ projectRoot: session\.projectPath \|\| config\.PROJECT_ROOT, taskId[:, }]/);
 });
 
 test('Codex terminal spawn pins high effort ahead of inherited config', async () => {

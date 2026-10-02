@@ -201,9 +201,9 @@ test('PiAgent.buildPrompt: KB-hygiene directive cannot false-trigger the attenti
       assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*plan ready[.!]?\s*$/im);
       assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*questions ready[.!]?\s*$/im);
 
-      // Ceiling raised 8500 -> 9000 for this directive — see pi-agent.test.js's comment on
-      // the same change. Worst measured case (20 blank tag descriptions) is ~8800 chars.
-      assert.ok(prompt.length < 9000, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
+      // Shared Pi ceiling — see pi-agent.test.js's comment on how each unconditional compact
+      // directive raised it. Worst measured case (20 blank tag descriptions) is ~9100 chars.
+      assert.ok(prompt.length < 9300, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

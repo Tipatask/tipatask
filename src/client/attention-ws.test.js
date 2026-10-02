@@ -136,6 +136,27 @@ test('session-runaway with killed=true stores killed in the detail and re-arms t
   assert.equal(lastNotification.options.body, 'kill text');
 });
 
+test('session-runaway with paused=true stores controls metadata and retires the warning ring', () => {
+  notify('title', 'body', 'C1'); // the warn banner already armed the debounce
+  handleAttentionMessage({ type: 'session-runaway', taskId: 'C1', count: 12, threshold: 50, rssMb: 3300, limitMb: 3072, reason: 'memory', promptText: 'paused text', paused: true });
+  const d = state.sessionMeta.get('C1').paused;
+  assert.equal(d.rssMb, 3300);
+  assert.equal(d.limitMb, 3072);
+  assert.equal(d.count, 12);
+  assert.equal(d.reason, 'memory');
+  assert.equal(state.attentionSessions.has('C1'), false);
+  assert.equal(constructorCount, 1);
+});
+
+test('session-runaway with resumed=true clears the pause ring without notifying', () => {
+  handleAttentionMessage({ type: 'session-runaway', taskId: 'C1', count: 12, threshold: 50, rssMb: 3300, promptText: 'paused text', paused: true });
+  const before = constructorCount;
+  handleAttentionMessage({ type: 'session-runaway', taskId: 'C1', resumed: true, promptText: 'Session resumed.' });
+  assert.equal(state.attentionSessions.has('C1'), false);
+  assert.equal(state.attentionDetails.has('C1'), false);
+  assert.equal(constructorCount, before);
+});
+
 test('session-ended removes attention state for that task', () => {
   state.attentionSessions.add('C1');
   state.attentionDetails.set('C1', { kind: 'attention', promptText: 'x', agent: 'claude' });
@@ -303,4 +324,17 @@ test('handleTaskActivityMessage: identical frame dispatched twice (browser mode\
 test('handleTaskActivityMessage returns false for an unrelated frame type', () => {
   assert.equal(handleTaskActivityMessage({ type: 'tasks-updated' }), false);
   assert.equal(handleTaskActivityMessage(null), false);
+});
+
+test('session-queue-state updates the queue and refetches sessions only when a task left it (TPT444)', async () => {
+  let fetched = 0;
+  globalThis.window.TipTask.fetchActiveSessions = async () => { fetched++; };
+  state.queuedSessions = new Map([['Q1', 1]]);
+  assert.equal(handleAttentionMessage({ type: 'session-queue-state', queued: [{ taskId: 'Q1', position: 1 }, { taskId: 'Q2', position: 2 }], running: 2, cap: 2 }), true);
+  assert.equal(fetched, 0);
+  assert.equal(state.queuedSessions.get('Q2'), 2);
+  handleAttentionMessage({ type: 'session-queue-state', queued: [{ taskId: 'Q2', position: 1 }], running: 2, cap: 2 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fetched, 1); // Q1 left the queue — server started it
+  globalThis.window.TipTask.fetchActiveSessions = async () => {};
 });

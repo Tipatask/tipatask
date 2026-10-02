@@ -1,9 +1,10 @@
 'use strict';
 
-const { readProjectConfig } = require('./project-config');
+const { readProjectConfig, migrateLegacyApiToken } = require('./project-config');
+const { readAccount, decodeTokenPayload } = require('./account-store');
 
 function missingCredential(name) {
-  const err = new Error(`API not configured for this project (missing ${name} in .tipatask/config.json)`);
+  const err = new Error(`API not configured for this project (missing ${name}${name === 'API_TOKEN' ? ' — sign in again' : ' in .tipatask/config.json'})`);
   err.missingCredentials = true;
   return err;
 }
@@ -18,8 +19,9 @@ function createTokenWatch(onChange) {
   return { last: null, onChange };
 }
 
-// Single runtime credential resolver. Always re-reads the selected project's
-// config.json so re-auth changes apply without a server or MCP restart.
+// Single runtime credential resolver. API_BASE_URL / API_PROJECT_ID come from the selected
+// project's config.json, the token from the app-level account store; both are re-read on
+// every call so re-auth changes apply without a server or MCP restart.
 // `opts.watch` (from createTokenWatch()): when the resolved token differs from the last
 // token this same watch object saw, fires onChange(token, prevToken) once. A first read
 // (prevToken === null) never fires — that's initial load, not a change. The callback is
@@ -29,9 +31,14 @@ function getApiCredentials(projectRoot, opts = {}) {
   // explicit project root and must not initialize the forked server's static
   // config singleton merely to read one project's credentials.
   const root = projectRoot || require('./config').PROJECT_ROOT;
-  const live = root ? readProjectConfig(root) : null;
+  let live = root ? readProjectConfig(root) : null;
+  // A pre-account-store project still carries API_TOKEN inline: lift it into the store once
+  // (and strip it from config.json), then re-read.
+  if (live && Object.hasOwn(live, 'API_TOKEN') && migrateLegacyApiToken(root)) live = readProjectConfig(root);
   const baseUrl = String(live?.API_BASE_URL || '').replace(/\/+$/, '');
-  const token = live?.API_TOKEN || '';
+  // The signed-in account's token is app-level (account-store.js), keyed by API server. The
+  // inline value only survives here when migration could not run (e.g. read-only checkout).
+  const token = readAccount(baseUrl)?.token || live?.API_TOKEN || '';
   const projectId = live?.API_PROJECT_ID || '';
 
   if (!baseUrl) throw missingCredential('API_BASE_URL');
@@ -52,4 +59,16 @@ function getApiCredentials(projectRoot, opts = {}) {
   return { baseUrl, token, projectId };
 }
 
-module.exports = { getApiCredentials, createTokenWatch };
+// User id of the account signed in on `baseUrl`'s API server, or null when nobody is. Reads
+// only the app-level account store (never a project's config.json), so it is cheap and safe
+// for Electron's main process to call per menu build. Entries written before the store
+// recorded userId fall back to the id claim inside the stored token.
+function getAccountUserId(baseUrl) {
+  const account = readAccount(baseUrl);
+  if (!account) return null;
+  if (account.userId != null) return account.userId;
+  const id = decodeTokenPayload(account.token)?.id;
+  return id != null ? id : null;
+}
+
+module.exports = { getApiCredentials, createTokenWatch, getAccountUserId };
