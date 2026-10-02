@@ -33,24 +33,32 @@ try {
   const from = template.indexOf('  // ── Search input ──');
   const to = template.indexOf('  // ── Show More button ──', from);
   assert.ok(from > 0 && to > from);
+  const moreFrom = template.indexOf('  const loadMoreBtn = document.getElementById(\'btn-load-more\');', to);
+  const moreTo = template.indexOf('  // Apply search filter after render', moreFrom);
+  assert.ok(moreFrom > to && moreTo > moreFrom);
   const bundled = await build({
     stdin: { contents: `import * as board from './src/client/task-board.js';
       import state from './src/client/state.js';
       import { nextStatusSelection } from './src/client/status-filter-select.js';
       import { statusNames } from './src/client/status-registry.js';
       import { escapeAttr } from './src/client/utils.js';
+      import { getSprintSortOrder } from './src/client/group-label.js';
       export { setSprintSortOrder } from './src/client/group-label.js';
       export { board, state };
       const { updateSearchInputWidth, assigneeFilterActive, statusFilterActive,
-        onBoardFiltersChanged, refreshBoardForFilters, clearSearchQuery, refreshFilterBarChrome } = board;
+        onBoardFiltersChanged, refreshBoardForFilters, clearSearchQuery, refreshFilterBarChrome,
+        computeVisibleTiers, anyNarrowingFilterActive, FILTERED_TIER_PAGE_SIZE } = board;
+      const getSprintsEnabled = () => true;
       const perfStart = () => {}, perfEnd = () => {};
       let _statusFilterPanelOpen = false, _statusFilterPanelCleanup = null;
       let _peopleFilterPanelOpen = false, _peopleFilterPanelCleanup = null;
-      export function bindFilters(app, tasks, loadAndRender) { ${template.slice(from, to)} }`, resolveDir: root },
+      export function bindFilters(app, tasks, loadAndRender) { ${template.slice(from, to)} }
+      export function bindShowMore(loadAndRender) { ${template.slice(moreFrom, moreTo)} }`, resolveDir: root },
     bundle: true, platform: 'node', format: 'esm', write: false, loader: { '.css': 'empty' },
   });
   writeFileSync(bundlePath, bundled.outputFiles[0].contents);
-  const { board, state, bindFilters, setSprintSortOrder } = await import(pathToFileURL(bundlePath).href);
+  const { board, state, bindFilters, bindShowMore, setSprintSortOrder } = await import(pathToFileURL(bundlePath).href);
+  window.scrollTo = () => {};
   const tick = (ms = 0) => new Promise(resolve => setTimeout(resolve, ms));
   let fetches = 0;
   globalThis.fetch = async (url, options) => {
@@ -63,8 +71,8 @@ try {
   };
   const unhandled = [];
   process.on('unhandledRejection', err => unhandled.push(err));
-  const keys = Array.from({ length: 10 }, (_, i) => 356 + i);
-  const tasks = keys.map(priority => ({
+  let keys = Array.from({ length: 10 }, (_, i) => 356 + i);
+  let tasks = keys.map(priority => ({
     id: `T${priority}`, priority, category: 'CODING',
     title: priority === 360 ? 'Unique needle' : 'Shared work', description: '',
     tags: priority === 360 ? ['special'] : ['general'],
@@ -88,6 +96,7 @@ try {
       ${board.renderBoardContent(keys, state.tiers, rows => rows, card)}`;
     app.querySelector('.search-input').value = state.searchQuery;
     bindFilters(app, tasks, render);
+    bindShowMore(render);
     board.applySearchFilter();
     board.refreshFilterBarChrome(app, render);
   }
@@ -162,6 +171,40 @@ try {
   assert.equal(state.activeTagFilters.size, 0);
   state.extraStepsLoaded = 50;
   await board.refreshBoardForFilters(render);
+  assert.equal(state.extraStepsLoaded, 0);
+  assert.equal(fetches, 0);
+  assert.deepEqual(unhandled, []);
+
+  // Completed spans many old sprints: only the newest 20 matching tiers appear at
+  // first, and each real Show More click adds the next 20 without clearing the filter.
+  keys = Array.from({ length: 163 }, (_, i) => 214 + i);
+  const matchingKeys = keys.filter(priority => priority % 13 !== 0);
+  tasks = keys.map(priority => ({
+    id: `T${priority}`, priority, category: 'CODING', title: 'Finished work',
+    description: '', tags: [], status: priority % 13 === 0 ? 'pending' : 'completed',
+  }));
+  state.tierKeys = keys;
+  state.tiers = Object.fromEntries(tasks.map(task => [task.priority, [task]]));
+  state._lastVisibleTasks = tasks;
+  state.allStepsLoaded = true; // Full search results still need local paging.
+  state.statusFilter = new Set(['completed']);
+  await board.refreshBoardForFilters(render);
+  assert.deepEqual(visible(), matchingKeys.slice(-20));
+  assert.equal(board.computeVisibleTiers(keys, state.tiers).hiddenCount, matchingKeys.length - 20);
+  assert.ok(app.querySelector('#btn-load-more'));
+  setSprintSortOrder('desc'); await render();
+  assert.deepEqual(visible(), [...matchingKeys.slice(-20)].reverse());
+  setSprintSortOrder('asc'); await render();
+  for (let page = 2; page <= Math.ceil(matchingKeys.length / 20); page++) {
+    app.querySelector('#btn-load-more').click();
+    await tick();
+    assert.deepEqual(visible(), matchingKeys.slice(-Math.min(page * 20, matchingKeys.length)));
+    assert.deepEqual([...state.statusFilter], ['completed']);
+  }
+  assert.equal(board.computeVisibleTiers(keys, state.tiers).hiddenCount, 0);
+  assert.equal(app.querySelector('#btn-load-more'), null);
+  await board.refreshBoardForFilters(render);
+  assert.deepEqual(visible(), matchingKeys.slice(-20));
   assert.equal(state.extraStepsLoaded, 0);
   assert.equal(fetches, 0);
   assert.deepEqual(unhandled, []);

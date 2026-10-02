@@ -85,7 +85,7 @@ test('rail rows are not rewritten when their markup is unchanged', () => {
 });
 
 test('Project Board / Create rail buttons minimize an open task terminal before navigating', () => {
-  const handler = template.slice(template.indexOf("panel.querySelectorAll('.left-nav-btn').forEach"));
+  const handler = template.slice(template.indexOf("panel.querySelectorAll('.left-nav-btn[data-section]').forEach"));
   const minimize = handler.indexOf('state.activeTerminal.detach?.({ refreshBoard: false })');
   assert.ok(minimize > -1, 'section nav handler must detach state.activeTerminal');
   assert.ok(minimize < handler.indexOf("perfStart('nav-section-switch'"), 'detach must precede navigation');

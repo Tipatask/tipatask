@@ -445,7 +445,7 @@ test('template mounts the block once with the nav panel and resets it with the p
   const appended = template.indexOf('document.body.appendChild(panel);', block);
   const mounted = template.indexOf('initializeAgentQuotaSidebar(panel.querySelector', block);
   assert.ok(appended > 0 && mounted > appended, 'mounted inside the build-once branch, after the panel is attached');
-  assert.ok(mounted < template.indexOf("panel.querySelectorAll('.left-nav-btn')", block));
+  assert.ok(mounted < template.indexOf("panel.querySelectorAll('.left-nav-btn[data-section]')", block));
   assert.doesNotMatch(template, /openAgentQuotaModal|onOpenAgentQuotaModal/);
   // (TPT381) The hover container is the whole section (bars + head), so the pointer can travel
   // from the bars to the button without the button hiding under it.

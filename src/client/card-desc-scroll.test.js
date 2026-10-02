@@ -67,7 +67,7 @@ test('the board card root is never a scroll container, and keeps a height cap', 
   const shared = css.match(/\.card\.card-expanded,\s*\.preview-card\.card-expanded \{([^}]*)\}/);
   assert.ok(shared, 'shared expanded rule not found');
   assert.doesNotMatch(shared[1], /overflow/);
-  assert.match(shared[1], /max-height:\s*80vh/);
+  assert.match(shared[1], /max-height:\s*min\(80vh, calc\(100vh - 20px\)\)/);
   // Resting cap stays: min-height: 0 on the description needs a bounded flex column.
   const base = css.match(/\n\s*\.card \{([^}]*display: flex[^}]*)\}/);
   assert.ok(base, 'base .card rule not found');
@@ -84,8 +84,9 @@ test('expandCard() only gives the card root an inline scroll when it is a previe
   const src = fnSource('expandCard');
   assert.match(src, /if \(isPreviewOverlay\) card\.style\.overflowY = 'auto'/);
   assert.doesNotMatch(src, /^\s*card\.style\.overflowY = 'auto';/m);
-  // Position from the natural height: the clipped part of the description counts.
-  assert.match(src, /desc\.scrollHeight - desc\.clientHeight/);
+  // (TPT456) Position from the laid-out height once the expanded cap is applied — the card's
+  // own scrollHeight would under-report a clipped description (TPT344).
+  assert.match(src, /maxHeight = expandedCardMaxHeight\([\s\S]*height: card\.offsetHeight/);
 });
 
 test('collapseCard() rewinds the description so a resting card never shows a mid-text slice', () => {
@@ -100,4 +101,20 @@ test('markTruncatedCards() flags a board card whose description is clipped', () 
   assert.match(src, /desc\.scrollHeight > desc\.clientHeight/);
   // Previews clamp on purpose and must not gain the class through the description path.
   assert.match(src, /matches\('\.card--preview, \.preview-card'\) \? null/);
+});
+
+// (TPT456) The expanded overlay is re-clamped to the viewport whenever its real height changes,
+// and it snaps to its full layout instead of animating its controls open after placement.
+test('expandCard re-places the overlay on size change and collapseCard tears it down', () => {
+  const expand = fnSource('expandCard');
+  assert.match(expand, /new ResizeObserver\(placeExpanded\)/);
+  assert.match(expand, /clampExpandedTop\(/);
+  assert.match(expand, /card\.offsetHeight/);
+  assert.match(expand, /addEventListener\('resize', placeExpanded\)/);
+  assert.match(fnSource('collapseCard'), /expandedPlacementTeardown\(\)/);
+});
+
+test('an expanded card does not animate its controls or description margin open', () => {
+  const body = ruleBody(/\n\s*\.card\.card-expanded \.task-card-hover-controls,\s*\n\s*\.card\.card-expanded > \.card-desc/);
+  assert.match(body, /transition:\s*none/);
 });
