@@ -164,19 +164,46 @@ test('the in-app notification-center card is pushed under the "completed" catego
   assert.equal(entries[0].category, 'completed');
 });
 
-test('in-app completion click (no known session) opens off-screen task details once without starting a terminal', async () => {
+test('in-app completion click recovers an off-screen exited session and opens its terminal once', async () => {
   hasFocus = false;
   appNode = { querySelector: () => null }; // task is filtered out of the board window
+  window.TipTask.fetchActiveSessions = async () => {
+    state.exitedSessions.add('C1');
+    state.sessionMeta.set('C1', { startedAt: 1234 });
+  };
   notifyTaskCompleted('C1', { title: 'Off-screen task' });
   const [entry] = getNotificationEntries();
   assert.equal(typeof entry.onClick, 'function');
   entry.onClick();
   entry.onClick(); // same click reaching two surfaces while navigation is in flight
   await new Promise(setImmediate);
-  assert.deepEqual(openedTasks, ['C1']);
-  assert.equal(terminalStarts, 0);
-  assert.equal(focusSelfCount, 2);
+  assert.deepEqual(openedTasks, []);
+  assert.equal(terminalStarts, 1);
+  assert.deepEqual(terminalOpens[0][4], { reconnectOnly: true, sessionStartedAt: 1234 });
   assert.equal(getNotificationEntries().length, 0);
+});
+
+test('completion click with no retained session never opens Edit or starts an agent', async () => {
+  hasFocus = false;
+  notifyTaskCompleted('C1', { title: 'Done task' });
+  getNotificationEntries()[0].onClick();
+  await new Promise(setImmediate);
+  assert.deepEqual(openedTasks, []);
+  assert.equal(terminalStarts, 0);
+});
+
+test('completion click refuses a newer run for the same task', async () => {
+  hasFocus = false;
+  state.sessionMeta.set('C1', { startedAt: 1234 });
+  notifyTaskCompleted('C1', { title: 'Old run' });
+  window.TipTask.fetchActiveSessions = async () => {
+    state.activeSessions.add('C1');
+    state.sessionMeta.set('C1', { startedAt: 5678 });
+  };
+  getNotificationEntries()[0].onClick();
+  await new Promise(setImmediate);
+  assert.deepEqual(openedTasks, []);
+  assert.equal(terminalStarts, 0);
 });
 
 test('in-app completion click with a finished session opens the console, not the edit modal', async () => {
@@ -207,7 +234,7 @@ test('completion action rejects a stale project card with the same-looking task 
   notifyTaskCompleted('C1', { title: 'Project B task' });
   getNotificationEntries()[0].onClick();
   await new Promise(setImmediate);
-  assert.deepEqual(openedTasks, ['C1']);
+  assert.deepEqual(openedTasks, []);
   assert.equal(terminalStarts, 0);
 });
 

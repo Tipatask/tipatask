@@ -245,21 +245,24 @@ test('terminal reconnect reports a newer server exit only for a missing registry
     await h.exports.handleConnection(ws, {
       url: `/?taskId=TPT415${start == null ? '' : `&startedAt=${start}`}`, headers: { host: 'localhost' },
     }, sessions, () => null);
-    assert.equal(ws.closed, true);
+    assert.equal(ws.closed, !existing);
     assert.equal(sessions.size, existing ? 1 : 0);
-    return ws.frames.find(f => f.type === 'error');
+    return { error: ws.frames.find(f => f.type === 'error'), frames: ws.frames };
   }
-  const frame = await connect(before);
+  const { error: frame } = await connect(before);
   assert.deepEqual(frame, { type: 'error', code: 'ESESSION_LOST', reason: 'signal:SIGTERM', at,
     message: `Terminal session for TPT415 was lost when the server exited (signal:SIGTERM, ${at}).` });
   for (const start of [null, '', 'bad', Date.parse(at), Date.parse(at) + 1000]) {
-    assert.equal((await connect(start)).code, undefined);
+    assert.equal((await connect(start)).error.code, undefined);
   }
-  const exited = { type: 'terminal', alive: false, buffer: 'retained history' };
-  assert.equal((await connect(before, exited)).code, undefined);
+  const exited = { type: 'terminal', tabId: 'TPT415', alive: false, buffer: 'retained history' };
+  const retained = await connect(before, exited);
+  assert.equal(retained.error, undefined);
+  assert.match(retained.frames.find(f => f.type === 'data').data, /retained history$/);
+  assert.equal(retained.frames.find(f => f.type === 'exit').code, null);
   assert.equal(exited.buffer, 'retained history');
   fs.writeFileSync(recordPath, '{');
-  assert.equal((await connect(before)).code, undefined);
+  assert.equal((await connect(before)).error.code, undefined);
 });
 
 test('DELETE /api/objective/prewarm kills the cold spare', async () => {

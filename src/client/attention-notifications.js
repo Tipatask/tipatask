@@ -28,13 +28,14 @@ function _taskCard(taskId) {
 // Shared notification-click action (attention + completion): focus the app and open the task's
 // console. Title/status are re-read at click time — the card may have re-rendered since the
 // banner was raised. openTerminal() itself reattaches a live or exited session.
-export function openTaskTerminalFromNotification(taskId, fallbackStatus) {
+export function openTaskTerminalFromNotification(taskId, fallbackStatus, opts = {}) {
   try { window.electronAPI?.focusSelf?.(); } catch (_) {}
   const card = _taskCard(taskId);
   const title = card?.querySelector?.('.card-title-inner')?.textContent?.trim()
     || state.taskTitleById?.get(taskId) || taskId;
   const status = card?.dataset?.status || fallbackStatus;
-  window.TipTask?.openTerminal?.(taskId, title, '', status);
+  if (Object.keys(opts).length) window.TipTask?.openTerminal?.(taskId, title, '', status, opts);
+  else window.TipTask?.openTerminal?.(taskId, title, '', status);
 }
 
 function _windowHasUserFocus() {
@@ -46,7 +47,7 @@ function _windowHasUserFocus() {
 
 export function isTaskInUserFocus(taskId) {
   if (!taskId || !_windowHasUserFocus()) return false;
-  if (state.activeTerminal?.taskId === taskId) return true;
+  if (state.activeTerminal?.taskId === taskId && state.activeTerminal.visible !== false) return true;
 
   const card = _taskCard(taskId);
   if (card) {

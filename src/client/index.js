@@ -46,6 +46,11 @@ window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, ws
 // Terminal task-title links need a page-level bridge: task-board.js owns the modal,
 // while template.html owns loadAndRender() and can select Project Board first.
 window.TipTask.openTaskEditModal = taskBoard.openTaskEditModalFromTerminal;
+// (TPT466) The task workspace (edit / agent terminal / chat in one modal): console-modal.js
+// openTerminal() and task-chat.js open() route here, and the terminal pane closes the
+// workspace through requestCloseTaskEditModal(). Neither module imports the modal itself.
+window.TipTask.openTaskWorkspace = taskBoard.openTaskWorkspace;
+window.TipTask.requestCloseTaskEditModal = taskBoard.requestCloseTaskEditModal;
 
 // (C1206) Bind the global voice-input shortcut here, at bundle evaluation — before any board
 // render. chatUI.attachChatHandlers() also calls registerVoiceShortcut() every render cycle

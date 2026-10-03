@@ -1028,6 +1028,15 @@
     color: #16160f;
     clip-path: inset(0 calc(100% - var(--fill)) 0 0);
   }
+  /* Light themes: --c-text is dark too, so dark ink on the fill read as one flat label. While a
+     caption is showing, deepen the fill and switch its ink to white (~5.5:1) so the text visibly
+     flips colour where the fill ends. Dark themes keep the rules above untouched. */
+  .agent-quota-sidebar-row { --agent-quota-fill-deep: color-mix(in srgb, var(--agent-quota-brand) 70%, #000); }
+  html:not(.theme-dark) .agent-quota-sidebar-row:is(:hover, :focus-visible) .agent-quota-sidebar-fill {
+    background: var(--agent-quota-fill-deep);
+  }
+  html:not(.theme-dark) .agent-quota-sidebar-text--fill { color: #fff; }
+  .agent-quota-sidebar-reset { font-weight: 600; }
   .agent-quota-sidebar-text > span {
     min-width: 0;
     overflow: hidden;
@@ -1273,6 +1282,11 @@
     outline-offset: 1px;
   }
 
+  /* (TPT469) A started project chat: chat glyph + summary title, no task key column. */
+  .active-session-item--chat .active-session-title {
+    flex: 1 1 auto;
+  }
+
   body.left-nav-collapsed .active-session-key,
   body.left-nav-collapsed .active-session-title {
     display: none;
@@ -1286,6 +1300,28 @@
     justify-content: center;
     width: 48px;
     padding: 0.3rem 0;
+  }
+
+  /* (TPT414) Full-title tooltip for .active-session-item rows. Body-appended + position:fixed
+     (ensureSessionTooltips() in task-board.js) because #left-nav-panel / .left-nav-main clip
+     overflow — a ::after inside the rail would be cut off. Out of flow: no layout shift in
+     either the expanded or .collapsed rail. */
+  .active-session-tooltip {
+    position: fixed;
+    z-index: 10000;
+    max-width: 320px;
+    padding: 4px 8px;
+    background: var(--c-bg-card, #23272e);
+    border: 1px solid var(--c-border, #333);
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    color: var(--c-text, #e2e8f0);
+    font-size: 0.8rem;
+    font-weight: 500;
+    line-height: 1.35;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    pointer-events: none;
   }
 
   body.left-nav-collapsed .sidebar-divider {
@@ -3975,9 +4011,21 @@
     border-color: #047857;
   }
 
+  /* (TPT399) Running spinner follows the theme accent, not the fixed resumable emerald. */
+  .btn-claude.session-running {
+    background: var(--c-primary);
+    border-color: var(--c-primary);
+    color: var(--c-on-primary, #fff);
+  }
+
+  .btn-claude.session-running:hover {
+    background: var(--c-primary-hover);
+    border-color: var(--c-primary-hover);
+  }
+
   /* (TPT374) In-progress + live process — busy, not actionable. Same arc-spinner recipe as
-     .left-nav-btn--primary.loading .left-nav-icon::after; currentColor picks up the on-primary
-     white on the card's green .btn-claude and the primary/on-primary tint on the modal pill. */
+     .left-nav-btn--primary.loading .left-nav-icon::after; currentColor picks up --c-on-primary
+     on the card's theme-accent .btn-claude and the primary tint on the modal pill. */
   .session-spinner {
     display: inline-block;
     box-sizing: border-box;
@@ -6130,7 +6178,9 @@
     flex-direction: column;
     gap: 0.5rem;
     max-width: 320px;
-    pointer-events: none; /* re-enabled per-child below — the column itself must stay click-through */
+    max-height: calc(100vh - 12rem);
+    overflow-y: auto;
+    pointer-events: auto; /* allow scrolling the retained cards */
   }
   /* the corner toast itself steps up to 5.25rem while a save is in flight (styles.css above) —
      step the stack above both when that happens */
@@ -6183,6 +6233,7 @@
     transform: translateY(6px);
     transition: opacity 0.2s ease, transform 0.2s ease, border-color 0.15s;
   }
+  .tt-notif-card { flex-shrink: 0; }
   .tt-notif-card.is-shown {
     opacity: 1;
     transform: none;
@@ -8017,40 +8068,6 @@
 
   /* ── end Spec Chat modal ── */
 
-  .chat-cards-intro {
-    font-size: 0.85rem;
-    color: var(--c-text-muted);
-    margin-bottom: 0.5rem;
-    margin-top: 0.5rem;
-  }
-
-  .chat-cards-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 0.75rem;
-  }
-  /* (C1243) The 260px column floor forces horizontal overflow once the composer's own content
-     width drops under ~300px (after the ≤768px left-nav collapse above). */
-  @media (max-width: 480px) {
-    .chat-cards-grid { grid-template-columns: minmax(0, 1fr); }
-  }
-
-  .chat-files-addressed {
-    margin-top: 0.75rem;
-  }
-
-  .files-addressed-header {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    cursor: pointer;
-    padding: 0.25rem 0;
-    user-select: none;
-  }
-
-  .files-addressed-label {
-    font-size: 0.8rem;
-    font-weight: 600;
   /* ── Task Chat window ── (task-chat.js)
      A conversation view for one task: un-bubbled assistant prose in a centred reading column,
      right-aligned user turns, composer docked at the bottom. Palette tokens only, so every
@@ -8087,32 +8104,15 @@
     overflow: hidden;
   }
 
+  /* One quiet row (TPT466): connection dot, kind, key and title, then Close. Starting another
+     chat lives in the left menu, not here. */
   .task-chat-header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 0.7rem 0.9rem 0.7rem 1.25rem;
+    gap: 0.6rem;
+    padding: 0.55rem 0.6rem 0.55rem 1.1rem;
     border-bottom: 1px solid var(--c-border);
     flex-shrink: 0;
-  }
-
-  .task-chat-heading {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-    min-width: 0;
-  }
-
-  .task-chat-eyebrow {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.68rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--c-text-muted);
   }
 
   .task-chat-dot {
@@ -8122,6 +8122,8 @@
     background: var(--c-success);
     flex-shrink: 0;
   }
+
+  .task-chat-panel--connecting .task-chat-dot { background: var(--c-text-faint); }
 
   .task-chat-panel--running .task-chat-dot {
     background: var(--c-primary);
@@ -8134,10 +8136,20 @@
   }
 
   .task-chat-title {
+    flex: 1;
     display: flex;
     align-items: baseline;
-    gap: 0.5rem;
+    gap: 0.55rem;
     min-width: 0;
+  }
+
+  .task-chat-eyebrow-text {
+    flex-shrink: 0;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--c-text-muted);
   }
 
   .task-chat-key {
@@ -8148,18 +8160,57 @@
   }
 
   .task-chat-title-text {
-    font-size: 0.98rem;
+    min-width: 0;
+    font-size: 0.95rem;
     font-weight: 600;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
-  .task-chat-header-actions {
+  .task-chat-header .task-chat-close { flex-shrink: 0; }
+
+  /* (TPT466) A task's chat inside its workspace modal (task-edit-modal.js Chat pane): the pane
+     is the frame, so the panel drops its own card chrome and fills it. */
+  .task-chat-embed {
     display: flex;
-    align-items: center;
-    gap: 0.15rem;
-    flex-shrink: 0;
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
+  }
+
+  .task-chat-panel.task-chat-panel--embedded {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    background: var(--c-bg);
+  }
+
+  .task-chat-panel--embedded .task-chat-scroll { padding-top: 1rem; }
+
+  /* The model pick reads as a compact pill in the composer; its label stays for assistive tech. */
+  .task-chat-selector-slot .chat-model-selector select {
+    min-height: 2rem;
+    padding: 0.3rem 0.7rem;
+    border-radius: 999px;
+  }
+
+  /* The objective chat's phone rules stretch every .btn-chat-send to a full row; in this
+     composer Send/Stop keep their size and the model pill takes the remaining width. */
+  .task-chat-actions .btn-chat-send,
+  .task-chat-actions .btn-chat-stop { flex: 0 0 auto; }
+  .task-chat-selector-slot .chat-model-selector { max-width: 100%; }
+  .task-chat-selector-slot .chat-model-selector select { max-width: 100%; }
+
+  .task-chat-selector-slot .chat-model-selector label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
   }
 
   .task-chat-icon-btn {
@@ -8908,6 +8959,107 @@
   .task-chat-start-cancel:focus-visible,
   .task-chat-start-go:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
 
+  /* Attachments (TPT473): the shared Embed control (embed-menu.js) in the composer and at the
+     gate, the upload status, file drop on the panel, and thumbnails / chips in user turns. */
+  .task-chat-embed-slot { display: inline-flex; flex-shrink: 0; }
+  .task-chat-embed-slot .embed-menu-trigger,
+  .task-chat-start-embed .embed-menu-trigger { min-height: 30px; padding: 0 10px; font-size: 0.76rem; }
+
+  .task-chat-upload-status {
+    flex: 1;
+    min-width: 0;
+    text-align: right;
+    font-size: 0.72rem;
+    color: var(--c-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .task-chat-start-embed { display: flex; justify-content: center; }
+
+  .task-chat-start-attachments {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.4rem;
+    max-width: 100%;
+  }
+  .task-chat-start-attachments[hidden] { display: none; }
+  .task-chat-start-attachments-note { margin: 0; font-size: 0.78rem; color: var(--c-text-faint); }
+  .task-chat-start-attachments .task-chat-attachments { justify-content: center; }
+
+  .task-chat-panel--drop::after {
+    content: attr(data-drop-label);
+    position: absolute;
+    inset: 0.5rem;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px dashed var(--c-primary);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--c-bg-card) 82%, transparent);
+    color: var(--c-primary);
+    font-size: 0.95rem;
+    font-weight: 600;
+    pointer-events: none;
+  }
+
+  .task-chat-msg--user .task-chat-user-text { white-space: pre-wrap; }
+  .task-chat-msg--user .task-chat-user-text + .task-chat-attachments { margin-top: 0.45rem; }
+
+  .task-chat-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    min-width: 0;
+    max-width: 100%;
+    white-space: normal;
+  }
+
+  .task-chat-attach {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    min-width: 0;
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    background: var(--c-bg-card);
+    color: var(--c-text);
+    text-decoration: none;
+    overflow: hidden;
+  }
+  .task-chat-attach:hover { border-color: var(--c-primary); }
+  .task-chat-attach:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+
+  .task-chat-attach--image img {
+    display: block;
+    max-width: 160px;
+    max-height: 120px;
+    object-fit: cover;
+  }
+
+  .task-chat-attach--file {
+    gap: 0.4rem;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
+  }
+  .task-chat-attach-icon {
+    flex-shrink: 0;
+    width: 0.8rem;
+    height: 1rem;
+    border: 1.5px solid currentColor;
+    border-radius: 2px 5px 2px 2px;
+    color: var(--c-primary);
+  }
+  .task-chat-attach-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   @media (max-width: 640px) {
     .task-chat-panel {
       width: 100vw;
@@ -8922,6 +9074,8 @@
     .task-chat-footer { padding: 0.5rem 0.85rem 0.85rem; }
     .task-chat-hint { display: none; }
     .task-chat-selector-slot { flex: 1; }
+    .task-chat-embed-slot .embed-menu-label { display: none; }
+    .task-chat-attach--image img { max-width: 120px; max-height: 90px; }
     .task-chat-widget--dialog { padding: 0.6rem 0.65rem; }
     .task-chat-dialog-actions { flex-direction: column; align-items: stretch; }
     .task-chat-dialog-submit { margin-left: 0; }
@@ -8937,6 +9091,40 @@
 
   /* ── end Task Chat window ── */
 
+  .chat-cards-intro {
+    font-size: 0.85rem;
+    color: var(--c-text-muted);
+    margin-bottom: 0.5rem;
+    margin-top: 0.5rem;
+  }
+
+  .chat-cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 0.75rem;
+  }
+  /* (C1243) The 260px column floor forces horizontal overflow once the composer's own content
+     width drops under ~300px (after the ≤768px left-nav collapse above). */
+  @media (max-width: 480px) {
+    .chat-cards-grid { grid-template-columns: minmax(0, 1fr); }
+  }
+
+  .chat-files-addressed {
+    margin-top: 0.75rem;
+  }
+
+  .files-addressed-header {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    cursor: pointer;
+    padding: 0.25rem 0;
+    user-select: none;
+  }
+
+  .files-addressed-label {
+    font-size: 0.8rem;
+    font-weight: 600;
     color: var(--c-text-muted);
   }
 
@@ -9163,7 +9351,12 @@
 
   .chat-brief-hint {
     font-size: 0.74rem;
-    color: var(--c-text-dim, #6c6c7a);
+    /* (TPT407) idle = muted token at reduced opacity; --low = warning token at full opacity.
+       Only real palette tokens — --c-text-dim/--c-yellow exist in no theme, so the old
+       hard-coded fallbacks (gray idle, pastel-yellow low) inverted emphasis on light palettes. */
+    color: var(--c-text-muted);
+    opacity: 0.75;
+    transition: color 0.15s, opacity 0.15s;
     padding: 0.2rem 0.1rem 0;
     display: flex;
     flex-wrap: wrap; /* (C1243) was unwrappable — the hint sentence clipped/overflowed at any
@@ -9171,7 +9364,9 @@
     gap: 0.3rem;
   }
   .chat-brief-hint--low {
-    color: var(--c-yellow, #f9e2af);
+    color: var(--c-warning);
+    opacity: 1;
+    font-weight: 600;
   }
 
   .chat-input-actions {
@@ -9289,7 +9484,7 @@
     cursor: not-allowed;
   }
   .embed-menu-trigger svg { width: 14px; height: 14px; }
-  /* (TPT280) Shared 12px svg caret (chat-ui.js DROPDOWN_CARET_SVG) on both Embed and Import. */
+  /* (TPT280) Shared 12px svg caret (embed-menu.js DROPDOWN_CARET_SVG) on both Embed and Import. */
   .embed-menu-caret,
   .embed-menu-trigger svg.embed-menu-caret {
     width: 12px;
@@ -10351,6 +10546,140 @@ img.agent-picker-icon {
   border-radius: 8px; padding: 0;
   box-shadow: 0 8px 32px rgba(0,0,0,0.22);
 }
+/* ── (TPT466) Task workspace: one modal, three panes (Edit / Agent Terminal / Chat) ──
+   The panel's data-pane picks its size: Edit keeps the form's width with content height, Chat
+   gets a fixed reading frame, and Agent Terminal is the largest — the xterm wants every row and
+   column it can get. On the terminal pane the overlay starts at the left-nav rail's edge
+   (TPT360 offsets, same as .terminal-overlay--task) so the rail's session rows stay live. */
+.task-edit-panel--tabs {
+  transition: max-width 0.18s ease, width 0.18s ease, height 0.18s ease;
+}
+.task-edit-panel--tabs[data-pane="chat"] {
+  max-width: min(880px, 94vw); height: min(86vh, 900px);
+}
+.task-edit-panel--tabs[data-pane="terminal"] {
+  max-width: min(1400px, 100%); height: min(900px, calc(100vh - 40px)); max-height: none;
+}
+.task-edit-overlay--rail {
+  left: 200px; padding: 20px;
+  transition: left 0.2s ease;
+}
+body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
+@media (max-width: 768px) {
+  .task-edit-overlay--rail { left: 56px; }
+}
+.task-modal-pane {
+  display: flex; flex-direction: column;
+  flex: 1 1 auto; min-height: 0;
+}
+.task-modal-pane[hidden] { display: none; }
+.task-modal-pane--chat { border-top: 1px solid var(--c-border); }
+.task-modal-pane--terminal {
+  position: relative;
+  background: #1e1e2e;
+  border-top: 1px solid var(--c-border);
+}
+/* The terminal's own frame (.terminal-container) is the pane here: no second card, no repeat of
+   the key/title the top bar already shows, no Show task / Minimize (the tabs and × do that). */
+.task-modal-pane--terminal .terminal-embed {
+  display: flex; flex: 1 1 auto; min-height: 0; min-width: 0;
+}
+.task-modal-pane--terminal .terminal-container {
+  max-width: none; max-height: none;
+  border-radius: 0; box-shadow: none; border: 0;
+}
+.task-modal-pane--terminal .terminal-task-key,
+.task-modal-pane--terminal .terminal-task-title,
+.task-modal-pane--terminal .btn-show-task,
+.task-modal-pane--terminal .btn-close-terminal { display: none; }
+.task-modal-pane--terminal.task-modal-pane--empty {
+  background: var(--c-bg);
+  align-items: center; justify-content: center;
+}
+.task-modal-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  max-width: 26rem; padding: 32px 20px; text-align: center;
+}
+.task-modal-empty-mark {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 44px; height: 44px; border-radius: 12px;
+  background: var(--c-primary-light); color: var(--c-primary);
+}
+.task-modal-empty-mark svg { width: 22px; height: 22px; }
+.task-modal-empty-title { margin: 6px 0 0; font-size: 0.98rem; font-weight: 600; color: var(--c-text); }
+.task-modal-empty-hint { margin: 0; font-size: 0.85rem; line-height: 1.5; color: var(--c-text-muted); }
+.task-modal-terminal-start {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-top: 10px; height: 34px; padding: 0 16px;
+  border: 1px solid var(--c-primary); border-radius: 8px;
+  background: var(--c-primary); color: var(--c-on-primary);
+  font-size: 0.85rem; font-weight: 600; cursor: pointer;
+}
+.task-modal-terminal-start:hover:not(:disabled) { background: var(--c-primary-hover); border-color: var(--c-primary-hover); }
+.task-modal-terminal-start:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--c-primary-light); }
+.task-modal-terminal-start:disabled { opacity: 0.45; cursor: not-allowed; }
+.task-modal-terminal-start svg { width: 14px; height: 14px; }
+.task-modal-terminal-start .session-spinner { width: 12px; height: 12px; }
+
+/* Segmented tab strip, centred between the key/status and the Save group. */
+.modal-top-bar .task-modal-tabs {
+  display: inline-flex; align-items: center; gap: 2px;
+  height: var(--modal-ctrl-h); padding: 2px; box-sizing: border-box;
+  border-radius: 8px; background: var(--c-bg-tier);
+}
+.modal-top-bar button.task-modal-tab {
+  position: relative;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 100%; padding: 0 12px;
+  border: 0; border-radius: 6px; box-shadow: none;
+  background: transparent; color: var(--c-text-secondary);
+  font-size: 0.8rem; font-weight: 600; white-space: nowrap;
+}
+.modal-top-bar button.task-modal-tab svg { width: 15px; height: 15px; flex-shrink: 0; }
+.modal-top-bar button.task-modal-tab:hover:not(.active) { color: var(--c-text); background: color-mix(in srgb, var(--c-bg-card) 60%, transparent); }
+.modal-top-bar button.task-modal-tab.active {
+  background: var(--c-bg-card); color: var(--c-primary);
+  box-shadow: 0 1px 2px var(--c-shadow);
+}
+.modal-top-bar button.task-modal-tab:focus-visible { box-shadow: 0 0 0 2px var(--c-primary); }
+.task-modal-tab-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--c-warning); flex-shrink: 0;
+}
+.task-modal-tab[data-pane="terminal"] .task-modal-tab-dot { background: var(--c-success); }
+.task-modal-tab[data-pane="terminal"] .task-modal-tab-dot--attention {
+  background: var(--c-warning);
+  animation: task-modal-dot-pulse 1.4s ease-in-out infinite;
+}
+.task-modal-tab-dot[hidden] { display: none; }
+@keyframes task-modal-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+/* Title beside the key on the Terminal and Chat panes, where the form (and its title field)
+   is hidden; the status select and Cancel/Reset/Save belong to the form and go with it. */
+.modal-head-title {
+  display: none; min-width: 0;
+  font-size: 0.92rem; font-weight: 600; color: var(--c-text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.task-edit-panel--tabs:not([data-pane="edit"]) .modal-head-title { display: block; }
+.task-edit-panel--tabs:not([data-pane="edit"]) .modal-status-select,
+.task-edit-panel--tabs:not([data-pane="edit"]) .modal-primary-actions { display: none; }
+.task-edit-panel--tabs:not([data-pane="edit"]) .modal-top-bar { flex-wrap: nowrap; padding-bottom: 12px; }
+.modal-top-bar button.btn-modal-close {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: var(--modal-ctrl-h); padding: 0;
+  background: transparent; border-color: transparent; box-shadow: none; color: var(--c-text-muted);
+}
+.modal-top-bar button.btn-modal-close svg { width: 16px; height: 16px; }
+.modal-top-bar button.btn-modal-close:hover { color: var(--c-text); background: var(--c-bg-tier); }
+.task-edit-panel--tabs[data-pane="edit"] .btn-modal-close { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .task-edit-panel--tabs, .task-edit-overlay--rail { transition: none; }
+  .task-modal-tab-dot--attention { animation: none; }
+}
+
 /* (TPT54) Panel is a flex column: .modal-top-bar and .modal-context-btns are
    flex-shrink:0 pinned siblings, everything else scrolls inside .modal-scroll-body —
    see ai/architecture/tt-task-edit-modal.md § Panel Scroll Layout. */
@@ -10388,14 +10717,9 @@ img.agent-picker-icon {
 .modal-top-bar button { padding: 0 14px; height: var(--modal-ctrl-h); border-radius: 6px; border: 1px solid var(--c-border); font-size: 0.82rem; font-weight: 600; cursor: pointer; background: var(--c-bg-card); color: var(--c-text); box-shadow: 0 1px 2px var(--c-shadow); transition: color 120ms ease, background 120ms ease, border-color 120ms ease; }
 /* Cancel and Reset are ghost actions; Save remains the filled primary action. */
 .modal-top-bar button.btn-modal-cancel,
-.modal-top-bar button.btn-modal-chat,
 .modal-top-bar button.btn-modal-reset { background: transparent; box-shadow: none; color: var(--c-text-secondary); }
 .modal-top-bar button.btn-modal-cancel:hover,
-.modal-top-bar button.btn-modal-chat:hover:not([disabled]),
 .modal-top-bar button.btn-modal-reset:hover:not([disabled]) { color: var(--c-primary); border-color: var(--c-primary); background: var(--c-primary-light); }
-/* Opens the task chat window: speech bubble + caption, ghost like Cancel/Reset. */
-.modal-top-bar button.btn-modal-chat { display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; }
-.modal-top-bar button.btn-modal-chat svg { width: 15px; height: 15px; flex-shrink: 0; }
 .modal-top-bar button:focus-visible { outline: none; border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-light); }
 .modal-top-bar button.btn-modal-save { background: var(--c-primary); color: var(--c-on-primary); border-color: var(--c-primary); }
 .modal-top-bar button.btn-modal-save:hover { background: var(--c-primary-hover); border-color: var(--c-primary-hover); }
@@ -10942,6 +11266,9 @@ img.agent-picker-icon {
 @media (max-width: 720px) {
   .task-edit-overlay { padding: 10px; }
   .task-edit-panel { max-width: 100%; max-height: calc(100vh - 20px); max-height: calc(100dvh - 20px); }
+  .task-edit-overlay--rail { padding: 10px; }
+  .task-edit-panel--tabs[data-pane="chat"],
+  .task-edit-panel--tabs[data-pane="terminal"] { max-width: 100%; height: calc(100vh - 20px); height: calc(100dvh - 20px); max-height: none; }
   .task-edit-panel .modal-field-group { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 480px) {
@@ -10951,9 +11278,9 @@ img.agent-picker-icon {
   .modal-task-id { padding: 0 10px; }
   .modal-top-bar .modal-status-select { padding: 0 22px 0 10px; background-position: right 0.5rem center; }
   .modal-top-bar button { padding: 0 10px; }
-  /* Icon only on a phone — the caption would push Reset/Save onto a second row. */
-  .modal-top-bar button.btn-modal-chat { padding: 0 9px; }
-  .modal-top-bar button.btn-modal-chat span { display: none; }
+  /* (TPT466) Icon-only workspace tabs on a phone, so the tab strip and Reset/Save share a row. */
+  .modal-top-bar .task-modal-tab { padding: 0 9px; }
+  .modal-top-bar .task-modal-tab-label { display: none; }
   .modal-scroll-body { padding: 0 12px 12px; }
   .modal-context-btns { padding: 8px 12px 10px; }
   .task-edit-panel .modal-field-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }

@@ -80,6 +80,9 @@ export function activateDialogFocus({ root, initialFocus, returnFocus, portals }
   return {
     focusFirst: () => { if (top() === layer) focusFirst(layer); },
     isTop: () => top() === layer,
+    // Re-evaluates which body children stay interactive — for a `portals` selector whose match
+    // set changes without a body child being added or removed (e.g. a body class toggle).
+    refresh: () => { if (!closed) syncInert(); },
     close() {
       if (closed) return;
       closed = true;

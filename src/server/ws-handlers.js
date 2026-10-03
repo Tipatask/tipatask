@@ -9,12 +9,12 @@ const { applyRehashIntent, spawnObjectiveTurn, killObjectiveProc, escalateKill, 
 const { spawnTurn, providerSessionId, clearProviderSessionId, applyModelSelection } = require('./providers/dispatch');
 const { listObjectiveProviders, listVisibleObjectiveProviders, clampSelectionToProviders, formatSelection, currentSelection, configForProject } = require('./providers/registry');
 const { createSession, isAgentChatType, isAgentChatId } = require('./session-state');
-const { TASK_CHAT, isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFromChatId, buildTaskChatSeed, buildTaskChatSystemPrompt } = require('./task-chat');
+const { TASK_CHAT, isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFromChatId, buildProjectChatTitle, buildTaskChatSeed, buildTaskChatSystemPrompt } = require('./task-chat');
 const { providerSupportsProfile } = require('./providers/tool-profiles');
 const { findOpenDialog, resolveDialogAnswer, replayTaskChatTurn, taskFrame, changedTaskFields, buildTaskEditNote } = require('./task-chat-widgets');
 const { killProcessGroup, resolveAgentLimits } = require('./process-group');
 const { createSessionQueue } = require('./session-queue');
-const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary } = require('./terminal-session');
+const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary } = require('./terminal-session');
 const { buildExitResolutionComment, hasSelfAuthoredResolution, waitForFinalMessage, selectFinalMessage } = require('./exit-resolution');
 const { getTaskAgentInfo, getTaskAgentLabels, getAvailableAgents, getAvailableAgentsPeek, listTaskAgentStatuses, listTaskAgentStatusesPeek, refreshAgentDetection, resolveTaskAgentId, listAgentModels, listAllAgentModels } = require('./task-agent');
 const { isModelAllowed } = require('./task-agent/model-registry');
@@ -148,6 +148,15 @@ function sessionListBucket(s) {
   return 'exited';
 }
 
+// A naturally exited terminal remains in the session map with its bounded PTY buffer. Reopen
+// that exact session without a prompt so a completion banner cannot start a second agent run.
+function replayExitedTerminal(ws, session) {
+  const reset = '\x1b[!p\x1b[?1049l\x1b[2J\x1b[H';
+  const buffer = sanitizeReplayBuffer(session.buffer || '');
+  ws.send(JSON.stringify({ type: 'data', tabId: session.tabId, data: reset + buffer }));
+  ws.send(JSON.stringify(buildTerminalExitFrame(session, session.exitCode ?? null, [])));
+}
+
 // (C1144/TPT413) One GET /api/sessions `sessionMeta` row. `agent` is read LIVE off the session
 // object every time — never a cached launch value. session.taskAgent is mutable: seeded by
 // createSession() (project default), overridden by the validated WS ?agent= param at connect
@@ -157,7 +166,10 @@ function sessionListBucket(s) {
 function sessionMetaRow(s) {
   return { agent: s.taskAgent || null, label: s.taskAgentLabel || '', type: s.type || 'terminal', alive: !!s.alive,
     paused: pausedSummary(s),
-    ...(s.startedAt ? { startedAt: s.startedAt } : {}) };
+    ...(s.startedAt ? { startedAt: s.startedAt } : {}),
+    // (TPT469) A project chat is listed in the left menu once it has a title — its first user
+    // message. Untitled ones are drafts the next Start Chat reuses.
+    ...(s.chatProjectId ? { chatProjectId: s.chatProjectId, title: s.chatTitle || '' } : {}) };
 }
 
 // Blocks starting a task assigned to someone else. Replaces the guard that used to sit
@@ -4267,6 +4279,21 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
 
   const existing = sessions.get(sessionKey);
 
+  if (terminateOnConnect && existing && existing.type === 'taskChat') {
+    // (TPT469) The left menu's End control on a chat row. A chat has no PTY: end it the way
+    // its own `kill` frame does, telling a window still attached to it, then ack this socket.
+    console.log(`[task-chat] Terminate-on-connect requested for ${taskId}`);
+    const attached = existing.ws;
+    dropObjectiveSession(sessions, sessionKey, existing, taskId, 'kill');
+    existing.alive = false;
+    if (attached && attached !== ws && attached.readyState === attached.OPEN) {
+      attached.send(JSON.stringify({ type: 'chat-ended', tabId: existing.tabId }));
+    }
+    broadcastSessionEnded(taskId, existing);
+    ws.send(JSON.stringify({ type: 'session-ended', ...sessionEndedPayload(taskId, existing, 'terminated') }), () => ws.close());
+    return;
+  }
+
   if (terminateOnConnect) {
     console.log(`[terminal] Terminate-on-connect requested for task ${taskId}`);
     terminateTerminalSession(existing, taskId, sessionKey, sessions, 'terminated', { ackWs: ws, backend });
@@ -4278,6 +4305,15 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     const resumed = existing?.type === 'terminal' ? resumeRunawaySession(existing) : null;
     if (resumed) websocket.emitSessionRunaway(existing.projectPath, { taskId: existing.tabId, pid: existing.ptyPid, resumed: true, promptText: resumed.text });
     ws.send(JSON.stringify({ type: 'resume-paused-result', ok: !!resumed, paused: pausedSummary(existing) }), () => ws.close());
+    return;
+  }
+
+  const requestedStart = Number(url.searchParams.get('startedAt'));
+  if (existing && !prompt && requestedStart > 0 && existing.startedAt > 0
+      && requestedStart !== existing.startedAt) {
+    ws.send(JSON.stringify({ type: 'error', code: 'ESESSION_LOST',
+      message: `Terminal session for ${taskId} was replaced by another run.` }));
+    ws.close();
     return;
   }
 
@@ -4316,6 +4352,18 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     }
     forceResumeRepaint(existing);
     maybeRefirePlanReady(existing, ws);
+    return;
+  }
+
+  if (existing && existing.type === 'terminal' && sessionListBucket(existing) === 'exited' && !prompt) {
+    if (projectPath) existing.projectPath = projectPath;
+    if (existing.ws && existing.ws !== ws && existing.ws.readyState === existing.ws.OPEN) {
+      _sendIfOpen(existing.ws, { type: 'detached', tabId: existing.tabId, message: 'Another client attached' });
+      try { existing.ws.close(); } catch { /* already closed */ }
+    }
+    existing.ws = ws;
+    wireClient(ws, existing, taskId, sessionKey, sessions, backend);
+    replayExitedTerminal(ws, existing);
     return;
   }
 
@@ -4412,6 +4460,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
       tabId: existing.tabId,
       taskKey: existing.taskKey,
       projectId: existing.chatProjectId || null,
+      title: existing.chatTitle || '',
       messages: existing.messages,
       historyWindowStart: 0,
       historyTotalCount: existing.messages.length,
@@ -5329,6 +5378,16 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         _userMsg.taskEdits = _edits.map(e => ({ taskKey: e.task.id, changed: e.changed }));
       }
       session.messages.push(_userMsg);
+      // (TPT469) The first message the user sends names a project chat: from here on it is a
+      // conversation of its own in the left menu, and the next Start Chat opens a new one.
+      if (session.chatProjectId && !session.chatTitle) {
+        session.chatTitle = buildProjectChatTitle(content);
+        if (session.ws && session.ws.readyState === session.ws.OPEN) {
+          session.ws.send(JSON.stringify({ type: 'project-chat-titled', tabId: session.tabId, title: session.chatTitle }));
+        }
+      }
+      // Image/file refs are localized by each provider's spawn (localizeAttachments() on the
+      // assembled prompt), so messages[].content keeps the text the user sent — no pass here.
       spawnTurn(session, taskId);
 
     } else if (msg.type === 'task-chat-task-edited' && session.type === 'taskChat') {
@@ -5484,7 +5543,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         session.pty.resize(session.cols, session.rows);
       }
     } else if (msg.type === 'session-status') {
-      if (!isAgentChatType(session.type)) {
+      if (!isAgentChatType(session.type) && session.alive) {
         emitTerminalState(session);
         maybeRefirePlanReady(session, ws);
       }
@@ -5661,6 +5720,7 @@ module.exports = {
   assertTaskStartable,
   claimUnassignedTaskOnStart,
   sessionListBucket, sessionMetaRow,
+  replayExitedTerminal,
   drainSessionQueue, sessionQueue,
   parsePiModelList,
   queryPiModels,

@@ -20,13 +20,15 @@ const DIALOG = {
 };
 const TASK = { id: 'TPT9', title: 'New task', description: 'Body', status: 'pending', tags: ['feature'], dependencies: [] };
 
-function harness(t, { topLayer = () => true } = {}) {
+function harness(t, { topLayer = () => true, draftStorage = new Map(), projectPath = '/projects/alpha' } = {}) {
   const window = new Window();
   t.after(() => window.happyDOM.close());
   const sent = [];
   const opened = [];
   const sockets = [];
+  const uploads = { menus: [], drops: [], pastes: [] };
   let locale = 'en';
+  let currentProjectPath = projectPath;
   class FakeSocket {
     constructor(url) { this.url = url; this.readyState = 1; sockets.push(this); }
     close() { this.readyState = 3; }
@@ -34,7 +36,11 @@ function harness(t, { topLayer = () => true } = {}) {
   FakeSocket.OPEN = 1;
   const env = {
     window, document: window.document, WebSocket: FakeSocket, console,
-    localStorage: { getItem: () => null, setItem: () => {} },
+    localStorage: {
+      getItem: key => draftStorage.get(key) ?? null,
+      setItem: (key, value) => draftStorage.set(key, String(value)),
+      removeItem: key => draftStorage.delete(key),
+    },
     requestAnimationFrame: (fn) => { fn(); return 1; }, cancelAnimationFrame: () => {},
     setTimeout: () => 1, clearTimeout: () => {},
     fetch: async () => ({ ok: false }),
@@ -44,8 +50,10 @@ function harness(t, { topLayer = () => true } = {}) {
     WS_SEND_TYPES, WS_RECV_TYPES,
     renderMarkdown: text => `<p>${text}</p>`,
     escapeAttr: value => String(value ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
-    autoGrowTextarea: () => {}, projectHeader: () => ({}), showToast: () => {},
+    autoGrowTextarea: () => {},
+    projectHeader: () => ({ 'x-tipatask-project': currentProjectPath }), showToast: () => {},
     modelLabel: (_id, value) => value,
+    CHAT_BUBBLE_SVG: '<svg class="chat-bubble"></svg>',
     state: { objectiveProviders: [], objectiveModel: '' },
     showActionConfirm: async () => true,
     activateDialogFocus: () => ({ close() {}, focusFirst() {}, isTop: topLayer }),
@@ -54,6 +62,13 @@ function harness(t, { topLayer = () => true } = {}) {
     getLocale: () => locale,
     renderCard: (task, opts) => `<div class="card card--preview" data-preview-task="${task.id}" data-opts="${opts.preview}">${task.title}</div>`,
     openTaskEditModal: async (key, callbacks) => { opened.push({ key, callbacks }); },
+    // (TPT473) The shared Embed control and uploads: markup only, and the options each wiring
+    // call received, so a test can play an upload's callbacks.
+    embedMenuHtml: () => '<div class="embed-menu-wrap"><button type="button" class="embed-menu-trigger"><span class="embed-menu-label"></span></button></div>',
+    attachEmbedMenu: (wrap, textarea, opts) => uploads.menus.push({ wrap, textarea, opts }),
+    attachFileDrop: (target, textarea, opts) => uploads.drops.push({ target, textarea, opts }),
+    attachImagePaste: (textarea, _ws, opts) => uploads.pastes.push({ textarea, opts }),
+    closeOpenEmbedMenu: () => {},
     ...model,
   };
   vm.createContext(env);
@@ -75,7 +90,9 @@ function harness(t, { topLayer = () => true } = {}) {
     sent.length = 0;
   };
   const setLocale = (lang) => { locale = lang; };
-  return { env, doc, sent, opened, sockets, feed, start, turn, setLocale, $: sel => doc.querySelector(sel), $$: sel => [...doc.querySelectorAll(sel)] };
+  const setProjectPath = (path) => { currentProjectPath = path; };
+  return { env, doc, sent, opened, sockets, uploads, feed, start, turn, setLocale, setProjectPath,
+    $: sel => doc.querySelector(sel), $$: sel => [...doc.querySelectorAll(sel)] };
 }
 
 function click(el) { el.dispatchEvent(new el.ownerDocument.defaultView.MouseEvent('click', { bubbles: true })); }
@@ -87,6 +104,73 @@ function askDialog(h) {
   h.feed({ type: 'data', data: 'Pick one.\n\n```ask_user\n{"question":"Where should it go?"}\n```' });
   h.feed({ type: 'task-chat-dialog', taskKey: 'TPT1', dialog: DIALOG });
 }
+
+function typeDraft(h, text) {
+  const input = h.$('.task-chat-input');
+  input.value = text;
+  input.dispatchEvent(new h.doc.defaultView.Event('input', { bubbles: true }));
+}
+
+test('task and project drafts survive reopening and reload without crossing projects', async (t) => {
+  const storage = new Map();
+  const h = harness(t, { draftStorage: storage });
+  h.env.open('TPT1');
+  typeDraft(h, 'Task draft');
+  h.env.close();
+
+  h.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '2' } }) });
+  await h.env.openProjectChat();
+  assert.equal(h.$('.task-chat-input').value, '', 'project chat has its own draft');
+  typeDraft(h, 'Project draft');
+  h.env.close();
+
+  h.env.open('TPT1');
+  assert.equal(h.$('.task-chat-input').value, 'Task draft', 'same task restores after closing');
+  h.env.close();
+  h.env.open('TPT2');
+  assert.equal(h.$('.task-chat-input').value, '', 'another task in the same project stays empty');
+  h.env.close();
+  h.setProjectPath('/projects/beta');
+  h.env.open('TPT1');
+  assert.equal(h.$('.task-chat-input').value, '', 'same task key in another project stays empty');
+  h.env.close();
+  h.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '3' } }) });
+  await h.env.openProjectChat();
+  assert.equal(h.$('.task-chat-input').value, '', 'another project chat stays empty');
+  h.env.close();
+
+  const reloaded = harness(t, { draftStorage: storage });
+  reloaded.env.open('TPT1');
+  assert.equal(reloaded.$('.task-chat-input').value, 'Task draft', 'task draft survives renderer reload');
+  reloaded.env.close();
+  reloaded.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '2' } }) });
+  await reloaded.env.openProjectChat();
+  assert.equal(reloaded.$('.task-chat-input').value, 'Project draft', 'project draft survives renderer reload');
+});
+
+test('sending clears persisted draft; an aborted turn stores returned text again', (t) => {
+  const storage = new Map();
+  const h = harness(t, { draftStorage: storage });
+  h.start();
+  typeDraft(h, 'Please check this');
+  assert.equal([...storage.keys()].filter(key => key.startsWith('tipatask-task-chat-draft:')).length, 1);
+  h.env.sendMessage();
+  assert.equal([...storage.keys()].filter(key => key.startsWith('tipatask-task-chat-draft:')).length, 0);
+  h.feed({ type: 'generation-aborted' });
+  assert.equal(h.$('.task-chat-input').value, 'Please check this');
+  assert.equal([...storage.values()].includes('Please check this'), true, 'abort restores persistent draft');
+  h.env.close();
+
+  const reloaded = harness(t, { draftStorage: storage });
+  reloaded.env.open('TPT1');
+  assert.equal(reloaded.$('.task-chat-input').value, 'Please check this');
+  reloaded.feed({ type: 'chat-history-reset', running: false,
+    messages: [{ role: 'user', content: 'seed', seed: true }, { role: 'assistant', content: 'Hello.' }] });
+  reloaded.feed({ type: 'config', objectiveProviders: [] });
+  reloaded.env.sendMessage();
+  assert.equal(reloaded.sent.at(-1).type, 'task-chat-message');
+  assert.equal([...storage.keys()].filter(key => key.startsWith('tipatask-task-chat-draft:')).length, 0);
+});
 
 test('a dialog frame draws a locked form mid-turn that opens when the turn ends', (t) => {
   const h = harness(t);
@@ -231,6 +315,63 @@ test('restored history shows an answered dialog locked with its pick, and the an
   assert.equal(dialog.dataset.state, 'answered');
   assert.deepEqual(h.$$('.task-chat-dialog-options input').filter(i => i.checked).map(i => i.value), ['1']);
   assert.equal(h.$('.task-chat-msg--user .task-chat-body').textContent, 'Backlog');
+});
+
+test('(TPT475) a reattached project chat opens its pending dialog once config arrives after the history', async (t) => {
+  const h = harness(t);
+  h.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '2' } }) });
+  await h.env.openProjectChat();
+  // ws-handlers.js order: chat-history-reset, chat-ready, then config from wireClient().
+  h.feed({
+    type: 'chat-history-reset', running: false, projectId: '2',
+    messages: [{ role: 'user', content: 'seed', seed: true }, { role: 'assistant', content: 'Pick.', dialogs: [{ ...DIALOG }] }],
+  });
+  h.feed({ type: 'chat-ready' });
+  const dialog = h.$('.task-chat-widget--dialog');
+  assert.equal(dialog.dataset.state, 'waiting', 'built before the socket counts as connected');
+  h.feed({ type: 'config', objectiveProviders: [] });
+  assert.equal(dialog.dataset.state, 'open');
+  assert.equal(dialog.disabled, false);
+
+  const submit = h.$('.task-chat-dialog-submit');
+  assert.equal(submit.disabled, true, 'nothing picked yet');
+  const radios = h.$$('.task-chat-dialog-options input[type="radio"]');
+  radios[0].checked = true;
+  change(radios[0]);
+  assert.equal(submit.disabled, false);
+  click(submit);
+  assert.deepEqual(h.sent, [{ type: 'task-chat-answer', dialogId: 'dlg-1', selected: [0], model: undefined }]);
+  assert.equal(dialog.dataset.state, 'answered');
+  assert.ok(h.$('.task-chat-msg--assistant.task-chat-msg--streaming'), 'the answer starts the next turn');
+});
+
+test('(TPT475) a dialog re-sent mid-turn is answered on the record the window repaints from', (t) => {
+  const h = harness(t);
+  h.start();
+  askDialog(h);
+  // A reattach mid-turn replays the frame: the record is replaced, the element is kept.
+  h.feed({ type: 'task-chat-dialog', taskKey: 'TPT1', dialog: { ...DIALOG } });
+  h.feed({ type: 'chat-ready' });
+  const dialog = h.$('.task-chat-widget--dialog');
+  assert.equal(dialog.dataset.state, 'open');
+  const radios = h.$$('.task-chat-dialog-options input[type="radio"]');
+  radios[1].checked = true;
+  change(radios[1]);
+  click(h.$('.task-chat-dialog-submit'));
+  assert.equal(h.sent.at(-1).type, 'task-chat-answer');
+  assert.equal(dialog.dataset.state, 'answered', 'not "skipped": the answer is on the current record');
+});
+
+test('(TPT475) chat-ended takes an open dialog back to waiting', (t) => {
+  const h = harness(t);
+  h.start();
+  askDialog(h);
+  h.feed({ type: 'chat-ready' });
+  const dialog = h.$('.task-chat-widget--dialog');
+  assert.equal(dialog.dataset.state, 'open');
+  h.feed({ type: 'chat-ended' });
+  assert.equal(dialog.dataset.state, 'waiting');
+  assert.equal(dialog.disabled, true);
 });
 
 test('tool frames draw chips that update in place and keep their expanded state', (t) => {
@@ -445,7 +586,7 @@ test('openProjectChat() connects to this window\'s project and starts it with st
     json: async () => ({ config: { API_PROJECT_ID: '2', projectName: 'Tipatask' } }),
   });
   await h.env.openProjectChat();
-  assert.equal(h.sockets[0].url, 'ws://test/?taskId=projectChat:2');
+  assert.match(h.sockets[0].url, /^ws:\/\/test\/\?taskId=projectChat:2:[a-z0-9]{6,32}$/);
   assert.equal(h.$('.task-chat-key'), null, 'no task key in the header');
   assert.equal(h.$('.task-chat-title-text').textContent, 'Tipatask');
   assert.equal(h.$('.task-chat-eyebrow-text').textContent, 'taskChat.projectEyebrow');
@@ -485,11 +626,11 @@ test('a project chat with history restores it and shows no gate', async (t) => {
 test('a language switch relabels the open window; any other reload leaves it alone', (t) => {
   const h = harness(t);
   h.start();
+  // (TPT466) No new-chat (pen) button: a new chat starts from the left menu.
+  assert.equal(h.$('.task-chat-new'), null);
   const reload = () => h.doc.dispatchEvent(new h.doc.defaultView.Event('tiptask:reload'));
   const labels = () => ({
     eyebrow: h.$('.task-chat-eyebrow-text').textContent,
-    newChat: h.$('.task-chat-new').getAttribute('aria-label'),
-    newChatTip: h.$('.task-chat-new').title,
     close: h.$('.task-chat-close').getAttribute('aria-label'),
     jump: h.$('.task-chat-jump span').textContent,
     placeholder: h.$('.task-chat-input').placeholder,
@@ -501,7 +642,7 @@ test('a language switch relabels the open window; any other reload leaves it alo
     author: h.$('.task-chat-author').textContent,
   });
   const english = {
-    eyebrow: 'taskChat.eyebrow', newChat: 'taskChat.newChat', newChatTip: 'taskChat.newChat', close: 'btn.close',
+    eyebrow: 'taskChat.eyebrow', close: 'btn.close',
     jump: 'taskChat.jumpToLatest', placeholder: 'taskChat.placeholder', inputName: 'taskChat.placeholder',
     hint: 'taskChat.hint', send: 'taskChat.send', stop: 'btn.stop', stopTip: 'tooltip.stop', author: 'taskChat.assistant',
   };
@@ -524,4 +665,203 @@ test('a language switch relabels the open window; any other reload leaves it alo
   h.setLocale('en');
   reload(); // listener is gone with the window: must not throw
   assert.equal(h.$('.task-chat-modal'), null);
+});
+
+test('mounted in a workspace pane: no window chrome, and the transcript and typed text survive hide/show (TPT466)', async (t) => {
+  const h = harness(t);
+  const win = h.env.window;
+  const host = h.doc.createElement('div');
+  h.doc.body.appendChild(host);
+  const openedTasks = [];
+  const handle = h.env.mount(host, 'TPT1', { onOpenTask: key => openedTasks.push(key) });
+  assert.ok(handle, 'a pane handle');
+  assert.ok(host.querySelector('.task-chat-embed .task-chat-panel--embedded'));
+  assert.equal(h.$('.task-chat-modal'), null, 'no window of its own');
+  assert.equal(h.$('.task-chat-backdrop'), null);
+  assert.equal(h.$('.task-chat-header'), null, 'the workspace top bar carries key and title');
+  assert.equal(h.$('.task-chat-new'), null, 'no new-chat button');
+  assert.equal(h.doc.body.classList.contains('task-chat-open'), false);
+  assert.equal(h.sockets[0].url, 'ws://test/?taskId=taskChat:TPT1');
+
+  h.feed({ type: 'config', objectiveProviders: [] });
+  click(h.$('.task-chat-start-go'));
+  h.feed({ type: 'data', data: 'Hello.' });
+  h.feed({ type: 'chat-ready' });
+  const input = h.$('.task-chat-input');
+  input.value = 'half-typed';
+  input.dispatchEvent(new win.Event('input', { bubbles: true }));
+
+  // Switching panes away and back: same DOM, same socket, same draft.
+  const message = h.$('.task-chat-msg--assistant');
+  handle.hide();
+  host.hidden = true;
+  host.hidden = false;
+  handle.show({ focus: false });
+  assert.equal(h.$('.task-chat-msg--assistant'), message);
+  assert.equal(h.$('.task-chat-input').value, 'half-typed');
+  assert.equal(h.sockets.length, 1);
+
+  // A task card goes to the workspace, not to a stacked edit modal.
+  h.feed({ type: 'task-chat-task', toolId: 'tool-1', action: 'updated', task: { id: 'TPT9', title: 'Other task' } });
+  click(h.$('.task-chat-widget--task'));
+  assert.deepEqual(openedTasks, ['TPT9']);
+  assert.equal(h.opened.length, 0);
+
+  // A save in the Edit pane is reported to the agent.
+  h.sent.length = 0;
+  handle.taskEdited('TPT1');
+  assert.deepEqual(h.sent, [{ type: WS_SEND_TYPES.TASK_CHAT_TASK_EDITED, taskKey: 'TPT1' }]);
+
+  // Disposed and mounted again (workspace closed and reopened): the unsent text comes back.
+  handle.dispose();
+  assert.equal(host.querySelector('.task-chat-embed'), null);
+  const again = h.env.mount(host, 'TPT1', {});
+  assert.equal(h.$('.task-chat-input').value, 'half-typed');
+  again.dispose();
+  handle.dispose(); // a stale handle never closes a newer chat
+  assert.equal(host.querySelector('.task-chat-embed'), null);
+
+  // With the workspace bridge loaded, open() routes a task chat to its Chat pane.
+  const routed = [];
+  win.TipTask = { openTaskWorkspace: (key, opts) => { routed.push({ key, opts }); } };
+  await h.env.open('TPT2');
+  assert.equal(JSON.stringify(routed), JSON.stringify([{ key: 'TPT2', opts: { pane: 'chat' } }])); // vm realm objects
+  assert.equal(h.$('.task-chat-modal'), null);
+});
+
+test('(TPT469) Start Chat reuses the untouched draft; a named chat sends the next click to a new one', async (t) => {
+  const h = harness(t);
+  h.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '2', projectName: 'Tipatask' } }) });
+  await h.env.openProjectChat();
+  const first = h.sockets[0].url;
+  const firstId = first.split('taskId=')[1];
+  assert.equal(h.env.currentChatId(), firstId);
+  await h.env.openProjectChat();
+  assert.equal(h.sockets.length, 1, 'the draft is already in front: nothing reconnects');
+  h.env.close();
+  await h.env.openProjectChat();
+  assert.equal(h.sockets[1].url, first, 'a closed, untouched draft opens again');
+  h.feed({ type: 'config', objectiveProviders: PROVIDERS });
+  click(h.$('.task-chat-start-go'));
+  h.feed({ type: 'data', data: 'Hi, what shall we look at?' });
+  h.feed({ type: 'chat-ready' });
+  h.env.close();
+  await h.env.openProjectChat();
+  assert.equal(h.sockets[2].url, first, 'the agent greeting alone does not name the chat');
+  h.feed({ type: 'chat-history-reset', messages: [{ role: 'assistant', content: 'Hi' }], running: false });
+  h.feed({ type: 'config', objectiveProviders: PROVIDERS });
+  h.turn('Which tasks block the release?');
+  h.feed({ type: 'project-chat-titled', title: 'Which tasks block the release?' });
+  assert.equal(h.$('.task-chat-title-text').textContent, 'Which tasks block the release?');
+  h.env.close();
+  await h.env.openProjectChat();
+  assert.notEqual(h.sockets[3].url, first, 'Start Chat now opens a new draft');
+  assert.match(h.sockets[3].url, /taskId=projectChat:2:[a-z0-9]{6,32}$/);
+  h.env.close();
+  await h.env.openProjectChat({ chatId: firstId });
+  assert.equal(h.sockets[4].url, first, 'the left-menu row reopens the named chat');
+  h.feed({ type: 'chat-history-reset', title: 'Which tasks block the release?', messages: [{ role: 'assistant', content: 'Hi' }], running: false });
+  assert.equal(h.$('.task-chat-title-text').textContent, 'Which tasks block the release?');
+});
+
+test('(TPT469) Start Chat picks up an untitled chat the server holds; a row of another project opens nothing', async (t) => {
+  const h = harness(t);
+  h.env.state.sessionMeta = new Map([
+    ['projectChat:2:old0001', { type: 'taskChat', title: '', startedAt: 1 }],
+    ['projectChat:2:new0002', { type: 'taskChat', title: '', startedAt: 2 }],
+    ['projectChat:2:named03', { type: 'taskChat', title: 'Named', startedAt: 3 }],
+    ['projectChat:3:other04', { type: 'taskChat', title: '', startedAt: 4 }],
+  ]);
+  const toasts = [];
+  h.env.showToast = msg => toasts.push(msg);
+  h.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '2' } }) });
+  await h.env.openProjectChat();
+  assert.equal(h.sockets[0].url, 'ws://test/?taskId=projectChat:2:new0002');
+  h.env.close();
+  await h.env.openProjectChat({ chatId: 'projectChat:3:other04' });
+  assert.equal(h.sockets.length, 1);
+  assert.deepEqual(toasts, ['taskChat.error.noProject']);
+});
+
+
+// ── Attachments (TPT473) ──
+
+test('composer and gate get the shared Embed control, paste and panel drop, all into the composer textarea', (t) => {
+  const h = harness(t);
+  h.env.open('TPT1');
+  const input = h.$('.task-chat-input');
+  assert.equal(h.uploads.pastes.length, 1);
+  assert.equal(h.uploads.pastes[0].textarea, input);
+  assert.equal(h.uploads.pastes[0].opts.taskKey, 'TPT1');
+  assert.deepEqual(h.uploads.menus.map(x => x.wrap.parentElement.className), ['task-chat-start-embed', 'task-chat-embed-slot']);
+  assert.ok(h.uploads.menus.every(x => x.textarea === input));
+  assert.equal(h.uploads.drops[0].target, h.$('.task-chat-panel'));
+  assert.equal(h.uploads.drops[0].textarea, input);
+});
+
+test('Send waits for an upload; the sent turn carries the reference and shows it as a thumbnail', (t) => {
+  const h = harness(t);
+  h.start();
+  const { opts } = h.uploads.pastes[0];
+  const input = h.$('.task-chat-input');
+  opts.onFileDetected({ name: 'shot.png' });
+  input.value = 'See ![img](blob:x/1)';
+  input.dispatchEvent(new h.doc.defaultView.Event('input', { bubbles: true }));
+  assert.equal(h.$('.task-chat-send').disabled, true);
+  assert.equal(h.$('.task-chat-upload-status').hidden, false);
+  input.value = 'See ![img](http://h/api/projects/2/images/5)';
+  opts.onUploaded({ name: 'shot.png' }, 'http://h/api/projects/2/images/5');
+  assert.equal(h.$('.task-chat-send').disabled, false);
+  assert.equal(h.$('.task-chat-upload-status').hidden, true);
+  h.env.sendMessage();
+  assert.equal(h.sent.at(-1).type, WS_SEND_TYPES.TASK_CHAT_MESSAGE);
+  assert.equal(h.sent.at(-1).content, 'See ![img](http://h/api/projects/2/images/5)');
+  const bubble = h.$$('.task-chat-msg--user').at(-1);
+  assert.equal(bubble.querySelector('.task-chat-user-text').textContent, 'See');
+  assert.equal(bubble.querySelector('.task-chat-attach--image img').getAttribute('src'), '/api/images/2/5');
+});
+
+test('a failed image upload drops its placeholder; a file upload holds Send until it settles', async (t) => {
+  const h = harness(t);
+  h.start();
+  const input = h.$('.task-chat-input');
+  const image = h.uploads.pastes[0].opts;
+  image.onFileDetected({ name: 'a.png' });
+  input.value = 'x![img](blob:x/2)';
+  image.onUploadError({ name: 'a.png' }, new Error('boom'));
+  assert.equal(input.value, 'x');
+  let finish;
+  h.uploads.menus[1].opts.onFileUpload(new Promise((resolve) => { finish = resolve; }), { name: 'spec.pdf' });
+  assert.equal(h.$('.task-chat-send').disabled, true);
+  finish();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.$('.task-chat-send').disabled, false);
+});
+
+test('restored history shows attachments of a user turn; a notice stays plain text', (t) => {
+  const h = harness(t);
+  h.env.open('TPT1');
+  h.feed({ type: 'chat-history-reset', messages: [
+    { role: 'user', content: 'seed', seed: true },
+    { role: 'assistant', content: 'Hi' },
+    { role: 'user', content: '[spec.pdf](https://h/api/projects/2/files/7)' },
+  ] });
+  h.feed({ type: 'config', objectiveProviders: [] });
+  const chip = h.$('.task-chat-msg--user .task-chat-attach--file');
+  assert.equal(chip.getAttribute('href'), '/api/files/2/7');
+  assert.equal(h.$('.task-chat-msg--user .task-chat-user-text'), null);
+});
+
+test('files attached at the start gate wait in the composer draft and are listed on the gate', (t) => {
+  const h = harness(t);
+  h.env.open('TPT1');
+  h.feed({ type: 'config', objectiveProviders: [] });
+  const box = h.$('.task-chat-start-attachments');
+  assert.equal(box.hidden, true);
+  typeDraft(h, '![img](http://h/api/projects/2/images/9)');
+  assert.equal(box.hidden, false);
+  assert.ok(box.querySelector('.task-chat-attach--image'));
+  click(h.$('.task-chat-start-go'));
+  assert.equal(box.hidden, true);
+  assert.equal(h.$('.task-chat-input').value, '![img](http://h/api/projects/2/images/9)');
 });

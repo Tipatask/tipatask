@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-  isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFromChatId,
+  isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFromChatId, buildProjectChatTitle,
   buildTaskChatSeed, buildTaskChatSystemPrompt, MAX_SEED_COMMENTS, MAX_SEED_COMMENT_CHARS,
   MAX_SEED_TASKS, DEFAULT_OPENING_MESSAGE, DEFAULT_PROJECT_OPENING_MESSAGE, CODEX_TASK_CHAT_FENCE,
 } = require('./task-chat');
@@ -19,6 +19,32 @@ test('session ids map to the bare task key', () => {
     assert.equal(isTaskChatId(id), false);
     assert.equal(taskKeyFromChatId(id), '');
   }
+});
+
+test('(TPT469) a project holds several chats: projectChat:<projectId>:<chatId>', () => {
+  assert.equal(isProjectChatId('projectChat:2:mf3k2a9x1q'), true);
+  assert.equal(projectIdFromChatId('projectChat:2:mf3k2a9x1q'), '2');
+  assert.equal(projectIdFromChatId('projectChat:12:abcdef'), '12');
+  for (const id of ['projectChat:2:', 'projectChat:2:abc', 'projectChat:2:AB12cd', 'projectChat:2:ab!cdef',
+    'projectChat:2:abcdef:x', 'projectChat:0:abcdef', 'projectChat:2:' + 'a'.repeat(33)]) {
+    assert.equal(isProjectChatId(id), false, id);
+    assert.equal(projectIdFromChatId(id), '', id);
+  }
+});
+
+test('(TPT469) buildProjectChatTitle summarizes the first message in a few words', () => {
+  assert.equal(buildProjectChatTitle('Which tasks block the release?'), 'Which tasks block the release?');
+  assert.equal(buildProjectChatTitle('Plan the billing epic. Then split it into three sprints please.'), 'Plan the billing epic');
+  assert.equal(buildProjectChatTitle('ok'), 'ok');
+  assert.equal(buildProjectChatTitle('  lots   of\tspace  '), 'lots of space');
+  assert.equal(buildProjectChatTitle('## What is left in [TPT12](https://x/y) and `api.js`?\nmore'), 'What is left in TPT12 and api.js?');
+  assert.equal(buildProjectChatTitle('```js\nthrow new Error()\n```\nWhy does this crash?'), 'Why does this crash?');
+  assert.equal(buildProjectChatTitle('- **Review** the open bugs'), 'Review the open bugs');
+  const long = buildProjectChatTitle('Let us talk about the roadmap for the next quarter and the hiring plan for the platform team');
+  assert.ok(long.length <= 48, long);
+  assert.match(long, /^Let us talk about the roadmap for the next\S*…$/);
+  assert.equal(buildProjectChatTitle('x'.repeat(80)).length, 48);
+  assert.equal(buildProjectChatTitle(''), '');
 });
 
 test('project chat ids contain a positive project id and no task key', () => {

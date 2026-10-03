@@ -25,6 +25,11 @@ export const CHAIN_COLORS = [
 // once the code-scan/inspection step was added — see seed-setup-tasks.js.
 export const MAX_DESC_LEN = 6000;
 
+// ── (TPT469) Chat glyph ──
+// A plain outline speech bubble: the left menu's Start Chat button, each started project chat's
+// row in the active-sessions list, and the chat window's start gate. Sized by CSS.
+export const CHAT_BUBBLE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15a2 2 0 0 1-2 2H7.5L3 20.5V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
+
 // ── (TPT272) Hourglass glyph for a board card locked by Rehash → Discuss ──
 // Path from design/hourglass.svg (Boxicons v3, free license); sized by CSS (.card-discuss-overlay).
 export const HOURGLASS_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><path d="M5 2H4v2h1v1c0 2.46 1.32 4.77 3.43 6.02.35.21.57.55.57.9v.16c0 .35-.21.69-.57.9A7.01 7.01 0 0 0 5 19v1H4v2h16v-2h-1v-1c0-2.46-1.32-4.77-3.43-6.02-.36-.21-.57-.55-.57-.9v-.16c0-.35.21-.69.57-.9A7.01 7.01 0 0 0 19 5V4h1V2zm12 3c0 1.76-.94 3.41-2.45 4.3-.97.57-1.55 1.55-1.55 2.62v.16c0 1.07.58 2.05 1.55 2.62 1.51.89 2.45 2.54 2.45 4.3v1H7v-1c0-1.76.94-3.41 2.45-4.3.97-.57 1.55-1.55 1.55-2.62v-.16c0-1.07-.58-2.05-1.55-2.62A5.01 5.01 0 0 1 7 5V4h10z"/></svg>';

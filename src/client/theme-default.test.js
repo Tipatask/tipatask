@@ -285,3 +285,17 @@ test('readProjectTheme keeps project color_scheme ahead of local config, and the
   assert.ok(schemeAt < localAt, 'project color_scheme must be consulted before the local config theme');
   assert.doesNotMatch(body, /DEFAULT_THEME|'paper'/, 'readProjectTheme() must not inject the default itself — _normalizeTheme() does');
 });
+
+test('running-session spinner button is filled from the theme accent token, after the fixed resumable green (TPT399)', () => {
+  const block = cssBlock('\\.btn-claude\\.session-running');
+  const hover = cssBlock('\\.btn-claude\\.session-running:hover');
+  assert.match(block, /background:\s*var\(--c-primary\)/);
+  assert.match(block, /border-color:\s*var\(--c-primary\)/);
+  assert.match(block, /color:\s*var\(--c-on-primary/);
+  assert.match(hover, /background:\s*var\(--c-primary-hover\)/);
+  assert.doesNotMatch(block + hover, /#[0-9a-fA-F]{3,8}\b(?![^)]*\))/, 'no hex literal in the running rule');
+  assert.ok(
+    CSS.indexOf('.btn-claude.session-running {') > CSS.indexOf('.btn-claude.resumable:hover'),
+    '.session-running must come after .resumable so it wins at equal specificity',
+  );
+});

@@ -529,9 +529,9 @@ function adoptSessionStart(taskId, msg) {
 }
 
 function buildTaskSessionWsExtra(taskId, title, desc, opts = {}) {
-  const isResume = state.activeSessions.has(taskId);
+  const isResume = opts.reconnectOnly || state.activeSessions.has(taskId) || state.exitedSessions.has(taskId);
   const wsExtra = isResume ? {} : { prompt: buildTaskSessionPrompt(taskId, title, desc, opts) };
-  const startedAt = state.sessionMeta.get(taskId)?.startedAt;
+  const startedAt = opts.sessionStartedAt || state.sessionMeta.get(taskId)?.startedAt;
   if (isResume && Number.isFinite(startedAt) && startedAt > 0) wsExtra.startedAt = startedAt;
   if (wsExtra && opts.planOnly) wsExtra.planOnly = '1';
   if (wsExtra && opts.agent) wsExtra.agent = opts.agent;
@@ -585,6 +585,24 @@ function _markAttentionSeen(taskId) {
 }
 
 export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
+  // (TPT466) A task terminal lives in its task's workspace modal (task-edit-modal.js), on the
+  // Agent Terminal pane: every launcher (card Start, rail rows, notifications, merge panel)
+  // routes there, and the workspace mounts it back through mountTaskTerminal() with a host.
+  // Without the bridge (unit tests, a page that never loaded the board) the standalone
+  // overlay below is used. The objective Debug Console never routes.
+  const host = opts.host && typeof opts.host.appendChild === 'function' ? opts.host : null;
+  const openWorkspace = window.TipTask?.openTaskWorkspace;
+  if (!host && !String(taskId).startsWith('obj-') && typeof openWorkspace === 'function') {
+    const { host: _ignored, onClosed: _c, onRequestClose: _r, ...launchOpts } = opts;
+    return openWorkspace(taskId, { pane: 'terminal', terminal: { title, desc, status: taskStatus, opts: launchOpts } });
+  }
+  // Host-mode hooks: the workspace learns when this xterm goes away on its own, and close
+  // gestures (double Esc, Minimize) close the whole workspace instead of just this terminal.
+  // Mutable so a reattached Codex terminal reports to its new workspace.
+  let onClosed = typeof opts.onClosed === 'function' ? opts.onClosed : null;
+  let onRequestClose = typeof opts.onRequestClose === 'function' ? opts.onRequestClose : null;
+  let hostEl = host;
+
   function captureOpenContext() {
     return state.pendingRestoreContext || {
       scrollY: window.scrollY,
@@ -597,7 +615,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     if (state.activeTerminal.taskId === taskId && !opts.restartLost) {
       _markAttentionSeen(taskId); // (C1387) refocusing an already-open terminal counts as seen
       state.activeTerminal.refresh?.({ send: true, focus: true });
-      return;
+      return state.activeTerminal;
     }
     // Different task (notification click, card Start/Resume) — minimize the irrelevant
     // terminal, keeping its process alive server-side, then fall through and open ours.
@@ -609,8 +627,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     _markAttentionSeen(taskId); // (C1387) reattaching a detached Codex terminal also counts as seen
     const restoredContext = captureOpenContext();
     state.pendingRestoreContext = restoredContext;
-    detachedCodex.reattach?.(restoredContext);
-    return;
+    detachedCodex.reattach?.(restoredContext, host ? { host, onClosed: opts.onClosed, onRequestClose: opts.onRequestClose } : undefined);
+    return detachedCodex;
   }
   if (detachedCodex) {
     detachedCodex.dispose?.();
@@ -618,7 +636,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   const knownLoss = state.lostSessions.get(taskId);
-  const isResume = state.activeSessions.has(taskId);
+  const isResume = opts.reconnectOnly || state.activeSessions.has(taskId) || state.exitedSessions.has(taskId);
   // (TPT443) Read before the clear below wipes it: a watchdog-paused session shows its banner at
   // once instead of waiting for the terminal-state round-trip that confirms (or clears) it.
   const seedRunaway = state.attentionDetails.get(taskId);
@@ -661,6 +679,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // (TPT360) `--task` offsets the overlay by the left-nav width (styles.css) so the rail's
   // active-session rows stay clickable while a terminal is open.
   overlay.className = 'terminal-overlay terminal-overlay--task';
+  if (hostEl) overlay.className = 'terminal-embed';
   overlay.innerHTML = `
     <div class="terminal-container">
       <div class="terminal-header">
@@ -675,8 +694,12 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       </div>
       <div class="terminal-body"></div>
     </div>`;
-  document.body.appendChild(overlay);
-  document.body.style.overflow = 'hidden';
+  if (hostEl) {
+    hostEl.appendChild(overlay);
+  } else {
+    document.body.appendChild(overlay);
+    document.body.style.overflow = 'hidden';
+  }
 
   const termBody = overlay.querySelector('.terminal-body');
   const taskLabelEl = overlay.querySelector('.task-label');
@@ -731,7 +754,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   let openRaf = 0;
   // Connect WebSocket — include prompt only for new sessions
   let firstReplayCleared = !isResume;
-  let pendingExitedReplayScroll = !isResume && state.exitedSessions.has(taskId);
+  let pendingExitedReplayScroll = state.exitedSessions.has(taskId);
   let firstResumeDataSeen = !isResume;
   let firstResumeDataWritten = !isResume;
   let codexResumeRedrawSent = !isResume;
@@ -779,14 +802,16 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
   }
 
-  function maybeScrollToBottom() {
-    if (_isPinnedToBottom(term)) term.scrollToBottom();
+  // (TPT466) A hidden workspace pane has no size — fitting it would shrink the PTY to nothing.
+  function terminalHasSize() {
+    return termBody.clientWidth > 0 && termBody.clientHeight > 0;
   }
 
   function refreshTerminalViewport({ send = false } = {}) {
-    if (!terminalOpened || terminalClosing) return;
-    fitAddon.fit();
-    maybeScrollToBottom();
+    if (!terminalOpened || terminalClosing || !terminalHasSize()) return;
+    // Snapshot following before fit can reflow the buffer. The writer keeps the
+    // same decision through queued PTY redraws and the native viewport settle.
+    outputWriter.refresh(() => fitAddon.fit());
     if (term.rows > 0) term.refresh(0, term.rows - 1);
     if (send) sendResize();
   }
@@ -1136,6 +1161,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         });
       } else if (msg.type === 'exit') {
         processRunning = false;
+        state.activeSessions.delete(taskId);
+        state.exitedSessions.add(taskId);
+        state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), alive: false });
         setCodexPlanReady(false);
         renderWatchdogActions(null);
         statusDot.className = 'status-dot exited';
@@ -1243,12 +1271,12 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     if (e.key === 'Escape' && e.type === 'keydown') {
       const now = Date.now();
       if (!processRunning) {
-        detachTerminal();
+        minimizeTerminal();
         return false;
       }
       if (now - lastEscTime < 400) {
         lastEscTime = 0;
-        detachTerminal();
+        minimizeTerminal();
         return false;
       }
       lastEscTime = now;
@@ -1360,11 +1388,12 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     if (voiceRecorder) voiceRecorder.stop();
     closeTerminalSocket();
     disposeTerminal();
-    document.body.style.overflow = '';
+    if (!hostEl) document.body.style.overflow = '';
     overlay.remove();
     if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
     if (state.activeTerminal === terminalController) state.activeTerminal = null;
     clearTaskSessionState();
+    notifyClosed();
     // Re-assert restore context in case a modal cancel nulled it between openTerminal and now
     if (!state.pendingRestoreContext) state.pendingRestoreContext = terminalOpenContext;
     // (C1306) Completion and terminal teardown can land close together. Refresh both sources:
@@ -1379,7 +1408,12 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     document.dispatchEvent(new Event('tiptask:sync-nav-statuses'));
   }
 
-  function reattachTerminal(restoredContext = terminalOpenContext) {
+  function reattachTerminal(restoredContext = terminalOpenContext, next) {
+    if (next?.host) {
+      hostEl = next.host;
+      onClosed = typeof next.onClosed === 'function' ? next.onClosed : null;
+      onRequestClose = typeof next.onRequestClose === 'function' ? next.onRequestClose : null;
+    }
     terminalClosing = false;
     terminalController.detached = false;
     _detachedCodexTerminals.delete(taskId);
@@ -1393,8 +1427,12 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     // last-known value rather than refreshing it; see tt-task-board.md § C1329), so "close
     // and reopen the terminal" alone didn't previously guarantee an up-to-date tick.
     document.dispatchEvent(new Event('tiptask:sync-nav-statuses'));
-    if (!overlay.isConnected) document.body.appendChild(overlay);
-    document.body.style.overflow = 'hidden';
+    if (hostEl) {
+      if (overlay.parentNode !== hostEl) hostEl.appendChild(overlay);
+    } else {
+      if (!overlay.isConnected) document.body.appendChild(overlay);
+      document.body.style.overflow = 'hidden';
+    }
     attachViewportListeners();
     scheduleTerminalRefresh({ send: true });
     requestAnimationFrame(() => {
@@ -1429,6 +1467,23 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       const detail = state.lostSessions.get(taskId);
       if (detail && !terminalClosing && !restartingLoss) showLostSession(detail);
     },
+    // (TPT466) Workspace pane visibility. Hidden, the xterm keeps running untouched (no fit to a
+    // zero-size box); shown again, it refits to the pane and tells the PTY its size.
+    show({ focus = true } = {}) {
+      if (terminalClosing || terminalDisposed) return;
+      _markAttentionSeen(taskId); // (C1387) coming back to the pane is looking at it
+      requestAnimationFrame(() => {
+        refreshTerminalViewport({ send: true });
+        if (focus) focusTerminalWithoutScrollJump();
+      });
+    },
+    hide() {
+      if (overlay.contains(document.activeElement)) document.activeElement.blur();
+    },
+    get embedded() { return !!hostEl; },
+    // False while its workspace pane is hidden behind the Edit or Chat tab — the user is not
+    // looking at it, so attention must not be treated as seen.
+    get visible() { return !hostEl || (overlay.isConnected && !overlay.closest('[hidden]')); },
     get processRunning() { return processRunning; },
   };
   state.activeTerminal = terminalController;
@@ -1523,11 +1578,12 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       disposeTerminal();
     }
     removeMcpAuthDialog();
-    document.body.style.overflow = '';
+    if (!hostEl) document.body.style.overflow = '';
     overlay.remove();
     if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
     if (state.activeTerminal === terminalController) state.activeTerminal = null;
     state.pendingRestoreContext = terminalOpenContext;
+    notifyClosed();
     // Refresh button states — skipped during a notification/card-triggered swap (the incoming
     // terminal's own ws.onopen + eventual detach already refresh). (C1387) The resurrection
     // hazard this comment used to describe — an immediate fetch here seeing the outgoing task
@@ -1572,7 +1628,22 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     terminateTaskSession(taskId, { timeoutMs: 5000 }).then(() => finishTerminalEnded());
   }
 
-  closeBtn.addEventListener('click', detachTerminal);
+  // (TPT466) In a workspace pane the close gestures close the workspace (which detaches this
+  // terminal through its pane handle); standalone they minimize, as before.
+  function minimizeTerminal() {
+    if (hostEl && onRequestClose) onRequestClose();
+    else detachTerminal();
+  }
+
+  // Tell the hosting workspace this xterm is gone — once per open; a reattach re-arms it.
+  function notifyClosed() {
+    const cb = onClosed;
+    if (!hostEl || !cb) return;
+    onClosed = null;
+    try { cb(); } catch (err) { console.warn('[terminal] onClosed failed', err); }
+  }
+
+  closeBtn.addEventListener('click', () => minimizeTerminal());
   terminateBtn.addEventListener('click', terminateSession);
 
   // (TPT360) The overlay box now starts at the left-nav rail's edge, so this backdrop-minimize
@@ -1581,10 +1652,22 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // mismatched-open path (detach the current terminal, keep its PTY alive, open the target).
   overlay.addEventListener('mousedown', (e) => {
     if (e.target !== overlay) return;
+    if (hostEl) return; // (TPT466) a workspace pane has no backdrop of its own
     e.preventDefault();
     e.stopPropagation();
     detachTerminal();
   });
+  return terminalController;
+}
+
+// (TPT466) Mount a task's terminal inside a workspace pane (task-edit-modal.js) instead of the
+// standalone overlay. Same session semantics as openTerminal() — resume an existing session,
+// or launch with `opts` — and returns the controller: show()/hide() for pane switches,
+// detach() to release it (the server session keeps running). `opts.onClosed` fires when the
+// xterm goes away on its own; `opts.onRequestClose` when the user asks to close (double Esc).
+export function mountTaskTerminal(host, taskId, title, desc, taskStatus, opts = {}) {
+  if (!host || !taskId) return null;
+  return openTerminal(taskId, title, desc, taskStatus, { ...opts, host }) || null;
 }
 
 // (C1122/C1279) One button per agent id, except 'pi': when the project has configured

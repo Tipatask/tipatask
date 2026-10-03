@@ -206,6 +206,129 @@ try {
   assert.doesNotMatch(modal().textContent, /First comment|Task updated/);
   board.closeTaskEditModal(true);
   assert.equal(resizeListeners, 0);
+
+  // (TPT466) Task workspace: Edit / Agent Terminal / Chat panes in one modal. The terminal and
+  // chat come in through the window.TipTask bridges, mounted into their pane on first visit.
+  const mounts = { terminal: [], chat: [] };
+  window.TipTask = {
+    mountTaskTerminal(host, id, title, desc, status, opts) {
+      const ctrl = {
+        id, host, title, opts, shown: 0, hidden: 0, detached: 0,
+        show() { this.shown++; }, hide() { this.hidden++; }, detach() { this.detached++; },
+      };
+      host.insertAdjacentHTML('beforeend', '<div class="fake-xterm"></div>');
+      mounts.terminal.push(ctrl);
+      return ctrl;
+    },
+    taskChat: {
+      mount(host, id, opts) {
+        const handle = {
+          id, host, opts, shown: 0, hidden: 0, disposed: 0, edited: [],
+          show() { this.shown++; }, hide() { this.hidden++; }, dispose() { this.disposed++; },
+          taskEdited(key) { this.edited.push(key); },
+        };
+        host.insertAdjacentHTML('beforeend', '<textarea class="fake-chat-input"></textarea>');
+        mounts.chat.push(handle);
+        return handle;
+      },
+    },
+  };
+  const tab = pane => modal().querySelector(`.task-modal-tab[data-pane="${pane}"]`);
+  const paneEl = pane => modal().querySelector(`.task-modal-pane--${pane}`);
+  await board.openTaskEditModal('TPT1');
+  await tick();
+  assert.equal(modal().querySelectorAll('.task-modal-tab').length, 3);
+  assert.equal(modal().querySelector('.task-edit-panel').dataset.pane, 'edit');
+  assert.equal(modal().querySelector('.btn-modal-chat'), null);
+  const draftTitle = modal().querySelector('.modal-title-input');
+  draftTitle.value = 'Draft across tabs';
+  draftTitle.dispatchEvent(new Event('input', { bubbles: true }));
+
+  // Chat: mounted once into its pane; the unsaved title rides along, flagged on the Edit tab.
+  tab('chat').click();
+  assert.equal(modal().dataset.pane, 'chat');
+  assert.equal(paneEl('edit').hidden, true);
+  assert.equal(paneEl('chat').hidden, false);
+  assert.equal(mounts.chat.length, 1);
+  assert.equal(mounts.chat[0].host, paneEl('chat'));
+  assert.equal(mounts.chat[0].id, 'TPT1');
+  assert.equal(tab('edit').querySelector('.task-modal-tab-dot').hidden, false);
+  mounts.chat[0].host.querySelector('.fake-chat-input').value = 'typed in chat';
+
+  // Terminal with no session: an empty state, nothing mounted.
+  tab('terminal').click();
+  assert.equal(mounts.terminal.length, 0);
+  assert.ok(paneEl('terminal').querySelector('.task-modal-empty'));
+  assert.ok(modal().querySelector('.task-edit-overlay--rail'), 'rail stays live beside the terminal pane');
+  assert.ok(document.body.classList.contains('task-modal-rail'));
+  assert.equal(mounts.chat[0].hidden, 1);
+
+  // With a session it mounts into the pane; switching away hides it, back shows the same one.
+  state.activeSessions.add('TPT1');
+  tab('edit').click();
+  assert.equal(modal().querySelector('.modal-title-input').value, 'Draft across tabs', 'draft kept');
+  assert.equal(tab('edit').querySelector('.task-modal-tab-dot').hidden, true);
+  assert.equal(document.body.classList.contains('task-modal-rail'), false);
+  tab('terminal').click();
+  assert.equal(mounts.terminal.length, 1);
+  assert.equal(mounts.terminal[0].host, paneEl('terminal'));
+  assert.equal(typeof mounts.terminal[0].opts.onClosed, 'function');
+  tab('chat').click();
+  assert.equal(mounts.terminal[0].hidden, 1);
+  assert.equal(mounts.chat.length, 1, 'chat is not remounted');
+  assert.equal(paneEl('chat').querySelector('.fake-chat-input').value, 'typed in chat');
+  tab('terminal').click();
+  assert.equal(mounts.terminal.length, 1, 'terminal is not remounted');
+  assert.equal(mounts.terminal[0].shown, 1, 'the return visit shows (refits) the mounted xterm');
+
+  // Reset rebuilds the form only — the mounted panes are carried over node for node.
+  const xterm = modal().querySelector('.fake-xterm');
+  const chatInput = modal().querySelector('.fake-chat-input');
+  modal().querySelector('.btn-modal-reset').click();
+  assert.equal(modal().querySelector('.fake-xterm'), xterm);
+  assert.equal(modal().querySelector('.fake-chat-input'), chatInput);
+  assert.equal(modal().dataset.pane, 'terminal');
+  assert.equal(modal().querySelector('.modal-title-input').value, 'Title TPT1');
+
+  // A save from the Edit pane is reported to the chat pane.
+  tab('edit').click();
+  const savedTitle = modal().querySelector('.modal-title-input');
+  savedTitle.value = 'Saved from workspace';
+  savedTitle.dispatchEvent(new Event('input', { bubbles: true }));
+  modal().querySelector('.btn-modal-save').click();
+  await tick();
+  assert.deepEqual(mounts.chat[0].edited, ['TPT1']);
+
+  // The xterm going away on its own leaves the empty state behind.
+  mounts.terminal[0].opts.onClosed();
+  state.activeSessions.delete('TPT1');
+  tab('terminal').click();
+  assert.ok(paneEl('terminal').querySelector('.task-modal-empty'));
+
+  // Close detaches both: their server session and chat keep running.
+  board.closeTaskEditModal(true);
+  assert.equal(mounts.chat[0].disposed, 1);
+  assert.equal(modal().dataset.pane, undefined);
+  assert.equal(document.body.classList.contains('task-modal-rail'), false);
+
+  // openTaskWorkspace() opens on the requested pane, and switches pane on an open workspace.
+  await board.openTaskWorkspace('TPT2', { pane: 'chat' });
+  await tick();
+  assert.equal(modal().dataset.taskId, 'TPT2');
+  assert.equal(modal().dataset.pane, 'chat');
+  assert.equal(mounts.chat.at(-1).id, 'TPT2');
+  await board.openTaskWorkspace('TPT2', { pane: 'edit' });
+  assert.equal(modal().dataset.pane, 'edit');
+  board.closeTaskEditModal(true);
+
+  // Proposal, diff and stacked (hideActions) modals stay edit-only.
+  await board.openTaskEditModal('new-2', { preloadedTask: task('new-2'), onSavePreview: async () => {} });
+  assert.equal(modal().querySelector('.task-modal-tabs'), null);
+  board.closeTaskEditModal(true);
+  await board.openTaskEditModal('TPT1', { hideActions: true });
+  assert.equal(modal().querySelector('.task-modal-tabs'), null);
+  board.closeTaskEditModal(true);
+  delete window.TipTask;
   console.log('TPT337_DOM_PASS');
 } catch (err) {
   console.error(err);

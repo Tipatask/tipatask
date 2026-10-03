@@ -104,15 +104,16 @@ test('task-chat.js: connects on the taskChat: / projectChat: session id and expo
   assert.match(taskChat, /const SESSION_PREFIX = 'taskChat:'/);
   assert.match(taskChat, /const PROJECT_SESSION_PREFIX = 'projectChat:'/);
   assert.match(taskChat, /sessionId: SESSION_PREFIX \+ key/);
-  assert.match(taskChat, /sessionId: PROJECT_SESSION_PREFIX \+ id/);
+  // (TPT469) One project holds several chats: projectChat:<projectId>:<chatId>.
+  assert.match(taskChat, /return `\$\{PROJECT_SESSION_PREFIX\}\$\{projectId\}:\$\{Date\.now\(\)\.toString\(36\)\}\$\{rand\}`;/);
   assert.match(taskChat, /buildWsUrl\(chat\.sessionId\)/);
   assert.match(taskChat, /export async function open\(taskId\)/);
-  assert.match(taskChat, /export async function openProjectChat\(\)/);
+  assert.match(taskChat, /export async function openProjectChat\(\{ chatId = '' \} = \{\}\)/);
   assert.match(taskChat, /export function close\(\)/);
 });
 
 test('task-chat.js: openProjectChat() reads this window\'s project id, never a task', () => {
-  const fn = taskChat.slice(taskChat.indexOf('export async function openProjectChat()'), taskChat.indexOf('function openChat('));
+  const fn = taskChat.slice(taskChat.indexOf('export async function openProjectChat('), taskChat.indexOf('function openChat('));
   // Header-scoped config: the id the server checks the session id against in multi-window Electron.
   assert.match(fn, /fetch\('\/api\/project-config', \{ headers: projectHeader\(\)/);
   assert.match(fn, /cfg\.API_PROJECT_ID/);
@@ -136,6 +137,19 @@ test('task-chat.js: a socket with no history reset shows the start gate instead 
   assert.equal(taskChat.split('beginChat(').length - 1, 1, 'beginChat() is only defined, never called directly');
 });
 
+test('task-chat.js: dialogs repaint on every socket state change, including the config frame of a reattach', () => {
+  // chat-history-reset (and a finished turn's flush) arrive before `config`, so restored dialogs
+  // are built `waiting`; `config` must flip them to `open`.
+  const setConnected = taskChat.slice(taskChat.indexOf('function setConnected('), taskChat.indexOf('function syncComposer('));
+  assert.match(setConnected, /connected = !!value;[\s\S]*syncDialogWidgets\(\);/);
+  const configCase = taskChat.slice(taskChat.indexOf("case 'config':"), taskChat.indexOf('case WS_RECV_TYPES.DATA:'));
+  assert.match(configCase, /setConnected\(true\)/);
+  assert.equal((taskChat.match(/^\s+connected = (true|false);/gm) || []).length, 2,
+    'only openChat() and close() (no root to repaint) set the flag directly');
+  // The open-state rule is the tested model helper, not a copy in the window.
+  assert.match(taskChat, /dialogState\(\{ messages, message: m, dialog, connected, running \}\)/);
+});
+
 test('task-chat.js: Start sends one start frame per socket, carrying the chosen model', () => {
   const begin = taskChat.slice(taskChat.indexOf('function beginChat()'), taskChat.indexOf('function focusComposer()'));
   assert.match(begin, /if \(!awaitingStart \|\| starting \|\| !connected \|\| !ws \|\| noUsableModel\(\)\) return;\s*starting = true;\s*awaitingStart = false;/);
@@ -148,7 +162,10 @@ test('task-chat.js: Start sends one start frame per socket, carrying the chosen 
 });
 
 test('task-chat.js: Cancel at the gate only closes — it never kills or starts', () => {
-  assert.match(taskChat, /querySelector\('\.task-chat-start-cancel'\)\.addEventListener\('click', close\)/);
+  // Standalone it closes the window; in a workspace pane it hands back to the Edit pane.
+  const cancel = taskChat.slice(taskChat.indexOf("querySelector('.task-chat-start-cancel').addEventListener('click'"), taskChat.indexOf("querySelector('.task-chat-start-go').addEventListener('click', beginChat)"));
+  assert.match(cancel, /if \(embedded && embedded\.onOpenTask && chat\) embedded\.onOpenTask\(chat\.key\);\s*else close\(\);/);
+  assert.doesNotMatch(cancel, /wsSend|KILL|START_/);
   // The server drops a still-pending session when its socket closes, so nothing was spawned.
   assert.match(wsHandlers, /if \(session\.pending\) \{\s*sessions\.delete\(sessionKey\);/);
 });
@@ -227,39 +244,44 @@ test('task-card.js: .btn-task-chat opens the chat for its task, behind the discu
   assert.doesNotMatch(taskCard, /from '\.\/task-chat\.js'/);
 });
 
-test('task-edit-modal.js: the header chat button is shown for a live task only', () => {
-  assert.match(editModal, /const showChat = !isPreviewTask && !isDiffMode && !hideActions && !_modalState\.callbacks\.readOnly;/);
-  assert.match(editModal, /const chatBtnHtml = showChat\s*\? `<button type="button" class="btn-modal-chat" title="\$\{escapeAttr\(t\('tooltip\.taskChat'\)\)\}" aria-label="\$\{escapeAttr\(t\('tooltip\.taskChat'\)\)\}">\$\{_CHAT_SVG\}<span>\$\{escapeAttr\(t\('btn\.taskChat'\)\)\}<\/span><\/button>`\s*: '';/);
-  // In the header, between the key/status group and Cancel/Reset/Save.
+test('task-edit-modal.js: the workspace tabs (Edit / Agent Terminal / Chat) are shown for a live task only', () => {
+  const enabled = editModal.slice(editModal.indexOf('function _paneTabsEnabled(callbacks)'), editModal.indexOf('const _PANE_ICONS'));
+  assert.match(enabled, /return !callbacks\.preloadedTask && !callbacks\.compareTask && !callbacks\.compareTaskId\s*&& !callbacks\.hideActions && !callbacks\.readOnly;/);
+  assert.match(editModal, /const _PANES = \['edit', 'terminal', 'chat'\];/);
+  // In the header, between the key/status group and Cancel/Reset/Save — where the chat button was.
   const bar = editModal.slice(editModal.indexOf('<div class="modal-top-bar">'), editModal.indexOf('<div class="modal-scroll-body">'));
   const meta = bar.indexOf('<div class="modal-head-meta">');
-  const chat = bar.indexOf('${chatBtnHtml}');
+  const tabs = bar.indexOf('${tabsHtml}');
   const primary = bar.indexOf('<div class="modal-primary-actions">');
-  assert.ok(meta !== -1 && chat > meta && primary > chat, 'meta, chat, primary actions');
+  assert.ok(meta !== -1 && tabs > meta && primary > tabs, 'meta, tabs, primary actions');
+  assert.doesNotMatch(editModal, /btn-modal-chat/, 'the separate chat button is gone');
 });
 
-test('task-edit-modal.js: the chat button saves a dirty draft, closes the modal, then opens the same chat', () => {
-  const start = editModal.indexOf("const chatBtn = modal.querySelector('.btn-modal-chat');");
-  assert.notEqual(start, -1, 'handler is attached');
-  const handler = editModal.slice(start, editModal.indexOf('// Reset', start));
-  assert.match(handler, /if \(chatBtn\) \{/, 'absent button is not an error');
-  const dirty = handler.indexOf('if (_isModalDirty()) {');
-  const save = handler.indexOf('saved = await persistDraft();');
-  const failed = handler.indexOf('if (!saved) return;');
-  const close = handler.indexOf('closeTaskEditModal(true);');
-  const open = handler.indexOf('window.TipTask?.taskChat?.open(taskId);');
-  assert.ok(dirty !== -1 && save > dirty && failed > save && close > failed && open > close,
-    'save first, stop on a failed save, close, open');
-  assert.match(handler, /const taskId = _modalState\.taskId;/);
+test('task-edit-modal.js: the chat pane mounts the task chat through the bridge, and a save tells it', () => {
+  const show = editModal.slice(editModal.indexOf('function _showChatPane('), editModal.indexOf('function _disposePane('));
+  assert.match(show, /const mount = window\.TipTask\?\.taskChat\?\.mount;/);
+  assert.match(show, /handle = mount\(pane, taskId, \{/);
+  assert.match(show, /handle\.show\(\{ focus \}\);/);
+  assert.match(editModal, /_modalState\.panes\?\.chat\?\.taskEdited\?\.\(taskId\)/);
   // The module boundary (task-edit-modal.behavior.test.js) forbids pulling task-card.js in here.
   assert.doesNotMatch(editModal, /from '\.\/task-chat\.js'/);
+  assert.doesNotMatch(editModal, /from '\.\/console-modal\.js'/);
 });
 
-test('styles.css: the header chat button is a ghost action that drops its caption on a phone', () => {
-  assert.match(styles, /\.modal-top-bar button\.btn-modal-cancel,\s*\.modal-top-bar button\.btn-modal-chat,\s*\.modal-top-bar button\.btn-modal-reset \{ background: transparent;/);
-  assert.match(styles, /\.modal-top-bar button\.btn-modal-chat \{ display: inline-flex; align-items: center; gap: 6px;/);
+test('task-chat.js: open() routes a task chat to its workspace; the project chat stays a window', () => {
+  const open = taskChat.slice(taskChat.indexOf('export async function open(taskId)'), taskChat.indexOf('export function mount('));
+  assert.match(open, /const openWorkspace = window\.TipTask\?\.openTaskWorkspace;\s*if \(typeof openWorkspace === 'function'\) return openWorkspace\(key, \{ pane: 'chat' \}\);/);
+  const project = taskChat.slice(taskChat.indexOf('export async function openProjectChat('), taskChat.indexOf('function openChat('));
+  assert.doesNotMatch(project, /openTaskWorkspace/);
+  assert.match(project, /openChat\(\{ kind: 'project'/);
+});
+
+test('styles.css: workspace tabs size the panel per pane, Agent Terminal largest, and drop captions on a phone', () => {
+  assert.match(styles, /\.task-edit-panel--tabs\[data-pane="chat"\] \{\s*max-width: min\(880px, 94vw\);/);
+  assert.match(styles, /\.task-edit-panel--tabs\[data-pane="terminal"\] \{\s*max-width: min\(1400px, 100%\);/);
+  assert.match(styles, /\.task-edit-overlay--rail \{\s*left: 200px;/);
   const phone = styles.slice(styles.indexOf('.modal-top-bar button { padding: 0 10px; }'));
-  assert.match(phone.slice(0, 400), /\.modal-top-bar button\.btn-modal-chat span \{ display: none; \}/);
+  assert.match(phone.slice(0, 400), /\.modal-top-bar \.task-modal-tab-label \{ display: none; \}/);
 });
 
 test('i18n: the entry-point labels exist and are translated in both locales', () => {
@@ -275,9 +297,46 @@ test('task-chat.js: every label is looked up when it is drawn, and a language sw
   const moduleLevel = taskChat.split('\n').filter(line => /^(const|let|var) /.test(line) && /\bt\(/.test(line));
   assert.deepEqual(moduleLevel, []);
   // The window's own markup carries no label text; applyChromeLabels() writes all of it.
-  const template = taskChat.slice(taskChat.indexOf('root.innerHTML = `'), taskChat.indexOf('document.body.appendChild(root);'));
+  const template = taskChat.slice(taskChat.indexOf('root.innerHTML = `'), taskChat.indexOf('(host || document.body).appendChild(root);'));
+  assert.ok(template.length > 0, 'window template found');
   assert.doesNotMatch(template, /\bt\(/);
   assert.match(taskChat, /function relabel\(\) \{\s*if \(!root \|\| getLocale\(\) === renderedLocale\) return;\s*applyChromeLabels\(\);\s*renderSelector\(\);\s*renderTranscript\(\);/);
   assert.match(taskChat, /document\.addEventListener\('tiptask:reload', reloadHandler\)/);
   assert.match(taskChat, /document\.removeEventListener\('tiptask:reload', reloadHandler\)/);
+});
+
+// ── Attachments (TPT473) ──
+// The composer reuses the objective chat's Embed control and upload helpers; nothing is copied.
+
+test('task-chat.js: Embed, paste and drop come from the shared helpers, with no upload code of its own', () => {
+  assert.match(taskChat, /import \{ attachImagePaste \} from '\.\/task-board\.js'/);
+  assert.match(taskChat, /import \{[^}]*\battachEmbedMenu\b[^}]*\battachFileDrop\b[^}]*\} from '\.\/embed-menu\.js'/);
+  for (const own of ['FileReader', 'api.files.upload', "'upload-image'", 'createObjectURL']) {
+    assert.ok(!taskChat.includes(own), `task-chat.js does not implement uploads itself (${own})`);
+  }
+  // Composer and start gate each carry the control; the drop target is the whole panel.
+  assert.match(taskChat, /task-chat-embed-slot">\$\{embedMenuHtml\(\{ label: '' \}\)/);
+  assert.match(taskChat, /task-chat-start-embed">\$\{embedMenuHtml\(/);
+  assert.match(taskChat, /attachFileDrop\(root\.querySelector\('\.task-chat-panel'\)/);
+  // Send waits for uploads; user turns render their attachments.
+  assert.match(taskChat, /send\.disabled = [^;]*uploadsPending > 0/);
+  assert.match(taskChat, /userMessageHtml\(m\.content/);
+});
+
+test('chat-ui.js: the objective chat uses the same shared Embed control', () => {
+  const chatUi = read('./chat-ui.js');
+  const embed = read('./embed-menu.js');
+  assert.match(chatUi, /from '\.\/embed-menu\.js'/);
+  assert.match(chatUi, /attachEmbedMenu\(embedWrap, chatInput/);
+  assert.ok(!chatUi.includes('_embedMenuCleanup'), 'the menu teardown lives in embed-menu.js');
+  assert.ok(!chatUi.includes('import-submenu--up'), 'the menu is built in embed-menu.js');
+  assert.match(embed, /uploadImageFile\(file, textarea, null, imageOpts\)/);
+  assert.match(embed, /uploadAttachmentFile\(file, textarea\)/);
+});
+
+test('styles.css: attachments and the drop state are styled inside the Task Chat block', () => {
+  const block = styles.slice(styles.indexOf('/* ── Task Chat window ──'), styles.indexOf('/* ── end Task Chat window ── */'));
+  for (const sel of ['.task-chat-attachments', '.task-chat-attach--image img', '.task-chat-attach--file', '.task-chat-panel--drop::after', '.task-chat-upload-status', '.task-chat-start-attachments']) {
+    assert.ok(block.includes(sel), `styled: ${sel}`);
+  }
 });

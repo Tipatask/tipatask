@@ -213,7 +213,7 @@ export const WS_SEND_TYPES = {
   APPLY_SPEC_UPDATE: 'apply-spec-update',
   // Task chat (task-chat.js) — session id `taskChat:<taskKey>`
   START_TASK_CHAT: 'start-task-chat',
-  START_PROJECT_CHAT: 'start-project-chat', // project chat, session id `projectChat:<API_PROJECT_ID>`
+  START_PROJECT_CHAT: 'start-project-chat', // project chat, session id `projectChat:<API_PROJECT_ID>:<chatId>`
   TASK_CHAT_MESSAGE: 'task-chat-message',
   TASK_CHAT_ANSWER: 'task-chat-answer',
   TASK_CHAT_TASK_EDITED: 'task-chat-task-edited', // the user saved a task from one of the chat's cards
@@ -257,6 +257,8 @@ export const WS_RECV_TYPES = {
   TASK_CHAT_TOOL: 'task-chat-tool',
   TASK_CHAT_TASK: 'task-chat-task',
   TASK_CHAT_TASK_EDITED: 'task-chat-task-edited',
+  PROJECT_CHAT_TITLED: 'project-chat-titled', // (TPT469) first user message named the chat
+  CHAT_ENDED: 'chat-ended',
   // Granular task mutation events
   TASK_CREATED: 'task:created',
   TASK_UPDATED: 'task:updated',

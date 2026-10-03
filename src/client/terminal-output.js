@@ -11,6 +11,7 @@ export function createTerminalOutputWriter(term) {
   let disposed = false;
   let frame = 0;
   let inputFrame = 0;
+  let pointerDown = false;
   let settledViewport = term.buffer.active.viewportY;
   const viewport = term.element.querySelector('.xterm-viewport');
 
@@ -37,11 +38,17 @@ export function createTerminalOutputWriter(term) {
     });
   }
 
+  // A held scrollbar or selection can keep scrolling long after the initial
+  // pointer event. Renderer-generated scroll events have no such user intent.
+  function onPointerDown() { pointerDown = true; }
+  function onPointerUp() { pointerDown = false; }
+
   function onViewportScroll() {
     // Renderer scroll events leave the buffer where parsing last put it. Native
     // scrollbar/selection scrolling changes it, including while writes are queued.
     const position = term.buffer.active.viewportY;
     if (position !== settledViewport) {
+      if ((pending || frame) && !inputFrame && !pointerDown) return;
       cancelFollow();
       following = !inputFrame && _isPinnedToBottom(term);
       settledViewport = position;
@@ -52,6 +59,10 @@ export function createTerminalOutputWriter(term) {
     term.element.addEventListener(type, onScrollInput, { capture: true, passive: true });
   }
   viewport?.addEventListener('scroll', onViewportScroll);
+  term.element.addEventListener('pointerdown', onPointerDown, true);
+  const pointerTarget = term.element.ownerDocument || term.element;
+  pointerTarget.addEventListener('pointerup', onPointerUp, true);
+  pointerTarget.addEventListener('pointercancel', onPointerUp, true);
 
   function scrollIfFollowing() {
     if (disposed) return;
@@ -59,12 +70,36 @@ export function createTerminalOutputWriter(term) {
     settledViewport = term.buffer.active.viewportY;
   }
 
+  function captureFollow() {
+    const pinned = _isPinnedToBottom(term);
+    if (!pending && !frame) following = pinned && !inputFrame;
+    else if (pinned && !inputFrame) following = true;
+  }
+
+  function settle() {
+    cancelAnimationFrame(frame);
+    // xterm synchronizes its native viewport in a render frame of its own.
+    // Keep the follow decision until that frame and the resulting scroll settle.
+    frame = requestAnimationFrame(() => {
+      scrollIfFollowing();
+      frame = requestAnimationFrame(() => {
+        scrollIfFollowing();
+        frame = 0;
+      });
+    });
+  }
+
   return {
+    refresh(fit) {
+      if (disposed) return;
+      captureFollow();
+      fit();
+      scrollIfFollowing();
+      settle();
+    },
     write(data, callback) {
       if (disposed) return;
-      const pinned = _isPinnedToBottom(term);
-      if (!pending && !frame) following = pinned && !inputFrame;
-      else if (pinned && !inputFrame) following = true;
+      captureFollow();
       cancelAnimationFrame(frame);
       frame = 0;
       pending++;
@@ -76,10 +111,7 @@ export function createTerminalOutputWriter(term) {
         scrollIfFollowing();
         if (!pending) {
           // One final pass after the entire queued burst and its layout work.
-          frame = requestAnimationFrame(() => {
-            frame = 0;
-            scrollIfFollowing();
-          });
+          settle();
         }
       });
     },
@@ -91,6 +123,9 @@ export function createTerminalOutputWriter(term) {
         term.element.removeEventListener(type, onScrollInput, true);
       }
       viewport?.removeEventListener('scroll', onViewportScroll);
+      term.element.removeEventListener('pointerdown', onPointerDown, true);
+      pointerTarget.removeEventListener('pointerup', onPointerUp, true);
+      pointerTarget.removeEventListener('pointercancel', onPointerUp, true);
     },
   };
 }

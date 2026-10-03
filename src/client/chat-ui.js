@@ -19,12 +19,13 @@ import { appendProgressLog, noteTurnBoundary, pushThinking, flushThinking, stage
 import { saveRecipe } from './recipe-sidebar.js';
 import { renderCardHtml, ensureExistingSnapshot, renderDiscussPreviewHtml } from './chat-task-preview.js';
 import { countPendingSubtaskCards, hasProposalCards } from './subtask-preview.js';
-import { attachImagePaste, uploadImageFile } from './task-board.js';
+import { attachImagePaste } from './task-board.js';
+import { DROPDOWN_CARET_SVG, embedMenuHtml, attachEmbedMenu, closeOpenEmbedMenu } from './embed-menu.js';
 import { openTaskEditModal } from './task-edit-modal.js';
 import { showActionConfirm } from './action-confirm.js';
 import { api } from './api-client.js';
 import { countUnresolvedCards } from './chat-finalize.js';
-import { FILE_ACCEPT, uploadAttachmentFile, ensureFileLinkHandler } from './file-attach.js';
+import { ensureFileLinkHandler } from './file-attach.js';
 import { requestPermission, notify, clearDebounce, objectiveTag, isNotifyEnabled } from './notifications.js';
 import { pushNotification, dismissNotification } from './notification-center.js';
 import { attachAudioRecorder, matchesVoiceShortcut, resolveVoiceTarget } from './audio-recorder.js';
@@ -267,26 +268,17 @@ function buildModelSelectorHtml(disabledAttr) {
   return `<div class="chat-model-selector"><label for="chat-model-select">${escapeAttr(t('field.model'))}</label><select id="chat-model-select"${disabledAttr}>${optgroups}</select></div>`;
 }
 
-// (TPT280) Shared 12px chevron caret for the composer's Embed and Import dropdown triggers —
-// one svg (not a text glyph) so both carets render at an identical size on every platform font.
-const DROPDOWN_CARET_SVG = '<svg class="embed-menu-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>';
-
-// (C1241) Embed control — paperclip + label trigger opening a dropdown with Image / Other file
-// rows, replacing the old direct-to-picker paperclip button. Keeps id #btn-obj-img-upload so
-// COMPOSER_TOOLTIPS (below) and the C1211 disabled-state wiring in attachChatHandlers() need no
-// change. (C1246) "Other file" is now live too — backed by the task_files store, wired to its
-// own hidden picker (#obj-file-input) below.
+// (C1241) Embed control — embed-menu.js, shared with the task / project chat composer. Keeps id
+// #btn-obj-img-upload so COMPOSER_TOOLTIPS (below) and the C1211 disabled-state wiring in
+// attachChatHandlers() need no change; (C1246) "Other file" uses its own picker (#obj-file-input).
 function buildEmbedMenuHtml(disabledAttr) {
-  return `
-    <div class="embed-menu-wrap">
-      <input type="file" id="obj-img-file-input" accept="image/*" style="display:none">
-      <input type="file" id="obj-file-input" accept="${FILE_ACCEPT}" style="display:none">
-      <button class="embed-menu-trigger" id="btn-obj-img-upload" type="button" aria-haspopup="true" aria-expanded="false"${disabledAttr}>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-        <span>${t('nav.embed')}</span>
-        ${DROPDOWN_CARET_SVG}
-      </button>
-    </div>`;
+  return embedMenuHtml({
+    label: t('nav.embed'),
+    disabled: !!disabledAttr,
+    triggerId: 'btn-obj-img-upload',
+    imageInputId: 'obj-img-file-input',
+    fileInputId: 'obj-file-input',
+  });
 }
 
 // (C1240, .import-menu-trigger re-parented into composer C1241) selector → i18n key for every
@@ -328,12 +320,6 @@ export function addComposerTooltips(root = document) {
 
 let _saveChatTimer = null;
 let _saveDraftTimer = null;
-// (C1241 fix, C1248) Teardown for the Embed menu's document-level outside-click/Escape
-// listeners. Only the item-click/outside-click/Escape close paths tore these down inline —
-// re-clicking the trigger to close, or a re-render while the menu is open (loadAndRender()
-// rewrites #app.innerHTML every render — template.html), otherwise leaked them onto detached
-// DOM. Same hazard/fix as template.html's _statusFilterPanelCleanup.
-let _embedMenuCleanup = null;
 let _objectiveNotificationPermissionRequested = false;
 // (TPT16) One-shot seed queued by spawnObjectiveTab() for the tab it just created/reused —
 // consumed by attachChatHandlers() the first time it runs against a LIVE #chat-input for
@@ -2094,7 +2080,7 @@ export function refreshObjectiveContent({ viewState = captureObjectiveViewState(
 export function ensureGlobalChatBindings() {
   registerVoiceShortcut();
   ensureFileLinkHandler();
-  if (_embedMenuCleanup) { _embedMenuCleanup(); _embedMenuCleanup = null; }
+  closeOpenEmbedMenu(); // (C1248) a render must not leave an open menu's document listeners
   if (!_objImgPreviewListenerRegistered) {
     _objImgPreviewListenerRegistered = true;
     document.addEventListener('tiptask:obj-image-preview', e => {
@@ -2178,68 +2164,13 @@ export function attachChatHandlers() {
           }
         });
     });
-    // (C1241, listener-leak fixed C1248) Embed dropdown — trigger opens Image/Other-file menu
-    // instead of jumping straight to the picker. Panel built imperatively, same recipe as
-    // template.html's Import submenu, but EVERY close path (item click, outside click, Escape,
-    // AND re-clicking the trigger to close it) routes through the one shared closeEmbedMenu()
-    // below, so the document-level outside-click/Escape listeners always get torn down —
-    // matching _embedMenuCleanup, cleared unconditionally at the top of this function too, in
-    // case a render lands mid-open (the panel dies with #app.innerHTML either way; the
-    // document listeners would not, without this).
-    const imgUploadBtn = document.getElementById('btn-obj-img-upload');
-    const imgFileInput = document.getElementById('obj-img-file-input');
-    const otherFileInput = document.getElementById('obj-file-input'); // (C1246)
-    if (imgUploadBtn && imgFileInput) {
-      const closeEmbedMenu = (menuEl) => {
-        menuEl.remove();
-        imgUploadBtn.setAttribute('aria-expanded', 'false');
-        if (_embedMenuCleanup) { _embedMenuCleanup(); _embedMenuCleanup = null; }
-      };
-      const openEmbedMenu = (wrap) => {
-        const menu = document.createElement('div');
-        menu.className = 'import-submenu import-submenu--up';
-
-        const imageItem = document.createElement('div');
-        imageItem.className = 'import-submenu-item';
-        imageItem.textContent = t('embed.image');
-        imageItem.addEventListener('click', () => { closeEmbedMenu(menu); imgFileInput.click(); });
-        menu.appendChild(imageItem);
-
-        const fileItem = document.createElement('div');
-        fileItem.className = 'import-submenu-item';
-        fileItem.textContent = t('embed.otherFile');
-        fileItem.title = t('tooltip.embedFile');
-        fileItem.addEventListener('click', () => { closeEmbedMenu(menu); otherFileInput?.click(); });
-        menu.appendChild(fileItem);
-
-        wrap.appendChild(menu);
-        imgUploadBtn.setAttribute('aria-expanded', 'true');
-
-        const onOutsideClick = (ev) => { if (!wrap.contains(ev.target)) closeEmbedMenu(menu); };
-        const onKeydown = (ev) => { if (ev.key === 'Escape') { ev.preventDefault(); closeEmbedMenu(menu); imgUploadBtn.focus(); } };
-        setTimeout(() => {
-          // Guard against a rapid open→close (toggle-reclick) that runs before this deferred
-          // attach fires — without it, these would attach for a menu that's already gone,
-          // orphaned from _embedMenuCleanup the moment a later open reassigns it.
-          if (!menu.isConnected) return;
-          document.addEventListener('click', onOutsideClick);
-          document.addEventListener('keydown', onKeydown);
-        }, 0);
-        _embedMenuCleanup = () => {
-          document.removeEventListener('click', onOutsideClick);
-          document.removeEventListener('keydown', onKeydown);
-        };
-      };
-      imgUploadBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const wrap = imgUploadBtn.closest('.embed-menu-wrap');
-        const existing = wrap.querySelector('.import-submenu');
-        if (existing) { closeEmbedMenu(existing); return; }
-        openEmbedMenu(wrap);
-      });
-      imgFileInput.addEventListener('change', () => {
-        const files = Array.from(imgFileInput.files || []);
-        files.forEach(file => uploadImageFile(file, chatInput, null, {
+    // (C1241, listener-leak fixed C1248) Embed dropdown — embed-menu.js; every close path tears
+    // down its document-level outside-click/Escape listeners (closeOpenEmbedMenu() also runs on
+    // every render, from ensureGlobalChatBindings()).
+    const embedWrap = document.getElementById('btn-obj-img-upload')?.closest('.embed-menu-wrap');
+    if (embedWrap) {
+      attachEmbedMenu(embedWrap, chatInput, {
+        imageOpts: {
           onFileDetected: file => console.debug('[NewObj:file]', file.name, file.size, file.type),
           onFileSkipped: file => console.warn('[NewObj:file] skipped non-image', file.name, file.size, file.type),
           onUploaded: (file, url) => appendNewObjectiveImagePreview(file, url),
@@ -2247,17 +2178,7 @@ export function attachChatHandlers() {
             console.error('[NewObj:file] upload failed', err);
             appendNewObjectiveUploadError(file, err);
           },
-        }));
-        imgFileInput.value = ''; // reset so same file can be re-selected
-      });
-    }
-    // (C1246) "Other file" picker — separate input/handler from images above: uploadAttachmentFile
-    // does its own base64 read + api.files.upload() + link-insert, no blob-preview swap needed.
-    if (otherFileInput) {
-      otherFileInput.addEventListener('change', () => {
-        const files = Array.from(otherFileInput.files || []);
-        files.forEach(file => uploadAttachmentFile(file, chatInput));
-        otherFileInput.value = ''; // reset so same file can be re-selected
+        },
       });
     }
     // (C1211) Mic shares composer's disabled state — locked for the whole in-flight turn,
@@ -2273,7 +2194,10 @@ export function attachChatHandlers() {
         const words = chatInput.value.trim().split(/\s+/).filter(Boolean).length;
         wordCountEl.textContent = `${words} word${words !== 1 ? 's' : ''}`;
         const hint = wordCountEl.closest('.chat-brief-hint');
-        if (hint) hint.classList.toggle('chat-brief-hint--low', words > 0 && words < 40);
+        if (hint) {
+          hint.setAttribute('aria-live', 'polite');
+          hint.classList.toggle('chat-brief-hint--low', words > 0 && words < 40);
+        }
       };
       chatInput.addEventListener('input', updateWordCount);
       updateWordCount();

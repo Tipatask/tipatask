@@ -42,7 +42,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openSetupWindow: (p) => inv('project:open-setup-window', p),
   onSetupOpenForPath: (cb) => ipcRenderer.on('setup:open-for-path', (_, p) => cb(p)),
   focusSelf: () => inv('window:focus-self'),
-  // (C1057) Native main-process notification transport — see notifications.js#_electronNotify.
+  notificationDelivery: 'desktop',
+  // App-owned desktop notification transport — see notifications.js#_electronNotify.
   notify: (payload) => inv('notify:show', payload),
   // (C1125) One-shot check of whether this bundle is code-signed — an unsigned bundle never
   // gets a Notification Center registration on macOS, so notify:show can silently drop every
@@ -69,6 +70,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // window/project that RAISED the notif, not necessarily this one — main.js routes the click
   // to whichever window owns that project NOW (see main.js resolveNotifyTarget). notifications.js
   // compares projectPath against getProjectPath() before running a click handler.
+  onNotificationDismiss: (cb) => {
+    const handler = (_, payload) => cb(payload);
+    ipcRenderer.on('notify:dismissed', handler);
+    return () => ipcRenderer.removeListener('notify:dismissed', handler);
+  },
   onNotificationClick: (cb) => {
     const handler = (_, payload) => cb(payload);
     ipcRenderer.on('notify:clicked', handler);

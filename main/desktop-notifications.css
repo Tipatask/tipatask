@@ -1,0 +1,13 @@
+:root { color-scheme: light dark; font: 13px system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 8px; background: transparent; }
+#tt-notif-stack { display: flex; flex-direction: column; gap: 8px; max-height: calc(100vh - 16px); overflow-y: auto; }
+.tt-notif-card { display: flex; flex: 0 0 108px; gap: 10px; padding: 12px; border: 1px solid #85928e; border-radius: 12px; background: #f9faf7; color: #182825; cursor: pointer; }
+.tt-notif-card:focus-visible, button:focus-visible { outline: 3px solid #008f80; outline-offset: -3px; }
+.tt-notif-card-icon { color: #008878; font-size: 19px; }
+.tt-notif-card--attention .tt-notif-card-icon { color: #b36b00; }
+.tt-notif-card-body-wrap { flex: 1; min-width: 0; overflow-y: auto; overflow-wrap: anywhere; }
+.tt-notif-card-title { font-weight: 650; margin-bottom: 5px; }
+.tt-notif-card-body { white-space: pre-wrap; opacity: .85; }
+.tt-notif-card-close { align-self: flex-start; border: 0; background: transparent; color: inherit; font-size: 20px; cursor: pointer; padding: 0 3px; }
+@media (prefers-color-scheme: dark) { .tt-notif-card { background: #1b2827; color: #f0f3ed; border-color: #536763; } }

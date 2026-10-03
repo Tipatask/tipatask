@@ -34,12 +34,13 @@ const _processCreatedAt = (() => {
   try { return process.getCreationTime ? process.getCreationTime() : null; } catch { return null; }
 })();
 
-const { BrowserWindow, Menu, shell, dialog, ipcMain, session, Notification, systemPreferences } = require('electron');
+const { BrowserWindow, Menu, shell, dialog, ipcMain, session, screen, systemPreferences } = require('electron');
 const { fork, execFile } = require('child_process');
 const crypto = require('node:crypto');
 const fs = require('fs');
 const path = require('path');
-const { createNotificationOriginRegistry } = require('./main/notification-origins');
+const { createDesktopNotifications } = require('./main/desktop-notifications');
+const { isTrustedTopFrame } = require('./main/ipc/external');
 const { loadWorkspace, saveWorkspace } = require('./src/server/workspace-state');
 // (C1430) Pure startup-restore precedence — no fs/electron, safe as top-level
 // require (does not violate the C1173 no-module-scope-I/O rule below).
@@ -139,14 +140,10 @@ function focusWindow(w, { steal = false } = {}) {
   return true;
 }
 
-// (C1069) tag + project path → notif origin. Main-process Notification carries no window identity of
-// its own. Store PROJECT PATH (not just window) — survives `project:open target:'current'`,
-// which reloads SAME webContents into DIFFERENT project. Values = plain ids/strings only, no
-// BrowserWindow/WebContents retained → entry can never keep closed window alive.
-const notifyOrigins = createNotificationOriginRegistry();
+let desktopNotifications = null;
 
-function rememberNotifyOrigin(tag, origin) {
-  return notifyOrigins.remember(tag, origin);
+function quitIfOnlyNotificationWindowRemains() {
+  if (process.platform !== 'darwin' && BrowserWindow.getAllWindows().every((w) => desktopNotifications?.owns(w))) app.quit();
 }
 
 // Prefer window that owns origin's project NOW; fall back to window that sent the IPC. Null if
@@ -253,16 +250,6 @@ async function refreshBundleSignatureState({ force = false } = {}) {
   }
   return _bundleSignatureState;
 }
-
-// (C1141) Native Notification has no JS-side owner once new Notification(...) returns —
-// nothing downstream closed over it (click/close/failed handlers close over tag/origin only).
-// V8 can collect the wrapper before macOS decides show/failed, which would silently surface
-// as the 1.5s not-delivered timeout with no real cause. Keep a live reference from creation
-// until its terminal event, same plain-values-only + FIFO-backstop shape as notifyOrigins
-// above so a leak can never hold a window/webContents alive either.
-const _liveNotifications = new Map();     // seq -> Notification
-const NOTIFY_LIVE_MAX = 200;
-let _notifyLiveSeq = 0;
 
 let workspaceState = null;
 const SESSION_FILE = 'session.json';
@@ -986,55 +973,8 @@ function registerIpcHandlers() {
     return { ok: true, changed: true };
   });
 
-  // (C1125) macOS's usernoted keys notification delivery off the app's code signature — an
-  // ad-hoc-or-unsigned bundle (electron-builder skips signing unless `build.mac.identity` is
-  // set — see package.json) never gets a Notification Center registration at all, and every
-  // `n.show()` below then silently drops with no error of any kind. `Contents/_CodeSignature`
-  // is what `codesign` writes for a real signature (even ad-hoc `--sign -`) and is absent when
-  // signing was skipped entirely — cheaper and more direct than shelling out to `codesign -dv`.
-  // Cached: the answer can't change without a relaunch. Always true outside darwin/packaged,
-  // where this failure mode doesn't apply (dev runs execute unsigned `electron .` directly and
-  // still notify fine — see tt-notifications.md's macOS bundle-identifier caveat).
-  let _codeSigned = null;
-  function isCodeSigned() {
-    if (_codeSigned !== null) return _codeSigned;
-    if (process.platform !== 'darwin' || !app.isPackaged) { _codeSigned = true; return true; }
-    try {
-      _codeSigned = fs.existsSync(path.join(process.resourcesPath, '..', '_CodeSignature'));
-    } catch { _codeSigned = false; }
-    return _codeSigned;
-  }
-
-  // (C1141) signed ≠ valid — isCodeSigned() above only proves Contents/_CodeSignature EXISTS
-  // (true at build time even for a bundle whose seal has since been broken by a stray write
-  // inside it). _bundleSignatureState is the actual `codesign --verify` result.
-  // (C1318) No longer fails open: a `null` state (check literally never ran) used to read back
-  // as `{valid: true}` — a check that never happened was indistinguishable from a healthy one.
-  // Now reported honestly as `valid: null` ("unknown"); notify:show's gate below treats that
-  // as pass-through (never blocks a send on an inconclusive check) while notify:status/the
-  // Settings badge can still tell "never checked" apart from "verified good".
-  function signatureStatus() {
-    return _bundleSignatureState || { valid: null, reason: 'not-checked', relaunchNeeded: false };
-  }
-
-  // (C1125) Lets notifications.js#getNotificationStatus() surface the unsigned-bundle condition
-  // in the Settings badge/warning-dot even before any notify:show attempt has happened.
-  // (C1141) valid/reason/relaunchNeeded added alongside signed.
-  // (C1318) Async now — re-verifies (TTL'd, see refreshBundleSignatureState) instead of only
-  // ever reporting the one-time startup snapshot, and adds `registered` (the direct "is this
-  // bundle actually connected to usernoted right now" signal — see checkNotificationCenterRegistration).
-  // (C1355) `conflicts`/`installerVolumes` added — the duplicate-LaunchServices-claimant self
-  // heal check, same TTL as the signature check above (see refreshBundleSignatureState).
-  ipcMain.handle('notify:status', async () => {
-    await refreshBundleSignatureState();
-    return {
-      signed: isCodeSigned(),
-      ...signatureStatus(),
-      registered: _ncRegistrationState,
-      conflicts: _lsRegistrationState?.conflicts ?? null,
-      installerVolumes: _lsRegistrationState?.installerVolumes ?? [],
-    };
-  });
+  // Desktop banners do not depend on native notification registration or permissions.
+  ipcMain.handle('notify:status', () => ({ delivery: 'desktop', available: true }));
 
   // (C1355) On-demand repair from the Settings "Repair" button — re-registers the RUNNING
   // bundle with LaunchServices so it becomes the freshest claimant of com.tipatask.app. Never
@@ -1075,97 +1015,27 @@ function registerIpcHandlers() {
     try { return await systemPreferences.askForMediaAccess('microphone'); } catch { return false; }
   });
 
-  // How long to wait for a 'show'/'failed' event before assuming the send is a bust. Electron
-  // documents 'failed' as Windows-only, so on macOS this timeout — not 'failed' — is what
-  // catches a delivery that neither the isCodeSigned() check nor 'show' itself flags.
-  const NOTIFY_SHOW_TIMEOUT_MS = 1500;
-
-  // (C1057) Native main-process notification — bypasses the renderer Web Notification
-  // permission model entirely (see the setPermissionRequestHandler/setPermissionCheckHandler
-  // pair below, which is the fallback path for when this transport is unavailable). Works in
-  // an unpackaged dev run too, unlike a renderer Notification that depends on the app bundle
-  // identity. (C1069) Click focuses the window that CURRENTLY owns the originating project
-  // (`notifyOrigins`/`resolveNotifyTarget`), activating the app BEFORE keying the window on
-  // macOS — see focusWindow() — then hands off to the renderer via 'notify:clicked' so
-  // notifications.js's registered onClick (e.g. open the task's terminal) still runs — see
-  // src/client/notifications.js and preload.js.
-  // (C1125) Now async and truthful — previously returned `{ok:true}` unconditionally right
-  // after `n.show()`, before the OS had decided anything, which is exactly how the unsigned-
-  // bundle drop above stayed invisible through the whole C1058/C1060/C1069 notification work.
-  ipcMain.handle('notify:show', (event, payload = {}) => {
-    if (!Notification.isSupported()) return { ok: false, reason: 'unsupported' };
-    if (!isCodeSigned()) return { ok: false, reason: 'unsigned' };
-    // (C1141) signed ≠ valid — see signatureStatus() above. (C1318) Explicit `=== false` —
-    // `null` (never checked / inconclusive) must pass through, not block every send.
-    if (signatureStatus().valid === false) return { ok: false, reason: 'seal-broken' };
-    const { title, body, tag, taskId } = payload || {};
-    // (C1069) Capture calling window UP FRONT — click callback below must not depend on
-    // whatever had focus when banner clicked. That dependence was the bug.
-    const originWin = BrowserWindow.fromWebContents(event.sender);
-    const origin = rememberNotifyOrigin(tag, {
-      windowId: originWin && !originWin.isDestroyed() ? originWin.id : null,
-      wcId: event.sender.id,
-      projectPath: projectDirs.get(event.sender.id) || null,
-    });
-    // (C1137) timeoutType:'never' keeps the toast on-screen until dismissed on Windows/Linux.
-    // Electron docs this as Windows-only, but Linux notification daemons (libnotify) generally
-    // honor it too since it maps to the freedesktop 'urgency'/'expire-timeout' hints. No effect
-    // on macOS: Electron's Notification is UNUserNotificationCenter-backed there (verified
-    // against the shipped framework binary — 0 hits NSUserNotificationCenter, 4 hits
-    // UNUserNotificationCenter), and Banner-vs-Alert (auto-dismiss vs stays-until-dismissed) is
-    // a user preference in System Settings › Notifications with no app-facing override — see
-    // ai/architecture/tt-notifications.md § In-app notification stack for the macOS-side answer
-    // (an in-app card stack, notification-center.js) and the Settings deep link this drives to.
-    const n = new Notification({ title: String(title || 'TipATask'), body: String(body || ''), silent: false, timeoutType: 'never' });
-    // (C1141) Retain — see _liveNotifications above. FIFO backstop so a leak (an event that
-    // never fires for some reason) can never grow this unbounded.
-    const liveKey = ++_notifyLiveSeq;
-    _liveNotifications.set(liveKey, n);
-    while (_liveNotifications.size > NOTIFY_LIVE_MAX) {
-      _liveNotifications.delete(_liveNotifications.keys().next().value);
-    }
-    const release = () => { _liveNotifications.delete(liveKey); };
-    n.on('click', () => {
-      // Registry first (survives this closure's own origin going stale), fall back to the
-      // origin captured above if the registry entry was already cleaned up.
-      const src = notifyOrigins.get(tag, origin.projectPath) || origin;
-      notifyOrigins.forget(tag, origin.projectPath);
-      const w = resolveNotifyTarget(src);
-      if (!w) return;
+  desktopNotifications = createDesktopNotifications({ BrowserWindow, screen, ipcMain,
+    onClick: (entry) => {
+      const w = resolveNotifyTarget(entry.origin);
+      if (!w || (entry.origin.projectPath && projectDirs.get(w.webContents.id) !== entry.origin.projectPath)) return;
       focusWindow(w, { steal: true });
-      // projectPath sent is the ORIGIN's project, not necessarily the resolved window's —
-      // deliberate: lets renderer detect "reloaded into different project since banner raised"
-      // and decline to act (see notifications.js).
-      if (!w.webContents.isDestroyed()) {
-        w.webContents.send('notify:clicked', { taskId, tag, windowId: src.windowId, projectPath: src.projectPath });
-      }
-    });
-    // Identity-guarded cleanup: a late 'close' from a superseded banner must not delete a
-    // fresher entry re-registered for same tag after notifications.js's 30s debounce expired.
-    const forget = () => notifyOrigins.forget(tag, origin.projectPath, origin);
-    n.on('close', () => { forget(); release(); });
-    return new Promise((resolve) => {
-      let settled = false;
-      let timer = null;
-      // (C1141) settle() only used to flip `settled` and resolve — the setTimeout below kept
-      // firing regardless (harmless for the result, but the timer never went away). Clear it
-      // on whichever path settles first.
-      const settle = (result) => {
-        if (settled) return;
-        settled = true;
-        if (timer) clearTimeout(timer);
-        resolve(result);
-      };
-      n.on('failed', () => { forget(); release(); settle({ ok: false, reason: 'failed' }); });
-      // release() deliberately NOT called on 'show' or on the not-delivered timeout below — a
-      // banner the user can still click (or that macOS is about to deliver late) must stay
-      // referenced past this IPC promise settling. Only 'close'/'failed' (the notification's own
-      // terminal events, above/below) release it; NOTIFY_LIVE_MAX is the backstop if neither
-      // ever fires.
-      n.on('show', () => settle({ ok: true }));
-      n.show();
-      timer = setTimeout(() => settle({ ok: false, reason: 'not-delivered' }), NOTIFY_SHOW_TIMEOUT_MS);
-    });
+      w.webContents.send('notify:clicked', { notificationId: entry.notificationId,
+        tag: entry.tag, taskId: entry.taskId, projectPath: entry.origin.projectPath });
+    },
+    onDismiss: (entry) => {
+      const w = resolveNotifyTarget(entry.origin);
+      if (w && !w.webContents.isDestroyed()) w.webContents.send('notify:dismissed', {
+        notificationId: entry.notificationId, projectPath: entry.origin.projectPath });
+    },
+  });
+  ipcMain.handle('notify:show', (event, payload = {}) => {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+      return { ok: false, reason: 'untrusted_sender' };
+    }
+    const w = BrowserWindow.fromWebContents(event.sender);
+    return desktopNotifications.show(payload || {}, { windowId: w.id,
+      wcId: event.sender.id, projectPath: projectDirs.get(event.sender.id) || null });
   });
 
   ipcMain.handle('project:remove', (_event, projectPath) => {
@@ -2203,6 +2073,7 @@ function createSetupWindow(projectPath) {
     projectDirs.delete(wcId);
     dropWindow(wcId);
     releaseSetup(w);
+    quitIfOnlyNotificationWindowRemains();
     if (dir && releaseProject(dir, w)) scheduleOpenProjectsSync();
   });
   return w;
@@ -2319,6 +2190,7 @@ async function createProjectWindow(projectDir, { deferShow = false } = {}) {
     projectDirs.delete(wcId);
     dropWindow(wcId);
     releaseSetup(w);
+    quitIfOnlyNotificationWindowRemains();
     if (dir && releaseProject(dir, w)) {
       scheduleOpenProjectsSync();
     }
@@ -2501,6 +2373,7 @@ app.on('before-quit', (event) => {
     confirmAndQuit();
     return;
   }
+  desktopNotifications?.dispose();
   saveWindowSession();
   if (!_quitting) {
     _quitting = true;
@@ -2534,7 +2407,7 @@ app.on('activate', () => {
   // about" list, not a "what was open" signal — reopening every workspace project on a
   // Dock click after the user closed everything was the live repro of "opens ALL OF THE
   // PROJECTS". One blank window instead.
-  if (BrowserWindow.getAllWindows().length === 0) createInitialWindows([]);
+  if (BrowserWindow.getAllWindows().every((w) => desktopNotifications?.owns(w))) createInitialWindows([]);
 });
 
 app.on('quit', () => {

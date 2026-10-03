@@ -117,6 +117,42 @@ test('dialogSubmission: a multi-choice dialog takes one or more, deduplicated an
   assert.equal(m.dialogSubmission(MULTI, { picked: [], other: '' }), null);
 });
 
+test('dialogSubmission: the single-choice Other row alone is a valid answer once it has text', () => {
+  // The window sends `other` only while the Other radio is checked; no option index goes with it.
+  assert.deepEqual(m.dialogSubmission(SINGLE, { picked: [], other: 'Start in batch 20' }), { dialogId: 'dlg-1', selected: [], other: 'Start in batch 20' });
+  assert.deepEqual(m.dialogSubmission(SINGLE, { picked: [2], other: '' }), { dialogId: 'dlg-1', selected: [2] });
+});
+
+test('dialogState: open on the latest finished turn once connected, waiting before and while a turn runs', () => {
+  const dialog = { ...SINGLE };
+  const reply = { role: 'assistant', content: 'Pick one', dialogs: [dialog] };
+  const messages = [{ role: 'user', content: 'Plan it' }, reply];
+  const state = (over = {}) => m.dialogState({ messages, message: reply, dialog, connected: true, running: false, ...over });
+  // A reattach restores the history before its `config` frame: built `waiting`, `open` once connected.
+  assert.equal(state({ connected: false }), 'waiting');
+  assert.equal(state(), 'open');
+  assert.equal(state({ running: true }), 'waiting');
+  assert.equal(m.dialogState({ messages, message: { ...reply, streaming: true }, dialog, connected: true, running: false }), 'skipped',
+    'a message that is not in the transcript is not the latest turn');
+  reply.streaming = true;
+  assert.equal(state(), 'waiting', 'the reply is still streaming');
+  delete reply.streaming;
+});
+
+test('dialogState: a window notice after the reply keeps it open; a later turn skips it; an answer locks it', () => {
+  const dialog = { ...SINGLE };
+  const reply = { role: 'assistant', content: '', dialogs: [dialog] };
+  const messages = [{ role: 'user', content: 'Plan it' }, reply, { role: 'system', content: 'TPT1 edited' }];
+  const args = { messages, message: reply, dialog, connected: true, running: false };
+  assert.equal(m.lastTurnMessage(messages), reply);
+  assert.equal(m.dialogState(args), 'open');
+  messages.push({ role: 'user', content: 'Never mind' });
+  assert.equal(m.dialogState(args), 'skipped');
+  assert.equal(m.dialogState({ ...args, dialog: { ...dialog, answer: { selected: ['Backlog'], indexes: [1], other: '' } } }), 'answered');
+  assert.equal(m.lastTurnMessage([]), null);
+  assert.equal(m.dialogState({ messages: [], message: null, dialog }), 'skipped');
+});
+
 test('localAnswer + answerSummary: the picks as the server stores them and as the user reads them', () => {
   const answer = m.localAnswer(MULTI, { dialogId: 'dlg-2', selected: [0, 2], other: 'plus a note' });
   assert.deepEqual(answer, { selected: ['Current sprint', 'Later'], indexes: [0, 2], other: 'plus a note' });
@@ -318,4 +354,61 @@ test('shortToolName: strips the mcp server prefix', () => {
   assert.equal(m.shortToolName('mcp__tipatask__update_task'), 'update_task');
   assert.equal(m.shortToolName('tipatask_api'), 'tipatask_api');
   assert.equal(m.shortToolName(undefined), '');
+});
+
+// ── Attachments (TPT473) ──
+
+const IMG = 'http://127.0.0.1:4454/api/projects/2/images/41';
+const PDF = 'https://web.tipatask.com/api/projects/2/files/7';
+
+test('splitAttachmentRefs: pulls image and file refs out of the text, rewritten to the proxies', () => {
+  const { text, attachments } = m.splitAttachmentRefs(`Look at this![img](${IMG})\n\nand the spec [spec.pdf](${PDF})`);
+  assert.equal(text, 'Look at this\n\nand the spec');
+  assert.deepEqual(attachments, [
+    { kind: 'image', name: 'img', src: '/api/images/2/41', href: '/api/images/2/41' },
+    { kind: 'file', name: 'spec.pdf', href: '/api/files/2/7' },
+  ]);
+});
+
+test('splitAttachmentRefs: a relative URL counts, other links and an uploading blob stay in the text', () => {
+  const r = m.splitAttachmentRefs('![shot](/api/projects/3/images/9)');
+  assert.equal(r.text, '');
+  assert.deepEqual(r.attachments.map(a => a.src), ['/api/images/3/9']);
+  const plain = 'see [docs](https://example.com/api/projects/x) and ![img](blob:http://x/1)';
+  assert.deepEqual(m.splitAttachmentRefs(plain), { text: plain, attachments: [] });
+  assert.deepEqual(m.splitAttachmentRefs(null), { text: '', attachments: [] });
+});
+
+test('splitAttachmentRefs: removing a ref collapses the blank lines it leaves', () => {
+  const { text } = m.splitAttachmentRefs(`one\n\n![img](${IMG})\n\n\ntwo   \n[a.txt](${PDF})`);
+  assert.equal(text, 'one\n\ntwo');
+});
+
+test('userMessageHtml: escaped text, an image thumbnail and a file chip', () => {
+  const tr = key => LOCALES.en[key] || key;
+  const html = m.userMessageHtml(`<b>hi</b>\n![img](${IMG}) [r&d.pdf](${PDF})`, { t: tr });
+  const doc = new Window().document;
+  doc.body.innerHTML = html;
+  assert.equal(doc.querySelector('.task-chat-user-text').textContent, '<b>hi</b>');
+  assert.equal(doc.querySelector('b'), null);
+  const thumb = doc.querySelector('a.task-chat-attach--image');
+  assert.ok(thumb.classList.contains('file-attachment-link'));
+  assert.equal(thumb.getAttribute('href'), '/api/images/2/41');
+  assert.equal(thumb.querySelector('img').getAttribute('src'), '/api/images/2/41');
+  assert.equal(thumb.querySelector('img').getAttribute('alt'), LOCALES.en['taskChat.embed.image']);
+  const chip = doc.querySelector('a.task-chat-attach--file');
+  assert.equal(chip.getAttribute('href'), '/api/files/2/7');
+  assert.equal(chip.textContent, 'r&d.pdf');
+});
+
+test('userMessageHtml: text without attachments is the text alone; attachments alone have no text row', () => {
+  assert.equal(m.userMessageHtml('a < b'), '<div class="task-chat-user-text">a &lt; b</div>');
+  assert.doesNotMatch(m.userMessageHtml(`![img](${IMG})`), /task-chat-user-text/);
+  assert.equal(m.attachmentsHtml([]), '');
+});
+
+test('stripPendingImageRefs: drops blob placeholders and keeps uploaded refs', () => {
+  assert.equal(m.stripPendingImageRefs(`a![img](blob:http://x/1)b![img](${IMG})`), `ab![img](${IMG})`);
+  assert.equal(m.stripPendingImageRefs('plain'), 'plain');
+  assert.equal(m.stripPendingImageRefs(undefined), '');
 });

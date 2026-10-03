@@ -38,64 +38,55 @@ const kinds = [
 
 for (const kind of kinds) {
   test(`${kind.name} localization sends bearer token only to exact-origin, current-project attachment routes`, async () => {
-    const received = [];
-    let listedUrls = [];
-    const api = await startServer((req, res) => {
-      received.push({ url: req.url, auth: req.headers.authorization });
-      if (req.url === `/api/projects/1/${kind.route}/task/C317`) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ [kind.route]: listedUrls.map(url => ({ url, filename: 'doc.txt' })) }));
-      }
-      res.writeHead(200, { 'Content-Type': kind.mime });
-      res.end(kind.data);
-    });
+    const origin = 'https://api.attachment.test:8443';
     const base = `/api/projects/1/${kind.route}`;
     const invalid = [
-      `http://127.0.0.1.attacker.invalid:${new URL(api.origin).port}${base}/90`,
-      `http://evil-127.0.0.1:${new URL(api.origin).port}${base}/91`,
-      `${api.origin.replace('http:', 'https:')}${base}/92`,
-      `${api.origin.replace(/:\d+$/, ':1')}${base}/93`,
-      api.origin.replace('://', '://user@') + `${base}/94`,
-      `${api.origin}/api/projects/2/${kind.route}/95`,
-      `${api.origin}/api/projects/1/${kind.route}/%39%36`,
-      `${api.origin}${base}/97/extra`,
-      `//127.0.0.1:${new URL(api.origin).port}${base}/98`,
+      `https://api.attachment.test.attacker.invalid:8443${base}/90`,
+      `https://evil-api.attachment.test:8443${base}/91`,
+      `${origin.replace('https:', 'http:')}${base}/92`,
+      `${origin.replace(/:\d+$/, ':1')}${base}/93`,
+      origin.replace('://', '://user@') + `${base}/94`,
+      `${origin}/api/projects/2/${kind.route}/95`,
+      `${origin}/api/projects/1/${kind.route}/%39%36`,
+      `${origin}${base}/97/extra`,
+      `//api.attachment.test:8443${base}/98`,
       `/api/projects/2/${kind.route}/99`,
       `/api/projects/1/${kind.route}/%31%30%30`,
     ];
-    listedUrls = [invalid[0], invalid[5], invalid[6], `${base}/45`];
-    const prompt = [kind.ref(`${api.origin}${base}/45`), kind.ref(`${base}/46`),
+    const listedUrls = [invalid[0], invalid[5], invalid[6], `${base}/45`];
+    const prompt = [kind.ref(`${origin}${base}/45`), kind.ref(`${base}/46`),
       ...invalid.map(kind.ref)].join('\n');
     const originalFetch = global.fetch;
     const attempted = [];
-    global.fetch = (url, options) => {
-      attempted.push({ url: String(url), auth: options?.headers?.Authorization, redirect: options?.redirect });
-      if (new URL(String(url)).origin !== api.origin) {
-        return Promise.reject(new Error('Test blocked unexpected outbound URL'));
+    global.fetch = async (url, options) => {
+      const href = String(url);
+      attempted.push({ url: href, auth: options?.headers?.Authorization, redirect: options?.redirect });
+      if (href === `${origin}${base}/task/C317`) {
+        return new Response(JSON.stringify({ [kind.route]: listedUrls.map(url => ({ url, filename: 'doc.txt' })) }),
+          { headers: { 'Content-Type': 'application/json' } });
       }
-      return originalFetch(url, options);
+      if (href === `${origin}${base}/45` || href === `${origin}${base}/46`) {
+        return new Response(kind.data, { headers: { 'Content-Type': kind.mime } });
+      }
+      throw new Error(`Unexpected attachment fetch: ${href}`);
     };
 
     try {
-      await withProject(api.origin, async projectRoot => {
+      await withProject(origin, async projectRoot => {
         const result = await kind.localize({ taskId: 'C317', prompt, taskCommentsBlock: '', projectRoot });
         for (const url of invalid) assert.ok(result.prompt.includes(kind.ref(url)), `rejected ref changed: ${url}`);
-        for (const url of [`${api.origin}${base}/45`, `${base}/46`]) {
+        for (const url of [`${origin}${base}/45`, `${base}/46`]) {
           assert.ok(!result.prompt.includes(kind.ref(url)), `valid ref not localized: ${url}`);
         }
         const localPaths = [...result.prompt.matchAll(/@(\/[^\s]+)/g)].map(match => match[1]);
         assert.ok(localPaths.length >= 2);
         for (const localPath of localPaths) assert.deepStrictEqual(fs.readFileSync(localPath), kind.data);
       });
-      assert.deepStrictEqual(received.map(row => row.url), [
-        `/api/projects/1/${kind.route}/task/C317`, `${base}/45`, `${base}/46`,
-      ]);
-      assert.ok(received.every(row => row.auth === 'Bearer origin-test-token'));
-      assert.ok(attempted.every(row => new URL(row.url).origin === api.origin &&
-        row.auth === 'Bearer origin-test-token' && row.redirect === 'error'));
+      assert.deepStrictEqual(attempted, [
+        `${origin}${base}/task/C317`, `${origin}${base}/45`, `${origin}${base}/46`,
+      ].map(url => ({ url, auth: 'Bearer origin-test-token', redirect: 'error' })));
     } finally {
       global.fetch = originalFetch;
-      await api.close();
     }
   });
 

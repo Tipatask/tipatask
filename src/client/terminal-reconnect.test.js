@@ -8,7 +8,7 @@ const source = readFileSync(new URL('./console-modal.js', import.meta.url), 'utf
 const helpers = source.slice(source.indexOf('function adoptSessionStart('), source.indexOf('export function startTaskSession('));
 
 test('resume forwards the server timestamp unchanged; fresh launches never reuse it', () => {
-  const state = { activeSessions: new Set(['TPT415']), sessionMeta: new Map([['TPT415', { agent: 'codex' }]]) };
+  const state = { activeSessions: new Set(['TPT415']), exitedSessions: new Set(), sessionMeta: new Map([['TPT415', { agent: 'codex' }]]) };
   const ctx = { state, buildTaskSessionPrompt: () => 'kickoff' };
   vm.createContext(ctx);
   vm.runInContext(helpers, ctx);
@@ -20,9 +20,14 @@ test('resume forwards the server timestamp unchanged; fresh launches never reuse
   assert.equal(ctx.buildTaskSessionWsExtra('TPT415', '', '').startedAt, startedAt);
   assert.equal(ctx.buildTaskSessionWsExtra('TPT415', '', '').prompt, undefined);
   state.activeSessions.clear();
+  state.exitedSessions.add('TPT415');
+  assert.equal(ctx.buildTaskSessionWsExtra('TPT415', '', '').prompt, undefined);
+  assert.equal(ctx.buildTaskSessionWsExtra('TPT415', '', '').startedAt, startedAt);
+  state.exitedSessions.clear();
   const fresh = ctx.buildTaskSessionWsExtra('TPT415', '', '');
   assert.equal(fresh.startedAt, undefined);
   assert.equal(fresh.prompt, 'kickoff');
   state.activeSessions.add('legacy');
   assert.equal(ctx.buildTaskSessionWsExtra('legacy', '', '').startedAt, undefined);
+  assert.equal(ctx.buildTaskSessionWsExtra('missing', '', '', { reconnectOnly: true, sessionStartedAt: startedAt }).prompt, undefined);
 });

@@ -10,6 +10,14 @@ export function expandedCardMaxHeight({ viewportHeight, isPreview = false, margi
   return isPreview ? full : Math.min(viewportHeight * 0.8, full);
 }
 
+// (TPT472) Resting-slot top for the expanded overlay: the live placeholder top when it's still in
+// the DOM (it moves with scroll AND with layout shifts above it), else the expand-time top shifted
+// by the window scroll since then. A top frozen at expand time drifts when anything above the slot
+// changes height without scrolling.
+export function resolveAnchorTop({ slotTop, expandTop, scrollDelta = 0 }) {
+  return Number.isFinite(slotTop) ? slotTop : expandTop - scrollDelta;
+}
+
 // Top edge for an overlay of `height` that would rather sit at `anchorTop` (its resting spot).
 // Stays at the anchor when it fits, lifts just enough to keep the bottom `margin` inside the
 // viewport when it doesn't, and never goes above the top margin — a card taller than the

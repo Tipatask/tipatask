@@ -434,6 +434,7 @@ test('packaged asar path (local section): uses Electron binary + ELECTRON_RUN_AS
   assert.doesNotMatch(toml, /NODE_COMPILE_CACHE/);
   // C1382 — registers only the 4 tools that still need a local checkout
   assert.match(toml, /TIPATASK_MCP_LOCAL_ONLY = "1"/);
+  assert.ok(toml.includes(`TIPATASK_USER_DATA = ${JSON.stringify(path.resolve(process.env.TIPATASK_USER_DATA || path.resolve(path.dirname(asarMcpPath), '../..')))}`));
   assert.doesNotMatch(toml, /^\s*transport\s*=/m);
   // approval mode still set
   assert.match(toml, new RegExp(`default_tools_approval_mode = "${CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE}"`));
@@ -453,6 +454,7 @@ test('dev/plain-node path (local section): uses mcp-node wrapper + NODE_COMPILE_
   // command uses the mcp-node wrapper under the server root (not inside asar)
   assert.match(toml, /mcp-node/);
   assert.match(toml, /TIPATASK_MCP_LOCAL_ONLY = "1"/);
+  assert.ok(toml.includes(`TIPATASK_USER_DATA = ${JSON.stringify(path.resolve(process.env.TIPATASK_USER_DATA || path.resolve(path.dirname(devMcpPath), '../..')))}`));
   assert.doesNotMatch(toml, /^\s*transport\s*=/m);
 });
 

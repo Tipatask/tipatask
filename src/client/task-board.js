@@ -2,7 +2,7 @@
 import state from './state.js';
 import { t, tc, setLocale } from './i18n.js';
 import { isTaskDiscussing } from './discuss-lock.js';
-import { DRAFT_KEY_TASK, ensureAgentModels } from './constants.js';
+import { DRAFT_KEY_TASK, ensureAgentModels, CHAT_BUBBLE_SVG } from './constants.js';
 import {
   statusNames, statusLabel, statusColor, statusRoleToken, WORKFLOW_COLOR_SWATCHES,
   isActiveName, isClosedName, isInProgressName, isCompleteName, isCanceledName, isStartName,
@@ -42,6 +42,7 @@ import {
   configureTaskEditModal, openTaskEditModal, closeTaskEditModal,
   requestCloseTaskEditModal, openTaskEditModalFromTerminal,
   registerTaskEditNavigation, syncTaskEditSessionButtons, replaceModalImageBlobUrl,
+  openTaskWorkspace, registerTaskWorkspaceOpener,
   // Builders shared with the New Task form (renderNewTaskForm / attachNewTaskFormHandlers).
   _renderDepChip, _statusOptionsHtml, _agentModelControlHtml, _applyModalAgentModelVisibility,
 } from './task-edit-modal.js';
@@ -49,6 +50,7 @@ import {
 export {
   openTaskEditModal, closeTaskEditModal, requestCloseTaskEditModal,
   openTaskEditModalFromTerminal, registerTaskEditNavigation,
+  openTaskWorkspace, registerTaskWorkspaceOpener,
 };
 
 const LEFT_NAV_COLLAPSED_CLASS = 'left-nav-collapsed';
@@ -2672,12 +2674,14 @@ function renderWatchdogActions(taskId) {
 // One row per running or lost terminal session in the left nav.
 // `sessions` entries: { taskId, agent, title, isOpen, needsAttention }. `collapsed` mirrors
 // document.body.classList.contains('left-nav-collapsed') — the row markup is identical either
-// way (CSS hides the key/title spans when collapsed, same pattern as .left-nav-label), but the
-// flag still drives the tooltip so an icon-only row stays identifiable on hover.
+// way (CSS hides the key/title spans when collapsed, same pattern as .left-nav-label). Every row
+// carries the full tooltip text in data-tooltip (TPT414) so an icon-only or ellipsized row stays
+// identifiable on hover.
 export function renderActiveSessionsList(sessions, collapsed) {
   const list = Array.isArray(sessions) ? sessions : [];
   if (list.length === 0) return '';
   return list.map((s) => {
+    if (s.chat) return renderChatSessionRow(s, collapsed);
     const key = escapeAttr(s.taskId);
     const title = escapeAttr(s.title || '');
     const done = isCompleteName(s.status); // (C1152) row styling + (C1157) check badge
@@ -2694,21 +2698,129 @@ export function renderActiveSessionsList(sessions, collapsed) {
     const tip = escapeAttr(s.lost ? t('nav.sessionLost', { label: base })
       : s.paused ? t('nav.sessionPaused', { label: base })
         : s.needsAttention ? t('nav.sessionNeedsAttention', { label: base }) : base);
-
     // (C1152) Close control — nested <span role="button"> since .active-session-item is
     // itself a <button> (nested <button> invalid HTML). Mirrors .chat-tab-close (chat-ui.js),
     // plus keyboard support that precedent lacks.
     const closeTip = escapeAttr(t(s.lost ? 'btn.close' : 'tooltip.terminateSession'));
+    // (TPT414) No native `title` on the close control — it would win under the pointer and
+    // replace the row's full-title tooltip; aria-label keeps it named for assistive tech.
     const closeBtn = s.paused ? renderWatchdogActions(key)
       : `<span class="active-session-close" role="button" tabindex="0" `
-        + `data-close-task-id="${key}" title="${closeTip}" aria-label="${closeTip}">&#x2715;</span>`;
-    return `<button type="button" class="${cls}" data-task-id="${key}" title="${tip}" aria-label="${tip}">`
+        + `data-close-task-id="${key}" aria-label="${closeTip}">&#x2715;</span>`;
+    // (TPT414) Full tooltip text travels as data-tooltip (rendered by the body-appended
+    // .active-session-tooltip, see ensureSessionTooltips()) instead of a native `title`, which
+    // has a ~1s delay and is reset by every rail repaint.
+    return `<button type="button" class="${cls}" data-task-id="${key}" data-tooltip="${tip}" aria-label="${tip}">`
       + `<span class="active-session-icon">${_sessionAgentIcon(s.agent)}${done ? SESSION_DONE_BADGE : ''}</span>`
       + `<span class="active-session-key">${key}</span>`
       + `<span class="active-session-title">${title}</span>`
       + closeBtn
       + `</button>`;
   }).join('');
+}
+
+// (TPT469) A started project chat: the chat glyph and its summary title (no task key), opened
+// with a click and ended with the trailing ✕. Drafts — chats with no user message yet — never
+// reach this list; syncActiveSessionsNav() keeps only titled chats.
+function renderChatSessionRow(s, collapsed) {
+  const id = escapeAttr(s.taskId);
+  const title = escapeAttr(s.title);
+  const cls = 'active-session-item active-session-item--chat'
+    + (s.isOpen ? ' active' : '')
+    + (collapsed ? ' collapsed' : '');
+  const end = escapeAttr(t('taskChat.nav.end'));
+  return `<button type="button" class="${cls}" data-chat-id="${id}" data-tooltip="${title}" aria-label="${title}">`
+    + `<span class="active-session-icon">${CHAT_BUBBLE_SVG}</span>`
+    + `<span class="active-session-title">${title}</span>`
+    + `<span class="active-session-close" role="button" tabindex="0" data-close-chat-id="${id}" aria-label="${end}">&#x2715;</span>`
+    + `</button>`;
+}
+
+// Started project chats of this window's project, oldest first. GET /api/sessions is already
+// project-scoped and ships each chat's title in sessionMeta; an untitled chat is a draft.
+function projectChatRows(openChatId) {
+  return [...state.sessionMeta.entries()]
+    .filter(([id, meta]) => /^projectChat:/.test(id) && meta?.type === 'taskChat' && meta?.title)
+    .sort((a, b) => (a[1].startedAt || 0) - (b[1].startedAt || 0) || a[0].localeCompare(b[0]))
+    .map(([id, meta]) => ({ chat: true, taskId: id, title: meta.title, isOpen: id === openChatId }));
+}
+
+// ── Session row tooltip (TPT414) ──
+// A row's identity: the task key of a terminal row, the session id of a chat row (TPT469).
+function sessionRowId(row) {
+  return row.dataset.taskId || row.dataset.chatId || '';
+}
+
+// Body-appended `position: fixed` tooltip (same pattern as task-card.js's C1568 button tip):
+// a ::after inside the rail would be clipped by #left-nav-panel / .left-nav-main overflow.
+// Listeners are bound once on the stable list host so they survive innerHTML repaints.
+let _sessTip = null;
+let _sessTipTimer = null;
+let _sessTipRowId = null;
+let _sessTipBound = false;
+const SESSION_TIP_DELAY_MS = 150;
+
+function hideSessionTip() {
+  clearTimeout(_sessTipTimer);
+  _sessTipTimer = null;
+  _sessTipRowId = null;
+  if (_sessTip) { _sessTip.remove(); _sessTip = null; }
+}
+
+function showSessionTip(row) {
+  const text = row.getAttribute('data-tooltip');
+  if (!text) return;
+  if (_sessTip) { _sessTip.remove(); _sessTip = null; }
+  const tip = document.createElement('div');
+  tip.className = 'active-session-tooltip';
+  tip.textContent = text;
+  document.body.appendChild(tip);
+  const panel = document.getElementById('left-nav-panel');
+  const rowRect = row.getBoundingClientRect();
+  const left = (panel ? panel.getBoundingClientRect().right : rowRect.right) + 8;
+  const tipH = tip.getBoundingClientRect().height;
+  const vh = document.documentElement.clientHeight || window.innerHeight;
+  const top = Math.max(4, Math.min(rowRect.top + (rowRect.height - tipH) / 2, vh - tipH - 4));
+  tip.style.left = left + 'px';
+  tip.style.top = top + 'px';
+  _sessTip = tip;
+  _sessTipRowId = sessionRowId(row) || null;
+}
+
+function ensureSessionTooltips(host) {
+  if (_sessTipBound) return;
+  _sessTipBound = true;
+  const schedule = (row) => {
+    if (_sessTipRowId && _sessTipRowId === sessionRowId(row) && _sessTip) return;
+    hideSessionTip();
+    _sessTipTimer = setTimeout(() => showSessionTip(row), SESSION_TIP_DELAY_MS);
+  };
+  host.addEventListener('mouseover', (e) => {
+    const row = e.target.closest?.('.active-session-item');
+    if (row) schedule(row);
+  });
+  host.addEventListener('mouseout', (e) => {
+    const row = e.target.closest?.('.active-session-item');
+    if (row && !row.contains(e.relatedTarget)) hideSessionTip();
+  });
+  host.addEventListener('focusin', (e) => {
+    const row = e.target.closest?.('.active-session-item');
+    if (row) schedule(row);
+  });
+  host.addEventListener('focusout', hideSessionTip);
+  host.addEventListener('mousedown', hideSessionTip, true);
+  host.addEventListener('scroll', hideSessionTip);
+  window.addEventListener('scroll', hideSessionTip, true);
+}
+
+// After a repaint replaced the row nodes: keep the tip only if its row still exists and is
+// still under the pointer / focused; otherwise drop it so it never strands.
+function resyncSessionTip(host) {
+  if (!_sessTip) return;
+  const row = [...host.querySelectorAll('.active-session-item')]
+    .find((r) => sessionRowId(r) === _sessTipRowId);
+  if (row && (row.matches(':hover') || row.matches(':focus-within'))) showSessionTip(row);
+  else hideSessionTip();
 }
 
 // Builds the session row list from state, paints it into the left nav, and (re)wires clicks.
@@ -2749,6 +2861,7 @@ export function syncActiveSessionsNav() {
       paused: state.sessionMeta.get(id)?.paused || null,
       lost: state.lostSessions.has(id),
     }));
+  rows.push(...projectChatRows(window.TipTask?.taskChat?.currentChatId?.() || ''));
   const html = renderActiveSessionsList(rows, collapsed);
   host.hidden = rows.length === 0;
   const divider = document.getElementById('active-sessions-divider');
@@ -2760,7 +2873,38 @@ export function syncActiveSessionsNav() {
   if (host._sessionsHtml === html && host.children.length === rows.length) return;
   host._sessionsHtml = html;
   host.innerHTML = html;
-  host.querySelectorAll('.active-session-item').forEach((btn) => {
+  ensureSessionTooltips(host);
+  resyncSessionTip(host);
+  host.querySelectorAll('.active-session-item[data-chat-id]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      window.TipTask?.taskChat?.openProjectChat?.({ chatId: btn.dataset.chatId });
+    });
+  });
+  // (TPT469) Ending a chat drops its whole conversation, so it always asks first.
+  host.querySelectorAll('.active-session-close[data-close-chat-id]').forEach((x) => {
+    const end = async (e) => {
+      e.stopPropagation(); // never let the click reach the row → reopen
+      e.preventDefault();
+      if (x.dataset.busy) return;
+      x.dataset.busy = '1';
+      const id = x.dataset.closeChatId;
+      const title = state.sessionMeta.get(id)?.title || '';
+      const ok = await showActionConfirm({
+        message: escapeAttr(t('taskChat.nav.confirmEnd', { title })),
+        confirmLabel: t('taskChat.nav.end'),
+        danger: true,
+        overlayClass: 'modal-overlay--over-board',
+      });
+      if (!ok) { delete x.dataset.busy; return; }
+      terminateTaskSession(id, { timeoutMs: 5000 }).finally(() => {
+        forgetLocalSession(id);
+        updateClaudeButtons();
+      });
+    };
+    x.addEventListener('click', end);
+    x.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') end(e); });
+  });
+  host.querySelectorAll('.active-session-item[data-task-id]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const id = btn.dataset.taskId;
       const title = state.taskTitleById.get(id) || id;
@@ -6523,6 +6667,7 @@ export function handleVoiceModelMessage(msg) {
 // combination. Electron's renderer permission is always 'granted' (the main-process transport
 // bypasses it entirely); the only failure signal there is a captured notify:show IPC error.
 function _notifStatusKey(status) {
+  if (status.delivery === 'desktop') return status.lastError ? 'settings.notifStateBlocked' : 'settings.notifStateDesktop';
   if (status.transport === 'unsupported') return 'settings.notifStateUnsupported';
   if (status.transport === 'electron') return status.lastError ? 'settings.notifStateBlocked' : 'settings.notifStateNative';
   switch (status.permission) {
@@ -6618,6 +6763,7 @@ async function _populateSettingsNotificationsRows() {
         : (blocked ? t('settings.notifHintBlocked') : '');
     }
     hintEl.hidden = !blocked;
+    if (status.delivery === 'desktop' && status.lastError && hintTextEl) hintTextEl.textContent = t('settings.notifHintDesktopFailed');
     // (C1355) Repair button only makes sense when there's an actual duplicate-claimant conflict
     // to fix — for every other blocked reason (unsigned, seal-broken, denied, unsupported) it
     // would just fail with nothing to repair.
@@ -6632,7 +6778,7 @@ async function _populateSettingsNotificationsRows() {
   // the answer and needs no Settings row of its own since it just works everywhere.
   const styleHint = document.getElementById('settings-notifications-style-hint');
   if (styleHint) {
-    const isMac = window.electronAPI?.platform === 'darwin';
+    const isMac = window.electronAPI?.platform === 'darwin' && status.delivery !== 'desktop';
     styleHint.hidden = !isMac;
     if (isMac) {
       const textEl = document.getElementById('settings-notifications-style-text');

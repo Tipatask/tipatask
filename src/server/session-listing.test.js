@@ -12,7 +12,17 @@ process.env.TASK_BACKEND = 'api';
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { sessionListBucket } = require('./ws-handlers');
+const { sessionListBucket, replayExitedTerminal } = require('./ws-handlers');
+
+test('exited terminal replay sends saved xterm output and the original exit code', () => {
+  const frames = [];
+  const ws = { send: (data) => frames.push(JSON.parse(data)) };
+  replayExitedTerminal(ws, { tabId: 'TPT467', buffer: 'agent output\r\n', exitCode: 0 });
+  assert.deepEqual(frames.map(frame => frame.type), ['data', 'exit']);
+  assert.match(frames[0].data, /agent output\r\n$/);
+  assert.equal(frames[0].tabId, 'TPT467');
+  assert.equal(frames[1].code, 0);
+});
 
 test('sessionListBucket: alive session is active', () => {
   assert.equal(sessionListBucket({ alive: true, pending: false, _starting: false }), 'active');

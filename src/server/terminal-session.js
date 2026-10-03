@@ -1754,6 +1754,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     console.log(`[terminal:${agent.id}] Process exited for task ${taskId} (code ${exitCode})`);
     if (session._terminated) return;
     session.alive = false;
+    session.exitCode = exitCode;
     session.codexPlanReady = false;
     session.agentPlanReady = false;
     // (C1565) A dead pid can be recycled by the OS — the watchdog must never resume

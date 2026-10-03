@@ -46,11 +46,11 @@ test('pushNotification moves an upserted entry back to the top', () => {
   assert.deepEqual(entries.map((e) => e.tag), ['C1', 'C2']);
 });
 
-test('pushNotification evicts the oldest entry past the cap', () => {
+test('pushNotification retains every entry beyond five', () => {
   for (let i = 1; i <= 6; i++) pushNotification({ tag: `C${i}`, title: `Task ${i}` });
   const entries = getNotificationEntries();
-  assert.equal(entries.length, 5); // MAX_ENTRIES
-  assert.deepEqual(entries.map((e) => e.tag), ['C6', 'C5', 'C4', 'C3', 'C2']); // C1 evicted (oldest)
+  assert.equal(entries.length, 6);
+  assert.deepEqual(entries.map((e) => e.tag), ['C6', 'C5', 'C4', 'C3', 'C2', 'C1']);
 });
 
 test('dismissNotification removes only the matching tag', () => {
@@ -81,4 +81,37 @@ test('getNotificationEntries returns a copy, not the live internal array', () =>
   const entries = getNotificationEntries();
   entries.push({ tag: 'fake', title: 'injected' });
   assert.equal(getNotificationEntries().length, 1); // internal state unaffected by the mutation above
+});
+
+// Exercise actual event propagation: closing must not activate the card underneath.
+test('DOM click and close remove only their own cards, retaining sibling nodes', async () => {
+  const { Window } = await import('happy-dom');
+  const browser = new Window();
+  globalThis.document = browser.document;
+  globalThis.requestAnimationFrame = (cb) => cb();
+  try {
+    let clicked = 0;
+    let closed = 0;
+    pushNotification({ tag: 'a', title: '<b>plain text</b>', onClick: () => clicked++ });
+    pushNotification({ tag: 'b', onClick: () => clicked++, onDismiss: () => closed++ });
+    pushNotification({ tag: 'c', onClick: () => { clicked++; pushNotification({ tag: 'c', title: 'new event' }); } });
+    const first = document.querySelector('[data-tag="a"]');
+    document.querySelector('[data-tag="b"] .tt-notif-card-close').click();
+    assert.equal(clicked, 0);
+    assert.equal(closed, 1);
+    assert.deepEqual(getNotificationEntries().map(e => e.tag), ['c', 'a']);
+    document.querySelector('[data-tag="c"]').click();
+    assert.equal(clicked, 1);
+    assert.equal(getNotificationEntries()[0].title, 'new event');
+    assert.equal(document.querySelector('[data-tag="a"]'), first);
+    assert.equal(first.querySelector('b'), null);
+    first.dispatchEvent(new browser.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    assert.equal(clicked, 2);
+    assert.deepEqual(getNotificationEntries().map(e => e.tag), ['c']);
+  } finally {
+    clearAllNotifications();
+    delete globalThis.document;
+    delete globalThis.requestAnimationFrame;
+    browser.happyDOM.abort();
+  }
 });

@@ -244,7 +244,8 @@ test('task edit modal: every read-only lock goes through _isModalReadOnly(); Sta
   const direct = code.match(/commands\.isTaskReadOnly\(/g) || [];
   assert.equal(direct.length, 2, 'only _isModalReadOnly() and the banner cause check may call isTaskReadOnly() directly');
   assert.ok((code.match(/_isModalReadOnly\(/g) || []).length >= 7, 'render, _applyModalLockState x3, desc click guard and member combo all use it');
-  assert.match(code, /function _isModalReadOnly\(draft\)\s*\{\s*return commands\.isTaskReadOnly\(draft\) \|\| !!_modalState\?\.callbacks\?\.readOnly;/);
+  // (TPT466) A discuss-locked task opened on its terminal/chat pane is read-only on Edit too.
+  assert.match(code, /function _isModalReadOnly\(draft\)\s*\{\s*return commands\.isTaskReadOnly\(draft\) \|\| !!_modalState\?\.callbacks\?\.readOnly \|\| !!_modalState\?\.discussLocked;/);
   assert.match(code, /const showStart = !isPreviewTask && !readOnly && /);
   assert.match(code, /modal\.readOnlyDiscuss/);
 });

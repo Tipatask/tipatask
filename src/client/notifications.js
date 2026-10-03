@@ -1,3 +1,5 @@
+import { getLocale } from './i18n.js';
+
 const _lastNotifiedAt = new Map();
 const DEBOUNCE_MS = 30000;
 // (C1138) Web Notification API replaces an on-screen banner whenever a new one shares the same
@@ -7,11 +9,20 @@ const DEBOUNCE_MS = 30000;
 // replacement; `_lastNotifiedAt`/`_clickHandlers` stay keyed on the real (unsuffixed) tag below,
 // since debounce/click-routing must still dedupe/route by task, not by individual banner.
 let _notifySeq = 0;
+const _notificationSession = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const _desktopDelivery = () => typeof window !== 'undefined' && window.electronAPI?.notificationDelivery === 'desktop';
 // (C1057) tag -> onClick, main-process transport only — Electron's Notification has no
 // `onclick`/`tag` of its own, so the click bridge (notify:clicked IPC) needs somewhere to
 // look the callback up by the tag we sent it.
 const _clickHandlers = new Map();
 let _bridgeInstalled = false;
+
+// Every category supplies its destination through onClick. Completion provides the terminal
+// action; attention, activity, objective, and test banners retain their own destinations.
+function _dispatchNotificationClick(onClick, focusWindow = false) {
+  if (focusWindow) { try { window.focus(); } catch (_) {} }
+  if (typeof onClick === 'function') { try { onClick(); } catch (_) {} }
+}
 
 // (C1058) Per-category user preference — terminal-prompt and Objective-Chat-completion
 // notifications are gated independently, since a user may want one without the other.
@@ -151,6 +162,10 @@ export function getNotificationStatus() {
   // register the app with Notification Center. (C1318) `_ncRegistered === false` is the same
   // fatal outcome by direct observation rather than inferred cause — folded in at the same
   // rank, but only once signed/valid aren't already explaining it (see lastError below).
+  if (_desktopDelivery()) return { transport: 'electron', delivery: 'desktop', permission: 'granted',
+    canDeliver: !_lastTransportError, lastError: _lastTransportError,
+    enabled: Object.fromEntries(Object.keys(NOTIFY_PREF_KEYS).map((key) => [key, isNotifyEnabled(key)])),
+    conflicts: null, installerVolumes: [] };
   const signatureBroken = _bundleSignature.signed === false || _bundleSignature.valid === false;
   const notRegistered = _ncRegistered === false;
   const canDeliver = electron ? (!_lastTransportError && !signatureBroken && !notRegistered) : permission === 'granted';
@@ -260,10 +275,12 @@ export function notify(title, body, tag, options = {}) {
     _lastNotifiedAt.set(tag, Date.now());
   }
   if (send) {
+    const notificationId = _desktopDelivery() ? `${_notificationSession}-${++_notifySeq}` : null;
+    const handlerKey = notificationId || tag;
     if (!_bridgeInstalled) {
       _bridgeInstalled = true;
       window.electronAPI.onNotificationClick((payload = {}) => {
-        const { tag: clickedTag, projectPath } = payload || {};
+        const { tag: clickedTag, notificationId: clickedId, projectPath } = payload || {};
         // (C1069) Payload names the project that RAISED the notif. A mismatch means this
         // renderer got reloaded into a different project since the banner went up (e.g.
         // project:open target:'current') — acting on it would open a terminal on the wrong
@@ -272,11 +289,16 @@ export function notify(title, body, tag, options = {}) {
         let mine = null;
         try { mine = window.electronAPI.getProjectPath?.() ?? null; } catch (_) { mine = null; }
         if (projectPath && mine && projectPath !== mine) return;
-        const cb = clickedTag && _clickHandlers.get(clickedTag);
-        if (cb) { try { cb(); } catch (_) {} }
+        const key = clickedId || clickedTag;
+        const cb = key && _clickHandlers.get(key);
+        if (clickedId) _clickHandlers.delete(clickedId);
+        _dispatchNotificationClick(cb);
+      });
+      window.electronAPI.onNotificationDismiss?.(({ notificationId: id } = {}) => {
+        if (id) _clickHandlers.delete(id);
       });
     }
-    if (tag && options.onClick) _clickHandlers.set(tag, options.onClick);
+    if (handlerKey && options.onClick) _clickHandlers.set(handlerKey, options.onClick);
     // (C1125) A send the OS drops must not stay "handed to a transport" forever from the
     // caller's point of view: re-arm the tag's debounce so a retry isn't blocked for 30s, and
     // tell any registered failure listener (attention-notifications.js un-records its
@@ -284,6 +306,7 @@ export function notify(title, body, tag, options = {}) {
     // silenced indefinitely by a send nobody ever saw.
     const onFailed = (reason) => {
       _lastTransportError = reason || 'failed';
+      if (notificationId) _clickHandlers.delete(notificationId);
       if (tag) {
         _lastNotifiedAt.delete(tag);
         for (const cb of _failureListeners) { try { cb(tag); } catch (_) {} }
@@ -293,7 +316,7 @@ export function notify(title, body, tag, options = {}) {
       // (C1058) Capture the IPC result instead of dropping it — it's how a Notification.
       // isSupported() === false failure on this OS reaches getNotificationStatus().lastError
       // rather than vanishing silently.
-      Promise.resolve(send({ title, body, tag, taskId: tag }))
+      Promise.resolve(send({ title, body, tag, taskId: tag, ...(notificationId ? { notificationId, category: options.category, locale: getLocale() } : {}) }))
         .then((result) => {
           // (C1141) This IPC result was never logged before — the single most useful line
           // missing when diagnosing a banner that never appeared (was it ok:true and macOS
@@ -310,10 +333,7 @@ export function notify(title, body, tag, options = {}) {
     // (C1138) Suffixed tag so a second banner for the same task (changed promptText re-notify,
     // debounce already cleared) doesn't silently replace the first on screen — see module note.
     const n = new Notification(title, { body, tag: tag ? `${tag}-${++_notifySeq}` : undefined, requireInteraction: true });
-    n.onclick = () => {
-      try { window.focus(); } catch (_) {}
-      try { options.onClick && options.onClick(); } catch (_) {}
-    };
+    n.onclick = () => _dispatchNotificationClick(options.onClick, true);
   } catch (_) { return false; }
   return true;
 }
@@ -350,7 +370,7 @@ export async function sendTestNotification(title, body) {
   // reason. main.js's own notify:status re-verifies on the same call (TTL'd there too).
   await refreshNotificationStatus();
   try {
-    const result = await send({ title, body, tag: TEST_TAG, taskId: TEST_TAG });
+    const result = await send({ title, body, tag: TEST_TAG, taskId: TEST_TAG, ...(_desktopDelivery() ? { notificationId: `${_notificationSession}-${++_notifySeq}`, locale: getLocale() } : {}) });
     _lastTransportError = (result && result.ok === false) ? (result.reason || 'failed') : null;
     return (result && result.ok === false) ? { ok: false, reason: result.reason || 'failed' } : { ok: true };
   } catch (err) {

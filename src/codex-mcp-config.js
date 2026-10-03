@@ -770,6 +770,9 @@ function buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath } = {}
   const resolvedProjectRoot = path.resolve(projectRoot);
   // Server root = the checkout that ships the MCP server (src/mcp/server.js → up 2 dirs).
   const computedServerRoot = path.resolve(path.dirname(resolvedMcpServerPath), '../..');
+  // The account token is shared by projects on one API server. A shell-launched Codex
+  // does not inherit Electron's userData path, so the local MCP needs it explicitly.
+  const userDataRoot = path.resolve(process.env.TIPATASK_USER_DATA || computedServerRoot);
 
   // ── Packaged-asar branch ───────────────────────────────────────────────────
   // When the MCP server path is inside an .asar archive, plain-node / shell wrappers
@@ -784,7 +787,7 @@ function buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath } = {}
         `[${sectionName}]`,
         `command = ${tomlString(process.execPath)}`,
         `args = [${tomlString(resolvedMcpServerPath)}]`,
-        `env = { ELECTRON_RUN_AS_NODE = "1", TIPATASK_PROJECT_ROOT = ${tomlString(resolvedProjectRoot)}, TIPATASK_SERVER_ROOT = ${tomlString(computedServerRoot)}, TIPATASK_MCP_LOCAL_ONLY = "1" }`,
+        `env = { ELECTRON_RUN_AS_NODE = "1", TIPATASK_PROJECT_ROOT = ${tomlString(resolvedProjectRoot)}, TIPATASK_SERVER_ROOT = ${tomlString(computedServerRoot)}, TIPATASK_USER_DATA = ${tomlString(userDataRoot)}, TIPATASK_MCP_LOCAL_ONLY = "1" }`,
         `default_tools_approval_mode = ${tomlString(CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE)}`,
         '',
       ],
@@ -805,7 +808,7 @@ function buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath } = {}
       `[${sectionName}]`,
       `command = ${tomlString(command)}`,
       `args = [${tomlString(resolvedMcpServerPath)}]`,
-      `env = { NODE_COMPILE_CACHE = ${tomlString(compileCacheDir)}, TIPATASK_PROJECT_ROOT = ${tomlString(resolvedProjectRoot)}, TIPATASK_SERVER_ROOT = ${tomlString(computedServerRoot)}, TIPATASK_MCP_LOCAL_ONLY = "1" }`,
+      `env = { NODE_COMPILE_CACHE = ${tomlString(compileCacheDir)}, TIPATASK_PROJECT_ROOT = ${tomlString(resolvedProjectRoot)}, TIPATASK_SERVER_ROOT = ${tomlString(computedServerRoot)}, TIPATASK_USER_DATA = ${tomlString(userDataRoot)}, TIPATASK_MCP_LOCAL_ONLY = "1" }`,
       `default_tools_approval_mode = ${tomlString(CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE)}`,
       '',
     ],

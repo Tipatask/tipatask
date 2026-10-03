@@ -112,7 +112,8 @@ export function resolveVoiceTarget() {
     const wrap = active.closest && active.closest('.audio-rec-wrap');
     if (wrap && wrap.__voiceRecorder) return wrap.__voiceRecorder;
   }
-  const terminalOverlay = document.querySelector('.terminal-overlay');
+  // (TPT466) A task terminal in its workspace pane is a .terminal-embed; only a visible one counts.
+  const terminalOverlay = document.querySelector('.terminal-overlay, .task-modal-pane--terminal:not([hidden]) .terminal-embed');
   if (terminalOverlay && terminalOverlay.__voiceRecorder) return terminalOverlay.__voiceRecorder;
   for (const id of ['chat-input', 'new-task-title', 'new-task-desc']) {
     const el = document.getElementById(id);

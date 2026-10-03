@@ -38,7 +38,7 @@ export function isAttentionRaised(taskId) {
 // `attention-cleared` broadcast is trustworthy enough to actually clear the flag (see
 // attention-ws.js#handleAttentionMessage).
 export function isTerminalOpenFor(taskId) {
-  return !!taskId && state.activeTerminal?.taskId === taskId;
+  return !!taskId && state.activeTerminal?.taskId === taskId && state.activeTerminal.visible !== false;
 }
 
 // Class-list fragment for renderCard()'s template string — same precedent as the existing

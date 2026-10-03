@@ -31,7 +31,12 @@ function setup(t) {
       frames.clear();
       batch.forEach(fn => fn());
     },
-    scroll(position) { buffer.viewportY = position; viewport.dispatchEvent(new Event('scroll')); },
+    scroll(position) {
+      element.dispatchEvent(new Event('pointerdown'));
+      buffer.viewportY = position;
+      viewport.dispatchEvent(new Event('scroll'));
+      element.dispatchEvent(new Event('pointerup'));
+    },
   };
 }
 
@@ -114,6 +119,72 @@ test('manual scrolling cancels the final burst frame', t => {
   h.scroll(50);
   h.frame();
   assert.equal(h.buffer.viewportY, 50);
+});
+
+test('renderer scroll events during parsing and layout keep the pre-write follow decision', t => {
+  const h = setup(t);
+  h.writer.write('redraw');
+  h.buffer.baseY = 400;
+  h.buffer.viewportY = 120;
+  h.viewport.dispatchEvent(new Event('scroll'));
+  h.parse(400, 120);
+  assert.equal(h.buffer.viewportY, 400);
+  h.buffer.viewportY = 180;
+  h.viewport.dispatchEvent(new Event('scroll'));
+  h.frame();
+  assert.equal(h.buffer.viewportY, 400);
+  h.buffer.viewportY = 200;
+  h.viewport.dispatchEvent(new Event('scroll'));
+  h.frame();
+  assert.equal(h.buffer.viewportY, 400);
+});
+
+test('refit captures the tail before reflow and preserves it through queued redraws', t => {
+  const h = setup(t);
+  h.writer.refresh(() => {
+    h.buffer.baseY = 200;
+    h.buffer.viewportY = 80;
+  });
+  assert.equal(h.buffer.viewportY, 200);
+  h.writer.write('resize redraw');
+  h.buffer.viewportY = 90;
+  h.writer.refresh(() => { h.buffer.baseY = 250; });
+  h.parse(400, 90);
+  h.frame();
+  h.frame();
+  assert.equal(h.buffer.viewportY, 400);
+});
+
+test('refit never follows a scrolled-up reader or a gesture during settling', t => {
+  const h = setup(t);
+  h.scroll(40);
+  h.writer.refresh(() => { h.buffer.baseY = 150; });
+  h.frame();
+  h.frame();
+  assert.equal(h.buffer.viewportY, 40);
+  assert.equal(h.term.scrolls, 0);
+  h.scroll(150);
+  h.writer.refresh(() => { h.buffer.baseY = 200; });
+  h.frame();
+  h.scroll(50);
+  h.frame();
+  assert.equal(h.buffer.viewportY, 50);
+});
+
+test('held selection cancels following when it starts scrolling during a burst', t => {
+  const h = setup(t);
+  h.term.element.dispatchEvent(new Event('pointerdown'));
+  h.writer.write('one');
+  h.writer.write('two');
+  h.parse(200, 100);
+  h.frame();
+  h.frame();
+  h.buffer.viewportY = 40;
+  h.viewport.dispatchEvent(new Event('scroll'));
+  h.parse(300, 40);
+  h.term.element.dispatchEvent(new Event('pointerup'));
+  h.frame();
+  assert.equal(h.buffer.viewportY, 40);
 });
 
 test('disposal cancels pending writes, input frames and final follow frames', t => {

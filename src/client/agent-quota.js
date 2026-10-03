@@ -107,6 +107,19 @@ function resetLabel(value) {
     : t('quota.resetUnknown');
 }
 
+const MINUTE_MS = 60000;
+
+// Time until a window resets: whole days, else whole hours, else whole minutes (an expired or
+// sub-minute reset clamps to 0m). null when the reset time is missing or unparseable.
+export function formatQuotaResetRemaining(resetAt, now = Date.now()) {
+  const time = typeof resetAt === 'string' && resetAt ? new Date(resetAt).getTime() : NaN;
+  if (!Number.isFinite(time)) return null;
+  const minutes = Math.floor(Math.max(0, time - now) / MINUTE_MS);
+  if (minutes >= 1440) return t('agentQuotaSidebar.remaining.days', { n: Math.floor(minutes / 1440) });
+  if (minutes >= 60) return t('agentQuotaSidebar.remaining.hours', { n: Math.floor(minutes / 60) });
+  return t('agentQuotaSidebar.remaining.minutes', { n: minutes });
+}
+
 // One thin bar per usage window, always in the provider colour. The caption (label left,
 // percent right) lives INSIDE the bar and only shows while that bar is hovered/focused — the
 // bar grows over its own row spacing, so nothing else moves. It is drawn twice: a base layer
@@ -117,7 +130,7 @@ function resetLabel(value) {
 // emptyRow), a known value (`--known`: provider-tinted track, fill only when usage > 0 — so a true
 // 0% is an empty tinted track, never confused with "nothing loaded yet"), unavailable (dashed
 // outline) and a failed read (renderAgentQuotaSidebarBody's inert dashed row).
-function renderRow(provider, agent, window, unavailable, hint) {
+function renderRow(provider, agent, window, unavailable, hint, now) {
   const state = !window || unavailable ? 'unavailable' : quotaUsageState(window.usagePercent);
   const known = state !== 'unavailable';
   const label = windowCaption(provider, window);
@@ -128,7 +141,10 @@ function renderRow(provider, agent, window, unavailable, hint) {
   const tip = [`${PROVIDER_NAMES[provider]}${agent?.plan ? ` · ${agent.plan}` : ''}`, known ? resetLabel(window.resetAt) : hint].filter(Boolean).join('\n');
   // Near-limit / exhausted are deliberately not colours — only announced to assistive tech.
   const valueText = known && state !== 'normal' ? `${used} · ${t(`quota.state.${state}`)}` : used;
-  const text = `<span>${escapeAttr(label)}</span><strong>${known ? escapeAttr(`${percent}%`) : '—'}</strong>`;
+  const remaining = known ? formatQuotaResetRemaining(window.resetAt, now) : null;
+  // The countdown span carries its reset time so the minute tick can refresh it in place.
+  const countdown = remaining == null ? '' : `<span class="agent-quota-sidebar-reset" data-reset-at="${escapeAttr(window.resetAt)}"> (${escapeAttr(remaining)})</span>`;
+  const text = `<span>${escapeAttr(label)}</span><strong>${known ? `${escapeAttr(`${percent}%`)}${countdown}` : '—'}</strong>`;
   const semantics = known
     ? `role="progressbar" aria-label="${escapeAttr(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${width}" aria-valuetext="${escapeAttr(valueText)}"`
     : `role="img" aria-label="${escapeAttr(`${label}: ${used}`)}"`;
@@ -137,7 +153,7 @@ function renderRow(provider, agent, window, unavailable, hint) {
   </div>`;
 }
 
-function renderProvider(provider, agent) {
+function renderProvider(provider, agent, now) {
   const name = PROVIDER_NAMES[provider];
   const connection = CONNECTIONS.has(agent?.connectionState) ? agent.connectionState : 'unknown';
   const windows = Array.isArray(agent?.windows) ? agent.windows.filter(w => w && typeof w === 'object') : [];
@@ -145,7 +161,7 @@ function renderProvider(provider, agent) {
   const reason = REASONS.has(agent?.unavailableReason) ? agent.unavailableReason : 'quota_unavailable';
   const partial = unavailable || !windows.length || windows.some(w => quotaUsageState(w.usagePercent) === 'unavailable');
   const hint = partial ? t(`quota.reason.${reason}`, { provider: name }) : '';
-  const rows = (windows.length ? windows : [null]).map(window => renderRow(provider, agent, window, unavailable, hint)).join('');
+  const rows = (windows.length ? windows : [null]).map(window => renderRow(provider, agent, window, unavailable, hint, now)).join('');
   return `<div class="agent-quota-sidebar-group" role="group" aria-label="${name}">${rows}</div>`;
 }
 
@@ -162,7 +178,7 @@ function renderPlaceholder() {
 }
 
 // Pure: `result` is a createQuotaLoader().read() result. `null` = nothing loaded yet.
-export function renderAgentQuotaSidebarBody(result) {
+export function renderAgentQuotaSidebarBody(result, now = Date.now()) {
   if (!result) return renderPlaceholder();
   if (result.error) {
     // Never keep the previous values on screen next to a failure.
@@ -172,7 +188,7 @@ export function renderAgentQuotaSidebarBody(result) {
     </div>`;
   }
   const agents = result.data?.agents || {};
-  return PROVIDERS.map(provider => renderProvider(provider, agents[provider])).join('');
+  return PROVIDERS.map(provider => renderProvider(provider, agents[provider], now)).join('');
 }
 
 // Left-nav plan-usage block lifecycle. Requests happen ONLY from mount() (startup), from a
@@ -196,6 +212,7 @@ export function createAgentQuotaSidebar(root, opts = {}) {
   let view = null;
   let checkedAt = null;
   let loadedTimer = null;
+  let tickTimer = null;
   let renderedLocale = null;
   let mounted = false;
   let disposed = false;
@@ -209,8 +226,32 @@ export function createAgentQuotaSidebar(root, opts = {}) {
     if (els.status) els.status.textContent = loading ? t('agentQuotaSidebar.loading') : loaded ? t('agentQuotaSidebar.loaded') : '';
   }
 
+  function stopTick() {
+    clearTimer(tickTimer);
+    tickTimer = null;
+  }
+
+  // Local-only refresh of the "(1d)" countdowns, aligned to the wall-clock minute. It edits the
+  // spans in place — never innerHTML — so a hovered/focused row keeps its state and the fill's
+  // entry animation does not replay. It never fetches.
+  function scheduleTick() {
+    stopTick();
+    if (disposed || !view || view.error || !els.body?.innerHTML.includes('agent-quota-sidebar-reset')) return;
+    tickTimer = setTimer(() => {
+      tickTimer = null;
+      if (disposed) return;
+      const current = now();
+      for (const el of els.body?.querySelectorAll?.('.agent-quota-sidebar-reset') || []) {
+        const remaining = formatQuotaResetRemaining(el.getAttribute('data-reset-at'), current);
+        if (remaining != null) el.textContent = ` (${remaining})`;
+      }
+      scheduleTick();
+    }, MINUTE_MS - (now() % MINUTE_MS));
+  }
+
   function paintBody() {
-    if (els.body) els.body.innerHTML = renderAgentQuotaSidebarBody(view);
+    if (els.body) els.body.innerHTML = renderAgentQuotaSidebarBody(view, now());
+    scheduleTick();
   }
 
   // The refresh control's tooltip / accessible name also carries when the numbers were read.
@@ -298,6 +339,7 @@ export function createAgentQuotaSidebar(root, opts = {}) {
     loader.invalidate();
     clearTimer(loadedTimer);
     loadedTimer = null;
+    stopTick();
   }
 
   return { root, mount, refresh, reset, syncLocale, dispose };

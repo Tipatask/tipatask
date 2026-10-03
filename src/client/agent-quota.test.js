@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import {
-  createQuotaLoader, quotaUsageState, renderAgentQuotaSidebarBody, createAgentQuotaSidebar,
+  createQuotaLoader, quotaUsageState, renderAgentQuotaSidebarBody, formatQuotaResetRemaining, createAgentQuotaSidebar,
   initializeAgentQuotaSidebar, refreshAgentQuota, resetAgentQuota, syncAgentQuotaSidebarLocale,
 } from './agent-quota.js';
 import { setLocale } from './i18n.js';
@@ -12,7 +12,7 @@ const payload = (root, usage = 30) => ({ projectRoot: root, agents: Object.fromE
   windows: [{ id: provider === 'claude' ? 'five_hour' : 'codex_primary', usagePercent: usage, resetAt: null, windowMinutes: 300 }],
 }])) });
 // Caption of every drawn bar, in order (the first text layer of each row).
-const captions = html => [...html.matchAll(/<span class="agent-quota-sidebar-text"><span>([^<]*)<\/span><strong>([^<]*)<\/strong>/g)].map(m => `${m[1]} | ${m[2]}`);
+const captions = html => [...html.matchAll(/<span class="agent-quota-sidebar-text"><span>([^<]*)<\/span><strong>(.*?)<\/strong>/g)].map(m => `${m[1]} | ${m[2].replace(/<[^>]*>/g, '')}`);
 const agentWith = (provider, windows, extra = {}) => ({ provider, projectRoot: '/A', connectionState: 'connected', plan: 'max', status: 'available', windows, ...extra });
 const response = data => ({ ok: true, json: async () => data });
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -22,7 +22,13 @@ const read = name => readFileSync(new URL(name, import.meta.url), 'utf8');
 function harness() {
   const classes = new Set(['agent-quota-sidebar', 'agent-quota-sidebar--loading']);
   const attrs = new Map();
-  const body = { innerHTML: '' };
+  const spans = [];
+  const body = {
+    innerHTML: '',
+    querySelectorAll: () => [...(body.innerHTML.matchAll(/data-reset-at="([^"]*)"/g))].map((m, i) => spans[i] ||= {
+      textContent: '', getAttribute: () => m[1],
+    }),
+  };
   const status = { textContent: '' };
   const title = { textContent: '' };
   const button = {
@@ -282,8 +288,8 @@ test('a loaded 0% is a known, tinted, empty track — distinct from loading, una
     ]),
     codex: agentWith('codex', [{ id: 'codex_primary', usagePercent: 5, resetAt: '2026-10-01T13:31:45.000Z', windowMinutes: 10080 }], { plan: 'prolite' }),
   } };
-  const loaded = renderAgentQuotaSidebarBody({ data });
-  assert.deepEqual(captions(loaded), ['Claude 5-hour | 0%', 'Claude 7-day | 0%', 'Fable 7-day | 0%', 'Codex 7-day | 5%']);
+  const loaded = renderAgentQuotaSidebarBody({ data }, Date.UTC(2026, 8, 24, 19, 0));
+  assert.deepEqual(captions(loaded), ['Claude 5-hour | 0% (1h)', 'Claude 7-day | 0% (6d)', 'Fable 7-day | 0% (6d)', 'Codex 7-day | 5% (6d)']);
   assert.equal((loaded.match(/role="progressbar"/g) || []).length, 4, 'zero is a real measurement, so it is a progressbar');
   assert.equal((loaded.match(/aria-valuenow="0"/g) || []).length, 3);
   assert.match(loaded, /aria-valuetext="0% used"/);
@@ -512,4 +518,111 @@ test('block CSS: hidden when collapsed/mobile, hover only ever grows the single 
   // Caption legibility: the base layer is clipped to the empty track, the ink copy to the fill.
   assert.match(block, /\.agent-quota-sidebar-text\s*\{[^}]*clip-path:\s*inset\(0 0 0 var\(--fill\)\)/);
   assert.match(block, /\.agent-quota-sidebar-text--fill\s*\{[^}]*clip-path:\s*inset\(0 calc\(100% - var\(--fill\)\) 0 0\)/);
+});
+
+const NOW = Date.UTC(2026, 9, 2, 12, 0, 0);
+const minute = 60000;
+
+test('formatQuotaResetRemaining: whole days, else hours, else minutes; expired clamps to 0m; bad input omitted (TPT455)', () => {
+  setLocale('en');
+  const at = ms => new Date(NOW + ms).toISOString();
+  const f = ms => formatQuotaResetRemaining(at(ms), NOW);
+  assert.equal(f(59000), '0m');
+  assert.equal(f(minute), '1m');
+  assert.equal(f(59 * minute + 59000), '59m');
+  assert.equal(f(60 * minute), '1h');
+  assert.equal(f(23 * 60 * minute + 59 * minute), '23h');
+  assert.equal(f(24 * 60 * minute), '1d');
+  assert.equal(f(6 * 1440 * minute + 23 * 60 * minute), '6d');
+  assert.equal(f(-5 * minute), '0m');
+  assert.equal(f(-9 * 1440 * minute), '0m');
+  for (const bad of [null, undefined, '', 'bad', 12345, {}]) assert.equal(formatQuotaResetRemaining(bad, NOW), null);
+  try {
+    setLocale('uk');
+    assert.equal(f(2 * 1440 * minute), '2 дн');
+    assert.equal(f(5 * 60 * minute), '5 год');
+    assert.equal(f(7 * minute), '7 хв');
+  } finally {
+    setLocale('en');
+  }
+});
+
+test('countdown renders after the percentage in both caption layers, only for a valid reset (TPT455)', () => {
+  setLocale('en');
+  const data = { projectRoot: '/A', agents: {
+    claude: agentWith('claude', [
+      { id: 'five_hour', usagePercent: 58, resetAt: new Date(NOW + 1440 * minute + 5000).toISOString(), windowMinutes: 300 },
+      { id: 'seven_day', usagePercent: 10, resetAt: 'bad', windowMinutes: 10080 },
+      { id: 'seven_day_sonnet', usagePercent: 10, resetAt: null, windowMinutes: 10080 },
+    ]),
+    codex: agentWith('codex', [{ id: 'codex_primary', usagePercent: 3, resetAt: new Date(NOW - minute).toISOString(), windowMinutes: 10080 }]),
+  } };
+  const html = renderAgentQuotaSidebarBody({ data }, NOW);
+  assert.deepEqual(captions(html), ['Claude 5-hour | 58% (1d)', 'Claude 7-day | 10%', 'Sonnet 7-day | 10%', 'Codex 7-day | 3% (0m)']);
+  assert.equal((html.match(/agent-quota-sidebar-reset/g) || []).length, 4, 'two layers x two rows with a reset');
+  assert.match(html, /58%<span class="agent-quota-sidebar-reset" data-reset-at="[^"]+"> \(1d\)<\/span>/);
+});
+
+test('countdown ticks locally each minute, never fetches, and stops with the view (TPT455)', async () => {
+  setLocale('en');
+  const h = harness();
+  let clock = Date.UTC(2026, 8, 23, 21, 40, 20);
+  const opts = { ...h.opts('/A'), now: () => clock };
+  const sidebar = createAgentQuotaSidebar(h.root, opts);
+  const withReset = (usage, ms) => ({ projectRoot: '/A', agents: {
+    claude: agentWith('claude', [{ id: 'five_hour', usagePercent: usage, resetAt: new Date(clock + ms).toISOString(), windowMinutes: 300 }]),
+    codex: agentWith('codex', []),
+  } });
+  sidebar.mount();
+  await h.settle(0, withReset(40, 61 * minute));
+  assert.match(captions(h.body.innerHTML)[0], /40% \(1h\)/);
+  const tick = () => h.timers.filter(t => !t.cleared && t.ms !== 1600);
+  const fire = timer => { timer.cleared = true; timer.fn(); };
+  assert.equal(tick().length, 1);
+  assert.equal(tick()[0].ms, minute - 20000, 'aligned to the wall-clock minute');
+
+  clock += minute - 20000 + 2 * minute; // 21:43:00 — reset is at 22:41:20 -> 58m left
+  fire(tick()[0]);
+  assert.equal(h.calls.length, 1, 'ticking never fetches');
+  const spans = h.body.querySelectorAll();
+  assert.equal(spans.length, 2, 'both caption layers updated in place');
+  assert.ok(spans.every(span => span.textContent === ' (58m)'), spans.map(span => span.textContent).join());
+  assert.equal(tick().length, 1, 'next tick scheduled');
+  assert.equal(tick()[0].ms, minute, 'already on the minute boundary');
+
+  // A failed read removes the countdowns and stops the timer.
+  h.button.click();
+  await h.fail(1);
+  assert.equal(tick().length, 0, 'tick timer stopped on failure');
+  h.button.click();
+  await h.settle(2, withReset(41, 5 * minute));
+  assert.equal(tick().length, 1, 'a recovered read restarts it');
+  sidebar.reset('/B');
+  assert.equal(tick().length, 0, 'project reset stops it until data returns');
+  sidebar.dispose();
+});
+
+test('light-theme caption ink: white on a deepened fill, dark themes untouched; AA in every light palette (TPT455)', () => {
+  const css = read('./styles.css');
+  assert.match(css, /\.agent-quota-sidebar-text--fill\s*\{\s*color:\s*#16160f/, 'dark-theme ink unchanged');
+  assert.match(css, /html:not\(\.theme-dark\) \.agent-quota-sidebar-text--fill\s*\{\s*color:\s*#fff/);
+  assert.match(css, /html:not\(\.theme-dark\) \.agent-quota-sidebar-row:is\(:hover, :focus-visible\) \.agent-quota-sidebar-fill\s*\{\s*background:\s*var\(--agent-quota-fill-deep\)/);
+  const lum = hex => {
+    const [r, g, b] = hex.match(/../g).map(c => { const v = parseInt(c, 16) / 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const ratio = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
+  const mix = (a, b, pct) => '' + [0, 2, 4].map(i => Math.round(parseInt(a.substr(i, 2), 16) * pct + parseInt(b.substr(i, 2), 16) * (1 - pct)).toString(16).padStart(2, '0')).join('');
+  const dark = new Set([...read('./task-board.js').match(/_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/)[1].matchAll(/'([^']+)'/g)].map(m => m[1]));
+  const palettes = [...css.matchAll(/^\s*\[data-theme="([^"]+)"\]\s*\{([^}]*)\}/gm)].filter(m => !dark.has(m[1]));
+  assert.ok(palettes.length >= 10, 'light palettes found');
+  for (const [, id, body] of palettes) {
+    const text = /--c-text:\s*#([0-9a-f]{6})/i.exec(body)[1];
+    const nav = /--c-nav-bg:\s*#([0-9a-f]{6})/i.exec(body)[1];
+    for (const brand of ['d97757', '10a37f']) {
+      assert.ok(ratio('ffffff', mix(brand, '000000', 0.7)) >= 4.5, `${id} ${brand} white on deep fill`);
+      const track = mix(brand, nav, 0.32);
+      assert.ok(ratio(text, track) >= 4.5, `${id} ${brand} text on track ${ratio(text, track).toFixed(2)}`);
+    }
+  }
 });

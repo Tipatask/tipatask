@@ -183,6 +183,56 @@ test('project reconnect restores its history and refuses another project identit
   assert.equal(h.named('dispatch.spawnTurn').length, 2, 'reconnect never starts another turn');
 });
 
+test('(TPT469) chats of one project are separate sessions; the first user message names each', async () => {
+  const h = harness();
+  const sessions = new Map();
+  const backend = projectBackend('2', 'Alpha');
+  const A = 'projectChat:2:aaaaaa1';
+  const B = 'projectChat:2:bbbbbb2';
+  const wsA = await connect(h, sessions, backend, A, '/proj/a');
+  await send(wsA, { type: 'start-project-chat' });
+  const wsB = await connect(h, sessions, backend, B, '/proj/a');
+  await send(wsB, { type: 'start-project-chat' });
+  const a = sessions.get(`${A}\0/proj/a`);
+  const b = sessions.get(`${B}\0/proj/a`);
+  assert.ok(a && b && a !== b);
+  assert.equal(a.chatProjectId, '2');
+  assert.equal(h.exports.sessionMetaRow(a).title, '', 'a started chat with only the seed turn is still a draft');
+  assert.equal(h.exports.sessionMetaRow(a).chatProjectId, '2');
+  await send(wsA, { type: 'task-chat-message', content: 'Which tasks block the release? Asking for the demo.' });
+  assert.equal(a.chatTitle, 'Which tasks block the release?');
+  assert.deepEqual(framesOf(wsA, 'project-chat-titled').map(f => f.title), ['Which tasks block the release?']);
+  assert.equal(h.exports.sessionMetaRow(a).title, 'Which tasks block the release?');
+  assert.equal(b.chatTitle, undefined, 'the other chat is untouched');
+  assert.equal(framesOf(wsB, 'project-chat-titled').length, 0);
+  await send(wsA, { type: 'task-chat-message', content: 'And the next one?' });
+  assert.equal(a.chatTitle, 'Which tasks block the release?', 'later messages keep the name');
+  assert.equal(framesOf(wsA, 'project-chat-titled').length, 1);
+  assert.equal(b.messages.some(m => /block the release/.test(m.content)), false, 'transcripts stay apart');
+  wsA.emit('close');
+  const back = await connect(h, sessions, backend, A, '/proj/a');
+  const reset = framesOf(back, 'chat-history-reset')[0];
+  assert.equal(reset.title, 'Which tasks block the release?');
+  assert.ok(reset.messages.some(m => m.content === 'And the next one?'));
+  const other = await connect(h, sessions, projectBackend('3', 'Beta'), A, '/proj/b');
+  assert.equal(other.closed, true, 'another project cannot open this chat');
+  assert.match(framesOf(other, 'error')[0].message, /does not match/);
+});
+
+test('(TPT469) terminate-on-connect ends a project chat and tells its window', async () => {
+  const h = harness();
+  const sessions = new Map();
+  const backend = projectBackend('2');
+  const id = 'projectChat:2:cccccc3';
+  const ws = await connect(h, sessions, backend, id, '/proj/a');
+  await send(ws, { type: 'start-project-chat' });
+  const killer = await connect(h, sessions, backend, id, '/proj/a', '&terminate=1');
+  assert.equal(sessions.has(`${id}\0/proj/a`), false);
+  assert.equal(framesOf(ws, 'chat-ended').length, 1);
+  assert.equal(framesOf(killer, 'session-ended')[0].taskId, id);
+  assert.equal(framesOf(killer, 'chat-history-reset').length, 0, 'the terminate socket never attaches');
+});
+
 test('project Start rejects settings returned for another project', async () => {
   const h = harness();
   const sessions = new Map();

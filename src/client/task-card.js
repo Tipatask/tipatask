@@ -25,7 +25,7 @@ import { collectFamilyIds } from './related-cards.js';
 import { HIDE_CLASS } from './sprint-tier-visibility.js';
 import { cardVariant, cardMaxWidthPx, estimateTextWidth, TITLE_CHAR_PX } from './card-width.js';
 import { hasUnmetDeps, unmetDependencyKeys } from './dependency-status.js';
-import { expandedCardMaxHeight, clampExpandedTop } from './card-placement.js';
+import { expandedCardMaxHeight, clampExpandedTop, resolveAnchorTop } from './card-placement.js';
 export { isDragStateStale, resolveDropTier, shouldDeferForDrag };
 export { hasUnmetDeps, unmetDependencyKeys };
 // (C1483) Shape check for "is this a real task key" (prefix+number or dashed epic form)
@@ -710,14 +710,20 @@ export function expandCard(card, mode = 'pinned') {
   // offsetHeight (already capped by max-height) means the overlay is never left hanging off
   // the bottom of the viewport; ResizeObserver callbacks run after layout and before paint,
   // so a correction never shows a frame offscreen.
-  const anchorTop = rect.top;
+  // (TPT472) Anchor rule: top/left come from the placeholder's LIVE rect on every run — it sits
+  // in the card's resting slot, so it follows both scroll and layout shifts above it (a card
+  // above dropping its peek controls, a late image). A top frozen at expand time only tracked
+  // scroll and left the overlay hanging ~56px below its slot. The body is observed too, so a
+  // shift above the slot re-runs placement even when the card itself doesn't resize.
   const scrollYAtExpand = window.scrollY;
   const placeExpanded = () => {
     if (!card.isConnected || !card.classList.contains('card-expanded')) return;
     const viewportHeight = window.innerHeight;
     card.style.maxHeight = expandedCardMaxHeight({ viewportHeight, isPreview: card.classList.contains('preview-card') }) + 'px';
+    const slot = placeholder.isConnected ? placeholder.getBoundingClientRect() : null;
+    if (slot) card.style.left = slot.left + 'px';
     const top = clampExpandedTop({
-      anchorTop: anchorTop - (window.scrollY - scrollYAtExpand),
+      anchorTop: resolveAnchorTop({ slotTop: slot?.top, expandTop: rect.top, scrollDelta: window.scrollY - scrollYAtExpand }),
       height: card.offsetHeight,
       viewportHeight,
     });
@@ -729,7 +735,10 @@ export function expandCard(card, mode = 'pinned') {
   window.addEventListener('scroll', placeExpanded, { passive: true });
   window.addEventListener('resize', placeExpanded);
   const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(placeExpanded) : null;
-  if (resizeObserver) resizeObserver.observe(card);
+  if (resizeObserver) {
+    resizeObserver.observe(card);
+    resizeObserver.observe(document.body);
+  }
   expandedPlacementTeardown = () => {
     window.removeEventListener('resize', placeExpanded);
     window.removeEventListener('scroll', placeExpanded);

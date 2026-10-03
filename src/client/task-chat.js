@@ -1,22 +1,28 @@
 // Task chat window — a conversation with an agent (Claude / Codex / Pi) about one task, or about
 // the selected project (no task). Server side: ws-handlers.js `taskChat:<taskKey>` /
-// `projectChat:<API_PROJECT_ID>` session (see tt-task-chat.md). The chat lives on the server
+// `projectChat:<API_PROJECT_ID>:<chatId>` session (see tt-task-chat.md). The chat lives on the server
 // until it is killed, so closing this window only detaches: reopening restores the transcript
 // from `chat-history-reset` and picks a running turn back up. A chat with no session yet waits
 // behind the start gate: nothing is sent to the server until the user picks a model and Starts.
+// (TPT466) A task's chat is shown on the Chat pane of its workspace modal (task-edit-modal.js),
+// mounted there through mount(); open() routes to that workspace. The project chat (left menu
+// "Start Chat") stays a window of its own.
 import { buildWsUrl, wsSend, WS_SEND_TYPES, WS_RECV_TYPES } from './ws-client.js';
 import { renderMarkdown, escapeAttr, autoGrowTextarea, projectHeader, showToast } from './utils.js';
-import { modelLabel } from './constants.js';
+import { modelLabel, CHAT_BUBBLE_SVG } from './constants.js';
 import state from './state.js';
-import { showActionConfirm } from './action-confirm.js';
 import { activateDialogFocus } from './dialog-focus.js';
 import { t, getLocale } from './i18n.js';
 import { renderCard } from './task-card.js';
 import { openTaskEditModal } from './task-edit-modal.js';
+import { attachImagePaste } from './task-board.js';
+import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu } from './embed-menu.js';
 import {
   taskChatProviders, pickSelection, buildModelOptionsHtml, stripAskUserFence,
   visibleHistory, upsertById, shortToolName, hasWidgets, collapseTaskEvents,
   dialogSubmission, localAnswer, answerSummary, dialogWidgetHtml, toolChipHtml,
+  splitAttachmentRefs, attachmentsHtml, userMessageHtml, stripPendingImageRefs,
+  dialogState, lastTurnMessage,
 } from './task-chat-model.js';
 
 const SESSION_PREFIX = 'taskChat:';
@@ -24,15 +30,18 @@ const PROJECT_SESSION_PREFIX = 'projectChat:';
 // Sticky model choice for this window. Deliberately not the objective chat's key: the two
 // chats offer different provider sets and a pick here must not move the planner's default.
 const MODEL_STORAGE_KEY = 'tipatask-task-chat-model';
+const DRAFT_STORAGE_PREFIX = 'tipatask-task-chat-draft:';
 const STICK_THRESHOLD_PX = 64;
 const FRESH_START_TIMEOUT_MS = 3000;
 
 const ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7z"/></svg>';
 const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
-const ICON_NEW = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>';
 const ICON_CLOSE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>';
 const ICON_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="m6 13 6 6 6-6"/></svg>';
-const ICON_CHAT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.6A8 8 0 1 1 21 12z"/><path d="M13 9v6M10 12h6"/></svg>';
+const ICON_CHAT = CHAT_BUBBLE_SVG;
+// (TPT469) A project holds several chats, `projectChat:<projectId>:<chatId>`. The bare
+// `projectChat:<projectId>` is a chat started before that, still reopened from the left menu.
+const PROJECT_CHAT_ID_RE = /^projectChat:([1-9]\d*)(?::[a-z0-9]{6,32})?$/;
 
 let ws = null;
 let chat = null;            // { kind: 'task'|'project', key, sessionId, title } — the open chat
@@ -60,18 +69,143 @@ let renderedLocale = '';     // locale the window's labels were last written in
 let pendingAnswer = null;   // { dialog, userMsg } — an answer sent, no frame of its turn back yet
 let widgetSeq = 0;
 const widgetSig = new WeakMap(); // widget element -> signature of the record it was built from
+let embedded = null;        // { host, onOpenTask, onClosed } while mounted in a workspace pane
+let uploadsPending = 0;     // attachments uploading into the composer; Send waits for them
+let uploadGen = 0;          // bumped per built window; a late upload callback of an old one is ignored
+// (TPT469) Per project, the chat Start Chat opens: kept until its first user message gives it a
+// title, so repeated clicks land on the same untouched draft instead of piling up new ones.
+// localStorage carries it across a renderer reload, together with that chat's composer text.
+const DRAFT_CHAT_STORAGE_PREFIX = 'tipatask-project-chat-draft:';
+const projectDraftChats = new Map();
+// Unsent composer text per project and chat. The map also keeps drafts available when browser
+// storage is blocked; localStorage carries them across a renderer reload.
+const composerDrafts = new Map();
 
 export async function open(taskId) {
   const key = String(taskId || '').trim();
   if (!key) return;
+  const openWorkspace = window.TipTask?.openTaskWorkspace;
+  if (typeof openWorkspace === 'function') return openWorkspace(key, { pane: 'chat' });
   openSeq++;
   openChat({ kind: 'task', key, sessionId: SESSION_PREFIX + key, title: '' });
 }
 
-// The chat about the project selected in this window, with no task. The id is read from this
+// (TPT466) The task's chat inside `host` — a workspace pane — rather than a window of its own.
+// The pane's modal owns the backdrop, focus layer, Escape and heading; this fills the rest.
+// The returned handle: show()/hide() for pane switches (transcript, scroll and typed text stay
+// as they are), dispose() to detach (the server chat keeps running), taskEdited(key) to tell
+// the agent about a save made in the Edit pane. `onOpenTask(key)` handles a task card click;
+// `onClosed()` fires if the chat closes on its own (another window took it over).
+export function mount(host, taskId, { onOpenTask, onClosed } = {}) {
+  const key = String(taskId || '').trim();
+  if (!host || !key) return null;
+  openSeq++;
+  openChat({ kind: 'task', key, sessionId: SESSION_PREFIX + key, title: '' }, { host, onOpenTask, onClosed });
+  const target = chat;
+  const live = () => chat === target && !!root;
+  return {
+    show({ focus = true } = {}) {
+      if (!live()) return;
+      growInput();
+      scrollToBottom(stickToBottom);
+      if (!focus) return;
+      if (awaitingStart) {
+        const go = root.querySelector('.task-chat-start-go');
+        if (go && !go.disabled) go.focus({ preventScroll: true });
+      } else {
+        focusComposer();
+      }
+    },
+    hide() {
+      if (live() && root.contains(document.activeElement)) document.activeElement.blur();
+    },
+    dispose() {
+      if (chat === target) close();
+    },
+    taskEdited(editedKey) {
+      if (live() && connected && ws) wsSend(ws, WS_SEND_TYPES.TASK_CHAT_TASK_EDITED, { taskKey: editedKey || key });
+    },
+  };
+}
+
+// The project id a project chat session id belongs to ('' for anything else).
+export function projectIdOfChat(id) {
+  const m = typeof id === 'string' ? PROJECT_CHAT_ID_RE.exec(id) : null;
+  return m ? m[1] : '';
+}
+
+// Session id of the chat window open right now ('' when none) — the left menu marks its row.
+export function currentChatId() {
+  return chat && root ? chat.sessionId : '';
+}
+
+function newProjectChatId(projectId) {
+  const rand = Math.random().toString(36).slice(2, 8).padEnd(6, '0');
+  return `${PROJECT_SESSION_PREFIX}${projectId}:${Date.now().toString(36)}${rand}`;
+}
+
+// Which chat Start Chat opens: the remembered draft while it is still untitled, else an untitled
+// chat of this project the server already holds (started in another window or before a reload),
+// else a new one. A titled chat is a conversation of its own and is only opened from its row.
+function pickProjectChatId(projectId) {
+  const meta = state.sessionMeta instanceof Map ? state.sessionMeta : new Map();
+  const untitled = id => !meta.get(id)?.title;
+  const remembered = readDraftChat(projectId);
+  if (remembered && untitled(remembered)) return remembered;
+  const serverDraft = [...meta.entries()]
+    .filter(([id, row]) => projectIdOfChat(id) === projectId && id !== PROJECT_SESSION_PREFIX + projectId && !row?.title)
+    .sort((a, b) => (b[1]?.startedAt || 0) - (a[1]?.startedAt || 0))[0];
+  const id = serverDraft ? serverDraft[0] : newProjectChatId(projectId);
+  writeDraftChat(projectId, id);
+  return id;
+}
+
+function draftChatKey(projectId) {
+  return DRAFT_CHAT_STORAGE_PREFIX + JSON.stringify([projectHeader()['x-tipatask-project'] || '', projectId]);
+}
+
+function readDraftChat(projectId) {
+  const key = draftChatKey(projectId);
+  if (projectDraftChats.has(key)) return projectDraftChats.get(key);
+  let id = '';
+  try { id = localStorage.getItem(key) || ''; } catch { /* storage unavailable */ }
+  return projectIdOfChat(id) === projectId ? id : '';
+}
+
+function writeDraftChat(projectId, id) {
+  const key = draftChatKey(projectId);
+  projectDraftChats.set(key, id);
+  try { localStorage.setItem(key, id); } catch { /* storage unavailable */ }
+}
+
+// The chat is named: Start Chat must open a new draft from now on.
+function forgetDraftChat(projectId, id) {
+  if (readDraftChat(projectId) !== id) return;
+  const key = draftChatKey(projectId);
+  projectDraftChats.delete(key);
+  try { localStorage.removeItem(key); } catch { /* storage unavailable */ }
+}
+
+// Repaint the left menu's session rows; `refetch` first reloads GET /api/sessions.
+function refreshSessionsNav(refetch = false) {
+  const repaint = () => window.TipTask?.taskBoard?.updateClaudeButtons?.();
+  if (!refetch) { repaint(); return; }
+  Promise.resolve(window.TipTask?.fetchActiveSessions?.()).then(repaint).catch(() => {});
+}
+
+// A chat about the project selected in this window, with no task. The id is read from this
 // window's own project config (header-scoped) — the one the server checks the session id against.
-export async function openProjectChat() {
+// Without `chatId` (Start Chat) it opens the project's draft chat; a left-menu row passes its own.
+export async function openProjectChat({ chatId = '' } = {}) {
   const seq = ++openSeq;
+  // (TPT466) Started from the left menu, which stays live beside a task workspace on its Agent
+  // Terminal pane: close that workspace first (dirty-discard confirm), or the chat would open
+  // underneath it (body.task-chat-open lifts the task modal above this window).
+  const workspace = document.getElementById('task-edit-modal');
+  if (workspace && !workspace.hidden && typeof window.TipTask?.requestCloseTaskEditModal === 'function') {
+    if (!(await window.TipTask.requestCloseTaskEditModal())) return;
+    if (seq !== openSeq) return;
+  }
   let cfg = {};
   try {
     const res = await fetch('/api/project-config', { headers: projectHeader(), cache: 'no-store' });
@@ -80,12 +214,21 @@ export async function openProjectChat() {
   if (seq !== openSeq) return; // a later open (double click, task chat) superseded this one
   const id = String(cfg.API_PROJECT_ID || '').trim();
   if (!/^[1-9]\d*$/.test(id)) { showToast(t('taskChat.error.noProject'), 'error'); return; }
-  openChat({ kind: 'project', key: id, sessionId: PROJECT_SESSION_PREFIX + id, title: String(cfg.projectName || '') });
+  if (chatId && projectIdOfChat(chatId) !== id) { showToast(t('taskChat.error.noProject'), 'error'); return; }
+  // Fresh titles first: a draft another window has since named must not be reused.
+  try { await window.TipTask?.fetchActiveSessions?.(); } catch { /* the known list still works */ }
+  if (seq !== openSeq) return;
+  const sessionId = chatId || pickProjectChatId(id);
+  if (chat && chat.sessionId === sessionId && root && !embedded) return; // already in front
+  const title = (state.sessionMeta instanceof Map && state.sessionMeta.get(sessionId)?.title) || '';
+  openChat({ kind: 'project', key: id, sessionId, title, projectName: String(cfg.projectName || '') });
 }
 
-function openChat(target) {
+function openChat(target, embedOpts = null) {
   if (chat) close();
-  chat = target;
+  const projectPath = projectHeader()['x-tipatask-project'] || '';
+  chat = { ...target, draftKey: DRAFT_STORAGE_PREFIX + JSON.stringify([projectPath, target.sessionId]) };
+  embedded = embedOpts;
   messages = [];
   providers = taskChatProviders(state.objectiveProviders);
   selection = pickSelection({ providers, stored: readStoredSelection(), fallback: state.objectiveModel });
@@ -99,7 +242,8 @@ function openChat(target) {
 
   renderWindow();
   connect();
-  if (chat.kind === 'task') loadTaskTitle(chat.key);
+  if (chat.kind === 'task' && !embedded) loadTaskTitle(chat.key);
+  if (chat.kind === 'project') refreshSessionsNav();
 }
 
 function isProjectChat() {
@@ -107,6 +251,11 @@ function isProjectChat() {
 }
 
 export function close() {
+  const wasEmbedded = embedded;
+  embedded = null;
+  closeOpenEmbedMenu();
+  uploadsPending = 0;
+  uploadGen++;
   detachSocket();
   clearTimeout(freshTimer);
   freshTimer = null;
@@ -116,9 +265,12 @@ export function close() {
   if (reloadHandler) { document.removeEventListener('tiptask:reload', reloadHandler); reloadHandler = null; }
   if (root) { root.remove(); root = null; }
   if (focusHandle) { focusHandle.close(); focusHandle = null; }
-  document.documentElement.style.overflowY = '';
-  document.body.style.paddingRight = '';
-  document.body.classList.remove('task-chat-open');
+  if (!wasEmbedded) {
+    document.documentElement.style.overflowY = '';
+    document.body.style.paddingRight = '';
+    document.body.classList.remove('task-chat-open');
+  }
+  const wasProject = isProjectChat();
   chat = null;
   messages = [];
   running = false;
@@ -127,38 +279,47 @@ export function close() {
   awaitingStart = false;
   starting = false;
   pendingAnswer = null;
+  if (wasProject) refreshSessionsNav();
 }
 
 // ── Window ──
 
 function renderWindow() {
+  const host = embedded ? embedded.host : null;
   root = document.createElement('div');
-  root.className = 'task-chat-modal';
-  root.setAttribute('role', 'dialog');
-  root.setAttribute('aria-modal', 'true');
-  root.setAttribute('aria-labelledby', 'task-chat-title');
-  root.innerHTML = `
-    <div class="task-chat-backdrop"></div>
-    <div class="task-chat-panel task-chat-panel--connecting">
+  root.className = host ? 'task-chat-embed' : 'task-chat-modal';
+  if (!host) {
+    root.setAttribute('role', 'dialog');
+    root.setAttribute('aria-modal', 'true');
+    root.setAttribute('aria-labelledby', 'task-chat-title');
+  }
+  // Standalone: one quiet header row — connection dot, kind and title, Close. Embedded, the
+  // workspace's own top bar carries the task key and title, so there is no header at all.
+  const headerHtml = host ? '' : `
       <header class="task-chat-header">
-        <div class="task-chat-heading">
-          <span class="task-chat-eyebrow"><span class="task-chat-dot" aria-hidden="true"></span><span class="task-chat-eyebrow-text"></span></span>
-          <div class="task-chat-title" id="task-chat-title">
-            ${chat.kind === 'task' ? `<span class="task-chat-key">${escapeAttr(chat.key)}</span>` : ''}
-            <span class="task-chat-title-text"></span>
-          </div>
+        <span class="task-chat-dot" aria-hidden="true"></span>
+        <div class="task-chat-title" id="task-chat-title">
+          <span class="task-chat-eyebrow-text"></span>
+          ${chat.kind === 'task' ? `<span class="task-chat-key">${escapeAttr(chat.key)}</span>` : ''}
+          <span class="task-chat-title-text"></span>
         </div>
-        <div class="task-chat-header-actions">
-          <button type="button" class="task-chat-icon-btn task-chat-new">${ICON_NEW}</button>
-          <button type="button" class="task-chat-icon-btn task-chat-close">${ICON_CLOSE}</button>
-        </div>
-      </header>
+        <button type="button" class="task-chat-icon-btn task-chat-close">${ICON_CLOSE}</button>
+      </header>`;
+  root.innerHTML = `
+    ${host ? '' : '<div class="task-chat-backdrop"></div>'}
+    <div class="task-chat-panel task-chat-panel--connecting${host ? ' task-chat-panel--embedded' : ''}">
+      ${headerHtml}
       <div class="task-chat-scroll">
         <section class="task-chat-start" aria-labelledby="task-chat-start-title" hidden>
           <span class="task-chat-start-mark">${ICON_CHAT}</span>
           <h2 class="task-chat-start-title" id="task-chat-start-title"></h2>
           <p class="task-chat-start-lead"></p>
           <div class="task-chat-start-model"></div>
+          <div class="task-chat-start-embed">${embedMenuHtml({ label: '' })}</div>
+          <div class="task-chat-start-attachments" hidden>
+            <p class="task-chat-start-attachments-note"></p>
+            <div class="task-chat-start-attachments-list"></div>
+          </div>
           <p class="task-chat-start-note" role="status" hidden></p>
           <div class="task-chat-start-actions">
             <button type="button" class="task-chat-start-cancel"></button>
@@ -172,35 +333,44 @@ function renderWindow() {
         <div class="task-chat-composer">
           <textarea class="task-chat-input" rows="1"></textarea>
           <div class="task-chat-actions">
+            <div class="task-chat-embed-slot">${embedMenuHtml({ label: '' })}</div>
             <div class="task-chat-selector-slot"></div>
             <span class="task-chat-hint"></span>
+            <span class="task-chat-upload-status" role="status" hidden></span>
             <button type="button" class="btn-chat-send task-chat-send">${ICON_SEND}<span></span></button>
             <button type="button" class="btn-chat-stop task-chat-stop" hidden>${ICON_STOP}<span></span></button>
           </div>
         </div>
       </footer>
     </div>`;
-  document.body.appendChild(root);
+  (host || document.body).appendChild(root);
 
-  const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
-  document.body.style.paddingRight = scrollbarWidth + 'px';
-  document.documentElement.style.overflowY = 'hidden';
-  // Lifts the Task Edit Modal (opened from a task widget) above this window — see styles.css.
-  document.body.classList.add('task-chat-open');
+  if (!host) {
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+    document.body.style.paddingRight = scrollbarWidth + 'px';
+    document.documentElement.style.overflowY = 'hidden';
+    // Lifts the Task Edit Modal (opened from a task widget) above this window — see styles.css.
+    document.body.classList.add('task-chat-open');
+    root.querySelector('.task-chat-backdrop').addEventListener('click', close);
+    root.querySelector('.task-chat-close').addEventListener('click', close);
+  }
 
   const input = root.querySelector('.task-chat-input');
-  root.querySelector('.task-chat-backdrop').addEventListener('click', close);
-  root.querySelector('.task-chat-close').addEventListener('click', close);
-  root.querySelector('.task-chat-new').addEventListener('click', startNewChat);
+  input.value = readDraft(chat.draftKey);
   root.querySelector('.task-chat-send').addEventListener('click', sendMessage);
   root.querySelector('.task-chat-stop').addEventListener('click', stopTurn);
   root.querySelector('.task-chat-jump').addEventListener('click', () => scrollToBottom(true));
-  // Cancel at the gate is a plain close: the socket only ever held a pending session, which the
-  // server drops on close — no start frame went out, so nothing was spawned.
-  root.querySelector('.task-chat-start-cancel').addEventListener('click', close);
+  // Cancel at the gate closes the window (embedded: the workspace goes back to Edit — its
+  // onOpenTask with this task's own key). The socket only ever held a pending session, which
+  // the server drops on close — no start frame went out, so nothing was spawned.
+  root.querySelector('.task-chat-start-cancel').addEventListener('click', () => {
+    if (embedded && embedded.onOpenTask && chat) embedded.onOpenTask(chat.key);
+    else close();
+  });
   root.querySelector('.task-chat-start-go').addEventListener('click', beginChat);
 
-  input.addEventListener('input', () => { growInput(); syncComposer(); });
+  input.addEventListener('input', () => { rememberDraft(); growInput(); syncComposer(); syncGateAttachments(); });
+  wireAttachments(input);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); }
   });
@@ -211,10 +381,14 @@ function renderWindow() {
     if (stickToBottom) root.querySelector('.task-chat-jump').hidden = true;
   });
 
-  // Capture phase, and only while this window is the top dialog layer: with the Task Edit Modal
-  // or a confirm open above it, Escape belongs to that layer and must not also close the chat.
-  keyHandler = (e) => { if (e.key === 'Escape' && focusHandle && focusHandle.isTop()) close(); };
-  document.addEventListener('keydown', keyHandler, true);
+  if (!host) {
+    // Capture phase, and only while this window is the top dialog layer: with the Task Edit Modal
+    // or a confirm open above it, Escape belongs to that layer and must not also close the chat.
+    // An open Embed menu takes Escape for itself (embed-menu.js).
+    const embedMenuOpen = () => !!(root && root.querySelector('.embed-menu-wrap .import-submenu'));
+    keyHandler = (e) => { if (e.key === 'Escape' && focusHandle && focusHandle.isTop() && !embedMenuOpen()) close(); };
+    document.addEventListener('keydown', keyHandler, true);
+  }
   providersHandler = (e) => {
     const list = e && e.detail && e.detail.objectiveProviders;
     if (Array.isArray(list)) applyProviders(list);
@@ -227,11 +401,34 @@ function renderWindow() {
 
   // The composer is hidden until the chat is known to exist or has been started (dialog-focus
   // skips a hidden target), so Close takes focus while connecting; focusComposer() moves it on.
-  focusHandle = activateDialogFocus({ root, initialFocus: () => input });
+  if (!host) focusHandle = activateDialogFocus({ root, initialFocus: () => input });
   applyChromeLabels();
   renderSelector();
   renderTranscript();
+  growInput();
   syncComposer();
+}
+
+function rememberDraft() {
+  const input = root && root.querySelector('.task-chat-input');
+  if (!chat || !input) return;
+  if (input.value) {
+    composerDrafts.set(chat.draftKey, input.value);
+    try { localStorage.setItem(chat.draftKey, input.value); } catch { /* storage unavailable */ }
+  } else {
+    clearDraft();
+  }
+}
+
+function readDraft(key) {
+  if (composerDrafts.has(key)) return composerDrafts.get(key);
+  try { return localStorage.getItem(key) || ''; } catch { return ''; }
+}
+
+function clearDraft() {
+  if (!chat) return;
+  composerDrafts.delete(chat.draftKey);
+  try { localStorage.removeItem(chat.draftKey); } catch { /* storage unavailable */ }
 }
 
 // The window's fixed labels, written when it is built and again when the language changes.
@@ -240,14 +437,16 @@ function applyChromeLabels() {
   const q = sel => root.querySelector(sel);
   const name = (el, text) => { el.title = text; el.setAttribute('aria-label', text); };
   const project = isProjectChat();
-  q('.task-chat-eyebrow-text').textContent = t(project ? 'taskChat.projectEyebrow' : 'taskChat.eyebrow');
-  if (project) {
-    const title = q('.task-chat-title-text');
+  const eyebrow = q('.task-chat-eyebrow-text');
+  if (eyebrow) eyebrow.textContent = t(project ? 'taskChat.projectEyebrow' : 'taskChat.eyebrow');
+  const title = q('.task-chat-title-text');
+  if (project && title) {
     title.textContent = chatTitle();
     title.title = chatTitle();
   }
-  name(q('.task-chat-new'), t('taskChat.newChat'));
-  name(q('.task-chat-close'), t('btn.close'));
+  const closeBtn = q('.task-chat-close');
+  if (closeBtn) name(closeBtn, t('btn.close'));
+  if (embedded) root.setAttribute('aria-label', t(project ? 'taskChat.projectEyebrow' : 'taskChat.eyebrow'));
   q('.task-chat-jump span').textContent = t('taskChat.jumpToLatest');
   const input = q('.task-chat-input');
   const placeholder = t(project ? 'taskChat.project.placeholder' : 'taskChat.placeholder');
@@ -259,17 +458,43 @@ function applyChromeLabels() {
   q('.task-chat-stop span').textContent = t('btn.stop');
   q('.task-chat-start-title').textContent = t('taskChat.start.title');
   q('.task-chat-start-lead').textContent = project
-    ? t('taskChat.start.projectLead', { project: chatTitle() })
+    ? t('taskChat.start.projectLead', { project: projectLabel() })
     : t('taskChat.start.taskLead', { key: chat.key });
   q('.task-chat-start-cancel').textContent = t('btn.cancel');
+  for (const trigger of root.querySelectorAll('.embed-menu-trigger')) {
+    trigger.querySelector('.embed-menu-label').textContent = t('taskChat.embed.button');
+    trigger.title = t('taskChat.embed.tooltip');
+    trigger.setAttribute('aria-label', t('taskChat.embed.button'));
+  }
+  q('.task-chat-start-attachments-note').textContent = t('taskChat.embed.queued');
+  q('.task-chat-panel').dataset.dropLabel = t('taskChat.embed.drop');
   syncStartGate();
   renderedLocale = getLocale();
 }
 
-// A project chat's heading: the project's name, else its id.
+// The project's name, else its id.
+function projectLabel() {
+  if (!chat) return '';
+  return chat.projectName || `#${chat.key}`;
+}
+
+// A project chat's heading: its summary title once the first message named it, else the project.
 function chatTitle() {
   if (!chat) return '';
-  return chat.title || `#${chat.key}`;
+  return chat.title || projectLabel();
+}
+
+// The server named this project chat from its first user message (or a reattach carried the
+// name): show it, stop treating the chat as the project's draft, and list it in the left menu.
+function applyProjectChatTitle(title) {
+  const text = String(title || '').trim();
+  if (!isProjectChat() || !text) return;
+  const changed = chat.title !== text;
+  chat.title = text;
+  forgetDraftChat(chat.key, chat.sessionId);
+  const el = root && root.querySelector('.task-chat-title-text');
+  if (el) { el.textContent = text; el.title = text; }
+  if (changed) refreshSessionsNav(true);
 }
 
 // Language switched while the window is open: rewrite the fixed labels and rebuild the
@@ -289,7 +514,8 @@ async function loadTaskTitle(key) {
     if (res.ok) title = ((await res.json()) || {}).title || '';
   } catch { /* the key alone still identifies the chat */ }
   if (!chat || chat.kind !== 'task' || chat.key !== key || !root) return;
-  const el = root.querySelector('.task-chat-title-text');
+  const el = root.querySelector('.task-chat-title-text'); // none when embedded
+
   if (el) { el.textContent = title; el.title = title; }
 }
 
@@ -371,6 +597,7 @@ function syncStartGate() {
   const note = gate.querySelector('.task-chat-start-note');
   note.hidden = !noUsableModel();
   note.textContent = noUsableModel() ? t('taskChat.start.noModels') : '';
+  syncGateAttachments();
 }
 
 // Providers were offered but none of them can run a chat. With no provider list at all the start
@@ -445,7 +672,10 @@ function buildMessageEl(m) {
       + '<div class="task-chat-status" hidden></div>';
   } else {
     el.innerHTML = '<div class="task-chat-body"></div>';
-    el.querySelector('.task-chat-body').textContent = m.content;
+    const body = el.querySelector('.task-chat-body');
+    // A user turn shows its attachments as thumbnails and chips; a notice is plain text.
+    if (m.role === 'user') body.innerHTML = userMessageHtml(m.content, { t });
+    else body.textContent = m.content;
     if (m.retry) {
       const btn = document.createElement('button');
       btn.type = 'button';
@@ -689,6 +919,7 @@ function renderTaskWidget(entry) {
 // board dialog underneath this window. A save is reported to the server, which tells the agent
 // about it with the next user turn.
 function openTaskFromChat(key, trigger) {
+  if (embedded && embedded.onOpenTask) { embedded.onOpenTask(key); return; }
   const chatId = chat && chat.sessionId;
   const socket = ws;
   Promise.resolve(openTaskEditModal(key, {
@@ -702,16 +933,9 @@ function openTaskFromChat(key, trigger) {
   })).catch((err) => console.warn('[task-chat] Could not open task', key, err));
 }
 
-function lastTurnMessage() {
-  return messages.findLast(m => m.role !== 'system') || null;
-}
-
-// The server takes an answer only for an unanswered dialog on the chat's latest message, with
-// no turn running — the widget is interactive under exactly those conditions.
-function dialogState(m, dialog) {
-  if (dialog.answer) return 'answered';
-  if (m !== lastTurnMessage()) return 'skipped';
-  return connected && !running && !m.streaming ? 'open' : 'waiting';
+// open / waiting / answered / skipped — the rule is dialogState() in task-chat-model.js.
+function widgetState(m, dialog) {
+  return dialogState({ messages, message: m, dialog, connected, running });
 }
 
 function readDialog(el, dialog) {
@@ -724,7 +948,7 @@ function readDialog(el, dialog) {
 }
 
 function applyDialogState(el, m, dialog) {
-  const state = dialogState(m, dialog);
+  const state = widgetState(m, dialog);
   el.dataset.state = state;
   el.disabled = state !== 'open';
   const submit = el.querySelector('.task-chat-dialog-submit');
@@ -747,10 +971,13 @@ function applyDialogState(el, m, dialog) {
 function renderDialogWidget(m, dialog) {
   const el = fromHtml(dialogWidgetHtml(dialog, { t, name: `task-chat-dlg-${++widgetSeq}` }));
   if (!el) return null;
+  // A re-sent frame replaces the record in m.dialogs (upsertById) while this element is kept:
+  // read and answer the current one, the record syncDialogWidgets() checks.
+  const current = () => (m.dialogs || []).find(d => d && String(d.id) === String(dialog.id)) || dialog;
   const other = el.querySelector('.task-chat-dialog-other');
   const otherToggle = el.querySelector('.task-chat-dialog-options input[value="other"]');
   const submit = el.querySelector('.task-chat-dialog-submit');
-  const sync = () => { submit.disabled = el.disabled || !readDialog(el, dialog); };
+  const sync = () => { submit.disabled = el.disabled || !readDialog(el, current()); };
   el.addEventListener('change', (e) => {
     if (e.target === otherToggle && otherToggle.checked) other.focus();
     sync();
@@ -760,15 +987,15 @@ function renderDialogWidget(m, dialog) {
     sync();
   });
   other.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submitDialog(el, m, dialog); }
+    if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submitDialog(el, m, current()); }
   });
-  submit.addEventListener('click', () => submitDialog(el, m, dialog));
+  submit.addEventListener('click', () => submitDialog(el, m, current()));
   applyDialogState(el, m, dialog);
   return el;
 }
 
 function submitDialog(el, m, dialog) {
-  if (!ws || dialogState(m, dialog) !== 'open') return;
+  if (!ws || widgetState(m, dialog) !== 'open') return;
   const submission = readDialog(el, dialog);
   if (!submission) return;
   wsSend(ws, WS_SEND_TYPES.TASK_CHAT_ANSWER, { ...submission, model: selection || undefined });
@@ -816,6 +1043,77 @@ function applyEditedTask(task) {
 
 // ── Composer ──
 
+// ── Attachments ──
+// The objective chat's Embed control (embed-menu.js), clipboard image paste (task-board.js
+// attachImagePaste) and file drop, all inserting their markdown reference into the composer
+// textarea — so the reference is part of the `task-chat-message` content. The start gate has the
+// same Embed control, and the drop target is the whole panel: anything attached before Start
+// waits in the composer draft for the first message.
+
+function wireAttachments(input) {
+  const gen = ++uploadGen;
+  const live = () => gen === uploadGen && !!root;
+  const started = () => {
+    if (!live()) return;
+    uploadsPending++;
+    syncComposer();
+    syncGateAttachments();
+  };
+  const settled = () => {
+    if (!live()) return;
+    uploadsPending = Math.max(0, uploadsPending - 1);
+    if (!uploadsPending) {
+      // A failed image upload leaves its blob placeholder behind.
+      const cleaned = stripPendingImageRefs(input.value);
+      if (cleaned !== input.value) { input.value = cleaned; rememberDraft(); growInput(); }
+    }
+    syncComposer();
+    syncGateAttachments();
+  };
+  const imageOpts = {
+    // A task chat links its images to the task, as the spec chat does.
+    taskKey: chat && chat.kind === 'task' ? chat.key : null,
+    onFileDetected: started,
+    onUploaded: settled,
+    onUploadError: (file, err) => {
+      if (live()) {
+        const name = (file && file.name) || t('taskChat.embed.image');
+        showToast(t('taskChat.embed.error', { name, msg: (err && err.message) || '' }), 'error');
+      }
+      settled();
+    },
+  };
+  // uploadAttachmentFile() shows its own progress and error toasts and never rejects.
+  const onFileUpload = (upload) => {
+    if (!live()) return;
+    started();
+    Promise.resolve(upload).then(settled, settled);
+  };
+  const labels = {
+    image: () => t('taskChat.embed.image'),
+    file: () => t('taskChat.embed.file'),
+    fileTitle: () => t('taskChat.embed.fileTooltip'),
+  };
+  attachImagePaste(input, null, imageOpts);
+  for (const wrap of root.querySelectorAll('.embed-menu-wrap')) {
+    attachEmbedMenu(wrap, input, { imageOpts, onFileUpload, labels });
+  }
+  attachFileDrop(root.querySelector('.task-chat-panel'), input, { imageOpts, onFileUpload, activeClass: 'task-chat-panel--drop' });
+}
+
+// At the start gate the composer is hidden: show what is attached and waiting in its draft.
+function syncGateAttachments() {
+  if (!root) return;
+  const box = root.querySelector('.task-chat-start-attachments');
+  const input = root.querySelector('.task-chat-input');
+  if (!box || !input) return;
+  const { attachments } = splitAttachmentRefs(input.value);
+  box.hidden = !awaitingStart || (!attachments.length && !uploadsPending);
+  const list = box.querySelector('.task-chat-start-attachments-list');
+  const html = attachmentsHtml(attachments, { t });
+  if (list.dataset.sig !== html) { list.innerHTML = html; list.dataset.sig = html; }
+}
+
 function growInput() {
   const input = root && root.querySelector('.task-chat-input');
   if (input) autoGrowTextarea(input, Math.round(window.innerHeight * 0.3));
@@ -823,6 +1121,14 @@ function growInput() {
 
 function setRunning(value) {
   running = !!value;
+  syncComposer();
+  syncDialogWidgets();
+}
+
+// Every change of the socket state repaints the dialogs too: a reattach restores the history
+// (and closes a finished turn) before its `config` frame, so its dialogs are built `waiting`.
+function setConnected(value) {
+  connected = !!value;
   syncComposer();
   syncDialogWidgets();
 }
@@ -836,9 +1142,12 @@ function syncComposer() {
   send.hidden = running;
   stop.hidden = !running;
   if (!running) stop.disabled = false;
-  send.disabled = !connected || running || awaitingStart || !input.value.trim();
+  send.disabled = !connected || running || awaitingStart || uploadsPending > 0 || !input.value.trim();
+  const uploading = root.querySelector('.task-chat-upload-status');
+  uploading.hidden = uploadsPending === 0;
+  uploading.textContent = uploadsPending ? t('taskChat.embed.uploading') : '';
+  root.querySelector('.task-chat-hint').hidden = uploadsPending > 0;
   if (select) select.disabled = running;
-  root.querySelector('.task-chat-new').disabled = running || !connected || awaitingStart;
   // No composer until there is a chat to type into: while the first connect is still deciding
   // between restore and the start gate, and while the gate is up.
   root.querySelector('.task-chat-panel').classList.toggle('task-chat-panel--connecting', !connected && !messages.length);
@@ -848,7 +1157,7 @@ function syncComposer() {
 }
 
 function sendMessage() {
-  if (!root || !connected || running || awaitingStart) return;
+  if (!root || !connected || running || awaitingStart || uploadsPending > 0 || ws?.readyState !== WebSocket.OPEN) return;
   const input = root.querySelector('.task-chat-input');
   const text = input.value.trim();
   if (!text) return;
@@ -858,26 +1167,13 @@ function sendMessage() {
   pushMessage({ role: 'assistant', content: '', streaming: true });
   setRunning(true);
   wsSend(ws, WS_SEND_TYPES.TASK_CHAT_MESSAGE, { content: text, model: selection || undefined });
+  clearDraft();
 }
 
 function stopTurn() {
   if (!running) return;
   root.querySelector('.task-chat-stop').disabled = true;
   wsSend(ws, WS_SEND_TYPES.ABORT, {});
-}
-
-async function startNewChat() {
-  if (running || !connected || awaitingStart) return;
-  if (messages.some(m => m.role !== 'system')) {
-    const ok = await showActionConfirm({
-      message: escapeAttr(t(isProjectChat() ? 'taskChat.project.confirmNewChat' : 'taskChat.confirmNewChat')),
-      confirmLabel: t('taskChat.newChat'),
-      danger: true,
-      overlayClass: 'modal-overlay--over-chat',
-    });
-    if (!ok || !root) return;
-  }
-  wsSend(ws, WS_SEND_TYPES.RESTART, { model: selection || undefined });
 }
 
 // ── Connection ──
@@ -892,7 +1188,7 @@ function detachSocket() {
 
 function connect() {
   detachSocket();
-  connected = false;
+  setConnected(false);
   sawReset = false;
   ended = false;
   resetSelection = '';
@@ -912,7 +1208,7 @@ function connect() {
   socket.onclose = () => {
     if (ws !== socket) return;
     ws = null;
-    connected = false;
+    setConnected(false);
     // A gate on a dead socket cannot start anything; the notice below offers the reconnect.
     awaitingStart = false;
     syncStartGate();
@@ -982,6 +1278,7 @@ function handleFrame(msg) {
       // History without even the generated seed is a session that cannot continue.
       if (!msg.running && !(Array.isArray(msg.messages) && msg.messages.length)) wantFresh = true;
       messages = visibleHistory(msg.messages);
+      if (msg.title) applyProjectChatTitle(msg.title);
       if (msg.running) messages.push({ role: 'assistant', content: '', streaming: true, dialogs: [], tools: [], taskEvents: [] });
       running = !!msg.running;
       renderTranscript();
@@ -990,7 +1287,7 @@ function handleFrame(msg) {
 
     // Last frame of every connect, fresh or reattached — the point where both are known.
     case 'config': {
-      connected = true;
+      setConnected(true);
       applyProviders(
         Array.isArray(msg.objectiveProviders) ? msg.objectiveProviders : providers,
         sawReset ? resetSelection : '',
@@ -1060,17 +1357,17 @@ function handleFrame(msg) {
       const partial = streamingMessage();
       if (partial) removeMessage(partial);
       // The server drops the user message that started the aborted turn; hand its text back.
-      const last = lastTurnMessage();
+      const last = lastTurnMessage(messages);
       if (last && last.role === 'user') {
         removeMessage(last);
         if (last.dialogAnswer) {
           // It was a dialog answer: nothing to retype — the dialog itself opens again.
-          const asked = lastTurnMessage();
+          const asked = lastTurnMessage(messages);
           const dialog = asked && (asked.dialogs || []).find(d => d.id === last.dialogAnswer.dialogId);
           if (dialog) delete dialog.answer;
         } else {
           const input = root.querySelector('.task-chat-input');
-          if (!input.value.trim()) { input.value = last.content; growInput(); }
+          if (!input.value.trim()) { input.value = last.content; rememberDraft(); growInput(); }
         }
       }
       setRunning(false);
@@ -1161,20 +1458,28 @@ function handleFrame(msg) {
       turnFailed(msg.message || t('taskChat.error.turn', { reason: 'error' }));
       break;
 
-    case 'chat-ended':
+    case WS_RECV_TYPES.PROJECT_CHAT_TITLED:
+      applyProjectChatTitle(msg.title);
+      break;
+
+    case WS_RECV_TYPES.CHAT_ENDED:
       clearTimeout(freshTimer);
+      if (isProjectChat()) refreshSessionsNav(true);
       if (wantFresh) { connect(); break; }
       ended = true;
-      connected = false;
+      setConnected(false);
       finishStreaming();
       setRunning(false);
       pushNotice(t('taskChat.ended'), { retry: startFresh });
       break;
 
-    case WS_RECV_TYPES.DETACHED:
+    case WS_RECV_TYPES.DETACHED: {
       showToast(t('taskChat.detached'));
+      const onClosed = embedded && embedded.onClosed;
       close();
+      if (onClosed) onClosed();
       break;
+    }
 
     default:
       break;

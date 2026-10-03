@@ -20,6 +20,7 @@ import { pushNotification, dismissNotification } from './notification-center.js'
 import { isCompleteName } from './status-registry.js';
 import { buildNotificationTitle, isTaskInUserFocus, openTaskTerminalFromNotification } from './attention-notifications.js';
 import state from './state.js';
+import { showToast } from './utils.js';
 
 // (C1355) "Already notified this completion" ledger — three separate code paths in template.html
 // converge on the same completion event (browser board WS, Electron task-state event, and the
@@ -27,7 +28,7 @@ import state from './state.js';
 // to three times. Cleared when the task's status leaves the complete role (see
 // forgetTaskCompletion below), so a reopened-then-recompleted task notifies again.
 const _notifiedCompletions = new Set();
-const _openingTasks = new Set();
+const _openingTerminals = new Set();
 
 function _tag(taskId) {
   return `completed-${taskId}`;
@@ -42,15 +43,19 @@ function _projectPath() {
   return null;
 }
 
+function _showMissingSession() {
+  if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+    showToast(t('terminal.sessionMissing'), 'error');
+  }
+}
+
 // Both notification surfaces share this action. The native transport has already focused the
 // originating project window; the path check also protects an in-app card left behind after a
-// project switch. (TPT439) A click opens the task's console on the finished session (scrolled to
-// the bottom by openTerminal()), like an attention click. Only when no session is known client-side
-// does it fall back to the task edit modal — openTerminal() on a session-less task would spawn a
-// brand-new agent run. The board's navigation bridge fetches the task by key even when no card is
-// currently rendered.
+// project switch. Refreshing /api/sessions restores an exited session that a task-status update
+// removed from the local sets. A completion click never launches a new agent or selects Edit.
 function _completionAction(taskId, tag) {
   const originPath = _projectPath();
+  const startedAt = state.sessionMeta?.get(taskId)?.startedAt;
   return () => {
     const currentPath = _projectPath();
     if (originPath && currentPath && originPath !== currentPath) {
@@ -58,20 +63,26 @@ function _completionAction(taskId, tag) {
       return;
     }
     dismissNotification(tag);
-    if (state.activeSessions?.has(taskId) || state.exitedSessions?.has(taskId)) {
-      openTaskTerminalFromNotification(taskId, state.taskStatusById?.get(taskId));
-      return;
-    }
     try { window.electronAPI?.focusSelf?.(); } catch (_) {}
-    const modal = typeof document !== 'undefined' && document.getElementById?.('task-edit-modal');
-    if (modal && !modal.hidden && modal.dataset?.taskId === taskId) return;
-    if (_openingTasks.has(taskId)) return;
-    const open = window.TipTask?.openTaskEditModal;
-    if (typeof open !== 'function') return;
-    _openingTasks.add(taskId);
-    Promise.resolve().then(() => open(taskId))
-      .catch((err) => debugNotifyLog('completion task open failed', taskId, err))
-      .finally(() => _openingTasks.delete(taskId));
+    if (_openingTerminals.has(taskId)) return;
+    _openingTerminals.add(taskId);
+    Promise.resolve().then(() => window.TipTask?.fetchActiveSessions?.())
+      .then(() => {
+        if (originPath && _projectPath() !== originPath) return;
+        const hasSession = state.activeSessions?.has(taskId) || state.exitedSessions?.has(taskId);
+        const currentStartedAt = state.sessionMeta?.get(taskId)?.startedAt;
+        if (!hasSession || (startedAt && currentStartedAt !== startedAt)) {
+          _showMissingSession();
+          return;
+        }
+        openTaskTerminalFromNotification(taskId, state.taskStatusById?.get(taskId),
+          { reconnectOnly: true, sessionStartedAt: startedAt || currentStartedAt });
+      })
+      .catch((err) => {
+        debugNotifyLog('completion terminal open failed', taskId, err);
+        _showMissingSession();
+      })
+      .finally(() => _openingTerminals.delete(taskId));
   };
 }
 

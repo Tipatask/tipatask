@@ -1,22 +1,11 @@
-// ── In-app notification stack (C1137, C1151) ──
-//
-// A fixed bottom-right column of cards that stay until dismissed (moved from top-right in
-// C1151 — the old anchor sat on top of the board's filter controls). Exists because macOS's
-// default "Banners" notification style auto-dismisses after ~5s and there is no app-side API to
-// force "Alerts" style (see ai/architecture/tt-notifications.md § macOS Code-Signing Requirement
-// / § In-app notification stack for the UNUserNotificationCenter finding this is built around).
-// This module is the in-app fallback surface that persists regardless of OS notification style
-// or platform, so a missed OS banner is not a missed prompt.
-//
-// Model first, DOM second (same split as notifications.js) — the model half is plain data and
-// unit-testable under `node --test` with no `document`; `_render()` is the only DOM-touching
-// piece, and it's a no-op outside a browser.
+// Shared persistent card renderer for project windows and the Electron desktop surface.
+// Each caller owns its model. Project entries upsert by task tag; desktop entries use
+// per-banner IDs. Model operations work without a DOM and never evict by count.
 
 import { t } from './i18n.js';
 
-const MAX_ENTRIES = 5;
 
-// Ordered newest-first. Array, not Map, so eviction/reorder-to-top stay simple splices.
+// Ordered newest-first; tag upserts move to the front.
 let _entries = [];
 
 // Guards on createElement too, not just `document` existing — attention-notifications.js's own
@@ -27,14 +16,13 @@ function _hasDocument() {
 }
 
 // Upsert keyed by `tag` — an existing entry for the same tag is updated in place and moved to
-// the top (fresh content, fresh position) instead of duplicated. Evicts the oldest entry past
-// MAX_ENTRIES. Returns the stored entry.
-export function pushNotification({ tag, title, body, onClick, category } = {}) {
+// the top (fresh content, fresh position) instead of duplicated. No count-based eviction.
+// Desktop callers use a distinct tag per delivered banner. Returns the stored entry.
+export function pushNotification({ tag, title, body, onClick, onDismiss, category, showClearAll = true } = {}) {
   if (!tag) return null;
   _entries = _entries.filter((e) => e.tag !== tag);
-  const entry = { tag, title: title || '', body: body || '', onClick: onClick || null, category: category || null };
+  const entry = { tag, title: title || '', body: body || '', onClick: onClick || null, category: category || null, onDismiss, showClearAll, dismissLabel: t('notifCenter.dismiss') };
   _entries.unshift(entry);
-  if (_entries.length > MAX_ENTRIES) _entries.length = MAX_ENTRIES;
   _render();
   return entry;
 }
@@ -102,13 +90,25 @@ function _cardEl(entry) {
   closeBtn.textContent = '×';
   closeBtn.addEventListener('click', (ev) => {
     ev.stopPropagation();
-    dismissNotification(card._entry.tag);
+    const entry = card._entry;
+    dismissNotification(entry.tag);
+    try { entry.onDismiss?.(); } catch (_) {}
   });
+  card._closeEl = closeBtn;
 
   card.append(icon, bodyWrap, closeBtn);
-  card.addEventListener('click', () => {
-    try { card._entry.onClick && card._entry.onClick(); } catch (_) {}
-    dismissNotification(card._entry.tag);
+  const activate = () => {
+    const entry = card._entry;
+    dismissNotification(entry.tag);
+    try { entry.onClick?.(); } catch (_) {}
+  };
+  card.tabIndex = 0;
+  card.setAttribute('role', 'button');
+  card.addEventListener('click', activate);
+  card.addEventListener('keydown', (event) => {
+    if (event.target !== card || !['Enter', ' '].includes(event.key)) return;
+    event.preventDefault();
+    activate();
   });
 
   _updateCardEl(card, entry);
@@ -119,6 +119,7 @@ function _cardEl(entry) {
 // in-flight entrance transition (or the user's hover) is undisturbed by an unrelated upsert.
 function _updateCardEl(card, entry) {
   card._entry = entry;
+  card._closeEl.setAttribute('aria-label', entry.dismissLabel);
   card.classList.remove('tt-notif-card--attention', 'tt-notif-card--objective', 'tt-notif-card--completed');
   if (entry.category) card.classList.add(`tt-notif-card--${entry.category}`);
   card._iconEl.textContent = _categoryGlyph(entry.category);
@@ -159,7 +160,7 @@ function _render() {
     header.append(heading, clearBtn);
     stack._headerEl = header;
   }
-  if (_entries.length > 1) {
+  if (_entries.length > 1 && _entries.every((e) => e.showClearAll)) {
     stack.appendChild(header); // first child — header renders above the card column
   } else if (header.isConnected) {
     header.remove();
