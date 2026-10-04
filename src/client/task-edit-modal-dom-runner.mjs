@@ -240,6 +240,10 @@ try {
   assert.equal(modal().querySelectorAll('.task-modal-tab').length, 3);
   assert.equal(modal().querySelector('.task-edit-panel').dataset.pane, 'edit');
   assert.equal(modal().querySelector('.btn-modal-chat'), null);
+  // (TPT479) The rail is uncovered on every pane, and ✕ is the close control on Edit too.
+  assert.ok(modal().querySelector('.task-edit-overlay--rail'), 'rail stays live beside the edit pane');
+  assert.ok(document.body.classList.contains('task-modal-rail'));
+  assert.ok(modal().querySelector('.btn-modal-close'));
   const draftTitle = modal().querySelector('.modal-title-input');
   draftTitle.value = 'Draft across tabs';
   draftTitle.dispatchEvent(new Event('input', { bubbles: true }));
@@ -253,6 +257,7 @@ try {
   assert.equal(mounts.chat[0].host, paneEl('chat'));
   assert.equal(mounts.chat[0].id, 'TPT1');
   assert.equal(tab('edit').querySelector('.task-modal-tab-dot').hidden, false);
+  assert.ok(modal().querySelector('.task-edit-overlay--rail'), 'rail stays live beside the chat pane');
   mounts.chat[0].host.querySelector('.fake-chat-input').value = 'typed in chat';
 
   // Terminal with no session: an empty state, nothing mounted.
@@ -268,11 +273,24 @@ try {
   tab('edit').click();
   assert.equal(modal().querySelector('.modal-title-input').value, 'Draft across tabs', 'draft kept');
   assert.equal(tab('edit').querySelector('.task-modal-tab-dot').hidden, true);
-  assert.equal(document.body.classList.contains('task-modal-rail'), false);
+  assert.ok(document.body.classList.contains('task-modal-rail'), 'switching to Edit keeps the rail');
+  assert.ok(modal().querySelector('.task-edit-overlay--rail'));
+  const termDot = () => tab('terminal').querySelector('.task-modal-tab-dot');
+  assert.equal(termDot().hidden, false, 'a live session lights the tab dot');
   tab('terminal').click();
   assert.equal(mounts.terminal.length, 1);
   assert.equal(mounts.terminal[0].host, paneEl('terminal'));
   assert.equal(typeof mounts.terminal[0].opts.onClosed, 'function');
+  // (TPT479) The tab dot is the one status light: it follows what the xterm reports.
+  mounts.terminal[0].opts.onStatus('paused', 'Paused');
+  assert.ok(termDot().classList.contains('task-modal-tab-dot--paused'));
+  assert.equal(termDot().title, 'Paused');
+  mounts.terminal[0].opts.onStatus('exited', 'Exited (code 0)');
+  assert.ok(termDot().classList.contains('task-modal-tab-dot--exited'));
+  assert.equal(termDot().classList.contains('task-modal-tab-dot--paused'), false);
+  mounts.terminal[0].opts.onStatus('', 'Connected');
+  assert.equal(termDot().classList.contains('task-modal-tab-dot--exited'), false);
+  assert.equal(termDot().hidden, false);
   tab('chat').click();
   assert.equal(mounts.terminal[0].hidden, 1);
   assert.equal(mounts.chat.length, 1, 'chat is not remounted');
@@ -319,7 +337,74 @@ try {
   assert.equal(mounts.chat.at(-1).id, 'TPT2');
   await board.openTaskWorkspace('TPT2', { pane: 'edit' });
   assert.equal(modal().dataset.pane, 'edit');
+
+  // (TPT479) Another task's workspace replaces this one in a single step: the open modal stays
+  // up (rail and all) until the next task has loaded, and it opens straight onto its pane.
+  const switching = board.openTaskWorkspace('TPT1', { pane: 'chat' });
+  assert.equal(modal().hidden, false, 'no modal-less frame while the next task loads');
+  assert.equal(modal().dataset.taskId, 'TPT2');
+  assert.ok(document.body.classList.contains('task-modal-rail'));
+  await switching;
+  await tick();
+  assert.equal(modal().dataset.taskId, 'TPT1');
+  assert.equal(modal().dataset.pane, 'chat');
+  assert.ok(modal().querySelector('.task-edit-overlay--rail'));
+
+  // An unsaved draft still asks first, and a cancelled confirm keeps the workspace as it was.
+  tab('edit').click();
+  const dirtyTitle = modal().querySelector('.modal-title-input');
+  dirtyTitle.value = 'Unsaved switch';
+  dirtyTitle.dispatchEvent(new Event('input', { bubbles: true }));
+  const guarded = board.openTaskWorkspace('TPT2', { pane: 'terminal' });
+  await tick();
+  const cancel = document.querySelector('.modal-overlay--over-modal .btn-cancel');
+  assert.ok(cancel, 'discard confirm is shown');
+  cancel.click();
+  await guarded;
+  await tick();
+  assert.equal(modal().dataset.taskId, 'TPT1');
+  assert.equal(modal().querySelector('.modal-title-input').value, 'Unsaved switch');
   board.closeTaskEditModal(true);
+
+  // (TPT485) The rail stays clickable while the next task loads, so opens overlap: the latest
+  // wins. The open workspace — not only a mounted xterm — owns the rail's active row, on every
+  // pane, and the row lets go once the workspace closes.
+  const navHost = document.createElement('div');
+  navHost.id = 'active-sessions-list';
+  document.body.appendChild(navHost);
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async url => (url === '/api/sessions' ? { ok: false, json: async () => null } : realFetch(url));
+  state.activeSessions.add('TPT1');
+  state.activeSessions.add('TPT2');
+  const realGet = api.tasks.get;
+  let releaseSlow = null;
+  api.tasks.get = async id => {
+    if (id === 'TPT2') await new Promise(resolve => { releaseSlow = resolve; });
+    return realGet(id);
+  };
+  const slowOpen = board.openTaskWorkspace('TPT2', { pane: 'edit' });
+  await tick();
+  await board.openTaskWorkspace('TPT1', { pane: 'edit' });
+  await tick();
+  releaseSlow();
+  await slowOpen;
+  await tick();
+  api.tasks.get = realGet;
+  assert.equal(modal().dataset.taskId, 'TPT1', 'an earlier, slower open never replaces the latest');
+  const activeRow = () => navHost.querySelector('.active-session-item.active')?.dataset.taskId;
+  assert.equal(activeRow(), 'TPT1');
+  for (const pane of ['chat', 'edit']) {
+    tab(pane).click();
+    await tick();
+    assert.equal(activeRow(), 'TPT1', `rail row stays active on ${pane}`);
+    assert.ok(document.body.classList.contains('task-modal-rail'));
+  }
+  board.closeTaskEditModal(true);
+  assert.equal(activeRow(), undefined, 'closing the workspace releases its row');
+  state.activeSessions.delete('TPT1');
+  state.activeSessions.delete('TPT2');
+  globalThis.fetch = realFetch;
+  navHost.remove();
 
   // Proposal, diff and stacked (hideActions) modals stay edit-only.
   await board.openTaskEditModal('new-2', { preloadedTask: task('new-2'), onSavePreview: async () => {} });

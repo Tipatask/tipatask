@@ -34,7 +34,7 @@ const _processCreatedAt = (() => {
   try { return process.getCreationTime ? process.getCreationTime() : null; } catch { return null; }
 })();
 
-const { BrowserWindow, Menu, shell, dialog, ipcMain, session, screen, systemPreferences } = require('electron');
+const { BrowserWindow, Menu, shell, dialog, ipcMain, session, screen, systemPreferences, Notification } = require('electron');
 const { fork, execFile } = require('child_process');
 const crypto = require('node:crypto');
 const fs = require('fs');
@@ -974,7 +974,20 @@ function registerIpcHandlers() {
   });
 
   // Desktop banners do not depend on native notification registration or permissions.
-  ipcMain.handle('notify:status', () => ({ delivery: 'desktop', available: true }));
+  // (TPT487) With "Show on Top" off, sends are native OS notifications again, so the Settings
+  // hints need the bundle-health signals that decide whether macOS shows them at all.
+  ipcMain.handle('notify:status', async () => {
+    if (!desktopNotifications || desktopNotifications.isEnabled()) return { delivery: 'desktop', available: true };
+    await refreshBundleSignatureState();
+    return {
+      delivery: 'native',
+      available: Notification.isSupported(),
+      ...(_bundleSignatureState || { valid: null, reason: 'not-checked', relaunchNeeded: false }),
+      registered: _ncRegistrationState,
+      conflicts: _lsRegistrationState?.conflicts ?? null,
+      installerVolumes: _lsRegistrationState?.installerVolumes ?? [],
+    };
+  });
 
   // (C1355) On-demand repair from the Settings "Repair" button — re-registers the RUNNING
   // bundle with LaunchServices so it becomes the freshest claimant of com.tipatask.app. Never
@@ -1015,20 +1028,44 @@ function registerIpcHandlers() {
     try { return await systemPreferences.askForMediaAccess('microphone'); } catch { return false; }
   });
 
-  desktopNotifications = createDesktopNotifications({ BrowserWindow, screen, ipcMain,
+  desktopNotifications = createDesktopNotifications({ BrowserWindow, screen, ipcMain, Notification,
+    // (TPT480/TPT487) Persisted "Show on Top" choice — app-level, not per project. Controlled
+    // from the Settings menu (createMenu()) and the Settings modal (notify:on-top-set). Off
+    // sends native OS notifications instead of the always-on-top stack.
+    settingsFile: path.join(app.getPath('userData'), 'desktop-notifications.json'),
+    isTrustedProjectSender: (event) => isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` }),
+    // (TPT484) One surface by app focus: the focused project window hosts the in-app panel;
+    // with no project window focused, the always-on-top banner takes over.
+    focusedProjectWindow: () => {
+      const w = BrowserWindow.getFocusedWindow();
+      return w && !w.isDestroyed() && !desktopNotifications?.owns(w) && projectDirs.has(w.webContents.id) ? w : null;
+    },
+    projectWindows: () => BrowserWindow.getAllWindows()
+      .filter((w) => !w.isDestroyed() && !w.webContents.isDestroyed() && projectDirs.has(w.webContents.id)),
+    // "Show More": focus the newest notification's project window; the controller then sends
+    // that window the full list (src/client/desktop-notification-panel.js).
+    onShowMore: (entry) => {
+      const w = resolveNotifyTarget(entry.origin);
+      return w && focusWindow(w, { steal: true }) ? w : null;
+    },
     onClick: (entry) => {
       const w = resolveNotifyTarget(entry.origin);
       if (!w || (entry.origin.projectPath && projectDirs.get(w.webContents.id) !== entry.origin.projectPath)) return;
       focusWindow(w, { steal: true });
       w.webContents.send('notify:clicked', { notificationId: entry.notificationId,
-        tag: entry.tag, taskId: entry.taskId, projectPath: entry.origin.projectPath });
+        tag: entry.tag, taskId: entry.taskId, projectPath: entry.origin.projectPath, cardSeq: entry.cardSeq ?? null });
     },
-    onDismiss: (entry) => {
+    // keepCard: only the callback identity is released (a newer send replaced it, or the
+    // on-top setting was turned off); the renderer keeps its in-app card.
+    onDismiss: (entry, { keepCard = false } = {}) => {
       const w = resolveNotifyTarget(entry.origin);
       if (w && !w.webContents.isDestroyed()) w.webContents.send('notify:dismissed', {
-        notificationId: entry.notificationId, projectPath: entry.origin.projectPath });
+        notificationId: entry.notificationId, tag: entry.tag, projectPath: entry.origin.projectPath, keepCard,
+        cardSeq: entry.cardSeq ?? null });
     },
   });
+  app.on('browser-window-focus', () => desktopNotifications?.syncNotificationSurface());
+  app.on('browser-window-blur', () => desktopNotifications?.syncNotificationSurface());
   ipcMain.handle('notify:show', (event, payload = {}) => {
     if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
       return { ok: false, reason: 'untrusted_sender' };
@@ -1036,6 +1073,55 @@ function registerIpcHandlers() {
     const w = BrowserWindow.fromWebContents(event.sender);
     return desktopNotifications.show(payload || {}, { windowId: w.id,
       wcId: event.sender.id, projectPath: projectDirs.get(event.sender.id) || null });
+  });
+
+  // (TPT484) In-app card mirror + programmatic dismissal + surface read-back. Project scope
+  // always comes from the sender, never from the payload.
+  ipcMain.handle('notify:card', (event, payload = {}) => {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+      return { ok: false, reason: 'untrusted_sender' };
+    }
+    const w = BrowserWindow.fromWebContents(event.sender);
+    const { tag, title, body, category, locale, seq } = payload || {};
+    if (typeof tag !== 'string' || !tag.trim()) return { ok: false, reason: 'invalid_tag' };
+    return desktopNotifications.upsertCard({ tag, title, body, category, locale, seq }, { windowId: w.id,
+      wcId: event.sender.id, projectPath: projectDirs.get(event.sender.id) || null });
+  });
+  ipcMain.handle('notify:dismiss', (event, payload = {}) => {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+      return { ok: false, reason: 'untrusted_sender' };
+    }
+    const tag = payload?.tag;
+    if (typeof tag !== 'string' || !tag.trim()) return { ok: false, reason: 'invalid_tag' };
+    return { ok: true, dismissed: desktopNotifications.dismissKey(tag, projectDirs.get(event.sender.id) || null) };
+  });
+  // (TPT487) Settings modal "Show on Top" checkbox. Same persisted flag as the menu item.
+  ipcMain.handle('notify:on-top-get', (event) => {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+      return { ok: false, reason: 'untrusted_sender' };
+    }
+    return { ok: true, enabled: desktopNotifications.isEnabled() };
+  });
+  ipcMain.handle('notify:on-top-set', (event, payload = {}) => {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+      return { ok: false, reason: 'untrusted_sender' };
+    }
+    return applyNotificationsOnTop(!!payload?.enabled);
+  });
+  ipcMain.handle('notify:surface-state', (event) => {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+      return { shared: false, active: false, entries: [] };
+    }
+    return desktopNotifications.surfaceFor(BrowserWindow.fromWebContents(event.sender));
+  });
+
+  ipcMain.handle('notify:dismiss-task', (event, payload = {}) => {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+      return { ok: false, reason: 'untrusted_sender' };
+    }
+    const taskId = payload?.taskId;
+    if (typeof taskId !== 'string' || !taskId.trim()) return { ok: false, reason: 'invalid_task' };
+    return { ok: true, dismissed: desktopNotifications.dismissTask(taskId, projectDirs.get(event.sender.id)) };
   });
 
   ipcMain.handle('project:remove', (_event, projectPath) => {
@@ -1720,6 +1806,37 @@ async function showVoiceShortcutDiagnostics(win) {
   });
 }
 
+// (TPT487) One writer for the "Show on Top" flag: applies at once, persists, rebuilds the menu
+// checkbox and tells every project window's Settings checkbox.
+function applyNotificationsOnTop(on) {
+  if (!desktopNotifications) return { ok: false, reason: 'unavailable' };
+  const result = desktopNotifications.setEnabled(on);
+  if (!result.ok) console.warn('[desktop-notifications] setting not saved', result.reason);
+  createMenu();
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed() && !w.webContents.isDestroyed() && projectDirs.has(w.webContents.id)) {
+      w.webContents.send('notify:on-top-changed', { enabled: result.enabled });
+    }
+  }
+  return result;
+}
+
+// (TPT480) App-level Settings submenu. The checkbox applies at once and persists across
+// restarts: checked keeps the desktop stack on top; unchecked hides it and sends new alerts as
+// transient native OS notifications (TPT487). In-app cards are unaffected either way.
+function appSettingsMenu(label) {
+  return {
+    label,
+    submenu: [{
+      label: mt('menu.notificationsOnTop'),
+      type: 'checkbox',
+      checked: desktopNotifications ? desktopNotifications.isEnabled() : true,
+      enabled: !!desktopNotifications,
+      click: (mi) => { applyNotificationsOnTop(mi.checked); },
+    }],
+  };
+}
+
 function createMenu() {
   const isMac = process.platform === 'darwin';
   const recentProjectItems = loadRecentProjects().map(projectPath => ({
@@ -1737,6 +1854,8 @@ function createMenu() {
         // below); the full notices text still needs its own window since the
         // native panel has no room for it.
         { label: mt('menu.thirdPartyLicenses'), click: () => openNoticesWindow() },
+        { type: 'separator' },
+        appSettingsMenu(mt('menu.appSettings')),
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -1805,6 +1924,8 @@ function createMenu() {
           ],
         },
         { type: 'separator' },
+        // (TPT480) Win/Linux have no app-name menu, so app-level settings live here.
+        ...(isMac ? [] : [appSettingsMenu(mt('menu.appSettingsOther')), { type: 'separator' }]),
         {
           label: mt('menu.reauthenticate'),
           click: (mi, window) => { if (window && !window.isDestroyed()) window.webContents.send('force-reauth'); },

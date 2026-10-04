@@ -1,6 +1,7 @@
 // ── Task Board rendering, search, and modals ──
 import state from './state.js';
 import { t, tc, setLocale } from './i18n.js';
+import { queueReasonText } from './queue-reason.js';
 import { isTaskDiscussing } from './discuss-lock.js';
 import { DRAFT_KEY_TASK, ensureAgentModels, CHAT_BUBBLE_SVG } from './constants.js';
 import {
@@ -19,6 +20,7 @@ import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.
 import { createMemberCache } from './member-cache.js';
 import { api } from './api-client.js';
 import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration } from './notifications.js';
+import { renderShowOnTopControl } from './desktop-notification-panel.js';
 import { buildDepGraph, collectCycleBlocked } from './dep-graph.js';
 import { tagName } from './tag-match.js';
 import { serializeBoardFilters, sanitizeBoardFilters } from './board-filter-prefs.js';
@@ -42,7 +44,7 @@ import {
   configureTaskEditModal, openTaskEditModal, closeTaskEditModal,
   requestCloseTaskEditModal, openTaskEditModalFromTerminal,
   registerTaskEditNavigation, syncTaskEditSessionButtons, replaceModalImageBlobUrl,
-  openTaskWorkspace, registerTaskWorkspaceOpener,
+  openTaskWorkspace, registerTaskWorkspaceOpener, getOpenWorkspaceTaskId,
   // Builders shared with the New Task form (renderNewTaskForm / attachNewTaskFormHandlers).
   _renderDepChip, _statusOptionsHtml, _agentModelControlHtml, _applyModalAgentModelVisibility,
 } from './task-edit-modal.js';
@@ -2513,7 +2515,7 @@ export function updateClaudeButtons() {
       // is parked FIFO and starts by itself when a running task completes. Not a live session:
       // no spinner, a "Queued #N" label, and Stop (terminate) doubles as "cancel the queued start".
       btn.textContent = t('queue.badge', { position: queuedPosition ?? '?' });
-      btn.title = t('tooltip.queuedSession');
+      btn.title = queueReasonText(state.queueDiagnostics.get(taskId) || { reason: state.queueReasons?.get(taskId) });
       btn.classList.remove('session-running');
       btn.classList.add('resumable');
       if (card) card.classList.add('has-active-session');
@@ -2840,7 +2842,10 @@ export function syncActiveSessionsNav() {
   const host = document.getElementById('active-sessions-list');
   if (!host) return;
   const collapsed = document.body.classList.contains('left-nav-collapsed');
-  const openId = state.activeTerminal?.taskId || null;
+  // (TPT485) The open task workspace owns the highlight on every pane (Edit, Agent Terminal,
+  // Chat) and through a workspace swap, where the old xterm is released a frame before the next
+  // one mounts — following state.activeTerminal alone dropped the row and repainted it back.
+  const openId = getOpenWorkspaceTaskId() || state.activeTerminal?.taskId || null;
   const rows = [...new Set([...state.activeSessions, ...state.lostSessions.keys()])]
     // /api/sessions does not filter by session type — keep objective/spec-chat sessions
     // (and their 'obj-'-prefixed synthetic ids) out of what is meant to be a terminal list.
@@ -6668,6 +6673,8 @@ export function handleVoiceModelMessage(msg) {
 // bypasses it entirely); the only failure signal there is a captured notify:show IPC error.
 function _notifStatusKey(status) {
   if (status.delivery === 'desktop') return status.lastError ? 'settings.notifStateBlocked' : 'settings.notifStateDesktop';
+  // (TPT487) "Show on Top" off — native OS notifications, judged like the pre-TPT464 transport.
+  if (status.delivery === 'native') return status.lastError ? 'settings.notifStateBlocked' : 'settings.notifStateNative';
   if (status.transport === 'unsupported') return 'settings.notifStateUnsupported';
   if (status.transport === 'electron') return status.lastError ? 'settings.notifStateBlocked' : 'settings.notifStateNative';
   switch (status.permission) {
@@ -6715,6 +6722,9 @@ function _populateSettingsDebugRow() {
 // Electron. Callers are fire-and-forget (unchanged) — the DOM updates once the refresh
 // settles rather than blocking the modal open.
 async function _populateSettingsNotificationsRows() {
+  // (TPT487) Bottom row of the block; a toggle re-reads the status so the badge follows it.
+  renderShowOnTopControl(document.getElementById('settings-notifications-ontop-mount'),
+    { onChange: () => { _populateSettingsNotificationsRows(); } });
   await refreshNotificationStatus();
 
   const stateEl = document.getElementById('settings-notifications-state');
@@ -6979,7 +6989,7 @@ export function initSettingsModal() {
     notifTestBtn.addEventListener('click', async () => {
       notifTestBtn.disabled = true;
       const res = await sendTestNotification(t('settings.notifTestTitle'), t('settings.notifTestBody'));
-      if (!res.ok) showToast(t('settings.notifTestFailed', { reason: res.reason || '' }), 'error');
+      if (!res.ok) showToast(t('settings.notifTestFailed', { reason: res.reason === 'desktop-disabled' ? t('notifCenter.desktopDisabled') : (res.reason || '') }), 'error');
       _populateSettingsNotificationsRows();
     });
   }
@@ -7050,7 +7060,7 @@ configureTaskEditModal({
   renderAgentPicker, initAgentPicker, _taskAgentPickerOptions,
   _applyAgentPickerSelection, isAgentLocked,
   showReiterateModal, showDeleteConfirmModal, terminateSessionFromCard,
-  updateClaudeButtons, applyParentSprintFollow, writeProjectBrowserTools,
+  updateClaudeButtons, syncActiveSessionsNav, applyParentSprintFollow, writeProjectBrowserTools,
   attachImagePaste,
   renderAgentBadge, refreshCard, regroupCardToSprint, regroupNeedsReload,
   isTaskReadOnly, hasUnmetDeps, unmetDependencyKeys, canStartTaskCard,

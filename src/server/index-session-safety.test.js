@@ -15,18 +15,20 @@ const pauseRunawaySession = () => null;
 
 // Execute the real bootstrap and timer callbacks without opening sockets, reading
 // credentials, running agents, or touching the user's process tree.
-async function harness(killEnv) {
+async function harness(killEnv, failStartup = false) {
   const timers = new Map();
   const exits = [];
   const lines = [];
   const sweeps = [];
+  const memory = { starts: 0, stops: 0, ended: [], options: null };
+  let shutdownOptions, listenCallback;
   const proc = Object.assign(new EventEmitter(), {
     env: { TIPATASK_WATCHDOG_KILL: killEnv }, platform: 'darwin', arch: 'arm64',
     exit: code => exits.push(code),
   });
   const log = { log() {}, warn() {}, error: line => lines.push(line) };
-  const server = Object.assign(new EventEmitter(), { listen() {} });
-  const backend = { init: async () => {} };
+  const server = Object.assign(new EventEmitter(), { listen(port, host, callback) { listenCallback = callback; } });
+  const backend = { init: async () => { if (failStartup) throw Error('startup failed'); }, getTask: async () => ({ status: 'completed' }) };
   const mocks = {
     'node:fs': { existsSync: () => false },
     'node:child_process': { execFileSync: () => 'caveman' },
@@ -35,16 +37,24 @@ async function harness(killEnv) {
       PROJECT_ROOT: '/project-a', TASK_BACKEND: 'api' },
     './spawn-utils': { augmentPathEnv: () => ({}), isAsarPath: () => false },
     './task-backend': { createBackend: () => backend, coerceBackendType: () => 'api' },
-    './ws-handlers': { createHttpHandler: () => () => {}, drainSessionQueue() {} },
+    './ws-handlers': { createHttpHandler: () => () => {}, drainSessionQueue() {}, sessionQueue: { setAdmission() {}, isRunning: () => false } },
+    './session-admission': { createSessionAdmission: () => ({ start() {}, stop() {} }) },
     './ws-upgrade': { createWebSocketGate: () => ({ clients: new Set([{ _boardWatcher: true }]) }) },
-    './websocket': { init() {} },
+    './websocket': { init() {}, emitTaskUpdated() {} },
     './task-agent': { preloadAgentDetection: async () => {}, listAllAgentModels: async () => [] },
-    './status-roles': {},
+    './status-roles': { fetchStatusRoles: async () => ({ complete: 'completed' }) },
+    './git-merge/completion-guard': { guardCompletionTransition: async () => ({ allowed: true }), warnIfCompletedWorktreeDirty: async () => {} },
     './task-change-poll': { createTaskChangePoll: () => ({ tick: async () => { throw new TypeError('poll failed'); } }) },
     './terminal-session': { killRunawaySession, pauseRunawaySession },
     './process-group': { snapshotProcesses: async () => ({}), resolveAgentLimits,
       sweepDescendantWatchdog: (...args) => sweeps.push(args) },
-    './shutdown-reaper': { installShutdownReaper() {} },
+    './shutdown-reaper': { installShutdownReaper(opts) { shutdownOptions = opts; } },
+    './memory-telemetry': { createMemoryTelemetry: opts => {
+      memory.options = opts;
+      return { tracker: {}, start() { memory.starts++; }, stop() { memory.stops++; }, snapshot: () => ({ diagnostic: true }) };
+    } },
+    './session-memory': { createSessionMemoryTracker: () => ({}), setSessionMemoryTracker() {},
+      endSessionMemory(...args) { memory.ended.push(args); } },
     './crash-guard': { installCrashGuard: opts => installCrashGuard({ ...opts,
       proc, exit: proc.exit, log, recordExit() {} }) },
     './project-config': {},
@@ -60,13 +70,14 @@ async function harness(killEnv) {
       throw new Error(`Unexpected bootstrap dependency: ${id}`);
     },
     setInterval: (fn, ms) => { timers.set(ms, fn); return { unref() {} }; },
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, setImmediate() {},
   }, { filename });
   // Let the async boot chain install the actual 10-second polling callback.
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(exits, [], lines.join('\n'));
-  assert.ok(timers.has(10000));
-  return { sessions: module.exports.sessions, timers, proc, exits, lines, sweeps };
+  assert.deepEqual(exits, failStartup ? [1] : [], lines.join('\n'));
+  if (!failStartup) assert.ok(timers.has(10000));
+  return { sessions: module.exports.sessions, timers, proc, exits, lines, sweeps, memory,
+    server, shutdownOptions, ready: () => listenCallback(), getMemoryTelemetry: module.exports.getMemoryTelemetry };
 }
 
 test('bootstrap guard reads live sessions in any project on every exception', async () => {
@@ -109,4 +120,31 @@ test('bootstrap hands the watchdog sweep the limits resolver and both action han
     assert.equal(deps.pauseRunawaySession, pauseRunawaySession);
     assert.equal('killEnabled' in deps, false);
   }
+});
+
+test('bootstrap starts telemetry on listen and wires close, exit, reaper and startup-failure cleanup', async () => {
+  const h = await harness();
+  assert.equal(h.memory.starts, 0);
+  h.ready();
+  assert.equal(h.memory.starts, 1);
+  assert.equal(h.memory.options.getSessions(), h.sessions);
+  assert.equal(h.getMemoryTelemetry().diagnostic, true);
+  h.server.emit('close');
+  h.proc.emit('exit');
+  h.shutdownOptions.beforeShutdown();
+  assert.equal(h.memory.stops, 3);
+  const failed = await harness(undefined, true);
+  assert.equal(failed.memory.starts, 0);
+  assert.equal(failed.memory.stops, 1);
+});
+
+test('completion sweep freezes task memory history even while terminal remains alive', async () => {
+  const h = await harness();
+  const s = { type: 'terminal', alive: true, taskId: 'TPT1', _terminalOutputSeen: true, onSessionExit() {} };
+  h.sessions.set('TPT1', s);
+  await assert.rejects(h.timers.get(10000)(), /poll failed/);
+  assert.equal(s.alive, true);
+  assert.equal(h.memory.ended.length, 1);
+  assert.equal(h.memory.ended[0][0], s);
+  assert.equal(h.memory.ended[0][1], 'completed');
 });

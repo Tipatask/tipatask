@@ -508,3 +508,30 @@ test('notify() success clears a prior lastError', async () => {
     clearDebounce('tagRecover');
   }
 });
+
+test('(TPT487) Show on Top off: status reports native delivery with bundle health, and Test succeeds', async () => {
+  let live = { delivery: 'native', available: true, valid: true, reason: null, registered: false };
+  const sent = [];
+  globalThis.window = { electronAPI: {
+    notificationDelivery: 'desktop',
+    notify: (payload) => { sent.push(payload); return Promise.resolve({ ok: true, id: '1', delivery: 'native' }); },
+    notifyStatus: () => Promise.resolve(live),
+  } };
+  try {
+    await refreshNotificationStatus();
+    let status = getNotificationStatus();
+    assert.equal(status.delivery, 'native');
+    assert.equal(status.transport, 'electron');
+    assert.equal(status.lastError, 'not-registered', 'native delivery surfaces Notification Center health again');
+    const result = await sendTestNotification('t', 'b');
+    assert.deepEqual(result, { ok: true });
+    assert.equal(typeof sent.at(-1).notificationId, 'string', 'native sends keep a callback identity for click routing');
+    live = { delivery: 'desktop', available: true };
+    await refreshNotificationStatus();
+    status = getNotificationStatus();
+    assert.equal(status.delivery, 'desktop');
+    assert.equal(status.lastError, null);
+  } finally {
+    delete globalThis.window;
+  }
+});

@@ -16,6 +16,7 @@ import { t, getLocale } from './i18n.js';
 import { renderCard } from './task-card.js';
 import { openTaskEditModal } from './task-edit-modal.js';
 import { attachImagePaste } from './task-board.js';
+import { attachAudioRecorder } from './audio-recorder.js';
 import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu } from './embed-menu.js';
 import {
   taskChatProviders, pickSelection, buildModelOptionsHtml, stripAskUserFence,
@@ -72,6 +73,7 @@ const widgetSig = new WeakMap(); // widget element -> signature of the record it
 let embedded = null;        // { host, onOpenTask, onClosed } while mounted in a workspace pane
 let uploadsPending = 0;     // attachments uploading into the composer; Send waits for them
 let uploadGen = 0;          // bumped per built window; a late upload callback of an old one is ignored
+let voiceRecorder = null;  // belongs to this composer, never reused across chat windows
 // (TPT469) Per project, the chat Start Chat opens: kept until its first user message gives it a
 // title, so repeated clicks land on the same untouched draft instead of piling up new ones.
 // localStorage carries it across a renderer reload, together with that chat's composer text.
@@ -117,6 +119,7 @@ export function mount(host, taskId, { onOpenTask, onClosed } = {}) {
       }
     },
     hide() {
+      if (live()) voiceRecorder?.stop();
       if (live() && root.contains(document.activeElement)) document.activeElement.blur();
     },
     dispose() {
@@ -251,6 +254,9 @@ function isProjectChat() {
 }
 
 export function close() {
+  voiceRecorder?.setLocked(true);
+  voiceRecorder?.stop();
+  voiceRecorder = null;
   const wasEmbedded = embedded;
   embedded = null;
   closeOpenEmbedMenu();
@@ -370,6 +376,13 @@ function renderWindow() {
   root.querySelector('.task-chat-start-go').addEventListener('click', beginChat);
 
   input.addEventListener('input', () => { rememberDraft(); growInput(); syncComposer(); syncGateAttachments(); });
+  const voiceRoot = root;
+  const voiceChat = chat;
+  voiceRecorder = attachAudioRecorder(input, {
+    emphasis: true,
+    // stop() drains asynchronously. Results belong only to the original, connected composer.
+    acceptTranscript: () => root === voiceRoot && chat === voiceChat && input.isConnected,
+  });
   wireAttachments(input);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); }
@@ -505,6 +518,7 @@ function relabel() {
   applyChromeLabels();
   renderSelector();
   renderTranscript();
+  syncComposer();
 }
 
 async function loadTaskTitle(key) {
@@ -1139,6 +1153,7 @@ function syncComposer() {
   const send = root.querySelector('.task-chat-send');
   const stop = root.querySelector('.task-chat-stop');
   const select = root.querySelector('#task-chat-model-select');
+  voiceRecorder?.setLocked(!connected || running || awaitingStart);
   send.hidden = running;
   stop.hidden = !running;
   if (!running) stop.disabled = false;

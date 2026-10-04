@@ -69,7 +69,7 @@ test('paused controls survive session snapshot and terminal reconnect; sidebar R
     state.taskTitleById.set('T417', 'Paused task');
     state.taskStatusById.set('T417', 'in_progress');
     document.body.innerHTML = '<div id="app"></div><div id="active-sessions-list"></div>';
-    const paused = { reason: 'memory', count: 35, rssMb: 6400, limitMb: 3072 };
+    const paused = { reason: 'memory-pressure', count: 35, rssMb: 6400, limitMb: 3072 };
     const snapshot = () => attention.mergeSessionsSnapshot({ sessions: ['T417'], sessionMeta: {
       T417: { type: 'terminal', agent: 'claude', alive: true, startedAt: Date.now(), paused },
     } });
@@ -95,6 +95,8 @@ test('paused controls survive session snapshot and terminal reconnect; sidebar R
     sockets[1].open();
     sockets[1].frame({ type: 'terminal-state', taskAgent: 'claude', phase: 'executing', paused });
     assert.ok(document.querySelector('.terminal-watchdog-actions .btn-resume-paused'));
+    assert.match(document.querySelector('.terminal-watchdog-actions').title, /Sustained high RSS, host pressure, and growth in this tree/);
+    assert.match(document.querySelector('.terminal-watchdog-actions').title, /RSS warning 3072 MiB/);
     document.querySelector('.terminal-watchdog-actions .btn-resume-paused').click();
     assert.deepEqual(sockets[1].sent.at(-1), { type: 'resume-paused' });
     sockets[1].frame({ type: 'terminal-state', taskAgent: 'claude', phase: 'executing', paused: null });

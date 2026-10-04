@@ -27,7 +27,8 @@ const CODEX_TOOL_FENCE =
   'You are a read-only PLANNER. Never call create_task, update_task, delete_task, ' +
   'create_task_comment, or create_system_tag — you only propose changes as fenced ```json ' +
   'blocks for a human to review and save. reserve_task_keys is the one exception (it only ' +
-  'claims a placeholder id, it never creates/mutates real task content).';
+  'claims a placeholder id, it never creates/mutates real task content). get_task is allowed ' +
+  '(read-only) to load an existing task\'s full description before proposing a modified one.';
 
 const MAX_IMAGE_ATTACH = 8;
 const IMAGE_ATTACH_RE = /@(\S+\.(?:png|jpe?g|gif|webp|svg))/gi;
@@ -64,6 +65,8 @@ function extractLocalImagePaths(text, max = MAX_IMAGE_ATTACH) {
 // every other MCP server in the project's Codex config, which the profile switches off.
 function buildCodexArgs(session, { cwd, model, imagePaths, otherMcpServers = [] }) {
   const imgFlags = imagePaths.flatMap(p => ['-i', p]);
+  // Headless exec has its own process per turn. These overrides are intentional:
+  // effort and the chat tool fence must never become mutable terminal defaults.
   const effortFlags = codexEffortArgs(toCodexEffort(config.OBJECTIVE_EFFORT));
   const profile = toolProfileFor(session, 'codex');
   if (session.codexSessionId) {
@@ -395,7 +398,7 @@ function spawnCodexTurn(session, taskId) {
 
     if (config.OBJECTIVE_TIMING_ENABLED) session.timingMilestones.procSpawnedAt = Date.now();
     emit({ type: 'objective-progress', stage: 'spawned' });
-    console.log(`[codex] Spawn task=${taskId} model=${model || '(default)'} first=${!hasProviderSession} images=${imagePaths.length}`);
+    console.log(`[codex] Spawn task=${taskId} model=${model || '(default)'} first=${!hasProviderSession} images=${imagePaths.length} mode=exec reason=per-turn-effort-and-tool-policy`);
 
     try {
       proc.stdin.write(finalPrompt);

@@ -48,6 +48,7 @@ function reapLlmChildren(sessions, reason, { claude, headless }) {
  * @param {Function} [opts.exit]         TEST SEAM — defaults to process.exit
  * @param {Function} [opts.sleepSync]    TEST SEAM — defaults to a blocking Atomics.wait
  * @param {number} [opts.graceMs]
+ * @param {Function} [opts.beforeShutdown] Synchronous best-effort diagnostic cleanup
  * @returns {Function} shutdown(reason)
  */
 function installShutdownReaper({
@@ -59,11 +60,13 @@ function installShutdownReaper({
   exit = (code) => process.exit(code),
   sleepSync = defaultSleepSync,
   graceMs = SHUTDOWN_KILL_GRACE_MS,
+  beforeShutdown = () => {},
 } = {}) {
   let started = false;
   const shutdown = (reason) => {
     if (started) return; // quitting delivers SIGTERM and then 'disconnect' — reap once
     started = true;
+    try { beforeShutdown(); } catch { /* diagnostic cleanup must not prevent shutdown */ }
     try {
       recordExit({ reason: SHUTDOWN_SIGNALS.includes(reason) ? `signal:${reason}` : reason, sessions });
     } catch { /* exit and child cleanup must still run */ }

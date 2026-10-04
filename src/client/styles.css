@@ -5347,6 +5347,11 @@
 
   .terminal-body {
     flex: 1;
+    min-width: 0;
+    min-height: 0;
+    /* FitAddon reads computed width/height of this parent as usable space.
+       Keep padding outside those measurements, unlike the app's global reset. */
+    box-sizing: content-box;
     padding: 4px;
     overflow: hidden;
     position: relative;
@@ -5354,6 +5359,16 @@
 
   .terminal-body .xterm {
     height: 100%;
+    text-align: left;
+    text-transform: none;
+    word-spacing: normal;
+  }
+
+  /* Terminal cells own wrapping; workspace prose rules must never split rows. */
+  .terminal-body .xterm-rows {
+    white-space: pre;
+    overflow-wrap: normal;
+    word-break: normal;
   }
 
   /* TPT171 — the terminal chrome is a fixed dark palette (#1e1e2e / #181825 / #313244,
@@ -6112,6 +6127,14 @@
     animation: tt-board-loader-in 0.18s ease 140ms forwards;
   }
   @keyframes tt-board-loader-in { to { opacity: 1; } }
+  /* (TPT485) While a task workspace is open the rail is live (TPT479), so a rail click that
+     loads the next task must not dim or block it: the loader starts at the rail's edge, the
+     same offsets as .task-edit-overlay--rail / .terminal-overlay--task — keep the three in sync. */
+  body.task-modal-rail .board-modal-loader { left: 200px; }
+  body.task-modal-rail.left-nav-collapsed .board-modal-loader { left: 56px; }
+  @media (max-width: 768px) {
+    body.task-modal-rail .board-modal-loader { left: 56px; }
+  }
   .tt-spinner-lg {
     width: 26px;
     height: 26px;
@@ -6197,96 +6220,88 @@
   /* Both up: saving pill and corner toast must not land on the same row. */
   body:has(#voice-rec-toast):has(#tt-saving-indicator) .tt-saving-indicator--toast { bottom: 8.5rem; }
   body:has(#voice-rec-toast):has(#tt-saving-indicator) #tt-notif-stack { bottom: 11.75rem; }
-  .tt-notif-stack-header {
+  /* Header, cards and Show More: the shared compact page in notification-cards.css (TPT484),
+     imported by index.js right after this file so the banner window and this stack match. */
+
+  /* ── Full desktop-notification list (TPT480, desktop-notification-panel.js) ──
+     Opened by the always-on-top banner's "Show More". Collapsed = the in-app stack's
+     footprint; expanded = full window height. Scrolls only when the cards overflow. While it
+     is mounted it replaces #tt-notif-stack, so the same notification never shows twice. */
+  body:has(#tt-desktop-notif-panel) #tt-notif-stack { display: none; }
+  #tt-desktop-notif-panel {
+    position: fixed;
+    right: 1.5rem;
+    bottom: 5.25rem;
+    z-index: 10002;
+    width: 340px;
+    max-width: calc(100vw - 2rem);
+    max-height: calc(100vh - 12rem);
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 0.72rem;
-    color: var(--c-text-muted, var(--c-text));
-    padding: 0 0.2rem;
-  }
-  .tt-notif-stack-clear {
-    pointer-events: auto;
-    background: none;
-    border: none;
-    color: var(--c-primary);
-    font-size: 0.72rem;
-    font-weight: 600;
-    cursor: pointer;
-    padding: 0;
-  }
-  .tt-notif-card {
-    position: relative;
-    pointer-events: auto;
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
+    flex-direction: column;
     background: var(--c-bg-card);
     color: var(--c-text);
     border: 1px solid var(--c-border);
-    border-radius: 10px;
-    box-shadow: 0 4px 16px var(--c-shadow);
-    padding: 0.55rem 1.6rem 0.55rem 0.75rem;
-    font-size: 0.85rem;
-    cursor: pointer;
-    opacity: 0;
-    transform: translateY(6px);
-    transition: opacity 0.2s ease, transform 0.2s ease, border-color 0.15s;
+    border-radius: 12px;
+    box-shadow: 0 8px 28px var(--c-shadow);
+    overflow: hidden;
   }
-  .tt-notif-card { flex-shrink: 0; }
-  .tt-notif-card.is-shown {
-    opacity: 1;
-    transform: none;
+  #tt-desktop-notif-panel.is-expanded {
+    top: 1rem;
+    bottom: 1rem;
+    max-height: none;
   }
-  .tt-notif-card:hover {
-    border-color: var(--c-primary);
-  }
-  .tt-notif-card-icon {
-    width: 14px;              /* same slot .tt-toast-icon occupies */
-    font-size: 0.9rem;
-    line-height: 1.3;
-    text-align: center;
+  .tt-dnp-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.6rem 0.5rem 0.85rem;
+    border-bottom: 1px solid var(--c-border);
     flex-shrink: 0;
   }
-  .tt-notif-card--attention .tt-notif-card-icon { color: var(--c-warning); }
-  .tt-notif-card--objective .tt-notif-card-icon { color: var(--c-success); }
-  .tt-notif-card--completed .tt-notif-card-icon { color: var(--c-primary); } /* (C1355) distinct from --objective's --c-success */
-  .tt-notif-card-body-wrap {
-    min-width: 0;
-    flex: 1;
-  }
-  .tt-notif-card-title {
-    font-size: 0.82rem;
-    font-weight: 600;
-    margin-bottom: 0.15rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .tt-notif-card-body {
-    font-size: 0.78rem;
-    color: var(--c-text-muted, var(--c-text));
-    line-height: 1.3;
-    overflow: hidden;
-    display: -webkit-box;
-    -webkit-line-clamp: 3;
-    -webkit-box-orient: vertical;
-  }
-  .tt-notif-card-close {
-    position: absolute;
-    top: 0.35rem;
-    right: 0.4rem;
+  .tt-dnp-count { flex: 1; font-size: 0.85rem; font-weight: 600; }
+  .tt-dnp-clear {
     background: none;
     border: none;
+    color: var(--c-primary);
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0.15rem 0.3rem;
+  }
+  .tt-dnp-clear[hidden] { display: none; }
+  .tt-dnp-icon {
+    width: 1.6rem;
+    height: 1.6rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 6px;
     color: var(--c-text-muted, var(--c-text));
-    font-size: 1rem;
+    font-size: 0.95rem;
     line-height: 1;
     cursor: pointer;
-    padding: 0.1rem 0.25rem;
   }
-  .tt-notif-card-close:hover {
-    color: var(--c-text);
+  .tt-dnp-icon:hover { color: var(--c-text); border-color: var(--c-border); }
+  .tt-dnp-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.6rem;
   }
+  .tt-dnp-list:empty { display: none; }
+  .tt-dnp-list .tt-notif-card { box-shadow: none; }
+  .tt-dnp-empty {
+    padding: 1.25rem 0.85rem;
+    text-align: center;
+    font-size: 0.8rem;
+    color: var(--c-text-muted, var(--c-text));
+  }
+  .tt-dnp-empty[hidden] { display: none; }
 
   .tt-toast--success .tt-toast-icon { color: var(--c-success); }
   .tt-toast--error   .tt-toast-icon { color: var(--c-danger); }
@@ -10547,18 +10562,19 @@ img.agent-picker-icon {
   box-shadow: 0 8px 32px rgba(0,0,0,0.22);
 }
 /* ── (TPT466) Task workspace: one modal, three panes (Edit / Agent Terminal / Chat) ──
-   The panel's data-pane picks its size: Edit keeps the form's width with content height, Chat
-   gets a fixed reading frame, and Agent Terminal is the largest — the xterm wants every row and
-   column it can get. On the terminal pane the overlay starts at the left-nav rail's edge
-   (TPT360 offsets, same as .terminal-overlay--task) so the rail's session rows stay live. */
+   (TPT479) One frame for all three panes: the same box on Edit, Agent Terminal and Chat, so a
+   pane switch never moves the panel, its header or the ✕. It is sized for the xterm, the pane
+   that wants every row and column; the Edit form reads in a centred column inside it. The
+   overlay starts at the left-nav rail's edge on every pane (TPT360 offsets, same as
+   .terminal-overlay--task) so the rail's session rows stay live. A fresh overlay is rendered
+   with the rail class already on, so its `left` transition only runs on a rail collapse. */
 .task-edit-panel--tabs {
-  transition: max-width 0.18s ease, width 0.18s ease, height 0.18s ease;
-}
-.task-edit-panel--tabs[data-pane="chat"] {
-  max-width: min(880px, 94vw); height: min(86vh, 900px);
-}
-.task-edit-panel--tabs[data-pane="terminal"] {
   max-width: min(1400px, 100%); height: min(900px, calc(100vh - 40px)); max-height: none;
+}
+.task-edit-panel--tabs .modal-scroll-body,
+.task-edit-panel--tabs .modal-context-btns {
+  padding-left: max(18px, calc((100% - 960px) / 2));
+  padding-right: max(18px, calc((100% - 960px) / 2));
 }
 .task-edit-overlay--rail {
   left: 200px; padding: 20px;
@@ -10576,6 +10592,8 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .task-modal-pane--chat { border-top: 1px solid var(--c-border); }
 .task-modal-pane--terminal {
   position: relative;
+  min-width: 0;
+  overflow: hidden;
   background: #1e1e2e;
   border-top: 1px solid var(--c-border);
 }
@@ -10585,13 +10603,19 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   display: flex; flex: 1 1 auto; min-height: 0; min-width: 0;
 }
 .task-modal-pane--terminal .terminal-container {
+  flex: 1 1 0;
+  min-width: 0; min-height: 0; height: auto;
   max-width: none; max-height: none;
   border-radius: 0; box-shadow: none; border: 0;
 }
+/* (TPT485) Toolbar edges on the workspace header's: the agent chip under the key chip,
+   Terminate under the ✕ (.task-edit-panel--tabs .modal-top-bar side padding, 12px on a phone). */
+.task-modal-pane--terminal .terminal-header { padding: 8px 18px; }
 .task-modal-pane--terminal .terminal-task-key,
 .task-modal-pane--terminal .terminal-task-title,
 .task-modal-pane--terminal .btn-show-task,
-.task-modal-pane--terminal .btn-close-terminal { display: none; }
+.task-modal-pane--terminal .btn-close-terminal,
+.terminal-embed .status-dot { display: none; }
 .task-modal-pane--terminal.task-modal-pane--empty {
   background: var(--c-bg);
   align-items: center; justify-content: center;
@@ -10621,6 +10645,24 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .task-modal-terminal-start svg { width: 14px; height: 14px; }
 .task-modal-terminal-start .session-spinner { width: 12px; height: 12px; }
 
+/* (TPT479) The header is a fixed grid on every pane — meta | tabs | actions | ✕ — so its height
+   and the tab strip's place never change: the actions cell keeps its 1fr when Reset/Save are
+   hidden (Terminal, Chat), which keeps the tabs exactly where they sit on Edit. */
+.task-edit-panel--tabs .modal-top-bar {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  grid-template-areas: "meta tabs actions close";
+  align-items: center; column-gap: 12px; row-gap: 8px;
+  min-height: calc(var(--modal-ctrl-h) + 26px); box-sizing: border-box;
+  padding: 14px 18px 12px;
+}
+.task-edit-panel--tabs .modal-top-bar .modal-head-meta { grid-area: meta; margin-right: 0; }
+.task-edit-panel--tabs .modal-top-bar .task-modal-tabs { grid-area: tabs; }
+.task-edit-panel--tabs .modal-top-bar .modal-primary-actions { grid-area: actions; justify-self: end; }
+.task-edit-panel--tabs .modal-top-bar .btn-modal-close { grid-area: close; justify-self: end; }
+/* ✕ is the workspace's one close control on every pane — it goes through the same dirty-draft
+   confirm Cancel did (requestCloseTaskEditModal()). Non-tabbed modals keep Cancel. */
+.task-edit-panel--tabs .btn-modal-cancel { display: none; }
+
 /* Segmented tab strip, centred between the key/status and the Save group. */
 .modal-top-bar .task-modal-tabs {
   display: inline-flex; align-items: center; gap: 2px;
@@ -10647,6 +10689,9 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   background: var(--c-warning); flex-shrink: 0;
 }
 .task-modal-tab[data-pane="terminal"] .task-modal-tab-dot { background: var(--c-success); }
+.task-modal-tab[data-pane="terminal"] .task-modal-tab-dot--paused { background: var(--c-warning); }
+.task-modal-tab[data-pane="terminal"] .task-modal-tab-dot--exited { background: var(--c-text-faint); }
+.task-modal-tab[data-pane="terminal"] .task-modal-tab-dot--disconnected { background: var(--c-danger); }
 .task-modal-tab[data-pane="terminal"] .task-modal-tab-dot--attention {
   background: var(--c-warning);
   animation: task-modal-dot-pulse 1.4s ease-in-out infinite;
@@ -10666,7 +10711,6 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .task-edit-panel--tabs:not([data-pane="edit"]) .modal-head-title { display: block; }
 .task-edit-panel--tabs:not([data-pane="edit"]) .modal-status-select,
 .task-edit-panel--tabs:not([data-pane="edit"]) .modal-primary-actions { display: none; }
-.task-edit-panel--tabs:not([data-pane="edit"]) .modal-top-bar { flex-wrap: nowrap; padding-bottom: 12px; }
 .modal-top-bar button.btn-modal-close {
   display: inline-flex; align-items: center; justify-content: center;
   width: var(--modal-ctrl-h); padding: 0;
@@ -10674,9 +10718,8 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 }
 .modal-top-bar button.btn-modal-close svg { width: 16px; height: 16px; }
 .modal-top-bar button.btn-modal-close:hover { color: var(--c-text); background: var(--c-bg-tier); }
-.task-edit-panel--tabs[data-pane="edit"] .btn-modal-close { display: none; }
 @media (prefers-reduced-motion: reduce) {
-  .task-edit-panel--tabs, .task-edit-overlay--rail { transition: none; }
+  .task-edit-overlay--rail { transition: none; }
   .task-modal-tab-dot--attention { animation: none; }
 }
 
@@ -11267,8 +11310,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   .task-edit-overlay { padding: 10px; }
   .task-edit-panel { max-width: 100%; max-height: calc(100vh - 20px); max-height: calc(100dvh - 20px); }
   .task-edit-overlay--rail { padding: 10px; }
-  .task-edit-panel--tabs[data-pane="chat"],
-  .task-edit-panel--tabs[data-pane="terminal"] { max-width: 100%; height: calc(100vh - 20px); height: calc(100dvh - 20px); max-height: none; }
+  .task-edit-panel--tabs { max-width: 100%; height: calc(100vh - 20px); height: calc(100dvh - 20px); max-height: none; }
   .task-edit-panel .modal-field-group { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 480px) {
@@ -11281,6 +11323,17 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   /* (TPT466) Icon-only workspace tabs on a phone, so the tab strip and Reset/Save share a row. */
   .modal-top-bar .task-modal-tab { padding: 0 9px; }
   .modal-top-bar .task-modal-tab-label { display: none; }
+  /* (TPT479) Two fixed rows on every pane — key/status + ✕, then tabs + Reset/Save — so the
+     header is one height whether or not the Edit-only actions are showing. */
+  .task-edit-panel--tabs .modal-top-bar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "meta close" "tabs actions";
+    padding: 12px 12px 8px;
+  }
+  .task-edit-panel--tabs .modal-top-bar .task-modal-tabs { justify-self: start; }
+  .task-modal-pane--terminal .terminal-header { padding: 8px 12px; }
+  .task-edit-panel--tabs .modal-scroll-body,
+  .task-edit-panel--tabs .modal-context-btns { padding-left: 12px; padding-right: 12px; }
   .modal-scroll-body { padding: 0 12px 12px; }
   .modal-context-btns { padding: 8px 12px 10px; }
   .task-edit-panel .modal-field-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }

@@ -32,10 +32,11 @@ class MockDocument extends EventTarget {
 
 globalThis.Notification = class MockNotification {
   constructor(title, options) {
-    lastNotification = { title, options };
+    this.record = lastNotification = { title, options };
     sentNotifications.push(lastNotification);
   }
-  set onclick(handler) { this._onclick = handler; lastNotification.onclick = handler; }
+  set onclick(handler) { this._onclick = handler; this.record.onclick = handler; }
+  close() { this.record.closed = true; }
   static get permission() { return mockPermission; }
   static requestPermission() { return Promise.resolve('granted'); }
 };

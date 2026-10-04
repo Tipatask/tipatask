@@ -153,3 +153,43 @@ test('GET /api/sessions restores project-scoped losses from disk after registry 
     await new Promise(resolve => server.close(resolve));
   }
 });
+
+test('HTTP inventory and queue WS frames preserve diagnostics and detail-only updates', async () => {
+  const { sessionQueue, queuedSessionFrame } = require('./ws-handlers');
+  const websocket = require('./websocket');
+  const frames = [], broadcasts = [];
+  const ws = { OPEN: 1, readyState: 1, send: raw => frames.push(JSON.parse(raw)) };
+  const s = fakeSession({ tabId: 'QUEUE', taskId: 'QUEUE', alive: false, projectPath: scratch, ws });
+  const key = `QUEUE\0${scratch}`;
+  const sessions = new Map([[key, s]]);
+  let diagnostic = { allowed: false, reason: 'coordination', coordinationReason: 'unregistered-server',
+    detail: null, instances: 1, censusPidCount: 2, unregisteredCount: 1, unregisteredPids: [9999] };
+  const server = http.createServer(createHttpHandler(sessions, () => ({})));
+  websocket.init({ clients: new Set([{ readyState: 1, _projectPath: scratch,
+    send: raw => broadcasts.push(JSON.parse(raw)) }]) });
+  sessionQueue.setAdmission({ tryReserve: () => diagnostic, snapshot: () => diagnostic });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    sessionQueue.submit({ key, session: s, taskId: 'QUEUE', start: () => assert.fail('must stay queued') });
+    for (const next of [diagnostic, { ...diagnostic, coordinationReason: null, detail: 'lock-busy',
+      instances: null, unregisteredCount: null, unregisteredPids: null },
+    { ...diagnostic, coordinationReason: null, detail: 'state-invalid', instances: null,
+      unregisteredCount: null, unregisteredPids: null }]) {
+      diagnostic = next;
+      sessionQueue.drain();
+      const response = await getJson(server.address().port, '/api/sessions', { 'x-tipatask-project': scratch });
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.json.admission, diagnostic);
+      const snapshot = sessionQueue.snapshot(scratch);
+      assert.deepEqual(response.json.queued, snapshot.queued);
+      assert.deepEqual(broadcasts.at(-1).queued, snapshot.queued);
+      assert.deepEqual(frames.at(-1), queuedSessionFrame(s, 'QUEUE', snapshot));
+      for (const field of ['coordinationReason', 'detail', 'instances', 'censusPidCount', 'unregisteredCount', 'unregisteredPids']) {
+        assert.deepEqual(frames.at(-1)[field], diagnostic[field], field);
+      }
+    }
+  } finally {
+    sessionQueue.remove(key); sessionQueue.setAdmission(null); websocket.init(null);
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+  }
+});

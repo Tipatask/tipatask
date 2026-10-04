@@ -32,3 +32,31 @@ test('desktop sends keep per-banner callbacks across debounce resets and ignore 
   assert.notEqual(sent[2].notificationId, sent[3].notificationId);
   delete globalThis.window;
 });
+
+test('task cleanup releases all matching desktop callbacks without touching another project', async () => {
+  const sent = [], dismissedTasks = [];
+  let projectPath = '/a', click;
+  globalThis.window = { electronAPI: { notificationDelivery: 'desktop',
+    notify: async payload => { sent.push(payload); return { ok: true }; },
+    getProjectPath: () => projectPath,
+    dismissTaskNotifications: id => { dismissedTasks.push([projectPath, id]); return Promise.resolve({ ok: true }); },
+    onNotificationClick: cb => { click = cb; }, onNotificationDismiss: () => {},
+  } };
+  const api = await import('./notifications.js?task-dismissal');
+  let calls = [];
+  function send(tag, id) {
+    api.clearDebounce(tag);
+    api.notify(tag, '', tag, { onClick: () => calls.push(id) });
+  }
+  send('TPT483', 'old1'); send('TPT483', 'old2'); send('activity-TPT483', 'activity');
+  send('completed-TPT483', 'completion'); send('objective-TPT483', 'objective');
+  projectPath = '/b'; send('TPT483', 'other-project');
+  projectPath = '/a';
+  api.dismissTaskNotifications('TPT483');
+  for (const payload of sent.slice(0, 5)) click({ ...payload, projectPath: '/a' });
+  assert.deepEqual(calls, ['objective']);
+  projectPath = '/b'; click({ ...sent[5], projectPath: '/b' });
+  assert.deepEqual(calls, ['objective', 'other-project']);
+  assert.deepEqual(dismissedTasks, [['/a', 'TPT483']]);
+  delete globalThis.window;
+});

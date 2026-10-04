@@ -19,10 +19,9 @@ function createSession(ws, pending, tabId, projectPath) {
     ptyPid: null,             // (C1565) pty leader pid == pgid (forkpty implies setsid) —
                                // stashed separately because terminateTerminalSession() nulls
                                // session.pty before the group-kill needs the pid
-    descendantWatchdog: null, // (C1565/TPT370) { pid, lastCount, lastAlertCount, threshold,
-                               // alerted, growthStreak, rssStreak, rssAlerted, lastAlertRssMb,
-                               // paused, killed, actReason, resumeBase } — set at spawn,
-                               // nulled on exit — see process-group.js evaluateRunaway()
+    descendantWatchdog: null, // Per-run count/RSS/pressure streaks, timestamps, policy identity,
+                               // action latches and resume baseline; set at spawn, cleared on exit.
+                               // See process-group.js evaluateRunaway().
     _pause: null,             // { at, reason, count, threshold, rssMb, limitMb, text, targets }
                                // while the watchdog holds the tree SIGSTOPped — see
                                // terminal-session.js pauseRunawaySession()/resumeRunawaySession()

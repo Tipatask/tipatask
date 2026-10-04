@@ -11,6 +11,16 @@ import { Window } from 'happy-dom';
 const source = readFileSync(new URL('./task-chat.js', import.meta.url), 'utf8');
 const model = await import('./task-chat-model.js');
 const { WS_SEND_TYPES, WS_RECV_TYPES } = await import('./ws-client.js');
+const { createLiveInserter } = await import('./utils.js');
+const voiceHelpers = {
+  ...await import('./voice-errors.js'),
+  ...await import('./voice-model-state.js'),
+  ...await import('./voice-report.js'),
+  ...await import('./voice-devices.js'),
+  ...await import('./voice-silence.js'),
+  ...await import('./voice-shortcut.js'),
+};
+const recorderSource = readFileSync(new URL('./audio-recorder.js', import.meta.url), 'utf8');
 
 const DIALOG = {
   id: 'dlg-1',
@@ -20,13 +30,15 @@ const DIALOG = {
 };
 const TASK = { id: 'TPT9', title: 'New task', description: 'Body', status: 'pending', tags: ['feature'], dependencies: [] };
 
-function harness(t, { topLayer = () => true, draftStorage = new Map(), projectPath = '/projects/alpha' } = {}) {
+function harness(t, { topLayer = () => true, draftStorage = new Map(), projectPath = '/projects/alpha', voice = false } = {}) {
   const window = new Window();
   t.after(() => window.happyDOM.close());
   const sent = [];
   const opened = [];
   const sockets = [];
   const uploads = { menus: [], drops: [], pastes: [] };
+  const recordings = [];
+  const toasts = [];
   let locale = 'en';
   let currentProjectPath = projectPath;
   class FakeSocket {
@@ -69,9 +81,39 @@ function harness(t, { topLayer = () => true, draftStorage = new Map(), projectPa
     attachFileDrop: (target, textarea, opts) => uploads.drops.push({ target, textarea, opts }),
     attachImagePaste: (textarea, _ws, opts) => uploads.pastes.push({ textarea, opts }),
     closeOpenEmbedMenu: () => {},
+    attachAudioRecorder: () => null,
     ...model,
   };
+  if (voice) {
+    const track = { stopped: false, stop() { this.stopped = true; } };
+    class Recorder extends window.EventTarget {
+      state = 'inactive';
+      mimeType = 'audio/webm';
+      start() { this.state = 'recording'; }
+      stop() { this.state = 'inactive'; this.dispatchEvent(new window.Event('stop')); }
+    }
+    Object.assign(env, voiceHelpers, {
+      createLiveInserter,
+      pureMatchesVoiceShortcut: voiceHelpers.matchesVoiceShortcut,
+      pureVoiceShortcutLabel: voiceHelpers.voiceShortcutLabel,
+      navigator: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [track] }) } },
+      MediaRecorder: Recorder, Blob, CustomEvent: window.CustomEvent, Event: window.Event,
+      showToast: message => toasts.push(message),
+      api: { transcribeAudio: async () => ({ transcript: 'Fallback speech.' }) },
+      createVoiceStream: callbacks => {
+        const stream = { ...callbacks, start() {}, stop: async () => ({ micPeak: 1 }) };
+        recordings.push(stream);
+        return stream;
+      },
+      track,
+    });
+  }
   vm.createContext(env);
+  if (voice) {
+    // Run the real inserter in this DOM's realm so its input events use the matching Event.
+    env.createLiveInserter = vm.runInContext(`(${createLiveInserter.toString()})`, env);
+    vm.runInContext(recorderSource.replace(/^import [\s\S]*?;\n/gm, '').replace(/^export /gm, ''), env);
+  }
   vm.runInContext(source.replace(/^import [\s\S]*?;\n/gm, '').replace(/^export /gm, ''), env);
   const doc = window.document;
   const feed = frame => sockets.at(-1).onmessage({ data: JSON.stringify(frame) });
@@ -91,7 +133,7 @@ function harness(t, { topLayer = () => true, draftStorage = new Map(), projectPa
   };
   const setLocale = (lang) => { locale = lang; };
   const setProjectPath = (path) => { currentProjectPath = path; };
-  return { env, doc, sent, opened, sockets, uploads, feed, start, turn, setLocale, setProjectPath,
+  return { env, doc, sent, opened, sockets, uploads, recordings, toasts, feed, start, turn, setLocale, setProjectPath,
     $: sel => doc.querySelector(sel), $$: sel => [...doc.querySelectorAll(sel)] };
 }
 
@@ -110,6 +152,191 @@ function typeDraft(h, text) {
   input.value = text;
   input.dispatchEvent(new h.doc.defaultView.Event('input', { bubbles: true }));
 }
+
+const drainVoice = () => new Promise(resolve => setImmediate(resolve));
+
+for (const kind of ['task', 'project']) {
+  test(`${kind} chat voice preserves typing through streaming and fallback without sending`, async t => {
+    const h = harness(t, { voice: true });
+    if (kind === 'task') h.start();
+    else {
+      h.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '2' } }) });
+      await h.env.openProjectChat();
+      h.feed({ type: 'config', objectiveProviders: [] });
+      click(h.$('.task-chat-start-go'));
+      h.feed({ type: 'chat-ready' });
+      h.sent.length = 0;
+    }
+    const input = h.$('.task-chat-input');
+    const recorder = input.__voiceRecorder;
+    const mic = h.$('.audio-rec-btn');
+    assert.ok(recorder);
+    assert.equal(mic.disabled, false);
+    assert.equal(mic.title, mic.getAttribute('aria-label'));
+    typeDraft(h, 'Typed: ');
+    input.setSelectionRange(input.value.length, input.value.length);
+    await recorder.start();
+    const stream = h.recordings.at(-1);
+    stream.onPartial('Hello');
+    assert.equal(input.value, 'Typed: Hello');
+    stream.onPartial('Hello world');
+    assert.equal(input.value, 'Typed: Hello world');
+    stream.onFinal('Hello world.');
+    recorder.stop();
+    await drainVoice();
+    assert.equal(input.value, 'Typed: Hello world. ');
+    await recorder.start();
+    h.recordings.at(-1).onPartial('Fallback');
+    recorder.stop();
+    await drainVoice();
+    assert.equal(input.value, 'Typed: Hello world. Fallback speech. ');
+    assert.deepEqual(h.sent, [], 'transcripts never submit a chat message');
+    h.env.close();
+    if (kind === 'task') h.env.open('TPT1');
+    else await h.env.openProjectChat();
+    assert.equal(h.$('.task-chat-input').value, 'Typed: Hello world. Fallback speech. ', 'voice uses normal draft persistence');
+  });
+}
+
+test('chat voice locks through connection, gate, reply and model availability; labels relocalize', async t => {
+  const h = harness(t, { voice: true });
+  h.env.open('TPT1');
+  const mic = h.$('.audio-rec-btn');
+  const recorder = h.$('.task-chat-input').__voiceRecorder;
+  assert.equal(mic.disabled, true);
+  h.feed({ type: 'config', objectiveProviders: [] });
+  await recorder.start();
+  assert.equal(h.recordings.length, 0);
+  click(h.$('.task-chat-start-go'));
+  assert.equal(mic.disabled, true);
+  h.feed({ type: 'chat-ready' });
+  assert.equal(mic.disabled, false);
+  h.env.setVoiceInputAvailability('local', [], 'missing');
+  assert.equal(mic.disabled, true);
+  await recorder.start();
+  assert.equal(h.recordings.length, 0);
+  assert.match(h.toasts.at(-1), /voice.errEngineUnavailable/);
+  h.env.setVoiceInputAvailability('cloud', [], '');
+  assert.equal(mic.disabled, false);
+  h.turn();
+  h.env.setVoiceInputAvailability('cloud', [], '');
+  assert.equal(mic.disabled, true, 'availability updates preserve reply lock');
+  h.feed({ type: 'chat-ready' });
+  assert.equal(mic.disabled, false);
+  h.setLocale('uk');
+  h.doc.dispatchEvent(new h.env.window.Event('tiptask:reload'));
+  assert.match(mic.title, /^uk:voice.record/);
+  assert.equal(mic.title, mic.getAttribute('aria-label'));
+  h.sockets.at(-1).onclose();
+  assert.equal(mic.disabled, true);
+});
+
+test('voice shortcut targets chat controls, excludes hidden panes and stops active capture first', async t => {
+  const h = harness(t, { voice: true });
+  h.start();
+  const input = h.$('.task-chat-input');
+  const recorder = input.__voiceRecorder;
+  const other = h.doc.createElement('textarea');
+  other.id = 'chat-input';
+  other.__voiceRecorder = { toggle() {} };
+  h.doc.body.append(other);
+  typeDraft(h, 'Draft');
+  h.$('.task-chat-send').focus();
+  assert.equal(h.env.resolveVoiceTarget(), recorder);
+  input.focus();
+  assert.equal(h.env.resolveVoiceTarget(), recorder);
+  h.$('.audio-rec-btn').focus();
+  assert.equal(h.env.resolveVoiceTarget(), recorder);
+  await recorder.start();
+  other.focus();
+  assert.equal(h.env.resolveVoiceTarget(), recorder, 'active mic outranks another focused field');
+  recorder.stop();
+  await drainVoice();
+  h.$('.task-chat-modal').hidden = true;
+  other.blur();
+  assert.equal(h.env.resolveVoiceTarget(), other.__voiceRecorder);
+});
+
+test('permission denial and close during permission prompt leave no capture or crossed draft', async t => {
+  const h = harness(t, { voice: true });
+  h.start();
+  const recorder = h.$('.task-chat-input').__voiceRecorder;
+  h.env.navigator.mediaDevices.getUserMedia = async () => { throw new Error('denied'); };
+  await recorder.start();
+  assert.equal(h.recordings.length, 0);
+  assert.equal(h.toasts.at(-1), 'voice.micDenied');
+  let grant;
+  h.env.navigator.mediaDevices.getUserMedia = () => new Promise(resolve => { grant = resolve; });
+  const start = recorder.start();
+  await drainVoice();
+  h.$('.task-chat-close').focus();
+  assert.equal(h.env.resolveVoiceTarget(), recorder, 'permission-pending capture keeps shortcut priority');
+  h.env.close();
+  h.env.open('TPT2');
+  grant({ getTracks: () => [h.env.track] });
+  await start;
+  assert.equal(h.env.track.stopped, true);
+  assert.equal(h.recordings.length, 0);
+  assert.equal(h.$('.task-chat-input').value, '');
+});
+
+test('closing chat stops capture and rejects delayed streaming and batch results after reopening', async t => {
+  const h = harness(t, { voice: true });
+  h.start();
+  typeDraft(h, 'Original draft');
+  const input = h.$('.task-chat-input');
+  await input.__voiceRecorder.start();
+  const stream = h.recordings.at(-1);
+  let finishDrain;
+  stream.stop = () => new Promise(resolve => { finishDrain = resolve; });
+  input.__voiceRecorder.stop();
+  await input.__voiceRecorder.start();
+  assert.equal(h.recordings.length, 1, 'shortcut cannot start another capture while draining');
+  h.env.close();
+  assert.equal(h.env.track.stopped, true);
+  h.env.open('TPT2');
+  typeDraft(h, 'Other draft');
+  stream.onPartial('Late partial');
+  stream.onFinal('Late final');
+  finishDrain({ micPeak: 1 });
+  await drainVoice();
+  assert.equal(input.value, 'Original draft');
+  assert.equal(h.$('.task-chat-input').value, 'Other draft');
+  h.env.close();
+  h.start();
+  let finishBatch;
+  h.env.api.transcribeAudio = () => new Promise(resolve => { finishBatch = resolve; });
+  const sameChatInput = h.$('.task-chat-input');
+  await sameChatInput.__voiceRecorder.start();
+  sameChatInput.__voiceRecorder.stop();
+  await drainVoice();
+  h.env.close();
+  h.env.open('TPT1');
+  finishBatch({ transcript: 'Late batch' });
+  await drainVoice();
+  assert.equal(h.$('.task-chat-input').value, 'Original draft', 'even reopening the same chat rejects stale results');
+});
+
+test('hiding embedded Chat pane stops capture and preserves its draft', async t => {
+  const h = harness(t, { voice: true });
+  const host = h.doc.createElement('div');
+  h.doc.body.append(host);
+  const pane = h.env.mount(host, 'TPT1');
+  h.feed({ type: 'config', objectiveProviders: [] });
+  click(h.$('.task-chat-start-go'));
+  h.feed({ type: 'chat-ready' });
+  const input = h.$('.task-chat-input');
+  typeDraft(h, 'Keep ');
+  input.setSelectionRange(input.value.length, input.value.length);
+  await input.__voiceRecorder.start();
+  pane.hide();
+  await drainVoice();
+  assert.equal(h.env.track.stopped, true);
+  assert.equal(input.value, 'Keep Fallback speech. ');
+  pane.show();
+  assert.equal(h.$('.task-chat-input'), input);
+  pane.dispose();
+});
 
 test('task and project drafts survive reopening and reload without crossing projects', async (t) => {
   const storage = new Map();

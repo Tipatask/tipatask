@@ -1,5 +1,6 @@
 // Frontend entry point — modules will be extracted here
 import './styles.css';
+import './notification-cards.css'; // (TPT484) compact notification page shared with the banner window
 import * as constants from './constants.js';
 import * as i18n from './i18n.js';
 import * as statusRegistry from './status-registry.js';
@@ -27,6 +28,7 @@ import * as attentionState from './attention-state.js';
 import * as taskActivity from './task-activity.js';
 import * as activityNotifications from './activity-notifications.js';
 import * as notificationCenter from './notification-center.js';
+import './desktop-notification-panel.js'; // (TPT480) Electron-only full desktop-notification list (banner "Show More")
 import * as projectCreationWizard from './project-creation-wizard.js';
 import { buildPresetSeedReport } from './preset-seed-report.js'; // (TPT203) wizard partial-seed report
 import * as projectOpenFlow from './project-open-flow.js';
@@ -40,6 +42,9 @@ import * as agentQuota from './agent-quota.js'; // (TPT310) left-nav plan-usage 
 import * as mergeBranchesModal from './merge-branches-modal.js'; // (TPT345) Merge task branches panel; template.html reaches it via the Project menu
 
 notifications.requestPermission();
+// (TPT484) Shared alert registry: click/dismiss bridge plus main's surface decision for this window.
+notifications.ensureNotificationBridge();
+notificationCenter.installNotificationSurface();
 
 // Expose modules globally so the inline <script> in template.html can access them.
 window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, ...consoleModal, ...recipeSidebar, chatUI, chatTaskPreview, specChat, taskChat, setupModal, notifications, attentionNotifications, completionNotifications, attentionWs, attentionState, taskActivity, activityNotifications, notificationCenter, projectCreationWizard, projectOpenFlow, audioRecorder, perfLog, tagMatch, statusFilterSelect, agentQuota, mergeBranchesModal };

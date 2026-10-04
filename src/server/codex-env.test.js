@@ -10,7 +10,7 @@ const toml = require('toml');
 const config = require('./config');
 const CodexAgent = require('./task-agent/codex-agent');
 const { buildCodexArgs } = require('./providers/codex-session');
-const { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, toCodexEffort } = require('./codex-env');
+const { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, toCodexEffort } = require('./codex-env');
 const { writeProjectConfig: writeLiveProjectConfig } = require('./project-config');
 
 function makeTempDir() {
@@ -122,6 +122,42 @@ test('buildCodexEnv live-reads token rotation and clears an inherited token when
   }
 });
 
+test('terminal environments remove task-local state and app capabilities without losing project credentials', t => {
+  const root = makeTempDir();
+  const keys = ['CODEX_HOME', 'TIPATASK_USER_DATA', 'TIPATASK_TASK_ID', 'TIPATASK_TRACK_DIR', 'TIPATASK_OBJECTIVE_TASK_ID', 'TIPATASK_LOCAL_SECRET', 'API_TOKEN'];
+  const previous = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  t.after(() => {
+    for (const k of keys) {
+      if (previous[k] === undefined) delete process.env[k]; else process.env[k] = previous[k];
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const user = path.join(root, 'user');
+  fs.mkdirSync(user);
+  fs.writeFileSync(path.join(user, 'config.toml'), '');
+  Object.assign(process.env, { CODEX_HOME: user, TIPATASK_USER_DATA: root, TIPATASK_TASK_ID: 'OLD',
+    TIPATASK_TRACK_DIR: '/old', TIPATASK_OBJECTIVE_TASK_ID: 'OLD-OBJECTIVE', TIPATASK_LOCAL_SECRET: 'app-secret', API_TOKEN: 'old-token' });
+  const first = path.join(root, 'first'), second = path.join(root, 'second');
+  writeLiveProjectConfig(first, { API_BASE_URL: 'https://first.test', API_PROJECT_ID: '1', API_TOKEN: 'first-token', MCP_BROWSER_TOOLS: [] });
+  writeLiveProjectConfig(second, { API_BASE_URL: 'https://second.test', API_PROJECT_ID: '2', API_TOKEN: '', MCP_BROWSER_TOOLS: [] });
+  const a = buildCodexEnv({ projectRoot: first, taskId: 'TPT1', term: 'xterm-256color' }).env;
+  process.env.TIPATASK_LOCAL_SECRET = 'new-app-secret';
+  const b = buildCodexEnv({ projectRoot: first, taskId: 'TPT2', term: 'xterm-256color' }).env;
+  assert.deepEqual(a, b, 'different tasks and a rotated app capability must not change daemon env');
+  for (const key of keys.slice(2, -1)) assert.equal(a[key], undefined, key);
+  assert.equal(a.API_TOKEN, 'first-token');
+  assert.equal(a.TIPATASK_API_TOKEN, 'first-token');
+  const other = buildCodexEnv({ projectRoot: second, taskId: 'TPT3', term: 'xterm-256color' }).env;
+  assert.notEqual(other.CODEX_HOME, a.CODEX_HOME);
+  assert.equal(other.API_TOKEN, undefined);
+  assert.equal(other.TIPATASK_API_TOKEN, undefined);
+  assert.equal(other.API_PROJECT_ID, '2');
+  const chat = buildCodexEnv({ projectRoot: first, taskId: 'TPT4' }).env;
+  assert.equal(chat.TIPATASK_TASK_ID, 'TPT4');
+  assert.equal(chat.TIPATASK_OBJECTIVE_TASK_ID, undefined);
+  assert.equal(chat.TIPATASK_LOCAL_SECRET, undefined);
+});
+
 test('buildCodexEnv refreshes managed browser presets before a Codex spawn', () => {
   const dir = makeTempDir();
   const previousCodexHome = process.env.CODEX_HOME;
@@ -207,6 +243,188 @@ test('Codex terminal spawn pins high effort ahead of inherited config', async ()
     else process.env.CODEX_HOME = previousCodexHome;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('normal and SIMPLE_MODE terminal launches share config effort without sharing task overrides', async t => {
+  const dir = makeTempDir();
+  const previousHome = process.env.CODEX_HOME;
+  const previousSimple = config.SIMPLE_MODE;
+  const home = path.join(dir, 'user');
+  fs.mkdirSync(home);
+  const preferences = 'approval_policy = "on-request"\nsandbox_mode = "workspace-write"\n[features]\nunified_exec = true\n';
+  fs.writeFileSync(path.join(home, 'config.toml'), preferences);
+  process.env.CODEX_HOME = home;
+  t.after(() => {
+    config.SIMPLE_MODE = previousSimple;
+    if (previousHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const agent = new CodexAgent();
+  t.mock.method(agent, 'localizeSpawnPrompt', async (_cfg, prompt, _id, opts) => ({ prompt, opts }));
+  for (const simple of [false, true]) {
+    config.SIMPLE_MODE = simple;
+    const root = path.join(dir, simple ? 'simple' : 'normal');
+    fs.mkdirSync(path.join(root, '.tipatask'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.tipatask/config.json'), JSON.stringify({
+      API_BASE_URL: 'https://terminal-launch.test', API_PROJECT_ID: simple ? '32' : '31',
+      API_TOKEN: simple ? 'simple-token' : 'normal-token', CODEX_MODEL: 'project-model', MCP_BROWSER_TOOLS: [],
+    }));
+    const cfg = { CODEX_BIN: 'codex', PROJECT_ROOT: '/wrong-root' };
+    const prompt = 'Work on task TPT497.';
+    const spawn = (opts, taskId = 'TPT497') => agent.getSpawnSpec(cfg, `Work on task ${taskId}.`, taskId, { projectPath: root, ...opts });
+    const [normal, low, max] = await Promise.all([
+      spawn({}), spawn({ task: { effort: 'low' }, model: 'task-model' }), spawn({ task: { effort: 'max' } }),
+    ]);
+    assert.equal(normal.cwd, root);
+    assert.equal(normal.env.CODEX_HOME, path.join(root, '.codex'));
+    assert.equal(normal.env.TIPATASK_API_TOKEN, simple ? 'simple-token' : 'normal-token');
+    assert.deepEqual(normal.args.slice(0, 3), ['--model', 'project-model', '--no-alt-screen']);
+    assert.equal(normal.args.some(arg => ['-c', '--config', '--profile', '--no-daemon', '--enable', '--disable', '--search'].includes(arg)), false);
+    assert.deepEqual(low.args.slice(0, 4), [...codexEffortArgs('low'), '--model', 'task-model']);
+    assert.deepEqual(max.args.slice(0, 2), codexEffortArgs('xhigh'));
+    const content = fs.readFileSync(path.join(normal.env.CODEX_HOME, 'config.toml'), 'utf8');
+    const parsed = toml.parse(content);
+    assert.equal(parsed.model_reasoning_effort, 'high');
+    assert.equal(parsed.approval_policy, 'on-request');
+    assert.equal(parsed.sandbox_mode, 'workspace-write');
+    assert.equal(parsed.features.unified_exec, true);
+    assert.equal(parsed.mcp_servers.tipatask.url, `https://terminal-launch.test/api/projects/${simple ? '32' : '31'}/mcp`);
+    assert.equal(parsed.mcp_servers.tipatask.bearer_token_env_var, 'TIPATASK_API_TOKEN');
+    assert.equal(parsed.mcp_servers['tipatask-local'].env.TIPATASK_PROJECT_ROOT, root);
+    assert.doesNotMatch(content, /simple-token|normal-token/);
+    assert.equal(low.env.CODEX_HOME, normal.env.CODEX_HOME);
+    assert.equal(max.env.CODEX_HOME, normal.env.CODEX_HOME);
+    const peers = await Promise.all(['TPT498', 'TPT499'].map(id => spawn({}, id)));
+    for (const peer of peers) {
+      assert.deepEqual(peer.env, normal.env, 'different tasks must have the same daemon environment');
+      assert.deepEqual(peer.args.slice(0, -1), normal.args.slice(0, -1));
+      assert.match(peer.args.at(-1), /Work on task TPT49[89]\./);
+    }
+    const again = await spawn({}, 'TPT500');
+    assert.deepEqual(again.args.slice(0, -1), normal.args.slice(0, -1));
+    assert.match(again.args.at(-1), /Work on task TPT500\./);
+    assert.equal(fs.readFileSync(path.join(normal.env.CODEX_HOME, 'config.toml'), 'utf8'), content);
+    if (simple) assert.equal(normal.args.at(-1), prompt);
+    else {
+      assert.match(normal.args.at(-1), /Do not implement, edit files, or run mutating commands until the user approves the plan/);
+      assert.match(normal.args.at(-1), /Plan ready\./);
+    }
+  }
+});
+
+test('terminal effort preserves custom settings and falls back for ancestor config or invalid TOML', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, '.git'));
+  const home = path.join(root, '.codex');
+  fs.mkdirSync(home);
+  const file = path.join(home, 'config.toml');
+  const content = '# custom\nmodel_reasoning_effort = "low"\n';
+  fs.writeFileSync(file, content);
+  assert.deepEqual(codexTerminalEffortArgs(root, home, 'low'), []);
+  assert.deepEqual(codexTerminalEffortArgs(root, home), codexEffortArgs('high'));
+  assert.equal(fs.readFileSync(file, 'utf8'), content);
+  const nested = path.join(root, 'nested');
+  const nestedHome = path.join(nested, '.codex');
+  fs.mkdirSync(nestedHome, { recursive: true });
+  fs.writeFileSync(path.join(nestedHome, 'config.toml'), 'model_reasoning_effort = "high"\n');
+  assert.deepEqual(codexTerminalEffortArgs(nested, nestedHome), codexEffortArgs('high'));
+  fs.writeFileSync(file, 'invalid = [');
+  assert.throws(() => codexTerminalEffortArgs(root, home));
+  assert.equal(fs.readFileSync(file, 'utf8'), 'invalid = [');
+});
+
+test('terminal daemon reuse survives module reload, preserves credentials and rejects unknown identity', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, '.git'));
+  const home = path.join(root, '.codex');
+  const daemonDir = path.join(home, 'app-server-daemon');
+  fs.mkdirSync(daemonDir, { recursive: true });
+  const file = path.join(home, 'config.toml');
+  const marker = path.join(daemonDir, 'daemon.pid');
+  const record = path.join(home, 'tipatask-daemon.json');
+  fs.writeFileSync(file, 'model_reasoning_effort = "high"\n');
+  const env = { CODEX_HOME: home, TIPATASK_API_TOKEN: 'first-secret' };
+  const launch = (extra = {}) => codexTerminalLaunchOptions(root, home, 'high', { ...env, ...extra });
+  const daemon = { pid: process.pid, processIdentity: { startSeconds: Math.floor(Date.now() / 1000) } };
+  fs.writeFileSync(marker, JSON.stringify(daemon));
+  assert.equal(launch().reason, 'daemon-unrecognized');
+  assert.deepEqual(launch().args, ['--no-daemon'], 'isolation must not manufacture an effort override');
+  fs.unlinkSync(marker);
+  assert.deepEqual(launch().args, [], 'first compatible launch may start a daemon');
+  assert.deepEqual(launch().args, [], 'concurrent compatible launch may join the pending daemon');
+  assert.equal(launch({ TIPATASK_API_TOKEN: 'rotated' }).reason, 'daemon-start-pending');
+  daemon.processIdentity.startSeconds = Math.floor(Date.now() / 1000);
+  fs.writeFileSync(marker, JSON.stringify(daemon));
+  assert.deepEqual(launch().args, [], 'same project environment may reuse the identified daemon');
+  assert.doesNotMatch(fs.readFileSync(record, 'utf8'), /first-secret|TIPATASK_API_TOKEN/);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(record).mode & 0o777, 0o600);
+  const modulePath = require.resolve('./codex-env');
+  const originalModule = require.cache[modulePath];
+  delete require.cache[modulePath];
+  try {
+    const reloaded = require('./codex-env');
+    assert.deepEqual(reloaded.codexTerminalLaunchOptions(root, home, 'high', env).args, [], 'fresh module must recognize persisted identity');
+  } finally { require.cache[modulePath] = originalModule; }
+  fs.appendFileSync(file, '\n# Native TUI bookkeeping\n[tui]\nscreen_reader_detection_done = true\n');
+  assert.deepEqual(launch().args, [], 'TUI counters and formatting do not change daemon configuration');
+  assert.equal(launch({ TIPATASK_API_TOKEN: 'rotated' }).reason, 'daemon-settings-changed');
+  fs.writeFileSync(file, 'sandbox_mode = "read-only"\n' + fs.readFileSync(file, 'utf8'));
+  assert.equal(launch().reason, 'daemon-settings-changed');
+  fs.unlinkSync(marker);
+  assert.deepEqual(launch({ TIPATASK_API_TOKEN: 'rotated' }).args, [], 'a stopped daemon permits a new environment');
+  fs.writeFileSync(marker, 'broken');
+  assert.equal(launch({ TIPATASK_API_TOKEN: 'rotated' }).reason, 'daemon-identity-invalid');
+});
+
+test('daemon metadata fails closed for contention, stale identities and copied project records', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, '.git'));
+  const home = path.join(root, '.codex');
+  fs.mkdirSync(path.join(home, 'app-server-daemon'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'config.toml'), 'model_reasoning_effort = "high"\n');
+  const record = path.join(home, 'tipatask-daemon.json');
+  const marker = path.join(home, 'app-server-daemon/daemon.pid');
+  const launch = () => codexTerminalLaunchOptions(root, home, 'high', { CODEX_HOME: home });
+  fs.writeFileSync(`${record}.lock`, String(process.pid));
+  assert.equal(launch().reason, 'daemon-record-busy');
+  fs.unlinkSync(`${record}.lock`);
+  assert.equal(launch().mode, 'shared');
+  const initial = fs.readFileSync(record, 'utf8');
+  const daemon = { pid: process.pid, processIdentity: { startSeconds: Math.floor(Date.now() / 1000) - 60 } };
+  fs.writeFileSync(marker, JSON.stringify(daemon));
+  assert.equal(launch().reason, 'daemon-unrecognized', 'a pending launch cannot adopt an older daemon');
+  daemon.processIdentity.startSeconds = Math.floor(Date.now() / 1000);
+  fs.writeFileSync(marker, JSON.stringify(daemon));
+  assert.equal(launch().mode, 'shared');
+  daemon.processIdentity.startSeconds++;
+  fs.writeFileSync(marker, JSON.stringify(daemon));
+  assert.equal(launch().reason, 'daemon-identity-changed');
+  fs.writeFileSync(record, JSON.stringify({ ...JSON.parse(initial), home: '/other/project/.codex' }));
+  assert.equal(launch().reason, 'daemon-record-invalid');
+  fs.writeFileSync(record, 'bad json');
+  assert.equal(launch().reason, 'daemon-record-invalid');
+});
+
+test('an abandoned daemon start expires without adopting an unidentified control socket', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, '.git'));
+  const home = path.join(root, '.codex');
+  fs.mkdirSync(home);
+  fs.writeFileSync(path.join(home, 'config.toml'), 'model_reasoning_effort = "high"\n');
+  const record = path.join(home, 'tipatask-daemon.json');
+  const launch = token => codexTerminalLaunchOptions(root, home, 'high', { CODEX_HOME: home, TIPATASK_API_TOKEN: token });
+  assert.equal(launch('old').mode, 'shared');
+  assert.equal(launch('new').reason, 'daemon-start-pending');
+  fs.writeFileSync(record, JSON.stringify({ ...JSON.parse(fs.readFileSync(record)), startedAt: Date.now() - 121000 }));
+  assert.equal(launch('new').mode, 'shared');
+  fs.mkdirSync(path.join(home, 'app-server-control'));
+  fs.writeFileSync(path.join(home, 'app-server-control/app-server-control.sock'), 'fixture');
+  assert.equal(launch('new').reason, 'daemon-identity-unavailable');
 });
 
 test('Codex objective argv maps max effort to xhigh for fresh and resumed turns', t => {

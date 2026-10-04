@@ -254,5 +254,21 @@ test('applyQueueSnapshot replaces the queue and returns the tasks that left it',
   assert.deepEqual(left, ['A']);
   assert.equal(state.queuedSessions.get('B'), 1);
   assert.deepEqual(state.queueInfo, { running: 3, cap: 3 });
+  applyQueueSnapshot({ queued: [{ taskId: 'B', position: 1, reason: 'pressure' }], admission: { mode: 'pressure' } });
+  assert.equal(state.queueReasons.get('B'), 'pressure');
+  assert.equal(state.admissionDiagnostics.mode, 'pressure');
   assert.deepEqual(applyQueueSnapshot(null), ['B']);
+});
+
+test('queue diagnostics survive HTTP hydration and WS updates and clear on departure', async () => {
+  const { applyQueueSnapshot } = await import('./attention-state.js');
+  const row = { taskId: 'Q', position: 1, reason: 'coordination', coordinationReason: 'unregistered-server',
+    unregisteredPids: [42], unregisteredCount: 1 };
+  mergeSessionsSnapshot({ sessions: [], exited: [], queued: [row] });
+  assert.deepEqual(state.queueDiagnostics.get('Q'), row);
+  const next = { ...row, coordinationReason: null, detail: 'lock-busy', unregisteredPids: null };
+  applyQueueSnapshot({ queued: [next] });
+  assert.deepEqual(state.queueDiagnostics.get('Q'), next);
+  applyQueueSnapshot({ queued: [] });
+  assert.equal(state.queueDiagnostics.size, 0);
 });

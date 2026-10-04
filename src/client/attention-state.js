@@ -130,6 +130,9 @@ export function mergeSessionsSnapshot(data, project = data?.projectPath || '') {
   state.activeSessions = sessions;
   state.exitedSessions = exited;
   state.queuedSessions = queued;
+  state.queueReasons = new Map((data.queued || []).map(q => [q.taskId, q.reason || 'device-cap']));
+  state.queueDiagnostics = new Map((data.queued || []).map(q => [q.taskId, q]));
+  state.admissionDiagnostics = data.admission || null;
   state.sessionMeta = meta;
 }
 
@@ -141,6 +144,9 @@ export function applyQueueSnapshot(snap) {
   const next = new Map(((snap && snap.queued) || []).map(q => [q.taskId, q.position]));
   const left = [...state.queuedSessions.keys()].filter(id => !next.has(id));
   state.queuedSessions = next;
+  state.queueReasons = new Map((snap?.queued || []).map(q => [q.taskId, q.reason || 'device-cap']));
+  state.queueDiagnostics = new Map((snap?.queued || []).map(q => [q.taskId, q]));
+  state.admissionDiagnostics = snap?.admission || null;
   state.queueInfo = { running: snap?.running ?? null, cap: snap?.cap ?? null };
   return left;
 }

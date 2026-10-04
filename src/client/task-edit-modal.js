@@ -2,6 +2,7 @@
 // Importing this module does not initialize the board, terminal, or chat modules.
 import state from './state.js';
 import { t, tc } from './i18n.js';
+import { queueReasonText } from './queue-reason.js';
 import { agentModelOptions, ensureAgentModels, EFFORT_LEVELS, EFFORT_LABELS } from './constants.js';
 import { statusNames, statusLabel, statusColor, isInProgressName, startName } from './status-registry.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
@@ -118,7 +119,7 @@ function _modalSessionButton(task) {
   const mode = sessionButtonMode(savedStatus, { active, exited, queued: queuedPosition !== undefined });
   if (mode === SESSION_BUTTON_MODES.QUEUED) {
     // (TPT444) Waiting in the server's start queue — clicking re-attaches to the wait.
-    return { mode, icon: _START_SVG, label: t('queue.badge', { position: queuedPosition ?? '?' }), title: t('tooltip.queuedSession') };
+    return { mode, icon: _START_SVG, label: t('queue.badge', { position: queuedPosition ?? '?' }), title: queueReasonText(state.queueDiagnostics.get(task.id) || { reason: state.queueReasons?.get(task.id) }) };
   }
   if (mode === SESSION_BUTTON_MODES.RUNNING) {
     return { mode, icon: '<span class="session-spinner" aria-hidden="true"></span>', label: t('btn.show'), title: t('tooltip.showRunningSession') };
@@ -728,7 +729,12 @@ export async function openTaskEditModal(taskId, callbacks = {}) {
   }
 }
 
+// (TPT485) Opens overlap now that the rail stays clickable while the next task loads: the
+// latest request wins, and a slower fetch for an earlier click never replaces it.
+let _openSeq = 0;
+
 async function _openTaskEditModalImpl(taskId, callbacks = {}) {
+  const openSeq = ++_openSeq;
   const invokingElement = callbacks.trigger || document.activeElement;
   // callbacks.preloadedTask: optional task object — skips API fetch (for in-memory proposals)
   // callbacks.onSavePreview: optional async (draft) => void — custom save for in-memory proposals
@@ -845,9 +851,11 @@ async function _openTaskEditModalImpl(taskId, callbacks = {}) {
     return;
   }
 
+  if (openSeq !== _openSeq) return; // (TPT485) a newer open superseded this one mid-fetch
+
   hideActionBanner('task-open-error-banner'); // (C1392) clear a stale banner on a recovered open
 
-  if (_modalState) closeTaskEditModal(true);
+  if (_modalState) closeTaskEditModal(true, { keepRail: true });
   _modalState = {
     taskId,
     original: structuredClone(task),
@@ -873,24 +881,29 @@ async function _openTaskEditModalImpl(taskId, callbacks = {}) {
     discussLocked,
     // (TPT466) Workspace panes — see _switchPane(). `panes` holds the mounted terminal/chat
     // handles ({ show, hide, dispose }); `pendingTerminal` the launch args for the next mount.
+    // (TPT479) The first paint already shows the requested pane, so a workspace opened onto its
+    // terminal or chat never flashes the Edit form (or its panel geometry) first.
     tabs: _paneTabsEnabled(callbacks),
-    pane: 'edit',
+    pane: _paneTabsEnabled(callbacks) && _PANES.includes(callbacks.initialPane) ? callbacks.initialPane : 'edit',
     panes: { terminal: null, chat: null },
     pendingTerminal: callbacks.terminalLaunch || null,
+    terminalStatus: null,
   };
   _renderTaskEditModal();
+  commands.syncActiveSessionsNav?.(); // (TPT485) this workspace's rail row is the open one now
   const modalRoot = document.getElementById('task-edit-modal');
   _modalDialogFocus = activateDialogFocus({
     root: modalRoot,
-    initialFocus: () => (!_isModalReadOnly(_modalState?.draft) && modalRoot.querySelector('.modal-title-input:not([hidden]):not(:disabled)'))
+    initialFocus: () => (_modalState?.pane === 'edit' && !_isModalReadOnly(_modalState?.draft) && modalRoot.querySelector('.modal-title-input:not([hidden]):not(:disabled)'))
+      || modalRoot.querySelector('.task-modal-tab.active')
       || modalRoot.querySelector('.modal-task-id'),
     returnFocus: () => {
       if (invokingElement?.isConnected && invokingElement.getClientRects().length) return invokingElement;
       return [...document.querySelectorAll('.card-edit-btn')]
         .find(btn => btn.dataset.taskId === taskId) || document.getElementById('left-nav-toggle');
     },
-    // (TPT466) On the Agent Terminal pane the overlay leaves the left-nav rail uncovered
-    // (TPT360), so its active-session rows stay live: the rail joins this layer only then.
+    // (TPT466/TPT479) A tabbed workspace leaves the left-nav rail uncovered (TPT360) on every
+    // pane, so its active-session rows stay live: the rail joins this layer while it is.
     portals: '.tag-typeahead-dropdown, .dep-typeahead-dropdown, .member-typeahead-dropdown, .mention-dropdown, [data-portaled="1"], body.task-modal-rail #left-nav-panel',
   });
   if (_modalState.tabs && _PANES.includes(callbacks.initialPane) && callbacks.initialPane !== 'edit') {
@@ -1030,7 +1043,9 @@ function _openImageLightbox(src, alt) {
 // confirm() that used to live in this function's `!force` branch is gone (it was a native
 // blocking dialog); interactive callers now go through requestCloseTaskEditModal() below,
 // which awaits a non-blocking confirm and then calls this with force=true.
-export function closeTaskEditModal(force = false) {
+// (TPT485) `keepRail`: the next workspace replaces this one in the same synchronous step, and
+// paints the rail itself once its state is in place — no in-between repaint with nothing open.
+export function closeTaskEditModal(force = false, { keepRail = false } = {}) {
   if (!_modalState) return;
   // (TPT466) Detach the terminal and chat before the DOM goes: their server-side session and
   // chat keep running, only this window's xterm and socket are released.
@@ -1057,6 +1072,7 @@ export function closeTaskEditModal(force = false) {
   _modalState = null;
   _modalDialogFocus?.close();
   _modalDialogFocus = null;
+  if (!keepRail) commands?.syncActiveSessionsNav?.(); // the workspace's row is no longer the open one
 }
 
 // (C1392) Interactive close path (Esc key, backdrop click) — replaces the native
@@ -1064,24 +1080,29 @@ export function closeTaskEditModal(force = false) {
 // that stalls CDP/Claude-in-Chrome automation). Non-interactive/force callers keep
 // calling closeTaskEditModal(true) directly and are unaffected.
 let _discardConfirmOpen = false;
+// Asks before an unsaved draft is thrown away; closes nothing itself. True = go ahead.
+async function _confirmDiscardIfDirty() {
+  if (!_modalState) return true;
+  if (!_isModalDirty()) return true;
+  if (_discardConfirmOpen) return false; // Esc re-entered while the confirm is already up
+  _discardConfirmOpen = true;
+  try {
+    return !!(await showActionConfirm({
+      message: t('modal.confirmDiscard'),
+      confirmLabel: t('btn.discard'),
+      danger: true,
+      overlayClass: 'modal-overlay--over-modal',
+    }));
+  } finally {
+    _discardConfirmOpen = false;
+  }
+}
+
 export async function requestCloseTaskEditModal() {
   if (!_modalState) return false;
-  if (_isModalDirty()) {
-    if (_discardConfirmOpen) return false; // Esc re-entered while the confirm is already up
-    _discardConfirmOpen = true;
-    let ok;
-    try {
-      ok = await showActionConfirm({
-        message: t('modal.confirmDiscard'),
-        confirmLabel: t('btn.discard'),
-        danger: true,
-        overlayClass: 'modal-overlay--over-modal',
-      });
-    } finally {
-      _discardConfirmOpen = false;
-    }
-    if (!ok) return false;
-  }
+  const closingState = _modalState;
+  if (!(await _confirmDiscardIfDirty())) return false;
+  if (_modalState !== closingState) return false;
   closeTaskEditModal(true);
   return true;
 }
@@ -1263,7 +1284,7 @@ function _renderTaskEditModal() {
     ? [...modal.querySelectorAll('.task-modal-pane--terminal, .task-modal-pane--chat')].map(el => { el.remove(); return el; })
     : [];
   modal.innerHTML = `
-    <div class="task-edit-overlay${tabs && pane === 'terminal' ? ' task-edit-overlay--rail' : ''}">
+    <div class="task-edit-overlay${tabs ? ' task-edit-overlay--rail' : ''}">
       <div class="task-edit-panel${isDiffMode ? ' task-edit-panel--diff' : ''}${tabs ? ' task-edit-panel--tabs' : ''}" data-pane="${pane}" role="dialog" aria-modal="true" aria-label="${escapeAttr(t(readOnly ? 'modal.taskDetails' : 'modal.editTask', { id: draft.id }))}">
         <div class="modal-top-bar">
           <div class="modal-head-meta">
@@ -2602,14 +2623,16 @@ function _paneTabsHtml(active) {
 }
 
 // Writes the active pane everywhere it is read: the tab strip, the panes' `hidden`, the panel's
-// data-pane (sizing, styles.css), #task-edit-modal[data-pane] (Escape guard in template.html,
-// attention focus check) and the rail class that un-covers the left nav on the terminal pane.
+// data-pane (styles.css), #task-edit-modal[data-pane] (Escape guard in template.html,
+// attention focus check) and the rail class that un-covers the left nav.
+// (TPT479) The rail is uncovered on every pane, not only the terminal one: the session menu
+// stays reachable from Edit and Chat, and the overlay's left edge — so the panel — never moves.
 function _applyPaneState(modal) {
   if (!modal || !_modalState?.tabs) return;
   const pane = _modalState.pane;
   modal.dataset.pane = pane;
   modal.querySelector('.task-edit-panel')?.setAttribute('data-pane', pane);
-  modal.querySelector('.task-edit-overlay')?.classList.toggle('task-edit-overlay--rail', pane === 'terminal');
+  modal.querySelector('.task-edit-overlay')?.classList.add('task-edit-overlay--rail');
   for (const tab of modal.querySelectorAll('.task-modal-tab')) {
     const on = tab.dataset.pane === pane;
     tab.classList.toggle('active', on);
@@ -2620,16 +2643,30 @@ function _applyPaneState(modal) {
     const el = modal.querySelector(`.task-modal-pane--${p}`);
     if (el) el.hidden = p !== pane;
   }
-  const rail = pane === 'terminal';
-  if (document.body.classList.contains('task-modal-rail') !== rail) {
-    document.body.classList.toggle('task-modal-rail', rail);
+  if (!document.body.classList.contains('task-modal-rail')) {
+    document.body.classList.add('task-modal-rail');
     _modalDialogFocus?.refresh?.();
   }
   _syncPaneDots(modal);
 }
 
-// Edit: unsaved edits while another pane is showing. Agent Terminal: a live session, accented
-// while it waits on the user.
+const _TERM_DOT_STATES = ['paused', 'exited', 'disconnected'];
+
+// The Agent Terminal tab's dot is the workspace's one session-status light (TPT479 — the
+// embedded terminal toolbar shows none). A mounted xterm reports its own status (onStatus,
+// console-modal.js); without one the board's session state stands in.
+function _terminalDotState(id) {
+  const reported = _modalState?.panes.terminal ? _modalState.terminalStatus : null;
+  if (reported) return reported;
+  if (state.lostSessions.has(id)) return { cls: 'disconnected', title: t('terminal.sessionLostTitle') };
+  if (state.sessionMeta.get(id)?.paused) return { cls: 'paused', title: t('terminal.pausedTitle') };
+  if (state.activeSessions.has(id)) return { cls: '', title: 'Connected' };
+  if (state.exitedSessions.has(id)) return { cls: 'exited', title: 'Exited' };
+  return null;
+}
+
+// Edit: unsaved edits while another pane is showing. Agent Terminal: the session's status,
+// accented while it waits on the user.
 function _syncPaneDots(modal) {
   if (!modal || !_modalState?.tabs) return;
   const id = _modalState.taskId;
@@ -2640,8 +2677,13 @@ function _syncPaneDots(modal) {
   }
   const termDot = modal.querySelector('.task-modal-tab[data-pane="terminal"] .task-modal-tab-dot');
   if (termDot) {
-    termDot.hidden = !state.activeSessions.has(id);
-    termDot.classList.toggle('task-modal-tab-dot--attention', state.attentionSessions.has(id));
+    const status = _terminalDotState(id);
+    termDot.hidden = !status;
+    for (const s of _TERM_DOT_STATES) termDot.classList.toggle(`task-modal-tab-dot--${s}`, status?.cls === s);
+    termDot.classList.toggle('task-modal-tab-dot--attention',
+      !!status && state.attentionSessions.has(id) && !state.lostSessions.has(id));
+    if (status) termDot.title = status.title || '';
+    else termDot.removeAttribute('title');
   }
 }
 
@@ -2682,6 +2724,7 @@ function _showTerminalPane(modal, { focus = true } = {}) {
   pane.innerHTML = '';
   pane.classList.remove('task-modal-pane--empty');
   const saved = _modalState.lastSaved || _modalState.draft;
+  const workspaceState = _modalState;
   const args = launch || { title: saved.title, desc: saved.description, status: saved.status, opts: {} };
   let ctrl = null;
   const handle = {
@@ -2690,6 +2733,7 @@ function _showTerminalPane(modal, { focus = true } = {}) {
     dispose: () => ctrl?.detach?.({ refreshBoard: true }),
   };
   _modalState.panes.terminal = handle;
+  _modalState.terminalStatus = null; // the new xterm reports its own (onStatus below)
   try {
     ctrl = mount(pane, taskId, args.title, args.desc, args.status, {
       ...(args.opts || {}),
@@ -2698,12 +2742,25 @@ function _showTerminalPane(modal, { focus = true } = {}) {
       onClosed: () => {
         if (_modalState?.panes.terminal !== handle) return;
         _modalState.panes.terminal = null;
+        _modalState.terminalStatus = null;
         const m = document.getElementById('task-edit-modal');
         const p = m?.querySelector('.task-modal-pane--terminal');
         if (p) _renderTerminalEmpty(p);
         _syncPaneDots(m);
       },
-      onRequestClose: () => { void requestCloseTaskEditModal(); },
+      onRequestClose: () => {
+        if (_modalState !== workspaceState) return false;
+        // onClosed clears this handle before a successful termination asks to close.
+        // A replacement terminal in the same workspace must also remain untouched.
+        if (_modalState.panes.terminal && _modalState.panes.terminal !== handle) return false;
+        return requestCloseTaskEditModal();
+      },
+      // (TPT479) The embedded toolbar has no status dot; the xterm's status lights the tab's.
+      onStatus: (cls, title) => {
+        if (_modalState?.panes.terminal !== handle) return;
+        _modalState.terminalStatus = { cls: cls || '', title: title || '' };
+        _syncPaneDots(document.getElementById('task-edit-modal'));
+      },
     });
   } catch (err) {
     console.error('[modal] terminal mount failed:', err);
@@ -2785,6 +2842,12 @@ function _disposePanes() {
   _disposePane('chat');
 }
 
+// (TPT485) The task whose tabbed workspace is on screen, whatever pane it shows — the rail
+// (task-board.js syncActiveSessionsNav) highlights this row. Null for no modal or a tab-less one.
+export function getOpenWorkspaceTaskId() {
+  return _modalState?.tabs ? _modalState.taskId : null;
+}
+
 // One entry point for "show this task's workspace on that pane" — the terminal and chat
 // launchers route here (console-modal.js openTerminal, task-chat.js open). An open workspace
 // on the same task just switches pane; another task's goes through the dirty-close confirm.
@@ -2796,7 +2859,13 @@ export async function openTaskWorkspace(taskId, { pane = 'edit', terminal = null
     _switchPane(target);
     return;
   }
-  if (_modalState && !(await requestCloseTaskEditModal())) return;
+  // (TPT479) Only ask about an unsaved draft here — the open workspace stays on screen until
+  // openTaskEditModal() swaps it for the next task in one synchronous step after its fetch.
+  // Closing first left a frame with no modal and re-added the rail class to a fresh overlay,
+  // whose `left` transition slid the backdrop across the session menu (the rail-click flicker).
+  // (TPT485) The rail stays live during that fetch (the board loader starts at its edge,
+  // styles.css), so a second rail click can overtake this one: the latest open wins.
+  if (_modalState && !(await _confirmDiscardIfDirty())) return;
   const opts = { initialPane: target, terminalLaunch: terminal, trigger };
   if (_taskWorkspaceOpener) return _taskWorkspaceOpener(taskId, opts);
   return openTaskEditModal(taskId, opts);

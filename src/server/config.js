@@ -104,14 +104,21 @@ const _CONFIG_ENV_SEED_SKIP = new Set([
   'AGENT_LIMITS_MAX_SUBAGENTS',
   'AGENT_LIMITS_WARN_DESCENDANTS',
   'AGENT_LIMITS_MAX_TREE_RSS_MB',
+  'AGENT_LIMITS_SOLO_MULTIPLIER',
+  'AGENT_LIMITS_MIN_SCALE',
   'AGENT_LIMITS_WATCHDOG_ACTION',
+  'AGENT_LIMITS_DESCENDANT_CEILING',
+  'AGENT_LIMITS_RSS_ACTION_MB',
+  'AGENT_LIMITS_RSS_GROWTH_MB',
+  'AGENT_LIMITS_RSS_PRESSURE_GROWTH_MB',
+  'AGENT_LIMITS_RSS_SAMPLES',
   ...API_CREDENTIAL_FIELDS,
 ]);
 for (const [key, val] of Object.entries(_startupProjectCfg)) {
   // typeof guard: env vars are strings — any object/array config value would otherwise
   // stringify to garbage. Generic so a future array-valued config key can't repeat the
   // PI_MODELS collision above.
-  if (!_CONFIG_ENV_SEED_SKIP.has(key) && val != null && val !== '' && typeof val !== 'object'
+  if (!_CONFIG_ENV_SEED_SKIP.has(key) && !key.startsWith('AGENT_ADMISSION_') && val != null && val !== '' && typeof val !== 'object'
       && !(key in process.env)) {
     process.env[key] = val;
   }

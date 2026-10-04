@@ -23,18 +23,21 @@ function harness(t) {
   const filename = path.join(__dirname, 'codex-session.js');
   const realRequire = createRequire(filename);
   const mocks = {
-    'node:child_process': { spawn() {
+    'node:child_process': { spawn(command, args, options) {
       const proc = new EventEmitter();
       proc.pid = 97000 + spawned.length;
       proc.stdout = new EventEmitter();
       proc.stderr = new EventEmitter();
-      proc.stdin = { write() {}, end() {} };
+      proc.spawnArgs = { command, args, options };
+      proc.stdinText = '';
+      proc.stdin = { write(text) { proc.stdinText += text; }, end() {} };
       spawned.push(proc);
       return proc;
     } },
-    '../codex-env': { buildCodexEnv: () => ({ env: {} }), codexEffortArgs: () => [], toCodexEffort: level => level },
+    '../codex-env': { ...realRequire('../codex-env'), buildCodexEnv: () => ({ env: { TIPATASK_API_TOKEN: 'fixture-token' } }) },
+    '../../codex-mcp-config': { listProjectMcpServerNames: () => ['tipatask', 'tipatask-local', 'playwright'] },
     '../claude-session': { normalizeProposals: x => x },
-    './transcript': { buildTurnPrompt: () => ({ prompt: 'plan it', mode: 'fresh' }), buildNudgeMessage: () => 'nudge' },
+    './transcript': { buildTurnPrompt: (_session, opts) => ({ prompt: 'plan it', mode: opts.hasProviderSession ? 'resume' : 'fresh' }), buildNudgeMessage: () => 'nudge' },
     '../task-agent/attachments': { localizeAttachments: async ({ prompt }) => { await localizeGate; return { prompt }; } },
     '../context-manager': { shouldTrimContext: () => false, trimContext: () => false },
   };
@@ -87,3 +90,34 @@ test('a teardown/restart during localization never spawns the stale turn and lea
   assert.equal(h.spawned.length, 0, 'stale turn never spawned');
   assert.equal(h.session._spawning, 'restart-spawn', 'the newer spawn keeps ownership');
 });
+
+for (const resumed of [false, true]) {
+  test(`Codex task chat spawn retains effort, credentials and tool policy (${resumed ? 'resume' : 'fresh'})`, async t => {
+    const config = require('../config');
+    const effort = config.OBJECTIVE_EFFORT;
+    config.OBJECTIVE_EFFORT = 'max';
+    t.after(() => { config.OBJECTIVE_EFFORT = effort; });
+    const h = harness(t);
+    Object.assign(h.session, { type: 'taskChat', toolProfile: 'taskChat', taskKey: 'TPT497',
+      projectPath: '/fixture/project', codexSessionId: resumed ? 'fixture-thread' : null });
+    h.codex.spawnCodexTurn(h.session, 'taskChat:TPT497');
+    h.releaseLocalize();
+    await settle(); await settle();
+    assert.equal(h.spawned.length, 1);
+    const { args, options } = h.spawned[0].spawnArgs;
+    assert.equal(options.cwd, '/fixture/project');
+    assert.equal(options.env.TIPATASK_API_TOKEN, 'fixture-token');
+    assert.ok(args.includes('model_reasoning_effort="xhigh"'));
+    assert.ok(args.includes('mcp_servers.tipatask-local.enabled_tools=["batch_grep_tags"]'));
+    assert.ok(args.includes('mcp_servers.playwright.enabled=false'));
+    assert.ok(args.some(a => a.startsWith('mcp_servers.tipatask.disabled_tools=')));
+    if (resumed) {
+      assert.equal(args[1], 'resume');
+      assert.equal(args[2], 'fixture-thread');
+      assert.ok(args.includes('sandbox_mode="read-only"'));
+    } else {
+      assert.equal(args[args.indexOf('-s') + 1], 'read-only');
+      assert.match(h.spawned[0].stdinText, /plan it/);
+    }
+  });
+}

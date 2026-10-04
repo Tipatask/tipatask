@@ -181,3 +181,21 @@ test('every slot-freeing path drains the queue: pty exit, task completion, watch
   assert.match(index, /drainSessionQueue\(\); \/\/ \(TPT444\) safety net/);
   assert.match(read('websocket.js'), /emitSessionQueueState\(projectPath, snapshot\)/);
 });
+
+test('per-entry diagnostics refresh broadcasts without changing position or main reason', () => {
+  const h = harness();
+  let detail = 'lock-busy';
+  const decision = session => ({ allowed: false, reason: 'coordination', coordinationReason: null,
+    detail: session.taskId === 'A' ? detail : 'state-invalid', instances: null, unregisteredCount: null });
+  h.queue.setAdmission({ tryReserve: decision, snapshot: () => ({ detail: 'global-only' }) });
+  h.request('A'); h.request('B');
+  assert.deepEqual(h.queue.snapshot('/p').queued.map(row => row.detail), ['lock-busy', 'state-invalid']);
+  h.changes.length = 0;
+  h.queue.drain(); assert.equal(h.changes.length, 0, 'unchanged details do not spam');
+  detail = 'state-invalid'; h.queue.drain();
+  assert.equal(h.changes.length, 1);
+  assert.equal(h.changes[0].snap.queued[0].position, 1);
+  assert.equal(h.changes[0].snap.queued[0].reason, 'coordination');
+  assert.equal(h.changes[0].snap.queued[0].detail, 'state-invalid');
+  assert.equal(h.changes[0].snap.queued[0].instances, null);
+});

@@ -224,10 +224,38 @@ function getTaskStartupGrepBundle(tagNames, projectRoot) {
   return bundle;
 }
 
+// Full current descriptions of the active tasks the objective text names by key. The
+// planner needs the verbatim original before it may propose a "modified" description
+// (buildObjectiveSystemPrompt()'s DESCRIPTION PRESERVATION rule) — list_task_id_meta's
+// active list carries no descriptions, and Pi has no MCP get_task to fetch one. Never
+// truncated: a cut description would be exactly the detail loss this exists to prevent.
+// Returns '' when the text names no active task.
+const REFERENCED_TASK_KEY_RE = /\b(?:H|[A-Z]{1,6})[0-9]+\b/g;
+const REFERENCED_TASKS_MAX = 5;
+
+function buildReferencedTasksSection(tasks, text, activeStatuses, max = REFERENCED_TASKS_MAX) {
+  if (!text || !Array.isArray(tasks)) return '';
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  const picked = [];
+  const seen = new Set();
+  for (const key of String(text).match(REFERENCED_TASK_KEY_RE) || []) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const t = byId.get(key);
+    if (!t || !activeStatuses.has(t.status)) continue;
+    picked.push({ id: t.id, title: t.title, status: t.status, description: t.description || '' });
+    if (picked.length >= max) break;
+  }
+  if (picked.length === 0) return '';
+  return `### Referenced task descriptions\nFull current descriptions of active tasks named in the objective — the verbatim originals to patch when proposing a "modified" description.\n\`\`\`json\n${JSON.stringify(picked, null, 2)}\n\`\`\``;
+}
+
 // Pre-fetches list_task_id_meta + get_tag_architectures concurrently at spawn time,
 // injecting results into the first-turn user prompt to eliminate LLM tool round-trips.
 // Returns { bundle: string, elapsedMs: number }.
-async function prefetchObjectiveWorkflow(backend, taskId, projectRoot) {
+// objectiveText — the first-turn user prompt; active task keys named in it get their full
+// description pre-fetched (### Referenced task descriptions).
+async function prefetchObjectiveWorkflow(backend, taskId, projectRoot, objectiveText = '') {
   const t0 = Date.now();
   try {
     // C1439: getTagsDetailed()'s failure used to collapse to `[]`, indistinguishable
@@ -300,6 +328,8 @@ async function prefetchObjectiveWorkflow(backend, taskId, projectRoot) {
       ? `\n\n### Deferred tag architectures (too large for prefetch — call \`mcp__tipatask__get_tag_architecture\` if needed)\n${deferredTags.map(t => `- ${t}`).join('\n')}`
       : '';
     const sections = [`### list_task_id_meta\n\`\`\`json\n${idMetaJson}\n\`\`\``, tagsSection];
+    const referencedSection = buildReferencedTasksSection(tasks, objectiveText, statusCtx.active);
+    if (referencedSection) sections.push(referencedSection);
     if (archSection) sections.push(archSection);
     const bundle = `## Pre-fetched Workflow Data (do not re-fetch via MCP tools)\n\n${sections.join('\n\n')}${deferredSection}`;
 
@@ -314,4 +344,4 @@ async function prefetchObjectiveWorkflow(backend, taskId, projectRoot) {
   }
 }
 
-module.exports = { getStaticBundle, getStaticBundleStats, getTaskTagBundleFromSession, getTaskStartupGrepBundle, prefetchObjectiveWorkflow, SESSION_ARCH_TTL_MS };
+module.exports = { getStaticBundle, getStaticBundleStats, getTaskTagBundleFromSession, getTaskStartupGrepBundle, prefetchObjectiveWorkflow, buildReferencedTasksSection, SESSION_ARCH_TTL_MS };

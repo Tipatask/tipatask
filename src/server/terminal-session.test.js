@@ -2006,7 +2006,7 @@ test('killRunawaySession records the reason, appends a [Task App] notice to the 
     const result = killRunawaySession(session, { count: 127, threshold: 50, snapshot: RUNAWAY_SNAPSHOT });
 
     assert.equal(result.first, true);
-    assert.match(result.text, /^Descendant watchdog killed this session: 127 descendant processes/);
+    assert.match(result.text, /^Watchdog killed this session: resource watchdog intervention; 127 descendant processes/);
     assert.match(result.text, /\u226550/);
     assert.match(result.text, /\u2265150/);
     assert.deepEqual(session._exitReason, { kind: 'runaway-killed', count: 127, threshold: 50, text: result.text });
@@ -2072,8 +2072,8 @@ test('killRunawaySession falls back to pty.kill() when the process tree yields n
 test('killRunawaySession words a memory kill around the limit and records the figures', () => {
   runWithStubbedKill(() => {
     const { session } = makeRunawaySession();
-    const result = killRunawaySession(session, { count: 12, threshold: 50, rssMb: 4800, limitMb: 3072, reason: 'memory', snapshot: RUNAWAY_SNAPSHOT });
-    assert.match(result.text, /^Watchdog killed this session: its process tree used 4800 MB, over the 3072 MB memory limit/);
+    const result = killRunawaySession(session, { count: 12, threshold: 50, rssMb: 4800, limitMb: 3072, reason: 'memory-growth', snapshot: RUNAWAY_SNAPSHOT });
+    assert.match(result.text, /^Watchdog killed this session: sustained high RSS and memory growth; 12 descendant processes using 4800 MiB/);
     assert.match(result.text, /12 descendant processes/);
     assert.equal(session._exitReason.kind, 'runaway-killed');
     assert.equal(session._exitReason.rssMb, 4800);
@@ -2083,7 +2083,7 @@ test('killRunawaySession words a memory kill around the limit and records the fi
 
 // ── pauseRunawaySession() / resumeRunawaySession() — process.kill stubbed, nothing real is signaled ──
 
-const PAUSE_ARGS = { count: 12, threshold: 50, rssMb: 3300, limitMb: 3072, reason: 'memory', snapshot: RUNAWAY_SNAPSHOT };
+const PAUSE_ARGS = { count: 12, threshold: 50, rssMb: 3300, limitMb: 3072, reason: 'memory-growth', snapshot: RUNAWAY_SNAPSHOT };
 
 test('pauseRunawaySession is a no-op returning null when the session is not alive or has no ptyPid', () => {
   runWithStubbedKill((calls) => {
@@ -2104,7 +2104,7 @@ test('pauseRunawaySession SIGSTOPs the whole tree, never kills, and writes one [
     const result = pauseRunawaySession(session, { ...PAUSE_ARGS, summary: 'node ×9' });
 
     assert.equal(result.first, true);
-    assert.match(result.text, /^Watchdog paused this session: its process tree uses 3300 MB, over the 3072 MB memory limit/);
+    assert.match(result.text, /^Watchdog paused this session: sustained high RSS and memory growth; 12 descendant processes using 3300 MiB/);
     assert.match(result.text, /Nothing was killed/);
     assert.match(result.text, /Resume the session/);
     assert.match(result.text, /Top processes: node ×9\.$/);
@@ -2117,7 +2117,7 @@ test('pauseRunawaySession SIGSTOPs the whole tree, never kills, and writes one [
     assert.equal(session._exitReason, null);
     assert.equal(session.alive, true);
     assert.deepEqual(session._pause.targets, { pgids: [424242, 555], pids: [] });
-    assert.equal(session._pause.reason, 'memory');
+    assert.equal(session._pause.reason, 'memory-growth');
     assert.equal(session._pause.rssMb, 3300);
     // Buffer (reconnect replay) and the live socket both carry the notice.
     assert.ok(session.buffer.startsWith('agent output\r\n'));
@@ -2131,17 +2131,17 @@ test('pauseRunawaySession SIGSTOPs the whole tree, never kills, and writes one [
     assert.deepEqual(Object.keys(sent[1].paused).sort(), ['at', 'count', 'limitMb', 'reason', 'rssMb', 'threshold']);
     assert.equal(sent[1].paused.rssMb, 3300);
     assert.equal(sent[1].paused.limitMb, 3072);
-    assert.equal(sent[1].paused.reason, 'memory');
+    assert.equal(sent[1].paused.reason, 'memory-growth');
   });
 });
 
 test('pauseRunawaySession words a count pause around the process growth', () => {
   runWithStubbedKill(() => {
     const { session } = makeRunawaySession();
-    const result = pauseRunawaySession(session, { count: 86, threshold: 50, rssMb: 700, limitMb: 3072, reason: 'count', snapshot: RUNAWAY_SNAPSHOT });
-    assert.match(result.text, /^Watchdog paused this session: 86 descendant processes using 700 MB and growing/);
+    const result = pauseRunawaySession(session, { count: 86, threshold: 50, rssMb: 700, limitMb: 3072, reason: 'count-growth', snapshot: RUNAWAY_SNAPSHOT });
+    assert.match(result.text, /^Watchdog paused this session: sustained process-count growth; 86 descendant processes using 700 MiB/);
     assert.match(result.text, /warn ≥50/);
-    assert.equal(session._pause.reason, 'count');
+    assert.equal(session._pause.reason, 'count-growth');
   });
 });
 
@@ -2195,6 +2195,7 @@ test('resumeRunawaySession SIGCONTs exactly the stopped set, clears the pause an
     assert.equal(session._exitReason, null);
     assert.deepEqual(session.descendantWatchdog, {
       threshold: 50, lastCount: 12, paused: false, actReason: null, growthStreak: 0, rssStreak: 0, pauseFailed: false,
+      rssGrowthStreak: 0, pressureGrowthStreak: 0, pressureStreak: 0, rssSince: null, lastSampleAt: null, lastRssMb: null,
       resumeBase: { count: 12, rssMb: 3300 },
     });
     assert.ok(session.buffer.includes(`[Task App] ${result.text}`));
@@ -2320,34 +2321,39 @@ const SPINNER = '✻ Crafting… (3s · esc to interrupt)\n';
 const TURN_OUTPUT = `${'●'.repeat(1)} Reply with the single word READY.\n${'.'.repeat(SUBMIT_MARKER_TRAILING_MAX + 100)}\n${SPINNER}`;
 
 // One spawn on a fresh session. Returns handles to feed PTY output and inspect PTY input.
-async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364', kickoffTypedLine } = {}) {
+async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, sessions, captureSpawn } = {}) {
   const writes = [];
   const sent = [];
   let dataCb = null;
+  let exitCb = null;
   const fakePty = {
     pid: 424242,
     write: (d) => { writes.push(d); },
     onData: (cb) => { dataCb = cb; },
-    onExit: () => {},
+    onExit: (cb) => { exitCb = cb; },
     resize: () => {},
     kill: () => {},
   };
   t.mock.method(nodePty, 'spawn', () => fakePty);
   const agent = getTaskAgent('claude');
   t.mock.method(agent, 'cachedDetect', async () => ({ id: 'claude', label: 'Claude Code', available: true }));
-  t.mock.method(agent, 'getSpawnSpec', async () => ({
-    command: 'claude', args: [], cwd: os.tmpdir(), env: {}, initialPrompt, model: 'test-model',
-    ...(kickoffTypedLine ? { kickoffTypedLine } : {}),
-  }));
+  t.mock.method(agent, 'getSpawnSpec', async (_config, prompt, taskId, opts) => {
+    captureSpawn?.(agent, prompt, opts);
+    return {
+      command: 'claude', args: [], cwd: os.tmpdir(), env: {}, initialPrompt, model: 'test-model',
+      ...(kickoffTypedLine ? { kickoffTypedLine } : {}),
+    };
+  });
   const session = createSession(null, false, 'TPT364-tab', '');
   session.taskAgent = 'claude';
   session.ws = { OPEN: 1, readyState: 1, send: (m) => sent.push(JSON.parse(m)) };
-  await spawnTerminal(session, 'raw prompt', 'TPT364', [], {});
+  await spawnTerminal(session, 'raw prompt', 'TPT364', [], { sessions });
   assert.equal(session.alive, true, 'the fake spawn must have gone live');
   assert.equal(typeof dataCb, 'function', 'onData handler must be registered');
   const k = {
     session,
     writes,
+    exit: () => exitCb({ exitCode: 0 }),
     feed: (chunk) => dataCb(chunk),
     // Advance in small steps so timers armed by a callback that fall inside the window still fire.
     advance: (ms) => { for (let left = ms; left > 0; left -= 50) t.mock.timers.tick(Math.min(50, left)); },
@@ -2570,4 +2576,48 @@ test('TPT364 fetchTaskCommentsContext stays fail-open: no backend, a throwing ba
   const r = await fetchTaskCommentsContext({ getTaskComments: async () => null }, 'TPT364');
   assert.equal(r.block, '');
   assert.equal(r.baselineId, null);
+});
+
+
+test('terminal kickoff scales the prompt cap against live sessions across projects', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const sessions = new Map([
+    ['chat', { type: 'objective', alive: true, ptyPid: 1 }],
+    ['dead', { type: 'terminal', alive: false, ptyPid: 2 }],
+    ['queued', { type: 'terminal', alive: false, _queued: true }],
+  ]);
+  const captures = [];
+  const captureSpawn = (agent, prompt, opts) => captures.push({
+    limits: opts.agentLimits,
+    prompt: agent.buildPrompt(prompt, opts),
+  });
+  const first = await startClaudeKickoff(t, { sessions, captureSpawn });
+  t.after(() => stopSession(first.session));
+  first.session.projectPath = '/other-project';
+  sessions.set('first', first.session);
+  const second = await startClaudeKickoff(t, { sessions, captureSpawn });
+  t.after(() => stopSession(second.session));
+  const base = require('./process-group').resolveAgentLimits(config.PROJECT_ROOT);
+  const scaled = require('./process-group').scaleAgentLimitsForConcurrency;
+  assert.deepEqual(captures[0].limits, scaled(base, 1));
+  assert.deepEqual(captures[1].limits, scaled(base, 2));
+  assert.ok(captures[1].limits.maxSubagents < captures[0].limits.maxSubagents);
+  for (const [i, kickoff] of [first, second].entries()) {
+    assert.match(captures[i].prompt, new RegExp(`at most ${captures[i].limits.maxSubagents} sub-agents`));
+    assert.equal(kickoff.session.descendantWatchdog.threshold, captures[i].limits.warnDescendants);
+  }
+});
+
+test('terminal spawn and natural exit notify memory lifetime tracker exactly once', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const { setSessionMemoryTracker } = require('./session-memory');
+  const calls = [];
+  setSessionMemoryTracker({ begin: s => calls.push(['start', s]), end: (s, reason) => calls.push([reason, s]) });
+  t.after(() => setSessionMemoryTracker(null));
+  const k = await startClaudeKickoff(t);
+  t.after(() => stopSession(k.session));
+  assert.deepEqual(calls, [['start', k.session]]);
+  k.exit();
+  assert.deepEqual(calls, [['start', k.session], ['exited', k.session]]);
+  assert.equal(k.session.ptyPid, null);
 });

@@ -1,0 +1,197 @@
+/* (TPT484) Compact notification page — the single stylesheet for the in-app panel
+   (#tt-notif-stack, imported by styles.css) and the always-on-top banner window
+   (main/desktop-notifications.html). Both surfaces render the same DOM
+   (src/client/notification-page.js), so they look the same.
+
+   Fixed heights (paged): header 24, card 70, Show More 24, gap 8 — mirrored by
+   pageHeight() in main/desktop-notifications.js. Card height = 1px border x2 + 10px padding x2
+   + 16px title + 2px gap + two 15px body lines (TPT498).
+
+   Colors: --tt-notif-* (set on the banner from the in-app host's palette) fall back to the
+   app's --c-* tokens, then to the brand paper defaults. The category badge color comes from
+   the card's data-category (attention → warning, objective/completed → success, else primary). */
+
+.tt-notif-page {
+  --tt-notif-c-bg: var(--tt-notif-bg, var(--c-bg-card, #fbf9f3));
+  --tt-notif-c-text: var(--tt-notif-text, var(--c-text, #1a1a19));
+  --tt-notif-c-muted: var(--tt-notif-muted, var(--c-text-muted, #6b6b64));
+  --tt-notif-c-border: var(--tt-notif-border, var(--c-border, #d9d6cc));
+  --tt-notif-c-primary: var(--tt-notif-primary, var(--c-primary, #007a6d));
+  --tt-notif-c-shadow: var(--tt-notif-shadow, var(--c-shadow, rgba(26, 26, 25, 0.06)));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 320px;
+  max-width: 100%;
+  font-family: inherit;
+}
+.tt-notif-page-header {
+  flex: 0 0 24px;
+  height: 24px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 12px;
+  border: 1px solid var(--tt-notif-c-border);
+  border-radius: 999px;
+  background: var(--tt-notif-c-bg);
+  background: color-mix(in srgb, var(--tt-notif-c-muted) 10%, var(--tt-notif-c-bg));
+  color: var(--tt-notif-c-muted);
+  font-size: 12px;
+  line-height: 1;
+}
+.tt-notif-page-header[hidden] { display: none; }
+.tt-notif-page-count { font-weight: 600; }
+.tt-notif-page-clear,
+.tt-notif-page-more {
+  background: none;
+  border: none;
+  color: var(--tt-notif-c-primary);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: none;
+  text-underline-offset: 2px;
+}
+.tt-notif-page-more {
+  flex: 0 0 24px;
+  height: 24px;
+  box-sizing: border-box;
+  align-self: center;
+  padding: 0 12px;
+  border: 1px solid var(--tt-notif-c-border);
+  border-radius: 999px;
+  background: var(--tt-notif-c-bg);
+}
+.tt-notif-page-more[hidden] { display: none; }
+.tt-notif-page-clear:hover,
+.tt-notif-page-clear:focus-visible,
+.tt-notif-page-more:hover,
+.tt-notif-page-more:focus-visible { text-decoration: underline; outline: none; }
+.tt-notif-page-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tt-notif-card {
+  --tt-notif-badge: var(--tt-notif-c-primary);
+  position: relative;
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+  flex-shrink: 0;
+  padding: 10px 30px 10px 12px;
+  background: var(--tt-notif-c-bg);
+  color: var(--tt-notif-c-text);
+  border: 1px solid var(--tt-notif-c-border);
+  /* Hairline stays visible on palettes whose border equals the card bg (ink). */
+  border-color: color-mix(in srgb, var(--tt-notif-c-text) 10%, var(--tt-notif-c-border));
+  border-radius: 10px;
+  /* Shadow stays inside the banner's 8px body padding — a larger blur is clipped at the
+     transparent window edge and reads as a cut second outline. */
+  box-shadow: 0 1px 2px var(--tt-notif-c-shadow),
+    0 2px 6px color-mix(in srgb, var(--tt-notif-c-shadow) 60%, transparent);
+  font-size: 13px;
+  line-height: 16px;
+  cursor: pointer;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.2s ease, transform 0.2s ease, border-color 0.15s;
+}
+.tt-notif-card[data-category="attention"] { --tt-notif-badge: var(--tt-notif-warning, var(--c-warning, #b36b00)); }
+.tt-notif-card[data-category="objective"],
+.tt-notif-card[data-category="completed"] { --tt-notif-badge: var(--tt-notif-success, var(--c-success, #2f7d4f)); }
+/* Paged surfaces use one fixed card height so the banner window can be sized exactly. */
+.tt-notif-page.is-paged .tt-notif-card { flex: 0 0 70px; height: 70px; }
+.tt-notif-card.is-shown { opacity: 1; transform: none; }
+.tt-notif-card:hover {
+  border-color: var(--tt-notif-c-primary);
+  border-color: color-mix(in srgb, var(--tt-notif-c-primary) 55%, var(--tt-notif-c-border));
+}
+.tt-notif-card:focus-visible {
+  outline: 2px solid var(--tt-notif-c-primary);
+  outline-offset: -2px;
+}
+.tt-notif-card-icon {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--tt-notif-badge);
+  color: var(--tt-notif-c-bg);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+.tt-notif-card-body-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+.tt-notif-card-title {
+  font-size: 13px;
+  line-height: 16px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tt-notif-key {
+  margin-right: 4px;
+  color: var(--tt-notif-c-muted);
+  font-weight: 500;
+}
+.tt-notif-key[hidden] { display: none; }
+.tt-notif-card-body {
+  font-size: 12px;
+  line-height: 15px;
+  color: var(--tt-notif-c-muted);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.tt-notif-card-body:empty,
+.tt-notif-card-body:has(> .tt-notif-body:empty) { display: none; }
+.tt-notif-card-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--tt-notif-c-muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  opacity: 0.6;
+  transition: opacity 0.15s, background-color 0.15s;
+}
+.tt-notif-card-close:hover,
+.tt-notif-card-close:focus-visible {
+  opacity: 1;
+  color: var(--tt-notif-c-text);
+  background: color-mix(in srgb, var(--tt-notif-c-muted) 16%, transparent);
+  outline: none;
+}

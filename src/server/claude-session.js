@@ -145,6 +145,9 @@ function resolveClaudeModel(session) {
 // mcp__tipatask__reserve_task_keys (C980) is NOT in this deny list and IS in
 // --allowedTools below — the one narrow exception to the read-only fence: it only
 // claims a placeholder key row, it never creates/mutates real task content.
+// mcp__tipatask__get_task is also allowed: a pure read, the planner's only way to load
+// an existing task's full description before proposing a "modified" description
+// (list_task_id_meta's active list carries no descriptions).
 const OBJECTIVE_DISALLOWED_TOOLS = [
   'Edit', 'Write', 'NotebookEdit', 'Bash', 'Grep', 'Glob',
   'ToolSearch', 'WebFetch', 'WebSearch',
@@ -351,8 +354,9 @@ function buildObjectiveArgs(session) {
     '--include-partial-messages',
     // C1382 — batch_grep_tags moved to the local-only 'tipatask-local' server (needs a
     // repo checkout the remote API doesn't have); get_tag_architecture/reserve_task_keys
-    // stayed on the primary 'tipatask' name (now the remote transport).
-    '--allowedTools', 'Read,mcp__tipatask-local__batch_grep_tags,mcp__tipatask__get_tag_architecture,mcp__tipatask__reserve_task_keys',
+    // stayed on the primary 'tipatask' name (now the remote transport). get_task is
+    // read-only — loads the full current description of a task the planner modifies.
+    '--allowedTools', 'Read,mcp__tipatask-local__batch_grep_tags,mcp__tipatask__get_tag_architecture,mcp__tipatask__reserve_task_keys,mcp__tipatask__get_task',
     '--disallowedTools', OBJECTIVE_DISALLOWED_TOOLS,
     '--permission-mode', 'default',
   ];

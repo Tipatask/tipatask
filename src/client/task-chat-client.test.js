@@ -276,9 +276,10 @@ test('task-chat.js: open() routes a task chat to its workspace; the project chat
   assert.match(project, /openChat\(\{ kind: 'project'/);
 });
 
-test('styles.css: workspace tabs size the panel per pane, Agent Terminal largest, and drop captions on a phone', () => {
-  assert.match(styles, /\.task-edit-panel--tabs\[data-pane="chat"\] \{\s*max-width: min\(880px, 94vw\);/);
-  assert.match(styles, /\.task-edit-panel--tabs\[data-pane="terminal"\] \{\s*max-width: min\(1400px, 100%\);/);
+test('styles.css: workspace tabs share one panel frame on every pane, and drop captions on a phone', () => {
+  // (TPT479) One box for Edit / Agent Terminal / Chat — a pane switch never moves the panel.
+  assert.match(styles, /\.task-edit-panel--tabs \{\s*max-width: min\(1400px, 100%\); height: min\(900px, calc\(100vh - 40px\)\); max-height: none;/);
+  assert.doesNotMatch(styles, /\.task-edit-panel--tabs\[data-pane="(?:chat|terminal|edit)"\] \{[^}]*(?:max-width|height)/);
   assert.match(styles, /\.task-edit-overlay--rail \{\s*left: 200px;/);
   const phone = styles.slice(styles.indexOf('.modal-top-bar button { padding: 0 10px; }'));
   assert.match(phone.slice(0, 400), /\.modal-top-bar \.task-modal-tab-label \{ display: none; \}/);

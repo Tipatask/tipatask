@@ -62,7 +62,14 @@ const sessionQueue = createSessionQueue({
   getSessions: () => sleepWatchdogSessions,
   defaultProject: config.PROJECT_ROOT,
   resolveLimits: (projectPath) => resolveAgentLimits(projectPath),
-  onChange: (projectPath, snapshot) => websocket.emitSessionQueueState(projectPath, snapshot),
+  onChange: (projectPath, snapshot) => {
+    websocket.emitSessionQueueState(projectPath, snapshot);
+    for (const session of sleepWatchdogSessions?.values() || []) {
+      if (session._queued && session.projectPath === projectPath) {
+        _sendIfOpen(session.ws, queuedSessionFrame(session, session.tabId, snapshot));
+      }
+    }
+  },
 });
 
 // Safe to call from anywhere a slot may have freed (task completed, pty exited, session
@@ -77,6 +84,13 @@ function _sendIfOpen(ws, payload) {
   }
 }
 
+function queuedSessionFrame(session, taskId, snapshot) {
+  const row = snapshot.queued.find(entry => entry.taskId === taskId);
+  return { type: 'session-queued', tabId: session.tabId, taskId,
+    position: row?.position ?? null, running: snapshot.running, cap: snapshot.cap,
+    reason: 'device-cap', ...row };
+}
+
 // A queued session has no wireClient() yet; this is its minimal socket handling: a Stop/kill
 // cancels the queue entry, a close just detaches (a headless Play All start closes on purpose).
 function announceQueuedClient(ws, session, taskId, sessionKey, sessions, backend) {
@@ -84,7 +98,7 @@ function announceQueuedClient(ws, session, taskId, sessionKey, sessions, backend
   if (!ws) return;
   session.ws = ws;
   const snap = sessionQueue.snapshot(session.projectPath);
-  _sendIfOpen(ws, { type: 'session-queued', tabId: session.tabId, taskId, position: sessionQueue.position(sessionKey), running: snap.running, cap: snap.cap });
+  _sendIfOpen(ws, queuedSessionFrame(session, taskId, snap));
   const onMessage = (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
@@ -679,6 +693,7 @@ function killTerminalPty(ptyProcess) {
 }
 
 function terminateTerminalSession(session, taskId, sessionKey, sessions, reason = 'terminated', opts = {}) {
+  require('./session-memory').endSessionMemory(session, 'terminated');
   let attachedWs = null;
   sessionQueue.remove(sessionKey); // (TPT444) cancelling a queued start
   detachQueuedClient(session);
@@ -1145,7 +1160,8 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         const bucket = sessionListBucket(s); // (C1444) 'active' covers alive || _starting
         if (bucket === 'active') active.push(id);
         else if (bucket === 'exited') exited.push(id);
-        else if (bucket === 'queued') queued.push({ taskId: id, position: sessionQueue.position(sessKey(id, s.projectPath || '')) });
+        else if (bucket === 'queued') queued.push({ taskId: id, position: sessionQueue.position(sessKey(id, s.projectPath || '')),
+          reason: 'device-cap', ...sessionQueue.snapshot(s.projectPath).queued.find(row => row.taskId === id) });
         if (s._attentionBroadcasted) {
           attention.push(id);
           if (s._attentionLastBroadcast) attentionDetails[id] = s._attentionLastBroadcast;
@@ -1162,7 +1178,8 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
           alive: false, startedAt: row.startedAt };
       }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      return res.end(JSON.stringify({ projectPath: reqPath || config.PROJECT_ROOT, sessions: active, exited, queued, lost, lostDetails, attention, attentionDetails, sessionMeta }));
+      return res.end(JSON.stringify({ projectPath: reqPath || config.PROJECT_ROOT, sessions: active, exited, queued, lost, lostDetails, attention, attentionDetails, sessionMeta,
+        admission: sessionQueue.snapshot(reqPath || config.PROJECT_ROOT).admission }));
     }
 
     // GET /api/agent-config — agent availability snapshot for startup population
@@ -3907,7 +3924,7 @@ async function launchNewTerminalSession(ctx) {
       _task = await claimUnassignedTaskOnStart(backend, taskId, _task, _me, projectPath);
       // C1122 — _piModelParam prefixed so the validated launch-time pick survives even
       // when the getTask() try/catch above swallowed an error before _taskModel was set.
-      await spawnTerminal(session, prompt, taskId, taskTags, { initialCols, initialRows, backend, model: _piModelParam || _taskModel, discovery, designMode: _designMode, task: _task });
+      await spawnTerminal(session, prompt, taskId, taskTags, { sessions, initialCols, initialRows, backend, model: _piModelParam || _taskModel, discovery, designMode: _designMode, task: _task });
       if (session.alive) forgetLostSession(taskId, projectPath || config.PROJECT_ROOT, config.USER_DATA_ROOT);
       if (session._terminated || sessions.get(sessionKey) !== session) {
         try { ws && ws.close(); } catch { /* already closed */ }
@@ -4975,7 +4992,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
             });
           }
           // Kick off pre-fetch before synchronous system-prompt work so both run concurrently.
-          const prefetchPromise = config.SIMPLE_MODE ? null : prefetchObjectiveWorkflow(backend, taskId, objProjectRoot);
+          const prefetchPromise = config.SIMPLE_MODE ? null : prefetchObjectiveWorkflow(backend, taskId, objProjectRoot, msg.prompt);
           if (msg.systemPrompt) {
             if (config.SIMPLE_MODE) {
               // SIMPLE_MODE: suppress static bundle; --append-system-prompt is skipped in buildObjectiveArgs
@@ -5061,78 +5078,95 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           sessions.delete(sessionKey);
         }
       } else {
-        if (msg.agent) {
-          if ((await getAvailableAgents(configForProject(session.projectPath))).includes(msg.agent)) {
-            session.taskAgent = msg.agent;
-          } else {
-            ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Unknown agent: ${msg.agent}` }));
-            ws.close();
-            sessions.delete(sessionKey);
-            return;
-          }
-        }
-        try {
-          // Inlined rather than reusing _fetchTaskTags() (whose tt-*-only return shape is also
-          // relied on by the objective-chat arch-cache prewarm call above) — this spawn site
-          // additionally needs the raw 'discovery' tag (C1134), which is not a tt-* tag.
-          // C1207: this deferred-start path reads neither the per-task model (claudeModel)
-          // nor claudeDesignMode — it is currently unreachable for a real task key (a
-          // promptless connect is rejected above unless the id is obj-*/specChat:, and the
-          // only `{type:'start'}` sender is objective-mode chat-ui.js). If that ever changes,
-          // both would need wiring here together, the same way as the path above.
-          let taskTags = [];
-          let discovery = false;
-          let _task = null; // C1408 — hoisted so assertTaskStartable()/claimUnassignedTaskOnStart() can reuse this fetch
+        if (session._queued || session._launching || session._starting || session.alive) return;
+        const launch = async () => {
           try {
-            _task = await backend.getTask(taskId);
-            const _rawTags = _task?.tags || [];
-            taskTags = _rawTags.filter(t => t.startsWith('tt-'));
-            discovery = _rawTags.includes('discovery');
-          } catch { /* ignore — tags and discovery fall back to empty/false */ }
-          // C1408 — see the handleConnection spawn path above for the same guard.
-          const _me = await assertTaskStartable(backend, taskId, _task);
-          _task = await claimUnassignedTaskOnStart(backend, taskId, _task, _me, session.projectPath);
-          await spawnTerminal(session, msg.prompt, taskId, taskTags, { backend, discovery, task: _task });
-          if (session._terminated || sessions.get(sessionKey) !== session) {
-            try { ws.close(); } catch { /* already closed */ }
-            return;
+            if (msg.agent) {
+              if ((await getAvailableAgents(configForProject(session.projectPath))).includes(msg.agent)) {
+                session.taskAgent = msg.agent;
+              } else {
+                ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Unknown agent: ${msg.agent}` }));
+                ws.close();
+                sessions.delete(sessionKey);
+                return;
+              }
+            }
+            try {
+              // Inlined rather than reusing _fetchTaskTags() (whose tt-*-only return shape is also
+              // relied on by the objective-chat arch-cache prewarm call above) — this spawn site
+              // additionally needs the raw 'discovery' tag (C1134), which is not a tt-* tag.
+              // C1207: this deferred-start path reads neither the per-task model (claudeModel)
+              // nor claudeDesignMode — it is currently unreachable for a real task key (a
+              // promptless connect is rejected above unless the id is obj-*/specChat:, and the
+              // only `{type:'start'}` sender is objective-mode chat-ui.js). If that ever changes,
+              // both would need wiring here together, the same way as the path above.
+              let taskTags = [];
+              let discovery = false;
+              let _task = null; // C1408 — hoisted so assertTaskStartable()/claimUnassignedTaskOnStart() can reuse this fetch
+              try {
+                _task = await backend.getTask(taskId);
+                const _rawTags = _task?.tags || [];
+                taskTags = _rawTags.filter(t => t.startsWith('tt-'));
+                discovery = _rawTags.includes('discovery');
+              } catch { /* ignore — tags and discovery fall back to empty/false */ }
+              // C1408 — see the handleConnection spawn path above for the same guard.
+              const _me = await assertTaskStartable(backend, taskId, _task);
+              _task = await claimUnassignedTaskOnStart(backend, taskId, _task, _me, session.projectPath);
+              await spawnTerminal(session, msg.prompt, taskId, taskTags, { sessions, backend, discovery, task: _task });
+              if (session._terminated || sessions.get(sessionKey) !== session) {
+                try { ws.close(); } catch { /* already closed */ }
+                return;
+              }
+              postDeviceSession(taskId, backend);
+              await _syncAgentAssignee(backend, taskId, session.taskAgent);
+              _recordLastUsedAgent(session);
+              if (session._terminated || sessions.get(sessionKey) !== session) {
+                try { ws.close(); } catch { /* already closed */ }
+                return;
+              }
+            } catch (err) {
+              if (err.code === 'ETERMINATED') {
+                try { ws.close(); } catch { /* already closed */ }
+                sessions.delete(sessionKey);
+                return;
+              }
+              if (err.code === 'EASSIGNEE') {
+                ws.send(JSON.stringify({ type: 'error', code: 'EASSIGNEE', tabId: session.tabId, message: 'Cannot start a task assigned to another member.' }));
+                ws.close();
+                sessions.delete(sessionKey);
+                return;
+              }
+              if (err.code === 'ECLAIM') {
+                ws.send(JSON.stringify({ type: 'error', code: 'ECLAIM', tabId: session.tabId, message: 'Could not assign this task to you. Task start canceled.' }));
+                ws.close();
+                sessions.delete(sessionKey);
+                return;
+              }
+              if (err.code === 'EAUTH') {
+                // (C1383) Pre-spawn credential check tripped — expired/invalid API_TOKEN.
+                ws.send(JSON.stringify({ type: 'error', code: 'EAUTH', tabId: session.tabId, message: eauthClientMessage(err) }));
+                ws.close();
+                sessions.delete(sessionKey);
+                return;
+              }
+              ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Failed to start ${session.taskAgentLabel}: ${err.message}` }));
+              ws.close();
+              sessions.delete(sessionKey);
+            }
+          } finally {
+            session._launching = false;
+            drainSessionQueue();
           }
-          postDeviceSession(taskId, backend);
-          await _syncAgentAssignee(backend, taskId, session.taskAgent);
-          _recordLastUsedAgent(session);
-          if (session._terminated || sessions.get(sessionKey) !== session) {
-            try { ws.close(); } catch { /* already closed */ }
-            return;
-          }
-        } catch (err) {
-          if (err.code === 'ETERMINATED') {
-            try { ws.close(); } catch { /* already closed */ }
-            sessions.delete(sessionKey);
-            return;
-          }
-          if (err.code === 'EASSIGNEE') {
-            ws.send(JSON.stringify({ type: 'error', code: 'EASSIGNEE', tabId: session.tabId, message: 'Cannot start a task assigned to another member.' }));
-            ws.close();
-            sessions.delete(sessionKey);
-            return;
-          }
-          if (err.code === 'ECLAIM') {
-            ws.send(JSON.stringify({ type: 'error', code: 'ECLAIM', tabId: session.tabId, message: 'Could not assign this task to you. Task start canceled.' }));
-            ws.close();
-            sessions.delete(sessionKey);
-            return;
-          }
-          if (err.code === 'EAUTH') {
-            // (C1383) Pre-spawn credential check tripped — expired/invalid API_TOKEN.
-            ws.send(JSON.stringify({ type: 'error', code: 'EAUTH', tabId: session.tabId, message: eauthClientMessage(err) }));
-            ws.close();
-            sessions.delete(sessionKey);
-            return;
-          }
-          ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Failed to start ${session.taskAgentLabel}: ${err.message}` }));
-          ws.close();
-          sessions.delete(sessionKey);
+        };
+        if (isAgentChatId(taskId)) await launch();
+        else {
+          const admitted = sessionQueue.submit({ key: sessionKey, session, taskId, start: launch });
+          if (admitted.queued) {
+            const snap = sessionQueue.snapshot(session.projectPath);
+            _sendIfOpen(ws, queuedSessionFrame(session, taskId, snap));
+          } else await admitted.done;
         }
+
       }
     } else if (msg.type === 'chat' && typeof msg.content === 'string' && session.type === 'objective') {
       if (config.OBJECTIVE_TIMING_ENABLED) session.timingMilestones.msgReceivedAt = Date.now();
@@ -5721,7 +5755,7 @@ module.exports = {
   claimUnassignedTaskOnStart,
   sessionListBucket, sessionMetaRow,
   replayExitedTerminal,
-  drainSessionQueue, sessionQueue,
+  drainSessionQueue, sessionQueue, queuedSessionFrame,
   parsePiModelList,
   queryPiModels,
   listPiModels,

@@ -1,4 +1,5 @@
 import { getLocale } from './i18n.js';
+import { activateLocalNotification, dismissTaskNotificationCards, notificationProjectPath, removeLocalNotification, taskNotificationTags } from './notification-center.js';
 
 const _lastNotifiedAt = new Map();
 const DEBOUNCE_MS = 30000;
@@ -15,7 +16,73 @@ const _desktopDelivery = () => typeof window !== 'undefined' && window.electronA
 // `onclick`/`tag` of its own, so the click bridge (notify:clicked IPC) needs somewhere to
 // look the callback up by the tag we sent it.
 const _clickHandlers = new Map();
+// Retain browser instances and desktop callback identities until their surface closes.
+const _deliveries = new Map();
+function releaseDelivery(key) {
+  _clickHandlers.delete(key);
+  _deliveries.delete(key);
+}
+
+export function dismissTaskNotifications(taskId) {
+  if (typeof taskId !== 'string' || !taskId.trim()) return;
+  const projectPath = notificationProjectPath();
+  const tags = taskNotificationTags(taskId);
+  dismissTaskNotificationCards(taskId, projectPath);
+  for (const [key, entry] of _deliveries) {
+    if (entry.projectPath !== projectPath || !tags.has(entry.tag)) continue;
+    releaseDelivery(key);
+    if (entry.notification) {
+      entry.notification.onclick = null;
+      entry.notification.onclose = null;
+      entry.notification.onerror = null;
+      try { entry.notification.close(); } catch (_) {}
+    }
+  }
+  // Invoke before a fresh completion send. Main scopes the removal to the sender's
+  // bound project and removes all matching entries in one publish, including overflow.
+  try {
+    const result = window.electronAPI?.dismissTaskNotifications?.(taskId);
+    Promise.resolve(result).catch((err) => debugNotifyLog('task notification dismissal failed', taskId, err));
+  } catch (err) { debugNotifyLog('task notification dismissal failed', taskId, err); }
+}
 let _bridgeInstalled = false;
+
+// Electron click/dismiss bridge from main's shared alert registry. Installed on the first
+// notify() and at boot (index.js), so alerts that only exist as mirrored in-app cards (TPT484)
+// still route their clicks and dismissals back to this window.
+export function ensureNotificationBridge() {
+  if (_bridgeInstalled || typeof window === 'undefined' || typeof window.electronAPI?.onNotificationClick !== 'function') return;
+  _bridgeInstalled = true;
+  window.electronAPI.onNotificationClick((payload = {}) => {
+    const { tag: clickedTag, notificationId: clickedId, projectPath, cardSeq } = payload || {};
+    // (C1069) Payload names the project that RAISED the notif. A mismatch means this
+    // renderer got reloaded into a different project since the banner went up (e.g.
+    // project:open target:'current') — acting on it would open a terminal on the wrong
+    // board. Null on EITHER side is NOT a mismatch: a setup window adopted via
+    // adoptProjectIntoWindow() has a project in main but no ?projectPath= in its URL.
+    let mine = null;
+    try { mine = window.electronAPI.getProjectPath?.() ?? null; } catch (_) { mine = null; }
+    if (projectPath && mine && projectPath !== mine) return;
+    const key = clickedId || clickedTag;
+    const cb = key && _clickHandlers.get(key);
+    if (clickedId) releaseDelivery(clickedId);
+    // (TPT484) One alert, one action: the notify() callback when registered, otherwise the
+    // mirrored in-app card's own onClick. Either way the local card goes too.
+    const scope = [clickedTag, projectPath || notificationProjectPath(), { upTo: cardSeq ?? null }];
+    if (cb) {
+      removeLocalNotification(...scope);
+      _dispatchNotificationClick(cb);
+    } else {
+      activateLocalNotification(...scope);
+    }
+  });
+  window.electronAPI.onNotificationDismiss?.(({ notificationId: id, tag, projectPath, keepCard, cardSeq } = {}) => {
+    if (id) releaseDelivery(id);
+    // keepCard: a newer send replaced this callback identity, or the on-top setting was turned
+    // off (cards fall back to this window's local list). Otherwise the alert is gone everywhere.
+    if (!keepCard && tag) removeLocalNotification(tag, projectPath || notificationProjectPath(), { upTo: cardSeq ?? null });
+  });
+}
 
 // Every category supplies its destination through onClick. Completion provides the terminal
 // action; attention, activity, objective, and test banners retain their own destinations.
@@ -148,6 +215,10 @@ function _electronNotify() {
 // false` once `signed`/`valid` are otherwise healthy (so it doesn't outrank a real cause).
 let _ncRegistered = null;
 
+// (TPT487) Delivery main reported on the last notify:status read: 'native' while "Show on Top"
+// is off (transient OS notifications, so bundle health matters again), otherwise desktop.
+let _statusDelivery = null;
+
 // (C1058) What the Settings-modal status row reads. (C1155: the nav-hamburger warning
 // dot that used to read this too was removed along with the hamburger button itself.)
 // `canDeliver` answers "can the OS receive a notification at all right now" — independent of
@@ -162,7 +233,8 @@ export function getNotificationStatus() {
   // register the app with Notification Center. (C1318) `_ncRegistered === false` is the same
   // fatal outcome by direct observation rather than inferred cause — folded in at the same
   // rank, but only once signed/valid aren't already explaining it (see lastError below).
-  if (_desktopDelivery()) return { transport: 'electron', delivery: 'desktop', permission: 'granted',
+  const native = _desktopDelivery() && _statusDelivery === 'native';
+  if (_desktopDelivery() && !native) return { transport: 'electron', delivery: 'desktop', permission: 'granted',
     canDeliver: !_lastTransportError, lastError: _lastTransportError,
     enabled: Object.fromEntries(Object.keys(NOTIFY_PREF_KEYS).map((key) => [key, isNotifyEnabled(key)])),
     conflicts: null, installerVolumes: [] };
@@ -175,6 +247,7 @@ export function getNotificationStatus() {
   else if (notRegistered) lastError = 'not-registered';
   return {
     transport,
+    ...(native ? { delivery: 'native' } : {}),
     permission,
     canDeliver,
     enabled: { attention: isNotifyEnabled('attention'), objective: isNotifyEnabled('objective'), completed: isNotifyEnabled('completed'), activity: isNotifyEnabled('activity') },
@@ -192,6 +265,7 @@ export function getNotificationStatus() {
 // state a stale boot-time snapshot populated, instead of that snapshot being permanent for
 // the renderer's whole lifetime.
 function _foldSignatureStatus(status) {
+  _statusDelivery = (status && status.delivery) || null;
   _bundleSignature = {
     signed: status ? status.signed !== false : null,
     valid: status && status.valid !== undefined ? status.valid !== false : null,
@@ -277,36 +351,18 @@ export function notify(title, body, tag, options = {}) {
   if (send) {
     const notificationId = _desktopDelivery() ? `${_notificationSession}-${++_notifySeq}` : null;
     const handlerKey = notificationId || tag;
-    if (!_bridgeInstalled) {
-      _bridgeInstalled = true;
-      window.electronAPI.onNotificationClick((payload = {}) => {
-        const { tag: clickedTag, notificationId: clickedId, projectPath } = payload || {};
-        // (C1069) Payload names the project that RAISED the notif. A mismatch means this
-        // renderer got reloaded into a different project since the banner went up (e.g.
-        // project:open target:'current') — acting on it would open a terminal on the wrong
-        // board. Null on EITHER side is NOT a mismatch: a setup window adopted via
-        // adoptProjectIntoWindow() has a project in main but no ?projectPath= in its URL.
-        let mine = null;
-        try { mine = window.electronAPI.getProjectPath?.() ?? null; } catch (_) { mine = null; }
-        if (projectPath && mine && projectPath !== mine) return;
-        const key = clickedId || clickedTag;
-        const cb = key && _clickHandlers.get(key);
-        if (clickedId) _clickHandlers.delete(clickedId);
-        _dispatchNotificationClick(cb);
-      });
-      window.electronAPI.onNotificationDismiss?.(({ notificationId: id } = {}) => {
-        if (id) _clickHandlers.delete(id);
-      });
-    }
+    ensureNotificationBridge();
     if (handlerKey && options.onClick) _clickHandlers.set(handlerKey, options.onClick);
+    if (handlerKey) _deliveries.set(handlerKey, { tag, projectPath: notificationProjectPath() });
     // (C1125) A send the OS drops must not stay "handed to a transport" forever from the
     // caller's point of view: re-arm the tag's debounce so a retry isn't blocked for 30s, and
     // tell any registered failure listener (attention-notifications.js un-records its
     // prompt-signature ledger entry) so the same prompt can notify again instead of being
     // silenced indefinitely by a send nobody ever saw.
     const onFailed = (reason) => {
+      if (handlerKey && !_deliveries.has(handlerKey)) return;
       _lastTransportError = reason || 'failed';
-      if (notificationId) _clickHandlers.delete(notificationId);
+      if (handlerKey) releaseDelivery(handlerKey);
       if (tag) {
         _lastNotifiedAt.delete(tag);
         for (const cb of _failureListeners) { try { cb(tag); } catch (_) {} }
@@ -323,6 +379,9 @@ export function notify(title, body, tag, options = {}) {
           // dropped it, or did main.js already know why it wouldn't deliver?).
           debugNotifyLog('notify:show resolved', tag, result);
           if (result && result.ok === false) onFailed(result.reason);
+          // (TPT480) Desktop banners turned off in the Settings menu: a deliberate no-op, not a
+          // transport failure. No banner exists to click, so drop its handler.
+          else if (result && result.delivery === 'disabled') { if (handlerKey) releaseDelivery(handlerKey); }
           else _lastTransportError = null;
         })
         .catch(() => onFailed('failed'));
@@ -333,7 +392,14 @@ export function notify(title, body, tag, options = {}) {
     // (C1138) Suffixed tag so a second banner for the same task (changed promptText re-notify,
     // debounce already cleared) doesn't silently replace the first on screen — see module note.
     const n = new Notification(title, { body, tag: tag ? `${tag}-${++_notifySeq}` : undefined, requireInteraction: true });
-    n.onclick = () => _dispatchNotificationClick(options.onClick, true);
+    const key = n;
+    _deliveries.set(key, { tag, projectPath: notificationProjectPath(), notification: n });
+    if (options.onClick) _clickHandlers.set(key, options.onClick);
+    n.onclick = () => _dispatchNotificationClick(_clickHandlers.get(key), true);
+    n.onclose = n.onerror = () => {
+      releaseDelivery(key);
+      n.onclick = n.onclose = n.onerror = null;
+    };
   } catch (_) { return false; }
   return true;
 }
@@ -371,6 +437,8 @@ export async function sendTestNotification(title, body) {
   await refreshNotificationStatus();
   try {
     const result = await send({ title, body, tag: TEST_TAG, taskId: TEST_TAG, ...(_desktopDelivery() ? { notificationId: `${_notificationSession}-${++_notifySeq}`, locale: getLocale() } : {}) });
+    // (TPT480) Setting off — report it so the Test button explains why nothing appeared.
+    if (result && result.delivery === 'disabled') return { ok: false, reason: 'desktop-disabled' };
     _lastTransportError = (result && result.ok === false) ? (result.reason || 'failed') : null;
     return (result && result.ok === false) ? { ok: false, reason: result.reason || 'failed' } : { ok: true };
   } catch (err) {

@@ -1,6 +1,6 @@
 {
   "name": "tipatask-app",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "description": "TipΔTask — Electron desktop app: local task board, architecture knowledge base, and AI coding-agent orchestrator (Claude/Codex/Pi), with a CLI installer for the agent harness files.",
   "license": "Apache-2.0",
   "author": "Anton Matiienko, Apppixies",

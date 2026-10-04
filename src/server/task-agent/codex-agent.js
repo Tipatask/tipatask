@@ -8,7 +8,7 @@ const BaseTaskAgent = require('./base-agent');
 const config = require('../config');
 const { getStaticBundle, getTaskStartupGrepBundle } = require('../static-context');
 const { resolveBin, resolveBinAsync, augmentPathEnv, resolveNvmBinDir, resolveSpawnModel } = require('../spawn-utils');
-const { buildCodexEnv, codexEffortArgs, toCodexEffort } = require('../codex-env');
+const { buildCodexEnv, codexTerminalLaunchOptions, toCodexEffort } = require('../codex-env');
 const { matchPromptLine, CODEX_PROMPT_PATTERNS } = require('./prompt-detect');
 const { parseCodexCatalog } = require('./model-registry');
 
@@ -119,10 +119,9 @@ class CodexAgent extends BaseTaskAgent {
       console.warn('[codex-agent] opts.projectPath is falsy in a packaged Electron build — falling back to config.PROJECT_ROOT (bundle path). Check WS session projectPath resolution.');
     }
     const projectRoot = opts.projectPath || config.PROJECT_ROOT;
-    // Explicit CLI config override wins over inherited user/project config.toml.
-    // TPT286 — a task's own effort replaces the fixed default (max -> xhigh, see codex-env.js).
+    // Resolve task effort without unconditionally forcing embedded mode with -c.
     const effort = this.resolveEffort(opts.task);
-    const args = effort ? codexEffortArgs(toCodexEffort(effort)) : codexEffortArgs();
+    const args = [];
     // Live-read config.json for the model (not the frozen startup config.CODEX_MODEL
     // snapshot) so a settings-page edit applies on the next spawn without a server
     // restart, and a stale exported CODEX_MODEL env var can never shadow it (C953).
@@ -137,6 +136,9 @@ class CodexAgent extends BaseTaskAgent {
     let env;
     try {
       ({ env } = buildCodexEnv({ projectRoot, taskId, term: 'xterm-256color' }));
+      const launch = codexTerminalLaunchOptions(projectRoot, env.CODEX_HOME, effort ? toCodexEffort(effort) : undefined, env);
+      args.unshift(...launch.args);
+      console.log(`[codex:launch] task=${taskId || '(none)'} mode=${launch.mode} reason=${launch.reason}`);
     } catch (err) {
       throw new Error(`Unable to prepare project-local Codex MCP config: ${err.message}`);
     }

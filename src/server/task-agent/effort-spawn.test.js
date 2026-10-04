@@ -2,7 +2,7 @@
 
 // TPT286 — a task's persisted effort (task.effort, threaded into getSpawnSpec() as opts.task)
 // must reach every agent CLI that supports one: Claude via CLAUDE_CODE_EFFORT_LEVEL (+ --effort
-// when the installed CLI's --help lists it), Codex via -c model_reasoning_effort (max -> xhigh),
+// when the installed CLI's --help lists it), Codex via config or -c (max -> xhigh),
 // Pi not at all (spawn unchanged).
 
 const { test } = require('node:test');
@@ -123,7 +123,7 @@ test('Codex: task effort replaces the default model_reasoning_effort, max -> xhi
   fs.mkdirSync(globalCodexHome, { recursive: true });
   fs.writeFileSync(path.join(globalCodexHome, 'config.toml'), '', 'utf8');
   fs.writeFileSync(path.join(projectRoot, '.tipatask', 'config.json'), JSON.stringify({
-    API_BASE_URL: 'http://127.0.0.1:4454', API_PROJECT_ID: '2', API_TOKEN: 'test-token',
+    API_BASE_URL: 'https://effort-spawn.test', API_PROJECT_ID: '2', API_TOKEN: 'test-token',
   }), 'utf8');
   process.env.CODEX_HOME = globalCodexHome;
   const cfg = { CODEX_BIN: 'codex', PROJECT_ROOT: projectRoot, USER_DATA_ROOT: dir };
@@ -138,7 +138,8 @@ test('Codex: task effort replaces the default model_reasoning_effort, max -> xhi
   ];
   for (const [task, expected] of cases) {
     const spec = await new CodexAgent().getSpawnSpec(cfg, 'Work on task TPT99.', '', { projectPath: projectRoot, task });
-    assert.deepEqual(effortArgPairs(spec.args), [expected], `task=${JSON.stringify(task)}`);
+    assert.deepEqual(effortArgPairs(spec.args), expected === 'model_reasoning_effort="high"' ? [] : [expected], `task=${JSON.stringify(task)}`);
+    assert.match(fs.readFileSync(path.join(spec.env.CODEX_HOME, 'config.toml'), 'utf8'), /^model_reasoning_effort = "high"/);
   }
 });
 

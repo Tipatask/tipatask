@@ -119,14 +119,6 @@ test('Claude and Codex get the full wording, Pi the compact one', (t) => {
   assert.ok(!prompt.includes(pi.buildResourceLimitsDirective(opts.agentLimits)));
 });
 
-// The real spawn path must hand the resolved limits to the adapter, or every kickoff would
-// silently state the default instead of the project's configured cap.
-test('terminal-session.js threads resolveAgentLimits() into getSpawnSpec() as agentLimits', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'terminal-session.js'), 'utf8');
-  assert.match(src, /const agentLimits = resolveAgentLimits\(session\.projectPath \|\| config\.PROJECT_ROOT\);/);
-  assert.match(src, /agent\.getSpawnSpec\([^\n]*\bagentLimits\b/);
-});
-
 // ── Modes that carry no shared directives ──
 
 test('ClaudeAgent.buildPrompt: designMode wins — no resource-limits directive fused into the /design brief', () => {

@@ -9,12 +9,10 @@
 // Role resolution goes through status-registry.js's isCompleteName() — statuses are per-project
 // and renameable (C1184/C1187), never a hardcoded 'completed' string.
 //
-// Tag is `completed-${taskId}`, NOT the bare taskId attention-notifications.js uses — a task
-// usually completes shortly after its last attention prompt, so sharing a tag would let
-// pushNotification() overwrite the still-visible attention card and let notify()'s 30s per-tag
-// debounce swallow the completion banner outright.
+// Completion uses its own tag so attention's 30s debounce cannot swallow the fresh banner.
+// A confirmed completion transition first removes existing alerts for this task.
 
-import { notify, debugNotifyLog, isNotifyEnabled } from './notifications.js';
+import { notify, debugNotifyLog, isNotifyEnabled, dismissTaskNotifications } from './notifications.js';
 import { t } from './i18n.js';
 import { pushNotification, dismissNotification } from './notification-center.js';
 import { isCompleteName } from './status-registry.js';
@@ -59,10 +57,10 @@ function _completionAction(taskId, tag) {
   return () => {
     const currentPath = _projectPath();
     if (originPath && currentPath && originPath !== currentPath) {
-      dismissNotification(tag);
+      dismissNotification(tag, originPath);
       return;
     }
-    dismissNotification(tag);
+    dismissNotification(tag, originPath);
     try { window.electronAPI?.focusSelf?.(); } catch (_) {}
     if (_openingTerminals.has(taskId)) return;
     _openingTerminals.add(taskId);
@@ -140,6 +138,8 @@ export function maybeNotifyCompletion(taskId, prevStatus, nextStatus, title) {
     return false;
   }
   if (typeof prevStatus !== 'string' || !prevStatus.trim() || isCompleteName(prevStatus)) return false;
+  if (_notifiedCompletions.has(taskId)) return false;
+  dismissTaskNotifications(taskId);
   return notifyTaskCompleted(taskId, { title });
 }
 

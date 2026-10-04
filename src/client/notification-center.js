@@ -1,12 +1,76 @@
-// Shared persistent card renderer for project windows and the Electron desktop surface.
-// Each caller owns its model. Project entries upsert by task tag; desktop entries use
-// per-banner IDs. Model operations work without a DOM and never evict by count.
+// In-app notification panel for project windows. The local model (`_entries`) owns this
+// window's cards and their click/dismiss callbacks; it upserts by (project, tag) and never
+// evicts by count. Model operations work without a DOM.
+//
+// (TPT484) Under Electron every card is also mirrored into main's shared alert registry
+// (main/desktop-notifications.js), which owns one identity per (project, tag) and decides
+// which surface shows the whole set: the focused project window's in-app panel, or the
+// always-on-top banner while another app is focused. While shared, this window renders main's
+// snapshot (every project's alerts, paged like the banner) only when it is the active host,
+// and nothing otherwise. Browser mode and the "on top" setting turned off fall back to
+// rendering the local model. Both surfaces render the same page (notification-page.js).
 
-import { t } from './i18n.js';
+import { t, getLocale } from './i18n.js';
+import { renderNotificationPage, createNotificationCard, updateNotificationCard } from './notification-page.js';
 
+export { createNotificationCard, updateNotificationCard };
 
 // Ordered newest-first; tag upserts move to the front.
 let _entries = [];
+// Main's decision for this window: shared registry on?, this window the in-app host?, and the
+// all-project snapshot to render while active.
+let _surface = { shared: false, active: false, entries: [] };
+let _surfaceInstalled = false;
+// Monotonic per-window card sequence. Main echoes the newest sequence it has seen for an alert
+// on dismiss/click, so a late removal never takes a card pushed again after it.
+let _seq = 0;
+
+export function notificationProjectPath() {
+  try {
+    return window.electronAPI?.getProjectPath?.()
+      || new URLSearchParams(window.location?.search || '').get('projectPath') || null;
+  } catch (_) { return null; }
+}
+
+export function taskNotificationTags(taskId) {
+  return new Set([taskId, `activity-${taskId}`, `completed-${taskId}`]);
+}
+
+const entryKey = (entry) => JSON.stringify([entry.projectPath, entry.tag]);
+const _api = () => (typeof window !== 'undefined' ? window.electronAPI : null);
+
+function _mirror(method, ...args) {
+  try {
+    const result = _api()?.[method]?.(...args);
+    Promise.resolve(result).catch(() => {});
+  } catch (_) {}
+}
+
+function _mirrorPush(entry) {
+  if (entry.projectPath !== notificationProjectPath()) return;
+  _mirror('pushSharedNotification', { tag: entry.tag, title: entry.title, body: entry.body,
+    category: entry.category, locale: entry.locale, seq: entry.seq });
+}
+
+// Local-only removal; returns the removed entry. Never mirrors and never runs callbacks.
+// `upTo`: only remove a card main had already seen (seq <= upTo).
+function _removeLocal(tag, projectPath, upTo = null) {
+  const entry = _entries.find((e) => e.tag === tag && e.projectPath === projectPath);
+  if (!entry || (Number.isFinite(upTo) && entry.seq > upTo)) return null;
+  _entries = _entries.filter((e) => e !== entry);
+  _render();
+  return entry;
+}
+
+// Remove presentation state only: no activation/dismiss callbacks or API read writes. Main's
+// matching entries are removed by notifications.js#dismissTaskNotifications (notify:dismiss-task).
+export function dismissTaskNotificationCards(taskId, projectPath = notificationProjectPath()) {
+  if (!taskId) return;
+  const tags = taskNotificationTags(taskId);
+  const before = _entries.length;
+  _entries = _entries.filter((entry) => entry.projectPath !== projectPath || !tags.has(entry.tag));
+  if (_entries.length !== before) _render();
+}
 
 // Guards on createElement too, not just `document` existing — attention-notifications.js's own
 // unit tests stub a minimal MockDocument (getElementById only, no createElement/body) so the
@@ -15,23 +79,30 @@ function _hasDocument() {
   return typeof document !== 'undefined' && typeof document.createElement === 'function';
 }
 
-// Upsert keyed by `tag` — an existing entry for the same tag is updated in place and moved to
-// the top (fresh content, fresh position) instead of duplicated. No count-based eviction.
-// Desktop callers use a distinct tag per delivered banner. Returns the stored entry.
+// Upsert keyed by (project, tag) — an existing entry is updated in place and moved to the top
+// instead of duplicated. No count-based eviction. Mirrored to main's shared registry (TPT484)
+// under the same identity, so the banner and this panel never show it twice. Returns the entry.
 export function pushNotification({ tag, title, body, onClick, onDismiss, category, showClearAll = true } = {}) {
   if (!tag) return null;
-  _entries = _entries.filter((e) => e.tag !== tag);
-  const entry = { tag, title: title || '', body: body || '', onClick: onClick || null, category: category || null, onDismiss, showClearAll, dismissLabel: t('notifCenter.dismiss') };
+  const projectPath = notificationProjectPath();
+  _entries = _entries.filter((e) => e.tag !== tag || e.projectPath !== projectPath);
+  const entry = { tag, projectPath, title: title || '', body: body || '', onClick: onClick || null, category: category || null, onDismiss, showClearAll, dismissLabel: t('notifCenter.dismiss'), locale: _safeLocale(), seq: ++_seq };
   _entries.unshift(entry);
   _render();
+  _mirrorPush(entry);
   return entry;
 }
 
-export function dismissNotification(tag) {
+function _safeLocale() {
+  try { return getLocale(); } catch (_) { return 'en'; }
+}
+
+// Programmatic removal (resolved prompt, opened objective, ...). Also removes the shared alert
+// of the same identity, so a dismissed alert cannot come back on the other surface.
+export function dismissNotification(tag, projectPath = notificationProjectPath()) {
   if (!tag) return;
-  const before = _entries.length;
-  _entries = _entries.filter((e) => e.tag !== tag);
-  if (_entries.length !== before) _render();
+  _removeLocal(tag, projectPath);
+  if (projectPath === notificationProjectPath()) _mirror('dismissSharedNotification', tag);
 }
 
 export function clearAllNotifications() {
@@ -40,97 +111,99 @@ export function clearAllNotifications() {
   _render();
 }
 
+// (TPT484) Main removed an alert (closed on either surface, Clear All, completion cleanup):
+// drop the local card without callbacks. Returns true when one was removed.
+export function removeLocalNotification(tag, projectPath = notificationProjectPath(), { upTo = null } = {}) {
+  return !!(tag && _removeLocal(tag, projectPath, upTo));
+}
+
+// (TPT484) Main routed a click to this window for an alert whose callback lives on the local
+// card (no notify() callback registered). Removes the card, then runs its onClick exactly once.
+export function activateLocalNotification(tag, projectPath = notificationProjectPath(), { upTo = null } = {}) {
+  const entry = tag && _removeLocal(tag, projectPath, upTo);
+  if (!entry || typeof entry.onClick !== 'function') return false;
+  try { entry.onClick(); } catch (_) {}
+  return true;
+}
+
 // Model read — used by tests and by _render(). Returns a shallow copy so callers can't mutate
 // internal state by reference.
 export function getNotificationEntries() {
   return _entries.slice();
 }
 
-// Glyph shown in the toast-style icon slot, keyed by entry.category (C1151 — mirrors the
-// glyph convention utils.js#showToast() uses for its own corner-toast family).
-function _categoryGlyph(category) {
-  if (category === 'attention') return '!';
-  if (category === 'objective') return '✓'; // ✓
-  if (category === 'completed') return '✓'; // ✓ (C1355) — same glyph as objective, distinct color
-  return 'ℹ'; // ℹ
+export function getNotificationSurface() {
+  return { ..._surface, entries: _surface.entries.slice() };
 }
 
-// Creates a card element once. Click/close handlers read `el._entry` (kept live by _render()'s
-// update-in-place path below) rather than closing over the `entry` passed at creation time, so
-// an upsert that changes `onClick`/title/body never needs to re-bind or re-create the node —
-// see _render()'s keyed-reuse comment (C1151).
-function _cardEl(entry) {
-  const card = document.createElement('div');
-  card.className = 'tt-notif-card';
-  card.dataset.tag = entry.tag;
-  card._entry = entry;
-
-  const icon = document.createElement('span');
-  icon.className = 'tt-notif-card-icon';
-  icon.setAttribute('aria-hidden', 'true');
-  card._iconEl = icon;
-
-  const bodyWrap = document.createElement('div');
-  bodyWrap.className = 'tt-notif-card-body-wrap';
-
-  const title = document.createElement('div');
-  title.className = 'tt-notif-card-title';
-  card._titleEl = title;
-
-  const body = document.createElement('div');
-  body.className = 'tt-notif-card-body';
-  card._bodyEl = body;
-
-  bodyWrap.append(title, body);
-
-  const closeBtn = document.createElement('button');
-  closeBtn.type = 'button';
-  closeBtn.className = 'tt-notif-card-close';
-  closeBtn.setAttribute('aria-label', t('notifCenter.dismiss'));
-  closeBtn.textContent = '×';
-  closeBtn.addEventListener('click', (ev) => {
-    ev.stopPropagation();
-    const entry = card._entry;
-    dismissNotification(entry.tag);
-    try { entry.onDismiss?.(); } catch (_) {}
-  });
-  card._closeEl = closeBtn;
-
-  card.append(icon, bodyWrap, closeBtn);
-  const activate = () => {
-    const entry = card._entry;
-    dismissNotification(entry.tag);
-    try { entry.onClick?.(); } catch (_) {}
-  };
-  card.tabIndex = 0;
-  card.setAttribute('role', 'button');
-  card.addEventListener('click', activate);
-  card.addEventListener('keydown', (event) => {
-    if (event.target !== card || !['Enter', ' '].includes(event.key)) return;
-    event.preventDefault();
-    activate();
-  });
-
-  _updateCardEl(card, entry);
-  return card;
+// (TPT484) Applies main's surface decision for this window. When sharing turns on (first read,
+// or the on-top setting re-enabled), re-mirror this window's local cards so main holds them.
+export function applyNotificationSurface(state = {}) {
+  const wasShared = _surface.shared;
+  const wasActive = _surface.active;
+  _surface = { shared: !!state.shared, active: !!state.shared && !!state.active,
+    entries: Array.isArray(state.entries) ? state.entries : [] };
+  if (_surface.shared && !wasShared) for (const entry of _entries.slice().reverse()) _mirrorPush(entry);
+  if (_surface.active && !wasActive) _sendTheme();
+  _render();
 }
 
-// Refreshes an existing card's content/entry reference in place — no DOM re-creation, so an
-// in-flight entrance transition (or the user's hover) is undisturbed by an unrelated upsert.
-function _updateCardEl(card, entry) {
-  card._entry = entry;
-  card._closeEl.setAttribute('aria-label', entry.dismissLabel);
-  card.classList.remove('tt-notif-card--attention', 'tt-notif-card--objective', 'tt-notif-card--completed');
-  if (entry.category) card.classList.add(`tt-notif-card--${entry.category}`);
-  card._iconEl.textContent = _categoryGlyph(entry.category);
-  card._titleEl.textContent = entry.title;
-  card._bodyEl.textContent = entry.body;
+// Banner colors follow the in-app host's palette, so both surfaces look the same.
+const THEME_TOKENS = { bg: '--c-bg-card', text: '--c-text', muted: '--c-text-muted', border: '--c-border',
+  primary: '--c-primary', warning: '--c-warning', success: '--c-success', shadow: '--c-shadow' };
+function _sendTheme() {
+  if (!_hasDocument() || typeof getComputedStyle !== 'function' || !document.documentElement) return;
+  try {
+    const style = getComputedStyle(document.documentElement);
+    const tokens = {};
+    for (const [key, prop] of Object.entries(THEME_TOKENS)) tokens[key] = style.getPropertyValue(prop).trim();
+    _api()?.setNotificationTheme?.(tokens);
+  } catch (_) {}
+}
+
+export function installNotificationSurface() {
+  const api = _api();
+  if (_surfaceInstalled || typeof api?.onNotificationSurface !== 'function') return false;
+  _surfaceInstalled = true;
+  api.onNotificationSurface((state) => applyNotificationSurface(state));
+  try {
+    Promise.resolve(api.notificationSurfaceState?.()).then((state) => {
+      if (state) applyNotificationSurface(state);
+    }).catch(() => {});
+  } catch (_) {}
+  // A theme switch while hosting re-sends the palette to the banner.
+  try {
+    if (typeof MutationObserver === 'function' && _hasDocument()) {
+      new MutationObserver(() => { if (_surface.active) _sendTheme(); })
+        .observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
+  } catch (_) {}
+  return true;
+}
+
+// Local-mode actions: activating or closing removes the entry first, then runs its callback.
+function _localAct(id, action) {
+  if (action === 'clear-all') return clearAllNotifications();
+  const entry = _entries.find((e) => entryKey(e) === id);
+  if (!entry) return;
+  dismissNotification(entry.tag, entry.projectPath);
+  if (action === 'click') entry.onClick?.();
+  else if (action === 'close') entry.onDismiss?.();
+}
+
+// Shared-mode actions go to main, which owns the alert and routes clicks to its project.
+function _sharedAct(id, action) {
+  try { _api()?.notificationSurfaceAction?.(action, id); } catch (_) {}
 }
 
 function _render() {
   if (!_hasDocument()) return;
+  const shared = _surface.shared;
+  const entries = shared
+    ? (_surface.active ? _surface.entries : [])
+    : _entries.map((e) => ({ ...e, id: entryKey(e) }));
   let stack = document.getElementById('tt-notif-stack');
-  if (!_entries.length) {
+  if (!entries.length) {
     if (stack) stack.remove();
     return;
   }
@@ -139,52 +212,10 @@ function _render() {
     stack.id = 'tt-notif-stack';
     document.body.appendChild(stack);
   }
-
-  // Keyed reuse (C1151): update/move existing card elements instead of tearing the stack down
-  // and rebuilding it on every push/dismiss — that used to replay every card's entrance
-  // transition as a flash on any unrelated change.
-  const existingByTag = new Map();
-  for (const el of stack.querySelectorAll('.tt-notif-card')) existingByTag.set(el.dataset.tag, el);
-
-  let header = stack._headerEl;
-  if (!header) {
-    header = document.createElement('div');
-    header.className = 'tt-notif-stack-header';
-    const heading = document.createElement('span');
-    heading.textContent = t('notifCenter.heading');
-    const clearBtn = document.createElement('button');
-    clearBtn.type = 'button';
-    clearBtn.className = 'tt-notif-stack-clear';
-    clearBtn.textContent = t('notifCenter.clearAll');
-    clearBtn.addEventListener('click', () => clearAllNotifications());
-    header.append(heading, clearBtn);
-    stack._headerEl = header;
-  }
-  if (_entries.length > 1 && _entries.every((e) => e.showClearAll)) {
-    stack.appendChild(header); // first child — header renders above the card column
-  } else if (header.isConnected) {
-    header.remove();
-  }
-
-  const newlyCreated = [];
-  for (const entry of _entries) {
-    let el = existingByTag.get(entry.tag);
-    if (el) {
-      existingByTag.delete(entry.tag);
-      _updateCardEl(el, entry);
-    } else {
-      el = _cardEl(entry);
-      newlyCreated.push(el);
-    }
-    stack.appendChild(el); // (re)places in current _entries order — a move, not a re-create
-  }
-
-  // Anything left in existingByTag fell out of _entries (dismissed/evicted) — remove it.
-  for (const el of existingByTag.values()) el.remove();
-
-  if (newlyCreated.length) {
-    requestAnimationFrame(() => {
-      for (const el of newlyCreated) el.classList.add('is-shown');
-    });
+  if (shared) {
+    renderNotificationPage(stack, entries, _sharedAct);
+  } else {
+    renderNotificationPage(stack, entries, _localAct, { paged: false,
+      header: entries.length > 1 && _entries.every((e) => e.showClearAll) });
   }
 }

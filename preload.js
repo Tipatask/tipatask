@@ -45,6 +45,29 @@ contextBridge.exposeInMainWorld('electronAPI', {
   notificationDelivery: 'desktop',
   // App-owned desktop notification transport — see notifications.js#_electronNotify.
   notify: (payload) => inv('notify:show', payload),
+  dismissTaskNotifications: (taskId) => inv('notify:dismiss-task', { taskId }),
+  // (TPT484) Shared alert registry: in-app cards mirror into main (one identity per project +
+  // tag), and main decides which surface shows them — this window's in-app panel while it is
+  // the focused project window, the always-on-top banner otherwise. See notification-center.js.
+  pushSharedNotification: (card) => inv('notify:card', card),
+  dismissSharedNotification: (tag) => inv('notify:dismiss', { tag }),
+  notificationSurfaceState: () => inv('notify:surface-state'),
+  onNotificationSurface: (cb) => {
+    const handler = (_, state) => cb(state);
+    ipcRenderer.on('notify:surface', handler);
+    return () => ipcRenderer.removeListener('notify:surface', handler);
+  },
+  notificationSurfaceAction: (action, id) => ipcRenderer.send('notify:surface-action', { action, id }),
+  setNotificationTheme: (tokens) => ipcRenderer.send('notify:theme', tokens),
+  // (TPT487) "Show on Top": on keeps the desktop stack, off sends native OS notifications.
+  // App-level (main persists it); every project window hears changes from the menu or Settings.
+  getNotificationsOnTop: () => inv('notify:on-top-get'),
+  setNotificationsOnTop: (on) => inv('notify:on-top-set', { enabled: !!on }),
+  onNotificationsOnTopChanged: (cb) => {
+    const handler = (_, state) => cb(state);
+    ipcRenderer.on('notify:on-top-changed', handler);
+    return () => ipcRenderer.removeListener('notify:on-top-changed', handler);
+  },
   // (C1125) One-shot check of whether this bundle is code-signed — an unsigned bundle never
   // gets a Notification Center registration on macOS, so notify:show can silently drop every
   // banner while still resolving `{ok:true}`. See main.js's notify:status handler.
@@ -80,6 +103,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('notify:clicked', handler);
     return () => ipcRenderer.removeListener('notify:clicked', handler);
   },
+  // (TPT480) Full desktop-notification list shown in this window after the banner's
+  // "Show More". cb(type, entries): type is 'open' | 'update' | 'close'. Actions go back to
+  // main's controller (main/desktop-notifications.js), which only accepts the current owner.
+  onDesktopNotificationList: (cb) => {
+    const open = (_, entries) => cb('open', entries);
+    const update = (_, entries) => cb('update', entries);
+    const close = () => cb('close', []);
+    ipcRenderer.on('notify:desktop-list-open', open);
+    ipcRenderer.on('notify:desktop-list', update);
+    ipcRenderer.on('notify:desktop-list-close', close);
+    return () => {
+      ipcRenderer.removeListener('notify:desktop-list-open', open);
+      ipcRenderer.removeListener('notify:desktop-list', update);
+      ipcRenderer.removeListener('notify:desktop-list-close', close);
+    };
+  },
+  desktopNotificationListAction: (action, id) => ipcRenderer.send('notify:desktop-list-action', { action, id }),
   saveProjectConfig: (projectRoot, config) => inv('save-project-config', { projectRoot, config }),
   openExternal: (url) => inv('open-external', url),
   revealPerfLog: () => inv('debug:reveal-perf-log'),

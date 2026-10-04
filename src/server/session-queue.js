@@ -27,6 +27,7 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
   const entries = []; // FIFO: { key, session, projectPath, taskId, start }
   let draining = false;
   let drainAgain = false;
+  let admission = null;
 
   function sessionsMap() {
     try { return getSessions() || new Map(); } catch { return new Map(); }
@@ -69,6 +70,14 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
     return live !== entry.session || entry.session._terminated === true;
   }
 
+  function decisionFor(entry) {
+    if (!admission) return { allowed: hasSlot(entry.projectPath) };
+    const limits = limitsFor(entry.projectPath);
+    const projectCap = limits.sessionCapSource !== 'device'
+      ? (limits.projectSessionCap || limits.maxConcurrentSessions) : null;
+    return admission.tryReserve(entry.session, projectCap);
+  }
+
   function position(key) {
     const i = entries.findIndex(e => e.key === key);
     return i === -1 ? null : i + 1;
@@ -77,10 +86,13 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
   function snapshot(projectPath) {
     const queued = [];
     entries.forEach((e, i) => {
-      if (projectPath === undefined || e.projectPath === projectPath) queued.push({ taskId: e.taskId, position: i + 1 });
+      if (projectPath === undefined || e.projectPath === projectPath) queued.push({ taskId: e.taskId, position: i + 1,
+        ...e.diagnostic });
     });
     const limits = limitsFor(projectPath);
-    return { queued, running: countRunning(), cap: limits.deviceSessionCap || null };
+    const diagnostic = admission?.snapshot();
+    return { queued, running: diagnostic?.running ?? countRunning(), cap: diagnostic?.cap ?? limits.deviceSessionCap ?? null,
+      ...(diagnostic ? { admission: diagnostic } : {}) };
   }
 
   function notify(projects) {
@@ -101,7 +113,16 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
         for (let i = 0; i < entries.length;) {
           const entry = entries[i];
           if (isStale(entry)) { entries.splice(i, 1); touched.add(entry.projectPath); continue; }
-          if (!hasSlot(entry.projectPath)) { i++; continue; }
+          const decision = decisionFor(entry);
+          if (!decision.allowed) {
+            const diagnostic = {};
+            for (const field of ['reason', 'coordinationReason', 'detail', 'instances', 'censusPidCount', 'unregisteredCount', 'unregisteredPids']) {
+              if (decision[field] !== undefined) diagnostic[field] = decision[field];
+            }
+            if (JSON.stringify(entry.diagnostic) !== JSON.stringify(diagnostic)) touched.add(entry.projectPath);
+            entry.diagnostic = diagnostic;
+            i++; continue;
+          }
           entries.splice(i, 1);
           touched.add(entry.projectPath);
           entry.session._queued = false;
@@ -111,6 +132,7 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
           entry.promise.catch(err => {
             entry.session._launching = false;
             log(`[session-queue] start of ${entry.taskId} failed: ${err && err.message}`);
+            drain();
           });
         }
       } while (drainAgain);
@@ -126,6 +148,7 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
   // { queued: true, position } when the session is parked.
   function submit({ key, session, taskId, start }) {
     const projectPath = projectOf(session, defaultProject);
+    session.projectPath = projectPath;
     const entry = { key, session, projectPath, taskId, start, promise: null };
     session._queued = true;
     session.queuedAt = Date.now();
@@ -146,7 +169,8 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
     return true;
   }
 
-  return { submit, remove, drain, position, snapshot, hasSlot, countRunning, isRunning, size: () => entries.length };
+  return { submit, remove, drain, position, snapshot, hasSlot, countRunning, isRunning, size: () => entries.length,
+    setAdmission(value) { admission = value; } };
 }
 
 module.exports = { createSessionQueue };

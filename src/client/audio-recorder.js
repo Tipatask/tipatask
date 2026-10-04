@@ -99,18 +99,24 @@ export function matchesVoiceShortcut(e) {
 //    rather than new state, via button.__voiceRecorder set at registration below.
 // 2. the focused mic-enabled element, or its .audio-rec-wrap ancestor if focus landed on the mic
 //    button itself rather than the field.
-// 3. an open agent terminal.
-// 4. the New Objective chat input, then the new-task title/description fields.
+// 3. the visible task/project chat (including focus on its composer controls).
+// 4. an open agent terminal, then New Objective and new-task fields.
 export function resolveVoiceTarget() {
   for (const button of _micButtons) {
     if (!button.__voiceRecorder) continue;
-    if (button.classList.contains('is-recording') || button.classList.contains('is-busy')) return button.__voiceRecorder;
+    if (button.__voiceRecorder.isActive) return button.__voiceRecorder;
   }
   const active = document.activeElement;
   if (active) {
     if (active.__voiceRecorder) return active.__voiceRecorder;
     const wrap = active.closest && active.closest('.audio-rec-wrap');
     if (wrap && wrap.__voiceRecorder) return wrap.__voiceRecorder;
+  }
+  const chatPanels = document.querySelectorAll('.task-chat-panel:not(.task-chat-panel--gated):not(.task-chat-panel--connecting)');
+  for (const panel of chatPanels) {
+    if (panel.closest('[hidden]')) continue;
+    const input = panel.querySelector('.task-chat-input');
+    if (input?.__voiceRecorder) return input.__voiceRecorder;
   }
   // (TPT466) A task terminal in its workspace pane is a .terminal-embed; only a visible one counts.
   const terminalOverlay = document.querySelector('.terminal-overlay, .task-modal-pane--terminal:not([hidden]) .terminal-embed');
@@ -399,7 +405,7 @@ export function createVoiceRecorder({ button, iconSize = 14, onTranscript, onErr
   }
 
   async function start() {
-    if (recorder || starting) return; // already recording, or an earlier press is still opening the mic
+    if (recorder || starting || finishing) return; // includes permission and transcript drain windows
     starting = true;
     startAbortRequested = false;
     try {
@@ -636,7 +642,7 @@ function _notifyFieldRecordingChange() {
   }));
 }
 
-export function attachAudioRecorder(inputEl, { emphasis = false } = {}) {
+export function attachAudioRecorder(inputEl, { emphasis = false, acceptTranscript = () => true } = {}) {
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') return null;
   if (inputEl.dataset.audioRec) return inputEl.__voiceRecorder || null;
   inputEl.dataset.audioRec = '1';
@@ -696,12 +702,12 @@ export function attachAudioRecorder(inputEl, { emphasis = false } = {}) {
         _notifyFieldRecordingChange();
       }
     },
-    onPartial: text => liveInserter && liveInserter.setPartial(text),
-    onFinal: text => liveInserter && liveInserter.commit(text),
+    onPartial: text => acceptTranscript() && liveInserter && liveInserter.setPartial(text),
+    onFinal: text => acceptTranscript() && liveInserter && liveInserter.commit(text),
     // Fallback batch path — routed through the same liveInserter (or a fresh one if streaming
     // never started at all) so it correctly REPLACES any dangling uncommitted partial instead
     // of leaving it in place and inserting a duplicate copy alongside it.
-    onTranscript: text => (liveInserter || createLiveInserter(inputEl)).commit(text),
+    onTranscript: text => acceptTranscript() && (liveInserter || createLiveInserter(inputEl)).commit(text),
   });
 
   btn.addEventListener('click', () => recorderHandle.toggle());

@@ -238,6 +238,7 @@ test('claude argv keeps its tool allowlist/denylist and appended-system flag', (
   const allowed = args[args.indexOf('--allowedTools') + 1];
   assert.match(allowed, /^Read,/);
   assert.match(allowed, /mcp__tipatask__reserve_task_keys/);
+  assert.match(allowed, /mcp__tipatask__get_task(,|$)/);
   assert.ok(args.includes('--disallowedTools'));
   assert.equal(args[args.indexOf('--permission-mode') + 1], 'default');
   assert.equal(args[args.indexOf('--append-system-prompt') + 1], SYSTEM);

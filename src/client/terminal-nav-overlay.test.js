@@ -67,8 +67,19 @@ test('refit is debounced and only messages the PTY when cols/rows changed', () =
   const fit = fnBody(modal, 'function fitIfSizeChanged()');
   assert.match(fit, /!terminalOpened \|\| terminalClosing \|\| terminalDisposed/);
   assert.match(fit, /refreshTerminalViewport\(\)/);
-  assert.match(fit, /term\.cols !== cols \|\| term\.rows !== rows/);
-  assert.match(fit, /sendResize\(\)/);
+});
+
+// (TPT485) The PTY's size is compared against what it was last TOLD, not against the xterm's
+// size before this fit: a silent fit (open, replay, `refresh()` without send) landing first used
+// to leave the agent drawing for the old width — the garbled right-edge wrap.
+test('every fit syncs the PTY; dedup is against the last size sent', () => {
+  const send = fnBody(modal, 'function sendResize(');
+  assert.match(send, /!force && lastSentSize && lastSentSize\.cols === cols && lastSentSize\.rows === rows\) return;/);
+  assert.match(send, /lastSentSize = \{ cols, rows \};/);
+  const refresh = fnBody(modal, 'function refreshTerminalViewport(');
+  assert.match(refresh, /sendResize\(\{ force: send \}\);/);
+  assert.doesNotMatch(refresh, /if \(send\) sendResize/);
+  assert.match(modal, /setStatus\('', 'Connected'\);\s*lastSentSize = null;[^\n]*\n\s*fitAndSendResize\(\);/);
 });
 
 test('backdrop mousedown still minimizes only when the overlay itself is the target', () => {
@@ -90,4 +101,37 @@ test('Project Board / Create rail buttons minimize an open task terminal before 
   assert.ok(minimize > -1, 'section nav handler must detach state.activeTerminal');
   assert.ok(minimize < handler.indexOf("perfStart('nav-section-switch'"), 'detach must precede navigation');
   assert.match(handler.slice(0, handler.indexOf("perfStart('nav-section-switch'")), /state\.pendingRestoreContext = null/);
+});
+
+// (TPT479) The task workspace is one stable frame: rail uncovered on every pane, one header
+// grid, ✕ as the only close control, and the Agent Terminal tab as the only status dot.
+test('workspace: rail on every pane, uniform header, ✕-only close, single status dot', () => {
+  const editModal = readFileSync(new URL('./task-edit-modal.js', import.meta.url), 'utf8');
+  assert.match(editModal, /<div class="task-edit-overlay\$\{tabs \? ' task-edit-overlay--rail' : ''\}">/);
+  assert.doesNotMatch(editModal, /toggle\('task-edit-overlay--rail', pane === 'terminal'\)/);
+  assert.match(ruleBody('.task-edit-panel--tabs .modal-top-bar'), /grid-template-columns:\s*minmax\(0, 1fr\) auto minmax\(0, 1fr\) auto/);
+  assert.match(ruleBody('.task-edit-panel--tabs .btn-modal-cancel'), /display:\s*none/);
+  assert.doesNotMatch(css, /\.task-edit-panel--tabs\[data-pane="edit"\] \.btn-modal-close/);
+  assert.match(css, /\.terminal-embed \.status-dot \{ display: none; \}/);
+  // Every toolbar-dot write goes through setStatus(), which reports to the hosting workspace.
+  const task = fnBody(modal, 'export function openTerminal(', '');
+  assert.doesNotMatch(task.replace(/function setStatus\([\s\S]*?\n  \}\n/, ''), /statusDot\.(className|title)\s*=/);
+  assert.match(task, /onStatus = typeof next\.onStatus === 'function'/);
+});
+
+// (TPT485) The rail stays live through a workspace swap: the loader starts at its edge, the
+// open workspace (not only a mounted xterm) owns the highlighted row, the toolbar dot of an
+// embedded terminal never shows, and the terminal toolbar shares the header's side padding.
+test('workspace swap keeps the rail live and the toolbar aligned', () => {
+  assert.match(ruleBody('body.task-modal-rail .board-modal-loader'), /left:\s*200px/);
+  assert.match(ruleBody('body.task-modal-rail.left-nav-collapsed .board-modal-loader'), /left:\s*56px/);
+  assert.match(css, /@media \(max-width: 768px\)\s*\{\s*body\.task-modal-rail \.board-modal-loader\s*\{\s*left:\s*56px/);
+  assert.match(ruleBody('.task-modal-pane--terminal .terminal-header'), /padding:\s*8px 18px/);
+  const sync = fnBody(board, 'export function syncActiveSessionsNav()', '');
+  assert.match(sync, /const openId = getOpenWorkspaceTaskId\(\) \|\| state\.activeTerminal\?\.taskId \|\| null;/);
+  const task = fnBody(modal, 'export function openTerminal(', '');
+  assert.match(task, /statusDot\.hidden = !!hostEl;/);
+  const editModal = readFileSync(new URL('./task-edit-modal.js', import.meta.url), 'utf8');
+  assert.match(editModal, /if \(openSeq !== _openSeq\) return;/);
+  assert.match(editModal, /closeTaskEditModal\(true, \{ keepRail: true \}\)/);
 });

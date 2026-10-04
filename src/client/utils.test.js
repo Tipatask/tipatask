@@ -333,6 +333,73 @@ test('OBJECTIVE_SYSTEM_PROMPT forbids descriptive-slug task ids and gives a pref
   assert.match(systemPrompt, /"TPT214" or "H3"/);
 });
 
+// TPT488: a "modified" description used to be rewritten from the title alone (the planner
+// never saw the original), dropping requirements. The prompt now demands the full original,
+// a minimal targeted edit, and exempts existing text from the C871 length/style rules.
+test('OBJECTIVE_SYSTEM_PROMPT requires the full original and a targeted edit for modified descriptions (TPT488)', () => {
+  const { systemPrompt } = buildObjectivePrompt('any objective', null, null);
+
+  assert.match(systemPrompt, /DESCRIPTION PRESERVATION/);
+  assert.match(systemPrompt, /FULL ORIGINAL REQUIRED/);
+  assert.match(systemPrompt, /### Referenced task descriptions/);
+  assert.match(systemPrompt, /call mcp__tipatask__get_task\(task_key\) first/);
+  assert.match(systemPrompt, /OMIT `description` from the card, keep any other field changes, and add a doc_updates entry/);
+  assert.match(systemPrompt, /NEVER reconstruct a description from the title, tags, or memory/);
+  assert.match(systemPrompt, /Remove or replace a detail ONLY when the objective explicitly supersedes it/);
+  assert.match(systemPrompt, /does NOT apply to existing text in a modified description/);
+  assert.match(systemPrompt, /applies to NEW task descriptions and to steps you ADD to a modified one/);
+  assert.match(systemPrompt, /ALLOWED tools \(only these 5\):[^\n]*mcp__tipatask__get_task/);
+  // tags-only modifications still omit description entirely
+  assert.match(systemPrompt, /When the change is tags-only, priority-only, or dependencies-only, do NOT include `description` at all/);
+});
+
+// TPT502: `active` includes in_progress tasks, so an id-only check let the planner rewrite
+// work an executor had already started. Only pending/on_fire targets may be modified.
+test('OBJECTIVE_SYSTEM_PROMPT gates modified cards on pending/on_fire status (TPT502)', () => {
+  const { systemPrompt } = buildObjectivePrompt('any objective', null, null);
+
+  assert.match(systemPrompt, /STATUS GATE \(hard rule/);
+  assert.match(systemPrompt, /read its `status`/);
+  assert.match(systemPrompt, /ONLY a task whose status is pending or on_fire may be modified/);
+  assert.match(systemPrompt, /status is in_progress, completed, canceled — or one absent from `active` — MUST NEVER be modified/);
+  assert.match(systemPrompt, /propose "type": "new" using a key returned by reserve_task_keys instead/);
+  assert.match(systemPrompt, /WRONG \(status gate — C42 is "in_progress" in active\): \{"type":"modified","task":\{"id":"C42"/);
+  assert.match(systemPrompt, /RIGHT \(status gate — locked C42 untouched, follow-up is a new card\): \{"type":"new","task":\{"id":"<key from reserve_task_keys, e\.g\. TPT215>".*"dependencies":\["C42"\]/);
+  assert.match(systemPrompt, /overlaps the objective AND passes the STATUS GATE, propose "modified"/);
+});
+
+test('OBJECTIVE_SYSTEM_PROMPT Show on Top example keeps focus, dismissal, pagination and cleanup in the RIGHT edit (TPT488)', () => {
+  const { systemPrompt } = buildObjectivePrompt('any objective', null, null);
+  const right = systemPrompt.match(/RIGHT \(targeted edit[^\n]*/)[0];
+  const wrongLine = systemPrompt.match(/WRONG \(rewrite[^\n]*/)[0];
+  const wrong = wrongLine.slice(wrongLine.indexOf('{'));
+
+  for (const detail of ['syncNotificationSurface()', 'focused', 'dismissNotification()', 'pagination', 'completion cleanup', 'Show on Top']) {
+    assert.ok(right.includes(detail), `RIGHT example must keep ${detail}`);
+  }
+  for (const detail of ['syncNotificationSurface()', 'dismissNotification()', 'pagination', 'completion cleanup']) {
+    assert.ok(!wrong.includes(detail), `WRONG example illustrates dropping ${detail}`);
+  }
+  // RIGHT keeps the original steps 1-3 in order and appends the new step as 4.
+  assert.match(right, /1\. @main\/desktop-notifications\.js[\s\S]*2\. @src\/client\/notification-center\.js[\s\S]*3\. @ai\/architecture\/tt-notifications\.md[\s\S]*4\. @src\/client\/desktop-notification-panel\.js/);
+});
+
+test('buildObjectivePrompt revision turn carries the preservation contract for modified cards (TPT488)', () => {
+  const prior = [
+    { type: 'modified', task: { id: 'C5', description: '1. @a.js keep me; verify X.' } },
+    { type: 'modified', task: { id: 'C6', tags: ['tt-x', 'bugfix'] } },
+  ];
+  const { userPrompt, systemPrompt } = buildObjectivePrompt('objective', prior, 'also add Y to C5');
+
+  assert.match(userPrompt, /DESCRIPTION PRESERVATION still applies/);
+  assert.match(userPrompt, /start from the description in its previous proposal above and apply ONLY the change this feedback asks for/);
+  assert.match(userPrompt, /stays description-less unless this feedback asks to change its description/);
+  assert.ok(userPrompt.includes('1. @a.js keep me; verify X.'), 'previous description is handed back verbatim');
+  // first-turn prompt carries no revision text; system prompt identical across turns
+  assert.doesNotMatch(buildObjectivePrompt('objective', null, null).userPrompt, /DESCRIPTION PRESERVATION/);
+  assert.equal(systemPrompt, buildObjectivePrompt('objective', null, null).systemPrompt);
+});
+
 // C1162: spawnObjectiveTab() (chat-ui.js) reuses a pristine tab instead of always
 // allocating a new one — isPristineObjectiveTab() is its pure decision function.
 test('isPristineObjectiveTab: no tab is never pristine', () => {

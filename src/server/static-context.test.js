@@ -175,3 +175,42 @@ test('prefetchObjectiveWorkflow: a backend with no getTagsDetailed() also render
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// TPT488 — the planner must see the verbatim original before proposing a "modified"
+// description; active tasks named by key in the objective are pre-fetched in full.
+test('buildReferencedTasksSection: active keys named in the objective get their full description', () => {
+  const longDesc = '1. @a.js keep focus routing; verify X.\n\n2. @b.js keep dismissal; verify Y.\n\n' + 'z'.repeat(5000);
+  const tasks = [
+    { id: 'TPT10', title: 'Panel', status: 'pending', description: longDesc },
+    { id: 'TPT11', title: 'Done one', status: 'completed', description: 'closed' },
+    { id: 'TPT12', title: 'Other', status: 'pending', description: 'not named' },
+  ];
+  const active = new Set(['pending', 'in_progress']);
+  const section = sc.buildReferencedTasksSection(tasks, 'Objective: add Show on Top to TPT10, TPT10 again, and TPT11. Ignore TPT999.', active);
+  assert.match(section, /^### Referenced task descriptions/);
+  const rows = JSON.parse(section.match(/```json\n([\s\S]*?)\n```/)[1]);
+  assert.deepEqual(rows.map(r => r.id), ['TPT10']);
+  assert.equal(rows[0].description, longDesc, 'description is never truncated');
+
+  assert.equal(sc.buildReferencedTasksSection(tasks, 'no keys here', active), '');
+  assert.equal(sc.buildReferencedTasksSection(tasks, 'only TPT11', active), '');
+  assert.equal(sc.buildReferencedTasksSection(tasks, '', active), '');
+});
+
+test('prefetchObjectiveWorkflow: renders the referenced-task block only when the objective names an active task', async () => {
+  const root = mkProject('tpt488-referenced');
+  try {
+    const backend = fakeBackend({ tags: [] });
+    backend.getTasksUnfiltered = async () => [
+      { id: 'C7', title: 'Seven', status: 'pending', category: 'CODING', priority: 1, description: 'full seven text' },
+    ];
+    const named = await sc.prefetchObjectiveWorkflow(backend, 'new', root, 'Objective from the user:\n\nupdate C7');
+    assert.match(named.bundle, /### Referenced task descriptions[\s\S]*full seven text/);
+    const unnamed = await sc.prefetchObjectiveWorkflow(backend, 'new', root, 'Objective from the user:\n\nsomething else');
+    assert.doesNotMatch(unnamed.bundle, /### Referenced task descriptions/);
+    const legacy = await sc.prefetchObjectiveWorkflow(backend, 'new', root);
+    assert.doesNotMatch(legacy.bundle, /### Referenced task descriptions/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

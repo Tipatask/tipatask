@@ -13,6 +13,7 @@ import { objectiveTag, clearDebounce } from './notifications.js';
 import { forgetTaskAttention } from './attention-notifications.js';
 import { createVoiceRecorder, voiceShortcutLabel, MIC_SVG } from './audio-recorder.js';
 import { t } from './i18n.js';
+import { queueReasonText } from './queue-reason.js';
 import { isInProgressName, isClosedName, isCompleteName, inProgressName, loadStatuses } from './status-registry.js';
 import { replayProgressLog, progressStatusLine } from './objective-progress-log.js';
 import { getAgentDisplayLabel } from './agent-select.js';
@@ -593,7 +594,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   const host = opts.host && typeof opts.host.appendChild === 'function' ? opts.host : null;
   const openWorkspace = window.TipTask?.openTaskWorkspace;
   if (!host && !String(taskId).startsWith('obj-') && typeof openWorkspace === 'function') {
-    const { host: _ignored, onClosed: _c, onRequestClose: _r, ...launchOpts } = opts;
+    const { host: _ignored, onClosed: _c, onRequestClose: _r, onStatus: _s, ...launchOpts } = opts;
     return openWorkspace(taskId, { pane: 'terminal', terminal: { title, desc, status: taskStatus, opts: launchOpts } });
   }
   // Host-mode hooks: the workspace learns when this xterm goes away on its own, and close
@@ -601,6 +602,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // Mutable so a reattached Codex terminal reports to its new workspace.
   let onClosed = typeof opts.onClosed === 'function' ? opts.onClosed : null;
   let onRequestClose = typeof opts.onRequestClose === 'function' ? opts.onRequestClose : null;
+  // (TPT479) The workspace shows this session's status on its Agent Terminal tab, not in the
+  // embedded toolbar (whose dot styles.css hides): every status change is reported here.
+  let onStatus = typeof opts.onStatus === 'function' ? opts.onStatus : null;
   let hostEl = host;
 
   function captureOpenContext() {
@@ -627,7 +631,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     _markAttentionSeen(taskId); // (C1387) reattaching a detached Codex terminal also counts as seen
     const restoredContext = captureOpenContext();
     state.pendingRestoreContext = restoredContext;
-    detachedCodex.reattach?.(restoredContext, host ? { host, onClosed: opts.onClosed, onRequestClose: opts.onRequestClose } : undefined);
+    detachedCodex.reattach?.(restoredContext, host ? { host, onClosed: opts.onClosed, onRequestClose: opts.onRequestClose, onStatus: opts.onStatus } : undefined);
     return detachedCodex;
   }
   if (detachedCodex) {
@@ -704,6 +708,22 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   const termBody = overlay.querySelector('.terminal-body');
   const taskLabelEl = overlay.querySelector('.task-label');
   const statusDot = overlay.querySelector('.status-dot');
+  // (TPT485) Embedded, the workspace's Agent Terminal tab is the one status light: the toolbar
+  // dot stays in the DOM (setStatus() still reads it for onStatus) but never shows, whatever
+  // the stylesheet. A standalone overlay keeps it.
+  statusDot.hidden = !!hostEl;
+  // One writer for the toolbar dot, so a hosting workspace (onStatus) always hears the change.
+  // `undefined` keeps that part as it is.
+  function setStatus(cls, title) {
+    if (cls !== undefined) statusDot.className = cls ? `status-dot ${cls}` : 'status-dot';
+    if (title !== undefined) statusDot.title = title;
+    reportStatus();
+  }
+  function reportStatus() {
+    if (!onStatus) return;
+    const cls = ['paused', 'exited', 'disconnected'].find((c) => statusDot.classList.contains(c)) || '';
+    try { onStatus(cls, statusDot.title); } catch (err) { console.warn('[terminal] onStatus failed:', err); }
+  }
   const showTaskBtn = overlay.querySelector('.btn-show-task');
   const closeBtn = overlay.querySelector('.btn-close-terminal');
   const terminateBtn = overlay.querySelector('.btn-terminate-terminal');
@@ -797,27 +817,51 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     overlay.__voiceRecorder = voiceRecorder;
   }
 
-  function sendResize() {
+  // (TPT485) What the PTY was last told. Every fit goes through sendResize(), and a size the
+  // PTY already has is not re-sent, so a fit that lands first (open, replay, a pane switch) can
+  // never leave the agent drawing for the old width — the garbled-wrap symptom. `force`
+  // re-states it anyway (showing a pane, reattaching, a fresh socket).
+  let lastSentSize = null;
+  function sendResize({ force = false } = {}) {
     if (!wsIsOpen()) return;
-    ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+    const { cols, rows } = term;
+    if (!force && lastSentSize && lastSentSize.cols === cols && lastSentSize.rows === rows) return;
+    ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+    lastSentSize = { cols, rows };
   }
 
   // (TPT466) A hidden workspace pane has no size — fitting it would shrink the PTY to nothing.
   function terminalHasSize() {
-    return termBody.clientWidth > 0 && termBody.clientHeight > 0;
+    return termBody.isConnected && !overlay.closest('[hidden]') &&
+      termBody.clientWidth > 0 && termBody.clientHeight > 0;
   }
 
   function refreshTerminalViewport({ send = false } = {}) {
-    if (!terminalOpened || terminalClosing || !terminalHasSize()) return;
+    if (!terminalOpened || terminalClosing || terminalDisposed || !terminalHasSize()) return;
     // Snapshot following before fit can reflow the buffer. The writer keeps the
     // same decision through queued PTY redraws and the native viewport settle.
     outputWriter.refresh(() => fitAddon.fit());
+    sendResize({ force: send });
     if (term.rows > 0) term.refresh(0, term.rows - 1);
-    if (send) sendResize();
   }
 
+  let refreshFrame = 0;
+  let refreshMustSend = false;
   function scheduleTerminalRefresh(opts = {}) {
-    requestAnimationFrame(() => refreshTerminalViewport(opts));
+    refreshMustSend ||= opts.send === true;
+    cancelAnimationFrame(refreshFrame);
+    refreshFrame = requestAnimationFrame(() => {
+      refreshFrame = 0;
+      const send = refreshMustSend;
+      refreshMustSend = false;
+      refreshTerminalViewport({ send });
+      // xterm resumes its renderer/character measurement after a hidden pane is
+      // shown. Refit after that render turn, then deduplicate against the PTY size.
+      refreshFrame = requestAnimationFrame(() => {
+        refreshFrame = 0;
+        fitIfSizeChanged();
+      });
+    });
   }
 
   function setCodexPlanReady(value) {
@@ -879,7 +923,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     });
     dlg.querySelector('.btn-plan-discard').addEventListener('click', () => {
       dlg.remove();
-      terminateSession();
+      handleTaskTerminate();
     });
     scheduleTerminalRefresh({ send: true });
   }
@@ -948,7 +992,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       if (!banner) return;
       banner.remove();
       // Every caller sets its own dot title (terminal-state just did) or class right after.
-      if (statusDot.classList.contains('paused')) statusDot.className = 'status-dot';
+      if (statusDot.classList.contains('paused')) setStatus('');
       scheduleTerminalRefresh({ send: true });
       return;
     }
@@ -970,7 +1014,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         resumeBtn.textContent = t('terminal.resuming');
         ws.send(JSON.stringify({ type: 'resume-paused' }));
       });
-      banner.querySelector('.btn-terminate-paused').addEventListener('click', () => terminateSession());
+      banner.querySelector('.btn-terminate-paused').addEventListener('click', handleTaskTerminate);
       overlay.querySelector('.terminal-header').after(banner);
     }
     const rss = Number(paused.rssMb) || 0;
@@ -980,12 +1024,14 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     banner.title = limit > 0
       ? t('terminal.pausedMemory', { rss, limit, count })
       : t('terminal.pausedMemoryNoLimit', { rss, count });
+    if (['count-growth', 'count-ceiling', 'memory-growth', 'memory-pressure'].includes(paused.reason)) {
+      banner.title = `${t(`terminal.watchdog.${paused.reason}`)} · ${banner.title}`;
+    }
     const resumeBtn = banner.querySelector('.btn-resume-paused');
     resumeBtn.disabled = false; // a fresh paused summary re-arms a Resume that did not take
     resumeBtn.textContent = t('terminal.resume');
     banner.querySelector('.btn-terminate-paused').textContent = t('btn.terminate');
-    statusDot.className = 'status-dot paused';
-    statusDot.title = t('terminal.pausedTitle');
+    setStatus('paused', t('terminal.pausedTitle'));
     if (added) scheduleTerminalRefresh({ send: true });
   }
 
@@ -994,8 +1040,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     setCodexPlanReady(false);
     renderWatchdogActions(null);
     markSessionLost(taskId, detail);
-    statusDot.className = 'status-dot disconnected';
-    statusDot.title = t('terminal.sessionLostTitle');
+    setStatus('disconnected', t('terminal.sessionLostTitle'));
     terminateBtn.textContent = t('btn.close');
     removeMcpAuthDialog();
     let notice = overlay.querySelector('.terminal-session-lost');
@@ -1035,8 +1080,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
 
     ws.onopen = () => {
       if (terminalClosing) return;
-      statusDot.className = 'status-dot';
-      statusDot.title = 'Connected';
+      setStatus('', 'Connected');
+      lastSentSize = null; // a new socket states the size once, whatever the last one heard
       fitAndSendResize();
       ws.send(JSON.stringify({ type: 'session-status' }));
       // (C1356) Tell the server this client is now actually looking at the terminal, so a
@@ -1070,6 +1115,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       }
     };
 
+    let lastQueueNotice = null;
     ws.onmessage = (event) => {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
@@ -1078,8 +1124,12 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         // (TPT444) No free slot — the server parked this start and will launch it, oldest first,
         // when a running task completes. Not a live session yet, so keep it out of activeSessions.
         state.queuedSessions.set(taskId, msg.position);
+        state.queueReasons.set(taskId, msg.reason || 'device-cap');
+        state.queueDiagnostics.set(taskId, msg);
         state.activeSessions.delete(taskId);
-        term.write(`\r\n\x1b[90m${t('terminal.queued', { position: msg.position ?? '?', cap: msg.cap ?? '?' })}\x1b[0m\r\n`);
+        const notice = `${t('queue.badge', { position: msg.position ?? '?' })}: ${queueReasonText(msg)}`;
+        if (notice !== lastQueueNotice) term.write(`\r\n\x1b[90m${notice}\x1b[0m\r\n`);
+        lastQueueNotice = notice;
         updateClaudeButtons();
       } else if (msg.type === 'config') {
         if (state.queuedSessions.delete(taskId)) state.activeSessions.add(taskId); // (TPT444) queue → running
@@ -1111,11 +1161,11 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         }
         terminalPhase = msg.phase || terminalPhase;
         updateTaskLabel({ agent: msg.taskAgent, label: msg.taskAgentLabel || state.taskAgentLabel, model: msg.taskAgentModel });
-        statusDot.title = terminalPhase === 'planning'
+        setStatus(undefined, terminalPhase === 'planning'
           ? (state.planApprovalCommand
               ? `Planning — type ${state.planApprovalCommand} to continue`
               : 'Planning — awaiting approval dialog')
-          : 'Executing';
+          : 'Executing');
         state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), paused: msg.paused || null });
         renderWatchdogActions(msg.paused);
         syncActiveSessionsNav();
@@ -1166,16 +1216,15 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), alive: false });
         setCodexPlanReady(false);
         renderWatchdogActions(null);
-        statusDot.className = 'status-dot exited';
         if (msg.reason === 'runaway-killed') {
           // (TPT357) The descendant-process watchdog ended this session — say so, in red,
           // instead of the generic "Process exited (code N)" line (the code is just the
           // SIGTERM/SIGKILL exit and says nothing about why).
           const runawayLine = `${t('terminal.runawayKilled')}${msg.reasonText ? ` — ${msg.reasonText}` : ''}`;
-          statusDot.title = runawayLine;
+          setStatus('exited', runawayLine);
           term.write(`\r\n\x1b[31m--- ${runawayLine} ---\x1b[0m\r\n`);
         } else {
-          statusDot.title = `Exited (code ${msg.code})`;
+          setStatus('exited', `Exited (code ${msg.code})`);
           term.write(`\r\n\x1b[90m--- Process exited (code ${msg.code}) ---\x1b[0m\r\n`);
         }
         term.scrollToBottom();
@@ -1205,8 +1254,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         if (restartingLoss && knownLoss) showLostSession(knownLoss);
         processRunning = false;
         setCodexPlanReady(false);
-        statusDot.className = 'status-dot disconnected';
-        statusDot.title = 'Error';
+        setStatus('disconnected', 'Error');
         term.write(`\r\n\x1b[31mError: ${msg.message}\x1b[0m\r\n`);
         term.scrollToBottom();
         if (!state.lostSessions.has(taskId)) clearTaskSessionState();
@@ -1244,8 +1292,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       // still the visible one (not detached/minimized, and not swapped out by another
       // terminal taking over state.activeTerminal).
       if (processRunning && state.activeTerminal === terminalController) {
-        statusDot.className = 'status-dot disconnected';
-        statusDot.title = 'Disconnected';
+        setStatus('disconnected', 'Disconnected');
       }
       if (terminalController.detached && !_wsCanStayAttached(ws)) {
         _detachedCodexTerminals.delete(taskId);
@@ -1254,8 +1301,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     };
 
     ws.onerror = () => {
-      statusDot.className = 'status-dot disconnected';
-      statusDot.title = 'Connection error';
+      setStatus('disconnected', 'Connection error');
     };
   }
 
@@ -1303,14 +1349,12 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // 56px on narrow viewports), and the rail collapse animates over 0.2s — a window `resize`
   // event alone never sees that. Observe the terminal body itself and refit once the size has
   // settled (trailing debounce, so the animation yields one fit instead of a PTY-resize storm).
-  // Only sends `resize` to the PTY when cols/rows actually changed.
+  // Only sends `resize` when cols/rows differ from what the PTY was last told (sendResize()).
   let bodyResizeObserver = null;
   let bodyResizeTimer = 0;
   function fitIfSizeChanged() {
-    if (!terminalOpened || terminalClosing || terminalDisposed) return;
-    const { cols, rows } = term;
+    if (!terminalOpened || terminalClosing || terminalDisposed || !terminalHasSize()) return;
     refreshTerminalViewport();
-    if (term.cols !== cols || term.rows !== rows) sendResize();
   }
   function scheduleBodyRefit() {
     clearTimeout(bodyResizeTimer);
@@ -1329,6 +1373,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   function detachViewportListeners() {
+    cancelAnimationFrame(refreshFrame);
+    refreshFrame = 0;
+    refreshMustSend = false;
     if (!viewportListenersAttached) return;
     window.removeEventListener('resize', onResize);
     document.removeEventListener('visibilitychange', onVisibilityChange);
@@ -1389,8 +1436,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     closeTerminalSocket();
     disposeTerminal();
     if (!hostEl) document.body.style.overflow = '';
+    if (overlay.contains(document.activeElement)) document.activeElement.blur();
     overlay.remove();
-    if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
     if (state.activeTerminal === terminalController) state.activeTerminal = null;
     clearTaskSessionState();
     notifyClosed();
@@ -1413,6 +1460,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       hostEl = next.host;
       onClosed = typeof next.onClosed === 'function' ? next.onClosed : null;
       onRequestClose = typeof next.onRequestClose === 'function' ? next.onRequestClose : null;
+      onStatus = typeof next.onStatus === 'function' ? next.onStatus : null;
+      statusDot.hidden = true;
+      reportStatus(); // the new workspace's tab picks up where the toolbar dot already is
     }
     terminalClosing = false;
     terminalController.detached = false;
@@ -1435,10 +1485,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     }
     attachViewportListeners();
     scheduleTerminalRefresh({ send: true });
-    requestAnimationFrame(() => {
-      refreshTerminalViewport({ send: true });
-      focusTerminalWithoutScrollJump();
-    });
+    requestAnimationFrame(focusTerminalWithoutScrollJump);
   }
 
   attachViewportListeners();
@@ -1472,10 +1519,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     show({ focus = true } = {}) {
       if (terminalClosing || terminalDisposed) return;
       _markAttentionSeen(taskId); // (C1387) coming back to the pane is looking at it
-      requestAnimationFrame(() => {
-        refreshTerminalViewport({ send: true });
-        if (focus) focusTerminalWithoutScrollJump();
-      });
+      scheduleTerminalRefresh({ send: true });
+      if (focus) requestAnimationFrame(focusTerminalWithoutScrollJump);
     },
     hide() {
       if (overlay.contains(document.activeElement)) document.activeElement.blur();
@@ -1609,23 +1654,28 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // is set BEFORE the confirm (re-entrancy guard) — a native confirm() used to make a
   // second click impossible by blocking the event loop; an async one doesn't, so a second
   // click must be rejected explicitly, and cleared again if the user cancels.
-  async function terminateSession() {
-    if (state.lostSessions.has(taskId)) { finishTerminalEnded(); return; }
+  async function handleTaskTerminate() {
     if (terminationInFlight) return;
     terminationInFlight = true;
-    if (!(await requestSessionClose(taskStatus, taskId))) {
+    // A parked Codex controller may be reattached while the request is pending. Only the
+    // workspace that originated this action may close, never its replacement.
+    const requestHostClose = hostEl ? onRequestClose : null;
+    try {
+      if (!state.lostSessions.has(taskId)) {
+        if (!(await requestSessionClose(taskStatus, taskId))) return;
+        const result = await terminateTaskSession(taskId, { timeoutMs: 5000 });
+        if (!result.ok) {
+          console.warn('[terminal] termination failed', taskId, result.message);
+          return;
+        }
+      }
+      finishTerminalEnded();
+      await requestHostClose?.();
+    } catch (err) {
+      console.warn('[terminal] termination failed', taskId, err);
+    } finally {
       terminationInFlight = false;
-      return;
     }
-    terminalClosing = true;
-    if (openRaf) {
-      cancelAnimationFrame(openRaf);
-      openRaf = 0;
-    }
-    clearAttention(taskId, 'session-ended');
-    const _killCard = document.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
-    if (_killCard) _killCard.classList.remove('needs-attention');
-    terminateTaskSession(taskId, { timeoutMs: 5000 }).then(() => finishTerminalEnded());
   }
 
   // (TPT466) In a workspace pane the close gestures close the workspace (which detaches this
@@ -1644,7 +1694,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   closeBtn.addEventListener('click', () => minimizeTerminal());
-  terminateBtn.addEventListener('click', terminateSession);
+  terminateBtn.addEventListener('click', handleTaskTerminate);
 
   // (TPT360) The overlay box now starts at the left-nav rail's edge, so this backdrop-minimize
   // only ever fires for a click on the board-side backdrop — it can no longer swallow a click

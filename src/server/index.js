@@ -15,7 +15,7 @@ const { createWebSocketGate } = require('./ws-upgrade');
 const config = require('./config');
 const { augmentPathEnv, isAsarPath } = require('./spawn-utils');
 const { createBackend, createPerProjectBackend, coerceBackendType } = require('./task-backend');
-const { createHttpHandler, handleConnection, drainSessionQueue } = require('./ws-handlers');
+const { createHttpHandler, handleConnection, drainSessionQueue, sessionQueue } = require('./ws-handlers');
 const websocket = require('./websocket');
 const { preloadAgentDetection, listAllAgentModels } = require('./task-agent');
 const { fetchStatusRoles } = require('./status-roles');
@@ -24,6 +24,8 @@ const { getAttentionPromptMatch, shouldHoldAttention, bgAgentsBusy, emitTerminal
 const { snapshotProcesses, sweepDescendantWatchdog, resolveAgentLimits } = require('./process-group'); // (C1565, TPT357/TPT370)
 const { installShutdownReaper } = require('./shutdown-reaper'); // (TPT295)
 const { installCrashGuard } = require('./crash-guard'); // (TPT356)
+const { createMemoryTelemetry } = require('./memory-telemetry');
+const { createSessionMemoryTracker, setSessionMemoryTracker, endSessionMemory } = require('./session-memory');
 
 // C1356 — true when the module-scope `backend` singleton (below) has no real project
 // bound and never will: packaged Electron's forked server is shared across every open
@@ -162,6 +164,22 @@ const { createLocalAccess, LOCAL_HOST } = require('./local-access');
 
 const backend = createBackend(config);
 const sessions = new Map();
+const memoryTelemetry = createMemoryTelemetry({
+  getSessions: () => sessions,
+  isRunning: session => sessionQueue.isRunning(session),
+  tracker: createSessionMemoryTracker({ historyFile: path.join(config.USER_DATA_ROOT, 'memory-peaks.json') }),
+});
+setSessionMemoryTracker(memoryTelemetry.tracker);
+const admission = require('./session-admission').createSessionAdmission({
+  getSessions: () => sessions,
+  getTelemetry: () => memoryTelemetry.snapshot(),
+  isRunning: session => sessionQueue.isRunning(session),
+  onChange: drainSessionQueue,
+});
+sessionQueue.setAdmission(admission);
+const stopMemoryAdmission = () => { admission.stop(); memoryTelemetry.stop(); };
+// Exit also covers fatal startup errors and the crash guard's explicit process.exit.
+process.once('exit', stopMemoryAdmission);
 
 // ── Per-project backend registry ──
 // Maps absolute project path → { config }. The backend singleton is always the
@@ -389,7 +407,8 @@ installCrashGuard({
 // groups — so the SIGTERM that stops this server (Electron quit → serverChild.kill()), a Ctrl+C
 // SIGINT, or Electron main going away never reaches them. Reap them, then exit. Installed at module
 // load, not in the boot chain below, so a quit during boot is covered too.
-installShutdownReaper({ sessions });
+installShutdownReaper({ sessions, beforeShutdown: stopMemoryAdmission });
+server.once('close', stopMemoryAdmission);
 
 const wss = createWebSocketGate(server, (ws, req) => {
   Promise.resolve(handleConnection(ws, req, sessions, getActiveBackend, broadcastAttentionFor, broadcastAttentionCleared, _registryOps.getBackendForPath)).catch(err => {
@@ -567,6 +586,7 @@ async function detectCompletedTerminalSessions() {
       // (template.html), same as a manual board edit. _completionEmitted above guards this
       // to firing once per session, independent of the resolution-comment dedupe below.
       session._completionEmitted = true;
+      endSessionMemory(session, 'completed');
       console.log(`[completion] ${session.taskId} → ${roles.complete}, emitting task:updated (project=${session.projectPath || '<default>'})`);
       websocket.emitTaskUpdated(task, null, session.projectPath);
       // (TPT345) git-worktree projects: warn the project's windows when the task's
@@ -666,9 +686,12 @@ if (process.platform === 'win32') {
     const snapshot = await snapshotProcesses();
     if (!snapshot) return; // ps failed/timed out — skip this tick, never throw
     // Count + memory limits and the action (warn / pause / kill) come from each session's
-    // project — resolveAgentLimits(); the default action pauses, killing is an explicit opt-in.
+    // project — resolveAgentLimits(); only advisory budgets scale with the cross-project
+    // registry. Fresh host pressure corroborates tree growth; killing is explicit opt-in.
     sweepDescendantWatchdog(sessions, snapshot, {
       resolveLimits: resolveAgentLimits,
+      host: memoryTelemetry.snapshot().host,
+      sampledAt: Date.now(),
       killRunawaySession,
       pauseRunawaySession,
       emitTerminalNotice,
@@ -744,6 +767,8 @@ ensureCavemanPlugin()
   .then(() => fetchUserProfile())
   .then(() => {
   server.listen(config.PORT, LOCAL_HOST, () => {
+    memoryTelemetry.start();
+    admission.start();
     if (process.send) process.send('ready');
     console.log(`TODO board: http://127.0.0.1:${config.PORT}/todo.html`);
     if (localAccess.loginCode) console.log(`Task App launch code: ${localAccess.loginCode} (enter at http://127.0.0.1:${config.PORT}/login)`);
@@ -809,9 +834,11 @@ ensureCavemanPlugin()
   }
   })
   .catch((err) => {
+    stopMemoryAdmission();
     console.error(err);
     sendFatal({ code: err && err.code || 'ERR_STARTUP', port: config.PORT, message: err && err.message || String(err) });
     process.exit(1);
   });
 
-module.exports = { server, sessions, projectRegistry, getActiveBackend, setActiveProject, getOrCreateBackend };
+module.exports = { server, sessions, projectRegistry, getActiveBackend, setActiveProject, getOrCreateBackend,
+  getMemoryTelemetry: () => memoryTelemetry.snapshot() };
