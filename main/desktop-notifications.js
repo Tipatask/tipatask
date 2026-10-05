@@ -17,9 +17,11 @@ const THEME_KEYS = ['bg', 'text', 'muted', 'border', 'primary', 'warning', 'succ
 // Live native notifications retained until their terminal event (TPT487); FIFO backstop.
 const NATIVE_MAX = 200;
 
+// The banner's footer row (the "Show" toggle, plus Show More past one page) is always present
+// (TPT505), so its height never depends on the overflow.
 function pageHeight(count) {
   const shown = Math.min(Math.max(1, count), PAGE_SIZE);
-  return PAD + HEADER + GAP + shown * CARD + (shown - 1) * GAP + (count > PAGE_SIZE ? GAP + MORE : 0);
+  return PAD + HEADER + GAP + shown * CARD + (shown - 1) * GAP + GAP + MORE;
 }
 
 // Persisted app-level "Show on Top" preference: `{ desktopNotificationsEnabled: boolean }`.
@@ -57,8 +59,9 @@ const keyOf = (projectPath, tag) => (tag ? JSON.stringify([projectPath || null, 
 // repeat send updates it in place. Entries survive navigation, reloads and elapsed time;
 // completion explicitly removes that task's entries within its originating project.
 function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, onDismiss, Notification = null,
-  onShowMore = () => null, isTrustedProjectSender = () => false, settingsFile = null,
-  focusedProjectWindow = () => null, projectWindows = () => [], settleMs = SURFACE_SETTLE_MS }) {
+  onShowMore = () => null, onSetOnTop = () => null, isTrustedProjectSender = () => false, settingsFile = null,
+  focusedProjectWindow = () => null, projectWindows = () => [], settleMs = SURFACE_SETTLE_MS,
+  platform = process.platform }) {
   const entries = new Map();
   const keys = new Map();
   let sequence = 0;
@@ -75,6 +78,9 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   const sentState = new Map();
   // Project window currently showing the full list ("Show More"): { win, wc, detach }.
   let panel = null;
+  // (TPT505) Banner dismissed with Hide: stays hidden, entries kept, until a new or changed
+  // alert arrives (upsert) or Show on Top is toggled. The in-app panel is unaffected.
+  let bannerHidden = false;
   // (TPT487) "Show on Top" off: one transient OS notification per alert, keyed like entries.
   // Referenced until click/close/failed so V8 can't collect one before the OS shows it.
   const natives = new Map();
@@ -116,7 +122,7 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     if (!window || window.isDestroyed() || loading) return;
     layout();
     window.webContents.send('notify:desktop-state', { entries: list, theme });
-    if (list.length && enabled && !current) window.showInactive();
+    if (list.length && enabled && !current && !bannerHidden) window.showInactive();
     else window.hide();
   }
 
@@ -208,7 +214,9 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   }
 
   // Upsert by (project, tag): same id, moved to newest. Returns { entry, created, released }.
-  function upsert(payload, origin, notificationId) {
+  // `reveal` (the default for real sends) clears bannerHidden; a mirrored card clears it only when
+  // it is new or its text changed, so a renderer re-mirror never brings a hidden banner back.
+  function upsert(payload, origin, notificationId, { reveal = true } = {}) {
     const key = keyOf(origin?.projectPath, payload.tag);
     const prev = key && keys.has(key) ? entries.get(keys.get(key)) : null;
     const id = prev ? prev.id : String(++sequence);
@@ -216,6 +224,7 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     const cardSeq = Number.isFinite(payload.cardSeq) ? payload.cardSeq : (prev?.cardSeq ?? null);
     const entry = { ...entryFields(payload), id, key, origin, cardSeq,
       notificationId: notificationId || prev?.notificationId || null, taskId: payload.taskId ?? prev?.taskId };
+    if (reveal || !prev || ['title', 'body', 'category'].some((field) => prev[field] !== entry[field])) bannerHidden = false;
     entries.set(id, entry);
     if (key) keys.set(key, id);
     // A newer send replaces the callback identity; release the older one (card stays).
@@ -260,8 +269,19 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     for (const entry of removed) onDismiss(entry, { keepCard });
   }
 
+  // (TPT505) Banner Hide: the banner steps aside without touching the registry or any project
+  // window — no onClick/onShowMore, no focus()/show(). The banner is a non-activating panel
+  // (ensureWindow()), so the click itself never brings Tipatask forward either.
+  function hideBanner() {
+    if (!entries.size) return;
+    bannerHidden = true;
+    if (window && !window.isDestroyed()) window.hide();
+  }
+
   function perform(id, action, { from = null } = {}) {
     if (action === 'clear-all') return dismissAll();
+    if (action === 'hide') return hideBanner();
+    if (action === 'on-top-off') return void onSetOnTop(false);
     if (action === 'show-more') {
       // From the in-app panel: open the full list right there, without moving focus.
       if (from) return attachPanel(from);
@@ -287,6 +307,10 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     const w = window = new BrowserWindow({
       // hasShadow: false — macOS traces a window shadow around a transparent window's opaque
       // pixels, drawing a jagged second outline around every card (TPT498); cards carry their own.
+      // (TPT505) Clicking the banner must not activate Tipatask: on macOS an activated app makes
+      // its next window key once the banner hides, raising a project window. A 'panel' is a
+      // non-activating NSPanel; Windows gets the same from focusable: false (WS_EX_NOACTIVATE).
+      ...(platform === 'darwin' ? { type: 'panel' } : platform === 'win32' ? { focusable: false } : {}),
       width: WIDTH, height: pageHeight(1), show: false, frame: false, transparent: true, hasShadow: false,
       alwaysOnTop: true, skipTaskbar: true, resizable: false, minimizable: false,
       maximizable: false, fullscreenable: false, title: 'TipATask',
@@ -312,9 +336,12 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     if (released) onDismiss(released, { keepCard: true });
   }
 
+  // The banner offers Hide and the "Show" toggle instead of Clear All (TPT505); the in-app
+  // panel keeps Clear All.
+  const BANNER_ACTIONS = ['click', 'close', 'hide', 'show-more', 'on-top-off'];
   const ACTIONS = ['click', 'close', 'clear-all', 'show-more'];
   ipcMain.on('notify:desktop-action', (event, { id, action } = {}) => {
-    if (!trusted(event) || !ACTIONS.includes(action)) return;
+    if (!trusted(event) || !BANNER_ACTIONS.includes(action)) return;
     perform(id, action);
   });
   // The project window showing the full list. Only its current owner may act on it; card
@@ -375,7 +402,7 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     upsertCard(payload, origin) {
       if (disposed || !enabled) return { ok: true, delivery: 'disabled' };
       if (!payload?.tag) return { ok: false, reason: 'invalid_tag' };
-      const { entry, released } = upsert({ ...payload, cardSeq: Number(payload.seq) }, origin, null);
+      const { entry, released } = upsert({ ...payload, cardSeq: Number(payload.seq) }, origin, null, { reveal: false });
       publish();
       releaseAfterPublish(released);
       // The banner window is only needed once another app takes focus; create it lazily.
@@ -406,6 +433,7 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     // A failed write keeps the in-memory choice and reports ok:false.
     setEnabled(on) {
       enabled = !!on;
+      bannerHidden = false;
       sentState.clear();
       if (!enabled) dismissAll({ keepCard: true });
       else { closeNatives(); publish(); }

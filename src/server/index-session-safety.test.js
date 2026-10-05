@@ -15,12 +15,13 @@ const pauseRunawaySession = () => null;
 
 // Execute the real bootstrap and timer callbacks without opening sockets, reading
 // credentials, running agents, or touching the user's process tree.
-async function harness(killEnv, failStartup = false) {
+async function harness(killEnv, failStartup = false, validationEnabled = false) {
   const timers = new Map();
   const exits = [];
   const lines = [];
   const sweeps = [];
   const memory = { starts: 0, stops: 0, ended: [], options: null };
+  const validation = { samples: [], lifecycle: [], watchdog: [], stops: 0, trackerOptions: null };
   let shutdownOptions, listenCallback;
   const proc = Object.assign(new EventEmitter(), {
     env: { TIPATASK_WATCHDOG_KILL: killEnv }, platform: 'darwin', arch: 'arm64',
@@ -38,9 +39,14 @@ async function harness(killEnv, failStartup = false) {
     './spawn-utils': { augmentPathEnv: () => ({}), isAsarPath: () => false },
     './task-backend': { createBackend: () => backend, coerceBackendType: () => 'api' },
     './ws-handlers': { createHttpHandler: () => () => {}, drainSessionQueue() {}, sessionQueue: { setAdmission() {}, isRunning: () => false } },
-    './session-admission': { createSessionAdmission: () => ({ start() {}, stop() {} }) },
+    './session-admission': { createSessionAdmission: () => ({ start() {}, stop() {}, snapshot: () => ({ cap: 6 }) }) },
+    './session-validation': { createSessionValidationRecorder: () => ({
+      status: () => ({ enabled: validationEnabled }),
+      sample: (...args) => validation.samples.push(args), lifecycle: e => validation.lifecycle.push(e),
+      watchdog: e => validation.watchdog.push(e), stop() { validation.stops++; },
+    }) },
     './ws-upgrade': { createWebSocketGate: () => ({ clients: new Set([{ _boardWatcher: true }]) }) },
-    './websocket': { init() {}, emitTaskUpdated() {} },
+    './websocket': { init() {}, emitTaskUpdated() {}, emitSessionRunaway() {} },
     './task-agent': { preloadAgentDetection: async () => {}, listAllAgentModels: async () => [] },
     './status-roles': { fetchStatusRoles: async () => ({ complete: 'completed' }) },
     './git-merge/completion-guard': { guardCompletionTransition: async () => ({ allowed: true }), warnIfCompletedWorktreeDirty: async () => {} },
@@ -53,7 +59,7 @@ async function harness(killEnv, failStartup = false) {
       memory.options = opts;
       return { tracker: {}, start() { memory.starts++; }, stop() { memory.stops++; }, snapshot: () => ({ diagnostic: true }) };
     } },
-    './session-memory': { createSessionMemoryTracker: () => ({}), setSessionMemoryTracker() {},
+    './session-memory': { createSessionMemoryTracker: opts => { validation.trackerOptions = opts; return {}; }, setSessionMemoryTracker() {},
       endSessionMemory(...args) { memory.ended.push(args); } },
     './crash-guard': { installCrashGuard: opts => installCrashGuard({ ...opts,
       proc, exit: proc.exit, log, recordExit() {} }) },
@@ -76,9 +82,29 @@ async function harness(killEnv, failStartup = false) {
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(exits, failStartup ? [1] : [], lines.join('\n'));
   if (!failStartup) assert.ok(timers.has(10000));
-  return { sessions: module.exports.sessions, timers, proc, exits, lines, sweeps, memory,
+  return { sessions: module.exports.sessions, timers, proc, exits, lines, sweeps, memory, validation,
     server, shutdownOptions, ready: () => listenCallback(), getMemoryTelemetry: module.exports.getMemoryTelemetry };
 }
+
+test('optional session validation records lifecycle, measurements and watchdog before shutdown without disabled sampling cost', async () => {
+  const disabled = await harness();
+  assert.equal(disabled.memory.options.onSample, null);
+  assert.equal(disabled.validation.trackerOptions.onLifecycle, null);
+  const h = await harness(undefined, false, true);
+  const snapshot = { host: { pressure: 'normal' } };
+  h.memory.options.onSample(snapshot);
+  assert.equal(h.validation.samples[0][0], snapshot);
+  assert.equal(h.validation.samples[0][1].cap, 6);
+  assert.equal(h.validation.samples[0][2], h.sessions);
+  h.validation.trackerOptions.onLifecycle({ type: 'end' });
+  assert.equal(h.validation.lifecycle[0].type, 'end');
+  await h.timers.get(30000)();
+  const event = { paused: true };
+  h.sweeps[0][2].emitSessionRunaway('/project', event);
+  assert.equal(h.validation.watchdog[0], event);
+  h.server.emit('close');
+  assert.equal(h.validation.stops, 1);
+});
 
 test('bootstrap guard reads live sessions in any project on every exception', async () => {
   const h = await harness();

@@ -73,8 +73,8 @@ function buildPiArgs(session, { extensionPath } = {}) {
     '--model', piModelFor(session),
     '--tools', profile ? profile.tools.join(',') : 'read',
   ];
+  args.push('--no-extensions');
   if (profile) {
-    args.push('--no-extensions');
     if (extensionPath) args.push('-e', extensionPath);
   }
   if (session.piSessionId) {
@@ -92,7 +92,7 @@ function extractCards(session, emit) {
   if (blocks.length === 0) return null;
   for (let i = blocks.length - 1; i >= 0; i--) {
     try {
-      const parsed = normalizeProposals(JSON.parse(blocks[i][1]));
+      const parsed = normalizeProposals(JSON.parse(blocks[i][1]), session._startStatusName, session._proposalContext || { tasks: null });
       if (parsed && parsed.changes && Array.isArray(parsed.changes)) {
         const cards = parsed.changes;
         const filesAddressed = parsed.files_addressed || [];
@@ -367,7 +367,7 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
     includeSystemPrompt: true,
     hasProviderSession: !isFirstTurn,
   });
-  let basePrompt = basePromptBuilt;
+  let basePrompt = (session.toolProfile ? '' : 'Pi objective planning: only the read tool is available. No MCP, REST, shell or file-writing tools. Return proposals; ignore coding-task completion and MCP instructions in shared context.\n\n') + basePromptBuilt;
   if (promptMode === 'handoff') {
     console.log(`[pi] task=${taskId} switching to pi — sending full transcript (${basePrompt.length} chars)`);
   }

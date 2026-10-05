@@ -266,6 +266,8 @@ function readEnv(filePath, projectRoot = PROJECT_ROOT, { readOnly = false } = {}
     // The token is the signed-in account's, held in the app-level account store.
     const account = readAccount(values.API_BASE_URL);
     if (account) values.API_TOKEN = account.token;
+    try { require('../server/account-store').assertTokenProject(values.API_TOKEN, values.API_PROJECT_ID); }
+    catch { values.API_TOKEN = ''; }
   }
 
   return { lines, values };
@@ -646,12 +648,16 @@ function inspectHarnessConfiguration(projectRoot) {
   const cfg = readProjectConfig(projectRoot);
   const checks = [
     ['.mcp.json', JSON.parse, value => value.mcpServers?.tipatask?.type === 'http'
-      && value.mcpServers?.tipatask?.url === '${API_BASE_URL}/api/projects/${API_PROJECT_ID}/mcp'
+      && value.mcpServers?.tipatask?.url === (cfg?.API_BASE_URL && cfg?.API_PROJECT_ID
+        ? `${String(cfg.API_BASE_URL).replace(/\/+$/, '')}/api/projects/${encodeURIComponent(cfg.API_PROJECT_ID)}/mcp`
+        : '${API_BASE_URL}/api/projects/${API_PROJECT_ID}/mcp')
+      && !!value.mcpServers?.tipatask?.headersHelper
+      && value.mcpServers?.tipatask?.headers?.Authorization === ''
       && value.mcpServers?.['tipatask-local']?.env?.TIPATASK_MCP_LOCAL_ONLY === '1'],
     ['.claude/settings.local.json', JSON.parse, value => ['tipatask', 'tipatask-local'].every(name =>
       value.enabledMcpjsonServers?.includes(name)) && (!cfg || API_CREDENTIAL_FIELDS.every(key =>
       value.env?.[key] === (key === 'API_TOKEN'
-        ? (readAccount(cfg.API_BASE_URL)?.token ?? String(cfg[key] ?? ''))
+        ? ''
         : String(cfg[key] ?? ''))))],
     ['.codex/config.toml', require('toml').parse, value => {
       const opts = { projectRoot, mcpServerPath: path.join(serverRoot, 'src/mcp/server.js') };
@@ -928,7 +934,7 @@ async function main() {
       updates.DEVICE_NAME = device.name;
     }
     writeEnv(ENV_PATH, initialEnv.lines, updates, projectRoot);
-    console.log(`\n  ${GREEN}Signed in. Token saved to .tipatask/config.json.${RESET}\n`);
+    console.log(`\n  ${GREEN}Signed in. Credentials saved to the account store.${RESET}\n`);
     return;
   }
 
@@ -1057,13 +1063,13 @@ async function main() {
     body: { project_id: project.id },
   });
 
-  // Exchange user JWT for a project-scoped JWT
+  // Exchange the sign-in token for the account-wide desktop token (legacy scope is preserved).
   let scopedToken;
   try {
     const { exchangeProjectToken } = require('./auth');
     scopedToken = await exchangeProjectToken(apiBaseUrl, token, project.id);
   } catch (err) {
-    console.error(`\n  ${YELLOW}Failed to exchange project-scoped token: ${err.message}${RESET}`);
+    console.error(`\n  ${YELLOW}Failed to exchange desktop token: ${err.message}${RESET}`);
     process.exit(1);
   }
 
@@ -1132,7 +1138,7 @@ async function main() {
         ? preWriteEnv.values.TASK_AGENT
         : mergedAgentIds[0]);
 
-  // Write project credentials to config.json and non-secret runtime settings to .env.
+  // Write the target to config.json, token to the account store, and runtime settings to .env.
   writeEnv(ENV_PATH, preWriteEnv.lines, {
     TASK_BACKEND: 'api',
     TASK_AGENT: finalTaskAgent,

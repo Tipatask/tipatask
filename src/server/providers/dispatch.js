@@ -16,12 +16,40 @@ const { spawnCodexTurn } = require('./codex-session');
 const registry = require('./registry');
 const { listTaskAgentStatuses } = require('../task-agent');
 const { providerSupportsProfile } = require('./tool-profiles');
+const { prepareObjectiveProposalContext } = require('../objective-proposal-status');
 
 /**
  * Provider-agnostic objective-turn entry point.
  * Drop-in replacement for spawnObjectiveTurn(session, taskId) — same signature.
  */
 function spawnTurn(session, taskId) {
+  const identity = require('../api-credentials').projectContextIdentity(session.projectPath);
+  if (session._agentContextIdentity !== undefined && session._agentContextIdentity !== identity) {
+    registry.clearAllProviderSessionIds(session);
+    if (session.ws?.readyState === 1) session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId,
+      reason: 'project-context-changed', status: 409, detail: 'Project or account changed. Start a new chat.' }));
+    return;
+  }
+  session._agentContextIdentity = identity;
+  if (session.type === 'objective' && session.backend) {
+    if (session._spawning || session.proc) return;
+    const epoch = session._epoch || 0;
+    session._aborted = false;
+    session._spawning = true;
+    const preparing = prepareObjectiveProposalContext(session);
+    const context = session._proposalContext;
+    return preparing.then(() => {
+      // Teardown/restart owns its throttle slot and replacement spawn state.
+      if (session._closed || session._aborted || (session._epoch || 0) !== epoch
+        || session._proposalContext !== context) return;
+      session._spawning = false;
+      return spawnPreparedTurn(session, taskId);
+    });
+  }
+  return spawnPreparedTurn(session, taskId);
+}
+
+function spawnPreparedTurn(session, taskId) {
   let provider = session.providerType || config.OBJECTIVE_PROVIDER;
   if (!providerSupportsProfile(session, provider)) {
     // Never run a fenced chat on a provider with no fence. Reachable only through a server

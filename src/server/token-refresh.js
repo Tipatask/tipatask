@@ -8,14 +8,15 @@
 //
 // The new token is persisted in the app-level account store (account-store.js, read live by
 // getApiCredentials(), projectEnvExtras() and the headers helper that feeds the remote MCP
-// server) and mirrored into the `env` copy in .claude/settings.local.json. It is never
+// server); legacy settings.local.json token copies are cleared. It is never
 // written to the project's config.json. Because the token is account-wide (TPT449), one
 // renewal serves every project on that API server, so in-flight requests are joined per
-// server, not per project. Token values are never logged.
+// server and token identity, not per project. Token values are never logged.
 
 const { tokenExpiryMs } = require('./auth-guard');
 const { writeProjectClaudeMcpApproval } = require('./project-config');
-const { readAccount, writeAccountToken, normalizeBaseUrl } = require('./account-store');
+const { readAccount, writeAccountToken, normalizeBaseUrl, decodeTokenPayload, assertTokenProject } = require('./account-store');
+const { createHash } = require('node:crypto');
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
@@ -42,6 +43,12 @@ async function requestFreshToken({ baseUrl, token, projectId, fetchImpl, timeout
   try { body = await res.json(); } catch { throw new Error('token refresh returned an unreadable response'); }
   const fresh = body && typeof body.token === 'string' ? body.token : '';
   if (tokenExpiryMs(fresh) == null) throw new Error('token refresh returned no usable token');
+  assertTokenProject(fresh, projectId);
+  const before = decodeTokenPayload(token);
+  const after = decodeTokenPayload(fresh);
+  if (before?.id !== after?.id || (before?.project_id ?? null) !== (after?.project_id ?? null)) {
+    throw new Error('token refresh changed account or scope — sign in again');
+  }
   return fresh;
 }
 
@@ -66,9 +73,12 @@ function refreshProjectToken({ projectRoot, baseUrl, token, projectId, fetchImpl
   if (!projectRoot || !baseUrl || !token || !projectId) {
     return Promise.reject(new Error('token refresh needs projectRoot, baseUrl, token and projectId'));
   }
+  try { assertTokenProject(token, projectId); } catch (err) { return Promise.reject(err); }
   const impl = fetchImpl || globalThis.fetch;
   if (typeof impl !== 'function') return Promise.reject(new Error('fetch is unavailable'));
-  const flightKey = normalizeBaseUrl(baseUrl);
+  // Join projects of the same account token, never a new sign-in or another
+  // legacy project scope on the same API server.
+  const flightKey = `${normalizeBaseUrl(baseUrl)}:${createHash('sha256').update(token).digest('hex')}`;
   const existing = _inflight.get(flightKey);
   if (existing) return existing;
   const run = doRefresh({

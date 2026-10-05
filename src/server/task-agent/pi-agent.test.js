@@ -419,18 +419,12 @@ test('PiAgent.buildPrompt: api backend gets the full Tipatask REST recipe keyed 
     const agent = new PiAgent();
     const prompt = agent.buildPrompt('Do the thing.', { taskTags: ['tt-pi-session'], projectPath: dir });
 
-    assert.match(prompt, /TT="\$API_BASE_URL\/api\/projects\/\$API_PROJECT_ID"/);
-    assert.match(prompt, /AUTH="Authorization: Bearer \$API_TOKEN"/);
-    assert.match(prompt, /```sh/);
-    assert.ok(prompt.includes('\n```\n'), 'fenced shell block must close');
-    assert.match(prompt, /curl -sS -H "\$AUTH" "\$TT\/tasks\/\$TIPATASK_TASK_ID"/);
-    assert.match(prompt, /\$TT\/tasks\/\$TIPATASK_TASK_ID\/comments/);
-    assert.match(prompt, /-X PATCH -H "\$AUTH" -H "\$JSON" "\$TT\/tasks\/\$TIPATASK_TASK_ID" -d '\{"status":"in_progress"\}'/);
+    assert.match(prompt, /TIPATASK_TOOL_SCRIPT/);
+    assert.match(prompt, /tt GET "\/tasks\/\$TIPATASK_TASK_ID"/);
+    assert.match(prompt, /tt complete "\$TIPATASK_TASK_ID"/);
+    assert.match(prompt, /tt verify "\$TIPATASK_TASK_ID"/);
+    assert.doesNotMatch(prompt, /Authorization: Bearer|AUTH=/);
     assert.match(prompt, /pending \| in_progress \| on_fire \| completed \| canceled/);
-    assert.match(prompt, /comment \| resolution \| spec/);
-    assert.match(prompt, /"\$TT\/tags" -d '\{"tags":\[\{"name"/);
-    assert.match(prompt, /\$TT\/members/);
-    assert.match(prompt, /\$TT\/knowledge/);
     // Regression guards: the old prompt made the model fill in <task_key> itself, and carried
     // a stray caveman-mode reference even though Pi never runs in caveman mode.
     assert.doesNotMatch(prompt, /<task_key>/);
@@ -450,7 +444,7 @@ test('PiAgent.buildPrompt: a legacy TASK_BACKEND="file" project config still get
     const prompt = agent.buildPrompt('Do the thing.', { taskTags: ['tt-pi-session'], projectPath: dir });
 
     assert.match(prompt, /API_BASE_URL/);
-    assert.match(prompt, /curl -sS/);
+    assert.match(prompt, /TIPATASK_TOOL_SCRIPT/);
     assert.match(prompt, /```sh/);
     assert.doesNotMatch(prompt, /task status lives in ai\/TODO\.md/);
     // No-MCP framing is backend-independent — Pi never has MCP regardless of task backend.
@@ -471,7 +465,7 @@ test('PiAgent.buildPrompt: api path carries the status/tag-review/KB rules Claud
     assert.match(prompt, /POST \/tags to register it.*then create the ai\/architecture\/tt-\*\.md stub/s);
     assert.match(prompt, /400 "tags not registered"/);
     assert.match(prompt, /Never write ai\/ARCHITECTURE\.md/);
-    assert.match(prompt, /Post it immediately before the PATCH that sets status to completed/);
+    assert.match(prompt, /Require completed:true; never use a status PATCH instead/);
     assert.match(prompt, /nothing auto-pushes your ai\/architecture\/\*\.md edits/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -729,13 +723,13 @@ test('PiAgent.buildPrompt: renamed project statuses render everywhere a status n
     };
     const prompt = agent.buildPrompt('Do the thing.', opts);
 
-    assert.match(prompt, /-d '\{"status":"Doing"\}'/);
+    assert.match(prompt, /'\{"status":"Doing"\}' \| tt PATCH/);
     assert.match(prompt, /Backlog \| Doing \| on_fire \| Shipped \| canceled/);
-    assert.match(prompt, /\$TT\/tasks\?status=Backlog&fields=summary&limit=20/);
+    assert.match(prompt, /\/tasks\?status=Backlog&fields=summary&limit=20/);
     assert.match(prompt, /PATCH status to Doing as soon as you start implementing/);
-    assert.match(prompt, /and to Shipped — or on_fire if this task is blocked —/);
+    assert.match(prompt, /tt complete for Shipped — or on_fire if this task is blocked —/);
     assert.match(prompt, /MANDATORY before marking this task Shipped/);
-    assert.match(prompt, /Post it immediately before the PATCH that sets status to Shipped/);
+    assert.match(prompt, /Require completed:true; never use a status PATCH instead/);
     // The legacy literals must not leak through once real roles are supplied.
     assert.doesNotMatch(prompt, /"status":"in_progress"/);
     assert.doesNotMatch(prompt, /MANDATORY before marking this task completed/);
@@ -768,7 +762,7 @@ test('PiAgent.buildPrompt: a project that removed on_fire entirely drops the "or
     };
     const prompt = agent.buildPrompt('Do the thing.', opts);
     assert.doesNotMatch(prompt, /or on_fire if you are leaving it broken/);
-    assert.match(prompt, /PATCH status to Doing as soon as you start implementing \(right after plan approval\), and to Shipped before your final message/);
+    assert.match(prompt, /PATCH status to Doing as soon as you start implementing \(right after plan approval\), and use tt complete for Shipped before your final message/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-provider-prompt-data-'));
+after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
 const { EventEmitter } = require('node:events');
 
 // Intercept the actual spawn boundary before adapters capture child_process.spawn.
@@ -16,6 +18,7 @@ mock.method(require('node:child_process'), 'spawn', (command, args, options) => 
   return capture.proc;
 });
 mock.method(require('../codex-env'), 'buildCodexEnv', () => ({ env: {} }));
+mock.method(require('../../codex-mcp-config'), 'buildScopedCodexMcpOverride', () => 'mcp_servers={}');
 mock.method(require('../task-agent/attachments'), 'localizeAttachments', async ({ prompt }) => ({ prompt }));
 
 const config = require('../config');
@@ -148,7 +151,7 @@ for (const id of Object.keys(providers)) {
         } else assert.deepEqual(args.slice(0, 3), ['exec', 'resume', 'native-session']);
       }
       if (id === 'pi') assert.equal(args[args.indexOf('--tools') + 1], 'read');
-      if (id === 'gemini') assert.ok(args.includes('--yolo'));
+      if (id === 'gemini') { assert.ok(!args.includes('--yolo')); assert.ok(args.includes('--approval-mode')); }
     });
   }
 

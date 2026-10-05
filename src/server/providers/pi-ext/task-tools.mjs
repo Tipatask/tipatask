@@ -2,11 +2,12 @@
 // single `tipatask_api` tool — Pi's replacement for the tipatask MCP task tools, and the only
 // way a Pi task chat can change anything: the turn runs with no bash, edit or write tool.
 // Every request goes through resolveTipataskRequest(), which pins the URL to this project's API
-// root and to a fixed list of method + path shapes. Credentials come from the spawn environment
+// root and to a fixed list of method + path shapes. Credentials are resolved from the live account store for the pinned launch context
 // and never appear in a tool result.
 
 import { Type } from "typebox";
 import requestGate from "./tipatask-request.cjs";
+import credentials from "./live-credentials.cjs";
 
 const { resolveTipataskRequest } = requestGate;
 
@@ -30,7 +31,10 @@ export default function (pi) {
       body: Type.Optional(Type.Any({ description: "JSON object body for POST and PATCH" })),
     }),
     async execute(_toolCallId, params, signal) {
-      const request = resolveTipataskRequest(params, process.env);
+      let env;
+      try { env = credentials.liveCredentials(process.env); }
+      catch (err) { return text(err.message); }
+      const request = resolveTipataskRequest(params, env);
       if (!request.ok) return text(`Rejected: ${request.error}`);
       try {
         const res = await fetch(request.url, {
@@ -39,13 +43,13 @@ export default function (pi) {
           body: request.body,
           signal,
         });
-        const raw = await res.text();
+        const raw = (await res.text()).split(env.API_TOKEN).join('[redacted]');
         const shown = raw.length > MAX_RESULT_CHARS
           ? `${raw.slice(0, MAX_RESULT_CHARS)}\n… (truncated, ${raw.length} chars total — narrow the request)`
           : raw;
         return text(`HTTP ${res.status}\n${shown}`);
       } catch (err) {
-        return text(`Request failed: ${err && err.message ? err.message : String(err)}`);
+        return text("Request failed; check project access and sign-in.");
       }
     },
   });

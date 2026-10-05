@@ -110,15 +110,15 @@ test('refreshProjectToken: rewrites the settings.local.json env copy and gitigno
     await refreshProjectToken({ projectRoot: root, baseUrl, token: oldTok, projectId: '2' });
 
     const settings = JSON.parse(fs.readFileSync(path.join(root, '.claude', 'settings.local.json'), 'utf8'));
-    assert.strictEqual(settings.env.API_TOKEN, newTok);
+    assert.strictEqual(settings.env.API_TOKEN, '');
     assert.strictEqual(settings.env.KEEP, 'me');
     assert.ok(fs.readFileSync(path.join(root, '.gitignore'), 'utf8').includes('.claude/settings.local.json'));
   });
 });
 
 test('refreshProjectToken: concurrent callers on one API server (even two projects) share a single request', async (t) => {
-  const oldTok = makeJwt(nowSec() + 300);
-  const newTok = makeJwt(nowSec() + 7 * 86400);
+  const oldTok = `${b64url({ alg: 'HS256' })}.${b64url({ id: 1, exp: nowSec() + 300 })}.sig`;
+  const newTok = `${b64url({ alg: 'HS256' })}.${b64url({ id: 1, exp: nowSec() + 7 * 86400 })}.sig`;
   await withApi((req, res) => {
     setTimeout(() => { res.writeHead(200); res.end(JSON.stringify({ token: newTok })); }, 50);
   }, async (baseUrl, requests) => {

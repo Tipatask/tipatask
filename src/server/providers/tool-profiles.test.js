@@ -84,12 +84,13 @@ test('codex task chat: read-only sandbox on fresh and resumed turns, MCP narrowe
   }
 });
 
-test('codex objective argv carries no profile overrides', () => {
+test('codex objective argv denies task mutations and local completion', () => {
   const fresh = buildCodexArgs({ type: 'objective', codexSessionId: null }, { cwd: '/p', model: 'm', imagePaths: [] });
-  assert.ok(!configOverrides(fresh).some(o => o.startsWith('mcp_servers.') || o.startsWith('sandbox_mode')));
+  assert.ok(configOverrides(fresh).some(o => o.includes('disabled_tools') && o.includes('update_task')));
+  assert.ok(configOverrides(fresh).includes('mcp_servers.tipatask-local.enabled_tools=["batch_grep_tags"]'));
 });
 
-test('codexProfileConfigArgs skips a server name a bare TOML key cannot spell', () => {
+test('legacy dotted overrides only use bare server names; real spawns replace the entire map', () => {
   const profile = PROFILES[TASK_CHAT].codex;
   const overrides = configOverrides(codexProfileConfigArgs(profile, { otherMcpServers: ['ok_name', 'we.ird', 'has space', 'a"b'] }));
   assert.ok(overrides.includes('mcp_servers.ok_name.enabled=false'));
@@ -110,5 +111,5 @@ test('pi task chat: no shell or file-writing tool, only the staged extension', (
 test('pi objective argv stays read-only with no extension flags', () => {
   const args = buildPiArgs({ type: 'objective', providerType: 'pi' });
   assert.equal(flag(args, '--tools'), 'read');
-  assert.ok(!args.includes('-e') && !args.includes('--no-extensions'));
+  assert.ok(!args.includes('-e') && args.includes('--no-extensions'));
 });

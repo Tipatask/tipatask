@@ -4,7 +4,7 @@
       "type": "http",
       "url": "${API_BASE_URL}/api/projects/${API_PROJECT_ID}/mcp",
       "headers": {
-        "Authorization": "Bearer ${API_TOKEN}",
+        "Authorization": "",
         "X-Tipatask-Session-Task": "${TIPATASK_TASK_ID:-}"
       }
     },
@@ -16,6 +16,7 @@
       "env": {
         "TIPATASK_PROJECT_ROOT": "{{PROJECT_ROOT}}",
         "TIPATASK_SERVER_ROOT": "{{SERVER_ROOT}}",
+        "TIPATASK_USER_DATA": "{{USER_DATA_ROOT}}",
         "TIPATASK_MCP_LOCAL_ONLY": "1"
       }
     }

@@ -235,7 +235,8 @@ class ClaudeAgent extends BaseTaskAgent {
     // TPT349 — when the CLI supports headersHelper, hand it a derived copy of .mcp.json whose
     // `tipatask` entry re-reads the account-store token on every (re)connect, so a
     // refreshed/re-authed token reaches the remote MCP without restarting the session. See
-    // mcp-spawn-config.js. Falls back to the project's own .mcp.json (token frozen at launch).
+    // mcp-spawn-config.js. The project file also uses a helper with blank static auth;
+    // CLIs without headersHelper cannot authenticate and must be upgraded.
     let mcpConfigPath = path.join(projectRoot, '.mcp.json');
     let mcpHeadersHelper = false;
     if (await ClaudeAgent._cliSupportsHeadersHelper(config)) {

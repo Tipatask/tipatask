@@ -2,7 +2,7 @@
 import state from './state.js';
 import { DRAFT_KEY_OBJECTIVE } from './constants.js';
 import { t, tc } from './i18n.js';
-import { startName, inProgressName, completeName, canceledName, statusNames, activeNames } from './status-registry.js';
+import { startName, inProgressName, completeName, canceledName, statusNames, activeNames, isLockedTargetStatus } from './status-registry.js';
 import { groupTitle, groupNewLabel } from './group-label.js';
 import { sanitizeMarkdownHtml } from './markdown-sanitize.js';
 
@@ -737,6 +737,8 @@ function normalizeProposals(parsed) {
       if (c.type === 'new') c.task.status = startName();
       else delete c.task.status;
     }
+    parsed.changes = parsed.changes.filter(c => c.type !== 'modified'
+      || !isLockedTargetStatus(state.taskStatusById.get(c.task?.id || c.task?.task_key)));
   }
   return parsed;
 }

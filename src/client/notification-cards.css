@@ -3,8 +3,8 @@
    (main/desktop-notifications.html). Both surfaces render the same DOM
    (src/client/notification-page.js), so they look the same.
 
-   Fixed heights (paged): header 24, card 70, Show More 24, gap 8 — mirrored by
-   pageHeight() in main/desktop-notifications.js. Card height = 1px border x2 + 10px padding x2
+   Fixed heights (paged): header 24, card 70, footer (Show More / banner "Show" toggle) 24,
+   gap 8 — mirrored by pageHeight() in main/desktop-notifications.js. Card height = 1px border x2 + 10px padding x2
    + 16px title + 2px gap + two 15px body lines (TPT498).
 
    Colors: --tt-notif-* (set on the banner from the in-app host's palette) fall back to the
@@ -45,6 +45,7 @@
 .tt-notif-page-header[hidden] { display: none; }
 .tt-notif-page-count { font-weight: 600; }
 .tt-notif-page-clear,
+.tt-notif-page-hide,
 .tt-notif-page-more {
   background: none;
   border: none;
@@ -58,11 +59,51 @@
   text-decoration: none;
   text-underline-offset: 2px;
 }
-.tt-notif-page-more {
+/* (TPT505) Footer row: the banner's "Show" toggle bottom-left with Show More on the right;
+   Show More alone (in-app) stays centered. Hidden when it holds neither (in-app stack with one
+   page), so that surface keeps its height. */
+.tt-notif-page-footer {
   flex: 0 0 24px;
   height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tt-notif-page-footer[hidden] { display: none; }
+.tt-notif-page-ontop {
+  flex: 0 0 auto;
+  height: 24px;
   box-sizing: border-box;
-  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px 0 7px;
+  border: 1px solid var(--tt-notif-c-border);
+  border-radius: 999px;
+  background: var(--tt-notif-c-bg);
+  background: color-mix(in srgb, var(--tt-notif-c-muted) 10%, var(--tt-notif-c-bg));
+  color: var(--tt-notif-c-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+}
+.tt-notif-page-ontop[hidden] { display: none; }
+.tt-notif-page-ontop input {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  accent-color: var(--tt-notif-c-primary);
+  cursor: pointer;
+}
+.tt-notif-page-ontop:hover { color: var(--tt-notif-c-text); }
+.tt-notif-page-ontop:not([hidden]) + .tt-notif-page-more { margin-right: 0; }
+.tt-notif-page-more {
+  flex: 0 0 auto;
+  margin: 0 auto;
+  height: 24px;
+  box-sizing: border-box;
   padding: 0 12px;
   border: 1px solid var(--tt-notif-c-border);
   border-radius: 999px;
@@ -71,6 +112,8 @@
 .tt-notif-page-more[hidden] { display: none; }
 .tt-notif-page-clear:hover,
 .tt-notif-page-clear:focus-visible,
+.tt-notif-page-hide:hover,
+.tt-notif-page-hide:focus-visible,
 .tt-notif-page-more:hover,
 .tt-notif-page-more:focus-visible { text-decoration: underline; outline: none; }
 .tt-notif-page-cards {

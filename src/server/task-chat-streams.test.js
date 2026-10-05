@@ -120,6 +120,7 @@ test('codex: mcp_tool_call items and the agent message become tool and dialog fr
   const spawned = [];
   const codex = loadInVm('providers/codex-session.js', {
     'node:child_process': { spawn() { const proc = fakeProc(97000 + spawned.length); spawned.push(proc); return proc; } },
+    '../../codex-mcp-config': { buildScopedCodexMcpOverride: () => 'mcp_servers={}' },
     '../codex-env': { buildCodexEnv: () => ({ env: {} }), codexEffortArgs: () => [], toCodexEffort: level => level },
     '../claude-session': { normalizeProposals: x => x },
     './transcript': { buildTurnPrompt: () => ({ prompt: 'seed', mode: 'fresh' }), buildNudgeMessage: () => 'nudge' },

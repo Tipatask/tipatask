@@ -5,6 +5,11 @@ function inv(channel, ...args) { return ipcRenderer.invoke(channel, ...args); }
 
 contextBridge.exposeInMainWorld('electronAPI', {
   platform: process.platform,
+  onSystemResume: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on('tiptask:system-resume', handler);
+    return () => ipcRenderer.removeListener('tiptask:system-resume', handler);
+  },
 
   // ── Project identity (bound to this window for its lifetime) ─────────────────
   getProjectPath: () => new URLSearchParams(location.search).get('projectPath') || null,
@@ -60,9 +65,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   notificationSurfaceAction: (action, id) => ipcRenderer.send('notify:surface-action', { action, id }),
   setNotificationTheme: (tokens) => ipcRenderer.send('notify:theme', tokens),
   // (TPT487) "Show on Top": on keeps the desktop stack, off sends native OS notifications.
-  // App-level (main persists it); every project window hears changes from the menu or Settings.
-  getNotificationsOnTop: () => inv('notify:on-top-get'),
-  setNotificationsOnTop: (on) => inv('notify:on-top-set', { enabled: !!on }),
+  // App-level (main persists it, set from View ▸ Notifications or the banner's "Show" box,
+  // TPT505); every project window hears changes.
   onNotificationsOnTopChanged: (cb) => {
     const handler = (_, state) => cb(state);
     ipcRenderer.on('notify:on-top-changed', handler);

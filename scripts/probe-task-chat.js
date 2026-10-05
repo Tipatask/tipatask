@@ -89,9 +89,10 @@ async function main() {
     process.exit(2);
   }
   const sourceCfg = JSON.parse(fs.readFileSync(path.join(sourceRoot, '.tipatask', 'config.json'), 'utf8'));
-  const { API_BASE_URL: base, API_PROJECT_ID: projectId, API_TOKEN: token } = sourceCfg;
+  const { baseUrl: base, projectId, token } = require('../src/server/api-credentials').getApiCredentials(sourceRoot);
+  delete sourceCfg.API_TOKEN;
   if (!base || !projectId || !token) {
-    console.error('The project config has no API credentials (API_BASE_URL / API_PROJECT_ID / API_TOKEN).');
+    console.error('The selected project or signed-in account is unavailable.');
     process.exit(2);
   }
   if (!opts.yes) {
@@ -118,13 +119,14 @@ async function main() {
   // inherited session markers change how the spawned `claude` persists its own session.
   for (const key of Object.keys(process.env)) {
     if (key === 'CLAUDECODE' || /^CLAUDE_CODE_(ENTRYPOINT|CHILD_SESSION|SESSION_ID|SESSION_ATTENDED|MESSAGING_SOCKET|MESSAGING_TOKEN|EXECPATH|SSE_PORT)$/.test(key)) delete process.env[key];
-    // config.json is the only credential source for the spawned turns.
+    // The scratch account store supplies credentials for spawned turns.
     if (/^(API_BASE_URL|API_TOKEN|API_PROJECT_ID|TIPATASK_TASK_ID|TIPATASK_TRACK_DIR|TIPATASK_ELECTRON_HOST)$/.test(key)) delete process.env[key];
   }
   process.env.TIPATASK_PROJECT_ROOT = scratch;
   process.env.TIPATASK_USER_DATA = userData;
   process.env.TIPATASK_SERVER_ROOT = SERVER_ROOT;
   process.env.TIPATASK_NO_BANNER = '1';
+  require('../src/server/account-store').writeAccountToken(base, token, { userDataRoot: userData });
 
   // Required only now, so config.js resolves against the scratch project.
   const config = require('../src/server/config');

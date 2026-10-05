@@ -46,14 +46,14 @@ function buildGeminiArgs(session) {
     '--output-format', 'stream-json',
     // (C1030) session.selectedModel (chat-model-selector) wins over config.GEMINI_MODEL.
     '--model', resolveProviderModel(session, 'gemini', config),
-    '--yolo',           // auto-approve all tool confirmations (non-interactive)
+    '--approval-mode', 'default',
+    '--extensions', 'none',
     '--prompt', '',     // placeholder; actual prompt written to stdin (-p still reads stdin)
   ];
-  // Multi-turn continuation: resume the most-recent session on follow-up turns.
-  // "latest" is safe because gemini sessions are project-scoped and task-local.
+  // Resume this chat's recorded session; concurrent chats must never use "latest".
   // If geminiSessionId is set this is a continuation turn, not the first.
   if (session.geminiSessionId) {
-    args.push('--resume', 'latest');
+    args.push('--resume', session.geminiSessionId);
   }
   return args;
 }
@@ -68,7 +68,7 @@ function extractCards(session, emit) {
   if (blocks.length === 0) return null;
   for (let i = blocks.length - 1; i >= 0; i--) {
     try {
-      const parsed = normalizeProposals(JSON.parse(blocks[i][1]));
+      const parsed = normalizeProposals(JSON.parse(blocks[i][1]), session._startStatusName, session._proposalContext || { tasks: null });
       if (parsed && parsed.changes && Array.isArray(parsed.changes)) {
         const cards = parsed.changes;
         const filesAddressed = parsed.files_addressed || [];
@@ -262,6 +262,9 @@ function spawnGeminiTurn(session, taskId, emitFn) {
   // Prepend the current process's node bin/ dir so gemini's shebang (#!/usr/bin/env node)
   // resolves to this server's Node version, not a potentially-incompatible system node.
   const env = { ...baseEnv, PATH: `${NODE_BIN_DIR}:${baseEnv.PATH}` };
+  env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = require('./gemini-config').prepareGeminiSettings(config.USER_DATA_ROOT);
+  delete env.API_TOKEN;
+  delete env.TIPATASK_API_TOKEN;
 
   const args = buildGeminiArgs(session);
 
@@ -274,7 +277,7 @@ function spawnGeminiTurn(session, taskId, emitFn) {
     includeSystemPrompt: true,
     hasProviderSession: !isFirstTurn,
   });
-  let basePrompt = basePromptBuilt;
+  let basePrompt = 'Gemini objective planning: read source/KB only and return proposals. No Tipatask MCP or REST tools are available. Ignore MCP tool schemas and coding-task completion instructions in shared context.\n\n' + basePromptBuilt;
   if (promptMode === 'handoff') {
     console.log(`[gemini] task=${taskId} switching to gemini — sending full transcript (${basePrompt.length} chars)`);
   }

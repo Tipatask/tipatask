@@ -153,7 +153,7 @@ test('localizeImageRefs saves an SVG ref with .svg extension', async () => {
   }
 });
 
-test('localizeImageRefs uses the current config.json token, not a stale snapshot (C1013)', async () => {
+test('localizeImageRefs uses the current account-store token, not a stale snapshot (C1013)', async () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
   const requests = [];
   const imageServer = await startImageServer((req, res) => {
@@ -178,11 +178,8 @@ test('localizeImageRefs uses the current config.json token, not a stale snapshot
 
       await localizeImageRefs({ taskId: 'C1013', prompt, taskCommentsBlock: '', projectRoot });
 
-      // Rotate the token in config.json only — no config-object mutation, no restart —
-      // mirroring a re-auth that happens while the server keeps running.
-      const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      cfg.API_TOKEN = 'token-B';
-      fs.writeFileSync(configPath, JSON.stringify(cfg));
+      // Re-auth rotates the account store without restarting the attachment reader.
+      require('../account-store').writeAccountToken(imageServer.baseUrl, 'token-B');
 
       await localizeImageRefs({ taskId: 'C1013', prompt, taskCommentsBlock: '', projectRoot });
 
@@ -219,7 +216,7 @@ test('localizeImageRefs warns and leaves refs unlocalized when credentials are m
 
       assert.strictEqual(result.prompt, prompt);
       assert.ok(
-        warnings.some(line => line.includes('[image-attach]') && line.includes('API_TOKEN')),
+        warnings.some(line => line.includes('[image-attach]') && line.includes('No signed-in account token')),
         `expected a credentials-unavailable warning, got: ${JSON.stringify(warnings)}`
       );
     });

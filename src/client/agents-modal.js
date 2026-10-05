@@ -33,7 +33,8 @@ export function openAgentsModal({ onSaved } = {}) {
     initialFocus: '.setup-modal-close',
   });
   // Capture-phase + stopPropagation so this doesn't also trigger the underlying
-  // #settings-modal's own bubble-phase Escape listener (task-board.js initSettingsModal()).
+  // #settings-modal's own Escape listener (task-board.js initSettingsModal(), which also
+  // yields whenever its dialog-focus layer is not on top).
   _keyHandler = (e) => {
     if (e.key !== 'Escape') return;
     e.stopPropagation();

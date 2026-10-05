@@ -5276,6 +5276,18 @@
     background: var(--c-danger-bg);
   }
 
+  /* (TPT418) A lost session's Close only dismisses it locally — no process to terminate — so it
+     drops the danger treatment and reads as the same neutral control as Minimize, leaving the
+     recovery strip's Restart as the one emphasized action. */
+  .btn-terminate-terminal.btn-terminate-terminal--dismiss {
+    border-color: var(--c-border-input);
+    color: var(--c-text);
+  }
+  .btn-terminate-terminal.btn-terminate-terminal--dismiss:not(:disabled):hover {
+    background: var(--c-primary-lighter);
+    border-color: var(--c-primary);
+  }
+
   /* ── Terminal-header voice input (tt-audio-input) — transcript injects into the PTY ── */
   .terminal-voice-btn {
     width: var(--terminal-header-control-height);
@@ -6495,6 +6507,29 @@
 
   .preview-card.preview-card--outside {
     border-left: 2px solid var(--c-warning);
+  }
+
+  .card.preview-card.locked-target {
+    --card-bg: var(--c-bg-card);
+    background: var(--c-bg-card);
+    border-color: var(--c-border);
+  }
+  .card.preview-card.locked-target .card-title,
+  .card.preview-card.locked-target .card-desc,
+  .card.preview-card.locked-target .change-label {
+    color: var(--c-text-muted);
+  }
+  .preview-card .change-target--locked {
+    color: var(--c-warning);
+    background: var(--c-warning-bg);
+    border-radius: 3px;
+    padding: 0.1rem 0.4rem;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .card.preview-card.locked-target :disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   /* (TPT257) A `new` card proposed inside a subtask (split) chat — it will be saved as a
@@ -10567,17 +10602,22 @@ img.agent-picker-icon {
    that wants every row and column; the Edit form reads in a centred column inside it. The
    overlay starts at the left-nav rail's edge on every pane (TPT360 offsets, same as
    .terminal-overlay--task) so the rail's session rows stay live. A fresh overlay is rendered
-   with the rail class already on, so its `left` transition only runs on a rail collapse. */
+   with the rail class already on, so its `left` transition only runs on a rail collapse.
+   (TPT499) The Edit pane fits its content, capped at that frame; Terminal and Chat fill it. The
+   overlay is top-anchored and the margin puts the panel's top edge where the centred full frame
+   would sit, so the header, tabs and ✕ still never move on a pane switch — only the bottom edge. */
 .task-edit-panel--tabs {
-  max-width: min(1400px, 100%); height: min(900px, calc(100vh - 40px)); max-height: none;
+  max-width: min(1400px, 100%); height: auto; max-height: min(900px, calc(100vh - 40px));
+  margin-top: max(0px, calc((100vh - 940px) / 2));
 }
+.task-edit-panel--tabs:not([data-pane="edit"]) { height: min(900px, calc(100vh - 40px)); }
 .task-edit-panel--tabs .modal-scroll-body,
 .task-edit-panel--tabs .modal-context-btns {
   padding-left: max(18px, calc((100% - 960px) / 2));
   padding-right: max(18px, calc((100% - 960px) / 2));
 }
 .task-edit-overlay--rail {
-  left: 200px; padding: 20px;
+  left: 200px; padding: 20px; align-items: flex-start;
   transition: left 0.2s ease;
 }
 body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
@@ -10723,18 +10763,40 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   .task-modal-tab-dot--attention { animation: none; }
 }
 
-/* (TPT54) Panel is a flex column: .modal-top-bar and .modal-context-btns are
-   flex-shrink:0 pinned siblings, everything else scrolls inside .modal-scroll-body —
-   see ai/architecture/tt-task-edit-modal.md § Panel Scroll Layout. */
+/* (TPT54/TPT499) Panel is a flex column: .modal-top-bar and .modal-context-btns are
+   flex-shrink:0 pinned siblings. .modal-scroll-body is a flex column too, sized to its content
+   until the panel's cap; past the cap only the description (General) or the Comments /
+   Notifications panel shrinks and scrolls, so title, tabs and field groups stay in view. Its
+   own overflow-y:auto is a fallback for a viewport too short for even that — see
+   ai/architecture/tt-task-edit-modal.md § Panel Scroll Layout. */
 .modal-top-bar {
   display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap;
   gap: 8px; margin-bottom: 0; flex-shrink: 0;
   padding: 14px 18px 10px;
 }
 .modal-scroll-body {
+  display: flex; flex-direction: column;
   flex: 1 1 auto; min-height: 0; overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0 18px 14px;
+}
+.modal-scroll-body > .modal-desc-display {
+  flex: 1 1 auto; min-height: 6rem; max-height: none;
+}
+/* The description editor: attachAudioRecorder() wraps the textarea, so the wrap takes the
+   display's flex role and the textarea fills it (beats .audio-rec-wrap textarea's 0 0 auto). */
+.modal-desc-edit-wrap,
+.modal-scroll-body > .modal-desc-textarea {
+  flex: 1 1 auto; min-height: 6rem;
+}
+.modal-desc-edit-wrap > .modal-desc-textarea {
+  flex: 1 1 auto; min-height: 0;
+}
+.modal-scroll-body .modal-desc-textarea { max-height: none; resize: none; }
+.modal-scroll-body > .modal-tab-panel[data-tab="comments"],
+.modal-scroll-body > .modal-tab-panel[data-tab="notifications"] {
+  flex: 1 1 auto; min-height: 8rem; overflow-y: auto;
+  overscroll-behavior: contain;
 }
 /* (TPT307) Key badge + status pill sit together on the left of the header, the way a card's
    id-badge and status pill do; Reset/Save are the only primary actions on the right. */
@@ -10747,9 +10809,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
    status pill, Reset/Save, "Open live task", footer pills — so they share top/bottom edges on one
    centre line. Mirrors the card's --card-ctrl-h (TPT277/TPT279), which is scoped to .card. */
 .modal-top-bar, .modal-context-btns { --modal-ctrl-h: 32px; }
-.modal-scroll-body > .modal-tabs {
-  position: sticky; top: 0; z-index: 1; background: var(--c-bg);
-}
+.modal-scroll-body > .modal-tabs { flex-shrink: 0; }
 .modal-task-id {
   display: inline-flex; align-items: center; box-sizing: border-box;
   height: var(--modal-ctrl-h); padding: 0 12px; border-radius: 6px;
@@ -10838,7 +10898,15 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   gap: 1rem;
   margin-bottom: 12px;
 }
-.diff-col { display: flex; flex-direction: column; min-width: 0; }
+.diff-col { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+/* (TPT499) In the modal's flex body the two-column header is the part that gives way when the
+   panel hits its cap: its one row is sized to the space left, and each column's description
+   scrolls inside it. */
+.modal-scroll-body > .diff-header-row {
+  flex: 1 1 auto; min-height: 6rem;
+  grid-template-rows: minmax(0, 1fr);
+}
+.diff-col > .modal-desc-display { flex: 1 1 auto; min-height: 0; }
 .diff-col-label {
   display: flex; align-items: center; gap: 6px;
   font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
@@ -10888,6 +10956,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 
 @media (max-width: 768px) {
   .diff-header-row { grid-template-columns: 1fr; }
+  .modal-scroll-body > .diff-header-row { grid-template-rows: none; grid-auto-rows: minmax(0, 1fr); }
   .task-edit-panel--diff { max-width: 96vw; }
 }
 
@@ -11310,7 +11379,8 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   .task-edit-overlay { padding: 10px; }
   .task-edit-panel { max-width: 100%; max-height: calc(100vh - 20px); max-height: calc(100dvh - 20px); }
   .task-edit-overlay--rail { padding: 10px; }
-  .task-edit-panel--tabs { max-width: 100%; height: calc(100vh - 20px); height: calc(100dvh - 20px); max-height: none; }
+  .task-edit-panel--tabs { max-width: 100%; max-height: calc(100vh - 20px); max-height: calc(100dvh - 20px); margin-top: 0; }
+  .task-edit-panel--tabs:not([data-pane="edit"]) { height: calc(100vh - 20px); height: calc(100dvh - 20px); }
   .task-edit-panel .modal-field-group { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 480px) {
@@ -12234,6 +12304,13 @@ mark.mention--agent {
 #settings-modal.open {
   display: flex;
 }
+/* (TPT508) Opened over the task workspace: above .task-edit-overlay (3000, 3150 with
+   body.task-chat-open) and its portaled typeahead dropdowns (3200), below the dialogs Settings
+   opens itself (.agents-modal 3300, action confirms 3400). Only toggled while a workspace is
+   open, so the default stacking is unchanged. */
+#settings-modal.settings-modal--over-modal {
+  z-index: 3250;
+}
 .settings-panel {
   position: relative;
   background: var(--c-bg-card);
@@ -12910,25 +12987,121 @@ input.sma-cb, input.sma-radio {
   .merge-branch-head > span:nth-child(n+4), .merge-branch-row > .merge-ab, .merge-branch-row > .merge-wt, .merge-branch-row > .merge-conf { display: none; }
 }
 
-/* Lost terminal sessions remain reachable without a live/attention indicator. */
-.card.session-lost,
+/* Lost terminal sessions remain reachable without a live/attention indicator (TPT418).
+   Card: a 2px muted ring, the same box-shadow geometry as .card.needs-attention, no dot; a
+   selected lost card keeps the green selection ring inside the grey one. Rail row: a dashed
+   muted border — it reuses the row's reserved transparent 1px border, so nothing shifts — and
+   no box-shadow, so .active's inset bar survives. Dashed grey reads "disconnected", distinct
+   from attention (peach + pulse), completed (faint text + green tick) and paused (dim icon). */
+.card.session-lost { box-shadow: 0 0 0 2px color-mix(in srgb, var(--c-text-muted) 75%, transparent); }
+.card.selected.session-lost {
+  box-shadow: 0 0 0 2px #22c55e, 0 0 0 4px color-mix(in srgb, var(--c-text-muted) 75%, transparent);
+}
 .active-session-item.session-lost {
+  border-style: dashed;
   border-color: var(--c-text-muted);
-  box-shadow: 0 0 0 1px var(--c-text-muted);
+}
+.active-session-item.session-lost:not(.session-completed) .active-session-icon > svg {
+  filter: grayscale(0.85);
+  opacity: 0.85;
 }
 .card.session-lost::before,
 .active-session-item.session-lost .active-session-icon::after { display: none; }
+
+/* Lost-session recovery strip under the terminal header: glyph · title · reason · time, and
+   Restart as the one primary action. Same chrome as .terminal-watchdog-actions below. */
 .terminal-session-lost {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: 0.75rem 1rem;
+  gap: 0.7rem;
+  min-width: 0;
+  padding: 6px 16px; /* inline padding tracks .terminal-header's, so glyph and Restart line up */
   color: var(--c-text);
   background: var(--c-bg-card);
   border-bottom: 1px solid var(--c-border);
+  box-shadow: inset 3px 0 0 var(--c-text-muted);
+  font-size: 0.8rem;
+  line-height: 1.35;
 }
-.terminal-session-lost button { flex-shrink: 0; }
+.terminal-session-lost[data-state="failed"] { box-shadow: inset 3px 0 0 var(--c-danger); }
+.terminal-session-lost-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: var(--c-text-muted);
+  background: color-mix(in srgb, var(--c-text-muted) 14%, transparent);
+}
+.terminal-session-lost[data-state="failed"] .terminal-session-lost-icon {
+  color: var(--c-danger);
+  background: var(--c-danger-bg);
+}
+.terminal-session-lost-text {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.terminal-session-lost-title { flex-shrink: 0; font-weight: 600; white-space: nowrap; }
+.terminal-session-lost-meta {
+  display: flex;
+  gap: 0.4rem;
+  min-width: 0;
+  color: var(--c-text-muted);
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
+.terminal-session-lost-reason { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.terminal-session-lost[data-state="failed"] .terminal-session-lost-reason { color: var(--c-danger); }
+.terminal-session-lost-sep { flex-shrink: 0; opacity: 0.6; }
+.terminal-session-lost-time { flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.btn-restart-session {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  flex-shrink: 0;
+  min-height: 32px;
+  min-width: 6.5rem;
+  padding: 0 0.85rem;
+  border: 1px solid var(--c-primary);
+  border-radius: 6px;
+  background: var(--c-primary);
+  color: var(--c-on-primary);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color .12s, border-color .12s, transform .06s;
+}
+.btn-restart-session:not(:disabled):hover { background: var(--c-primary-hover); border-color: var(--c-primary-hover); }
+.btn-restart-session:not(:disabled):active { transform: translateY(1px); }
+.btn-restart-session:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+.btn-restart-session:disabled { cursor: progress; opacity: 0.8; }
+.btn-restart-session-icon { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; }
+.task-modal-pane--terminal .terminal-session-lost { padding-inline: 18px; }
+@media (max-width: 480px) {
+  .terminal-session-lost,
+  .task-modal-pane--terminal .terminal-session-lost { padding-inline: 12px; }
+  .terminal-overlay--task .terminal-session-lost { padding-inline: 6px; }
+}
+/* Narrow: title over meta, and meta stacks reason over time so the reason keeps a full line;
+   the strip wraps, dropping Restart to its own right-aligned row before the text gets cramped. */
+@media (max-width: 560px) {
+  .terminal-session-lost { flex-wrap: wrap; row-gap: 0.4rem; }
+  .terminal-session-lost-text { flex: 1 1 9rem; flex-direction: column; align-items: stretch; gap: 0.1rem; overflow: hidden; }
+  .terminal-session-lost-meta { flex-direction: column; gap: 0; }
+  .terminal-session-lost-sep { display: none; }
+  .btn-restart-session { min-width: 0; margin-left: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn-restart-session { transition: none; }
+}
 /* Compact paused controls leave terminal output visible. */
 .terminal-watchdog-actions {
   display: flex;

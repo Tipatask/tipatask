@@ -34,6 +34,13 @@ const TASK_CHAT_LOCAL_DENIED = Object.freeze(['push_knowledge', 'pull_knowledge'
 
 const PI_TASK_API_TOOL = 'tipatask_api';
 
+const CODEX_OBJECTIVE_PROFILE = Object.freeze({
+  sandbox: 'read-only', mcpServers: [REMOTE_MCP, LOCAL_MCP],
+  remoteDisabledTools: ['create_task', 'update_task', 'delete_task', 'create_task_comment',
+    'create_system_tag', 'ensure_project_tag', 'purge_stale_reservations'],
+  localEnabledTools: TASK_CHAT_LOCAL_TOOLS,
+});
+
 const PROFILES = Object.freeze({
   [TASK_CHAT]: Object.freeze({
     claude: Object.freeze({
@@ -63,7 +70,7 @@ const PROFILES = Object.freeze({
   }),
 });
 
-// Providers that can enforce a profile at all. Gemini runs `--yolo` with no tool restriction.
+// Providers that can enforce a profile at all. Gemini is restricted to objective reading and has no task-mutation transport.
 const PROFILE_PROVIDERS = Object.freeze(['claude', 'codex', 'pi']);
 
 function toolProfileFor(session, provider) {
@@ -82,8 +89,8 @@ function tomlStringArray(values) {
 
 // Codex has no allow/deny flags: the fence is `-c key=value` config overrides, which both
 // `codex exec` and `codex exec resume` accept. `otherMcpServers` are the remaining servers in
-// the project's .codex/config.toml (browser presets, servers inherited from ~/.codex) — each is
-// switched off for the turn. A name a bare TOML key cannot spell is skipped, never guessed at.
+// the project's .codex/config.toml for legacy bare-key callers. Real headless spawns
+// replace the complete MCP map with buildScopedCodexMcpOverride().
 function codexProfileConfigArgs(profile, { resume = false, otherMcpServers = [] } = {}) {
   if (!profile) return [];
   const overrides = [];
@@ -92,8 +99,8 @@ function codexProfileConfigArgs(profile, { resume = false, otherMcpServers = [] 
   overrides.push(`mcp_servers.${LOCAL_MCP}.enabled_tools=${tomlStringArray(profile.localEnabledTools)}`);
   for (const name of otherMcpServers) {
     if (profile.mcpServers.includes(name)) continue;
-    if (!/^[A-Za-z0-9_-]+$/.test(name)) continue;
-    overrides.push(`mcp_servers.${name}.enabled=false`);
+    // Legacy bare-key callers only; real spawns replace the whole MCP map.
+    if (/^[A-Za-z0-9_-]+$/.test(name)) overrides.push(`mcp_servers.${name}.enabled=false`);
   }
   return overrides.flatMap(o => ['-c', o]);
 }
@@ -103,6 +110,7 @@ module.exports = {
   PROFILES,
   PROFILE_PROVIDERS,
   PI_TASK_API_TOOL,
+  CODEX_OBJECTIVE_PROFILE,
   toolProfileFor,
   providerSupportsProfile,
   codexProfileConfigArgs,

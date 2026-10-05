@@ -14,13 +14,14 @@ function applyTheme(theme) {
   }
 }
 
-// Fixed-height page: header, the five newest cards, centered Show More. Never scrolls — the
-// full list opens in the newest notification's project window (main's show-more action).
+// Fixed-height page: header with Hide (TPT505 — never Clear All here), the five newest cards,
+// and a footer with the "Show" on-top checkbox and centered Show More. Never scrolls — the full
+// list opens in the newest notification's project window (main's show-more action).
 export function renderDesktopPage(state) {
   const entries = Array.isArray(state) ? state : (state?.entries || []);
   applyTheme(Array.isArray(state) ? null : state?.theme);
   if (entries.length) setLocale(entries[0].locale);
-  renderNotificationPage(document.body, entries, act);
+  renderNotificationPage(document.body, entries, act, { headerAction: 'hide', onTopToggle: true });
 }
 
 window.desktopNotifications.onState(renderDesktopPage);

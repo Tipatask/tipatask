@@ -24,7 +24,7 @@ const { prewarmArchCache } = require('./arch-cache-prewarm');
 const { addTagsForTask } = require('./tag-cache');
 const { getTaskTagBundleFromSession, getStaticBundleStats } = require('./static-context');
 const { buildTurnPrompt, buildNudgeMessage } = require('./providers/transcript');
-const { fetchStatusContext } = require('./status-roles');
+const { fetchStatusContext, isLockedTargetStatus } = require('./status-roles');
 const { isTaskKeyLike } = require('./task-key-format');
 const { clearAllProviderSessionIds } = require('./providers/registry');
 const { toolProfileFor } = require('./providers/tool-profiles');
@@ -154,6 +154,10 @@ const OBJECTIVE_DISALLOWED_TOOLS = [
   'mcp__tipatask__update_task', 'mcp__tipatask__create_task',
   'mcp__tipatask__delete_task', 'mcp__tipatask__create_task_comment',
   'mcp__tipatask__create_system_tag',
+  'mcp__tipatask__ensure_project_tag', 'mcp__tipatask__purge_stale_reservations',
+  'mcp__tipatask-local__push_knowledge', 'mcp__tipatask-local__pull_knowledge',
+  'mcp__tipatask-local__git_worktree_status', 'mcp__tipatask-local__complete_task',
+  'Agent', 'Task', 'MultiEdit',
 ].join(',');
 
 const PERFORMANCE_SUGGESTION_TAG = 'tt-performance-suggestions';
@@ -176,7 +180,7 @@ function normalizeEfficiencySuggestionCard(card, startName = 'pending') {
 }
 
 // `startName` — see normalizeEfficiencySuggestionCard() above for the same contract.
-function normalizeProposals(parsed, startName = 'pending') {
+function normalizeProposals(parsed, startName = 'pending', context) {
   if (!parsed) return null;
   if (!parsed.changes && parsed.tasks && Array.isArray(parsed.tasks)) {
     parsed.changes = parsed.tasks.map(t =>
@@ -201,6 +205,15 @@ function normalizeProposals(parsed, startName = 'pending') {
       }
       if (c.task.description) c.task.description = c.task.description.replace(/(?<!\\)~/g, '\\~');
     }
+    if (context) {
+      parsed.changes = parsed.changes.filter(change => {
+        if (change.type !== 'modified') return true;
+        const target = context.tasks?.get(change.task?.id);
+        if (target && !isLockedTargetStatus(target.status, context.roles)) return true;
+        console.warn(`[objective] Dropping modified proposal for ${change.task?.id}: ${target ? `locked status ${target.status}` : 'target unavailable'}`);
+        return false;
+      });
+    }
   }
   return parsed;
 }
@@ -211,7 +224,7 @@ function tryEmitTaskCards(session) {
 
   for (let i = blocks.length - 1; i >= 0; i--) {
     try {
-      const parsed = normalizeProposals(JSON.parse(blocks[i][1]), sessionStartName(session));
+      const parsed = normalizeProposals(JSON.parse(blocks[i][1]), sessionStartName(session), session.type === 'objective' ? (session._proposalContext || { tasks: null }) : undefined);
       if (parsed.changes && Array.isArray(parsed.changes)) {
         const cards = parsed.changes;
         const filesAddressed = parsed.files_addressed || [];
@@ -367,6 +380,10 @@ function buildObjectiveArgs(session) {
     args.push('--append-system-prompt', session._rehashDirective);
   }
   if (session.claudeSessionId) args.push('--resume', session.claudeSessionId);
+  const scopedMcp = writeScopedMcpConfig({ projectRoot: session.projectPath || config.PROJECT_ROOT,
+    userDataRoot: config.USER_DATA_ROOT, servers: ['tipatask', 'tipatask-local'], label: 'objective' });
+  // An empty strict config still prevents discovering arbitrary global servers.
+  args.push('--mcp-config', scopedMcp || '{"mcpServers":{}}', '--strict-mcp-config');
   return args;
 }
 
@@ -397,7 +414,7 @@ function prewarmObjectiveCold(projectRoot) {
   const projectExtras = sharedProjectEnvExtras(root);
   const projectId = projectExtras.API_PROJECT_ID || config.API_PROJECT_ID;
   if (projectId) prewarmArchCache({ projectId, projectRoot: root });
-  const args = buildObjectiveArgs({ claudeSessionId: null, systemPrompt: null });
+  const args = buildObjectiveArgs({ claudeSessionId: null, systemPrompt: null, projectPath: root });
   const turnId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
   const env = config.OBJECTIVE_DEBUG_STARTUP
     ? augmentPathEnv({ TERM: 'dumb', DEBUG: '*', TIPATASK_TURN_ID: turnId, ...projectExtras })
@@ -981,7 +998,7 @@ function spawnObjectiveTurn(session, taskId) {
     // Only the profile's MCP servers exist for this turn — no other project or user-level
     // server is loaded. Without a derived file (no .mcp.json) the tool lists are the fence.
     const scopedMcp = writeScopedMcpConfig({ projectRoot: cwd, userDataRoot: config.USER_DATA_ROOT, servers: profile.mcpServers, label: session.toolProfile });
-    if (scopedMcp) args.push('--mcp-config', scopedMcp, '--strict-mcp-config');
+    args.push('--mcp-config', scopedMcp || '{"mcpServers":{}}', '--strict-mcp-config');
   }
 
   // Try to adopt a pre-warmed proc (eliminates proc_startup latency on follow-up and first turns)
@@ -1870,7 +1887,7 @@ async function spawnEfficiencyAnalysis(session, totalMs) {
         try { const outer = JSON.parse(text); if (outer.result) text = outer.result; } catch {}
         const block = text.match(/```json\s*([\s\S]*?)```/i);
         const jsonStr = block ? block[1] : text;
-        const parsed = normalizeProposals(JSON.parse(jsonStr), sessionStartName(session));
+        const parsed = normalizeProposals(JSON.parse(jsonStr), sessionStartName(session), session.type === 'objective' ? (session._proposalContext || { tasks: null }) : undefined);
         const cards = (parsed?.changes || []).map(c => normalizeEfficiencySuggestionCard({ ...c, _efficiencyHint: true }, sessionStartName(session)));
         resolve(cards);
       } catch {

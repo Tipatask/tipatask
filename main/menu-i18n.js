@@ -49,11 +49,9 @@ const en = {
   'menu.learnMore': 'Learn More',
   'menu.about': 'About TipΔTask',
   'menu.thirdPartyLicenses': 'Third-Party Licenses',
-  // (TPT480) App-level settings: macOS app menu ("Settings"), Project menu elsewhere
-  // ("App Settings" — Project ▸ Settings… already opens project settings there).
-  'menu.appSettings': 'Settings',
-  'menu.appSettingsOther': 'App Settings',
-  'menu.notificationsOnTop': 'Show Notifications on Top of Other Apps',
+  // (TPT480/TPT505) View ▸ Notifications ▸ app-level "Show on Top" checkbox.
+  'menu.notifications': 'Notifications',
+  'menu.notificationsOnTop': 'Show on Top of Other Apps',
 
   'about.version': 'Version',
   'about.credit': 'Includes Pi Coding Agent (MIT License)',
@@ -104,9 +102,8 @@ const uk = {
   'menu.learnMore': 'Дізнатися більше',
   'menu.about': 'Про TipΔTask',
   'menu.thirdPartyLicenses': 'Ліцензії третіх сторін',
-  'menu.appSettings': 'Налаштування',
-  'menu.appSettingsOther': 'Налаштування програми',
-  'menu.notificationsOnTop': 'Показувати сповіщення поверх інших програм',
+  'menu.notifications': 'Сповіщення',
+  'menu.notificationsOnTop': 'Показувати поверх інших програм',
 
   'about.version': 'Версія',
   'about.credit': 'Включає Pi Coding Agent (ліцензія MIT)',

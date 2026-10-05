@@ -154,7 +154,7 @@ test('offline sync refreshes without an agent list and keeps credentials isolate
   assert.match(read(root, 'AGENTS.md'), /Tipatask/);
   assert.equal(read(root, '.tipatask/config.json'), before);
   assert.equal(JSON.parse(read(root, '.mcp.json')).mcpServers['tipatask-local'].env.TIPATASK_PROJECT_ROOT, root);
-  assert.equal(JSON.parse(read(root, '.claude/settings.local.json')).env.API_TOKEN, 'selected-secret');
+  assert.equal(JSON.parse(read(root, '.claude/settings.local.json')).env.API_TOKEN, '');
   const codex = read(root, '.codex/config.toml');
   assert.equal(toml.parse(codex).mcp_servers.tipatask.url, 'https://selected.test/api/projects/78/mcp');
   assert.doesNotMatch(codex, /selected-secret|pi-secret/);
@@ -205,7 +205,8 @@ test('refresh rotates and clears Claude credentials while preserving unrelated s
     writeProjectConfig(root, { API_BASE_URL: 'https://selected.test', API_PROJECT_ID: '78', API_TOKEN: token });
     writeProjectClaudeMcpApproval(root);
     const env = JSON.parse(read(root, '.claude/settings.local.json')).env;
-    assert.equal(env.API_TOKEN, token);
+    assert.equal(env.API_TOKEN, '');
+    assert.equal(readAccount('https://selected.test')?.token || '', token);
     assert.equal(env.CUSTOM, 'keep');
   }
 });

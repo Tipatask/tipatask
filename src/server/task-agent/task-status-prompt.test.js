@@ -38,7 +38,7 @@ for (const Agent of [ClaudeAgent, CodexAgent, PiAgent]) {
     });
     taskStatus(prompt);
     assert.match(prompt, /shipped/);
-    assert.doesNotMatch(prompt, /\bcompleted\b|\bon_fire\b/);
+    assert.doesNotMatch(prompt.replaceAll('completed:true', ''), /\bcompleted\b|\bon_fire\b/);
   });
 
   test(`${id}: SIMPLE_MODE still returns only the task text`, () => {

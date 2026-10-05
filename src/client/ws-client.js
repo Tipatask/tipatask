@@ -1,5 +1,18 @@
 // ── WebSocket shared helpers ──
 
+// One IPC bridge per renderer. Socket owners subscribe independently, including
+// retained terminals whose viewport listeners are detached while minimized.
+export function onSystemResume(cb) {
+  document.addEventListener('tiptask:system-resume', cb);
+  return () => document.removeEventListener('tiptask:system-resume', cb);
+}
+
+if (typeof window !== 'undefined') {
+  window.electronAPI?.onSystemResume?.(() => {
+    document.dispatchEvent(new Event('tiptask:system-resume'));
+  });
+}
+
 export function buildWsUrl(taskId, extraParams) {
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   let url = `${wsProto}//${location.host}/?taskId=${encodeURIComponent(taskId)}`;

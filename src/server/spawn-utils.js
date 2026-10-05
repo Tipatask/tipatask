@@ -468,19 +468,22 @@ function resolveAttentionTerminalBell(projectRoot) {
   return true;
 }
 
-// Per-project env overrides for agent spawns. Given an absolute project dir,
-// returns { TIPATASK_PROJECT_ROOT, ...per-project API creds } read from that
-// project's .tipatask/config.json. These override the forked server's global
-// process.env (which carries the startup/global project) — see config.js
-// precedence: env > project config.json. Returns {} when projectPath is falsy
-// (browser/single-project mode) so spawn env is unchanged. Single source of
-// truth shared by the terminal/coding agents and the objective-chat path.
+// Per-project spawn environment: selected target, live account-store token, runtime
+// tool paths and writable user-data location. Empty values clear inherited credentials.
+// A missing explicit path resolves the active project before reading configuration.
+// Shared by terminal agents and objective/task-chat providers.
 function projectEnvExtras(projectPath) {
-  if (!projectPath) return {};
+  if (!projectPath) projectPath = require('./project-root').resolveProjectRoot();
   const { readProjectConfig, CONFIG_FIELDS, piDefaultEntry, piKeyEnvVars } = require('./project-config');
   let cfg;
   try { cfg = readProjectConfig(projectPath); } catch { cfg = null; }
-  const extras = { TIPATASK_PROJECT_ROOT: projectPath };
+  const extras = {
+    TIPATASK_PROJECT_ROOT: projectPath,
+    TIPATASK_USER_DATA: require('./account-store').userDataRoot(),
+    TIPATASK_TOOL_EXEC: process.execPath,
+    TIPATASK_TOOL_SCRIPT: path.join(__dirname, '../cli/task-tools.js'),
+    API_BASE_URL: '', API_PROJECT_ID: '', API_TOKEN: '', TIPATASK_API_TOKEN: '',
+  };
   if (cfg) {
     for (const k of CONFIG_FIELDS) {
       if (k !== 'projectName' && cfg[k] != null && cfg[k] !== '') extras[k] = String(cfg[k]);
@@ -490,6 +493,8 @@ function projectEnvExtras(projectPath) {
     let account = null;
     try { account = require('./account-store').readAccount(cfg.API_BASE_URL); } catch { /* unreadable store: no token */ }
     if (account) extras.API_TOKEN = account.token;
+    try { require('./account-store').assertTokenProject(extras.API_TOKEN, extras.API_PROJECT_ID); }
+    catch { extras.API_TOKEN = ''; }
     // C1121 — PI_MODELS (array of {model,apiKey} rows) is now the sole source for
     // Pi's OpenRouter key; the flat OPENROUTER_API_KEY config.json field the loop above
     // reads is legacy-only (pre-C1121 projects). Row 0 wins when both are present — a

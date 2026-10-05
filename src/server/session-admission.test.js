@@ -72,6 +72,30 @@ test('rapid Play All reserves synchronously, spaces starts and never exceeds eig
   assert.deepEqual(a.started, Array.from({ length: 8 }, (_, n) => `T${n}`));
 });
 
+for (const ceiling of [6, 8, 12]) test(`replay ${ceiling} ordinary slots across independent registries and projects`, async t => {
+  const h = harness(t, { config: { AGENT_ADMISSION_CEILING: ceiling }, projectConfigs: {
+    '/a': { AGENT_ADMISSION_WORKLOAD_CLASS: 'ordinary' }, '/b': { AGENT_ADMISSION_WORKLOAD_CLASS: 'ordinary' },
+  } });
+  const a = h.instance(1000), b = h.instance(2000); await h.warm();
+  for (let n = 0; n < ceiling + 4; n++) (n % 2 ? b : a).request(`R${n}`, n % 2 ? '/b' : '/a');
+  for (let at = 65000; at <= 250000; at += 5000) {
+    await h.advance(at);
+    assert.ok(a.queue.countRunning() + b.queue.countRunning() <= ceiling);
+  }
+  assert.equal(a.started.length + b.started.length, ceiling);
+  assert.equal(a.queue.size() + b.queue.size(), 4);
+  assert.equal(b.admission.snapshot().reservedBytes, ceiling * 2 * GiB);
+});
+
+test('twelve-slot ceiling does not promise twelve unknown unobserved launches', async t => {
+  const h = harness(t, { config: { AGENT_ADMISSION_CEILING: 12 } });
+  const a = h.instance(1000); await h.warm();
+  for (let n = 0; n < 12; n++) a.request(`R${n}`);
+  for (let at = 65000; at <= 250000; at += 5000) await h.advance(at);
+  assert.equal(a.started.length, 8); // 40 GiB proxy cannot cover 6 + 1 + 9 * 4 GiB.
+  assert.equal(a.queue.snapshot().queued[0].reason, 'headroom');
+});
+
 test('different watchdog RSS budgets cannot change shared ceiling; lower project cap does not block others', async t => {
   const h = harness(t, { mode: 'static', projectConfigs: {
     '/a': { AGENT_LIMITS_MAX_TREE_RSS_MB: 128, AGENT_LIMITS_MAX_CONCURRENT_SESSIONS: 1 },

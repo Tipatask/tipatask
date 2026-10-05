@@ -38,7 +38,9 @@ function validateDraftRelationship(options) {
 }
 
 function hashProject(projectPath) {
-  return crypto.createHash('md5').update(String(projectPath)).digest('hex').slice(0, 8);
+  const identity = require('./api-credentials').projectContextIdentity(projectPath);
+  // Do not guess an owner for legacy path-only drafts after configuration.
+  return crypto.createHash('md5').update(String(projectPath) + (identity ? '\0' + identity : '')).digest('hex').slice(0, identity ? 16 : 8);
 }
 
 function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROOT } = {}) {
@@ -115,8 +117,8 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
   }
 
   async function readChatDraft(projectPath) {
+    const filePath = chatDraftPath(projectPath);
     return forProject(projectPath, async () => {
-      const filePath = chatDraftPath(projectPath);
       await cleanupStaleTemps(filePath);
       return readDraftFile(filePath);
     });
@@ -124,8 +126,8 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
 
   async function writeChatDraft(messages, taskId, options = {}, projectPath) {
     validateDraftRelationship(options);
+    const filePath = chatDraftPath(projectPath);
     return forProject(projectPath, async () => {
-      const filePath = chatDraftPath(projectPath);
       await cleanupStaleTemps(filePath);
       const historyWindowStart = Math.max(1, Number(options.historyWindowStart) || 1);
       let mergedMessages = Array.isArray(messages) ? messages : [];
@@ -163,8 +165,8 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
   }
 
   async function deleteChatDraft(projectPath) {
+    const filePath = chatDraftPath(projectPath);
     return forProject(projectPath, async () => {
-      const filePath = chatDraftPath(projectPath);
       await cleanupStaleTemps(filePath);
       try { await fsOps.unlink(filePath); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -172,8 +174,8 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
   }
 
   async function readChatState(projectPath) {
+    const filePath = chatStatePath(projectPath);
     return forProject(projectPath, async () => {
-      const filePath = chatStatePath(projectPath);
       await cleanupStaleTemps(filePath);
       try { return await fsOps.readFile(filePath, 'utf8'); }
       catch (error) { if (error.code === 'ENOENT') return null; throw error; }
@@ -181,16 +183,16 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
   }
 
   async function writeChatState(body, projectPath) {
+    const filePath = chatStatePath(projectPath);
     return forProject(projectPath, async () => {
-      const filePath = chatStatePath(projectPath);
       await cleanupStaleTemps(filePath);
       await atomicWrite(filePath, body);
     });
   }
 
   async function deleteChatState(projectPath) {
+    const filePath = chatStatePath(projectPath);
     return forProject(projectPath, async () => {
-      const filePath = chatStatePath(projectPath);
       await cleanupStaleTemps(filePath);
       try { await fsOps.unlink(filePath); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }

@@ -98,7 +98,7 @@ function cleanRecord(r) {
   return out;
 }
 
-function createSessionMemoryTracker({ now = Date.now, historyFile = null } = {}) {
+function createSessionMemoryTracker({ now = Date.now, historyFile = null, onLifecycle = null } = {}) {
   const active = new Map();
   const records = new WeakMap();
   let history = [], storageStatus = historyFile ? 'ok' : 'memory-only';
@@ -139,6 +139,11 @@ function createSessionMemoryTracker({ now = Date.now, historyFile = null } = {})
     records.set(session, r);
     session._memoryRunId = r.id;
     active.set(session, r);
+    try { onLifecycle?.({ type: 'start', id: r.id, ...identity(session), startedAt: r.startedAt,
+      observedStart, pid: session.ptyPid || null,
+      queueMs: Number.isFinite(session._admittedAt) && Number.isFinite(session.queuedAt)
+        ? Math.max(0, session._admittedAt - session.queuedAt) : null,
+      startupMs: Number.isFinite(session._admittedAt) ? Math.max(0, r.startedAt - session._admittedAt) : null }); } catch { /* diagnostic only */ }
     return r;
   }
   function finalize(r, reason) {
@@ -148,6 +153,7 @@ function createSessionMemoryTracker({ now = Date.now, historyFile = null } = {})
       completeLifetime: reason === 'completed' && r.observedStart && r.sampleCount > 0 && !r.gap
         && !r.missingSamples && tailGap >= 0 && tailGap <= STALE_AFTER_MS });
     persist(record);
+    try { onLifecycle?.({ type: 'end', ...record }); } catch { /* diagnostic only */ }
     return record;
   }
   function end(session, reason = 'exited') {

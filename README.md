@@ -214,3 +214,24 @@ Matiienko and Apppixies (https://github.com/Tipatask/tipatask)"*.
 TipΔTask bundles the [Pi Coding Agent](https://github.com/earendil-works/pi) (MIT). Keep
 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) too — it credits every third-party
 package in the app, and is also under **Help ▸ Third-Party Licenses**.
+
+## Launching an agent from a shell
+
+Run the project-bound launcher using the Node version pinned by this checkout:
+
+```sh
+node /path/to/tipatask/src/cli/launch-agent.js codex --project-root /path/to/project
+```
+
+Replace `codex` with `claude` or `pi`. Refresh the agent harness in the Task App first;
+its local MCP registration records the runtime and account-store locations. A packaged
+install runs the same script inside `app.asar` with its Electron executable and
+`ELECTRON_RUN_AS_NODE=1`. The launcher supplies current credentials internally; do not
+copy tokens into commands, shell profiles, or tracked configuration. Gemini is supported
+only as a read-only objective-chat provider, not as a Task App terminal or task chat.
+
+Claude requires a CLI that supports `headersHelper`; reconnecting MCP rereads the account
+store. Codex reads bearer credentials from its launch environment, so restart it after
+changing accounts or renewing credentials. Global Codex configuration has no default
+Tipatask project: the launcher selects the project's `.codex` home. Pi has no MCP and
+uses the credential-safe `src/cli/task-tools.js` command described in its task prompt.

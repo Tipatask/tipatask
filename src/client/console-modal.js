@@ -5,7 +5,7 @@ import '@xterm/xterm/css/xterm.css';
 import state from './state.js';
 import { XTERM_THEME, MAX_DESC_LEN, CHAT_STATE_KEY, DRAFT_KEY_OBJECTIVE, LAST_PROMPT_KEY, modelLabel } from './constants.js';
 import { escapeAttr, projectHeader, fetchWithRetry, shortModelName, clearDraft } from './utils.js';
-import { buildWsUrl, startTerminalSession, terminateTaskSession } from './ws-client.js';
+import { buildWsUrl, startTerminalSession, terminateTaskSession, onSystemResume } from './ws-client.js';
 import { updateClaudeButtons, syncActiveSessionsNav } from './task-board.js';
 import { showActionConfirm } from './action-confirm.js';
 import { dismissNotification } from './notification-center.js';
@@ -64,10 +64,6 @@ const _HUMAN_AGENT_SVG = `<svg class="agent-logo" viewBox="0 0 24 24" width="20"
 const _PI_AGENT_SVG = `<svg class="agent-logo" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M4 7h16v2.2h-2.6l-.9 9.4a1.6 1.6 0 0 1-3.18-.16l.68-9.24H9.9l-.7 9.3a1.6 1.6 0 0 1-3.18-.18l.68-9.12H4V7z"/></svg>`;
 const _detachedCodexTerminals = new Map();
 
-function _wsCanStayAttached(ws) {
-  return ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING);
-}
-
 function _isCodexTerminal(terminal) {
   return terminal && (terminal.taskAgent === 'codex' || terminal.planApprovalCommand === null);
 }
@@ -75,6 +71,10 @@ function _isCodexTerminal(terminal) {
 function _canShowPlanReadyDialog(terminal) {
   return terminal && (terminal.taskAgent !== 'codex' || terminal.codexPlanReady === true);
 }
+
+// (TPT418) Lost-session strip glyphs: an unplugged connector, and the Restart arrow.
+const LOST_SESSION_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m19 5 3-3"/><path d="m2 22 3-3"/><path d="M6.3 20.3a2.4 2.4 0 0 0 3.4 0L12 18l-6-6-2.3 2.3a2.4 2.4 0 0 0 0 3.4Z"/><path d="M7.5 13.5 10 11"/><path d="M10.5 16.5 13 14"/><path d="m12 6 6 6 2.3-2.3a2.4 2.4 0 0 0 0-3.4l-2.6-2.6a2.4 2.4 0 0 0-3.4 0Z"/></svg>';
+const RESTART_SVG = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>';
 
 function _agentSelectorIcon(id) {
   if (id === 'claude') return _CLAUDE_AGENT_SVG;
@@ -480,34 +480,37 @@ export async function fetchActiveSessions() {
   } catch { /* ignore */ }
 }
 
-export function showClaudeConfirmModal(taskId, title, desc, taskStatus, opts = {}) {
-  const agentLabel = escapeAttr(state.taskAgentLabel || 'selected agent');
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-    <div class="modal">
-      <p>Task <strong>${escapeAttr(taskId)}</strong> is already completed. Start a new ${agentLabel} session anyway?</p>
-      <div class="modal-buttons">
-        <button class="btn-cancel">Cancel</button>
-        <button class="btn-confirm">Confirm</button>
-      </div>
-    </div>`;
-  document.body.appendChild(overlay);
+// Task ids with a completed-task start confirm on screen — a second Start/Restart for the same
+// task while one is open must not stack another dialog (and later a second session).
+const _completedStartConfirms = new Set();
 
-  overlay.querySelector('.btn-cancel').addEventListener('click', () => {
+// (TPT418) Goes through showActionConfirm() so the dialog registers its own dialog-focus.js
+// layer. A bare body-appended overlay opened over the task workspace (Restart on a lost
+// session) was made inert by the workspace's layer — visible, but Cancel/Confirm took no
+// clicks or focus. The --over-modal tier stacks it above .task-edit-overlay; the helper's
+// capture-phase Escape keeps template.html's Escape from also closing the workspace.
+export async function showClaudeConfirmModal(taskId, title, desc, taskStatus, opts = {}) {
+  if (_completedStartConfirms.has(taskId)) return false;
+  _completedStartConfirms.add(taskId);
+  let confirmed = false;
+  try {
+    confirmed = await showActionConfirm({
+      message: t('terminal.confirmCompletedStart', {
+        id: `<strong>${escapeAttr(taskId)}</strong>`,
+        agent: escapeAttr(state.taskAgentLabel || t('terminal.selectedAgent')),
+      }),
+      confirmLabel: t('btn.confirm'),
+      overlayClass: 'modal-overlay--over-modal',
+    });
+  } finally {
+    _completedStartConfirms.delete(taskId);
+  }
+  if (!confirmed) {
     state.pendingRestoreContext = null;
-    overlay.remove();
-  });
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) {
-      state.pendingRestoreContext = null;
-      overlay.remove();
-    }
-  });
-  overlay.querySelector('.btn-confirm').addEventListener('click', () => {
-    overlay.remove();
-    openTerminal(taskId, title, desc, taskStatus, opts);
-  });
+    return false;
+  }
+  openTerminal(taskId, title, desc, taskStatus, opts);
+  return true;
 }
 
 function buildTaskSessionPrompt(taskId, title, desc, opts = {}) {
@@ -627,7 +630,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   const detachedCodex = _detachedCodexTerminals.get(taskId);
-  if (detachedCodex && _isCodexTerminal(detachedCodex) && detachedCodex.processRunning && _wsCanStayAttached(detachedCodex.ws)) {
+  if (detachedCodex && _isCodexTerminal(detachedCodex) && detachedCodex.processRunning && !detachedCodex.disposed) {
     _markAttentionSeen(taskId); // (C1387) reattaching a detached Codex terminal also counts as seen
     const restoredContext = captureOpenContext();
     state.pendingRestoreContext = restoredContext;
@@ -640,7 +643,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   const knownLoss = state.lostSessions.get(taskId);
-  const isResume = opts.reconnectOnly || state.activeSessions.has(taskId) || state.exitedSessions.has(taskId);
+  let isResume = opts.reconnectOnly || state.activeSessions.has(taskId) || state.exitedSessions.has(taskId);
   // (TPT443) Read before the clear below wipes it: a watchdog-paused session shows its banner at
   // once instead of waiting for the terminal-state round-trip that confirms (or clears) it.
   const seedRunaway = state.attentionDetails.get(taskId);
@@ -778,6 +781,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   let firstResumeDataSeen = !isResume;
   let firstResumeDataWritten = !isResume;
   let codexResumeRedrawSent = !isResume;
+  let resumeRedrawTimer = 0;
   let pendingPlanReady = false;
   let terminalPlanApprovalCommand = isResume ? undefined : state.planApprovalCommand;
   let terminalPlanApprovalCommandKnown = !isResume;
@@ -823,7 +827,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // re-states it anyway (showing a pane, reattaching, a fresh socket).
   let lastSentSize = null;
   function sendResize({ force = false } = {}) {
-    if (!wsIsOpen()) return;
+    if (!wsIsOpen() || resumeRedrawTimer) return;
     const { cols, rows } = term;
     if (!force && lastSentSize && lastSentSize.cols === cols && lastSentSize.rows === rows) return;
     ws.send(JSON.stringify({ type: 'resize', cols, rows }));
@@ -899,10 +903,19 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
 
   function maybeSendCodexResumeRedraw() {
     if (!isResume || codexResumeRedrawSent || !firstResumeDataWritten) return;
-    if (!terminalPlanApprovalCommandKnown || terminalPlanApprovalCommand || !wsIsOpen()) return;
-    if (terminalPhase === 'planning' || terminalCodexPlanReady) return;
-    ws.send(JSON.stringify({ type: 'data', data: '\x0c' }));
+    if (!terminalPlanApprovalCommandKnown || terminalController.taskAgent !== 'codex' || !wsIsOpen()) return;
+    if (terminalDisposed || terminalClosing || !processRunning || !terminalHasSize()) return;
+    // Same-size resize is a kernel no-op. Wait until replay is parsed, then give
+    // Codex two actual size changes without injecting input into an approval dialog.
+    const socket = ws;
+    refreshTerminalViewport();
     codexResumeRedrawSent = true;
+    resumeRedrawTimer = setTimeout(() => {
+      resumeRedrawTimer = 0;
+      if (ws !== socket || terminalDisposed || !processRunning || !wsIsOpen()) return;
+      sendResize({ force: true });
+    }, 120);
+    socket.send(JSON.stringify({ type: 'resize', cols: Math.max(1, term.cols - 1), rows: term.rows }));
   }
 
   function showPlanReadyDialog() {
@@ -1035,51 +1048,107 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     if (added) scheduleTerminalRefresh({ send: true });
   }
 
-  function showLostSession(detail = {}) {
+  // (TPT418) Recovery strip under the terminal header: glyph · "Session lost" · reason · time,
+  // with Restart as the one primary action. `restarting` shows the in-flight state of a
+  // Restart (this xterm is the restarted one, waiting for terminal-state); `failed` carries
+  // the error of a restart that did not start, so the strip says why it is back.
+  function renderLostNotice(detail = {}, { restarting = false, failed = '' } = {}) {
+    let notice = overlay.querySelector('.terminal-session-lost');
+    if (!notice) {
+      notice = document.createElement('div');
+      notice.className = 'terminal-session-lost';
+      notice.setAttribute('role', 'status');
+      notice.innerHTML = `
+        <span class="terminal-session-lost-icon" aria-hidden="true">${LOST_SESSION_SVG}</span>
+        <span class="terminal-session-lost-text">
+          <strong class="terminal-session-lost-title"></strong>
+          <span class="terminal-session-lost-meta"><span class="terminal-session-lost-reason"></span><span class="terminal-session-lost-sep" aria-hidden="true">·</span><time class="terminal-session-lost-time"></time></span>
+        </span>
+        <button type="button" class="btn-restart-session"><span class="btn-restart-session-icon" aria-hidden="true"></span><span class="btn-restart-session-label"></span></button>`;
+      const restart = notice.querySelector('.btn-restart-session');
+      restart.addEventListener('click', async () => {
+        if (restart.disabled) return;
+        setRestartBusy(notice, true);
+        // Launch options only: this xterm's host hooks stay behind, so an embedded restart
+        // routes through openTaskWorkspace() — the workspace disposes this pane and tracks the
+        // replacement — instead of mounting into the pane with the old pane's onClosed.
+        const { host: _host, onClosed: _closed, onRequestClose: _close, onStatus: _status, ...launchOpts } = opts;
+        try {
+          await window.TipTask.taskCard.startTaskById(taskId, { ...launchOpts, restartLost: true });
+        } finally {
+          // Still on screen: nothing replaced this xterm (a declined completed-task confirm,
+          // a task fetch error), so the strip must be usable again.
+          if (notice.isConnected) setRestartBusy(notice, false);
+        }
+      });
+      overlay.querySelector('.terminal-header').after(notice);
+    }
+    const at = Date.parse(detail.at);
+    const reason = detail.reason || t('terminal.sessionMissing');
+    const time = Number.isFinite(at) ? new Date(at).toLocaleString() : t('terminal.timeUnknown');
+    const shownReason = failed ? t('terminal.restartFailed', { message: failed }) : reason;
+    notice.dataset.state = failed ? 'failed' : 'lost';
+    notice.setAttribute('aria-label', failed
+      ? `${t('terminal.sessionLostTitle')}: ${shownReason}`
+      : t('terminal.sessionLost', { reason, time }));
+    notice.querySelector('.terminal-session-lost-title').textContent = t('terminal.sessionLostTitle');
+    notice.querySelector('.terminal-session-lost-reason').textContent = shownReason;
+    const timeEl = notice.querySelector('.terminal-session-lost-time');
+    timeEl.textContent = time;
+    if (Number.isFinite(at)) timeEl.dateTime = new Date(at).toISOString();
+    else timeEl.removeAttribute('datetime');
+    notice.querySelector('.terminal-session-lost-meta').title = `${shownReason} · ${time}`;
+    setRestartBusy(notice, restarting);
+    return notice;
+  }
+
+  function setRestartBusy(notice, busy) {
+    const restart = notice.querySelector('.btn-restart-session');
+    restart.disabled = busy;
+    restart.toggleAttribute('aria-busy', busy);
+    notice.classList.toggle('terminal-session-lost--restarting', busy);
+    restart.querySelector('.btn-restart-session-icon').innerHTML = busy ? '<span class="session-spinner"></span>' : RESTART_SVG;
+    restart.querySelector('.btn-restart-session-label').textContent = t(busy ? 'terminal.restarting' : 'terminal.restart');
+  }
+
+  function showLostSession(detail = {}, { failed = '' } = {}) {
     processRunning = false;
     setCodexPlanReady(false);
     renderWatchdogActions(null);
     markSessionLost(taskId, detail);
     setStatus('disconnected', t('terminal.sessionLostTitle'));
     terminateBtn.textContent = t('btn.close');
+    terminateBtn.classList.add('btn-terminate-terminal--dismiss'); // (TPT418) nothing to kill: neutral, not danger
     removeMcpAuthDialog();
-    let notice = overlay.querySelector('.terminal-session-lost');
-    if (!notice) {
-      notice = document.createElement('div');
-      notice.className = 'terminal-session-lost';
-      notice.setAttribute('role', 'status');
-      const message = document.createElement('span');
-      const restart = document.createElement('button');
-      restart.type = 'button';
-      restart.className = 'btn-restart-session';
-      restart.textContent = t('terminal.restart');
-      restart.addEventListener('click', async () => {
-        if (restart.disabled) return;
-        restart.disabled = true;
-        try {
-          await window.TipTask.taskCard.startTaskById(taskId, { ...opts, restartLost: true });
-        } finally {
-          restart.disabled = false;
-        }
-      });
-      notice.append(message, restart);
-      overlay.querySelector('.terminal-header').after(notice);
-    }
-    const at = Date.parse(detail.at);
-    notice.querySelector('span').textContent = t('terminal.sessionLost', {
-      reason: detail.reason || t('terminal.sessionMissing'),
-      time: Number.isFinite(at) ? new Date(at).toLocaleString() : t('terminal.timeUnknown'),
-    });
+    renderLostNotice(detail, { failed });
     updateClaudeButtons();
     scheduleTerminalRefresh();
   }
 
-  function connectWebSocket() {
-    ws = new WebSocket(buildWsUrl(taskId, wsExtra));
+  function connectWebSocket({ resume = false } = {}) {
+    clearTimeout(resumeRedrawTimer);
+    resumeRedrawTimer = 0;
+    if (resume) {
+      isResume = true;
+      firstReplayCleared = false;
+      firstResumeDataSeen = false;
+      firstResumeDataWritten = false;
+      codexResumeRedrawSent = false;
+      pendingPlanReady = false;
+      terminalPlanApprovalCommandKnown = false;
+      pendingExitedReplayScroll = state.exitedSessions.has(taskId);
+    }
+    const previous = ws;
+    const extra = resume
+      ? buildTaskSessionWsExtra(taskId, title, desc, { ...opts, reconnectOnly: true })
+      : wsExtra;
+    const socket = new WebSocket(buildWsUrl(taskId, extra));
+    ws = socket;
     terminalController.ws = ws;
+    if (previous && (previous.readyState === WebSocket.OPEN || previous.readyState === WebSocket.CONNECTING)) previous.close();
 
     ws.onopen = () => {
-      if (terminalClosing) return;
+      if (ws !== socket || (terminalClosing && !terminalController.detached) || terminalDisposed) return;
       setStatus('', 'Connected');
       lastSentSize = null; // a new socket states the size once, whatever the last one heard
       fitAndSendResize();
@@ -1088,7 +1157,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       // still-open TUI prompt can be re-raised (not permanently deduped) if the user leaves
       // without answering — see the local _markAttentionSeen(taskId) call above (C1387) and
       // the server-side attention-seen handler (ws-handlers.js) for the full reasoning.
-      ws.send(JSON.stringify({ type: 'attention-seen' }));
+      if (!terminalController.detached && terminalController.visible) ws.send(JSON.stringify({ type: 'attention-seen' }));
       state.activeSessions.add(taskId);
       // (C1144) Fresh launch: known immediately from launch opts — no need to wait on a
       // /api/sessions refetch for the left-nav row's icon to be correct. (TPT413) Resume: a
@@ -1117,6 +1186,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
 
     let lastQueueNotice = null;
     ws.onmessage = (event) => {
+      if (ws !== socket || terminalDisposed) return;
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
 
@@ -1149,6 +1219,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         restartingLoss = false;
         processRunning = true;
         terminateBtn.textContent = t('btn.terminate');
+        terminateBtn.classList.remove('btn-terminate-terminal--dismiss');
         dismissLostSession(taskId);
         overlay.querySelector('.terminal-session-lost')?.remove();
         state.activeSessions.add(taskId);
@@ -1181,9 +1252,10 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         if (isFirstResumeData) firstResumeDataSeen = true;
         if (!firstReplayCleared) {
           firstReplayCleared = true;
-          term.clear();
+          term.reset();
         }
         outputWriter.write(msg.data, () => {
+          if (ws !== socket || terminalDisposed) return;
           // (TPT439) Finished-session reattach: the replay lands in one frame, and the pin check
           // in refreshTerminalViewport() can lose the bottom after fit() reflows — force it once.
           if (pendingExitedReplayScroll) {
@@ -1197,10 +1269,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
           }
           if (isFirstResumeData) {
             firstResumeDataWritten = true;
-            // Repaints the local xterm canvas over the replayed buffer. Pairs with the
-            // server's forceResumeRepaint() resize wobble (terminal-session.js, C966),
-            // which makes the agent TUI itself re-emit a fresh frame instead of relying
-            // on stale replayed content.
+            // Repaint only after xterm has parsed the retained PTY buffer.
             scheduleTerminalRefresh({ send: true });
             maybeSendCodexResumeRedraw();
             if (pendingPlanReady) {
@@ -1251,7 +1320,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
           showLostSession({ reason: msg.reason, at: msg.at });
           return;
         }
-        if (restartingLoss && knownLoss) showLostSession(knownLoss);
+        if (restartingLoss && knownLoss) showLostSession(knownLoss, { failed: msg.message || t('terminal.sessionMissing') });
         processRunning = false;
         setCodexPlanReady(false);
         setStatus('disconnected', 'Error');
@@ -1288,19 +1357,17 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     };
 
     ws.onclose = () => {
+      if (ws !== socket || terminalDisposed) return;
       // Only show disconnected if the process was still running and this terminal is
       // still the visible one (not detached/minimized, and not swapped out by another
       // terminal taking over state.activeTerminal).
       if (processRunning && state.activeTerminal === terminalController) {
         setStatus('disconnected', 'Disconnected');
       }
-      if (terminalController.detached && !_wsCanStayAttached(ws)) {
-        _detachedCodexTerminals.delete(taskId);
-        disposeTerminal();
-      }
     };
 
     ws.onerror = () => {
+      if (ws !== socket || terminalDisposed) return;
       setStatus('disconnected', 'Connection error');
     };
   }
@@ -1394,6 +1461,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   function disposeTerminal() {
     if (terminalDisposed) return;
     terminalDisposed = true;
+    unsubscribeSystemResume();
+    clearTimeout(resumeRedrawTimer);
     outputWriter?.dispose();
     if (wheelHandler && term.element) {
       try { term.element.removeEventListener('wheel', wheelHandler); } catch { /* ignore */ }
@@ -1484,7 +1553,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       document.body.style.overflow = 'hidden';
     }
     attachViewportListeners();
+    if (!wsIsOpen()) connectWebSocket({ resume: true });
     scheduleTerminalRefresh({ send: true });
+    maybeSendCodexResumeRedraw();
     requestAnimationFrame(focusTerminalWithoutScrollJump);
   }
 
@@ -1520,6 +1591,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       if (terminalClosing || terminalDisposed) return;
       _markAttentionSeen(taskId); // (C1387) coming back to the pane is looking at it
       scheduleTerminalRefresh({ send: true });
+      maybeSendCodexResumeRedraw();
       if (focus) requestAnimationFrame(focusTerminalWithoutScrollJump);
     },
     hide() {
@@ -1530,8 +1602,20 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     // looking at it, so attention must not be treated as seen.
     get visible() { return !hostEl || (overlay.isConnected && !overlay.closest('[hidden]')); },
     get processRunning() { return processRunning; },
+    get disposed() { return terminalDisposed; },
   };
   state.activeTerminal = terminalController;
+
+  const unsubscribeSystemResume = onSystemResume(() => {
+    if (terminalDisposed || !terminalOpened || !processRunning || terminationInFlight || restartingLoss) return;
+    if (terminalClosing && !terminalController.detached) return;
+    if (state.queuedSessions.has(taskId)) return;
+    // OS sleep can leave readyState OPEN indefinitely. Replace the connection
+    // without remounting/focusing the pane; replay owns the resize repaint nudge.
+    setStatus('disconnected', 'Disconnected');
+    connectWebSocket({ resume: true });
+    scheduleTerminalRefresh({ send: true });
+  });
 
   openRaf = requestAnimationFrame(() => {
     openRaf = 0;
@@ -1590,6 +1674,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     }
     if (knownLoss && !opts.restartLost) showLostSession(knownLoss);
     else {
+      // (TPT418) A Restart keeps the recovery strip up, busy, until terminal-state removes it
+      // or an error re-arms it — never a blank xterm while the fresh session spins up.
+      if (knownLoss) renderLostNotice(knownLoss, { restarting: true });
       if (seedPaused) renderWatchdogActions(seedPaused);
       connectWebSocket();
     }
@@ -1612,7 +1699,6 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     const keepCodexTerminal = persistCodex
       && processRunning
       && _isCodexTerminal(terminalController)
-      && wsIsOpen()
       && !terminalDisposed;
     if (keepCodexTerminal) {
       terminalController.detached = true;

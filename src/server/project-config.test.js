@@ -96,7 +96,8 @@ test('existing config wins while stale legacy credentials are removed', (t) => {
   assert.ok(migrateFromLegacy(root));
   const cfg = readProjectConfig(root);
   assert.strictEqual(cfg.API_BASE_URL, 'https://live.example.test');
-  assert.strictEqual(cfg.API_TOKEN, 'live-token');
+  assert.equal(cfg.API_TOKEN, undefined);
+  assert.equal(readAccount('https://live.example.test').token, 'live-token');
   assert.strictEqual(cfg.API_PROJECT_ID, '2');
 
   const env = fs.readFileSync(path.join(root, 'ai', 'todo', 'server', '.env'), 'utf8');
@@ -118,12 +119,13 @@ test('existing config backfills absent credentials before sanitizing legacy .env
     '',
   ].join('\n'));
 
+  const previousAccount = readAccount('https://example.test');
   migrateFromLegacy(root);
   const cfg = readProjectConfig(root);
   assert.strictEqual(cfg.API_BASE_URL, 'https://example.test');
   assert.strictEqual(cfg.API_PROJECT_ID, '3');
   assert.ok(!Object.hasOwn(cfg, 'API_TOKEN'));
-  assert.strictEqual(readAccount('https://example.test'), null, 'explicit blank token must block stale fallback');
+  assert.deepEqual(readAccount('https://example.test'), previousAccount, 'legacy blank never signs out another project or revives stale fallback');
   assert.strictEqual(
     fs.readFileSync(path.join(root, 'ai', 'todo', 'server', '.env'), 'utf8').trim(),
     ''
@@ -338,7 +340,7 @@ test('recordLastUsedAgent preserves unrelated keys (API_TOKEN, AVAILABLE_AGENTS,
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   initConfig(root, {
     TASK_AGENT: 'claude',
-    API_TOKEN: 'secret-token',
+    API_BASE_URL: 'https://preserve.test', API_TOKEN: 'secret-token',
     AVAILABLE_AGENTS: 'claude,codex,pi',
     theme: 'blueish',
     language: 'uk',
@@ -346,7 +348,8 @@ test('recordLastUsedAgent preserves unrelated keys (API_TOKEN, AVAILABLE_AGENTS,
 
   recordLastUsedAgent(root, 'codex', 'o4-mini');
   const cfg = readProjectConfig(root);
-  assert.strictEqual(cfg.API_TOKEN, 'secret-token');
+  assert.strictEqual(cfg.API_TOKEN, undefined);
+  assert.strictEqual(require('./account-store').readAccount('https://preserve.test').token, 'secret-token');
   assert.strictEqual(cfg.AVAILABLE_AGENTS, 'claude,codex,pi');
   assert.strictEqual(cfg.theme, 'blueish');
   assert.strictEqual(cfg.language, 'uk');
@@ -550,7 +553,7 @@ test('writeProjectMcpConfig writes both servers with a credential-free ${VAR} re
   const mcp = JSON.parse(fs.readFileSync(path.join(projectRoot, '.mcp.json'), 'utf8'));
   assert.strictEqual(mcp.mcpServers.tipatask.type, 'http');
   assert.strictEqual(mcp.mcpServers.tipatask.url, '${API_BASE_URL}/api/projects/${API_PROJECT_ID}/mcp');
-  assert.strictEqual(mcp.mcpServers.tipatask.headers.Authorization, 'Bearer ${API_TOKEN}');
+  assert.strictEqual(mcp.mcpServers.tipatask.headers.Authorization, '');
   // No concrete credential anywhere in the remote entry — it must stay git-safe.
   assert.doesNotMatch(JSON.stringify(mcp.mcpServers.tipatask), /[0-9a-f]{20,}/);
   assert.strictEqual(mcp.mcpServers['tipatask-local'].command, path.join(path.resolve(serverRoot), 'bin', 'mcp-node'));
@@ -627,7 +630,7 @@ test('writeProjectClaudeMcpApproval writes concrete credentials into settings.en
   const settings = JSON.parse(fs.readFileSync(path.join(projectRoot, '.claude', 'settings.local.json'), 'utf8'));
   assert.strictEqual(settings.env.API_BASE_URL, 'https://tt.example.com');
   assert.strictEqual(settings.env.API_PROJECT_ID, '9');
-  assert.strictEqual(settings.env.API_TOKEN, 'concrete-jwt');
+  assert.strictEqual(settings.env.API_TOKEN, '');
 
   const gitignore = fs.readFileSync(path.join(projectRoot, '.gitignore'), 'utf8');
   assert.match(gitignore, /^\.claude\/settings\.local\.json$/m);
@@ -999,8 +1002,8 @@ test('writeProjectConfig routes API_TOKEN to the account store and never writes 
 test('writeProjectConfig keeps the token inline when the config has no API_BASE_URL to key the store', (t) => {
   const root = makeRoot();
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  writeProjectConfig(root, { API_TOKEN: 'orphan-token', API_PROJECT_ID: '1' });
-  assert.strictEqual(readProjectConfig(root).API_TOKEN, 'orphan-token');
+  assert.throws(() => writeProjectConfig(root, { API_TOKEN: 'orphan-token', API_PROJECT_ID: '1' }), /API_BASE_URL is required/);
+  assert.equal(readProjectConfig(root), null);
 });
 
 test('rendererProjectConfig reports hasApiToken from the account store', (t) => {

@@ -5,8 +5,8 @@
 // Confirms, against the REAL installed Claude CLI, the assumption the token-refresh work rests
 // on: a `--mcp-config <derived file> --strict-mcp-config` whose `tipatask` http entry carries a
 // `headersHelper` gets its Authorization header from the helper (the CURRENT token in
-// .tipatask/config.json), not from the static `Bearer ${API_TOKEN}` expanded out of the
-// launch-time environment. The env deliberately holds a STALE token and config.json a FRESH
+// account store), not from the static `Bearer ${API_TOKEN}` expanded out of the
+// launch-time environment. The env deliberately holds a STALE token and the store a FRESH
 // one — the exact shape of an expired-then-re-authed session.
 //
 // The "MCP server" is a local stub on an ephemeral 127.0.0.1 port that only records the
@@ -64,11 +64,12 @@ async function main() {
 
   try {
     fs.mkdirSync(path.join(root, '.tipatask'));
-    fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify({ API_BASE_URL: baseUrl, API_PROJECT_ID: '2', API_TOKEN: FRESH }));
+    fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify({ API_BASE_URL: baseUrl, API_PROJECT_ID: '2' }));
     fs.writeFileSync(path.join(root, '.mcp.json'), JSON.stringify({
       mcpServers: { tipatask: { type: 'http', url: '${API_BASE_URL}/api/projects/${API_PROJECT_ID}/mcp', headers: { Authorization: 'Bearer ${API_TOKEN}' } } },
     }));
-    const helperCommand = buildHeadersHelperCommand({ projectRoot: root, electron: false });
+    require('../src/server/account-store').writeAccountToken(baseUrl, FRESH, { userDataRoot: userData });
+    const helperCommand = buildHeadersHelperCommand({ projectRoot: root, userDataRoot: userData, electron: false });
     const derived = writeSpawnMcpConfig({ projectRoot: root, userDataRoot: userData, helperCommand });
     if (!derived) throw new Error('could not derive spawn MCP config');
 

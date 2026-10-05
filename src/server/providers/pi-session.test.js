@@ -76,7 +76,7 @@ const SESSION_EVENT = { type: 'session', version: 3, id: 'uuid-1' };
 
 test('buildPiArgs: prefixed OpenRouter id is passed verbatim with --provider openrouter', () => {
   const args = buildPiArgs({ selectedModel: MODEL, piSessionId: null });
-  assert.deepStrictEqual(args, ['--mode', 'json', '--provider', 'openrouter', '--model', MODEL, '--tools', 'read']);
+  assert.deepStrictEqual(args, ['--mode', 'json', '--provider', 'openrouter', '--model', MODEL, '--tools', 'read', '--no-extensions']);
   const resumed = buildPiArgs({ selectedModel: MODEL, piSessionId: 'uuid-9' });
   assert.deepStrictEqual(resumed.slice(-2), ['--session', 'uuid-9']);
 });
@@ -188,7 +188,7 @@ test('spawnPiTurn: non-zero exit with no text reports pi-exit with the stderr ta
 test('spawnPiTurn: text deltas stream and the turn finalizes on close with usage', (t) => {
   enableTimers(t);
   const turn = startTurn(t);
-  assert.deepStrictEqual(turn.spawnCall().args.slice(-8), ['--mode', 'json', '--provider', 'openrouter', '--model', MODEL, '--tools', 'read']);
+  assert.deepStrictEqual(turn.spawnCall().args.slice(-9), ['--mode', 'json', '--provider', 'openrouter', '--model', MODEL, '--tools', 'read', '--no-extensions']);
   assert.strictEqual(turn.spawnCall().opts.env.OPENROUTER_API_KEY, 'sk-or-test');
   turn.out(
     SESSION_EVENT,
@@ -224,12 +224,12 @@ test('spawnPiTurn: a deepseek row spawns with --provider deepseek and DEEPSEEK_A
     ],
   }), 'utf8');
   const session = { ...makeSession(dir), selectedModel: 'deepseek-flash' };
-  assert.deepStrictEqual(buildPiArgs(session), ['--mode', 'json', '--provider', 'deepseek', '--model', 'deepseek-flash', '--tools', 'read']);
+  assert.deepStrictEqual(buildPiArgs(session), ['--mode', 'json', '--provider', 'deepseek', '--model', 'deepseek-flash', '--tools', 'read', '--no-extensions']);
   let spawnCall = null;
   spawnPiTurn(session, 'T1', () => {}, {
     spawn: (command, args, opts) => { spawnCall = { command, args, opts }; return makeFakeProc(); },
   });
-  assert.deepStrictEqual(spawnCall.args.slice(-8, -4), ['--mode', 'json', '--provider', 'deepseek']);
+  assert.deepStrictEqual(spawnCall.args.slice(-9, -5), ['--mode', 'json', '--provider', 'deepseek']);
   assert.strictEqual(spawnCall.opts.env.DEEPSEEK_API_KEY, 'sk-ds-test');
   assert.notStrictEqual(spawnCall.opts.env.OPENROUTER_API_KEY, 'sk-ds-test');
 });
@@ -248,12 +248,12 @@ test('spawnPiTurn: a google row spawns with --provider google and GEMINI_API_KEY
     ],
   }), 'utf8');
   const session = { ...makeSession(dir), selectedModel: 'gemini-2.5-pro' };
-  assert.deepStrictEqual(buildPiArgs(session), ['--mode', 'json', '--provider', 'google', '--model', 'gemini-2.5-pro', '--tools', 'read']);
+  assert.deepStrictEqual(buildPiArgs(session), ['--mode', 'json', '--provider', 'google', '--model', 'gemini-2.5-pro', '--tools', 'read', '--no-extensions']);
   let spawnCall = null;
   spawnPiTurn(session, 'T1', () => {}, {
     spawn: (command, args, opts) => { spawnCall = { command, args, opts }; return makeFakeProc(); },
   });
-  assert.deepStrictEqual(spawnCall.args.slice(-8, -4), ['--mode', 'json', '--provider', 'google']);
+  assert.deepStrictEqual(spawnCall.args.slice(-9, -5), ['--mode', 'json', '--provider', 'google']);
   assert.strictEqual(spawnCall.opts.env.GEMINI_API_KEY, 'sk-g-test');
   assert.strictEqual(spawnCall.opts.env.OPENROUTER_API_KEY, 'sk-or-test', 'row 0 key stays under its own provider var');
   assert.ok(!spawnCall.args.includes('sk-g-test'), 'the key travels by env var, never argv');
@@ -268,12 +268,12 @@ test('spawnPiTurn: a keyless Bedrock row spawns with --provider amazon-bedrock a
     PI_MODELS: [{ model: 'us.anthropic.claude-sonnet-4', apiKey: '', provider: 'amazon-bedrock' }],
   }), 'utf8');
   const session = { ...makeSession(dir), selectedModel: 'us.anthropic.claude-sonnet-4' };
-  assert.deepStrictEqual(buildPiArgs(session), ['--mode', 'json', '--provider', 'amazon-bedrock', '--model', 'us.anthropic.claude-sonnet-4', '--tools', 'read']);
+  assert.deepStrictEqual(buildPiArgs(session), ['--mode', 'json', '--provider', 'amazon-bedrock', '--model', 'us.anthropic.claude-sonnet-4', '--tools', 'read', '--no-extensions']);
   let spawnCall = null;
   spawnPiTurn(session, 'T1', () => {}, {
     spawn: (command, args, opts) => { spawnCall = { command, args, opts }; return makeFakeProc(); },
   });
-  assert.deepStrictEqual(spawnCall.args.slice(-8, -4), ['--mode', 'json', '--provider', 'amazon-bedrock']);
+  assert.deepStrictEqual(spawnCall.args.slice(-9, -5), ['--mode', 'json', '--provider', 'amazon-bedrock']);
   // The ambient value (if any) passes through untouched — an empty row key must not blank it.
   assert.strictEqual(spawnCall.opts.env.AWS_BEARER_TOKEN_BEDROCK, process.env.AWS_BEARER_TOKEN_BEDROCK);
 });
@@ -308,7 +308,7 @@ test('buildPiArgs: a custom row passes the generated block id as --provider and 
   const session = { ...makeSession(dir), selectedModel: 'llama3.1:8b' };
   assert.deepStrictEqual(
     buildPiArgs(session),
-    ['--mode', 'json', '--provider', piCustomProviderId(CUSTOM_KEYLESS), '--model', 'llama3.1:8b', '--tools', 'read'],
+    ['--mode', 'json', '--provider', piCustomProviderId(CUSTOM_KEYLESS), '--model', 'llama3.1:8b', '--tools', 'read', '--no-extensions'],
   );
   assert.strictEqual(fs.existsSync(path.join(dir, '.pi')), false, 'buildPiArgs is a pure argv builder — it must not touch disk');
 });
@@ -320,7 +320,7 @@ test('spawnPiTurn: a keyed custom row spawns on the generated provider, writes m
   const { call } = spawnCapture(session);
   const providerId = piCustomProviderId(CUSTOM_KEYED);
 
-  assert.deepStrictEqual(call().args.slice(-8), ['--mode', 'json', '--provider', providerId, '--model', 'gpt-4o-mini', '--tools', 'read']);
+  assert.deepStrictEqual(call().args.slice(-9), ['--mode', 'json', '--provider', providerId, '--model', 'gpt-4o-mini', '--tools', 'read', '--no-extensions']);
   const env = call().opts.env;
   assert.strictEqual(env.PI_CODING_AGENT_DIR, path.join(dir, '.pi', 'agent'));
   assert.strictEqual(env.PI_CODING_AGENT_SESSION_DIR, piDefaultSessionDir(dir, process.env), 'sessions stay in Pi\'s normal per-cwd store');
@@ -346,7 +346,7 @@ test('spawnPiTurn: a keyless custom row gets the placeholder apiKey and exports 
   const session = { ...makeSession(dir), selectedModel: 'llama3.1:8b' };
   const { call } = spawnCapture(session);
   const providerId = piCustomProviderId(CUSTOM_KEYLESS);
-  assert.deepStrictEqual(call().args.slice(-8, -4), ['--mode', 'json', '--provider', providerId]);
+  assert.deepStrictEqual(call().args.slice(-9, -5), ['--mode', 'json', '--provider', providerId]);
   assert.strictEqual(call().opts.env.PI_CODING_AGENT_DIR, path.join(dir, '.pi', 'agent'));
   assert.strictEqual(call().opts.env.TIPATASK_PI_CUSTOM_API_KEY, process.env.TIPATASK_PI_CUSTOM_API_KEY, 'ambient value passes through untouched');
   const block = JSON.parse(fs.readFileSync(path.join(dir, '.pi', 'agent', 'models.json'), 'utf8')).providers[providerId];

@@ -12,17 +12,13 @@ const { buildTurnPrompt, buildNudgeMessage } = require('./transcript');
 const { localizeAttachments } = require('../task-agent/attachments');
 const { shouldTrimContext, trimContext } = require('../context-manager');
 const throttle = require('../objective-throttle');
-const { toolProfileFor, codexProfileConfigArgs } = require('./tool-profiles');
+const { toolProfileFor, codexProfileConfigArgs, CODEX_OBJECTIVE_PROFILE } = require('./tool-profiles');
 const { CODEX_TASK_CHAT_FENCE } = require('../task-chat');
-const { listProjectMcpServerNames } = require('../../codex-mcp-config');
+const { buildScopedCodexMcpOverride } = require('../../codex-mcp-config');
 const taskChatWidgets = require('../task-chat-widgets');
 
-// Codex has no --disallowedTools equivalent — `-s read-only` blocks filesystem/shell
-// mutation but NOT MCP tool calls (the project's .codex/config.toml registers the full
-// tipatask MCP surface, same as the terminal Codex task agent). This is a prompt-level
-// fence only — a determined/confused model could still attempt a write MCP call and get
-// whatever error the MCP server itself returns. Documented residual risk (C1029 plan
-// Risk 13); mirrors OBJECTIVE_DISALLOWED_TOOLS in claude-session.js.
+// The text fence explains the objective contract; the scoped MCP map and tool
+// allow/deny configuration enforce it independently on every fresh/resumed turn.
 const CODEX_TOOL_FENCE =
   'You are a read-only PLANNER. Never call create_task, update_task, delete_task, ' +
   'create_task_comment, or create_system_tag — you only propose changes as fenced ```json ' +
@@ -68,7 +64,7 @@ function buildCodexArgs(session, { cwd, model, imagePaths, otherMcpServers = [] 
   // Headless exec has its own process per turn. These overrides are intentional:
   // effort and the chat tool fence must never become mutable terminal defaults.
   const effortFlags = codexEffortArgs(toCodexEffort(config.OBJECTIVE_EFFORT));
-  const profile = toolProfileFor(session, 'codex');
+  const profile = toolProfileFor(session, 'codex') || CODEX_OBJECTIVE_PROFILE;
   if (session.codexSessionId) {
     return [
       'exec', 'resume', session.codexSessionId,
@@ -100,7 +96,7 @@ function extractCards(session, emit) {
   if (blocks.length === 0) return null;
   for (let i = blocks.length - 1; i >= 0; i--) {
     try {
-      const parsed = normalizeProposals(JSON.parse(blocks[i][1]));
+      const parsed = normalizeProposals(JSON.parse(blocks[i][1]), session._startStatusName, session._proposalContext || { tasks: null });
       if (parsed && parsed.changes && Array.isArray(parsed.changes)) {
         const cards = parsed.changes;
         const filesAddressed = parsed.files_addressed || [];
@@ -374,9 +370,11 @@ function spawnCodexTurn(session, taskId) {
     const imagePaths = extractLocalImagePaths(finalPrompt);
 
     let env;
+    let mcpOverride;
     try {
       // Profiled project chats have no task key to stamp into TIPATASK_TASK_ID.
       ({ env } = buildCodexEnv({ projectRoot: session.projectPath || config.PROJECT_ROOT, taskId: session.toolProfile ? session.taskKey : taskId }));
+      mcpOverride = buildScopedCodexMcpOverride(cwd, toolProfileFor(session, 'codex') || CODEX_OBJECTIVE_PROFILE);
     } catch (err) {
       session._spawning = false;
       console.error(`[codex] env build failed task=${taskId}: ${err.message}`);
@@ -385,8 +383,8 @@ function spawnCodexTurn(session, taskId) {
     }
 
     // Read after buildCodexEnv(): it has just refreshed the project's .codex/config.toml.
-    const otherMcpServers = toolProfileFor(session, 'codex') ? listProjectMcpServerNames(cwd) : [];
-    const args = buildCodexArgs(session, { cwd, model, imagePaths, otherMcpServers });
+    const args = buildCodexArgs(session, { cwd, model, imagePaths });
+    args.splice(-1, 0, '-c', mcpOverride);
     const proc = cpSpawn(config.CODEX_BIN, args, {
       cwd,
       env,

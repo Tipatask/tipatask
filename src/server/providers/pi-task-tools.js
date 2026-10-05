@@ -9,7 +9,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const SOURCE_DIR = path.join(__dirname, 'pi-ext');
-const FILES = ['task-tools.mjs', 'tipatask-request.cjs'];
+const FILES = ['task-tools.mjs', 'tipatask-request.cjs', 'live-credentials.cjs'];
 const ENTRY = 'task-tools.mjs';
 
 // Returns the absolute path of the copied extension entry, or null when it cannot be written —

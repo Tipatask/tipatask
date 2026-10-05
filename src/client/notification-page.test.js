@@ -10,6 +10,7 @@ let onState;
 const bannerActs = [];
 globalThis.window = { desktopNotifications: { onState: (cb) => { onState = cb; }, act: (id, action) => bannerActs.push([action, id]) } };
 const { renderNotificationPage, splitNotificationTitle } = await import('./notification-page.js');
+const { setLocale } = await import('./i18n.js');
 await import('./desktop-notifications.js');
 
 const entries = Array.from({ length: 6 }, (_, i) => ({ id: String(6 - i), tag: `TPT${6 - i}`, title: `Title ${6 - i}`,
@@ -26,7 +27,14 @@ test('banner and in-app host render identical pages for the same alerts', () => 
   renderNotificationPage(inApp, entries, (id, action) => appActs.push([action, id]));
   onState({ entries, theme: { bg: '#123456' } });
   const banner = document.body.querySelector(':scope > .tt-notif-page');
-  assert.deepEqual(shape(banner), shape(inApp.firstElementChild));
+  // Same cards; only the header action (Hide vs Clear All) and the footer toggle differ (TPT505).
+  assert.deepEqual(shape(banner.querySelector('.tt-notif-page-cards')),
+    shape(inApp.querySelector('.tt-notif-page-cards')));
+  assert.equal(inApp.querySelector('.tt-notif-page-header button').className, 'tt-notif-page-clear');
+  assert.equal(inApp.querySelector('.tt-notif-page-ontop').hidden, true, 'in-app stack has no on-top toggle');
+  assert.equal(banner.querySelector('.tt-notif-page-header button').className, 'tt-notif-page-hide');
+  assert.equal(banner.querySelector('.tt-notif-page-clear'), null, 'no Clear All on the banner');
+  assert.equal(banner.querySelector('.tt-notif-page-ontop').hidden, false);
   assert.equal(banner.querySelectorAll('.tt-notif-card').length, 5);
   assert.equal(banner.querySelector('.tt-notif-page-more').hidden, false);
   assert.equal(banner.querySelector('b'), null, 'content stays plain text');
@@ -82,5 +90,45 @@ test('cards carry data-category and key/title/body spans that survive repeat pus
 
   renderNotificationPage(host, [{ ...one, category: null }], () => {});
   assert.equal(card.dataset.category, 'info');
+  host.remove();
+});
+
+test('(TPT505) header action: Clear All by default, Hide on request; footer "Show" toggle acts on-top-off', () => {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const acts = [];
+  const act = (id, action) => acts.push([action, id]);
+  const two = entries.slice(0, 2);
+  setLocale('en');
+  const page = renderNotificationPage(host, two, act);
+  assert.equal(page.querySelector('.tt-notif-page-clear').textContent, 'Clear all');
+  assert.equal(page.querySelector('.tt-notif-page-footer').hidden, true, 'one page, no toggle: no footer');
+  page.querySelector('.tt-notif-page-clear').click();
+
+  renderNotificationPage(host, two, act, { headerAction: 'hide', onTopToggle: true });
+  const hide = page.querySelector('.tt-notif-page-hide');
+  assert.equal(hide.textContent, 'Hide');
+  assert.equal(page.querySelector('.tt-notif-page-clear'), null);
+  assert.equal(page.querySelector('.tt-notif-page-footer').hidden, false);
+  const toggle = page.querySelector('.tt-notif-page-ontop');
+  const input = toggle.querySelector('input[type="checkbox"]');
+  assert.equal(toggle.hidden, false);
+  assert.equal(input.checked, true);
+  assert.equal(toggle.textContent, 'Show');
+  assert.equal(toggle.title, 'Show notifications on top of other apps');
+  assert.equal(page.querySelector('.tt-notif-page-more').hidden, true);
+  hide.click();
+  input.checked = false;
+  input.dispatchEvent(new browser.Event('change'));
+  assert.deepEqual(acts, [['clear-all', null], ['hide', null], ['on-top-off', null]]);
+
+  setLocale('uk');
+  renderNotificationPage(host, two, act, { headerAction: 'hide', onTopToggle: true });
+  assert.equal(page.querySelector('.tt-notif-page-hide').textContent, 'Сховати');
+  assert.equal(toggle.textContent, 'Показувати');
+  assert.equal(input.checked, true, 'a re-render shows the live (on) state');
+  renderNotificationPage(host, two, act);
+  assert.equal(page.querySelector('.tt-notif-page-clear').textContent, 'Очистити всі');
+  setLocale('en');
   host.remove();
 });

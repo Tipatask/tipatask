@@ -31,7 +31,7 @@ function buildVcsContextDirective(context) {
       : 'VCS settings could not be verified. No VCS writes are authorized. Retry the live read; do not mark completed until verification succeeds.',
     'Before VCS writes, after resuming, and immediately before completion, call tipatask-local git_worktree_status with task_key. Require verified:true; current settings supersede the kickoff snapshot. A failed read is not merge disabled.',
     'Finish with tipatask-local complete_task(task_key, resolution): it verifies current settings and local merges before posting your plain-English resolution and completed status. Do not substitute remote update_task or PR creation for this check. Run relevant checks on the merged checkouts first and include their results in resolution.',
-    'If these local tools are unavailable or runtime_replaced_restart_required is reported, restart using the updated Task App. For a settings-only read, GET /api/projects/{API_PROJECT_ID} using current .tipatask/config.json credentials without printing them; this does not replace the local completion check.',
+    'If these local tools are unavailable or runtime_replaced_restart_required is reported, restart using the updated Task App. For a settings-only read, GET /api/projects/{API_PROJECT_ID} using the selected project target and current account-store token through getApiCredentials(), without printing the token; this does not replace the local completion check.',
   ].join('\n');
 }
 

@@ -37,8 +37,8 @@
    - If a touched module has no `tt-*` tag: call `create_system_tag(tag_name, description, architecture_hint)` — auto-creates stub at `ai/architecture/{tag}.md` + registers in DB
    - Call `update_task` with final tag list (3–5 tags: ≥1 feature/module + 1 action + 1+ detail)
    - **KB hygiene**: before touching any `ai/architecture/*.md`, apply the line test in § KB Hygiene below. Standing system concepts only.
-3.6. **Resolution comment**: call `create_task_comment(task_key, content)` with a real report, in plain English prose (not caveman-styled) — what was implemented and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). Defaults to `type='resolution'`. Do this in the same tool-call batch as step 4 below.
-4. After implementation, task-local verification, and tag review, post the resolution comment (3.6) and set `completed` in the same tool-call batch — **DO NOT send the final response before this step**
+3.6. Prepare one plain-English resolution covering changes, key files, verification and caveats.
+4. After implementation, checks, tag review and permitted commits, call `tipatask-local.complete_task(task_key, resolution)` (Pi: `tt complete`) and require successful verification and saved completion status.
 5. Blocked within this task's scope: set `on_fire` when available, explain why. Unrelated issues are caveats under § Task status scope.
 6. **ALWAYS** kill node server you start so I can run mine on that port
 
@@ -73,7 +73,7 @@ Re-ran 3x, all green. Next agent: check this before trusting the cache.
 - User-given plan (not from a task): check if it matches an existing task, update that too
 - Write status with the current project's `tipatask` MCP `update_task`, then call `get_task` to confirm the saved status under the active `API_PROJECT_ID`.
 - If `update_task`/`get_task` results do not match the active `API_PROJECT_ID` (`.tipatask/config.json`), stop and fix MCP registration (`.mcp.json`, Claude settings, Codex config) before trusting task writes.
-- If every `tipatask` MCP call fails with HTTP 401 (expired launch-time token), the status write is still mandatory — use the REST fallback in § MCP 401 fallback, then confirm with a GET.
+- If remote MCP authentication fails, follow Credential recovery and completion; never bypass local verification.
 - **PRE-SEND CHECKLIST** — run this mentally before every response:
   1. Did I touch a task? → status updated via MCP `update_task`?
   2. If NO → **do it now, before sending**
@@ -139,28 +139,31 @@ Technical reference is split across `ai/architecture/` by system tag:
 
 Call `list_system_tags` for the live project taxonomy.
 
-## Tipatask API Access
+## Agent context and credentials
 
-To communicate with the Tipatask task API server, use `API_TOKEN` from `.tipatask/config.json` (project root) — the Task App's own `.env` no longer carries API credentials. Base URL and project ID are also configured there.
+Claude loads `CLAUDE.md`; Codex loads `AGENTS.md`; Pi loads its native project guides (`AGENTS.md`, with `CLAUDE.md` fallback). Tipatask injects the task or chat contract separately. Gemini is supported only for objective planning; its launch loads `AGENTS.md`/`GEMINI.md` and injected planning context, with read tools and no Tipatask MCP/REST tools. It is not a task-execution or task/project-chat provider.
 
-### MCP 401 fallback (expired `API_TOKEN`)
+Apply system/developer and explicit user instructions first. Within the project workflow, the current injected session contract and verified VCS settings take precedence over generic guide defaults. Planning approval forbids mutations, including task status writes. Objective chat proposes work; task/project chat may change tasks but cannot edit code or run Git, even when a general guide describes coding tasks. Claude/Codex task terminals use MCP; Pi uses the credential-safe REST command in its launch prompt. Do not treat missing MCP in Pi or Gemini as a setup error.
 
-The remote `tipatask` MCP server authenticates with the project token that was in `API_TOKEN` when your session **launched**. It is a 7-day JWT, and Claude Code expands `${API_TOKEN}` from its own process environment, so a token that expired or was renewed later is not visible to a running session's frozen `$API_TOKEN` (the Task App normally renews a dying token before launch, and `/mcp` → Reconnect picks up a renewed one when the session was started with the headers helper). If every `tipatask` MCP call fails with `rejected the Authorization header` / HTTP 401 (the API's own reply reads `API token expired at <time>`), the token expired — `tipatask-local` keeps working. You cannot run `/mcp` yourself, so do not stop: finish through REST, reading the **current** credentials from `.tipatask/config.json` (`API_BASE_URL`, `API_PROJECT_ID`, `API_TOKEN`) — not from `$API_TOKEN` (the frozen launch value) and not from the Task App's own `.env` (it carries no credentials). Never print the token.
+The selected project's `.tipatask/config.json` stores `API_BASE_URL` and `API_PROJECT_ID`. The signed-in token lives in `.tipatask-account.json` under `TIPATASK_USER_DATA`, keyed by API server. Never print/copy a token, commit it, or read it from a legacy `.env`. A legacy project-scoped token cannot authorize another project: sign in again to obtain an account token. Opening an old checkout must not change the signed-in account.
 
-1. `POST {API_BASE_URL}/api/projects/{API_PROJECT_ID}/tasks/{KEY}/comments` with `{"content": "<resolution report>", "type": "resolution"}` → expect `201`.
-2. `PATCH {API_BASE_URL}/api/projects/{API_PROJECT_ID}/tasks/{KEY}` with `{"status": "completed"}` (the project's complete-status name) → expect `200`.
-3. `GET {API_BASE_URL}/api/projects/{API_PROJECT_ID}/tasks/{KEY}` and confirm the returned `status` — never assume the PATCH took effect.
+Claude's generated MCP header helper reads the current account on connect/reconnect. Codex reads its bearer environment at launch; restart it after token/account rotation. Direct Codex/Pi shells need the shipped `src/cli/launch-agent.js <provider> --project-root <directory>` launcher, run with the installing app's Node runtime (packaged Electron uses `ELECTRON_RUN_AS_NODE=1`). The launcher reads non-secret runtime/user-data paths from generated `.mcp.json`; refresh the agent harness if those paths are stale. A plain Codex command with no launch environment is not a supported authenticated Tipatask launch.
 
-Every request sends `Authorization: Bearer <token from config.json>`; write the JSON body to a file and use `-d @file` to avoid shell-quoting a long report. Example:
+## Credential recovery and completion
 
-```bash
-# read the CURRENT credentials from config.json (never echo the token)
-read -r BASE PID TOK < <(node -e "const c=require('./.tipatask/config.json');console.log(c.API_BASE_URL,c.API_PROJECT_ID,c.API_TOKEN)")
-curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/api/projects/$PID/tasks/<KEY>/comments" \
-  -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d @/tmp/resolution.json   # -> 201
+A missing account store or wrong `TIPATASK_USER_DATA` is not token expiry. Check the selected project and generated local MCP paths (`TIPATASK_PROJECT_ROOT`, `TIPATASK_SERVER_ROOT`, `TIPATASK_USER_DATA`) without displaying credentials. For an actual expired/rejected token or scope mismatch, use Project → Re-authenticate / Change Account, then reconnect Claude or restart the affected agent. Do not retry with an inherited token from another project.
+
+When remote MCP is unavailable, use the shipped `src/cli/task-tools.js` through the installing runtime. It reads live credentials internally; requests accept a project-relative method/path and JSON bodies on stdin, never a token argument. Task terminals receive `TIPATASK_TOOL_EXEC` and `TIPATASK_SERVER_ROOT`:
+
+```sh
+tt() { ELECTRON_RUN_AS_NODE=1 "$TIPATASK_TOOL_EXEC" "$TIPATASK_TOOL_SCRIPT" "$@"; }
+tt GET "/tasks/$TIPATASK_TASK_ID"
+tt verify "$TIPATASK_TASK_ID"
+tt complete "$TIPATASK_TASK_ID" < /path/to/resolution.txt
 ```
 
-If REST also answers `401 API token expired at …`, the token in `config.json` has expired too: say so in your final reply and ask the user to sign in again (Project ▸ Re-authenticate / Change Account) instead of retrying.
+Require live verified VCS settings before Git writes and successful completion verification before finishing. Use `tipatask-local.complete_task(task_key, resolution)` for MCP agents, or `tt complete` for Pi/REST recovery; both run the same guard and post one plain-English resolution plus the configured completion status. Never bypass this guard by directly PATCHing a completed status. If local verification is unavailable or requires a runtime restart, leave the task incomplete and report the reason.
+
 
 ## Conventions
 

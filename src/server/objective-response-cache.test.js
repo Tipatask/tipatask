@@ -6,6 +6,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 const objectiveResponseCache = require('./objective-response-cache');
 const { isAgentChatType, isAgentChatId } = require('./session-state');
+const { prepareObjectiveProposalContext } = require('./objective-proposal-status');
+const { normalizeProposals } = require('./claude-session');
 
 const { buildKey } = objectiveResponseCache;
 
@@ -32,6 +34,7 @@ function wire({ session: sessionOverrides = {}, config: configOverrides = {}, en
     { id: 'TPT357', status: 'completed', tags: [] },
   ];
   const env = {
+    prepareObjectiveProposalContext, normalizeProposals, structuredClone,
     config: { SIMPLE_MODE: false, PROJECT_ROOT: '/config-project-root', ...configOverrides },
     console: { log() {}, warn: (...args) => warns.push(args.join(' ')) },
     process: { env: processEnv },
@@ -56,7 +59,7 @@ function wire({ session: sessionOverrides = {}, config: configOverrides = {}, en
   };
   vm.createContext(env);
   vm.runInContext(source.slice(start, source.indexOf('\n}', start) + 2), env);
-  env.wireClient(ws, session, TASK_ID, 'fixture', new Map(), {});
+  env.wireClient(ws, session, TASK_ID, 'fixture', new Map(), { getTasksUnfiltered: async () => fixtureTasks });
   return { handlers, frames, turns, warns, session, tasks: fixtureTasks };
 }
 
@@ -103,6 +106,17 @@ test('first-turn lookup replays a cached payload instead of spawning', async () 
   assert.equal(assistant.role, 'assistant');
   assert.equal(assistant.fromCache, true);
   assert.deepEqual(Array.from(assistant.newTags), ['caching']);
+});
+
+test('cached reply filters locked targets without changing the cached payload', async () => {
+  const { handlers, frames, turns, tasks } = wire();
+  const cards = tasks.map(task => ({ type: 'modified', task: { id: task.id, title: 'Changed' } }));
+  const key = expectedKey({ tasks });
+  objectiveResponseCache.set(key, { content: 'cached answer', cards, filesAddressed: [], docUpdates: [] });
+  await handlers.message(startMsg());
+  assert.equal(turns.length, 0);
+  assert.deepEqual(frames.find(f => f.type === 'objective-result').cards.map(c => c.task.id), ['TPT356']);
+  assert.deepEqual(objectiveResponseCache.get(key).payload.cards.map(c => c.task.id), tasks.map(t => t.id));
 });
 
 test('lookup key is scoped to the session project root, falling back to config.PROJECT_ROOT', async () => {

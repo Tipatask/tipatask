@@ -3,7 +3,7 @@
 // Use window.TipTask for board/terminal callbacks: static imports would pull CSS and
 // xterm into this module and break plain-node tests.
 import state from './state.js';
-import { buildWsUrl } from './ws-client.js';
+import { buildWsUrl, onSystemResume } from './ws-client.js';
 import { clearDebounce, debugNotifyLog } from './notifications.js';
 import { notifyTaskNeedsAttention, forgetTaskAttention } from './attention-notifications.js';
 import { dismissNotification } from './notification-center.js';
@@ -187,6 +187,7 @@ export function connectAttentionWs() {
   const ws = new WebSocket(buildWsUrl('__attention__'));
   _ws = ws;
   ws.onopen = () => {
+    if (_ws !== ws) return;
     _backoffMs = 1000;
     // Self-heal: pick up anything missed while disconnected (or before this socket existed).
     // (C1058) taskBoard is a NESTED namespace on window.TipTask (only consoleModal and
@@ -199,6 +200,7 @@ export function connectAttentionWs() {
       .catch(() => {});
   };
   ws.onmessage = (event) => {
+    if (_ws !== ws) return;
     let msg;
     try { msg = JSON.parse(event.data); } catch { return; }
     if (handleAttentionMessage(msg)) return;
@@ -232,7 +234,8 @@ export function connectAttentionWs() {
     }
   };
   ws.onclose = () => {
-    if (_ws === ws) _ws = null;
+    if (_ws !== ws) return;
+    _ws = null;
     scheduleReconnect();
   };
   ws.onerror = () => {};
@@ -240,13 +243,23 @@ export function connectAttentionWs() {
 
 export function closeAttentionWs() {
   clearTimeout(_reconnectTimer);
-  if (_ws) {
-    try { _ws.close(); } catch (_) { /* already closed */ }
-    _ws = null;
+  const previous = _ws;
+  _ws = null;
+  if (previous) {
+    try { previous.close(); } catch (_) { /* already closed */ }
   }
 }
 
+export function resyncAttentionWs() {
+  closeAttentionWs();
+  _backoffMs = 1000;
+  connectAttentionWs(); // no backoff delay, even if the old socket still looked OPEN
+}
+
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  onSystemResume(() => {
+    if (window.electronAPI?.api) resyncAttentionWs();
+  });
   window.addEventListener('online', () => connectAttentionWs());
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') connectAttentionWs();

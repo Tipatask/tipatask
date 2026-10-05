@@ -22,7 +22,7 @@ function replay(rows, opts = limits(), state = fresh()) {
 }
 const noAction = results => assert.ok(results.every(r => !r.pause && !r.kill), JSON.stringify(results));
 
-for (const sessions of [1, 2, 6, 8]) {
+for (const sessions of [1, 2, 6, 8, 12]) {
   test(`stable 54-process trees survive ${sessions} terminals at low and high RSS`, () => {
     const scaled = scaleAgentLimitsForConcurrency(limits(), sessions);
     assert.equal(scaled.warnDescendants, 50);
@@ -40,7 +40,7 @@ for (const sessions of [1, 2, 6, 8]) {
 
 test('live concurrency changes never reset growth or lower enforcement', () => {
   const state = fresh();
-  for (const [i, sessions] of [1, 2, 6, 8, 2, 8].entries()) {
+  for (const [i, sessions] of [1, 2, 6, 8, 12, 2, 8].entries()) {
     const result = evaluateRunaway(state, { count: 54, rssMb: 5000, sampledAt: i * 30000 }, scaleAgentLimitsForConcurrency(limits(), sessions));
     noAction([result]);
     assert.equal(state.threshold, 50);
@@ -127,7 +127,7 @@ test('custom limits, fallback precedence and admission independence', () => {
     [K.rssPressureGrowthMb]: 64, [K.rssSamples]: 4 };
   const configured = limits(config);
   assert.equal(configured.deviceSessionCap, limits().deviceSessionCap);
-  for (const n of [1, 2, 6, 8]) {
+  for (const n of [1, 2, 6, 8, 12]) {
     const scaled = scaleAgentLimitsForConcurrency(configured, n);
     assert.equal(scaled.warnDescendants, 20);
     assert.equal(scaled.descendantCeiling, 90);

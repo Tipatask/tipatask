@@ -22,7 +22,7 @@ test('browser settings routes return no stored secret and resolve saves within p
   t.after(() => roots.forEach((root) => fs.rmSync(root, { recursive: true, force: true })));
   for (const [i, root] of roots.entries()) {
     writeProjectConfig(root, {
-      API_TOKEN: `sentinel-token-${i}`, ASSEMBLYAI_API_KEY: `sentinel-voice-${i}`,
+      API_BASE_URL: `https://server-${i}.test`, API_TOKEN: `sentinel-token-${i}`, ASSEMBLYAI_API_KEY: `sentinel-voice-${i}`,
       PI_MODELS: [{ model: 'm1', apiKey: `sentinel-pi-${i}` }],
       TASK_AGENT: 'pi', AVAILABLE_AGENTS: 'pi', API_PROJECT_ID: String(i + 1),
     });

@@ -277,12 +277,37 @@ test('task-chat.js: open() routes a task chat to its workspace; the project chat
 });
 
 test('styles.css: workspace tabs share one panel frame on every pane, and drop captions on a phone', () => {
-  // (TPT479) One box for Edit / Agent Terminal / Chat — a pane switch never moves the panel.
-  assert.match(styles, /\.task-edit-panel--tabs \{\s*max-width: min\(1400px, 100%\); height: min\(900px, calc\(100vh - 40px\)\); max-height: none;/);
+  // (TPT479) One frame for Edit / Agent Terminal / Chat — a pane switch never moves the header.
+  // (TPT499) Edit fits its content inside that frame; Terminal and Chat fill it. The overlay is
+  // top-anchored and the margin reproduces the centred frame's top edge.
+  assert.match(styles, /\.task-edit-panel--tabs \{\s*max-width: min\(1400px, 100%\); height: auto; max-height: min\(900px, calc\(100vh - 40px\)\);\s*margin-top: max\(0px, calc\(\(100vh - 940px\) \/ 2\)\);/);
+  assert.match(styles, /\.task-edit-panel--tabs:not\(\[data-pane="edit"\]\) \{ height: min\(900px, calc\(100vh - 40px\)\); \}/);
   assert.doesNotMatch(styles, /\.task-edit-panel--tabs\[data-pane="(?:chat|terminal|edit)"\] \{[^}]*(?:max-width|height)/);
-  assert.match(styles, /\.task-edit-overlay--rail \{\s*left: 200px;/);
+  assert.match(styles, /\.task-edit-overlay--rail \{\s*left: 200px; padding: 20px; align-items: flex-start;/);
   const phone = styles.slice(styles.indexOf('.modal-top-bar button { padding: 0 10px; }'));
   assert.match(phone.slice(0, 400), /\.modal-top-bar \.task-modal-tab-label \{ display: none; \}/);
+});
+
+test('styles.css: the edit body fits its content and only the description or a tab panel scrolls', () => {
+  // (TPT499) .modal-scroll-body is a flex column; the description (or its editor wrap) and the
+  // Comments / Notifications panels are the parts that shrink and scroll at the panel's cap.
+  assert.match(styles, /\.modal-scroll-body \{\s*display: flex; flex-direction: column;\s*flex: 1 1 auto; min-height: 0;/);
+  assert.match(styles, /\.modal-scroll-body > \.modal-desc-display \{\s*flex: 1 1 auto; min-height: 6rem; max-height: none;/);
+  assert.match(styles, /\.modal-desc-edit-wrap,\s*\.modal-scroll-body > \.modal-desc-textarea \{\s*flex: 1 1 auto; min-height: 6rem;/);
+  assert.match(styles, /\.modal-scroll-body > \.modal-tab-panel\[data-tab="comments"\],\s*\.modal-scroll-body > \.modal-tab-panel\[data-tab="notifications"\] \{\s*flex: 1 1 auto; min-height: 8rem; overflow-y: auto;/);
+  assert.doesNotMatch(styles, /\.modal-scroll-body > \.modal-tabs \{[^}]*position: sticky/);
+  // The Settings modal's tab strip stays unscoped and untouched.
+  assert.match(styles, /\n\.modal-tabs \{\s*display: flex;/);
+});
+
+test('task-edit-modal.js: read-marking observers root on the scrolling tab panel', () => {
+  const helper = editModal.slice(editModal.indexOf('function _tabScrollRoot('), editModal.indexOf('function _observeVisibleComments('));
+  assert.match(helper, /panel\?\.parentElement\?\.classList\.contains\('modal-scroll-body'\)\) return panel;/);
+  for (const fn of ['function _observeVisibleComments(', 'function _observeVisibleEvents(']) {
+    const body = editModal.slice(editModal.indexOf(fn), editModal.indexOf('new IntersectionObserver', editModal.indexOf(fn)));
+    assert.match(body, /const root = _tabScrollRoot\(modal, panel\);/, fn);
+  }
+  assert.match(editModal, /micWrap\?\.classList\.add\('modal-desc-edit-wrap'\);/);
 });
 
 test('i18n: the entry-point labels exist and are translated in both locales', () => {

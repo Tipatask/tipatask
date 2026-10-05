@@ -47,6 +47,15 @@ test('snapshot exposes timestamps, swap activity, session union and peaks withou
   assert.equal(s.lastSuccessAt, 6000);
   h.telemetry.stop();
 });
+
+test('optional validation sink receives completed measurements and cannot break telemetry', async () => {
+  let seen;
+  const h = harness({ onSample(snapshot) { seen = snapshot; throw Error('diagnostic failure'); } });
+  await h.telemetry.poll();
+  assert.equal(seen.processes.unionRssBytes, 300 * 1024);
+  assert.equal(h.telemetry.snapshot().host.status, 'ok');
+  h.telemetry.stop();
+});
 test('stale, backward-clock and stopped readings never expose current capacity', async () => {
   const h = harness();
   assert.equal(h.telemetry.snapshot().host.pressure, 'unknown');

@@ -618,6 +618,21 @@ function sanitizeReplayBuffer(buf, opts = {}) {
   return trimTrailingAltScreenExit(buf) ?? buf;
 }
 
+// Called synchronously during live reattachment, before the event loop can forward
+// another PTY chunk. Replay is one snapshot, never appended back into session.buffer.
+// Even an empty snapshot provides a parser barrier for the client's repaint nudge.
+function replayLiveTerminal(session, ws = session?.ws) {
+  if (!session?.alive || !ws || ws.readyState !== ws.OPEN) return false;
+  const reset = '\x1b[!p\x1b[?1049l\x1b[2J\x1b[H';
+  const buffer = sanitizeReplayBuffer(session.buffer || '', {
+    preserveAltScreenFrame: session.taskAgent === 'codex'
+      && session.terminalPhase === 'planning'
+      && session.codexPlanReady === true && codexPlanReadyIsFresh(session),
+  });
+  ws.send(JSON.stringify({ type: 'data', tabId: session.tabId, data: reset + buffer }));
+  return true;
+}
+
 function readTrackedFiles(taskId) {
   const trackFile = path.join(config.USER_DATA_ROOT, '.file-tracks', `${taskId}.txt`);
   try {
@@ -1025,8 +1040,7 @@ function killPausedTargets(session) {
 // TUI. Wobble the row count down and back (with a gap so the two SIGWINCHes
 // don't coalesce) to force Claude/Pi to re-emit a fresh full-screen frame on
 // reattach, instead of relying on the user nudging the cursor to trigger it.
-// Codex is skipped: it already self-redraws via a client-sent \x0c and has a
-// delicate plan-ready alt-screen replay this could disturb.
+// Codex is skipped: its client waits for replay parsing, then wobbles columns.
 function forceResumeRepaint(session) {
   if (!session || !session.alive || !session.pty) return;
   if (session.taskAgent === 'codex') return;
@@ -2001,6 +2015,7 @@ module.exports = {
   planReadyMinBufferLength,
   truncateBufferSafely,
   sanitizeReplayBuffer,
+  replayLiveTerminal,
   imageMimeAllowed,
   saveBase64Image,
   injectPastedImage,

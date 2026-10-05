@@ -1,7 +1,7 @@
 'use strict';
 
 const { readProjectConfig, migrateLegacyApiToken } = require('./project-config');
-const { readAccount, decodeTokenPayload } = require('./account-store');
+const { readAccount, decodeTokenPayload, assertTokenProject, accountStorePath } = require('./account-store');
 
 function missingCredential(name) {
   const err = new Error(`API not configured for this project (missing ${name}${name === 'API_TOKEN' ? ' — sign in again' : ' in .tipatask/config.json'})`);
@@ -23,7 +23,7 @@ function createTokenWatch(onChange) {
 // project's config.json, the token from the app-level account store; both are re-read on
 // every call so re-auth changes apply without a server or MCP restart.
 // `opts.watch` (from createTokenWatch()): when the resolved token differs from the last
-// token this same watch object saw, fires onChange(token, prevToken) once. A first read
+// token or API target this same watch object saw, fires onChange(token, prevToken) once. A first read
 // (prevToken === null) never fires — that's initial load, not a change. The callback is
 // swallowed on error — a broken listener must never break credential resolution.
 function getApiCredentials(projectRoot, opts = {}) {
@@ -34,27 +34,35 @@ function getApiCredentials(projectRoot, opts = {}) {
   let live = root ? readProjectConfig(root) : null;
   // A pre-account-store project still carries API_TOKEN inline: lift it into the store once
   // (and strip it from config.json), then re-read.
-  if (live && Object.hasOwn(live, 'API_TOKEN') && migrateLegacyApiToken(root)) live = readProjectConfig(root);
+  if (opts.migrate !== false && live && Object.hasOwn(live, 'API_TOKEN') && migrateLegacyApiToken(root)) live = readProjectConfig(root);
   const baseUrl = String(live?.API_BASE_URL || '').replace(/\/+$/, '');
   // The signed-in account's token is app-level (account-store.js), keyed by API server. The
   // inline value only survives here when migration could not run (e.g. read-only checkout).
-  const token = readAccount(baseUrl)?.token || live?.API_TOKEN || '';
+  const token = readAccount(baseUrl)?.token || (opts.migrate === false ? '' : live?.API_TOKEN) || '';
   const projectId = live?.API_PROJECT_ID || '';
-
-  if (!baseUrl) throw missingCredential('API_BASE_URL');
-  if (!token) throw missingCredential('API_TOKEN');
-  if (!projectId) throw missingCredential('API_PROJECT_ID');
 
   const watch = opts.watch;
   if (watch) {
     const prev = watch.last;
+    const context = JSON.stringify([baseUrl, String(projectId)]);
+    const previousContext = watch.context;
     watch.last = token;
-    if (prev !== null && prev !== token) {
+    watch.context = context;
+    if (prev !== null && (prev !== token || previousContext !== context)) {
       try { watch.onChange(token, prev); } catch (e) {
         console.warn('[api-credentials] token-watch listener error:', e.message);
       }
     }
   }
+
+  if (!baseUrl) throw missingCredential('API_BASE_URL');
+  if (!projectId) throw missingCredential('API_PROJECT_ID');
+  if (!token) {
+    const err = missingCredential('API_TOKEN');
+    err.message = `No signed-in account token at ${accountStorePath()}. Check TIPATASK_USER_DATA or sign in again.`;
+    throw err;
+  }
+  assertTokenProject(token, projectId);
 
   return { baseUrl, token, projectId };
 }
@@ -71,4 +79,14 @@ function getAccountUserId(baseUrl) {
   return id != null ? id : null;
 }
 
-module.exports = { getApiCredentials, createTokenWatch, getAccountUserId };
+// Non-secret namespace for histories and provider continuations. Rotation retains
+// identity; an API-server/project/account switch does not.
+function projectContextIdentity(projectRoot) {
+  if (!projectRoot) return '';
+  const cfg = readProjectConfig(projectRoot);
+  if (!cfg?.API_BASE_URL || !cfg?.API_PROJECT_ID) return '';
+  const account = readAccount(cfg.API_BASE_URL);
+  const userId = account?.userId ?? decodeTokenPayload(account?.token)?.id ?? null;
+  return JSON.stringify([require('./account-store').normalizeBaseUrl(cfg.API_BASE_URL), String(cfg.API_PROJECT_ID), userId]);
+}
+module.exports = { getApiCredentials, createTokenWatch, getAccountUserId, projectContextIdentity };

@@ -71,6 +71,11 @@ function isClosedName(name, roles) {
   return !!name && (name === roles.complete || name === roles.canceled);
 }
 
+// Objective proposals may only edit tasks that have not started or closed.
+function isLockedTargetStatus(name, roles = LEGACY_ROLE_NAMES) {
+  return !!name && (name === roles.in_progress || isClosedName(name, roles));
+}
+
 // This project's non-closed status names, e.g. for an "active tasks" filter. `names` is
 // the project's full ordered name list (fetchStatusNames()); `roles` is fetchStatusRoles().
 function activeNames(names, roles) {
@@ -130,6 +135,7 @@ module.exports = {
   fetchStatusNames,
   fetchStatusContext,
   isClosedName,
+  isLockedTargetStatus,
   activeNames,
   sanitizeStatusName,
 };

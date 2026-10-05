@@ -1,6 +1,6 @@
 // ── Task card previews within chat replies ──
 import state from './state.js';
-import { statusLabel, statusColor, statusRoleToken, isActiveName, isStartName, startName } from './status-registry.js';
+import { statusLabel, statusColor, statusRoleToken, isActiveName, isStartName, startName, isLockedTargetStatus, loadStatuses } from './status-registry.js';
 import { escapeAttr, showSaveToast, showToast, fetchWithRetry, projectHeader, showSavingIndicator, hideSavingIndicator, buildUsedIds, upsertTaskEntry } from './utils.js';
 import { collapseCard, renderAgentBadge, renderCard as renderBoardCard } from './task-card.js';
 import { api } from './api-client.js';
@@ -194,6 +194,25 @@ function cascadeBump(msg) {
   }
 }
 
+// A preview snapshot can be stale or assignee-scoped. Check every target live
+// before either save path writes, including cards converted from an origin.
+async function assertEditableModifiedCards(cards, taskMap) {
+  const modified = cards.filter(card => card.type === 'modified');
+  if (!modified.length) return;
+  await loadStatuses();
+  for (const card of modified) {
+    const task = await api.tasks.get(card.task.id);
+    if (!task) throw new Error(translate('chat.errTargetUnavailable', { id: card.task.id }));
+    if (isLockedTargetStatus(task.status)) {
+      throw new Error(translate('chat.errLockedTarget', { id: task.id, status: statusLabel(task.status) }));
+    }
+    // The scoped snapshot may predate a status change. Keep its status current
+    // so merging an eligible edit cannot revive an old closed status.
+    const existing = taskMap.get(card.task.id);
+    if (existing) existing.status = task.status;
+  }
+}
+
 // ── Exported: write a user-selected sprint step back to a proposal card, run cascade, persist ──
 export async function commitPreviewStep(msg, cardIdx, newPriority) {
   if (!msg || !msg.cards || !msg.cards[cardIdx]) return;
@@ -250,6 +269,18 @@ export async function ensureExistingSnapshot(msg) {
   if (reconcileModifiedCards(msg)) saveChatState();
 }
 
+// Use the target's snapshot status, never a status supplied by the planner.
+// Origin-adopted cards save as modifications even while their type is still new.
+export function getLockedCardTarget(msg, cardIdx, cs = state.chatState) {
+  if (msg.confirmedMask?.[cardIdx]) return null;
+  const card = msg.cards?.[cardIdx];
+  if (!card?.task || !(msg._existingTasksSnapshot instanceof Map)) return null;
+  const targetId = card.type === 'modified' ? card.task.id
+    : cardIdx === previewOriginSingleTarget(cs, msg) ? cs?.originTaskKey : null;
+  const target = targetId ? msg._existingTasksSnapshot.get(targetId) : null;
+  return target && isLockedTargetStatus(target.status) ? target : null;
+}
+
 // ── Render card HTML for a single assistant message ──
 export function renderCardHtml(msg, msgIdx) {
   if (!msg.cards || msg.cards.length === 0) return '';
@@ -284,7 +315,11 @@ export function renderCardHtml(msg, msgIdx) {
   const renderCard = (c, cardIdx) => {
     const t = c.task;
     normalizeCardDescription(c);
-    const accepted = mask[cardIdx] !== false;
+    const lockedTarget = getLockedCardTarget(msg, cardIdx);
+    const lockedError = lockedTarget ? translate('chat.lockedTargetError', {
+      id: lockedTarget.id, status: statusLabel(lockedTarget.status),
+    }) : '';
+    const accepted = !lockedTarget && mask[cardIdx] !== false;
     const isConfirmed = confirmed[cardIdx];
     const isHint = !!c._efficiencyHint;
     const isOriginTarget = cardIdx === originPreviewIdx && !isConfirmed;
@@ -322,7 +357,7 @@ export function renderCardHtml(msg, msgIdx) {
     // (the composer's .chat-model-selector look, no native chrome).
     const stepSelector = isConfirmed
       ? `<span class="step-label card-ctl">${escapeAttr(groupNoun())}: ${currentStep === 0 ? 'Backlog' : currentStep}</span>`
-      : `<select class="step-selector preview-step-select card-ctl" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}">${stepOptionsHtml}</select>`;
+      : `<select class="step-selector preview-step-select card-ctl" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}"${lockedTarget ? ` disabled title="${escapeAttr(lockedError)}"` : ''}>${stepOptionsHtml}</select>`;
 
     const efficiencyBanner = isHint ? `<div class="efficiency-hint-banner">Performance suggestion</div>` : '';
     const hintClass = isHint ? ' task-card--efficiency' : '';
@@ -339,7 +374,7 @@ export function renderCardHtml(msg, msgIdx) {
     // Unless the user explicitly set it here (_statusEdited), prefer the live snapshot so
     // the card badge agrees with the diff modal's lock/status display, which also seeds
     // from the live task.
-    const displayStatus = (c.type === 'modified' && !c._statusEdited
+    const displayStatus = lockedTarget?.status || (c.type === 'modified' && !c._statusEdited
       ? existingMap?.get(t.id)?.status || t.status
       : t.status || existingMap?.get(t.id)?.status) || startName();
 
@@ -347,19 +382,21 @@ export function renderCardHtml(msg, msgIdx) {
     // (id badge, title, Board markdown description, tags) is identical to the Project Board.
     // Proposal-only controls ride in its head/meta/foot slots; the root and fields keep the
     // .preview-card / .preview-title / .preview-desc hooks every chat reader queries.
-    const rootClass = `${typeClass}${hintClass}${accepted ? '' : ' rejected'}${isConfirmed ? ' confirmed' : ''}${isOutOfSubtree ? ' preview-card--outside' : ''}${isSubtaskCard ? ' preview-card--subtask' : ''}`;
+    const rootClass = `${typeClass}${hintClass}${mask[cardIdx] === false ? ' rejected' : ''}${lockedTarget ? ' locked-target' : ''}${isConfirmed ? ' confirmed' : ''}${isOutOfSubtree ? ' preview-card--outside' : ''}${isSubtaskCard ? ' preview-card--subtask' : ''}`;
     const rootAttrs = `data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" data-task-id="${escapeAttr(dataTaskId)}" data-accepted="${accepted}"${isSubtaskCard ? ` data-parent-key="${escapeAttr(subtaskParentKey)}"` : ''}`;
-    const headHtml = `${efficiencyBanner}<div class="preview-card-head"><span class="change-label">${typeLabel}</span>${subtaskBadge}${isOriginTarget ? `<span class="change-target">→ ${escapeAttr(state.chatState.originTaskKey)}</span>` : ''}${isOutOfSubtree ? `<span class="change-target change-target--outside" title="${escapeAttr(translate('preview.outsideSubtree'))}">⚠ ${escapeAttr(translate('preview.outsideSubtree'))}</span>` : ''}</div>`;
+    const lockedBadge = lockedTarget
+      ? `<span class="change-target change-target--locked" title="${escapeAttr(lockedError)}">${escapeAttr(translate('chat.lockedTargetBadge', { status: statusLabel(lockedTarget.status) }))}</span>` : '';
+    const headHtml = `${efficiencyBanner}<div class="preview-card-head"><span class="change-label">${typeLabel}</span>${lockedBadge}${subtaskBadge}${isOriginTarget ? `<span class="change-target">→ ${escapeAttr(state.chatState.originTaskKey)}</span>` : ''}${isOutOfSubtree ? `<span class="change-target change-target--outside" title="${escapeAttr(translate('preview.outsideSubtree'))}">⚠ ${escapeAttr(translate('preview.outsideSubtree'))}</span>` : ''}</div>`;
     // (TPT279) .card-preview-meta flex row: status → sprint → deps → agent badge (always last,
     // static — pushed to the row end by CSS, never floated over .preview-card-actions).
     // (TPT303) Status + sprint share one non-wrapping .preview-meta-controls group, so they stay
     // on a single line under the title; only deps and the agent badge may wrap below it.
     const metaHtml = `<span class="preview-meta-controls"><span class="status card-ctl" style="--status-color:${statusColor(displayStatus)}" data-status-role="${statusRoleToken(displayStatus)}">${statusLabel(displayStatus)}</span>${stepSelector}</span>${deps}${renderAgentBadge(t)}`;
     const footHtml = isConfirmed ? '' : `<div class="preview-card-actions">
-          <button class="btn-accept-card${accepted ? ' active' : ''}" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" title="Accept">
+          <button class="btn-accept-card${accepted ? ' active' : ''}" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" title="${escapeAttr(lockedError || 'Accept')}"${lockedTarget ? ' disabled aria-disabled="true"' : ''}>
             <svg viewBox="0 0 16 16" fill="none"><polyline points="3 8 6.5 11.5 13 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
-          <button class="btn-reject-card${accepted ? '' : ' active'}" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" title="Reject">
+          <button class="btn-reject-card${mask[cardIdx] === false ? ' active' : ''}" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" title="Reject">
             <svg viewBox="0 0 16 16" fill="none"><line x1="4" y1="4" x2="12" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="12" y1="4" x2="4" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
           </button>
         </div>`;
@@ -470,6 +507,17 @@ export function renderSaveBarHtml(msg, msgIdx) {
     </div>`;
   }
 
+  const lockedIdx = msg.cards.findIndex((card, i) => msg.acceptedMask?.[i] !== false && getLockedCardTarget(msg, i));
+  if (lockedIdx >= 0) {
+    const target = getLockedCardTarget(msg, lockedIdx);
+    const error = escapeAttr(translate('chat.lockedTargetError', { id: target.id, status: statusLabel(target.status) }));
+    return `<div class="chat-save-bar" data-msg-idx="${msgIdx}">
+      <span class="save-bar-status">${error}</span>
+      <button class="btn-discard chat-discard-btn" data-msg-idx="${msgIdx}">Discard</button>
+      <button class="btn-done chat-save-btn" data-msg-idx="${msgIdx}" disabled title="${error}">Save Tasks</button>
+    </div>`;
+  }
+
   const anyConfirmed = (msg.confirmedMask || []).some(v => v);
   if (anyConfirmed) {
     return `<div class="chat-save-bar resolved" data-msg-idx="${msgIdx}">
@@ -488,7 +536,7 @@ export function attachCardHandlers() {
   // Step selector: change handler
   chatMessages.addEventListener('change', async (e) => {
     const sel = e.target.closest('.step-selector');
-    if (!sel || !state.chatState) return;
+    if (!sel || sel.disabled || !state.chatState) return;
     const msgIdx = parseInt(sel.dataset.msgIdx);
     const cardIdx = parseInt(sel.dataset.cardIdx);
     const msg = state.chatState.messages[msgIdx];
@@ -540,6 +588,12 @@ export function attachCardHandlers() {
       const card = btn.closest('.preview-card');
 
       if (acceptBtn) {
+        const target = getLockedCardTarget(msg, cardIdx, cs);
+        if (target) {
+          showToast(translate('chat.lockedTargetError', { id: target.id, status: statusLabel(target.status) }), 'error');
+          return;
+        }
+        if (acceptBtn.disabled) return;
         msg.acceptedMask[cardIdx] = true;
         card.classList.remove('rejected');
         card.dataset.accepted = 'true';
@@ -622,6 +676,7 @@ export function attachCardHandlers() {
     // ── Per-message Save Tasks button ──
     const saveBtn = e.target.closest('.chat-save-btn');
     if (saveBtn) {
+      if (saveBtn.disabled) return;
       const msgIdx = parseInt(saveBtn.dataset.msgIdx);
       // Capture tab at click time — prevents mid-save tab-switch from redirecting
       // acceptedChanges, auto-discard loop, and teardown to the wrong session.
@@ -642,7 +697,7 @@ export function attachCardHandlers() {
       const confirmed = msg.confirmedMask || [];
       const acceptedChanges = [];
       for (let i = 0; i < msg.cards.length; i++) {
-        if (mask[i] && !confirmed[i]) acceptedChanges.push({ card: msg.cards[i], cardIdx: i });
+        if (mask[i] && !confirmed[i] && !getLockedCardTarget(msg, i, cs)) acceptedChanges.push({ card: msg.cards[i], cardIdx: i });
       }
       if (acceptedChanges.length === 0) return;
 
@@ -711,6 +766,8 @@ export function attachCardHandlers() {
               hydrateModifiedCard(target.card, taskMap.get(originPlan.originTaskKey));
             }
           }
+
+          await assertEditableModifiedCards(acceptedChanges.map(({ card }) => card), taskMap);
 
           // Phase 1: ensure every new card has a unique client-side key.
           for (const { card } of acceptedChanges) {
@@ -1054,6 +1111,8 @@ export async function saveTaskChange(change, { msg } = {}) {
     hydrateModifiedCard(change, taskMap.get(originPlan.originTaskKey));
   }
 
+  await assertEditableModifiedCards([change], taskMap);
+
   // Fill in any field a `modified` proposal omitted, from the freshly-read live task
   // (C1071) — a modified card must never acquire fields (e.g. assignee) nobody changed.
   if (change.type === 'modified') hydrateModifiedCard(change, taskMap.get(change.task.id));
@@ -1278,6 +1337,16 @@ export function updateSaveBar(targetMsgIdx) {
         bar.classList.add('resolved');
         bar.innerHTML = '<span class="save-bar-status">Discarded</span>';
       }
+      return;
+    }
+
+    // Saving/rejecting the final eligible card must leave the locked-only
+    // explanation visible. A refreshed eligible target re-enables the bar.
+    const lockedOnly = count === 0 && msg.cards?.some((card, i) =>
+      msg.acceptedMask?.[i] !== false && getLockedCardTarget(msg, i));
+    if (lockedOnly || (count > 0 && bar?.querySelector('.chat-save-btn:disabled'))) {
+      if (bar) bar.outerHTML = renderSaveBarHtml(msg, targetMsgIdx);
+      else reload();
       return;
     }
 

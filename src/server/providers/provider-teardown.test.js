@@ -27,6 +27,7 @@ function loadProvider(file, { localize } = {}) {
       watchTurn: () => () => {},
     },
     '../claude-session': { normalizeProposals: x => x },
+    '../../codex-mcp-config': { buildScopedCodexMcpOverride: () => 'mcp_servers={}' },
     '../codex-env': { buildCodexEnv: () => ({ env: {} }), codexEffortArgs: () => [], toCodexEffort: level => level },
     '../context-manager': { shouldTrimContext: () => false, trimContext() {} },
     '../task-agent/attachments': {

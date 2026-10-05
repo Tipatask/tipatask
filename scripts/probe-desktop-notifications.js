@@ -7,6 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const { createDesktopNotifications } = require('../main/desktop-notifications');
 
 app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-banner-probe-')));
@@ -15,7 +16,7 @@ let surface;
 app.whenReady().then(async () => {
   console.log(`Probe PID: ${process.pid}`);
   const sources = [new BrowserWindow({ show: false }), new BrowserWindow({ show: false })];
-  const clicks = [], dismissals = [], shownMore = [];
+  const clicks = [], dismissals = [], shownMore = [], onTopSets = [];
   // (TPT484) Until the focus phase below, behave as if another app is focused.
   let projectFocus = false;
   const surfaceSent = new Map();
@@ -34,7 +35,8 @@ app.whenReady().then(async () => {
     projectWindows: () => sources,
     onClick: entry => { clicks.push(entry); BrowserWindow.fromId(entry.origin.windowId)?.show(); },
     onDismiss: (entry, { keepCard } = {}) => { if (!keepCard) dismissals.push(entry); },
-    onShowMore: entry => { shownMore.push(entry); return null; } });
+    onShowMore: entry => { shownMore.push(entry); return null; },
+    onSetOnTop: on => onTopSets.push(on) });
   for (const w of sources) await w.loadURL('data:text/html,<title>Notification probe</title><p>Isolated notification test</p>');
   sources[0].show();
   sources[0].minimize();
@@ -83,10 +85,30 @@ app.whenReady().then(async () => {
   await delay(100);
   assert.equal(shownMore[0].notificationId, 'probe-17', 'Show More targets the newest remaining entry');
   assert.equal(surface.snapshot().length, 18);
-  await js("document.querySelector('.tt-notif-page-clear').click()");
+  // (TPT505) The banner offers Hide and a checked "Show" toggle, never Clear All. Hide keeps
+  // every alert and raises or focuses no window; a new send brings the banner back.
+  assert.equal(await js("document.querySelector('.tt-notif-page-clear')"), null);
+  assert.equal(await js("document.querySelector('.tt-notif-page-ontop input').checked"), true);
+  const focusedBeforeHide = BrowserWindow.getFocusedWindow()?.id;
+  await js("document.querySelector('.tt-notif-page-hide').click()");
+  await delay(150);
+  assert.equal(stack.isVisible(), false, 'Hide hides the banner');
+  assert.equal(surface.snapshot().length, 18, 'Hide keeps every alert');
+  assert.equal(BrowserWindow.getFocusedWindow()?.id, focusedBeforeHide, 'Hide focuses no window');
+  assert.equal(clicks.length, 1);
+  await surface.show({ title: 'TPT505: after Hide', tag: 'probe-after-hide', notificationId: 'probe-after-hide' },
+    { windowId: sources[0].id, projectPath: '/probe/A' });
+  await delay(100);
+  assert.equal(stack.isVisible(), true, 'a new alert re-shows the banner');
+  await js("const i = document.querySelector('.tt-notif-page-ontop input'); i.click()");
+  await delay(100);
+  assert.deepEqual(onTopSets, [false], 'unchecking Show asks main to turn Show on Top off');
+  for (const { id } of surface.snapshot()) {
+    ipcMain.emit('notify:desktop-action', { sender: stack.webContents, senderFrame: stack.webContents.mainFrame }, { id, action: 'close' });
+  }
   await delay(100);
   assert.equal(surface.snapshot().length, 0);
-  assert.equal(dismissals.length, 19);
+  assert.equal(dismissals.length, 20);
   assert.equal(stack.isVisible(), false);
   // Task completion removes both visible and overflow cards, preserving other projects.
   for (let i = 0; i < 9; i++) {
@@ -122,8 +144,18 @@ app.whenReady().then(async () => {
   assert.equal(await js("[...document.querySelectorAll('.tt-notif-card')].map(c => c.dataset.id).join(',')"), before.split(',').slice(0, 5).join(','));
   if (hostId) assert.equal(surfaceSent.get(hostId).active, false);
   assert.equal(stack.isFocused(), false, 'the banner never takes focus');
-  await js("document.querySelector('.tt-notif-page-clear').click()");
+  // (TPT505) The banner is a non-activating panel on macOS; it must stay up while another app
+  // is frontmost (no hide-on-deactivate).
+  if (process.platform === 'darwin' && process.env.PROBE_SKIP_DEACTIVATE !== '1') {
+    execFileSync('osascript', ['-e', 'tell application "Finder" to activate']);
+    await delay(600);
+    surface.syncNotificationSurface({ immediate: true });
+    await delay(100);
+    assert.equal(stack.isVisible(), true, 'banner stays visible while another app is frontmost');
+  }
+  await js("document.querySelector('.tt-notif-page-hide').click()");
   await delay(100);
+  assert.equal(stack.isVisible(), false);
   surface.setEnabled(false);
   const off = { windowId: sources[0].id, projectPath: '/probe/A' };
   assert.equal((await surface.show({ title: 'TipATask probe', body: 'Show on Top off', tag: 'probe-native' }, off)).delivery, 'native');
@@ -132,7 +164,7 @@ app.whenReady().then(async () => {
   assert.equal(natives.length, 2);
   await delay(500);
   surface.setEnabled(true);
-  console.log(`PASS: five-card page, uk count, no scroll, persistence, focus, origins, isolated preload, click/close, Show More, Clear All, task dismissal and refill, focus flip between in-app and banner, native delivery when Show on Top is off (OS 'show' events: ${natives.filter((n) => n.probeShown).length}/2). Screenshot: ${screenshot}`);
+  console.log(`PASS: five-card page, uk count, no scroll, persistence, focus, origins, isolated preload, click/close, Show More, Hide (no focus) and Show toggle, task dismissal and refill, focus flip between in-app and banner, banner kept over another app, native delivery when Show on Top is off (OS 'show' events: ${natives.filter((n) => n.probeShown).length}/2). Screenshot: ${screenshot}`);
 }).then(() => { surface?.dispose(); app.exit(0); }).catch(error => {
   console.error(error);
   surface?.dispose();

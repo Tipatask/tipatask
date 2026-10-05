@@ -6,7 +6,7 @@ import { queueReasonText } from './queue-reason.js';
 import { agentModelOptions, ensureAgentModels, EFFORT_LEVELS, EFFORT_LABELS } from './constants.js';
 import { statusNames, statusLabel, statusColor, isInProgressName, startName } from './status-registry.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
-import { escapeAttr, insertAtCursor, autoGrowTextarea, renderMarkdown, renderSprintCombobox, initSprintCombobox, showToast, showBoardLoader, hideBoardLoader, showActionBanner, hideActionBanner, taskOpenErrorLabel, sprintRecordMax } from './utils.js';
+import { escapeAttr, insertAtCursor, renderMarkdown, renderSprintCombobox, initSprintCombobox, showToast, showBoardLoader, hideBoardLoader, showActionBanner, hideActionBanner, taskOpenErrorLabel, sprintRecordMax } from './utils.js';
 import { api } from './api-client.js';
 import { isTaskDiscussing, lockIntentOf, lockMessageKey } from './discuss-lock.js';
 import { buildMentionCandidates, highlightMentionsInHtml, AGENT_HANDLES } from './mention-highlight.js';
@@ -204,6 +204,13 @@ function _disconnectCommentSeenObserver() {
   _commentSeenObserver = null;
 }
 
+// (TPT499) IntersectionObserver root for a Comments/Notifications tab panel: the panel itself
+// when it is the scrolling element (inside .modal-scroll-body), else the nearest wrapper.
+function _tabScrollRoot(modal, panel) {
+  if (panel?.parentElement?.classList.contains('modal-scroll-body')) return panel;
+  return modal.querySelector('.modal-scroll-body') || modal.querySelector('.task-edit-panel') || null;
+}
+
 function _observeVisibleComments(modal) {
   _disconnectCommentSeenObserver();
   if (!modal || !_modalState || typeof IntersectionObserver === 'undefined') return;
@@ -212,9 +219,9 @@ function _observeVisibleComments(modal) {
   const items = [...panel.querySelectorAll('.comment-item')];
   if (!items.length) return;
 
-  // (TPT54) .modal-scroll-body is now the actual scrolling viewport; fall back to the
-  // panel for any render path that lacks the wrapper.
-  const root = modal.querySelector('.modal-scroll-body') || modal.querySelector('.task-edit-panel') || null;
+  // (TPT499) The Comments panel is its own scroll region; .modal-scroll-body only scrolls as a
+  // short-viewport fallback, so it (then the panel) is the fallback root.
+  const root = _tabScrollRoot(modal, panel);
   _commentSeenObserver = new IntersectionObserver((entries, observer) => {
     let changed = false;
     for (const entry of entries) {
@@ -313,9 +320,8 @@ function _observeVisibleEvents(modal) {
   const items = [...panel.querySelectorAll('.notif-event-item')];
   if (!items.length) return;
 
-  // (TPT54) .modal-scroll-body is now the actual scrolling viewport; fall back to the
-  // panel for any render path that lacks the wrapper.
-  const root = modal.querySelector('.modal-scroll-body') || modal.querySelector('.task-edit-panel') || null;
+  // (TPT499) Same as _observeVisibleComments(): the Notifications panel is the scroll region.
+  const root = _tabScrollRoot(modal, panel);
   _notifSeenObserver = new IntersectionObserver((entries, observer) => {
     let changed = false;
     for (const entry of entries) {
@@ -1701,6 +1707,29 @@ function _modalUpdateButtonStates(saveBtn, resetBtn) {
   _syncPaneDots(document.getElementById('task-edit-modal'));
 }
 
+// (TPT499) Scroll position of a scroll region as a 0..1 fraction (0 when it doesn't scroll).
+function _scrollRatio(el) {
+  const range = el.scrollHeight - el.clientHeight;
+  return range > 0 ? el.scrollTop / range : 0;
+}
+function _applyScrollRatio(el, ratio) {
+  el.scrollTop = Math.round(ratio * Math.max(0, el.scrollHeight - el.clientHeight));
+}
+
+// (TPT499) Grow the description editor to its content. Unlike utils.js autoGrowTextarea(), it
+// leaves overflow-y to CSS: in the modal's flex body the textarea can be shrunk below this height
+// when the panel hits its cap, and must still scroll then. The diff view keeps its 40vh cap
+// (styles.css .task-edit-panel--diff .modal-desc-textarea); the plain view has none — the panel's
+// cap and flex shrink bound it.
+function _growDescTextarea(ta, isDiff) {
+  if (!ta?.isConnected) return;
+  const scrollTop = ta.scrollTop;
+  ta.style.height = 'auto';
+  const cap = isDiff ? window.innerHeight * 0.4 : Infinity;
+  ta.style.height = Math.min(ta.scrollHeight, cap) + 'px';
+  ta.scrollTop = scrollTop;
+}
+
 function _attachModalHandlers(modal) {
   const overlay  = modal.querySelector('.task-edit-overlay');
   const titleInput = modal.querySelector('.modal-title-input');
@@ -1836,6 +1865,9 @@ function _attachModalHandlers(modal) {
       ? _caretOffsetFromClick(evt, rawDesc) : null;
     // Measure before any DOM changes so layout is stable
     const displayHeight = descDisplay.getBoundingClientRect().height;
+    // (TPT499) The description is a scroll region now — carry its scroll position into the
+    // editor (as a fraction: rendered markdown and raw text differ in height) and back out.
+    const displayScrollRatio = _scrollRatio(descDisplay);
     const ta = document.createElement('textarea');
     ta.id = 'modal-desc-textarea';
     ta.className = 'modal-desc-textarea';
@@ -1852,6 +1884,8 @@ function _attachModalHandlers(modal) {
     // mic button above it — that adds height the displayHeight pin above didn't account for.
     // Subtract the wrap's overhead so the TOTAL swapped-in block still matches displayHeight.
     const micWrap = ta.closest('.audio-rec-wrap');
+    // (TPT499) The wrap stands in for the display in .modal-scroll-body's flex column.
+    micWrap?.classList.add('modal-desc-edit-wrap');
     if (micWrap) {
       const overhead = micWrap.getBoundingClientRect().height - ta.getBoundingClientRect().height;
       ta.style.height = Math.max(0, displayHeight - overhead) + 'px';
@@ -1869,13 +1903,11 @@ function _attachModalHandlers(modal) {
     // today's top-anchored behavior instead of an arbitrary position.
     ta.setSelectionRange(caretOffset ?? 0, caretOffset ?? 0);
     ta.focus();
-    if (caretOffset == null) ta.scrollTop = 0;
+    if (caretOffset == null) _applyScrollRatio(ta, displayScrollRatio);
     ta.addEventListener('input', () => {
       _modalState.draft.description = ta.value;
-      // (C1470) Auto-grow while typing so leaving edit mode isn't a jump either — cap
-      // mirrors .modal-desc-display's max-height (60vh plain, 40vh in the narrower diff
-      // columns, see styles.css .task-edit-panel--diff .modal-desc-textarea).
-      autoGrowTextarea(ta, window.innerHeight * (_modalState.compareTask ? 0.4 : 0.6));
+      // (C1470) Auto-grow while typing so leaving edit mode isn't a jump either.
+      _growDescTextarea(ta, !!_modalState.compareTask);
       upd();
       if (_modalState.compareTask) _scheduleModalDiffRecompute(modal, { description: true });
     });
@@ -1887,6 +1919,7 @@ function _attachModalHandlers(modal) {
       // recording live, else field ripped out from under createLiveInserter.
       if (micHandle?.isActive) { upd(); return; }
       const wrap = ta.closest('.audio-rec-wrap') || ta; // (C1212) remove mic wrap too, not just ta
+      const editorScrollRatio = _scrollRatio(ta);
       if (_modalState.compareTask) {
         descDisplay.style.display = '';
         wrap.remove();
@@ -1896,6 +1929,7 @@ function _attachModalHandlers(modal) {
         descDisplay.style.display = '';
         wrap.remove();
       }
+      _applyScrollRatio(descDisplay, editorScrollRatio);
       upd();
       if (restoreDisplayFocus) descDisplay.focus();
     });

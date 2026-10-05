@@ -83,6 +83,7 @@ function validateCredentials(projectRoot, opts = {}) {
     if (err && err.missingCredentials) {
       return { ok: false, reason: err.message, reasonCode: 'missing' };
     }
+    if (err?.authError) return { ok: false, reason: err.message, reasonCode: err.reasonCode };
     // Unexpected read failure — don't seal on something this module can't name.
     return { ok: true, reason: null, reasonCode: 'unreadable' };
   }
@@ -127,9 +128,6 @@ function formatTokenExpiry(ms, now = Date.now()) {
 // null when the token carries no `exp`). Callers that ignore the result keep the old contract.
 async function assertCredentialsUsable(backend, opts = {}) {
   const now = typeof opts.now === 'number' ? opts.now : Date.now();
-  if (backend && typeof backend.getConnectionState === 'function' && backend.getConnectionState() === 'unauthorized') {
-    throw new AuthCorruptedError('Authentication expired or invalid — sign in again.', { reasonCode: 'unauthorized' });
-  }
   let creds;
   try {
     creds = backend.getCredentials();
@@ -137,6 +135,7 @@ async function assertCredentialsUsable(backend, opts = {}) {
     if (err && err.missingCredentials) {
       throw new AuthCorruptedError(err.message, { reasonCode: 'missing' });
     }
+    if (err?.authError) throw new AuthCorruptedError(err.message, { reasonCode: err.reasonCode });
     // Unexpected read failure — not this gate's call to make; let the spawn proceed
     // and fail at the real request layer instead of blocking on an unrelated error.
     return { refreshed: false, expiresAt: null };
@@ -149,6 +148,11 @@ async function assertCredentialsUsable(backend, opts = {}) {
       throw new AuthCorruptedError(`API token expired at ${formatTokenExpiry(expMs, now)} — sign in again.`, { reasonCode: 'expired' });
     }
     throw new AuthCorruptedError(verdict.reason || 'Authentication invalid', { reasonCode: verdict.reasonCode });
+  }
+  // Resolve first: token watchers can clear a stale latch after re-auth, and a
+  // missing store must not be mislabeled as an expired token.
+  if (backend?.getConnectionState?.() === 'unauthorized') {
+    throw new AuthCorruptedError('API rejected this account — sign in again.', { reasonCode: 'unauthorized' });
   }
   if (expMs == null) return { refreshed: false, expiresAt: null }; // opaque / no-exp: nothing to judge
   const remaining = expMs - now;

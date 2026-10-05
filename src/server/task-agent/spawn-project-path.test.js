@@ -41,8 +41,16 @@ function mcpConfigArg(args) {
 }
 
 test('projectEnvExtras: empty for falsy path, populated from project config.json', () => {
-  assert.deepStrictEqual(projectEnvExtras(''), {});
-  assert.deepStrictEqual(projectEnvExtras(null), {});
+  const empty = makeProjectDir({});
+  const previousRoot = process.env.TIPATASK_PROJECT_ROOT;
+  try {
+    process.env.TIPATASK_PROJECT_ROOT = empty;
+    assert.ok(projectEnvExtras('').API_TOKEN === '', 'empty project must not inherit a credential');
+    assert.ok(projectEnvExtras(null).TIPATASK_API_TOKEN === '', 'empty project must not inherit an alias');
+  } finally {
+    if (previousRoot === undefined) delete process.env.TIPATASK_PROJECT_ROOT; else process.env.TIPATASK_PROJECT_ROOT = previousRoot;
+    fs.rmSync(empty, { recursive: true, force: true });
+  }
 
   const dir = makeProjectDir({ API_PROJECT_ID: '7', API_TOKEN: 'tok', projectName: 'X' });
   try {

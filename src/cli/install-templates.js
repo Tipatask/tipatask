@@ -371,6 +371,7 @@ function buildHarnessPlaceholders(projectRoot, serverRoot) {
     PROJECT_ROOT: toPosix(root),
     TASK_APP_PATH: serverPath,
     SERVER_ROOT: serverPath,
+    USER_DATA_ROOT: toPosix(require('../server/account-store').userDataRoot({ serverRoot: server })),
     SERVER_NODE_WRAPPER: process.platform === 'win32' ? 'mcp-node.cmd' : 'mcp-node',
   };
 }

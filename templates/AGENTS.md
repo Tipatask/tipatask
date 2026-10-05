@@ -57,19 +57,35 @@ Skipping this step = completed task with stale tags = broken architecture naviga
 
 ## Resolution Comment
 
-Before/with the final `update_task(status='completed')` call: call `create_task_comment(task_key, content)` with a real report, in plain English prose, covering: what was implemented and why, key files touched, how to verify, and any follow-ups/caveats (write "none" if there are none). Defaults to `type='resolution'`. This is Claude/Codex explaining itself in the task, distinct from the Task App's automatic terminal-tail resolution comment posted on session end.
+Pass one resolution report to `tipatask-local.complete_task(task_key, resolution)` (or `tt complete` for Pi), in plain English prose, covering: what was implemented and why, key files touched, how to verify, and any follow-ups/caveats (write "none" if there are none). The completion guard posts the resolution and status together. This is the executing agent explaining itself in the task, distinct from the Task App's automatic terminal-tail resolution comment posted on session end.
 
 To read how earlier tagged tasks were resolved, call `list_task_resolutions(tags=[...])` — that is where per-task narrative is stored and read back, not `ai/architecture/*.md`.
 
-## MCP 401 Fallback (expired `API_TOKEN`)
+## Agent context and credentials
 
-The remote `tipatask` MCP server authenticates with the project token that was in the environment when your session **launched** (a 7-day JWT, read once at start). If every `tipatask` MCP call fails with HTTP 401 / `rejected the Authorization header` (the API's own reply reads `API token expired at <time>`), the token expired and you cannot reconnect from inside the session. Finish through REST using the **current** credentials in `.tipatask/config.json` (`API_BASE_URL`, `API_PROJECT_ID`, `API_TOKEN`) — not the frozen env value, and not the Task App's own `.env` (no credentials there). Never print the token.
+Claude loads `CLAUDE.md`; Codex loads `AGENTS.md`; Pi loads its native project guides (`AGENTS.md`, with `CLAUDE.md` fallback). Tipatask injects the task or chat contract separately. Gemini is supported only for objective planning; its launch loads `AGENTS.md`/`GEMINI.md` and injected planning context, with read tools and no Tipatask MCP/REST tools. It is not a task-execution or task/project-chat provider.
 
-1. `POST {API_BASE_URL}/api/projects/{API_PROJECT_ID}/tasks/{KEY}/comments` with `{"content": "<resolution report>", "type": "resolution"}` → expect `201`.
-2. `PATCH {API_BASE_URL}/api/projects/{API_PROJECT_ID}/tasks/{KEY}` with `{"status": "completed"}` (the project's complete-status name) → expect `200`.
-3. `GET {API_BASE_URL}/api/projects/{API_PROJECT_ID}/tasks/{KEY}` and confirm the returned `status`.
+Apply system/developer and explicit user instructions first. Within the project workflow, the current injected session contract and verified VCS settings take precedence over generic guide defaults. Planning approval forbids mutations, including task status writes. Objective chat proposes work; task/project chat may change tasks but cannot edit code or run Git, even when a general guide describes coding tasks. Claude/Codex task terminals use MCP; Pi uses the credential-safe REST command in its launch prompt. Do not treat missing MCP in Pi or Gemini as a setup error.
 
-Send `Authorization: Bearer <token>` on each call. If REST also answers `401 API token expired at …`, tell the user to sign in again (Project ▸ Re-authenticate / Change Account) instead of retrying.
+The selected project's `.tipatask/config.json` stores `API_BASE_URL` and `API_PROJECT_ID`. The signed-in token lives in `.tipatask-account.json` under `TIPATASK_USER_DATA`, keyed by API server. Never print/copy a token, commit it, or read it from a legacy `.env`. A legacy project-scoped token cannot authorize another project: sign in again to obtain an account token. Opening an old checkout must not change the signed-in account.
+
+Claude's generated MCP header helper reads the current account on connect/reconnect. Codex reads its bearer environment at launch; restart it after token/account rotation. Direct Codex/Pi shells need the shipped `src/cli/launch-agent.js <provider> --project-root <directory>` launcher, run with the installing app's Node runtime (packaged Electron uses `ELECTRON_RUN_AS_NODE=1`). The launcher reads non-secret runtime/user-data paths from generated `.mcp.json`; refresh the agent harness if those paths are stale. A plain Codex command with no launch environment is not a supported authenticated Tipatask launch.
+
+## Credential recovery and completion
+
+A missing account store or wrong `TIPATASK_USER_DATA` is not token expiry. Check the selected project and generated local MCP paths (`TIPATASK_PROJECT_ROOT`, `TIPATASK_SERVER_ROOT`, `TIPATASK_USER_DATA`) without displaying credentials. For an actual expired/rejected token or scope mismatch, use Project → Re-authenticate / Change Account, then reconnect Claude or restart the affected agent. Do not retry with an inherited token from another project.
+
+When remote MCP is unavailable, use the shipped `src/cli/task-tools.js` through the installing runtime. It reads live credentials internally; requests accept a project-relative method/path and JSON bodies on stdin, never a token argument. Task terminals receive `TIPATASK_TOOL_EXEC` and `TIPATASK_SERVER_ROOT`:
+
+```sh
+tt() { ELECTRON_RUN_AS_NODE=1 "$TIPATASK_TOOL_EXEC" "$TIPATASK_TOOL_SCRIPT" "$@"; }
+tt GET "/tasks/$TIPATASK_TASK_ID"
+tt verify "$TIPATASK_TASK_ID"
+tt complete "$TIPATASK_TASK_ID" < /path/to/resolution.txt
+```
+
+Require live verified VCS settings before Git writes and successful completion verification before finishing. Use `tipatask-local.complete_task(task_key, resolution)` for MCP agents, or `tt complete` for Pi/REST recovery; both run the same guard and post one plain-English resolution plus the configured completion status. Never bypass this guard by directly PATCHing a completed status. If local verification is unavailable or requires a runtime restart, leave the task incomplete and report the reason.
+
 
 ## Knowledge Base Hygiene
 
@@ -152,4 +168,4 @@ Never invent `tt-*` tags without first calling `list_system_tags` to verify no e
 
 ### Status discipline
 
-Every task touched = status updated before response ends. `in_progress` when starting, `completed` or `on_fire` before sending reply. Status update via `update_task` MCP tool. Verify completion against the active project only — `get_task` after `update_task`. `create_task_comment` (full resolution report — see "Resolution Comment" above) fires before/with the `completed` status update.
+For task execution after plan approval, keep task status current; planning and chat follow their session contract. `in_progress` when starting, `completed` or `on_fire` before sending reply. Use `update_task` for non-completion status changes; complete through the guarded completion tool with one resolution report.

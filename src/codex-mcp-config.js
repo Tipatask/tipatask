@@ -630,6 +630,24 @@ function tomlValue(value) {
   return JSON.stringify(value);
 }
 
+// Replace the complete MCP map for a headless turn. Codex -c dotted keys do not
+// parse TOML quotes, so quoting a server name there creates a different invalid
+// entry. A single inline table excludes every third-party entry without editing
+// the user's config (including names containing dots, spaces or quotes).
+function buildScopedCodexMcpOverride(projectRoot, profile) {
+  const parsed = toml.parse(fs.readFileSync(path.join(projectRoot, '.codex/config.toml'), 'utf8'));
+  const all = parsed.mcp_servers || {};
+  const selected = {};
+  for (const name of profile.mcpServers) {
+    if (!all[name]) continue;
+    const entry = { ...all[name], enabled: true };
+    if (name === TIPATASK_MCP_NAME) entry.disabled_tools = profile.remoteDisabledTools;
+    if (name === TIPATASK_MCP_LOCAL_NAME) entry.enabled_tools = profile.localEnabledTools;
+    selected[name] = entry;
+  }
+  return `mcp_servers=${tomlValue(selected)}`;
+}
+
 // Project-local CODEX_HOME hides user defaults. Backfill absent preferences on
 // upgrades as well as first setup. Existing values remain project-owned because
 // older configs have no provenance proving they are safe to replace.
@@ -772,7 +790,7 @@ function buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath } = {}
   const computedServerRoot = path.resolve(path.dirname(resolvedMcpServerPath), '../..');
   // The account token is shared by projects on one API server. A shell-launched Codex
   // does not inherit Electron's userData path, so the local MCP needs it explicitly.
-  const userDataRoot = path.resolve(process.env.TIPATASK_USER_DATA || computedServerRoot);
+  const userDataRoot = require('./server/account-store').userDataRoot({ serverRoot: computedServerRoot });
 
   // ── Packaged-asar branch ───────────────────────────────────────────────────
   // When the MCP server path is inside an .asar archive, plain-node / shell wrappers
@@ -859,28 +877,10 @@ function updateGlobalCodexMcpApprovalConfig({ targetPath, projectRoot, mcpServer
   let out = removeTomlSections(existing, isMcpToolApprovalSection);
   out = removeTopLevelTomlKey(out, 'default_tools_approval_mode');
 
-  // C1382 — the remote 'tipatask' section is fully app-owned and must always reflect
-  // the current project URL and secret-free bearer env-var contract. Unlike the local
-  // section below, there is no
-  // "leave a hand-tuned section alone" case to protect here, so this upsert is
-  // UNCONDITIONAL rather than gated on mcpSectionHasCommand — gating it, the way the
-  // pre-C1382 code did, means an existing install's 'tipatask' section (which already
-  // has a `command =` line from the old stdio config) never gets migrated at all.
-  if (projectRoot) {
-    const remote = buildCodexMcpSection({ projectRoot });
-    out = upsertTomlSection(out, remote.sectionName, remote.sectionLines);
-  }
-
-  // Local section: repair-only, same discipline as the pre-C1382 single-section code —
-  // write a full block only when the section is absent or has no command/url (bare
-  // approval-only stub), so a hand-tuned local override survives. This happens when the
-  // Electron app runs on a machine where `npm run setup` was never executed (only
-  // app-spawned Codex tasks have run).
-  const localSectionName = `mcp_servers.${TIPATASK_MCP_LOCAL_NAME}`;
-  if (!mcpSectionHasCommand(out, localSectionName) && projectRoot) {
-    const local = buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath });
-    out = upsertTomlSection(out, local.sectionName, local.sectionLines);
-  }
+  // Project registrations belong only to the project home. A global last-opened
+  // project would route a plain shell launched in another checkout to the wrong API.
+  out = removeTomlSections(out, name =>
+    /^mcp_servers\.(tipatask|tipatask-local)(\.|$)/.test(name));
 
   out = removeTipataskTransportKeys(out);
 
@@ -996,6 +996,7 @@ module.exports = {
   ensureProjectCodexHome,
   getCodexPaths,
   listProjectMcpServerNames,
+  buildScopedCodexMcpOverride,
   mcpSectionHasCommand,
   mergeGlobalMcpServerTables,
   mergeGlobalCodexPreferences,

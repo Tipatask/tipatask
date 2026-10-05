@@ -66,7 +66,7 @@ test('headersHelper supported: --mcp-config is the derived file, only tipatask c
   const helper = derived.mcpServers.tipatask.headersHelper;
   assert.match(helper, /auth-header-helper\.js/);
   assert.ok(helper.includes(dir), 'helper is bound to this project root');
-  assert.equal(derived.mcpServers.tipatask.headers.Authorization, 'Bearer ${API_TOKEN}', 'static header kept as fallback');
+  assert.equal(derived.mcpServers.tipatask.headers.Authorization, '', 'static credentials cleared to fail closed');
   assert.equal('headersHelper' in derived.mcpServers['tipatask-local'], false);
 
   // The token in the spawn env is the one now in config.json — the launch-preflight contract.

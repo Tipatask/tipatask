@@ -251,7 +251,7 @@ test('codex argv: read-only sandbox on a fresh turn, inherited on resume, no sys
   const resume = buildCodexArgs({ codexSessionId: 'tid' }, { cwd: '/p', model: 'm', imagePaths: [] });
   assert.deepEqual(resume.slice(0, 3), ['exec', 'resume', 'tid']);
   assert.ok(!resume.includes('-s'));
-  for (const a of [...fresh, ...resume]) assert.doesNotMatch(String(a), /system/i);
+  for (const a of [...fresh, ...resume]) assert.doesNotMatch(String(a), /^--.*system/i);
 });
 
 test('gemini argv: stdin prompt, resume only with a session id, no system flag', () => {

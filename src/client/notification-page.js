@@ -1,6 +1,7 @@
-// (TPT484) The one compact notification page, rendered identically by the always-on-top banner
+// (TPT484) The one compact notification page, rendered by the always-on-top banner
 // (src/client/desktop-notifications.js) and the in-app panel (notification-center.js): count
-// header with Clear All, the newest cards, and Show More. Styles: notification-cards.css; the
+// header with Clear All (the banner: Hide, TPT505), the newest cards, and a footer row with Show
+// More (the banner adds its "Show" on-top checkbox there). Styles: notification-cards.css; the
 // fixed heights are mirrored by pageHeight() in main/desktop-notifications.js.
 
 import { t, tc } from './i18n.js';
@@ -123,9 +124,13 @@ function _reveal(cards) {
 
 // Renders `entries` (newest first, each with a stable `id`) into `host`, reusing card nodes by
 // id so an arrival never re-creates (flashes) a visible card. `act(id, action)` receives
-// 'click' | 'close' | 'clear-all' | 'show-more'. `paged: false` shows every entry (the stack
-// scrolls) for the browser-mode local list; `header: false` hides the count/Clear All row.
-export function renderNotificationPage(host, entries, act, { paged = true, header = true } = {}) {
+// 'click' | 'close' | 'clear-all' | 'hide' | 'show-more' | 'on-top-off'. `paged: false` shows
+// every entry (the stack scrolls) for the browser-mode local list; `header: false` hides the
+// count row. `headerAction` picks the header button: 'clear-all' (default) or 'hide' (the banner,
+// TPT505 — keeps every alert). `onTopToggle` adds the footer's checked "Show" box (banner only);
+// unchecking it acts 'on-top-off'.
+export function renderNotificationPage(host, entries, act,
+  { paged = true, header = true, headerAction = 'clear-all', onTopToggle = false } = {}) {
   let page = host.querySelector(':scope > .tt-notif-page');
   if (!entries.length) { page?.remove(); return null; }
   const model = paged ? desktopPageModel(entries)
@@ -137,23 +142,43 @@ export function renderNotificationPage(host, entries, act, { paged = true, heade
     head.className = 'tt-notif-page-header';
     const count = document.createElement('span');
     count.className = 'tt-notif-page-count';
-    const clear = _button('tt-notif-page-clear', () => page._act(null, 'clear-all'));
-    head.append(count, clear);
+    const action = _button('', () => page._act(null, page._headerAction));
+    head.append(count, action);
     const cards = document.createElement('div');
     cards.className = 'tt-notif-page-cards';
+    const footer = document.createElement('div');
+    footer.className = 'tt-notif-page-footer';
+    const onTop = document.createElement('label');
+    onTop.className = 'tt-notif-page-ontop';
+    const onTopInput = document.createElement('input');
+    onTopInput.type = 'checkbox';
+    const onTopText = document.createElement('span');
+    onTop.append(onTopInput, onTopText);
+    onTopInput.addEventListener('change', () => { if (!onTopInput.checked) page._act(null, 'on-top-off'); });
     const more = _button('tt-notif-page-more', () => page._act(null, 'show-more'));
-    page.append(head, cards, more);
+    footer.append(onTop, more);
+    page.append(head, cards, footer);
     page._handlers = { onActivate: (e) => page._act(e.id, 'click'), onClose: (e) => page._act(e.id, 'close') };
-    Object.assign(page, { _head: head, _count: count, _clear: clear, _cards: cards, _more: more });
+    Object.assign(page, { _head: head, _count: count, _action: action, _cards: cards, _footer: footer,
+      _onTop: onTop, _onTopInput: onTopInput, _onTopText: onTopText, _more: more });
     host.appendChild(page);
   }
+  const hide = headerAction === 'hide';
   page._act = act;
+  page._headerAction = hide ? 'hide' : 'clear-all';
   page.classList.toggle('is-paged', paged);
   page._head.hidden = !header;
   page._count.textContent = tc('notifCenter.count', model.total);
-  page._clear.textContent = t('notifCenter.clearAll');
+  page._action.className = hide ? 'tt-notif-page-hide' : 'tt-notif-page-clear';
+  page._action.textContent = t(hide ? 'notifCenter.hide' : 'notifCenter.clearAll');
+  page._onTop.hidden = !onTopToggle;
+  page._onTop.title = t('notifCenter.showOnTopTitle');
+  page._onTopText.textContent = t('notifCenter.showOnTop');
+  // Shown only while "Show on Top" is on, so it always renders checked.
+  page._onTopInput.checked = true;
   page._more.textContent = t('notifCenter.showMore', { n: model.hidden });
   page._more.hidden = !model.hasMore;
+  page._footer.hidden = !onTopToggle && !model.hasMore;
 
   const existing = new Map([...page._cards.children].map((el) => [el.dataset.id, el]));
   const created = [];

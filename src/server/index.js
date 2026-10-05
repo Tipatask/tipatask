@@ -164,10 +164,13 @@ const { createLocalAccess, LOCAL_HOST } = require('./local-access');
 
 const backend = createBackend(config);
 const sessions = new Map();
+const sessionValidation = require('./session-validation').createSessionValidationRecorder();
 const memoryTelemetry = createMemoryTelemetry({
   getSessions: () => sessions,
   isRunning: session => sessionQueue.isRunning(session),
-  tracker: createSessionMemoryTracker({ historyFile: path.join(config.USER_DATA_ROOT, 'memory-peaks.json') }),
+  tracker: createSessionMemoryTracker({ historyFile: path.join(config.USER_DATA_ROOT, 'memory-peaks.json'),
+    onLifecycle: sessionValidation.status().enabled ? event => sessionValidation.lifecycle(event) : null }),
+  onSample: sessionValidation.status().enabled ? snapshot => sessionValidation.sample(snapshot, admission.snapshot(), sessions) : null,
 });
 setSessionMemoryTracker(memoryTelemetry.tracker);
 const admission = require('./session-admission').createSessionAdmission({
@@ -177,7 +180,7 @@ const admission = require('./session-admission').createSessionAdmission({
   onChange: drainSessionQueue,
 });
 sessionQueue.setAdmission(admission);
-const stopMemoryAdmission = () => { admission.stop(); memoryTelemetry.stop(); };
+const stopMemoryAdmission = () => { admission.stop(); memoryTelemetry.stop(); sessionValidation.stop(); };
 // Exit also covers fatal startup errors and the crash guard's explicit process.exit.
 process.once('exit', stopMemoryAdmission);
 
@@ -695,7 +698,10 @@ if (process.platform === 'win32') {
       killRunawaySession,
       pauseRunawaySession,
       emitTerminalNotice,
-      emitSessionRunaway: websocket.emitSessionRunaway,
+      emitSessionRunaway(projectPath, detail) {
+        sessionValidation.watchdog(detail);
+        websocket.emitSessionRunaway(projectPath, detail);
+      },
     });
   }, 30000);
 }

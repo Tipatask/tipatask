@@ -210,3 +210,8 @@ export function statusRoleToken(name) {
 }
 
 export { LEGACY_STATUSES, LEGACY_ROLE_NAMES, ROLE_COLUMN };
+
+// Objective edits are forbidden once work starts or the task is closed.
+export function isLockedTargetStatus(name) {
+  return !!name && (name === inProgressName() || isClosedName(name));
+}

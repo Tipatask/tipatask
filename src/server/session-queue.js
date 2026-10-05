@@ -127,6 +127,7 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
           touched.add(entry.projectPath);
           entry.session._queued = false;
           entry.session._launching = true; // counted as running from this tick on
+          entry.session._admittedAt = Date.now();
           for (const e of entries) touched.add(e.projectPath); // positions behind it shifted
           entry.promise = Promise.resolve().then(() => entry.start());
           entry.promise.catch(err => {

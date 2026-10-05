@@ -35,7 +35,7 @@ function nativeClass({ supported = true } = {}) {
 }
 
 function fixture({ fail = false, settingsFile = null, showMoreTarget = null, loadGate = null, projects = [],
-  native = nativeClass() } = {}) {
+  native = nativeClass(), platform = 'darwin' } = {}) {
   const windows = [];
   class BrowserWindow extends EventEmitter {
     constructor(options) { super(); this.options = options; this.webContents = new EventEmitter();
@@ -55,13 +55,14 @@ function fixture({ fail = false, settingsFile = null, showMoreTarget = null, loa
   const screen = new EventEmitter();
   const display = { id: 1, workArea: { x: 100, y: 20, width: 1024, height: 768 } };
   screen.getAllDisplays = () => [display]; screen.getPrimaryDisplay = () => display;
-  const clicked = [], dismissed = [], shownMore = [], released = [];
+  const clicked = [], dismissed = [], shownMore = [], released = [], onTopSets = [];
   let focused = null;
   const surface = createDesktopNotifications({ BrowserWindow, screen, ipcMain, settingsFile, Notification: native.Notification,
     focusedProjectWindow: () => focused, projectWindows: () => projects,
     onClick: e => clicked.push(e),
     onDismiss: (e, { keepCard } = {}) => (keepCard ? released : dismissed).push(e),
     onShowMore: e => { shownMore.push(e); return showMoreTarget; },
+    onSetOnTop: on => onTopSets.push(on), platform,
     isTrustedProjectSender: (event) => event.trustedProject === true });
   const action = (id, action, trusted = true) => {
     const w = windows.at(-1);
@@ -74,7 +75,7 @@ function fixture({ fail = false, settingsFile = null, showMoreTarget = null, loa
   const surfaceAction = (sender, action, id, trustedProject = true) =>
     ipcMain.emit('notify:surface-action', { sender, trustedProject }, { action, id });
   const lastSurface = (w) => w.webContents.sent.filter((m) => m.channel === 'notify:surface').at(-1)?.data;
-  return { surface, windows, natives: native.natives, clicked, dismissed, released, shownMore, action, listAction, screen,
+  return { surface, windows, natives: native.natives, clicked, dismissed, released, shownMore, onTopSets, action, listAction, screen,
     ipcMain, focus, surfaceAction, lastSurface, setFocused: (w) => { focused = w; } };
 }
 
@@ -147,22 +148,76 @@ test('twelve entries stay reachable while the banner window sizes to one five-ca
   assert.deepEqual(f.surface.snapshot().slice(0, 2).map((e) => e.title), ['T12', 'T11']);
   assert.equal(f.windows[0].bounds.height, pageHeight(12));
   assert.equal(pageHeight(12), pageHeight(6));
-  assert.ok(pageHeight(5) < pageHeight(6), 'Show More row only when more than a page exists');
+  assert.equal(pageHeight(5), pageHeight(6), 'the footer row (Show toggle) is always there');
   assert.ok(pageHeight(12) <= 768 * .75);
   f.surface.dispose();
 });
 
-test('Clear All dismisses every entry on every page and hides the window', async () => {
-  const f = fixture();
+// (TPT505) The banner offers Hide, never Clear All: hiding keeps every alert and touches no
+// project window; the banner stays hidden until a new or changed alert arrives.
+test('banner Hide keeps every alert, focuses nothing, and Clear All is unreachable from the banner', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const a = projectWindow();
+  const f = fixture({ projects: [a] });
   await show(f, 12);
-  f.action(null, 'clear-all', false);
-  assert.equal(f.surface.snapshot().length, 12);
   f.action(null, 'clear-all');
+  assert.equal(f.surface.snapshot().length, 12, 'banner clear-all is ignored');
+  assert.equal(f.dismissed.length, 0);
+  f.action(null, 'hide', false);
+  assert.equal(f.windows[0].visible, true, 'untrusted senders are ignored');
+  f.action(null, 'hide');
+  assert.equal(f.windows[0].visible, false);
+  assert.equal(f.surface.snapshot().length, 12);
+  assert.deepEqual([f.dismissed.length, f.released.length, f.clicked.length, f.shownMore.length], [0, 0, 0, 0]);
+  assert.equal(a.focused, false, 'no project window focused');
+  // Focus flips keep the banner hidden; the focused project window still hosts every alert.
+  f.focus(null);
+  assert.equal(f.windows[0].visible, false);
+  f.focus(a);
+  assert.equal(f.lastSurface(a).entries.length, 12);
+  f.focus(null);
+  assert.equal(f.windows[0].visible, false, 'still hidden after leaving Tipatask again');
+  // A mirrored card that changed nothing does not bring it back; a changed one does.
+  const origin = { windowId: 1, projectPath: '/a' };
+  f.surface.upsertCard({ tag: 'TPT9', title: 'card', seq: 1 }, origin);
+  assert.equal(f.windows[0].visible, true, 'a new mirrored card re-shows it');
+  f.action(null, 'hide');
+  f.surface.upsertCard({ tag: 'TPT9', title: 'card', seq: 2 }, origin);
+  assert.equal(f.windows[0].visible, false, 'an identical re-mirror keeps it hidden');
+  f.surface.upsertCard({ tag: 'TPT9', title: 'card changed', seq: 3 }, origin);
+  assert.equal(f.windows[0].visible, true, 'an updated entry re-shows it');
+  f.action(null, 'hide');
+  await f.surface.show({ title: 'T1', notificationId: 'again' }, origin);
+  assert.equal(f.windows[0].visible, true, 'any real send re-shows it');
+  // The in-app host keeps Clear All; Hide with nothing to show is a no-op.
+  f.focus(a);
+  f.surfaceAction(a.webContents, 'clear-all');
   assert.equal(f.surface.snapshot().length, 0);
-  assert.equal(f.dismissed.length, 12);
-  assert.equal(f.clicked.length, 0);
+  f.focus(null);
+  f.action(null, 'hide');
   assert.equal(f.windows[0].visible, false);
   f.surface.dispose();
+});
+
+test('the banner "Show" checkbox turns Show on Top off through main\'s single writer', async () => {
+  const f = fixture();
+  await show(f, 2);
+  f.action(null, 'on-top-off', false);
+  assert.deepEqual(f.onTopSets, []);
+  f.action(null, 'on-top-off');
+  assert.deepEqual(f.onTopSets, [false]);
+  f.surface.dispose();
+});
+
+test('the banner never activates the app when clicked: macOS panel, Windows non-focusable', async () => {
+  for (const [platform, expected] of [['darwin', { type: 'panel', focusable: undefined }],
+    ['win32', { type: undefined, focusable: false }], ['linux', { type: undefined, focusable: undefined }]]) {
+    const f = fixture({ platform });
+    await f.surface.show({ title: 'Title', notificationId: 'n1' }, { windowId: 1, projectPath: '/a' });
+    const { type, focusable } = f.windows[0].options;
+    assert.deepEqual({ type, focusable }, expected, platform);
+    f.surface.dispose();
+  }
 });
 
 test('Show More focuses the newest entry window and streams the full list there', async () => {
@@ -480,7 +535,7 @@ test('native delivery reports unsupported platforms instead of dropping silently
 });
 
 test('pageHeight follows the compact page geometry', () => {
-  assert.equal(pageHeight(1), 16 + 24 + 8 + 70);
-  assert.equal(pageHeight(5), 16 + 24 + 8 + 5 * 70 + 4 * 8);
-  assert.equal(pageHeight(6), pageHeight(5) + 8 + 24);
+  assert.equal(pageHeight(1), 16 + 24 + 8 + 70 + 8 + 24);
+  assert.equal(pageHeight(5), 16 + 24 + 8 + 5 * 70 + 4 * 8 + 8 + 24);
+  assert.equal(pageHeight(6), pageHeight(5));
 });

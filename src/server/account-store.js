@@ -23,13 +23,17 @@ const STORE_VERSION = 1;
 // Mirrors config.js USER_DATA_ROOT without loading it (config.js builds the forked server's
 // static singleton, which Electron's main process must not initialize just to read a
 // token): TIPATASK_USER_DATA, else the server root — TIPATASK_SERVER_ROOT, else this checkout.
-// A server root inside an app.asar is read-only, so it is skipped in favour of the default.
+// A packaged app.asar needs an explicit writable user-data location; never guess one.
 function userDataRoot(opts) {
   if (opts && opts.userDataRoot) return opts.userDataRoot;
   if (process.env.TIPATASK_USER_DATA) return path.resolve(process.env.TIPATASK_USER_DATA);
-  const serverRoot = process.env.TIPATASK_SERVER_ROOT;
-  if (serverRoot && !/\.asar([\\/]|$)/.test(serverRoot)) return path.resolve(serverRoot);
-  return path.resolve(__dirname, '../..');
+  const serverRoot = opts?.serverRoot || process.env.TIPATASK_SERVER_ROOT || path.resolve(__dirname, '../..');
+  if (/\.asar([\\/]|$)/.test(serverRoot)) {
+    const err = new Error('TIPATASK_USER_DATA is missing for the packaged runtime; refresh the agent harness.');
+    err.missingCredentials = true;
+    throw err;
+  }
+  return path.resolve(serverRoot);
 }
 
 function accountStorePath(opts) {
@@ -86,7 +90,8 @@ function readStore(opts) {
       value = { version: STORE_VERSION, accounts: parsed.accounts };
     }
   } catch (e) {
-    console.warn(`[account-store] read failed: ${e.message}`);
+    // JSON parse errors can quote the input, including a bearer token.
+    console.warn('[account-store] unreadable account store — sign in again or repair the user-data path');
   }
   _cache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, value });
   return value;
@@ -109,6 +114,18 @@ function readAccount(baseUrl, opts) {
   const entry = readStore(opts).accounts[key];
   if (!entry || typeof entry.token !== 'string' || !entry.token) return null;
   return entry;
+}
+
+// A legacy project JWT remains usable only for that project. This is a local
+// scope check, not signature verification (the API remains authoritative).
+function assertTokenProject(token, projectId) {
+  const payload = decodeTokenPayload(token);
+  if (payload?.project_id != null && String(payload.project_id) !== String(projectId)) {
+    const err = new Error('Stored token is scoped to another project — sign in again to obtain an account token.');
+    err.authError = true;
+    err.reasonCode = 'project-scope';
+    throw err;
+  }
 }
 
 // Every stored account, for UIs that list who is signed in where.
@@ -155,6 +172,8 @@ function clearAccountToken(baseUrl, opts) {
 module.exports = {
   STORE_FILE,
   accountStorePath,
+  userDataRoot,
+  assertTokenProject,
   normalizeBaseUrl,
   decodeTokenPayload,
   readAccount,

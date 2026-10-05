@@ -5,7 +5,7 @@ const path = require('node:path');
 const { spawn: spawnChild } = require('node:child_process');
 const config = require('./config');
 const { readLastExitSince, readLostSessions, forgetLostSession } = require('./last-exit');
-const { applyRehashIntent, spawnObjectiveTurn, killObjectiveProc, escalateKill, clearRetryTimers, clearTurnDeadline, prewarmObjective, killPrewarm, teardownObjectiveSession, trackHelperProc, clearHeartbeat, prewarmObjectiveCold, killColdPrewarm, startSleepWatchdog, objectiveCacheActivity, ensureSessionStartName, computeTurnSpans } = require('./claude-session');
+const { normalizeProposals, applyRehashIntent, spawnObjectiveTurn, killObjectiveProc, escalateKill, clearRetryTimers, clearTurnDeadline, prewarmObjective, killPrewarm, teardownObjectiveSession, trackHelperProc, clearHeartbeat, prewarmObjectiveCold, killColdPrewarm, startSleepWatchdog, objectiveCacheActivity, ensureSessionStartName, computeTurnSpans } = require('./claude-session');
 const { spawnTurn, providerSessionId, clearProviderSessionId, applyModelSelection } = require('./providers/dispatch');
 const { listObjectiveProviders, listVisibleObjectiveProviders, clampSelectionToProviders, formatSelection, currentSelection, configForProject } = require('./providers/registry');
 const { createSession, isAgentChatType, isAgentChatId } = require('./session-state');
@@ -14,7 +14,7 @@ const { providerSupportsProfile } = require('./providers/tool-profiles');
 const { findOpenDialog, resolveDialogAnswer, replayTaskChatTurn, taskFrame, changedTaskFields, buildTaskEditNote } = require('./task-chat-widgets');
 const { killProcessGroup, resolveAgentLimits } = require('./process-group');
 const { createSessionQueue } = require('./session-queue');
-const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary } = require('./terminal-session');
+const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, replayLiveTerminal, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary } = require('./terminal-session');
 const { buildExitResolutionComment, hasSelfAuthoredResolution, waitForFinalMessage, selectFinalMessage } = require('./exit-resolution');
 const { getTaskAgentInfo, getTaskAgentLabels, getAvailableAgents, getAvailableAgentsPeek, listTaskAgentStatuses, listTaskAgentStatusesPeek, refreshAgentDetection, resolveTaskAgentId, listAgentModels, listAllAgentModels } = require('./task-agent');
 const { isModelAllowed } = require('./task-agent/model-registry');
@@ -37,6 +37,7 @@ const { request: httpRequest } = require('../cli/http');
 const { getStaticBundle, getStaticBundleStats, prefetchObjectiveWorkflow } = require('./static-context');
 const { prewarmArchCache } = require('./arch-cache-prewarm');
 const taskCache = require('../mcp/task-cache');
+const { assertEditableModifiedTargets, prepareObjectiveProposalContext } = require('./objective-proposal-status');
 const archCache = require('../mcp/architecture-cache');
 const objectiveResponseCache = require('./objective-response-cache');
 const { summarizeOldTurns } = require('./objective-summarizer');
@@ -3861,7 +3862,8 @@ h1{font-size:1.15rem;margin:0 0 12px}p{margin:0 0 8px;color:#4c4f69}ul{padding-l
 // Prevents two Electron windows with the same-millisecond taskId (e.g. both
 // clicking New Objective at once) from sharing a single in-memory session object.
 function sessKey(id, projectPath) {
-  return id + (projectPath ? '\0' + projectPath : '');
+  const identity = isAgentChatId(id) ? require('./api-credentials').projectContextIdentity(projectPath) : '';
+  return id + (projectPath ? '\0' + projectPath : '') + (identity ? '\0' + identity : '');
 }
 
 // (TPT444) Everything a NEW terminal task session does once it holds a start slot: resolve
@@ -4355,18 +4357,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
       console.log(`[vcs:resume] ${taskId}: ${JSON.stringify(context)}`);
     });
     wireClient(ws, existing, taskId, sessionKey, sessions, backend);
-    if (existing.buffer.length > 0) {
-      // Reset xterm parser state before replay so a buffer that begins mid-frame
-      // (after MAX_SCROLLBACK rollover) cannot leave the parser in an SGR/CSI
-      // state and render escape-sequence fragments as literal text.
-      const REPLAY_RESET = '\x1b[!p\x1b[?1049l\x1b[2J\x1b[H';
-      const replayBuffer = sanitizeReplayBuffer(existing.buffer, {
-        preserveAltScreenFrame: existing.taskAgent === 'codex'
-          && existing.terminalPhase === 'planning'
-          && existing.codexPlanReady === true && codexPlanReadyIsFresh(existing),
-      });
-      ws.send(JSON.stringify({ type: 'data', tabId: existing.tabId, data: REPLAY_RESET + replayBuffer }));
-    }
+    replayLiveTerminal(existing, ws);
     forceResumeRepaint(existing);
     maybeRefirePlanReady(existing, ws);
     return;
@@ -5038,7 +5029,10 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
 
               const hit = objectiveResponseCache.get(cacheKey);
               if (hit) {
-                const p = hit.payload;
+                const p = { ...hit.payload };
+                await prepareObjectiveProposalContext(session);
+                if (session._closed || session._aborted || (session._epoch || 0) !== epochAtReceipt) return;
+                p.cards = normalizeProposals({ changes: structuredClone(p.cards || []) }, session._startStatusName, session._proposalContext).changes;
                 const assistantMsg = {
                   role: 'assistant', content: p.content, cards: p.cards,
                   filesAddressed: p.filesAddressed, docUpdates: p.docUpdates,
@@ -5515,15 +5509,17 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         }
         return;
       }
-      if (session.proc) {
+      if (session.proc || session._spawning) {
         if (session.ws && session.ws.readyState === session.ws.OPEN) {
           session.ws.send(JSON.stringify({ type: 'error', message: 'Cannot finalize while a turn is in progress' }));
         }
         return;
       }
-      forcePendingProposalStatuses(changes, 'objective-finalize', (await fetchStatusContext(backend)).roles.start);
       let finalizeTimeoutId;
       try {
+        const { roles } = await fetchStatusContext(backend);
+        await assertEditableModifiedTargets(changes, backend, roles);
+        forcePendingProposalStatuses(changes, 'objective-finalize', roles.start);
         const finalizeTimeout = new Promise((_, rej) => {
           finalizeTimeoutId = setTimeout(
             () => rej(Object.assign(new Error('finalize timed out'), { code: 'EFINALIZETIMEOUT' })),

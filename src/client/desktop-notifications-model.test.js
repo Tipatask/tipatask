@@ -26,7 +26,7 @@ test('notification count and pagination labels in English and Ukrainian', () => 
     assert.deepEqual([1, 3, 5, 21, 12].map((n) => tc('notifCenter.count', n)),
       ['1 сповіщення', '3 сповіщення', '5 сповіщень', '21 сповіщення', '12 сповіщень']);
     assert.equal(t('notifCenter.showMore', { n: 7 }), 'Показати ще (+7)');
-    for (const key of ['expand', 'collapse', 'closePanel', 'empty', 'desktopDisabled', 'clearAll']) {
+    for (const key of ['expand', 'collapse', 'closePanel', 'empty', 'desktopDisabled', 'clearAll', 'hide', 'showOnTop', 'showOnTopTitle']) {
       assert.notEqual(t(`notifCenter.${key}`), `notifCenter.${key}`);
     }
   } finally { setLocale('en'); }

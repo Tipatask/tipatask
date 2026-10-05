@@ -104,7 +104,7 @@ test('the extension source registers only the gated tool and reads no credential
   const src = fs.readFileSync(path.join(__dirname, 'task-tools.mjs'), 'utf8');
   assert.equal((src.match(/registerTool\(/g) || []).length, 1);
   assert.match(src, /name: "tipatask_api"/);
-  assert.match(src, /resolveTipataskRequest\(params, process\.env\)/);
-  assert.doesNotMatch(src, /API_TOKEN/, 'the token is only ever handled inside the request gate');
+  assert.match(src, /credentials\.liveCredentials\(process\.env\)/);
+  assert.match(src, /split\(env\.API_TOKEN\)/, 'server responses redact any credential echo');
   assert.doesNotMatch(src, /child_process|node:fs|writeFile/);
 });

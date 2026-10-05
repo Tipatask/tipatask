@@ -204,6 +204,10 @@ const en = {
   'tooltip.queuedSession': 'Waiting for a free slot — starts automatically when a running task completes. Click Stop to cancel.',
   'terminal.timeUnknown': 'unknown time',
   'terminal.restart': 'Restart',
+  'terminal.restarting': 'Restarting…',
+  'terminal.restartFailed': 'Restart failed: {message}',
+  'terminal.confirmCompletedStart': 'Task {id} is already completed. Start a new {agent} session anyway?',
+  'terminal.selectedAgent': 'selected agent',
   'nav.sessionLost': '{label} (session lost)',
   'terminal.runawayKilled': 'Killed by the descendant-process watchdog',
   // Compact watchdog controls in the terminal modal and active-sessions rail.
@@ -280,6 +284,10 @@ const en = {
 
   // (C1458) Board-wide alert()/confirm() conversion — chat-ui.js/chat-task-preview.js
   // write failures, previously hard-coded English alert()s.
+  'chat.errLockedTarget': 'Task {id} cannot be changed by Objective mode while its status is {status}.',
+  'chat.lockedTargetBadge': 'Locked: {status}',
+  'chat.lockedTargetError': 'Task {id} is {status}. Objective mode cannot apply this change.',
+  'chat.errTargetUnavailable': 'Cannot verify the current status of task {id}. Try again.',
   'chat.errSaveTask': 'Failed to save task: {msg}',
   'chat.errSaveTasks': 'Failed to save tasks: {msg}',
   'chat.errSaveRecipe': 'Failed to save recipe: {msg}',
@@ -1180,9 +1188,6 @@ const en = {
   // top-right regardless of OS notification style/platform.
   'settings.notifStateDesktop': 'desktop banners',
   'settings.notifHintDesktopFailed': 'Could not show desktop banners. Try the Test button again.',
-  'settings.notifShowOnTop': 'Show on Top',
-  'settings.notifShowOnTopHintOn': 'stack stays above other apps',
-  'settings.notifShowOnTopHintOff': 'brief system notifications',
   'notifCenter.heading': 'Notifications',
   'notifCenter.clearAll': 'Clear all',
   'notifCenter.dismiss': 'Dismiss',
@@ -1194,7 +1199,11 @@ const en = {
   'notifCenter.collapse': 'Collapse',
   'notifCenter.closePanel': 'Close notification list',
   'notifCenter.empty': 'No notifications',
-  'notifCenter.desktopDisabled': '“Show Notifications on Top of Other Apps” is turned off in the app Settings menu',
+  'notifCenter.desktopDisabled': '“Show on Top of Other Apps” is turned off in View ▸ Notifications',
+  // (TPT505) Banner-only header action (keeps every alert) and its footer "Show on Top" checkbox.
+  'notifCenter.hide': 'Hide',
+  'notifCenter.showOnTop': 'Show',
+  'notifCenter.showOnTopTitle': 'Show notifications on top of other apps',
 
   // Attention notifications (C1057/C1058) — fallback body text when the agent's prompt has no
   // detected promptText, keyed by `kind`. See attention-notifications.js#buildAttentionBody.
@@ -1428,6 +1437,10 @@ const uk = {
   'tooltip.queuedSession': 'Очікує вільного місця — запуститься автоматично, коли завершиться одне з активних завдань. Натисніть «Стоп», щоб скасувати.',
   'terminal.timeUnknown': 'час невідомий',
   'terminal.restart': 'Перезапустити',
+  'terminal.restarting': 'Перезапуск…',
+  'terminal.restartFailed': 'Не вдалося перезапустити: {message}',
+  'terminal.confirmCompletedStart': 'Задачу {id} уже завершено. Усе одно почати нову сесію {agent}?',
+  'terminal.selectedAgent': 'вибраного агента',
   'nav.sessionLost': '{label} (сесію втрачено)',
   'terminal.runawayKilled': 'Зупинено сторожем дочірніх процесів',
   // Компактні елементи керування призупиненою сесією.
@@ -1551,6 +1564,10 @@ const uk = {
   'card.splitting': 'Розбивається на підзадачі в чаті цілі. Заблоковано, доки чат не буде збережено або закрито.',
 
   // (C1458) Board-wide alert()/confirm() conversion
+  'chat.errLockedTarget': 'Режим цілі не може змінити задачу {id}, поки її статус — {status}.',
+  'chat.lockedTargetBadge': 'Заблоковано: {status}',
+  'chat.lockedTargetError': 'Задача {id} має статус «{status}». Режим цілі не може застосувати цю зміну.',
+  'chat.errTargetUnavailable': 'Не вдалося перевірити поточний статус задачі {id}. Спробуйте ще раз.',
   'chat.errSaveTask': 'Не вдалося зберегти задачу: {msg}',
   'chat.errSaveTasks': 'Не вдалося зберегти задачі: {msg}',
   'chat.errSaveRecipe': 'Не вдалося зберегти рецепт: {msg}',
@@ -2340,9 +2357,6 @@ const uk = {
 
   'settings.notifStateDesktop': 'банери на робочому столі',
   'settings.notifHintDesktopFailed': 'Не вдалося показати банери на робочому столі. Спробуйте кнопку перевірки ще раз.',
-  'settings.notifShowOnTop': 'Показувати поверх',
-  'settings.notifShowOnTopHintOn': 'стос лишається поверх інших програм',
-  'settings.notifShowOnTopHintOff': 'короткі системні сповіщення',
   'notifCenter.heading': 'Сповіщення',
   'notifCenter.clearAll': 'Очистити всі',
   'notifCenter.dismiss': 'Закрити',
@@ -2355,7 +2369,11 @@ const uk = {
   'notifCenter.collapse': 'Згорнути',
   'notifCenter.closePanel': 'Закрити список сповіщень',
   'notifCenter.empty': 'Немає сповіщень',
-  'notifCenter.desktopDisabled': '«Показувати сповіщення поверх інших програм» вимкнено в меню налаштувань програми',
+  'notifCenter.desktopDisabled': '«Показувати поверх інших програм» вимкнено в меню View ▸ Сповіщення',
+  // (TPT505) Banner-only header action (keeps every alert) and its footer "Show on Top" checkbox.
+  'notifCenter.hide': 'Сховати',
+  'notifCenter.showOnTop': 'Показувати',
+  'notifCenter.showOnTopTitle': 'Показувати сповіщення поверх інших програм',
 
   'attention.toolApproval': 'Очікується підтвердження інструменту',
   'attention.mcpTrust': 'Очікується підтвердження MCP-сервера',

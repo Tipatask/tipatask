@@ -13,6 +13,7 @@ const {
   handleTerminalInput,
   getMcpTrustAutoAnswer,
   sanitizeReplayBuffer,
+  replayLiveTerminal,
   truncateBufferSafely,
   injectPastedImage,
   carveAttentionLines,
@@ -77,6 +78,48 @@ function makeConfiguredProjectDir(prefix) {
 
 const ALT_ON = '\x1b[?1049h';
 const ALT_OFF = '\x1b[?1049l';
+
+test('live reconnect replays one snapshot before subsequent output without modifying retained history', () => {
+  for (const agent of ['codex', 'claude', 'pi']) {
+    const frames = [];
+    const ws = { OPEN: 1, readyState: 1, send: raw => frames.push(JSON.parse(raw)) };
+    const session = { alive: true, ws, taskAgent: agent, tabId: 'reconnect', buffer: 'History once\r\n' };
+    assert.equal(replayLiveTerminal(session), true);
+    assert.deepEqual(frames, [{ type: 'data', tabId: 'reconnect',
+      data: '\x1b[!p\x1b[?1049l\x1b[2J\x1b[HHistory once\r\n' }]);
+    assert.equal(session.buffer, 'History once\r\n');
+    // The next PTY event uses the same socket and only contributes new bytes.
+    const next = 'Live once\r\n';
+    session.buffer += next;
+    ws.send(JSON.stringify({ type: 'data', tabId: session.tabId, data: next }));
+    assert.equal(frames.length, 2);
+    assert.equal(frames.map(frame => frame.data).join('').match(/History once/g).length, 1);
+    assert.equal(frames[1].data, next);
+  }
+});
+
+test('live replay provides an empty-buffer barrier and preserves only a fresh Codex plan frame', () => {
+  const frames = [];
+  const ws = { OPEN: 1, readyState: 1, send: raw => frames.push(JSON.parse(raw)) };
+  const session = { alive: true, ws, tabId: 'reconnect', buffer: '' };
+  assert.equal(replayLiveTerminal(session), true);
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].data, '\x1b[!p\x1b[?1049l\x1b[2J\x1b[H');
+  Object.assign(session, { taskAgent: 'codex', terminalPhase: 'planning', codexPlanReady: true,
+    _codexPlan: { ready: true }, buffer: `${ALT_ON}Plan ready.\r\n${ALT_OFF}Initial screen` });
+  replayLiveTerminal(session);
+  assert.ok(frames.at(-1).data.endsWith(`${ALT_ON}Plan ready.\r\n`));
+  assert.ok(session.buffer.endsWith('Initial screen'), 'replay sanitization never changes stored bytes');
+  session._codexPlan.ready = false;
+  replayLiveTerminal(session);
+  assert.ok(frames.at(-1).data.endsWith(session.buffer));
+  session.alive = false;
+  assert.equal(replayLiveTerminal(session), false);
+  session.alive = true;
+  ws.readyState = 3;
+  assert.equal(replayLiveTerminal(session), false);
+  assert.equal(frames.length, 3);
+});
 
 test('truncateBufferSafely trims trailing alt-screen exit after captured plan content', () => {
   const replayTail = [

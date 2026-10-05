@@ -6,6 +6,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-codex-config-data-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
 
 const {
   CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE,
@@ -84,7 +86,7 @@ test('global Codex config strips tool overrides and forces tipatask prompt-free 
 
     const out = fs.readFileSync(targetPath, 'utf8');
     const topLevel = out.slice(0, out.indexOf('['));
-    assert.match(out, new RegExp(`\\[mcp_servers\\.tipatask\\][\\s\\S]*default_tools_approval_mode = "${CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE}"`));
+    assert.equal(toml.parse(out).mcp_servers.tipatask, undefined);
     assert.doesNotMatch(topLevel, /^\s*default_tools_approval_mode\s*=/m);
     assert.doesNotMatch(out, /\[mcp_servers\.tipatask\.tools\./);
     assert.doesNotMatch(out, /^\s*approval_mode = "approve"/m);
@@ -523,112 +525,25 @@ test('buildCodexMcpSection (remote): missing .tipatask/config.json degrades to a
   }
 });
 
-test('updateGlobalCodexMcpApprovalConfig: absent tipatask section + projectRoot → writes remote HTTP block + local stdio block', () => {
-  const dir = makeTempDir();
-  try {
-    const targetPath = path.join(dir, 'config.toml');
-    // Start with a config that has no tipatask section at all
-    fs.writeFileSync(targetPath, [
-      'model = "gpt-5.5"',
-      '',
-      '[mcp_servers.other]',
-      'command = "/some/other"',
-      '',
-    ].join('\n'));
-
-    const mcpServerPath = path.join(dir, 'src', 'mcp', 'server.js');
-    updateGlobalCodexMcpApprovalConfig({ targetPath, projectRoot: dir, mcpServerPath });
-
-    const out = fs.readFileSync(targetPath, 'utf8');
-    // Remote section: no .tipatask/config.json in `dir`, so url degrades to "" — the
-    // point of this test is the section shape, not real credentials.
-    assert.match(out, /\[mcp_servers\.tipatask\]/);
-    assert.equal(toml.parse(out).mcp_servers.tipatask.transport, undefined);
-    assert.match(out, /url = /);
-    assert.doesNotMatch(out.slice(out.indexOf('[mcp_servers.tipatask]'), out.indexOf('[mcp_servers.tipatask-local]')), /^\s*command\s*=/m);
-    // Local section: absent before the call, so the repair-only gate fires and writes it
-    assert.match(out, /\[mcp_servers\.tipatask-local\]/);
-    assert.match(out, /command = /);
-    assert.equal(toml.parse(out).mcp_servers['tipatask-local'].transport, undefined);
-    assert.match(out, new RegExp(`default_tools_approval_mode = "${CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE}"`));
-    // guardian_approval must be false
-    assert.match(out, /\[features\][\s\S]*guardian_approval = false/);
-    // Other server must be preserved
-    assert.match(out, /\[mcp_servers\.other\]/);
-    // mcpSectionHasCommand must now return true for both (url= counts as a command for
-    // the remote section, per mcpSectionHasCommand's own command|url check)
-    assert.equal(mcpSectionHasCommand(out, 'mcp_servers.tipatask'), true);
-    assert.equal(mcpSectionHasCommand(out, 'mcp_servers.tipatask-local'), true);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('updateGlobalCodexMcpApprovalConfig: bare approval-only stub → tipatask becomes remote HTTP, tipatask-local gets a fresh stdio block', () => {
-  const dir = makeTempDir();
-  try {
-    const targetPath = path.join(dir, 'config.toml');
-    // Simulate the broken state: tipatask section exists but has only the approval key
-    fs.writeFileSync(targetPath, [
-      '[mcp_servers.tipatask]',
-      'default_tools_approval_mode = "approve"',
-      '',
-    ].join('\n'));
-
-    const mcpServerPath = path.join(dir, 'src', 'mcp', 'server.js');
-    updateGlobalCodexMcpApprovalConfig({ targetPath, projectRoot: dir, mcpServerPath });
-
-    const out = fs.readFileSync(targetPath, 'utf8');
-    assert.match(out, /\[mcp_servers\.tipatask\]/);
-    assert.equal(toml.parse(out).mcp_servers.tipatask.transport, undefined);
-    assert.match(out, /\[mcp_servers\.tipatask-local\]/);
-    assert.match(out, /command = /);
-    assert.equal(toml.parse(out).mcp_servers['tipatask-local'].transport, undefined);
-    assert.match(out, new RegExp(`default_tools_approval_mode = "${CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE}"`));
-    assert.equal(mcpSectionHasCommand(out, 'mcp_servers.tipatask-local'), true);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('updateGlobalCodexMcpApprovalConfig (R2 regression): a FULL legacy stdio tipatask section still migrates to remote HTTP', () => {
-  const dir = makeTempDir();
-  try {
-    const targetPath = path.join(dir, 'config.toml');
-    // Simulate a real pre-C1382 install: tipatask already has a full, valid stdio
-    // block (command/args/env/transport) — mcpSectionHasCommand(out, 'mcp_servers.
-    // tipatask') is TRUE for this section, which is exactly the case the pre-C1382
-    // code's `!mcpSectionHasCommand(...)` gate would have skipped forever.
-    fs.writeFileSync(targetPath, [
-      '[mcp_servers.tipatask]',
-      'transport = "stdio"',
-      'command = "/old/mcp-node"',
-      'args = ["/old/repo/ai/todo/server/src/mcp/server.js"]',
-      'env = { TIPATASK_PROJECT_ROOT = "/old/repo", TIPATASK_SERVER_ROOT = "/old/repo/ai/todo/server" }',
-      'default_tools_approval_mode = "approve"',
-      '',
-    ].join('\n'));
-
-    const projectRoot = path.join(dir, 'project');
-    writeProjectConfig(projectRoot, { API_BASE_URL: 'https://tt.example.com', API_PROJECT_ID: '3', API_TOKEN: 'new-token' });
-
-    updateGlobalCodexMcpApprovalConfig({ targetPath, projectRoot });
-
-    const out = fs.readFileSync(targetPath, 'utf8');
-    const tipataskSection = out.slice(out.indexOf('[mcp_servers.tipatask]'), out.indexOf('[mcp_servers.tipatask-local]'));
-    assert.doesNotMatch(tipataskSection, /^\s*transport\s*=/m);
-    assert.match(tipataskSection, /url = "https:\/\/tt\.example\.com\/api\/projects\/3\/mcp"/);
-    assert.match(tipataskSection, /bearer_token_env_var = "TIPATASK_API_TOKEN"/);
-    assert.doesNotMatch(tipataskSection, /new-token/);
-    assert.doesNotMatch(tipataskSection, /http_headers|Authorization|Bearer/);
-    // The stale stdio command/args/env must be GONE, not left alongside the new keys
-    assert.doesNotMatch(tipataskSection, /command = "\/old\/mcp-node"/);
-    assert.doesNotMatch(tipataskSection, /args = \[/);
-    assert.doesNotMatch(tipataskSection, /\/old\/repo/);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
+for (const legacy of ['', '[mcp_servers.tipatask]\nurl = "https://old.test/api/projects/1/mcp"\nhttp_headers = { Authorization = "old-secret" }\n', '[mcp_servers.tipatask-local]\ncommand = "/old/mcp"\n']) {
+  test(`global refresh removes project registrations while preserving user config (${legacy.length})`, () => {
+    const dir = makeTempDir();
+    try {
+      const targetPath = path.join(dir, 'config.toml');
+      fs.writeFileSync(targetPath, 'model = "user-model"\n[mcp_servers.other]\ncommand = "/other/mcp"\n' + legacy);
+      updateGlobalCodexMcpApprovalConfig({ targetPath, projectRoot: dir });
+      const out = fs.readFileSync(targetPath, 'utf8');
+      const parsed = toml.parse(out);
+      assert.equal(parsed.mcp_servers.tipatask, undefined);
+      assert.equal(parsed.mcp_servers['tipatask-local'], undefined);
+      assert.equal(parsed.mcp_servers.other.command, '/other/mcp');
+      assert.equal(parsed.model, 'user-model');
+      assert.doesNotMatch(out, /old-secret|old.test/);
+      updateGlobalCodexMcpApprovalConfig({ targetPath, projectRoot: dir });
+      assert.equal(fs.readFileSync(targetPath, 'utf8'), out);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+}
 
 test('writeCodexMcpConfig removes a legacy inline Authorization header and every token value', () => {
   const dir = makeTempDir();
@@ -674,7 +589,7 @@ test('writeCodexMcpConfig removes a legacy inline Authorization header and every
   }
 });
 
-test('global refresh removes legacy transport from a customized local entry without replacing its connection', () => {
+test('global refresh removes project-specific local entries and preserves unrelated servers', () => {
   const dir = makeTempDir();
   try {
     const targetPath = path.join(dir, 'config.toml');
@@ -697,28 +612,26 @@ test('global refresh removes legacy transport from a customized local entry with
 
     const parsed = toml.parse(fs.readFileSync(targetPath, 'utf8'));
     assert.equal(parsed.model, 'user-model');
-    assert.equal(parsed.mcp_servers['tipatask-local'].transport, undefined);
-    assert.equal(parsed.mcp_servers['tipatask-local'].command, '/custom/mcp');
-    assert.deepEqual(parsed.mcp_servers['tipatask-local'].args, ['--custom']);
-    assert.equal(parsed.mcp_servers['tipatask-local'].env.CUSTOM, 'yes');
+    assert.equal(parsed.mcp_servers['tipatask-local'], undefined);
     assert.equal(parsed.mcp_servers.other.transport, 'stdio');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('upsertKeyInAllMcpServerSections reaches the hyphenated tipatask-local section name', () => {
+test('global cleanup recognizes hyphenated tipatask-local', () => {
   const dir = makeTempDir();
   try {
     const targetPath = path.join(dir, 'config.toml');
     fs.writeFileSync(targetPath, ['[mcp_servers.tipatask-local]', 'command = "/x"', ''].join('\n'));
     updateGlobalCodexMcpApprovalConfig({ targetPath });
     const out = fs.readFileSync(targetPath, 'utf8');
-    assert.match(out, new RegExp(`\\[mcp_servers\\.tipatask-local\\][\\s\\S]*default_tools_approval_mode = "${CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE}"`));
+    assert.equal(toml.parse(out).mcp_servers?.['tipatask-local'], undefined);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
 
 // ── Opt-in browser-tools MCP presets (TPT95) ────────────────────────────────────
 // Deliberately do NOT call ensureProjectCodexHome() anywhere below — it always also

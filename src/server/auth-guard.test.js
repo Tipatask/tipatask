@@ -9,6 +9,8 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-auth-guard-data-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
 
 const {
   AuthCorruptedError,
@@ -31,10 +33,7 @@ function makeJwt(payload, header = { alg: 'HS256', typ: 'JWT' }) {
   return `${b64url(header)}.${b64url(payload)}.sig-not-checked-client-side`;
 }
 
-function writeConfig(root, values) {
-  fs.mkdirSync(path.join(root, '.tipatask'), { recursive: true });
-  fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify(values), 'utf8');
-}
+function writeConfig(root, cfg) { require('./project-config').writeProjectConfig(root, cfg); }
 
 // ── AuthCorruptedError ──
 

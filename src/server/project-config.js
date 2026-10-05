@@ -516,7 +516,7 @@ function readProjectConfig(projectRoot) {
     _readConfigCache.set(projectRoot, { mtimeMs: stat.mtimeMs, value });
     return value;
   } catch (e) {
-    console.warn(`[project-config] read failed (${configPath}): ${e.message}`);
+    console.warn(`[project-config] unreadable config (${configPath}); check JSON format and file access`);
     return null;
   }
 }
@@ -566,7 +566,10 @@ function _routeTokenToAccountStore(config) {
   const { API_TOKEN: token, ...rest } = config;
   const baseUrl = rest.API_BASE_URL;
   const accountStore = require('./account-store');
-  if (!accountStore.normalizeBaseUrl(baseUrl)) return config;
+  if (!accountStore.normalizeBaseUrl(baseUrl)) {
+    if (token) throw new Error('API_BASE_URL is required before saving account credentials');
+    return rest;
+  }
   const value = typeof token === 'string' ? token.trim() : '';
   if (value) accountStore.writeAccountToken(baseUrl, value);
   else accountStore.clearAccountToken(baseUrl);
@@ -588,8 +591,8 @@ function writeProjectConfig(projectRoot, config) {
 
 // One-time move of a legacy per-project config.json API_TOKEN into the account store.
 // A project written before the account store still carries the token inline; the first
-// getApiCredentials() read lifts it into the store (unless the store already holds a token
-// that outlives it) and strips the key so config.json stops being a credential file.
+// getApiCredentials() read seeds an empty store, never replaces an existing account,
+// and strips the inline key so config.json stops being a credential file.
 // A legacy blank is only stripped — it never signs the account out of other projects.
 // Never throws: a read-only checkout just keeps working off the inline token.
 function migrateLegacyApiToken(projectRoot) {
@@ -601,17 +604,17 @@ function migrateLegacyApiToken(projectRoot) {
     if (!accountStore.normalizeBaseUrl(raw.API_BASE_URL)) return false;
     const legacy = typeof raw.API_TOKEN === 'string' ? raw.API_TOKEN.trim() : '';
     if (legacy) {
-      const expOf = (t) => Number((accountStore.decodeTokenPayload(t) || {}).exp) || 0;
       const stored = accountStore.readAccount(raw.API_BASE_URL);
-      // >= so an inline token written by an older Task App build (same or later expiry) wins.
-      if (!stored || expOf(legacy) >= expOf(stored.token)) accountStore.writeAccountToken(raw.API_BASE_URL, legacy);
+      // Opening an old checkout must never change the currently signed-in account.
+      // A scoped legacy token can seed an empty store, but resolution checks its scope.
+      if (!stored) accountStore.writeAccountToken(raw.API_BASE_URL, legacy);
     }
     delete raw.API_TOKEN;
     writeProjectConfig(projectRoot, raw);
     return true;
   } catch (e) {
     if (e && e.code === 'ENOENT') return false; // no config.json yet: nothing to migrate
-    console.warn(`[project-config] legacy API_TOKEN migration skipped: ${e.message}`);
+    console.warn('[project-config] legacy token migration skipped; check config format and user-data file access');
     return false;
   }
 }
@@ -659,6 +662,7 @@ function _removeEnvKeys(filePath, keys) {
 }
 
 function migrateFromLegacy(projectRoot) {
+  const accountStore = require('./account-store');
   const configPath = path.join(projectRoot, CONFIG_REL);
   const legacyEnvPath = path.join(projectRoot, LEGACY_ENV_REL);
   const configExists = fs.existsSync(configPath);
@@ -696,16 +700,25 @@ function migrateFromLegacy(projectRoot) {
       configChanged = true;
     }
 
-    if (configChanged) writeProjectConfig(projectRoot, migrated);
+    if (configChanged) {
+      // Legacy discovery is not a sign-in. Never replace or clear the shared account.
+      const { API_TOKEN: legacyToken, ...target } = migrated;
+      if (legacyToken && !target.API_BASE_URL) throw new Error('Legacy credentials need an API base URL');
+      if (legacyToken && !accountStore.readAccount(target.API_BASE_URL)?.token) {
+        accountStore.writeAccountToken(target.API_BASE_URL, legacyToken);
+      }
+      writeProjectConfig(projectRoot, target);
+    }
+    const tokenMigrated = migrateLegacyApiToken(projectRoot);
 
-    // Credentials now belong exclusively to config.json. Sanitize even when config
+    // The target belongs to config.json and tokens to the account store. Sanitize when config
     // already existed so old self-hosted installs cannot retain a stale bearer token.
     const envChanged = legacyExists
       ? _removeEnvKeys(legacyEnvPath, API_CREDENTIAL_FIELDS)
       : false;
-    return (configChanged || envChanged) ? migrated : null;
+    return (configChanged || envChanged || tokenMigrated) ? readProjectConfig(projectRoot) : null;
   } catch (e) {
-    console.warn(`[project-config] migration failed: ${e.message}`);
+    console.warn('[project-config] legacy migration failed; check configuration format and file access');
     return null;
   }
 }
@@ -730,11 +743,8 @@ function _ensureGitignoreLine(dir, line) {
   }
 }
 
-// Pre-approve registered MCP servers before Claude's first spawn. Write
-// settings.local.json atomically and preserve existing/third-party settings.
-// Add it to .gitignore before writing concrete API credentials; if that fails,
-// omit the env block so a JWT cannot enter a commit. Missing/corrupt settings
-// are tolerated.
+// Pre-approve the two managed MCP servers without caching credentials. Preserve
+// third-party settings; malformed settings are left intact for user repair.
 function writeProjectClaudeMcpApproval(projectRoot) {
   const serverNames = ['tipatask', 'tipatask-local'];
   const settingsDir = path.join(projectRoot, '.claude');
@@ -745,7 +755,7 @@ function writeProjectClaudeMcpApproval(projectRoot) {
     const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Expected a settings object');
     settings = parsed;
-  } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  } catch (err) { if (err.code !== 'ENOENT') throw new Error('Invalid agent configuration JSON; repair the file before refreshing the harness.'); }
 
   const enabled = new Set(settings.enabledMcpjsonServers || []);
   const alreadyEnabled = serverNames.every(n => enabled.has(n));
@@ -780,10 +790,9 @@ function writeProjectClaudeMcpApproval(projectRoot) {
     for (const k of ['API_BASE_URL', 'API_PROJECT_ID']) {
       if (cfg) wanted[k] = cfg[k] == null ? '' : String(cfg[k]);
     }
-    // The token comes from the account store; a legacy config.json token is the fallback.
+    // Clear the obsolete copy; headersHelper resolves the current account.
     if (cfg) {
-      const account = require('./account-store').readAccount(cfg.API_BASE_URL);
-      wanted.API_TOKEN = account ? account.token : (cfg.API_TOKEN == null ? '' : String(cfg.API_TOKEN));
+      wanted.API_TOKEN = ''; // credentials are resolved by headersHelper, never cached here
     }
     if (Object.keys(wanted).length > 0) {
       const beforeEnv = JSON.stringify(settings.env || {});
@@ -801,50 +810,52 @@ function writeProjectClaudeMcpApproval(projectRoot) {
   fs.renameSync(tmp, settingsPath);
 }
 
-// ── MCP config writer ──
-// Generates .mcp.json for external projects with two servers:
-//   'tipatask'       — (C1382) remote Streamable HTTP, api/src/routes/mcp.js, 17 tools.
-//                       Credential-free `${VAR}` references — every Claude/Codex process
-//                       the Task App spawns already gets API_BASE_URL/API_PROJECT_ID/
-//                       API_TOKEN injected by projectEnvExtras() (spawn-utils.js), so no
-//                       per-project baked value is needed here, and the file stays git-safe.
-//   'tipatask-local' — stdio, this shared install, TIPATASK_MCP_LOCAL_ONLY=1 (registers
-//                       only the 4 tools that need a repo checkout: batch_grep_tags,
-//                       push_knowledge, pull_knowledge, git_worktree_status).
-// Safe to call on every project open — idempotent atomic write, skips if content unchanged.
-// Also runs when projectRoot IS this checkout (dogfooding the Task App on itself): the
-// resulting .mcp.json carries machine-specific absolute paths, which is why this repo
-// gitignores its own /.mcp.json.
+// Generate project-bound Claude HTTP + local stdio registrations. The HTTP entry
+// uses a live headersHelper and blank static auth; local env carries all three roots.
+// Source installs use mcp-node; packaged installs run the Electron binary as Node.
+// Writes are atomic/idempotent and preserve unrelated MCP entries.
 function writeProjectMcpConfig(projectRoot, serverRoot) {
   const absProjectRoot = path.resolve(projectRoot);
   const absServerRoot = path.resolve(serverRoot);
   // Same rule as config.js USER_DATA_ROOT: TIPATASK_USER_DATA, else the server root. Handed
   // to the stdio server so a `claude` launched from a plain shell still finds the account store.
-  const userDataRoot = path.resolve(process.env.TIPATASK_USER_DATA || absServerRoot);
+  const userDataRoot = require('./account-store').userDataRoot({ serverRoot: absServerRoot });
 
   // Pre-approve both MCP servers in Claude's local project settings so the "New MCP
   // server found" trust dialog never appears on a task's first spawn (C1047), and (C1382)
-  // write concrete credentials into settings.local.json's env block for a shell-launched
+  // clear legacy credentials from settings.local.json's env block for a shell-launched
   // `claude`. .claude/settings.local.json is a local, gitignored file (see
   // writeProjectClaudeMcpApproval).
   try { writeProjectClaudeMcpApproval(absProjectRoot); }
   catch (e) { console.warn(`[project-config] mcp trust pre-approval write failed: ${e.message}`); }
 
+  migrateLegacyApiToken(absProjectRoot);
+  const cfg = readProjectConfig(absProjectRoot);
+  const { buildHeadersHelperCommand } = require('./mcp-spawn-config');
+  const packaged = /\.asar([\\/]|$)/.test(absServerRoot) || !!(_electronApp && _electronApp.isPackaged);
+  const helper = buildHeadersHelperCommand({
+    execPath: packaged ? process.execPath : path.join(absServerRoot, 'bin', process.platform === 'win32' ? 'mcp-node.cmd' : 'mcp-node'),
+    scriptPath: path.join(absServerRoot, 'src/mcp/auth-header-helper.js'),
+    projectRoot: absProjectRoot, userDataRoot, electron: packaged,
+  });
   const tipataskEntry = {
     type: 'http',
-    url: '${API_BASE_URL}/api/projects/${API_PROJECT_ID}/mcp',
+    url: cfg?.API_BASE_URL && cfg?.API_PROJECT_ID
+      ? `${String(cfg.API_BASE_URL).replace(/\/+$/, '')}/api/projects/${encodeURIComponent(cfg.API_PROJECT_ID)}/mcp`
+      : '${API_BASE_URL}/api/projects/${API_PROJECT_ID}/mcp',
+    headersHelper: helper,
     headers: {
-      Authorization: 'Bearer ${API_TOKEN}',
+      Authorization: '',
       'X-Tipatask-Session-Task': '${TIPATASK_TASK_ID:-}',
     },
   };
 
   let tipataskLocalEntry;
-  if (_electronApp && _electronApp.isPackaged) {
+  if (packaged) {
     // Packaged Electron build — the asar is read-only; plain posix_spawn cannot enter it.
     // Use the Electron binary as a Node process (ELECTRON_RUN_AS_NODE=1) so it reads the
     // asar normally with its bundled Node runtime.
-    const asarRoot = path.join(process.resourcesPath, 'app.asar');
+    const asarRoot = absServerRoot;
     tipataskLocalEntry = {
       command: process.execPath,                                        // …/Contents/MacOS/TipATask
       args: [path.join(asarRoot, 'src', 'mcp', 'server.js')],           // …/app.asar/src/mcp/server.js
@@ -878,7 +889,7 @@ function writeProjectMcpConfig(projectRoot, serverRoot) {
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Expected an MCP configuration object');
     existing = parsed;
-  } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  } catch (err) { if (err.code !== 'ENOENT') throw new Error('Invalid agent configuration JSON; repair the file before refreshing the harness.'); }
   const merged = {
     ...existing,
     mcpServers: {

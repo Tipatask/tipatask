@@ -34,7 +34,7 @@ const _processCreatedAt = (() => {
   try { return process.getCreationTime ? process.getCreationTime() : null; } catch { return null; }
 })();
 
-const { BrowserWindow, Menu, shell, dialog, ipcMain, session, screen, systemPreferences, Notification } = require('electron');
+const { BrowserWindow, Menu, shell, dialog, ipcMain, session, screen, systemPreferences, Notification, powerMonitor } = require('electron');
 const { fork, execFile } = require('child_process');
 const crypto = require('node:crypto');
 const fs = require('fs');
@@ -1030,9 +1030,10 @@ function registerIpcHandlers() {
 
   desktopNotifications = createDesktopNotifications({ BrowserWindow, screen, ipcMain, Notification,
     // (TPT480/TPT487) Persisted "Show on Top" choice — app-level, not per project. Controlled
-    // from the Settings menu (createMenu()) and the Settings modal (notify:on-top-set). Off
-    // sends native OS notifications instead of the always-on-top stack.
+    // from View ▸ Notifications (createMenu()) and the banner's "Show" checkbox (onSetOnTop,
+    // TPT505). Off sends native OS notifications instead of the always-on-top stack.
     settingsFile: path.join(app.getPath('userData'), 'desktop-notifications.json'),
+    onSetOnTop: (on) => applyNotificationsOnTop(on),
     isTrustedProjectSender: (event) => isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` }),
     // (TPT484) One surface by app focus: the focused project window hosts the in-app panel;
     // with no project window focused, the always-on-top banner takes over.
@@ -1094,19 +1095,6 @@ function registerIpcHandlers() {
     const tag = payload?.tag;
     if (typeof tag !== 'string' || !tag.trim()) return { ok: false, reason: 'invalid_tag' };
     return { ok: true, dismissed: desktopNotifications.dismissKey(tag, projectDirs.get(event.sender.id) || null) };
-  });
-  // (TPT487) Settings modal "Show on Top" checkbox. Same persisted flag as the menu item.
-  ipcMain.handle('notify:on-top-get', (event) => {
-    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
-      return { ok: false, reason: 'untrusted_sender' };
-    }
-    return { ok: true, enabled: desktopNotifications.isEnabled() };
-  });
-  ipcMain.handle('notify:on-top-set', (event, payload = {}) => {
-    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
-      return { ok: false, reason: 'untrusted_sender' };
-    }
-    return applyNotificationsOnTop(!!payload?.enabled);
   });
   ipcMain.handle('notify:surface-state', (event) => {
     if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
@@ -1807,7 +1795,7 @@ async function showVoiceShortcutDiagnostics(win) {
 }
 
 // (TPT487) One writer for the "Show on Top" flag: applies at once, persists, rebuilds the menu
-// checkbox and tells every project window's Settings checkbox.
+// checkbox and tells every project window (its Settings ▸ Notifications status follows it).
 function applyNotificationsOnTop(on) {
   if (!desktopNotifications) return { ok: false, reason: 'unavailable' };
   const result = desktopNotifications.setEnabled(on);
@@ -1821,12 +1809,13 @@ function applyNotificationsOnTop(on) {
   return result;
 }
 
-// (TPT480) App-level Settings submenu. The checkbox applies at once and persists across
+// (TPT480/TPT505) View ▸ Notifications. The checkbox applies at once and persists across
 // restarts: checked keeps the desktop stack on top; unchecked hides it and sends new alerts as
-// transient native OS notifications (TPT487). In-app cards are unaffected either way.
-function appSettingsMenu(label) {
+// transient native OS notifications (TPT487). In-app cards are unaffected either way. The
+// banner's own "Show" checkbox writes the same flag.
+function notificationsMenu() {
   return {
-    label,
+    label: mt('menu.notifications'),
     submenu: [{
       label: mt('menu.notificationsOnTop'),
       type: 'checkbox',
@@ -1854,8 +1843,6 @@ function createMenu() {
         // below); the full notices text still needs its own window since the
         // native panel has no room for it.
         { label: mt('menu.thirdPartyLicenses'), click: () => openNoticesWindow() },
-        { type: 'separator' },
-        appSettingsMenu(mt('menu.appSettings')),
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -1924,8 +1911,6 @@ function createMenu() {
           ],
         },
         { type: 'separator' },
-        // (TPT480) Win/Linux have no app-name menu, so app-level settings live here.
-        ...(isMac ? [] : [appSettingsMenu(mt('menu.appSettingsOther')), { type: 'separator' }]),
         {
           label: mt('menu.reauthenticate'),
           click: (mi, window) => { if (window && !window.isDestroyed()) window.webContents.send('force-reauth'); },
@@ -1970,6 +1955,8 @@ function createMenu() {
         { role: 'zoomOut' },
         { type: 'separator' },
         { role: 'togglefullscreen' },
+        { type: 'separator' },
+        notificationsMenu(),
       ],
     },
     {
@@ -2381,8 +2368,21 @@ async function createInitialWindows(projectPaths = null, opts = {}) {
   }
 }
 
+function registerSystemResumeHandlers() {
+  const notifyResume = () => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed() || win.webContents.isDestroyed()) continue;
+      try { win.webContents.send('tiptask:system-resume'); }
+      catch (err) { console.warn('[system-resume] window delivery failed:', err.message); }
+    }
+  };
+  powerMonitor.on('resume', notifyResume);
+  powerMonitor.on('unlock-screen', notifyResume);
+}
+
 app.whenReady()
   .then(async () => {
+    registerSystemResumeHandlers();
     // C1006: splash first, awaited until its first frame is painted — the
     // captureLoginShellPath() call below blocks the main process for up to 10 s,
     // so anything created after it (or not yet painted) would show as an empty rect.

@@ -17,6 +17,11 @@ function inside(layer, el) {
   return !!el && (layer.root.contains(el) || portalsFor(layer).some(portal => portal.contains(el)));
 }
 
+function inertWithin(el) {
+  for (let node = el; node; node = node.parentElement) if (node.inert) return true;
+  return false;
+}
+
 function focusables(layer) {
   return [layer.root, ...portalsFor(layer)].flatMap(root => [...root.querySelectorAll(FOCUSABLE)])
     .filter(el => el.tabIndex >= 0 && !el.disabled && !el.closest('[hidden]')
@@ -97,7 +102,10 @@ export function activateDialogFocus({ root, initialFocus, returnFocus, portals }
       }
       if (!wasTop) return;
       const candidate = typeof layer.returnFocus === 'function' ? layer.returnFocus() : layer.returnFocus;
-      if (candidate?.isConnected && !candidate.inert && candidate.getClientRects().length) {
+      // The saved element may sit in a lower layer that closed meanwhile (now inert background):
+      // it must lie in the layer that is top now, and no ancestor may be inert.
+      if (candidate?.isConnected && !inertWithin(candidate) && candidate.getClientRects().length
+        && (!top() || inside(top(), candidate))) {
         candidate.focus({ preventScroll: true });
       } else if (top()) {
         focusFirst(top());

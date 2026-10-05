@@ -1,5 +1,38 @@
 'use strict';
 
+const { fetchStatusContext, isLockedTargetStatus } = require('./status-roles');
+
+// Streaming parsers are synchronous. Refresh their project-owned snapshot before
+// every turn; a failed read removes the old snapshot and suppresses modifications.
+async function prepareObjectiveProposalContext(session) {
+  const context = { tasks: null };
+  const epoch = session._epoch || 0;
+  session._proposalContext = context;
+  try {
+    const backend = session.backend;
+    const roles = (await fetchStatusContext(backend)).roles;
+    const tasks = await backend.getTasksUnfiltered();
+    if (session._closed || (session._epoch || 0) !== epoch || session._proposalContext !== context) return;
+    Object.assign(context, { roles, tasks: new Map(tasks.map(task => [task.id, task])) });
+    session._startStatusName = roles.start;
+  } catch (err) {
+    console.warn(`[objective] Cannot verify proposal targets: ${err.message}`);
+  }
+}
+
+// Validate the entire batch before finalizeChanges can create or patch any task.
+async function assertEditableModifiedTargets(changes, backend, roles) {
+  for (const change of changes) {
+    if (change?.type !== 'modified') continue;
+    const id = change.task?.id || change.task?.task_key;
+    const task = await backend.getTask(id);
+    if (!task) throw new Error(`Cannot verify objective target ${id}`);
+    if (isLockedTargetStatus(task.status, roles)) {
+      throw new Error(`Objective cannot modify task ${id}: status ${task.status} is locked`);
+    }
+  }
+}
+
 const TODO_JSON_BLOCK_RE = /^([\s\S]*?```json\s*\n)([\s\S]*)(```[\s\S]*)$/;
 
 // `startName` (C1187) — this project's workflow-start role name (fetchStatusContext()
@@ -52,6 +85,8 @@ function forcePendingTodoPayloadNewTasks(content, source = 'todo-write', startNa
 }
 
 module.exports = {
+  prepareObjectiveProposalContext,
+  assertEditableModifiedTargets,
   forcePendingProposalStatuses,
   forcePendingTodoPayloadNewTasks,
 };

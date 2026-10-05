@@ -1,16 +1,7 @@
 'use strict';
 
-// Spawn-time MCP config for Claude sessions. The project's .mcp.json registers the remote
-// `tipatask` server with `Authorization: Bearer ${API_TOKEN}`, which Claude Code expands from
-// its own process environment once, at launch — so a token that expires (7-day JWT) or is
-// replaced by a re-auth mid-session keeps being re-sent stale, even across /mcp reconnects.
-//
-// When the installed CLI supports `headersHelper`, the Task App points Claude at a derived
-// copy of .mcp.json (under USER_DATA_ROOT, never inside the project) whose `tipatask` entry
-// also carries a headersHelper command. Claude runs that command on every connect/reconnect
-// and its output overrides the static Authorization header, so /mcp → Reconnect picks up the
-// current token in .tipatask/config.json. The project's own .mcp.json is never modified; the
-// static header stays as the fallback if the helper fails.
+// Derived Claude registrations bind the selected project URL and live account-store
+// helper. An empty static header prevents reuse of stale launch-time credentials.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -36,15 +27,21 @@ function buildHeadersHelperCommand({
   platform = process.platform,
 } = {}) {
   if (!execPath || !scriptPath || !projectRoot) return null;
+  // Bind helper output to the URL this MCP registration actually connects to.
+  // A project re-targeted on disk must not send its new server's token to the old URL.
+  let target = null;
+  try { target = JSON.parse(fs.readFileSync(path.join(projectRoot, '.tipatask/config.json'), 'utf8')); } catch { /* unconfigured */ }
+  const binding = target?.API_BASE_URL && target?.API_PROJECT_ID
+    ? ['--api-base-url', String(target.API_BASE_URL), '--project-id', String(target.API_PROJECT_ID)] : [];
   if (platform === 'win32') {
-    if ([execPath, scriptPath, projectRoot, userDataRoot || ''].some((p) => String(p).includes('"'))) return null;
+    if ([execPath, scriptPath, projectRoot, userDataRoot || '', ...binding].some((p) => /["%\r\n]/.test(String(p)))) return null;
     const prefix = electron ? 'set "ELECTRON_RUN_AS_NODE=1" && ' : '';
     const userData = userDataRoot ? ` --user-data "${userDataRoot}"` : '';
-    return `${prefix}"${execPath}" "${scriptPath}" --project-root "${projectRoot}"${userData}`;
+    return `${prefix}"${execPath}" "${scriptPath}" --project-root "${projectRoot}"${userData}${binding.length ? ' ' + binding.map(v => `"${v}"`).join(' ') : ''}`;
   }
   const prefix = electron ? 'ELECTRON_RUN_AS_NODE=1 ' : '';
   const userData = userDataRoot ? ` --user-data ${shQuote(userDataRoot)}` : '';
-  return `${prefix}${shQuote(execPath)} ${shQuote(scriptPath)} --project-root ${shQuote(projectRoot)}${userData}`;
+  return `${prefix}${shQuote(execPath)} ${shQuote(scriptPath)} --project-root ${shQuote(projectRoot)}${userData}${binding.length ? ' ' + binding.map(shQuote).join(' ') : ''}`;
 }
 
 // Writes the derived config and returns its path, or null when there is nothing to derive
@@ -60,6 +57,10 @@ function writeSpawnMcpConfig({ projectRoot, userDataRoot, helperCommand }) {
   }
   const entry = parsed && parsed.mcpServers && parsed.mcpServers[REMOTE_SERVER_NAME];
   if (!entry || typeof entry !== 'object' || entry.type !== 'http') return null;
+  const target = require('./project-config').readProjectConfig(projectRoot);
+  if (!target?.API_BASE_URL || !target?.API_PROJECT_ID) return null;
+  entry.url = `${String(target.API_BASE_URL).replace(/\/+$/, '')}/api/projects/${encodeURIComponent(target.API_PROJECT_ID)}/mcp`;
+  entry.headers = { ...entry.headers, Authorization: '' };
   entry.headersHelper = helperCommand;
 
   const dir = path.join(userDataRoot, 'mcp-spawn');
@@ -85,7 +86,7 @@ function writeSpawnMcpConfig({ projectRoot, userDataRoot, helperCommand }) {
 // Writes a copy of the project's .mcp.json holding only the named servers and returns its
 // path, for a spawn that pairs it with --strict-mcp-config so no other MCP server (project or
 // user-level) is reachable. Returns null when .mcp.json is missing/invalid or defines none of
-// them — the caller then spawns without the flag and relies on its tool allowlist alone.
+// them — headless callers use an empty strict config in that case.
 function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label }) {
   if (!projectRoot || !userDataRoot || !Array.isArray(servers) || !label) return null;
   let parsed;
@@ -94,6 +95,18 @@ function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label }) {
   } catch {
     return null;
   }
+  // Refresh managed URL/helper/roots before scoping; user servers are never carried
+  // into a headless chat. The shared writer preserves their project registration.
+  const target = require('./project-config').readProjectConfig(projectRoot);
+  if (target?.API_BASE_URL && target?.API_PROJECT_ID && parsed?.mcpServers?.tipatask?.type === 'http') {
+    const entry = parsed.mcpServers.tipatask;
+    entry.url = `${String(target.API_BASE_URL).replace(/\/+$/, '')}/api/projects/${encodeURIComponent(target.API_PROJECT_ID)}/mcp`;
+    entry.headers = { ...entry.headers, Authorization: '' };
+    entry.headersHelper = buildHeadersHelperCommand({ projectRoot, userDataRoot });
+  }
+  const local = parsed?.mcpServers?.['tipatask-local'];
+  if (local) local.env = { ...local.env, TIPATASK_PROJECT_ROOT: path.resolve(projectRoot), TIPATASK_USER_DATA: userDataRoot,
+    TIPATASK_SERVER_ROOT: path.resolve(__dirname, '../..'), TIPATASK_MCP_LOCAL_ONLY: '1' };
   const all = parsed && parsed.mcpServers;
   if (!all || typeof all !== 'object') return null;
   const mcpServers = {};

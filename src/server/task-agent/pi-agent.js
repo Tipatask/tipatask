@@ -30,31 +30,23 @@ function buildTipataskRestRecipe(opts = {}) {
     ? `${cleanNames.slice(0, 12).join(' | ')} | … (${cleanNames.length - 12} more — GET /statuses for the full list)`
     : cleanNames.join(' | ');
   return [
-    '- Tipatask REST is the full replacement for those MCP tools. The env vars below are already exported in this shell (from .tipatask/config.json). Never hardcode a token, a URL or a task key, and never invent an endpoint that is not listed here.',
+    '- Pi uses REST, not MCP. The selected project config holds API_BASE_URL/API_PROJECT_ID; the account store holds the token. Never print tokens or read them into a shell variable.',
+    '- Use the credential-safe command below; it reads the current account on every call. JSON bodies and the completion report go on stdin. On missing store/path, check TIPATASK_USER_DATA; on scope mismatch or expired credentials, sign in again. Never bypass completion verification with a status PATCH.',
     '```sh',
-    'TT="$API_BASE_URL/api/projects/$API_PROJECT_ID"; AUTH="Authorization: Bearer $API_TOKEN"; JSON="Content-Type: application/json"',
-    '# read THIS task (all fields + tags); $TIPATASK_TASK_ID is already set to this task key',
-    'curl -sS -H "$AUTH" "$TT/tasks/$TIPATASK_TASK_ID"',
-    '# read comments on this task',
-    'curl -sS -H "$AUTH" "$TT/tasks/$TIPATASK_TASK_ID/comments"',
-    `# set status (this project's configured statuses): ${namesLine}`,
-    `curl -sS -X PATCH -H "$AUTH" -H "$JSON" "$TT/tasks/$TIPATASK_TASK_ID" -d '{"status":"${inProgressName}"}'`,
-    '# post a comment (type: comment | resolution | spec)',
-    'curl -sS -X POST -H "$AUTH" -H "$JSON" "$TT/tasks/$TIPATASK_TASK_ID/comments" -d \'{"content":"REPORT TEXT","type":"resolution"}\'',
-    '# the same PATCH also accepts: title description priority story_points type assignee due_date dependencies parent_id',
-    '# list the project tag table (replaces list_system_tags / get_project_tags)',
-    'curl -sS -H "$AUTH" "$TT/tags"',
-    '# register a tag BEFORE putting it on a task (bulk array; description required, max 500 chars)',
-    'curl -sS -X POST -H "$AUTH" -H "$JSON" "$TT/tags" -d \'{"tags":[{"name":"tt-x","description":"what module tt-x covers"}]}\'',
-    '# replace this task full tag list (every name must already exist in /tags, else 400)',
-    'curl -sS -X PATCH -H "$AUTH" -H "$JSON" "$TT/tasks/$TIPATASK_TASK_ID" -d \'{"tags":["tt-a","tt-b","bugfix"]}\'',
-    '# other tasks: list, or read one by key',
-    `curl -sS -H "$AUTH" "$TT/tasks?status=${startName}&fields=summary&limit=20"`,
-    'curl -sS -H "$AUTH" "$TT/tasks/C123"',
-    '# project members (for @mentions in a comment)',
-    'curl -sS -H "$AUTH" "$TT/members"',
-    '# push an edited architecture doc to the shared KB (file_key = repo-relative path)',
-    'curl -sS -X POST -H "$AUTH" -H "$JSON" "$TT/knowledge" -d "$(jq -Rs \'{files:[{file_key:"ai/architecture/tt-x.md",content:.}]}\' < ai/architecture/tt-x.md)"',
+    'tt() { ELECTRON_RUN_AS_NODE=1 "$TIPATASK_TOOL_EXEC" "$TIPATASK_TOOL_SCRIPT" "$@"; }',
+    'tt GET "/tasks/$TIPATASK_TASK_ID"',
+    'tt GET "/tasks/$TIPATASK_TASK_ID/comments"',
+    `# configured statuses: ${namesLine}`,
+    `printf '%s' '{"status":"${inProgressName}"}' | tt PATCH "/tasks/$TIPATASK_TASK_ID"`,
+    'tt GET /tags',
+    `tt GET "/tasks?status=${startName}&fields=summary&limit=20"`,
+    '# Register tags with POST /tags and a {"tags":[{"name":"...","description":"..."}]} JSON body.',
+    '# Update task fields/tags with PATCH /tasks/<KEY>; comments with POST /tasks/<KEY>/comments.',
+    '# Read /tasks, /members, /sprints, /statuses, /knowledge; push KB with POST /knowledge.',
+    '# Before Git writes and completion, require verified:true from:',
+    'tt verify "$TIPATASK_TASK_ID"',
+    '# After checks/required commits, pass a plain-English report file; require completed:true:',
+    'tt complete "$TIPATASK_TASK_ID" < /path/to/resolution.txt',
     '```',
   ].join('\n');
 }
@@ -178,7 +170,7 @@ class PiAgent extends BaseTaskAgent {
     const lines = [
       'Use the Tipatask workflow for this repository.',
       'You are running inside Pi Coding Agent. Pi has NO MCP support at all — that is Pi\'s design (its README says "No MCP."), not a broken setup. A missing `tipatask` MCP server here is expected and is NOT a bug: never report it to the user, never investigate it, never read or edit `.mcp.json`, and never stop work over it. Use Pi built-in shell/read/edit tools only.',
-      'Pi auto-loads this repo\'s AGENTS.md / CLAUDE.md, which were written for MCP-capable agents (Claude Code, Codex). Every instruction there to call a `tipatask` MCP tool — list_system_tags, get_project_tags, get_tag_architecture, get_tag_architectures, create_system_tag, batch_grep_tags, list_tasks, get_task, create_task, update_task, create_task_comment, push_knowledge — does NOT apply to you, and neither does the "MCP Tool Schemas" section of your system prompt. Read architecture docs straight off disk (ai/architecture/*.md) and use the curl recipes below for everything else.',
+      'Pi auto-loads this repo\'s AGENTS.md / CLAUDE.md, which were written for MCP-capable agents (Claude Code, Codex). Every instruction there to call a `tipatask` MCP tool — list_system_tags, get_project_tags, get_tag_architecture, get_tag_architectures, create_system_tag, batch_grep_tags, list_tasks, get_task, create_task, update_task, create_task_comment, push_knowledge — does NOT apply to you, and neither does the "MCP Tool Schemas" section of your system prompt. Read architecture docs straight off disk (ai/architecture/*.md) and use the REST command below for task operations and verified completion.',
       'Start in planning mode enforced by Task App. First study the task, relevant source code, configuration files, and architecture docs. Do not implement, edit files, or run mutating commands until the user approves the plan.',
       // (C1116) The instruction below is deliberately kept as ONE unbroken sentence with no
       // literal newline — Pi's TUI echoes this prompt verbatim in its first frames, and the
@@ -202,9 +194,9 @@ class PiAgent extends BaseTaskAgent {
       // one: it's just an ordinary active, non-start, non-in-progress status. Matched
       // by literal name here so a project that removed it entirely isn't told to use a
       // status that no longer exists.
-      `- Task status: PATCH status to ${this.resolveStatusForRole('in_progress', opts)} as soon as you start implementing (right after plan approval), and to ${this.resolveStatusForRole('complete', opts)}${this.resolveStatusNames(opts).includes('on_fire') ? ' — or on_fire if this task is blocked —' : ''} before your final message. Re-GET the task afterwards to confirm the saved status.`,
+      `- Task status: PATCH status to ${this.resolveStatusForRole('in_progress', opts)} as soon as you start implementing (right after plan approval), and use tt complete for ${this.resolveStatusForRole('complete', opts)}${this.resolveStatusNames(opts).includes('on_fire') ? ' — or on_fire if this task is blocked —' : ''} before your final message. Re-GET the task afterwards to confirm the saved status.`,
       '- Before marking this task complete: if a module you touched has no tt-* tag, GET /tags to check, then POST /tags to register it (description required), then create the ai/architecture/tt-*.md stub yourself with your write tool, then PATCH the task tags. That order matters: an unregistered name inside a PATCH tags array is rejected with 400 "tags not registered". There is no create_system_tag here to write the stub for you.',
-      `- MANDATORY before marking this task ${this.resolveStatusForRole('complete', opts)}: post ONE self-authored resolution comment using the resolution-comment command above. content must be a real report in plain English prose covering: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). If the work needs a follow-up task, describe it here instead of creating one. Post it immediately before the PATCH that sets status to ${this.resolveStatusForRole('complete', opts)}. It is separate from and required IN ADDITION TO the auto-posted terminal-tail resolution comment (a raw log dump posted on session exit) — that one does not satisfy this step.`,
+      `- MANDATORY before marking this task ${this.resolveStatusForRole('complete', opts)}: pass ONE self-authored plain-English resolution to tt complete. Cover what changed and why, key files, checks, and follow-ups/caveats (none if absent). Require completed:true; never use a status PATCH instead. The automatic terminal-tail comment is separate and does not replace this report.`,
       '- KB push: nothing auto-pushes your ai/architecture/*.md edits from this session (that hook is Claude Code only, and Task App session start only pulls). After your LAST edit to an arch doc, push it with the arch-doc command above. If jq is unavailable, skip the push and say so in the resolution comment — the file on disk stays authoritative.',
       `- ${grepNote}`,
       ...directives,

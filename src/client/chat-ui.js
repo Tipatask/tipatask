@@ -17,7 +17,7 @@ import { buildWsUrl } from './ws-client.js';
 import { cleanupChat, closeConsoleIfOpen } from './console-modal.js';
 import { appendProgressLog, noteTurnBoundary, pushThinking, flushThinking, stageLogText } from './objective-progress-log.js';
 import { saveRecipe } from './recipe-sidebar.js';
-import { renderCardHtml, ensureExistingSnapshot, renderDiscussPreviewHtml } from './chat-task-preview.js';
+import { renderCardHtml, ensureExistingSnapshot, renderDiscussPreviewHtml, getLockedCardTarget } from './chat-task-preview.js';
 import { countPendingSubtaskCards, hasProposalCards } from './subtask-preview.js';
 import { attachImagePaste } from './task-board.js';
 import { DROPDOWN_CARET_SVG, embedMenuHtml, attachEmbedMenu, closeOpenEmbedMenu } from './embed-menu.js';
@@ -1482,7 +1482,7 @@ export function getUnsavedAcceptedCountForMsg(msg) {
   const mask = msg.acceptedMask || [];
   const confirmed = msg.confirmedMask || [];
   for (let i = 0; i < msg.cards.length; i++) {
-    if (mask[i] && !confirmed[i]) count++;
+    if (mask[i] && !confirmed[i] && !getLockedCardTarget(msg, i)) count++;
   }
   return count;
 }
@@ -2819,7 +2819,7 @@ export function connectObjectiveWS(taskId, prompt, opts) {
         if (msg.filesAddressed) lastMsgOR.filesAddressed = msg.filesAddressed;
         if (msg.docUpdates) lastMsgOR.docUpdates = msg.docUpdates;
         if (msg.timingMilestones) lastMsgOR.timingMilestones = msg.timingMilestones;
-        if (msg.cards && msg.cards.length > 0) {
+        if (Array.isArray(msg.cards)) {
           lastMsgOR._serverCards = msg.cards;
           lastMsgOR.streaming = false;
           if (tab) tab.status = 'done';
@@ -2879,7 +2879,7 @@ export function connectObjectiveWS(taskId, prompt, opts) {
         lastMsg.streaming = false;
         try {
           let cards;
-          if (lastMsg._serverCards && lastMsg._serverCards.length > 0) {
+          if (Array.isArray(lastMsg._serverCards)) {
             cards = lastMsg._serverCards;
             lastMsg.newTags = Array.isArray(lastMsg._serverNewTags) ? lastMsg._serverNewTags : [];
             lastMsg.objectiveSummary = lastMsg._serverObjectiveSummary || null; // C1339

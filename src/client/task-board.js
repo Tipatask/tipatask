@@ -20,7 +20,6 @@ import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.
 import { createMemberCache } from './member-cache.js';
 import { api } from './api-client.js';
 import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration } from './notifications.js';
-import { renderShowOnTopControl } from './desktop-notification-panel.js';
 import { buildDepGraph, collectCycleBlocked } from './dep-graph.js';
 import { tagName } from './tag-match.js';
 import { serializeBoardFilters, sanitizeBoardFilters } from './board-filter-prefs.js';
@@ -1486,24 +1485,40 @@ export function applyParentSprintFollow(entries) {
 }
 
 // ── Status change confirmation modal ──
+// (TPT508) Owns a dialog-focus layer and an above-workspace tier: opened over the task
+// workspace (TPT466), an unlayered confirm painted on top but stayed inert.
 export function showConfirmModal(taskId, prevStatus, newStatus, onDone) {
+  const workspace = document.getElementById('task-edit-modal');
   const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
+  overlay.className = `modal-overlay ${workspace && !workspace.hidden ? 'modal-overlay--over-modal' : 'modal-overlay--over-board'}`;
   overlay.innerHTML = `
-    <div class="modal">
-      <p>${t('modal.changeStatus', { id: `<strong>${taskId}</strong>`, label: `<strong>${statusLabel(newStatus)}</strong>` })}</p>
+    <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="status-change-message">
+      <p id="status-change-message">${t('modal.changeStatus', { id: `<strong>${taskId}</strong>`, label: `<strong>${statusLabel(newStatus)}</strong>` })}</p>
       <div class="modal-buttons">
         <button class="btn-cancel">${t('btn.cancel')}</button>
         <button class="btn-confirm">${t('btn.confirm')}</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
+  const focusHandle = activateDialogFocus({ root: overlay, initialFocus: '.btn-cancel' });
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener('keydown', onKey, true);
+    focusHandle.close();
+  };
+  const onKey = (e) => {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation();
+    close();
+  };
+  document.addEventListener('keydown', onKey, true);
 
-  overlay.querySelector('.btn-cancel').addEventListener('click', () => overlay.remove());
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  overlay.querySelector('.btn-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
   overlay.querySelector('.btn-confirm').addEventListener('click', async () => {
-    overlay.remove();
+    close();
     try {
       // (C1259) applyTaskPatch() (task-card.js) patches the card in place from the PATCH
       // response — a status-only change never moves tiers, so this always takes the
@@ -5038,8 +5053,24 @@ export function attachNewTaskFormHandlers(root, { onRerender } = {}) {
 
 // ── Settings modal + theme ──
 
+// (TPT508) Settings' own dialog-focus layer. Opened over the task workspace (TPT466), whose
+// layer inerts every other body child, Settings painted on top yet took no clicks or focus.
+let _settingsFocus = null;
+
 export function openSettingsModal() {
-  document.getElementById('settings-modal')?.classList.add('open');
+  const modal = document.getElementById('settings-modal');
+  if (modal) {
+    modal.classList.add('open');
+    const workspace = document.getElementById('task-edit-modal');
+    modal.classList.toggle('settings-modal--over-modal', !!workspace && !workspace.hidden);
+    // Once per open — a repeated ⌘, while Settings is already up must not stack a second layer.
+    if (!_settingsFocus) {
+      _settingsFocus = activateDialogFocus({
+        root: modal,
+        initialFocus: () => modal.querySelector('.modal-tab-btn.active') || modal.querySelector('.settings-close'),
+      });
+    }
+  }
   _populateSettingsAgentsRow();
   _populateSettingsLanguageSelect();
   _populateSettingsNotificationsRows();
@@ -5054,7 +5085,9 @@ export function openSettingsModal() {
   applyProjectTheme();
 }
 export function closeSettingsModal() {
-  document.getElementById('settings-modal')?.classList.remove('open');
+  document.getElementById('settings-modal')?.classList.remove('open', 'settings-modal--over-modal');
+  _settingsFocus?.close();
+  _settingsFocus = null;
 }
 
 // TPT220 — the shipped default theme: 'paper' (TipATask dawn), what a fresh install with no
@@ -5864,9 +5897,6 @@ function _wireVoiceModelRow(row) {
   }
 }
 
-// Generic confirmation dialog. overlayClass selects the stacking context; all variants
-// render at z-index 3400. Focus Cancel (or the sole button for okOnly) to prevent Enter
-// from activating the underlying page. Escape/backdrop/Cancel resolve false.
 function _markVoiceModelRowDownloading(row, percent) {
   const stateEl = row.querySelector('.settings-voice-model-state');
   const bar = row.querySelector('.settings-voice-model-progress');
@@ -6722,9 +6752,6 @@ function _populateSettingsDebugRow() {
 // Electron. Callers are fire-and-forget (unchanged) — the DOM updates once the refresh
 // settles rather than blocking the modal open.
 async function _populateSettingsNotificationsRows() {
-  // (TPT487) Bottom row of the block; a toggle re-reads the status so the badge follows it.
-  renderShowOnTopControl(document.getElementById('settings-notifications-ontop-mount'),
-    { onChange: () => { _populateSettingsNotificationsRows(); } });
   await refreshNotificationStatus();
 
   const stateEl = document.getElementById('settings-notifications-state');
@@ -6885,10 +6912,15 @@ export function initSettingsModal() {
   _wireSettingsWorkflowTab();
   // Backdrop click closes
   modal.addEventListener('click', (e) => { if (e.target === modal) closeSettingsModal(); });
-  // Escape closes (only when open; other Escape handlers keep their own guards)
+  // Escape closes. (TPT508) Capture phase + stopPropagation so the task workspace's own
+  // document-level Escape closer (template.html) never sees an Esc meant for Settings above it;
+  // isTop() leaves the key to Edit Agents / an action confirm opened over Settings.
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && modal.classList.contains('open')) closeSettingsModal();
-  });
+    if (e.key !== 'Escape' || !modal.classList.contains('open') || !_settingsFocus?.isTop()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    closeSettingsModal();
+  }, true);
   // Theme select inside the modal — wired once (element is static, not in #app).
   const themeSelect = modal.querySelector('#settings-theme-select');
   if (themeSelect) {
@@ -6993,6 +7025,13 @@ export function initSettingsModal() {
       _populateSettingsNotificationsRows();
     });
   }
+  // (TPT487/TPT505) "Show on Top" lives in View ▸ Notifications and on the banner now; when it
+  // flips, the open modal's status badge/hints re-read the delivery mode.
+  try {
+    window.electronAPI?.onNotificationsOnTopChanged?.(() => {
+      if (document.getElementById('settings-modal')?.classList.contains('open')) _populateSettingsNotificationsRows();
+    });
+  } catch (_) {}
   // (C1259) Debug ▸ click-to-render perf logging toggle + log-path hint buttons — wired
   // once; state/path repopulated on each open via _populateSettingsDebugRow().
   const debugToggle = modal.querySelector('#settings-debug-perf-toggle');

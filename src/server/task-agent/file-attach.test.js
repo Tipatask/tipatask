@@ -148,7 +148,7 @@ test('localizeFileRefs warns and leaves refs unlocalized when credentials are mi
 
       assert.strictEqual(result.prompt, prompt);
       assert.ok(
-        warnings.some(line => line.includes('[file-attach]') && line.includes('API_TOKEN')),
+        warnings.some(line => line.includes('[file-attach]') && line.includes('No signed-in account token')),
         `expected a credentials-unavailable warning, got: ${JSON.stringify(warnings)}`
       );
     });

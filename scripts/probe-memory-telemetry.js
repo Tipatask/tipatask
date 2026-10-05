@@ -9,16 +9,27 @@ const { execFile, spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { setTimeout: delay } = require('node:timers/promises');
 const { createCommandRunner } = require('../src/server/host-memory');
-const { createMemoryTelemetry } = require('../src/server/memory-telemetry');
+const { createMemoryTelemetry, parseMemoryProcesses } = require('../src/server/memory-telemetry');
 const { createSessionMemoryTracker } = require('../src/server/session-memory');
+const { createSessionValidationRecorder } = require('../src/server/session-validation');
 
 async function main() {
   if (process.platform !== 'darwin') throw Error('This probe requires macOS');
   const commands = new Set();
+  const commandDiagnostics = [];
   let execCount = 0;
   const runner = createCommandRunner({ exec(file, args, opts, cb) {
     execCount++;
-    const child = execFile(file, args, opts, cb);
+    const child = execFile(file, args, opts, (err, stdout) => {
+      if (err || (file === '/bin/ps' && !parseMemoryProcesses(stdout))) {
+        const invalidRows = file === '/bin/ps' && typeof stdout === 'string' ? stdout.trim().split('\n').filter(line => {
+          const parts = line.trim().split(/\s+/);
+          return parts.length !== 5 || parts.slice(0, 4).some(p => !/^\d+$/.test(p)) || !/^[A-Za-z]/.test(parts[4]);
+        }).slice(0, 3) : [];
+        commandDiagnostics.push({ command: file, error: err?.code || null, signal: err?.signal || null, invalidRows });
+      }
+      cb(err, stdout);
+    });
     commands.add(child);
     child.once('close', () => commands.delete(child));
     return child;
@@ -27,11 +38,14 @@ async function main() {
   const closed = once(worker, 'close');
   const session = { type: 'terminal', taskAgent: 'unknown', alive: true, ptyPid: worker.pid };
   const sessions = new Map([['probe', session]]);
-  const tracker = createSessionMemoryTracker();
+  const validation = createSessionValidationRecorder();
+  const tracker = createSessionMemoryTracker({ onLifecycle: event => validation.lifecycle(event) });
   tracker.begin(session);
   const telemetry = createMemoryTelemetry({ runner, tracker, getSessions: () => sessions,
-    isRunning: s => s.alive && !s._completionEmitted });
+    isRunning: s => s.alive && !s._completionEmitted,
+    onSample: snapshot => validation.sample(snapshot, null, sessions) });
   const summaries = [];
+  let failure = null;
   const record = () => {
     const s = telemetry.snapshot();
     assert.equal(s.host.status, 'ok', 'macOS host telemetry must be readable');
@@ -57,8 +71,11 @@ async function main() {
     assert.equal(summaries.at(-1).admissionSlots, 0);
     assert.equal(tracker.getHistory()[0].completeLifetime, true);
     assert.ok(new Set(summaries.map(s => s.sampledAt)).size >= 3);
+  } catch (err) {
+    failure = err;
   } finally {
     telemetry.stop();
+    validation.stop();
     if (worker.exitCode === null && worker.signalCode === null) worker.kill('SIGKILL');
     await closed;
     await Promise.all([...commands].map(child => once(child, 'close')));
@@ -70,8 +87,12 @@ async function main() {
   assert.equal(runner.pendingCount(), 0);
   assert.equal(telemetry.snapshot().inFlight, false);
   assert.throws(() => process.kill(worker.pid, 0), { code: 'ESRCH' });
-  console.log(JSON.stringify({ ok: true, workerPid: worker.pid, samples: summaries, execCount,
-    history: tracker.getHistory(), cleanup: 'no sampler timers, commands or worker remain' }, null, 2));
+  console.log(JSON.stringify({ ok: !failure, error: failure?.message || null, commandDiagnostics,
+    workerPid: worker.pid, samples: summaries, execCount,
+    history: tracker.getHistory(), validation: validation.status(),
+    evidenceKind: 'short-idle-smoke', representativeLiveRuns: 0,
+    cleanup: 'no sampler timers, commands or worker remain' }, null, 2));
+  if (failure) throw failure;
 }
 
 main().catch(err => { console.error(err.message); process.exitCode = 1; });

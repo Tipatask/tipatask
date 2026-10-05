@@ -97,7 +97,7 @@ test('POST /api/agents-config writes to the header-supplied project root, not co
 });
 
 test('POST /api/agents-config merges into existing project config — credentials survive', async () => {
-  const proj = makeProjectDir({ projectName: 'X', API_TOKEN: 'secret-token', CLAUDE_MODEL: 'opusplan' });
+  const proj = makeProjectDir({ projectName: 'X', API_BASE_URL: 'https://api-config.test', API_TOKEN: 'secret-token', CLAUDE_MODEL: 'opusplan' });
   try {
     const req = fakeReq('POST', '/api/agents-config', {
       headers: { 'x-tipatask-project': proj },
@@ -108,7 +108,8 @@ test('POST /api/agents-config merges into existing project config — credential
     assert.strictEqual(res.statusCode, 200);
 
     const onDisk = readProjectConfig(proj);
-    assert.strictEqual(onDisk.API_TOKEN, 'secret-token', 'unrelated existing keys must survive the merge');
+    assert.equal(onDisk.API_TOKEN, undefined);
+    assert.equal(require('./account-store').readAccount('https://api-config.test').token, 'secret-token');
     assert.strictEqual(onDisk.CLAUDE_MODEL, 'opusplan');
     assert.strictEqual(onDisk.TASK_AGENT, 'codex');
   } finally {

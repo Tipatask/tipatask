@@ -17,6 +17,7 @@ function parseMemoryProcesses(text) {
 }
 
 function createMemoryTelemetry({ getSessions, isRunning, platform = process.platform, now = Date.now,
+  onSample = null,
   runner = createCommandRunner(), tracker = createSessionMemoryTracker(),
   setIntervalFn = setInterval, clearIntervalFn = clearInterval } = {}) {
   let timer = null, stopped = false, inFlight = null, previousHost = null, latest = null;
@@ -48,6 +49,8 @@ function createMemoryTelemetry({ getSessions, isRunning, platform = process.plat
     if (host.status === 'ok') lastSuccessAt = hostAt;
     latest = { sampledAt: now(), host, processes: { ...diagnostics, rows, sampledAt: processStartedAt,
       status: snapshot ? (diagnostics.unionRssBytes === null ? 'partial' : 'ok') : 'unknown' } };
+    // Optional observation must never invalidate telemetry or interrupt admission.
+    try { onSample?.(telemetrySnapshot()); } catch { /* diagnostic sink only */ }
   }
   function poll() {
     if (stopped) return Promise.resolve();
@@ -59,7 +62,7 @@ function createMemoryTelemetry({ getSessions, isRunning, platform = process.plat
     }).finally(() => { inFlight = null; });
     return inFlight;
   }
-  function snapshot() {
+  function telemetrySnapshot() {
     const time = now();
     const hostAgeMs = latest ? time - latest.host.sampledAt : null;
     const processAgeMs = latest ? time - latest.processes.sampledAt : null;
@@ -79,7 +82,7 @@ function createMemoryTelemetry({ getSessions, isRunning, platform = process.plat
       processes: { ...processes, ageMs: processAgeMs, fresh: processesFresh },
       history: tracker.getHistory(), historyStorage: tracker.storageStatus() });
   }
-  return { tracker, poll, snapshot,
+  return { tracker, poll, snapshot: telemetrySnapshot,
     start() {
       if (stopped || timer !== null) return;
       timer = setIntervalFn(poll, SAMPLE_INTERVAL_MS);

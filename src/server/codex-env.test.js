@@ -483,9 +483,8 @@ test('existing-project upgrade reaches both Codex launch environments with new g
   const afterTerminal = fs.readFileSync(projectConfigPath, 'utf8');
   assert.equal(toml.parse(afterTerminal).mcp_servers.tipatask.transport, undefined);
   assert.equal(toml.parse(afterTerminal).mcp_servers['tipatask-local'].transport, undefined);
-  const refreshedGlobalLocal = toml.parse(fs.readFileSync(path.join(home, 'config.toml'), 'utf8')).mcp_servers['tipatask-local'];
-  assert.equal(refreshedGlobalLocal.transport, undefined);
-  assert.equal(refreshedGlobalLocal.command, '/custom/local-mcp');
+  const refreshedGlobalLocal = toml.parse(fs.readFileSync(path.join(home, 'config.toml'), 'utf8')).mcp_servers?.['tipatask-local'];
+  assert.equal(refreshedGlobalLocal, undefined);
   fs.writeFileSync(projectConfigPath, legacyConfig);
   const objective = buildCodexEnv({ projectRoot: root, taskId: 'TPT258' }).env;
   assert.equal(fs.readFileSync(projectConfigPath, 'utf8'), afterTerminal);

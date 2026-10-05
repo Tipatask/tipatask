@@ -35,7 +35,7 @@ function harness(t) {
       return proc;
     } },
     '../codex-env': { ...realRequire('../codex-env'), buildCodexEnv: () => ({ env: { TIPATASK_API_TOKEN: 'fixture-token' } }) },
-    '../../codex-mcp-config': { listProjectMcpServerNames: () => ['tipatask', 'tipatask-local', 'playwright'] },
+    '../../codex-mcp-config': { buildScopedCodexMcpOverride: () => 'mcp_servers={}' },
     '../claude-session': { normalizeProposals: x => x },
     './transcript': { buildTurnPrompt: (_session, opts) => ({ prompt: 'plan it', mode: opts.hasProviderSession ? 'resume' : 'fresh' }), buildNudgeMessage: () => 'nudge' },
     '../task-agent/attachments': { localizeAttachments: async ({ prompt }) => { await localizeGate; return { prompt }; } },
@@ -109,7 +109,7 @@ for (const resumed of [false, true]) {
     assert.equal(options.env.TIPATASK_API_TOKEN, 'fixture-token');
     assert.ok(args.includes('model_reasoning_effort="xhigh"'));
     assert.ok(args.includes('mcp_servers.tipatask-local.enabled_tools=["batch_grep_tags"]'));
-    assert.ok(args.includes('mcp_servers.playwright.enabled=false'));
+    assert.ok(args.includes('mcp_servers={}'));
     assert.ok(args.some(a => a.startsWith('mcp_servers.tipatask.disabled_tools=')));
     if (resumed) {
       assert.equal(args[1], 'resume');

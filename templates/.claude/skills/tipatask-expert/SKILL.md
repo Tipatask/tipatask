@@ -20,17 +20,9 @@ Two MCP servers are registered — call each tool on the right one:
 
 If a tool call fails with "tool not found," check you called it on the right server name.
 
-## MCP 401 — Expired `API_TOKEN` (REST fallback)
+## Credential recovery
 
-The remote `tipatask` server authenticates with the project token your session was launched with (`API_TOKEN`, a 7-day JWT read once at launch from `.tipatask/config.json`). If every call on it fails with HTTP 401 / "rejected the Authorization header" (the API says `API token expired at <time>`), the token has expired; `tipatask-local` still works, and `/mcp` → Reconnect is a user action, not yours. Do not skip the required writes — use REST with the **current** credentials from `.tipatask/config.json` (not `$API_TOKEN`, which is frozen at launch; not the Task App's own `.env`, which has no credentials), and never print the token:
-
-1. `POST {API_BASE_URL}/api/projects/{API_PROJECT_ID}/tasks/{KEY}/comments` `{"content": "...", "type": "resolution"}` → `201`
-2. `PATCH {API_BASE_URL}/api/projects/{API_PROJECT_ID}/tasks/{KEY}` `{"status": "completed"}` → `200`
-3. `GET {API_BASE_URL}/api/projects/{API_PROJECT_ID}/tasks/{KEY}` — confirm the saved status; never assume the PATCH stuck.
-
-REST answering `401 API token expired at …` too means the token in `config.json` is dead: report it and ask the user to re-authenticate (Project ▸ Re-authenticate / Change Account). Full recipe: `CLAUDE.md` § MCP 401 fallback.
-
----
+Project config holds only the API target; the account store under TIPATASK_USER_DATA holds credentials. Follow CLAUDE.md’s Credential recovery and completion section. Missing user-data paths are not expiry. Never print tokens or bypass local completion verification with a REST status write.
 
 ## Architecture Context Loading
 
@@ -159,7 +151,7 @@ Update architecture **before** marking the task `completed`. Stale architecture 
 
 ## Post-Task Completion Checklist
 
-Run this **before every `update_task(status='completed')` call**. Do not skip.
+Run this **before `tipatask-local.complete_task(task_key, resolution)`**. The guarded tool posts the report and completion status together; do not bypass it with `update_task`.
 
 ### 1. Tags accurate?
 - Call `list_system_tags` if any touched module might need a new `tt-*` tag
@@ -184,7 +176,7 @@ This is the most commonly skipped step. Capture anything surprising — but **wh
 Write it as one or two standing lines in a "Gotchas"/"Known issues" block in the relevant `tt-*.md` — no investigation log, no dates, no task keys, no evidence tables. Cross-project/reusable (a library pattern, a framework quirk) → save a `feedback_*.md` memory file in the project memory dir and add a pointer to `MEMORY.md` instead.
 
 **Task narrative → resolution comment, never the KB.** How you found it, what you tried first, evidence tables of observed values, dated findings, and any correction of your own earlier analysis:
-- Call `create_task_comment(task_key, content, type='resolution')` with the report.
+- Pass the report to `tipatask-local.complete_task(task_key, resolution)` after verification; use `create_task_comment` only for separate investigation notes during work.
 - To read how a past task went, call `list_task_resolutions(tags=[...])` — that is where this narrative lives, not `ai/architecture/*.md`.
 
 **Line test**: would this line still be worth reading a year from now, with this task long forgotten? Yes → KB. No → resolution comment. Naming a task key, a date, or what you personally tried is itself the answer: resolution comment.
