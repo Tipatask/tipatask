@@ -781,3 +781,215 @@ test('Pi assembled kickoff uses REST and compact rules without embedding the sta
     assert.ok(prompt.length < 9300);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// ── MCP bridge (TPT512) ──
+
+function makeBridgeProject() {
+  const dir = makeProjectDir({ API_BASE_URL: 'https://selected.test', API_PROJECT_ID: '2' });
+  fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({
+    mcpServers: {
+      tipatask: { type: 'http', url: '${API_BASE_URL}/api/projects/${API_PROJECT_ID}/mcp', headers: { Authorization: 'Bearer ${API_TOKEN}' } },
+      'tipatask-local': { command: '/bin/local', args: ['server.js'], env: { TIPATASK_MCP_LOCAL_ONLY: '1' } },
+    },
+  }));
+  return dir;
+}
+
+test('PiAgent.buildPrompt: bridge mode maps MCP names to bridged tools and drops the REST recipe', () => {
+  const dir = makeProjectDir({ TASK_BACKEND: 'api' });
+  try {
+    const prompt = new PiAgent().buildPrompt('Do the thing.', { taskTags: ['tt-pi-session'], projectPath: dir, piMcpBridge: true });
+    assert.match(prompt, /named <server>__<tool>/);
+    assert.match(prompt, /drop any `mcp__` prefix/);
+    for (const tool of ['tipatask__update_task', 'tipatask__get_task', 'tipatask__list_system_tags', 'tipatask__create_system_tag',
+      'tipatask-local__complete_task', 'tipatask-local__git_worktree_status', 'tipatask-local__push_knowledge']) {
+      assert.ok(prompt.includes(tool), `expected bridge prompt to name ${tool}`);
+    }
+    assert.match(prompt, /never set completed with tipatask__update_task/);
+    assert.match(prompt, /never read or edit `\.mcp\.json`/i);
+    assert.doesNotMatch(prompt, /TIPATASK_TOOL_SCRIPT|tt complete|tt verify|```sh|NO MCP/);
+    assert.match(prompt, /Do the thing\./);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('PiAgent.buildPrompt: bridge mode discovery mandate and tag backfill name bridged tools', () => {
+  const dir = makeProjectDir({ TASK_BACKEND: 'api' });
+  try {
+    const prompt = new PiAgent().buildPrompt('Do the thing.', {
+      taskTags: ['tt-pi-session'], projectPath: dir, piMcpBridge: true, discovery: true,
+      tagDescriptions: { 'tt-pi-session': '' },
+    });
+    assert.match(prompt, /tipatask__list_tasks\) and their comment history \(tipatask__list_task_resolutions\)/);
+    assert.doesNotMatch(prompt, /curls above/);
+    assert.match(prompt, /Blank tag description\(s\) on this task: tt-pi-session/);
+    assert.match(prompt, /ensure_project_tag\(tag_name, description\)/);
+    assert.doesNotMatch(prompt, /PUT \/tags/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('PiAgent.buildPrompt: bridge-mode kickoff stays echo-safe and under 9000 chars', (t) => {
+  const dir = makeProjectDir({ TASK_BACKEND: 'api' });
+  try {
+    const agent = new PiAgent();
+    for (const discovery of [false, true]) {
+      const prompt = agent.buildPrompt('Do the thing.', { taskTags: ['tt-pi-session'], projectPath: dir, discovery, piMcpBridge: true });
+      for (const line of prompt.split('\n')) {
+        assert.equal(matchPromptLine(line, PI_PROMPT_PATTERNS), null, `[discovery=${discovery}] PI table matched: ${line}`);
+        assert.equal(matchPromptLine(line, GENERIC_PROMPT_PATTERNS), null, `[discovery=${discovery}] generic table matched: ${line}`);
+      }
+      for (const { re, agents } of buildLegacyPatternTable()) {
+        if (agents && !agents.includes('pi')) continue;
+        assert.ok(!re.test(prompt), `[discovery=${discovery}] tail-scoped pattern matched the prompt: ${re}`);
+      }
+      assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*plan ready[.!]?\s*$/im);
+      assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*questions ready[.!]?\s*$/im);
+      t.diagnostic(`Pi bridge/discovery=${discovery}: ${prompt.length} / 9000`);
+      assert.ok(prompt.length < 9000, `[discovery=${discovery}] bridge prompt grew to ${prompt.length} chars`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('PiAgent.getSpawnSpec: loads the MCP bridge with -e and its derived config, no --tools allowlist', async (t) => {
+  const dir = makeBridgeProject();
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-pi-bridge-data-'));
+  // A staged bundle stands in for the build output (stagePiMcpBridge keeps an identical copy).
+  fs.mkdirSync(path.join(userData, 'pi-ext'));
+  const { BRIDGE_SOURCE, BRIDGE_FILE } = require('../providers/pi-task-tools');
+  const staged = path.join(userData, 'pi-ext', BRIDGE_FILE);
+  fs.writeFileSync(staged, fs.existsSync(BRIDGE_SOURCE) ? fs.readFileSync(BRIDGE_SOURCE, 'utf8') : 'export default function () {}\n');
+  const lines = [];
+  t.mock.method(console, 'log', (...args) => { lines.push(args.join(' ')); });
+  // These projects carry an API target, so attachment localization would try the network.
+  t.mock.method(PiAgent.prototype, 'localizeSpawnPrompt', async (_c, prompt, _id, opts) => ({ prompt, opts }));
+  try {
+    const spec = await new PiAgent().getSpawnSpec({ ...FAKE_CONFIG, SIMPLE_MODE: false, USER_DATA_ROOT: userData }, 'Work on task C1.', 'C1', { projectPath: dir });
+    const eAt = spec.args.indexOf('-e');
+    assert.ok(eAt > 0, 'expected -e <bridge>');
+    assert.equal(spec.args[eAt + 1], staged);
+    assert.ok(!spec.args.includes('--tools') && !spec.args.includes('-t'), 'an allowlist would deactivate bridged tools');
+    const cfgPath = spec.env.TIPATASK_PI_MCP_CONFIG;
+    assert.match(path.basename(cfgPath), /^[0-9a-f]{12}\.pi\.json$/);
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(cfgPath, 'utf8')).mcpServers), ['tipatask', 'tipatask-local']);
+    assert.match(spec.args.at(-1), /tipatask-local__complete_task/);
+    assert.doesNotMatch(spec.args.at(-1), /TIPATASK_TOOL_SCRIPT/);
+    assert.ok(lines.some((l) => l.includes(`mcp-bridge=${staged}`)), JSON.stringify(lines));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(userData, { recursive: true, force: true });
+  }
+});
+
+function stageBridgeBundle(userData) {
+  fs.mkdirSync(path.join(userData, 'pi-ext'), { recursive: true });
+  const { BRIDGE_SOURCE, BRIDGE_FILE } = require('../providers/pi-task-tools');
+  const staged = path.join(userData, 'pi-ext', BRIDGE_FILE);
+  fs.writeFileSync(staged, fs.existsSync(BRIDGE_SOURCE) ? fs.readFileSync(BRIDGE_SOURCE, 'utf8') : 'export default function () {}\n');
+  return staged;
+}
+
+// The argv order and the derived config are what Pi actually loads: one -e before the system
+// prompt and the positional kickoff, and a config whose `tipatask` entry is bound to the account
+// helper (never a `${API_TOKEN}` header the bridge would expand from Pi's env).
+test('PiAgent.getSpawnSpec: bridge argv order and the derived Pi MCP config', async (t) => {
+  const dir = makeBridgeProject();
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-pi-bridge-cfg-'));
+  const staged = stageBridgeBundle(userData);
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(PiAgent.prototype, 'localizeSpawnPrompt', async (_c, prompt, _id, opts) => ({ prompt, opts }));
+  try {
+    const spec = await new PiAgent().getSpawnSpec({ ...FAKE_CONFIG, SIMPLE_MODE: false, USER_DATA_ROOT: userData }, 'Work on task C1.', 'C1', { projectPath: dir });
+    const args = spec.args.slice(expectedLaunch().argsPrefix.length);
+    assert.equal(args.filter((a) => a === '-e').length, 1, 'exactly one extension');
+    const at = (flag) => args.indexOf(flag);
+    assert.ok(at('--approve') < at('-e'), JSON.stringify(args.slice(0, 8)));
+    assert.equal(args[at('-e') + 1], staged);
+    assert.ok(at('-e') < at('--append-system-prompt'));
+    assert.equal(at('--append-system-prompt') + 2, args.length - 1, 'the kickoff prompt stays the last, positional argument');
+
+    const cfgPath = spec.env.TIPATASK_PI_MCP_CONFIG;
+    assert.equal(path.dirname(cfgPath), path.join(userData, 'mcp-spawn'));
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    assert.doesNotMatch(raw, /\$\{API_TOKEN\}|Bearer/, 'no token placeholder or literal reaches the bridge');
+    const { tipatask, 'tipatask-local': local } = JSON.parse(raw).mcpServers;
+    assert.equal(tipatask.url, 'https://selected.test/api/projects/2/mcp');
+    assert.equal(tipatask.headers.Authorization, '');
+    assert.equal(typeof tipatask.headersHelper, 'string');
+    assert.ok(tipatask.headersHelper.length > 0);
+    assert.equal(local.env.TIPATASK_MCP_LOCAL_ONLY, '1');
+    assert.equal(local.env.TIPATASK_PROJECT_ROOT, path.resolve(dir));
+    assert.equal(local.env.TIPATASK_USER_DATA, userData);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(userData, { recursive: true, force: true });
+  }
+});
+
+test('PiAgent.getSpawnSpec: .mcp.json without an API target fails closed to the REST fallback', async (t) => {
+  const dir = makeBridgeProject();
+  fs.writeFileSync(path.join(dir, '.tipatask', 'config.json'), JSON.stringify({ TASK_BACKEND: 'api' }));
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-pi-bridge-closed-'));
+  stageBridgeBundle(userData);
+  const lines = [];
+  t.mock.method(console, 'log', (...args) => { lines.push(args.join(' ')); });
+  try {
+    const spec = await new PiAgent().getSpawnSpec({ ...FAKE_CONFIG, SIMPLE_MODE: false, USER_DATA_ROOT: userData }, 'Work on task C1.', 'C1', { projectPath: dir });
+    assert.ok(!spec.args.includes('-e'));
+    assert.equal(spec.env.TIPATASK_PI_MCP_CONFIG, '');
+    assert.match(spec.args.at(-1), /tt complete "\$TIPATASK_TASK_ID"/);
+    assert.doesNotMatch(spec.args.at(-1), /tipatask-local__complete_task/);
+    assert.ok(lines.some((l) => l.includes('mcp-bridge=off')), JSON.stringify(lines));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(userData, { recursive: true, force: true });
+  }
+});
+
+test('PiAgent.getSpawnSpec: an inherited TIPATASK_PI_MCP_CONFIG never survives into the spawn env', async (t) => {
+  const withBridge = makeBridgeProject();
+  const without = makeProjectDir({ API_BASE_URL: 'https://selected.test', API_PROJECT_ID: '2' });
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-pi-bridge-env-'));
+  stageBridgeBundle(userData);
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(PiAgent.prototype, 'localizeSpawnPrompt', async (_c, prompt, _id, opts) => ({ prompt, opts }));
+  const previous = process.env.TIPATASK_PI_MCP_CONFIG;
+  process.env.TIPATASK_PI_MCP_CONFIG = '/stale/inherited.pi.json';
+  try {
+    const cfg = { ...FAKE_CONFIG, SIMPLE_MODE: false, USER_DATA_ROOT: userData };
+    const off = await new PiAgent().getSpawnSpec(cfg, 'Work on task C1.', 'C1', { projectPath: without });
+    assert.equal(off.env.TIPATASK_PI_MCP_CONFIG, '');
+    const on = await new PiAgent().getSpawnSpec(cfg, 'Work on task C1.', 'C1', { projectPath: withBridge });
+    assert.equal(path.dirname(on.env.TIPATASK_PI_MCP_CONFIG), path.join(userData, 'mcp-spawn'));
+  } finally {
+    if (previous === undefined) delete process.env.TIPATASK_PI_MCP_CONFIG;
+    else process.env.TIPATASK_PI_MCP_CONFIG = previous;
+    fs.rmSync(withBridge, { recursive: true, force: true });
+    fs.rmSync(without, { recursive: true, force: true });
+    fs.rmSync(userData, { recursive: true, force: true });
+  }
+});
+
+test('PiAgent.getSpawnSpec: no .mcp.json means no bridge, REST fallback prompt and an empty config env', async (t) => {
+  const dir = makeProjectDir({ API_BASE_URL: 'https://selected.test', API_PROJECT_ID: '2' });
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-pi-nobridge-data-'));
+  const lines = [];
+  t.mock.method(console, 'log', (...args) => { lines.push(args.join(' ')); });
+  // These projects carry an API target, so attachment localization would try the network.
+  t.mock.method(PiAgent.prototype, 'localizeSpawnPrompt', async (_c, prompt, _id, opts) => ({ prompt, opts }));
+  try {
+    const spec = await new PiAgent().getSpawnSpec({ ...FAKE_CONFIG, SIMPLE_MODE: false, USER_DATA_ROOT: userData }, 'Work on task C1.', 'C1', { projectPath: dir });
+    assert.ok(!spec.args.includes('-e'));
+    assert.equal(spec.env.TIPATASK_PI_MCP_CONFIG, '');
+    assert.match(spec.args.at(-1), /tt complete "\$TIPATASK_TASK_ID"/);
+    assert.ok(lines.some((l) => l.includes('mcp-bridge=off')), JSON.stringify(lines));
+    assert.equal(fs.existsSync(path.join(userData, 'pi-ext')), false, 'nothing staged without a config');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(userData, { recursive: true, force: true });
+  }
+});

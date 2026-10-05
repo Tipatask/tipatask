@@ -220,6 +220,22 @@ test('styles.css: the Task Chat block is built from theme tokens', () => {
   assert.ok(literals.every(c => /^rgba\(0, 0, 0, /.test(c)), `unexpected colour literal in ${literals.join(' ')}`);
 });
 
+test('task-chat.js: the mic mounts in its own row above the composer card', () => {
+  const row = taskChat.indexOf('<div class="task-chat-voice-row"></div>');
+  const composer = taskChat.indexOf('<div class="task-chat-composer">');
+  assert.ok(row !== -1 && composer > row, 'voice row precedes the composer');
+  assert.match(taskChat, /attachAudioRecorder\(input, \{[\s\S]*?mountTarget: root\.querySelector\('\.task-chat-voice-row'\)/);
+  const block = styles.slice(styles.indexOf('/* ── Task Chat window ──'), styles.indexOf('/* ── end Task Chat window ── */'));
+  assert.match(block, /\.task-chat-voice-row \{/);
+  assert.match(block, /\.task-chat-voice-row:empty \{ display: none; \}/);
+});
+
+test('audio-recorder.js: mountTarget keeps the field in place and puts a button-only wrap in the target', () => {
+  const recorder = read('./audio-recorder.js');
+  assert.match(recorder, /if \(mountTarget\) mountTarget\.appendChild\(wrap\);\s*else inputEl\.parentNode\.insertBefore\(wrap, inputEl\);/);
+  assert.match(recorder, /if \(!mountTarget\) wrap\.appendChild\(inputEl\);/);
+});
+
 test('index.js: the window is bundled and reachable as TipTask.taskChat', () => {
   assert.match(index, /import \* as taskChat from '\.\/task-chat\.js'/);
   assert.match(index, /window\.TipTask = \{[^}]*\btaskChat\b/);

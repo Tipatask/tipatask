@@ -11,8 +11,10 @@ const { matchPromptLine, PI_PROMPT_PATTERNS } = require('./prompt-detect');
 const { LEGACY_STATUSES, LEGACY_ROLE_NAMES, sanitizeStatusName } = require('../status-roles');
 const { buildVcsDirective } = require('../vcs-settings');
 const { buildTagDescriptionDirective } = require('../tag-descriptions');
+const { resolvePiMcpBridge } = require('../providers/pi-task-tools');
 
-// Pi has no built-in MCP; this single fenced REST recipe keeps URL, auth, and body
+// Fallback for a spawn without the MCP bridge (see buildPiMcpToolMap() below): Pi has no
+// built-in MCP; this single fenced REST recipe keeps URL, auth, and body
 // together for copying. Credentials and task key arrive through spawn env vars.
 // Its text is echoed into prompt detection: avoid bare sentinels, dialog-shaped rows,
 // and approval phrases. Sanitize interpolated status names before rendering.
@@ -51,6 +53,16 @@ function buildTipataskRestRecipe(opts = {}) {
   ].join('\n');
 }
 
+// With the MCP bridge loaded (getSpawnSpec() sets opts.piMcpBridge), Pi has the same Tipatask
+// tools Claude and Codex have, under bridged names. One naming rule plus the names AGENTS.md /
+// CLAUDE.md lean on most replaces the REST recipe. Same echo-safety rules as the recipe above.
+function buildPiMcpToolMap() {
+  return [
+    'You are running inside Pi Coding Agent with the Task App MCP bridge loaded: the `tipatask` and `tipatask-local` MCP servers are native Pi tools named <server>__<tool>. Wherever AGENTS.md / CLAUDE.md or the "MCP Tool Schemas" section of your system prompt names an MCP tool, call the bridged name and drop any `mcp__` prefix: get_task, list_tasks, update_task, create_task, create_task_comment, list_system_tags, get_tag_architecture, get_tag_architectures, create_system_tag, ensure_project_tag, get_project_tags and list_task_resolutions become tipatask__<name>; git_worktree_status, complete_task, push_knowledge and batch_grep_tags become tipatask-local__<name>. Read architecture docs with those tools or straight off disk (ai/architecture/*.md).',
+    'Never read or edit `.mcp.json`. If a bridged tool is missing, the bridge could not reach that server: mention it once in your final report and continue with Pi built-in tools; never investigate MCP setup.',
+  ].join('\n');
+}
+
 // ── (C1134/C1217, migrated onto the shared helper by C1528) Ask-and-stop mechanism — every
 // Pi task ──
 // Pi has no AskUserQuestion tool and no interactive picker (upstream design, see the no-MCP
@@ -69,10 +81,12 @@ function buildTipataskRestRecipe(opts = {}) {
 // tasks). Forces Pi to ground its questions in what already exists instead of assuming a blank
 // project, and explicitly overrides the "write the plan immediately" instruction above for
 // THIS task only: questions come before the plan, not after.
-function piDiscoveryMandateLines() {
+function piDiscoveryMandateLines(bridge = false) {
   return [
     `- This is a discovery task: before asking anything, read what already exists — ai/architecture/GENERAL.md (its ## Source Documents and ## Existing Code sections), any root README/docs, and any manifest file — so your questions are grounded in the real project, not assumptions.`,
-    `- Then read the other tasks in this project and their comments (the GET /tasks and GET /tasks/<key>/comments curls above) so you never re-ask something a sibling task already recorded.`,
+    bridge
+      ? `- Then read the other tasks in this project (tipatask__list_tasks) and their comment history (tipatask__list_task_resolutions) so you never re-ask something a sibling task already recorded.`
+      : `- Then read the other tasks in this project and their comments (the GET /tasks and GET /tasks/<key>/comments curls above) so you never re-ask something a sibling task already recorded.`,
     `- Only then ask the user with the Clarifying questions mechanism above, in batches of 3-5, repeating for follow-up batches until the task's own question list is answered — this overrides the earlier instruction to write the plan immediately: for THIS task, the plan comes after the answers. If the user says "you decide", record it as an explicit Assumption line in the deliverable instead of silently choosing.`,
   ];
 }
@@ -117,14 +131,14 @@ class PiAgent extends BaseTaskAgent {
     return opts.vcsSettings ? buildVcsDirective(opts.vcsSettings, { compact: true }) : '';
   }
 
-  // C1513 — same reasoning as resolveVcsDirective() above: Pi has no MCP, so the
-  // backfill directive's remedy has to be `PUT /tags/:name`, not `ensure_project_tag`.
+  // C1513 — without the MCP bridge the backfill directive's remedy has to be
+  // `PUT /tags/:name`; with it, the full wording's ensure_project_tag maps to a bridged tool.
   buildTagDescriptionDirective(opts = {}) {
-    return buildTagDescriptionDirective(opts.taskTags, opts.tagDescriptions, { compact: true });
+    return buildTagDescriptionDirective(opts.taskTags, opts.tagDescriptions, { compact: !opts.piMcpBridge });
   }
 
   // Compact wording for every shared directive — Pi's kickoff prompt is echoed verbatim into
-  // its own TUI under a hard size budget, and Pi has no MCP tools to name. Text clarifying
+  // its own TUI under a hard size budget, and the REST fallback has no MCP tools to name. Text clarifying
   // questions stay on: Pi has no question tool.
   getPreamblePolicy() {
     return { compact: true, clarify: true };
@@ -166,11 +180,41 @@ class PiAgent extends BaseTaskAgent {
     // "[y/n]", no "do you want to …?" etc.) and inside the echo-verbatim prompt budget —
     // pi-agent.test.js's echo-safety sweep covers them.
     const { directives, clarify } = this.buildSharedPreamble(opts);
+    const bridge = !!opts.piMcpBridge;
+    const completeName = this.resolveStatusForRole('complete', opts);
+    const inProgressName = this.resolveStatusForRole('in_progress', opts);
+    const hasOnFire = this.resolveStatusNames(opts).includes('on_fire');
+    // Without the bridge (bundle not built, no .mcp.json, no project target), Pi gets the
+    // no-MCP framing and the credential-safe `tt` REST recipe instead.
+    const intro = bridge ? [buildPiMcpToolMap()] : [
+      'You are running inside Pi Coding Agent. Pi has NO MCP support at all — that is Pi\'s design (its README says "No MCP."), not a broken setup. A missing `tipatask` MCP server here is expected and is NOT a bug: never report it to the user, never investigate it, never read or edit `.mcp.json`, and never stop work over it. Use Pi built-in shell/read/edit tools only.',
+      'Pi auto-loads this repo\'s AGENTS.md / CLAUDE.md, which were written for MCP-capable agents (Claude Code, Codex). Every instruction there to call a `tipatask` MCP tool — list_system_tags, get_project_tags, get_tag_architecture, get_tag_architectures, create_system_tag, batch_grep_tags, list_tasks, get_task, create_task, update_task, create_task_comment, push_knowledge — does NOT apply to you, and neither does the "MCP Tool Schemas" section of your system prompt. Read architecture docs straight off disk (ai/architecture/*.md) and use the REST command below for task operations and verified completion.',
+    ];
+    // "on_fire" carries no role flag by design — unlike "canceled" (which got a 4th
+    // role flag, is_workflow_canceled, in C1187), on_fire was never meant to have
+    // one: it's just an ordinary active, non-start, non-in-progress status. Matched
+    // by literal name here so a project that removed it entirely isn't told to use a
+    // status that no longer exists.
+    const taskOps = bridge ? [
+      `- Task status: set ${inProgressName} with tipatask__update_task as soon as you start implementing (right after plan approval)${hasOnFire ? ', or on_fire if this task is blocked' : ''}. Finish only through tipatask-local__complete_task(task_key, resolution), which verifies VCS state and saves ${completeName}; never set ${completeName} with tipatask__update_task. Re-check with tipatask__get_task afterwards.`,
+      '- Before Git writes and before completion, call tipatask-local__git_worktree_status with task_key and require verified: true.',
+      '- Tag review before completion: tipatask__list_system_tags; for a touched module with no tt-* tag, tipatask__create_system_tag(tag_name, description, architecture_hint); register plain tags with tipatask__ensure_project_tag; then tipatask__update_task with the final tag list.',
+      `- MANDATORY before marking this task ${completeName}: the resolution you pass to tipatask-local__complete_task is ONE self-authored plain-English report covering what changed and why, key files, checks, and follow-ups/caveats (none if absent). The automatic terminal-tail comment is separate and does not replace it.`,
+      '- KB push: nothing auto-pushes your ai/architecture/*.md edits from this session (that hook is Claude Code only). After your LAST arch-doc edit, call tipatask-local__push_knowledge.',
+    ] : [
+      // C1184: statuses are per-project custom now — pull the resolved role names
+      // (fail-open to the legacy pending/in_progress/completed via LEGACY_ROLE_NAMES)
+      // instead of writing the literal names into the prompt.
+      buildTipataskRestRecipe(opts),
+      `- Task status: PATCH status to ${inProgressName} as soon as you start implementing (right after plan approval), and use tt complete for ${completeName}${hasOnFire ? ' — or on_fire if this task is blocked —' : ''} before your final message. Re-GET the task afterwards to confirm the saved status.`,
+      '- Before marking this task complete: if a module you touched has no tt-* tag, GET /tags to check, then POST /tags to register it (description required), then create the ai/architecture/tt-*.md stub yourself with your write tool, then PATCH the task tags. That order matters: an unregistered name inside a PATCH tags array is rejected with 400 "tags not registered". There is no create_system_tag here to write the stub for you.',
+      `- MANDATORY before marking this task ${completeName}: pass ONE self-authored plain-English resolution to tt complete. Cover what changed and why, key files, checks, and follow-ups/caveats (none if absent). Require completed:true; never use a status PATCH instead. The automatic terminal-tail comment is separate and does not replace this report.`,
+      '- KB push: nothing auto-pushes your ai/architecture/*.md edits from this session (that hook is Claude Code only, and Task App session start only pulls). After your LAST edit to an arch doc, push it with the arch-doc command above. If jq is unavailable, skip the push and say so in the resolution comment — the file on disk stays authoritative.',
+    ];
 
     const lines = [
       'Use the Tipatask workflow for this repository.',
-      'You are running inside Pi Coding Agent. Pi has NO MCP support at all — that is Pi\'s design (its README says "No MCP."), not a broken setup. A missing `tipatask` MCP server here is expected and is NOT a bug: never report it to the user, never investigate it, never read or edit `.mcp.json`, and never stop work over it. Use Pi built-in shell/read/edit tools only.',
-      'Pi auto-loads this repo\'s AGENTS.md / CLAUDE.md, which were written for MCP-capable agents (Claude Code, Codex). Every instruction there to call a `tipatask` MCP tool — list_system_tags, get_project_tags, get_tag_architecture, get_tag_architectures, create_system_tag, batch_grep_tags, list_tasks, get_task, create_task, update_task, create_task_comment, push_knowledge — does NOT apply to you, and neither does the "MCP Tool Schemas" section of your system prompt. Read architecture docs straight off disk (ai/architecture/*.md) and use the REST command below for task operations and verified completion.',
+      ...intro,
       'Start in planning mode enforced by Task App. First study the task, relevant source code, configuration files, and architecture docs. Do not implement, edit files, or run mutating commands until the user approves the plan.',
       // (C1116) The instruction below is deliberately kept as ONE unbroken sentence with no
       // literal newline — Pi's TUI echoes this prompt verbatim in its first frames, and the
@@ -185,22 +229,10 @@ class PiAgent extends BaseTaskAgent {
       '- General architecture and tag taxonomy are pre-loaded in the system prompt.',
       `- ${tagNote}`,
       '- After any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task to reflect changed endpoints, schema, env vars, file structure, or behavior. Never write ai/ARCHITECTURE.md — deprecated path, no agent loads it. During exploration, if a STANDING fact is missing from a tt-*.md (undocumented endpoint, missing file row, changed schema, behavioral nuance), fix that doc immediately with that fact alone.',
-      // C1184: statuses are per-project custom now — pull the resolved role names
-      // (fail-open to the legacy pending/in_progress/completed via LEGACY_ROLE_NAMES)
-      // instead of writing the literal names into the prompt.
-      buildTipataskRestRecipe(opts),
-      // "on_fire" carries no role flag by design — unlike "canceled" (which got a 4th
-      // role flag, is_workflow_canceled, in C1187), on_fire was never meant to have
-      // one: it's just an ordinary active, non-start, non-in-progress status. Matched
-      // by literal name here so a project that removed it entirely isn't told to use a
-      // status that no longer exists.
-      `- Task status: PATCH status to ${this.resolveStatusForRole('in_progress', opts)} as soon as you start implementing (right after plan approval), and use tt complete for ${this.resolveStatusForRole('complete', opts)}${this.resolveStatusNames(opts).includes('on_fire') ? ' — or on_fire if this task is blocked —' : ''} before your final message. Re-GET the task afterwards to confirm the saved status.`,
-      '- Before marking this task complete: if a module you touched has no tt-* tag, GET /tags to check, then POST /tags to register it (description required), then create the ai/architecture/tt-*.md stub yourself with your write tool, then PATCH the task tags. That order matters: an unregistered name inside a PATCH tags array is rejected with 400 "tags not registered". There is no create_system_tag here to write the stub for you.',
-      `- MANDATORY before marking this task ${this.resolveStatusForRole('complete', opts)}: pass ONE self-authored plain-English resolution to tt complete. Cover what changed and why, key files, checks, and follow-ups/caveats (none if absent). Require completed:true; never use a status PATCH instead. The automatic terminal-tail comment is separate and does not replace this report.`,
-      '- KB push: nothing auto-pushes your ai/architecture/*.md edits from this session (that hook is Claude Code only, and Task App session start only pulls). After your LAST edit to an arch doc, push it with the arch-doc command above. If jq is unavailable, skip the push and say so in the resolution comment — the file on disk stays authoritative.',
+      ...taskOps,
       `- ${grepNote}`,
       ...directives,
-      ...(opts.discovery ? piDiscoveryMandateLines() : []),
+      ...(opts.discovery ? piDiscoveryMandateLines(bridge) : []),
       '',
     ];
     // (C1575) Fit the parent-task block against the REAL assembled framing + task text
@@ -272,10 +304,16 @@ class PiAgent extends BaseTaskAgent {
     const selEntry = (piCfg && piEntryForModel(piCfg, piModel)) || piEntry || null;
     const { provider: piProvider, env: piEndpointEnv } = preparePiCustomEndpoint(projectRoot, selEntry, env);
     Object.assign(env, piKeyEnvVars(selEntry), piEndpointEnv);
+
+    // MCP bridge: Pi loads mcp-bridge.mjs with -e and reads the derived config named by
+    // TIPATASK_PI_MCP_CONFIG. Empty when unavailable, so an inherited value never applies.
+    const bridge = this._resolveMcpBridge(config, projectRoot);
+    env.TIPATASK_PI_MCP_CONFIG = bridge ? bridge.configPath : '';
+    opts = { ...opts, piMcpBridge: !!bridge };
     // (C1117) Logged so a model-specific misbehavior (e.g. Kimi K3 leaking a bare `<|sep|>`
     // chat-template token on plan approval — see tt-pi-session.md § Plan approval PTY protocol)
     // doesn't require a follow-up round-trip just to find out which model was running.
-    console.log(`[terminal:pi] spawning task ${taskId || '(objective)'} model=${piModel} provider=${piProvider}`);
+    console.log(`[terminal:pi] spawning task ${taskId || '(objective)'} model=${piModel} provider=${piProvider} mcp-bridge=${bridge ? bridge.extensionPath : 'off'}`);
     // TPT286 — Pi has no reasoning-effort setting; a task's effort is noted and otherwise ignored.
     const effort = this.resolveEffort(opts.task);
     if (effort) console.debug(`[terminal:pi] task ${taskId || '(objective)'} effort=${effort} ignored — Pi has no effort setting`);
@@ -284,6 +322,12 @@ class PiAgent extends BaseTaskAgent {
       '--model', piModel,
       '--approve',
     ];
+    // No --tools allowlist on purpose: the terminal keeps Pi's default built-ins (read, bash,
+    // edit, write) and every tool the bridge registers in session_start. Pi activates a
+    // late-registered tool under an allowlist only when the list names it, so an allowlist here
+    // would have to name every bridged tool, which is only known once the servers answer.
+    // Headless chat turns do pass one (tool-profiles.js piToolAllowlist) — they want a fence.
+    if (bridge) args.push('-e', bridge.extensionPath);
     if (!config.SIMPLE_MODE) {
       args.push('--append-system-prompt', this._buildAppendSystemPrompt(opts));
     }
@@ -296,6 +340,12 @@ class PiAgent extends BaseTaskAgent {
       env,
       model: piModel,
     };
+  }
+
+  // Derived `.mcp.json` first (null when the project has none or no API target), then the
+  // staged bundle; null when either is missing, and the prompt falls back to the REST recipe.
+  _resolveMcpBridge(config, projectRoot) {
+    return resolvePiMcpBridge({ projectRoot, userDataRoot: config.USER_DATA_ROOT });
   }
 
   // ── Plan-approval submission (C1117) ──

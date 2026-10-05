@@ -4386,9 +4386,10 @@ if (window.electronAPI) {
         const stale = await window.electronAPI.getCurrentProject?.();
         _reauthInFlight = false;
         if (stale) _openSetupWizardForPath(stale, false);
-        // Blank window (no project at all) — nothing to re-authenticate. A 401-driven call can't
-        // reach here (an unbound window has no backend to 401), so only the menu path speaks up.
-        else if (force) showToast(t('project.noProjectLoaded'), 'info');
+        // Blank window (no project at all) — no project credentials to renew, but the app-level
+        // account can still be swapped. A 401-driven call can't reach here (an unbound window
+        // has no backend to 401), so only the menu path opens it.
+        else if (force) _openAccountReauth();
         return;
       }
       window.TipTask.setupModal.openReauth({
@@ -4408,6 +4409,28 @@ if (window.electronAPI) {
     }
   }
 
+  // Change Account with no project (default empty window): account-only wizard — sign-in through
+  // setup:reauth-account, then a summary. The Get Started modal (z-index 9999) sits above
+  // .setup-modal, so hide it while the wizard is up and bring it back afterwards.
+  function _openAccountReauth() {
+    const restoreGetStarted = _chooseModal.style.display === 'flex';
+    if (restoreGetStarted) _chooseModal.style.display = 'none';
+    _reauthInFlight = true;
+    const finish = () => {
+      _reauthInFlight = false;
+      if (restoreGetStarted) _showChooseModal({ mode: 'getStarted' });
+    };
+    window.TipTask.setupModal.openReauth({
+      chooseAccount: true,
+      accountOnly: true,
+      onComplete: ({ user } = {}) => {
+        showToast(t('reauth.accountSwitched', { email: user?.email || t('setup.userFallback') }), 'success');
+        finish();
+      },
+      onCancel: finish,
+    });
+  }
+
   // One-shot main-process re-auth: authenticate + exchange + write config + re-probe,
   // all in the main process — no project-pick step, no renderer modal chain.
   async function _runForceReauth() {
@@ -4418,6 +4441,7 @@ if (window.electronAPI) {
         // one-shot path (the Project ▸ Re-authenticate menu item goes through _maybeOpenReauth).
         const stale = await window.electronAPI.getCurrentProject?.();
         if (stale) _openSetupWizardForPath(stale, false);
+        else _openAccountReauth();
         return;
       }
       const res = await window.electronAPI.setupForceReauth(ctx.projectPath);

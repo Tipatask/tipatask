@@ -37,12 +37,17 @@ test('expand/collapse toggles full window height and labels', () => {
   const toggle = $('.tt-dnp-toggle');
   assert.equal(panel.classList.contains('is-expanded'), false);
   assert.equal(toggle.getAttribute('aria-label'), 'Expand to full height');
+  const chevron = () => toggle.querySelector('svg polyline')?.getAttribute('points');
+  assert.equal(chevron(), '6 15 12 9 18 15', 'collapsed shows a chevron pointing up');
+  assert.equal(toggle.textContent.trim(), '', 'no ⤒/⤓ text glyphs');
   toggle.click();
   assert.equal(panel.classList.contains('is-expanded'), true);
   assert.equal(toggle.getAttribute('aria-pressed'), 'true');
   assert.equal(toggle.getAttribute('aria-label'), 'Collapse');
+  assert.equal(chevron(), '6 9 12 15 18 9', 'expanded shows a chevron pointing down');
   toggle.click();
   assert.equal(panel.classList.contains('is-expanded'), false);
+  assert.equal(chevron(), '6 15 12 9 18 15');
 });
 
 test('live updates, Ukrainian labels, empty state and closing', () => {

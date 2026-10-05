@@ -10,6 +10,7 @@ const { spawnTurn, providerSessionId, clearProviderSessionId, applyModelSelectio
 const { listObjectiveProviders, listVisibleObjectiveProviders, clampSelectionToProviders, formatSelection, currentSelection, configForProject } = require('./providers/registry');
 const { createSession, isAgentChatType, isAgentChatId } = require('./session-state');
 const { TASK_CHAT, isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFromChatId, buildProjectChatTitle, buildTaskChatSeed, buildTaskChatSystemPrompt } = require('./task-chat');
+const { resolvePiMcpBridge } = require('./providers/pi-task-tools');
 const { providerSupportsProfile } = require('./providers/tool-profiles');
 const { findOpenDialog, resolveDialogAnswer, replayTaskChatTurn, taskFrame, changedTaskFields, buildTaskEditNote } = require('./task-chat-widgets');
 const { killProcessGroup, resolveAgentLimits } = require('./process-group');
@@ -4700,14 +4701,24 @@ async function maybeCompressHistory(session, taskId) {
 // fetched tag docs to session.systemPrompt and relies on that prefix staying stable.
 function ensureTaskChatSystemPrompt(session) {
   const provider = session.providerType || config.OBJECTIVE_PROVIDER;
-  if (session._taskChatPromptProvider === provider && session.systemPrompt) return;
+  // Pi's tool vocabulary depends on whether the MCP bridge loads for this project: bridged MCP
+  // tool names, or the REST `tipatask_api` recipe. Same resolver pi-session.js spawns with.
+  let piMcpBridge = false;
+  if (provider === 'pi') {
+    try {
+      piMcpBridge = !!resolvePiMcpBridge({ projectRoot: session.projectPath || config.PROJECT_ROOT, userDataRoot: config.USER_DATA_ROOT });
+    } catch { piMcpBridge = false; }
+  }
+  const promptKey = piMcpBridge ? `${provider}+mcp` : provider;
+  if (session._taskChatPromptProvider === promptKey && session.systemPrompt) return;
   session.systemPrompt = buildTaskChatSystemPrompt({
     provider,
     task: session.chatProjectId ? null : (session._taskChatTask || { id: session.taskKey }),
     project: session._taskChatProject || null,
     langDirective: buildLanguageDirective(session.projectPath || config.PROJECT_ROOT),
+    piMcpBridge,
   });
-  session._taskChatPromptProvider = provider;
+  session._taskChatPromptProvider = promptKey;
   session._cachedTagsSerialized = new Set();
 }
 

@@ -137,6 +137,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // One-shot re-auth skipping project-pick: OAuth + token exchange + config write + re-probe,
   // all in the main process. Returns { ok, state?, error? }.
   setupForceReauth: (projectPath) => inv('setup:force-reauth', projectPath),
+  // App-level account sign-in / swap — no project required (works in a blank window).
+  // apiBaseUrl defaults to the stored account's server, else production. Returns { ok, user, apiBaseUrl, error? }.
+  reauthAccount: (apiBaseUrl) => inv('setup:reauth-account', apiBaseUrl || null),
+  // Live stored account for the project wizards' Sign-in skip: { token, user, apiBaseUrl } or null.
+  setupStoredAccount: (apiBaseUrl) => inv('setup:stored-account', apiBaseUrl || null),
   completeProjectWizard: (detail) => inv('project:create-from-wizard', detail),
   openExistingProject: (detail) => inv('project:open-existing', detail),
   // (C1388) Native-menu locale follow — see main/menu-i18n.js. Pushed from

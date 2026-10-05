@@ -100,8 +100,17 @@ test('the extension is staged outside the app bundle, byte-identical and idempot
   assert.equal(materializePiTaskTools(''), null);
 });
 
+test('restToolEnabled: the REST tool is the fallback for a turn without an MCP bridge config', () => {
+  const { restToolEnabled } = require('./tipatask-request.cjs');
+  assert.equal(restToolEnabled({}), true);
+  assert.equal(restToolEnabled({ TIPATASK_PI_MCP_CONFIG: '' }), true, 'pi-session.js sets it empty without a bridge');
+  assert.equal(restToolEnabled({ TIPATASK_PI_MCP_CONFIG: '/data/mcp-spawn/abc.pi.json' }), false);
+  assert.equal(restToolEnabled(undefined), true);
+});
+
 test('the extension source registers only the gated tool and reads no credentials itself', () => {
   const src = fs.readFileSync(path.join(__dirname, 'task-tools.mjs'), 'utf8');
+  assert.match(src, /if \(!restToolEnabled\(process\.env\)\) return;\n  pi\.registerTool\(/, 'registration is skipped when the MCP bridge is configured');
   assert.equal((src.match(/registerTool\(/g) || []).length, 1);
   assert.match(src, /name: "tipatask_api"/);
   assert.match(src, /credentials\.liveCredentials\(process\.env\)/);

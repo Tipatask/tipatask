@@ -83,4 +83,11 @@ function resolveTipataskRequest(input, env) {
   };
 }
 
-module.exports = { resolveTipataskRequest, RULES, MAX_BODY_BYTES };
+// The REST tool is the fallback for a turn without the MCP bridge: when TIPATASK_PI_MCP_CONFIG
+// names a bridge config, the bridged `tipatask__*` tools are the task tools and this one stays
+// unregistered. pi-session.js always sets the variable, empty when there is no bridge.
+function restToolEnabled(env) {
+  return !(env && env.TIPATASK_PI_MCP_CONFIG);
+}
+
+module.exports = { resolveTipataskRequest, restToolEnabled, RULES, MAX_BODY_BYTES };

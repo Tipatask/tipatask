@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { TASK_CHAT, PROFILES, toolProfileFor, providerSupportsProfile, codexProfileConfigArgs } = require('./tool-profiles');
+const { TASK_CHAT, PROFILES, toolProfileFor, providerSupportsProfile, codexProfileConfigArgs, piToolAllowlist, PI_OBJECTIVE_PROFILE } = require('./tool-profiles');
 const { buildObjectiveArgs } = require('../claude-session');
 const { buildCodexArgs } = require('./codex-session');
 const { buildPiArgs } = require('./pi-session');
@@ -112,4 +112,45 @@ test('pi objective argv stays read-only with no extension flags', () => {
   const args = buildPiArgs({ type: 'objective', providerType: 'pi' });
   assert.equal(flag(args, '--tools'), 'read');
   assert.ok(!args.includes('-e') && args.includes('--no-extensions'));
+});
+
+const eFlags = args => args.filter((a, i) => args[i - 1] === '-e');
+// Every MCP tool a Pi turn must never reach under its bridged name.
+const PI_NEVER_BRIDGED = ['tipatask__purge_stale_reservations', 'tipatask__reserve_task_keys',
+  'tipatask-local__push_knowledge', 'tipatask-local__pull_knowledge', 'tipatask-local__complete_task',
+  'tipatask-local__git_worktree_status'];
+
+test('pi task chat with the MCP bridge: bridged task tools replace the REST tool, writes stay off', () => {
+  const args = buildPiArgs(chat({ providerType: 'pi' }), { extensionPath: '/data/pi-ext/task-tools.mjs', mcpBridgePath: '/data/pi-ext/mcp-bridge.mjs' });
+  const tools = flag(args, '--tools').split(',');
+  for (const tool of ['read', 'grep', 'find', 'ls', 'tipatask__update_task', 'tipatask__create_task_comment',
+    'tipatask__create_task', 'tipatask__get_task', 'tipatask__get_tag_architecture', 'tipatask-local__batch_grep_tags']) {
+    assert.ok(tools.includes(tool), `${tool} must be allowed`);
+  }
+  for (const tool of ['bash', 'edit', 'write', 'tipatask_api', ...PI_NEVER_BRIDGED]) assert.ok(!tools.includes(tool), `${tool} must not be enabled`);
+  assert.ok(args.includes('--no-extensions'));
+  assert.deepEqual(eFlags(args), ['/data/pi-ext/task-tools.mjs', '/data/pi-ext/mcp-bridge.mjs']);
+  // The bridged list mirrors Claude's named remote allowlist exactly.
+  const claudeRemote = PROFILES[TASK_CHAT].claude.allowedTools.filter(t => t.startsWith('mcp__')).map(t => t.replace(/^mcp__/, '')).sort();
+  assert.deepEqual(PROFILES[TASK_CHAT].pi.mcpTools.slice().sort(), claudeRemote);
+});
+
+test('pi objective with the MCP bridge: read plus read-only bridged tools, bridge loaded alone', () => {
+  const args = buildPiArgs({ type: 'objective', providerType: 'pi' }, { mcpBridgePath: '/data/pi-ext/mcp-bridge.mjs' });
+  const tools = flag(args, '--tools').split(',');
+  for (const tool of ['read', 'tipatask__get_task', 'tipatask__list_tasks', 'tipatask__get_tag_architecture',
+    'tipatask__get_project_tags', 'tipatask-local__batch_grep_tags']) {
+    assert.ok(tools.includes(tool), `${tool} must be allowed`);
+  }
+  for (const tool of ['bash', 'edit', 'write', 'grep', 'tipatask_api', 'tipatask__update_task', 'tipatask__create_task',
+    'tipatask__delete_task', 'tipatask__create_task_comment', 'tipatask__create_system_tag', 'tipatask__ensure_project_tag', ...PI_NEVER_BRIDGED]) {
+    assert.ok(!tools.includes(tool), `${tool} must not be enabled`);
+  }
+  assert.deepEqual(eFlags(args), ['/data/pi-ext/mcp-bridge.mjs'], 'no REST extension for a planner');
+});
+
+test('piToolAllowlist falls back to the objective fence and to the REST tools without a bridge', () => {
+  assert.deepEqual(piToolAllowlist(null), ['read']);
+  assert.deepEqual(piToolAllowlist(PI_OBJECTIVE_PROFILE, { bridge: false }), ['read']);
+  assert.deepEqual(piToolAllowlist(PROFILES[TASK_CHAT].pi), ['read', 'grep', 'find', 'ls', 'tipatask_api']);
 });

@@ -642,7 +642,7 @@ function _notifyFieldRecordingChange() {
   }));
 }
 
-export function attachAudioRecorder(inputEl, { emphasis = false, acceptTranscript = () => true } = {}) {
+export function attachAudioRecorder(inputEl, { emphasis = false, acceptTranscript = () => true, mountTarget = null } = {}) {
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') return null;
   if (inputEl.dataset.audioRec) return inputEl.__voiceRecorder || null;
   inputEl.dataset.audioRec = '1';
@@ -666,7 +666,8 @@ export function attachAudioRecorder(inputEl, { emphasis = false, acceptTranscrip
 
   const wrap = document.createElement('div');
   wrap.className = emphasis ? 'audio-rec-wrap audio-rec-wrap--emphasis' : 'audio-rec-wrap';
-  inputEl.parentNode.insertBefore(wrap, inputEl);
+  if (mountTarget) mountTarget.appendChild(wrap);
+  else inputEl.parentNode.insertBefore(wrap, inputEl);
 
   const btn = document.createElement('button');
   btn.type = 'button';
@@ -677,7 +678,9 @@ export function attachAudioRecorder(inputEl, { emphasis = false, acceptTranscrip
   wrap.appendChild(btn);
   // (C1287) Keep the mic in normal flow before its field so every attached form shares the
   // same above-textarea placement contract. CSS keeps the field full width below the button.
-  wrap.appendChild(inputEl);
+  // (TPT515) A caller-owned mountTarget (task/project chat's voice row) holds a button-only
+  // wrap instead; the field stays where its own markup put it.
+  if (!mountTarget) wrap.appendChild(inputEl);
 
   // (C1212) Never steal focus from field. Click-to-edit host (task edit modal's
   // .modal-desc-textarea) tears down textarea on blur — w/o this, wrap+btn leave

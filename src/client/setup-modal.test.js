@@ -132,3 +132,9 @@ test('buildReauthConfig: falls back to baseCfg TASK_AGENT/AVAILABLE_AGENTS, then
   assert.equal(cfgNoFallback.TASK_AGENT, 'claude');
   assert.equal(cfgNoFallback.AVAILABLE_AGENTS, 'claude');
 });
+
+test('stepsFor/nextStep: account-only mode is Sign-in then Confirm, nothing else', () => {
+  assert.deepEqual(stepsFor('account'), ['signin', 'confirm']);
+  assert.equal(nextStep('account', 'signin'), 'confirm');
+  assert.equal(nextStep('account', 'signin', { skipProject: true }), 'confirm');
+});

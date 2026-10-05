@@ -162,3 +162,9 @@ test('merge.* plural keys keep {n} in every present plural form', () => {
     }
   }
 });
+
+test('reauth.accountSwitched keeps the {email} placeholder in every locale', () => {
+  for (const [lang, table] of Object.entries(LOCALES)) {
+    assert.match(table['reauth.accountSwitched'], /\{email\}/, `${lang} reauth.accountSwitched`);
+  }
+});

@@ -673,6 +673,16 @@ const en = {
   'setup.configSaveFailed': 'Config save failed ({status})',
   'setup.reauthenticatedOk': 'Re-authenticated ✓',
   'setup.setupCompleteOk': 'Setup complete ✓',
+  'setup.checkingSignIn': 'Checking sign-in…',
+  // setup-modal.js account-only mode — Change Account in a window with no project.
+  'reauth.accountHeaderTitle': 'Change Account',
+  'reauth.accountSignInTitle': 'Sign in with the account you want to use',
+  'reauth.accountSignInHint': 'No project is open. Your browser opens the Tipatask sign-in page, where you can continue as the current account or choose another.',
+  'reauth.accountSwitchedTitle': 'Account switched',
+  'reauth.summaryServer': 'Server',
+  'reauth.accountOnlyHint': "Recent Projects now lists this account's projects. Open or create a project to continue.",
+  'reauth.accountSwitched': 'Signed in as {email}',
+  'reauth.accountDesktopOnly': 'Changing the account needs the desktop app.',
 
   // (C1388) project-creation-wizard.js — new project creation wizard (6 steps).
   'wizard.headerTitle': 'Create Project',
@@ -1892,6 +1902,16 @@ const uk = {
   'setup.configSaveFailed': 'Не вдалося зберегти конфігурацію ({status})',
   'setup.reauthenticatedOk': 'Повторну автентифікацію виконано ✓',
   'setup.setupCompleteOk': 'Налаштування завершено ✓',
+  'setup.checkingSignIn': 'Перевірка входу…',
+  // setup-modal.js, режим лише акаунта — зміна акаунта у вікні без проєкту.
+  'reauth.accountHeaderTitle': 'Змінити акаунт',
+  'reauth.accountSignInTitle': 'Увійдіть в акаунт, який хочете використовувати',
+  'reauth.accountSignInHint': 'Жоден проєкт не відкрито. У браузері відкриється сторінка входу Tipatask, де можна продовжити з поточним акаунтом або вибрати інший.',
+  'reauth.accountSwitchedTitle': 'Акаунт змінено',
+  'reauth.summaryServer': 'Сервер',
+  'reauth.accountOnlyHint': 'Тепер «Останні проєкти» показують проєкти цього акаунта. Відкрийте або створіть проєкт, щоб продовжити.',
+  'reauth.accountSwitched': 'Ви увійшли як {email}',
+  'reauth.accountDesktopOnly': 'Змінити акаунт можна лише в настільному застосунку.',
 
   // (C1388) project-creation-wizard.js — майстер створення нового проєкту (6 кроків).
   'wizard.headerTitle': 'Створити проєкт',

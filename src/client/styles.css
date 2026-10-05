@@ -6296,6 +6296,7 @@
     cursor: pointer;
   }
   .tt-dnp-icon:hover { color: var(--c-text); border-color: var(--c-border); }
+  .tt-dnp-toggle svg { display: block; pointer-events: none; }
   .tt-dnp-list {
     flex: 1 1 auto;
     min-height: 0;
@@ -8834,6 +8835,17 @@
   .task-chat-jump svg { width: 13px; height: 13px; }
   .task-chat-jump:hover { border-color: var(--c-primary); color: var(--c-text); }
   .task-chat-jump[hidden] { display: none; }
+
+  /* (TPT515) Mic row above the composer card, outside its border — the objective chat's
+     placement. attachAudioRecorder() mounts a button-only wrap here (mountTarget). */
+  .task-chat-voice-row {
+    display: flex;
+    justify-content: flex-end;
+    max-width: 720px;
+    margin: 0 auto 0.4rem;
+  }
+  .task-chat-voice-row:empty { display: none; }
+  .task-chat-voice-row .audio-rec-btn { margin: 0; }
 
   .task-chat-composer {
     max-width: 720px;

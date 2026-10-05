@@ -336,6 +336,7 @@ function renderWindow() {
       </div>
       <footer class="task-chat-footer">
         <button type="button" class="task-chat-jump" hidden>${ICON_DOWN}<span></span></button>
+        <div class="task-chat-voice-row"></div>
         <div class="task-chat-composer">
           <textarea class="task-chat-input" rows="1"></textarea>
           <div class="task-chat-actions">
@@ -380,6 +381,8 @@ function renderWindow() {
   const voiceChat = chat;
   voiceRecorder = attachAudioRecorder(input, {
     emphasis: true,
+    // Mic sits in its own row above the composer card, like the objective chat's.
+    mountTarget: root.querySelector('.task-chat-voice-row'),
     // stop() drains asynchronously. Results belong only to the original, connected composer.
     acceptTranscript: () => root === voiceRoot && chat === voiceChat && input.isConnected,
   });

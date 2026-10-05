@@ -9,6 +9,7 @@ const path = require('node:path');
 const {
   STORE_FILE, accountStorePath, normalizeBaseUrl, decodeTokenPayload,
   readAccount, listAccounts, writeAccountToken, clearAccountToken,
+  saveAccountForServer, defaultAccountServer,
 } = require('./account-store');
 
 function scratch(t) {
@@ -96,4 +97,36 @@ test('TIPATASK_USER_DATA selects the store location when no explicit root is giv
   writeAccountToken('https://env.test', 'env-token');
   assert.strictEqual(accountStorePath(), path.join(path.resolve(dir), STORE_FILE));
   assert.strictEqual(readAccount('https://env.test').token, 'env-token');
+});
+
+test('saveAccountForServer prefers the hydrated user id/email and falls back to the token payload', (t) => {
+  const opts = scratch(t);
+  const token = jwt({ id: 1, email: 'old@example.test', purpose: 'desktop' });
+  const explicit = saveAccountForServer('https://a.test/', { token, userId: 7, email: 'new@example.test' }, opts);
+  assert.strictEqual(explicit.userId, 7);
+  assert.strictEqual(explicit.email, 'new@example.test');
+  assert.strictEqual(explicit.apiBaseUrl, 'https://a.test');
+  const onDisk = JSON.parse(fs.readFileSync(accountStorePath(opts), 'utf8')).accounts['https://a.test'];
+  assert.strictEqual(onDisk.userId, 7);
+  assert.strictEqual(onDisk.email, 'new@example.test');
+
+  const fallback = saveAccountForServer('https://a.test', { token }, opts);
+  assert.strictEqual(fallback.userId, 1);
+  assert.strictEqual(fallback.email, 'old@example.test');
+  assert.throws(() => saveAccountForServer('https://a.test', { token: ' ' }, opts), /token/);
+  assert.throws(() => saveAccountForServer('', { token }, opts), /base URL/);
+});
+
+test('defaultAccountServer returns the most recently signed-in server, or blank when none', (t) => {
+  const opts = scratch(t);
+  assert.strictEqual(defaultAccountServer(opts), '');
+  fs.writeFileSync(accountStorePath(opts), JSON.stringify({
+    version: 1,
+    accounts: {
+      'https://old.test': { token: 'a', apiBaseUrl: 'https://old.test', updatedAt: '2026-01-01T00:00:00.000Z' },
+      'https://new.test': { token: 'b', apiBaseUrl: 'https://new.test', updatedAt: '2026-06-01T00:00:00.000Z' },
+      'https://gone.test': { token: '', apiBaseUrl: 'https://gone.test', updatedAt: '2026-09-01T00:00:00.000Z' },
+    },
+  }));
+  assert.strictEqual(defaultAccountServer(opts), 'https://new.test');
 });

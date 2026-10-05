@@ -9,8 +9,7 @@ const ELECTRON_DEV = process.argv.includes('--electron-dev');
 const SRC = path.join(__dirname, 'src', 'client');
 const DIST = path.join(__dirname, 'dist');
 const ASSETS = path.join(__dirname, 'assets');
-
-fs.mkdirSync(DIST, { recursive: true });
+const PI_BRIDGE_ENTRY = path.join(__dirname, 'src', 'server', 'providers', 'pi-ext', 'mcp-bridge.mjs');
 
 function copyTemplate() {
   fs.copyFileSync(
@@ -44,6 +43,24 @@ function launchElectron() {
   child.on('exit', () => process.exit(0));
 }
 
+// The Pi MCP bridge extension is staged outside app.asar (providers/pi-task-tools.js), where no
+// node_modules exist, so the SDK is inlined. The banner gives bundled CommonJS dependencies a
+// working require() inside the ESM output.
+async function bundlePiExt(outfile = path.join(DIST, 'pi-ext', 'mcp-bridge.mjs')) {
+  await esbuild.build({
+    entryPoints: [PI_BRIDGE_ENTRY],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    target: 'node22',
+    outfile,
+    banner: { js: "import { createRequire as __bridgeCreateRequire } from 'node:module'; const require = __bridgeCreateRequire(import.meta.url);" },
+    logLevel: 'warning',
+  });
+  console.log(`  ${path.relative(__dirname, outfile)}`);
+  return outfile;
+}
+
 const htmlPlugin = {
   name: 'html-template',
   setup(build) {
@@ -61,6 +78,8 @@ const htmlPlugin = {
 };
 
 async function main() {
+  fs.mkdirSync(DIST, { recursive: true });
+  await bundlePiExt();
   const buildOptions = {
     entryPoints: [path.join(SRC, 'index.js')],
     bundle: true,
@@ -86,7 +105,11 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = { bundlePiExt };

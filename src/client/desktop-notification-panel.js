@@ -8,6 +8,10 @@ import { createNotificationCard, updateNotificationCard } from './notification-c
 import { t, tc } from './i18n.js';
 
 const PANEL_ID = 'tt-desktop-notif-panel';
+// (TPT516) Expand toggle chevrons: up while collapsed (expand), down while expanded (collapse).
+const _chevron = (points) => `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="${points}"></polyline></svg>`;
+const CHEVRON_UP = _chevron('6 15 12 9 18 15');
+const CHEVRON_DOWN = _chevron('6 9 12 15 18 9');
 let _entries = [];
 let _expanded = false;
 let _installed = false;
@@ -61,7 +65,7 @@ function _render() {
   panel._clear.textContent = t('notifCenter.clearAll');
   panel._clear.hidden = !_entries.length;
   const toggleLabel = t(_expanded ? 'notifCenter.collapse' : 'notifCenter.expand');
-  panel._toggle.textContent = _expanded ? '⤓' : '⤒';
+  panel._toggle.innerHTML = _expanded ? CHEVRON_DOWN : CHEVRON_UP;
   panel._toggle.title = toggleLabel;
   panel._toggle.setAttribute('aria-label', toggleLabel);
   panel._toggle.setAttribute('aria-pressed', String(_expanded));

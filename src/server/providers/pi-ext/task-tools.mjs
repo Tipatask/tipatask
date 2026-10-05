@@ -1,6 +1,8 @@
 // Pi extension loaded by task-chat turns (`pi --no-extensions -e <this file>`). It registers the
 // single `tipatask_api` tool — Pi's replacement for the tipatask MCP task tools, and the only
 // way a Pi task chat can change anything: the turn runs with no bash, edit or write tool.
+// It is the fallback for a project without the MCP bridge: when TIPATASK_PI_MCP_CONFIG is set
+// the bridged `tipatask__*` MCP tools (mcp-bridge.mjs) take its place and nothing is registered.
 // Every request goes through resolveTipataskRequest(), which pins the URL to this project's API
 // root and to a fixed list of method + path shapes. Credentials are resolved from the live account store for the pinned launch context
 // and never appear in a tool result.
@@ -9,7 +11,7 @@ import { Type } from "typebox";
 import requestGate from "./tipatask-request.cjs";
 import credentials from "./live-credentials.cjs";
 
-const { resolveTipataskRequest } = requestGate;
+const { resolveTipataskRequest, restToolEnabled } = requestGate;
 
 const MAX_RESULT_CHARS = 60000;
 
@@ -18,6 +20,7 @@ function text(value) {
 }
 
 export default function (pi) {
+  if (!restToolEnabled(process.env)) return;
   pi.registerTool({
     name: "tipatask_api",
     label: "Tipatask API",

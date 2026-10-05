@@ -20,12 +20,18 @@ import { t } from './i18n.js';
 // the project picker entirely and goes straight to 'agent'.
 const SETUP_STEPS = ['signin', 'project', 'device', 'agent', 'confirm'];
 const REAUTH_STEPS = ['signin', 'project', 'agent', 'confirm'];
+// 'account' — openReauth({ accountOnly: true }): app-level account swap with no project
+// (Change Account on the default empty window). Sign-in runs setup:reauth-account, which
+// authenticates and saves the account store itself; Confirm only summarizes the result.
+const ACCOUNT_STEPS = ['signin', 'confirm'];
 
 export function stepsFor(mode) {
+  if (mode === 'account') return ACCOUNT_STEPS;
   return mode === 'reauth' ? REAUTH_STEPS : SETUP_STEPS;
 }
 
 export function nextStep(mode, from, { skipProject = false } = {}) {
+  if (mode === 'account') return 'confirm';
   if (from === 'signin') return skipProject ? 'agent' : 'project';
   if (from === 'project') return mode === 'reauth' ? 'agent' : 'device';
   if (from === 'device') return 'agent';
@@ -73,7 +79,12 @@ let _onComplete = null;
 let _overlay = null;
 let _keyHandler = null;
 let _busy = false;
-let _mode = 'setup'; // 'setup' | 'reauth'
+let _mode = 'setup'; // 'setup' | 'reauth' | 'account'
+// Setup mode only: true while open() checks the account store for a live sign-in
+// (setup:stored-account). The Sign-in step shows a spinner until it resolves.
+let _storedAccountPending = false;
+// Account mode only: setup:reauth-account's { ok, user, apiBaseUrl } once the swap succeeded.
+let _accountResult = null;
 // Ask the web sign-in page for an account chooser (continue as the browser's current account vs.
 // pick another) instead of silently handing back its existing session. True for the Project ▸
 // Re-authenticate / Change Account menu path and once the user clicks "Use a different account".
@@ -117,15 +128,42 @@ export function open({ projectPath, onComplete, onCancel }) {
   _onCancel = onCancel || null;
   _completed = false;
   _busy = false;
+  _accountResult = null;
+  _storedAccountPending = !!window.electronAPI?.setupStoredAccount;
   _render();
   _keyHandler = (e) => { if (e.key === 'Escape') close(); };
   document.addEventListener('keydown', _keyHandler);
+  if (_storedAccountPending) _adoptStoredAccount();
+}
+
+// Already signed in before the wizard opened (account store holds a live account-wide token
+// for this server) → skip Sign-in and start on the project picker. Back still reaches the
+// "Signed in as X / Use a different account" variant of Sign-in. Any miss or failure falls
+// back to the normal Sign-in step.
+async function _adoptStoredAccount() {
+  const gen = _openId;
+  let acct = null;
+  try { acct = await window.electronAPI.setupStoredAccount(_apiBaseUrl); } catch {}
+  if (gen !== _openId || _mode !== 'setup' || _step !== 'signin') return;
+  _storedAccountPending = false;
+  if (acct && acct.token && !_userToken) {
+    _userToken = acct.token;
+    _userInfo = acct.user || {};
+    _history = ['signin'];
+    _step = 'project';
+  }
+  _render();
 }
 
 // Re-auth flow: skip API-URL step, skip project pick when existing project is reusable.
-export function openReauth({ projectPath, existingConfig, onComplete, onCancel, chooseAccount }) {
+// accountOnly — no project at all (default empty window): Sign-in → Confirm summary only,
+// through setup:reauth-account. onComplete({ user, apiBaseUrl }) fires on the first close
+// after a successful swap (Done, X or Escape alike); onCancel when closed before one.
+export function openReauth({ projectPath, existingConfig, onComplete, onCancel, chooseAccount, accountOnly }) {
   if (_overlay) close();
-  _mode = 'reauth';
+  _mode = accountOnly ? 'account' : 'reauth';
+  _storedAccountPending = false;
+  _accountResult = null;
   _chooseAccount = !!chooseAccount;
   _existingConfig = existingConfig || {};
   _projectPath = projectPath;
@@ -169,6 +207,8 @@ export function openReauth({ projectPath, existingConfig, onComplete, onCancel, 
 export function close() {
   const wasOpen = !!_overlay;
   const completed = _completed; // capture before reset
+  const accountDone = wasOpen && completed && _mode === 'account' ? _accountResult : null;
+  const completeCb = accountDone ? _onComplete : null;
   if (_overlay) { _overlay.remove(); _overlay = null; }
   document.documentElement.style.overflowY = '';
   document.body.style.paddingRight = '';
@@ -180,8 +220,11 @@ export function close() {
   _completed = false;
   _busy = false;
   _history = [];
+  _accountResult = null;
+  _storedAccountPending = false;
   _openId++; // invalidate any in-flight timer/async callback from this session
   if (cancelCb) { try { cancelCb(); } catch {} }
+  if (completeCb) { try { completeCb({ user: accountDone.user || {}, apiBaseUrl: accountDone.apiBaseUrl }); } catch {} }
   // Dedicated setup window: cancel before completion closes the window.
   if (wasOpen && window._isSetupWindow) {
     window._isSetupWindow = false;
@@ -229,7 +272,7 @@ function _render() {
   _overlay.innerHTML = `
     <div class="setup-modal-backdrop"></div>
     <div class="setup-modal-panel">
-      ${headerHtml({ title: t('setup.headerTitle'), projectPath: _projectPath })}
+      ${headerHtml({ title: _mode === 'account' ? t('reauth.accountHeaderTitle') : t('setup.headerTitle'), projectPath: _projectPath })}
       <div class="setup-modal-steps">${dots}</div>
       <div class="setup-modal-step-body" id="setup-step-body"></div>
       <div class="setup-modal-footer" id="setup-footer"></div>
@@ -252,6 +295,11 @@ function _renderStep() {
   const body = _overlay.querySelector('#setup-step-body');
   const footer = _overlay.querySelector('#setup-footer');
 
+  if (_mode === 'account') {
+    if (_step === 'confirm') _renderAccountConfirm(body, footer);
+    else _renderAccountSignIn(body, footer);
+    return;
+  }
   if (_step === 'signin') _renderSignIn(body, footer);
   else if (_step === 'project') _renderProject(body, footer);
   else if (_step === 'device') _renderDevice(body, footer);
@@ -276,6 +324,15 @@ function _renderSignIn(body, footer) {
   // existing config) — skip straight to Agent. Recomputed on every entry (not just once)
   // since _refreshSelectedProjectName() can only run once a token exists.
   const skipProject = isReauth && !!(_selectedProject && _selectedProject.id);
+
+  if (_storedAccountPending) {
+    body.innerHTML = `<div class="setup-modal-spinner">${_esc(t('setup.checkingSignIn'))}</div>`;
+    footer.innerHTML = `
+      <button class="setup-modal-btn setup-modal-btn--secondary" id="setup-cancel-btn">${_esc(t('common.cancel'))}</button>
+    `;
+    footer.querySelector('#setup-cancel-btn').addEventListener('click', close);
+    return;
+  }
 
   if (_userToken) {
     const email = _userInfo?.email || t('setup.userFallback');
@@ -758,6 +815,80 @@ function _renderConfirm(body, footer) {
       footer.querySelector('#setup-back-btn').disabled = false;
     }
   });
+}
+
+// ── Account-only sign-in / summary (mode 'account') ─────────────────────────────
+// One browser trip: setup:reauth-account authenticates with the account chooser AND saves the
+// account store, so this mode never calls setupAuthWeb, the project-token exchange or
+// api:auth.reauth-save. The renderer never sees the token here.
+
+function _renderAccountSignIn(body, footer) {
+  body.innerHTML = `
+    <p class="setup-modal-label">${_esc(t('reauth.accountSignInTitle'))}</p>
+    <p class="setup-modal-hint">${_esc(t('reauth.accountSignInHint'))}</p>
+    <div class="setup-modal-row setup-modal-row--center" id="setup-auth-actions">
+      <button class="setup-modal-btn setup-modal-btn--primary" id="setup-signin-btn">${_esc(t('setup.signIn'))}</button>
+    </div>
+    <div class="setup-modal-spinner" id="setup-oauth-spinner" style="display:none">${_esc(t('setup.openingBrowserSignIn'))}</div>
+    <div class="setup-modal-msg" id="setup-oauth-msg"></div>
+  `;
+  footer.innerHTML = `
+    <button class="setup-modal-btn setup-modal-btn--secondary" id="setup-cancel-btn">${_esc(t('common.cancel'))}</button>
+  `;
+  footer.querySelector('#setup-cancel-btn').addEventListener('click', close);
+
+  const actions = body.querySelector('#setup-auth-actions');
+  const spinner = body.querySelector('#setup-oauth-spinner');
+  const msg = body.querySelector('#setup-oauth-msg');
+  const signinBtn = body.querySelector('#setup-signin-btn');
+  const fail = (text) => {
+    spinner.style.display = 'none';
+    msg.textContent = text;
+    msg.className = 'setup-modal-msg setup-modal-msg--error';
+    actions.style.display = '';
+    signinBtn.disabled = false;
+  };
+
+  signinBtn.addEventListener('click', async () => {
+    if (!window.electronAPI?.reauthAccount) { fail(t('reauth.accountDesktopOnly')); return; }
+    const gen = _openId;
+    signinBtn.disabled = true;
+    actions.style.display = 'none';
+    spinner.style.display = '';
+    msg.textContent = '';
+    let res;
+    try {
+      // null → main picks the most recently signed-in server, else production.
+      res = await window.electronAPI.reauthAccount(_existingConfig?.API_BASE_URL || null);
+    } catch (e) {
+      res = { ok: false, error: e?.message };
+    }
+    if (gen !== _openId) return;
+    if (!res?.ok) { fail(res?.error || t('setup.signInFailed')); return; }
+    _userInfo = res.user || {};
+    _apiBaseUrl = res.apiBaseUrl || _apiBaseUrl;
+    _accountResult = res;
+    _completed = true; // the account store is already switched — a close from here reports it
+    _goto(nextStep('account', 'signin'));
+  });
+}
+
+function _renderAccountConfirm(body, footer) {
+  const email = _userInfo?.email || t('setup.userFallback');
+  body.innerHTML = `
+    <p class="setup-modal-label">${_esc(t('reauth.accountSwitchedTitle'))}</p>
+    <table class="setup-modal-summary">
+      <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryAccount'))}</td><td class="setup-modal-summary-val">${_esc(email)}</td></tr>
+      <tr><td class="setup-modal-summary-key">${_esc(t('reauth.summaryServer'))}</td><td class="setup-modal-summary-val">${_esc(_apiBaseUrl)}</td></tr>
+    </table>
+    <p class="setup-modal-hint">${_esc(t('reauth.accountOnlyHint'))}</p>
+  `;
+  footer.innerHTML = `
+    <button class="setup-modal-btn setup-modal-btn--secondary" id="setup-switch-btn">${_esc(t('wizard.useDifferentAccount'))}</button>
+    <button class="setup-modal-btn setup-modal-btn--primary" id="setup-done-btn">${_esc(t('common.done'))}</button>
+  `;
+  footer.querySelector('#setup-switch-btn').addEventListener('click', _back);
+  footer.querySelector('#setup-done-btn').addEventListener('click', close);
 }
 
 // Fetch live project name from the API and update _selectedProject.name.

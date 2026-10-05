@@ -154,6 +154,22 @@ test('each provider is told about the tools it actually has', () => {
   assert.doesNotMatch(pi, /\$API_TOKEN|Bearer/, 'credentials never appear in the prompt');
 });
 
+test('pi with the MCP bridge is told the bridged tool names instead of the REST recipe', () => {
+  const pi = buildTaskChatSystemPrompt({ provider: 'pi', task: TASK, piMcpBridge: true });
+  for (const tool of ['tipatask__update_task', 'tipatask__create_task_comment', 'tipatask__get_tag_architecture', 'tipatask-local__batch_grep_tags']) {
+    assert.ok(pi.includes(`\`${tool}\``), tool);
+  }
+  assert.match(pi, /inherits this task's sprint/);
+  assert.doesNotMatch(pi, /tipatask_api|PATCH \/tasks/);
+  assert.doesNotMatch(pi, /```json|READ-ONLY PLANNER/);
+  assert.doesNotMatch(pi, /\$API_TOKEN|Bearer/);
+  const project = buildTaskChatSystemPrompt({ provider: 'pi', project: { id: 2, name: 'P' }, piMcpBridge: true });
+  assert.match(project, /deliberate `priority`/);
+  assert.doesNotMatch(project, /inherits this task's sprint/);
+  assert.equal(buildTaskChatSystemPrompt({ provider: 'claude', task: TASK, piMcpBridge: true }), buildTaskChatSystemPrompt({ provider: 'claude', task: TASK }),
+    'the flag only changes Pi');
+});
+
 test('a project language directive leads the prompt; none leaves it untouched', () => {
   const plain = buildTaskChatSystemPrompt({ provider: 'claude', task: TASK });
   assert.ok(plain.startsWith('TASK CHAT'));

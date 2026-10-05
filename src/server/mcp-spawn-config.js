@@ -8,6 +8,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const REMOTE_SERVER_NAME = 'tipatask';
+// Servers a Pi task terminal reaches through the MCP bridge extension (providers/pi-ext/mcp-bridge.mjs).
+const PI_MCP_SERVERS = Object.freeze([REMOTE_SERVER_NAME, 'tipatask-local']);
 const HELPER_SCRIPT = path.join(__dirname, '..', 'mcp', 'auth-header-helper.js');
 
 function shQuote(value) {
@@ -87,7 +89,15 @@ function writeSpawnMcpConfig({ projectRoot, userDataRoot, helperCommand }) {
 // path, for a spawn that pairs it with --strict-mcp-config so no other MCP server (project or
 // user-level) is reachable. Returns null when .mcp.json is missing/invalid or defines none of
 // them — headless callers use an empty strict config in that case.
-function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label }) {
+// `caller: 'pi'` defaults servers/label for a Pi task terminal and fails closed unless the
+// `tipatask` entry was bound to the account-store headersHelper: the bridge expands `${VAR}` from
+// Pi's env, which carries API_TOKEN, so an unbound `Bearer ${API_TOKEN}` header must never reach it.
+function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label, caller }) {
+  const pi = caller === 'pi';
+  if (pi) {
+    servers = servers || PI_MCP_SERVERS;
+    label = label || 'pi';
+  }
   if (!projectRoot || !userDataRoot || !Array.isArray(servers) || !label) return null;
   let parsed;
   try {
@@ -103,6 +113,10 @@ function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label }) {
     entry.url = `${String(target.API_BASE_URL).replace(/\/+$/, '')}/api/projects/${encodeURIComponent(target.API_PROJECT_ID)}/mcp`;
     entry.headers = { ...entry.headers, Authorization: '' };
     entry.headersHelper = buildHeadersHelperCommand({ projectRoot, userDataRoot });
+  }
+  if (pi) {
+    const remote = parsed?.mcpServers?.[REMOTE_SERVER_NAME];
+    if (servers.includes(REMOTE_SERVER_NAME) && remote && (!remote.headersHelper || remote.headers?.Authorization !== '')) return null;
   }
   const local = parsed?.mcpServers?.['tipatask-local'];
   if (local) local.env = { ...local.env, TIPATASK_PROJECT_ROOT: path.resolve(projectRoot), TIPATASK_USER_DATA: userDataRoot,
@@ -135,4 +149,4 @@ function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label }) {
   return outPath;
 }
 
-module.exports = { REMOTE_SERVER_NAME, HELPER_SCRIPT, buildHeadersHelperCommand, writeSpawnMcpConfig, writeScopedMcpConfig };
+module.exports = { REMOTE_SERVER_NAME, PI_MCP_SERVERS, HELPER_SCRIPT, buildHeadersHelperCommand, writeSpawnMcpConfig, writeScopedMcpConfig };

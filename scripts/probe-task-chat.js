@@ -135,6 +135,7 @@ async function main() {
   const { teardownObjectiveSession } = require('../src/server/claude-session');
   const { writeProjectMcpConfig, readPiEntries } = require('../src/server/project-config');
   const { TASK_CHAT, buildTaskChatSeed, buildTaskChatSystemPrompt } = require('../src/server/task-chat');
+  const { resolvePiMcpBridge } = require('../src/server/providers/pi-task-tools');
 
   writeProjectMcpConfig(scratch, SERVER_ROOT); // .mcp.json + .claude/settings.local.json, as for a real project
 
@@ -203,7 +204,10 @@ async function main() {
         type: 'taskChat', taskKey, toolProfile: TASK_CHAT, projectPath: scratch,
         providerType: provider, selectedModel: null,
       });
-      session.systemPrompt = buildTaskChatSystemPrompt({ provider, task });
+      // Pi's tool vocabulary follows MCP bridge availability, as ensureTaskChatSystemPrompt() decides.
+      const piMcpBridge = provider === 'pi' && !!resolvePiMcpBridge({ projectRoot: scratch, userDataRoot: config.USER_DATA_ROOT });
+      if (provider === 'pi') console.log(`  pi task tools: ${piMcpBridge ? 'bridged MCP (tipatask__*)' : 'REST fallback (tipatask_api)'}`);
+      session.systemPrompt = buildTaskChatSystemPrompt({ provider, task, piMcpBridge });
       // ws-handlers.js reads the task back and broadcasts here; the probe only needs the call.
       const mutations = [];
       session.onTaskChatMutation = (info) => { mutations.push(info); return null; };

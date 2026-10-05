@@ -10,7 +10,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const { buildHeadersHelperCommand, writeSpawnMcpConfig, writeScopedMcpConfig, HELPER_SCRIPT } = require('./mcp-spawn-config');
+const { buildHeadersHelperCommand, writeSpawnMcpConfig, writeScopedMcpConfig, HELPER_SCRIPT, PI_MCP_SERVERS } = require('./mcp-spawn-config');
 
 function tmp(t, prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -229,4 +229,52 @@ test('writeScopedMcpConfig: null when there is nothing to scope to', (t) => {
   assert.strictEqual(writeScopedMcpConfig({ ...args, label: '' }), null);
   assert.strictEqual(writeScopedMcpConfig({ ...args, servers: null }), null);
   assert.strictEqual(fs.existsSync(path.join(userDataRoot, 'mcp-spawn')), false);
+});
+
+// ── writeScopedMcpConfig — Pi task-terminal variant ──
+
+test('writeScopedMcpConfig caller=pi: both Tipatask servers, helper-bound auth, own file name', (t) => {
+  const projectRoot = tmp(t, 'tt-mcp-pi-proj-');
+  const userDataRoot = tmp(t, 'tt-mcp-pi-data-');
+  fs.writeFileSync(path.join(projectRoot, '.mcp.json'), JSON.stringify(MCP_JSON));
+  const out = writeScopedMcpConfig({ projectRoot, userDataRoot, caller: 'pi' });
+  assert.ok(out.startsWith(path.join(userDataRoot, 'mcp-spawn') + path.sep), out);
+  assert.match(path.basename(out), /^[0-9a-f]{12}\.pi\.json$/);
+  const written = JSON.parse(fs.readFileSync(out, 'utf8'));
+  assert.deepStrictEqual(Object.keys(written.mcpServers), [...PI_MCP_SERVERS]);
+  const remote = written.mcpServers.tipatask;
+  assert.equal(remote.url, 'https://selected.test/api/projects/2/mcp');
+  assert.equal(remote.headers.Authorization, '');
+  assert.equal(remote.headers['X-Tipatask-Session-Task'], '${TIPATASK_TASK_ID:-}');
+  assert.match(remote.headersHelper, /auth-header-helper\.js/);
+  assert.equal(written.mcpServers['tipatask-local'].env.TIPATASK_MCP_LOCAL_ONLY, '1');
+});
+
+test('writeScopedMcpConfig caller=pi: the file never carries a token literal', (t) => {
+  const projectRoot = tmp(t, 'tt-mcp-pi-tok-');
+  const userDataRoot = tmp(t, 'tt-mcp-pi-tok-data-');
+  const token = 'eyJhbGciOiJIUzI1NiJ9.secret-pi-token.sig';
+  // Legacy inline token in config.json, a literal bearer in .mcp.json and an exported env token.
+  fs.writeFileSync(path.join(projectRoot, '.tipatask/config.json'), JSON.stringify({ API_BASE_URL: 'https://selected.test', API_PROJECT_ID: '2', API_TOKEN: token }));
+  const mcp = JSON.parse(JSON.stringify(MCP_JSON));
+  mcp.mcpServers.tipatask.headers.Authorization = `Bearer ${token}`;
+  fs.writeFileSync(path.join(projectRoot, '.mcp.json'), JSON.stringify(mcp));
+  const prev = process.env.API_TOKEN;
+  process.env.API_TOKEN = token;
+  t.after(() => { if (prev === undefined) delete process.env.API_TOKEN; else process.env.API_TOKEN = prev; });
+  const out = writeScopedMcpConfig({ projectRoot, userDataRoot, caller: 'pi' });
+  const content = fs.readFileSync(out, 'utf8');
+  assert.ok(!content.includes(token), 'token literal leaked into the Pi MCP config');
+  assert.ok(!content.includes('${API_TOKEN}'), 'unbound API_TOKEN reference leaked into the Pi MCP config');
+});
+
+test('writeScopedMcpConfig caller=pi: fails closed when the remote entry cannot be helper-bound', (t) => {
+  const projectRoot = tmp(t, 'tt-mcp-pi-unbound-');
+  const userDataRoot = tmp(t, 'tt-mcp-pi-unbound-data-');
+  fs.writeFileSync(path.join(projectRoot, '.mcp.json'), JSON.stringify(MCP_JSON));
+  fs.rmSync(path.join(projectRoot, '.tipatask/config.json'));
+  assert.strictEqual(writeScopedMcpConfig({ projectRoot, userDataRoot, caller: 'pi' }), null);
+  // Non-Pi callers keep their verbatim-copy behavior.
+  assert.ok(writeScopedMcpConfig({ projectRoot, userDataRoot, servers: ['tipatask'], label: 'objective' }));
+  assert.strictEqual(writeScopedMcpConfig({ projectRoot: '', userDataRoot, caller: 'pi' }), null);
 });

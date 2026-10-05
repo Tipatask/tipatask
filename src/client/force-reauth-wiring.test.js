@@ -72,7 +72,75 @@ test('_maybeOpenReauth: unconfigured and blank windows do not silently no-op', (
   const body = extractClosureFunction(template, '_maybeOpenReauth');
   assert.match(body, /getCurrentProject\?\.\(\)/);
   assert.match(body, /if \(stale\) _openSetupWizardForPath\(stale, false\)/);
-  assert.match(body, /else if \(force\) showToast\(t\('project\.noProjectLoaded'\), 'info'\)/);
+  // Blank window: the menu item swaps the app-level account instead of a "no project" toast.
+  assert.match(body, /else if \(force\) _openAccountReauth\(\)/);
+  assert.doesNotMatch(body, /project\.noProjectLoaded/);
+});
+
+test('_runForceReauth: blank window opens the account-only wizard too', () => {
+  const body = extractClosureFunction(template, '_runForceReauth');
+  assert.match(body, /if \(stale\) _openSetupWizardForPath\(stale, false\);\s*else _openAccountReauth\(\);/);
+});
+
+test('_openAccountReauth: account-only wizard with the chooser, toast on success, Get Started restored', () => {
+  const start = template.indexOf('function _openAccountReauth(');
+  assert.ok(start >= 0, '_openAccountReauth() not found in template.html');
+  const body = template.slice(start, template.indexOf('\n  }\n', start));
+  assert.match(body, /accountOnly: true/);
+  assert.match(body, /chooseAccount: true/);
+  assert.match(body, /showToast\(t\('reauth\.accountSwitched', \{ email:/);
+  assert.match(body, /_chooseModal\.style\.display = 'none'/);
+  assert.match(body, /if \(restoreGetStarted\) _showChooseModal\(\{ mode: 'getStarted' \}\)/);
+  assert.match(body, /onCancel: finish/);
+  assert.match(body, /_reauthInFlight = false/);
+});
+
+function sliceFn(source, header) {
+  const start = source.indexOf(header);
+  assert.ok(start >= 0, `${header} not found`);
+  return source.slice(start, source.indexOf('\n}\n', start));
+}
+
+test('setup-modal account mode: one browser trip through reauthAccount, no project writes', () => {
+  assert.match(setupModal, /_mode = accountOnly \? 'account' : 'reauth'/);
+  const signIn = sliceFn(setupModal, 'function _renderAccountSignIn(');
+  assert.match(signIn, /window\.electronAPI\.reauthAccount\(/);
+  const confirm = sliceFn(setupModal, 'function _renderAccountConfirm(');
+  for (const body of [signIn, confirm]) {
+    assert.doesNotMatch(body, /setupAuthWeb|setupExchangeProjectToken|reauthSave|openExistingProject/);
+  }
+  // A successful swap is reported on whichever close follows (Done, X, Escape).
+  const closeFn = sliceFn(setupModal, 'export function close(');
+  assert.match(closeFn, /_mode === 'account'/);
+  assert.match(closeFn, /completeCb\(\{ user: accountDone\.user/);
+});
+
+test('setup:stored-account returns a live account-wide sign-in or null', () => {
+  const idx = mainJs.indexOf("ipcMain.handle('setup:stored-account'");
+  assert.ok(idx >= 0, 'setup:stored-account handler not found');
+  const handler = mainJs.slice(idx, mainJs.indexOf("ipcMain.handle('setup:list-projects'", idx));
+  assert.match(handler, /readAccount\(apiBaseUrl\)/);
+  assert.match(handler, /if \(!account\) return null/);
+  assert.match(handler, /decodeTokenPayload\(account\.token\)\?\.project_id != null\) return null/);
+  assert.match(handler, /\/api\/auth\/me/);
+  assert.match(handler, /if \(status !== 200[^)]*\) return null/);
+  assert.match(handler, /catch \(err\) \{[\s\S]*return null;/);
+  assert.match(preload, /setupStoredAccount:\s*\(apiBaseUrl\)\s*=>\s*inv\('setup:stored-account', apiBaseUrl \|\| null\)/);
+});
+
+test('project wizards skip Sign-in for a stored account; reauth/account modes never do', () => {
+  const creationWizard = readSource(CLIENT_DIR, 'project-creation-wizard.js');
+  for (const [name, src] of [['setup-modal.js', setupModal], ['project-creation-wizard.js', creationWizard]]) {
+    const openFn = sliceFn(src, 'export function open(');
+    assert.match(openFn, /setupStoredAccount/, `${name} open() must check the stored account`);
+    assert.match(openFn, /_adoptStoredAccount\(\)/, `${name} open() must adopt it`);
+    assert.match(sliceFn(src, 'async function _adoptStoredAccount('), /gen !== _openId/, `${name}: stale-session guard`);
+  }
+  const openReauth = sliceFn(setupModal, 'export function openReauth(');
+  assert.doesNotMatch(openReauth, /setupStoredAccount|_adoptStoredAccount/);
+  assert.match(openReauth, /_storedAccountPending = false/);
+  // "Use a different account" in the creation wizard must request the chooser.
+  assert.match(creationWizard, /setupAuthWeb\(_apiBaseUrl, undefined, \{ chooseAccount: _chooseAccount \}\)/);
 });
 
 test('setup-modal forwards chooseAccount into setupAuthWeb and resets it on a fresh setup open', () => {
@@ -103,4 +171,25 @@ test('setup:force-reauth (reauth banner path) still authenticates and rebinds th
   assert.match(handler, /await authenticate\(apiBaseUrl\)/);
   assert.match(handler, /exchangeProjectToken\(apiBaseUrl, userToken, cfg\.API_PROJECT_ID\)/);
   assert.match(handler, /reconfigureWindowBackend\(event\.sender\.id, newConfig\)/);
+});
+
+test('preload exposes reauthAccount on the setup:reauth-account channel (no project needed)', () => {
+  assert.match(preload, /reauthAccount:\s*\(apiBaseUrl\)\s*=>\s*inv\('setup:reauth-account', apiBaseUrl \|\| null\)/);
+});
+
+test('setup:reauth-account swaps the app-level account without a project and returns no token', () => {
+  const idx = mainJs.indexOf("ipcMain.handle('setup:reauth-account'");
+  assert.ok(idx >= 0, 'setup:reauth-account handler not found');
+  const handler = mainJs.slice(idx, mainJs.indexOf("ipcMain.handle('project:rename'", idx));
+  assert.match(handler, /if \(_forceReauthInFlight\) return \{ ok: false/);
+  assert.match(handler, /_forceReauthInFlight = false/);
+  assert.match(handler, /defaultAccountServer\(\)\s*\|\| DEFAULT_API_BASE_URL/);
+  assert.match(handler, /authenticate\(apiBaseUrl, \{ chooseAccount: true \}\)/);
+  assert.match(handler, /saveAccountForServer\(apiBaseUrl, \{ token, userId: user\?\.id, email: user\?\.email \}\)/);
+  assert.match(handler, /createMenu\(\)/);
+  assert.doesNotMatch(handler, /readProjectConfig|projectPath|exchangeProjectToken/);
+  const ret = handler.slice(handler.indexOf('return {\n'), handler.indexOf('} catch'));
+  assert.match(ret, /ok: true/);
+  assert.match(ret, /apiBaseUrl: saved\.apiBaseUrl/);
+  assert.doesNotMatch(ret, /token/);
 });

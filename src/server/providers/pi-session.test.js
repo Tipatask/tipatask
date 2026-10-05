@@ -398,3 +398,75 @@ test('spawnPiTurn: a non-custom row leaves Pi\'s agent dir alone and creates no 
   assert.strictEqual(env.PI_CODING_AGENT_SESSION_DIR, process.env.PI_CODING_AGENT_SESSION_DIR);
   assert.strictEqual(fs.existsSync(path.join(turn.session.projectPath, '.pi')), false);
 });
+
+// ── MCP bridge (TPT513) ──
+
+const BRIDGE = { extensionPath: '/data/pi-ext/mcp-bridge.mjs', configPath: '/data/mcp-spawn/abc.pi.json' };
+
+function spawnWithBridge(t, session, bridge) {
+  enableTimers(t);
+  const proc = makeFakeProc();
+  let stdin = '';
+  proc.stdin = { write(s) { stdin += s; }, end() {} };
+  let spawnCall = null;
+  const calls = [];
+  spawnPiTurn(session, 'T1', () => {}, {
+    spawn: (command, args, opts) => { spawnCall = { command, args, opts }; return proc; },
+    resolveMcpBridge: (opts) => { calls.push(opts); return bridge; },
+  });
+  return { spawnCall: () => spawnCall, stdin: () => stdin, calls };
+}
+
+test('buildPiArgs: objective without a bridge stays `--tools read` with no extension', () => {
+  const args = buildPiArgs({ selectedModel: MODEL });
+  assert.strictEqual(args[args.indexOf('--tools') + 1], 'read');
+  assert.ok(!args.includes('-e'));
+});
+
+test('buildPiArgs: objective with a bridge loads it alone and allowlists the read-only bridged tools', () => {
+  const args = buildPiArgs({ selectedModel: MODEL }, { mcpBridgePath: BRIDGE.extensionPath });
+  const tools = args[args.indexOf('--tools') + 1].split(',');
+  assert.ok(tools.includes('tipatask__get_tag_architecture') && tools.includes('tipatask-local__batch_grep_tags'));
+  assert.ok(!tools.includes('tipatask__update_task'));
+  assert.deepStrictEqual(args.slice(args.indexOf('--no-extensions')), ['--no-extensions', '-e', BRIDGE.extensionPath]);
+});
+
+test('buildPiArgs: task chat with a bridge loads both extensions; without one only the REST extension', () => {
+  const chat = { selectedModel: MODEL, type: 'taskChat', toolProfile: 'taskChat', taskKey: 'TPT1' };
+  const withBridge = buildPiArgs(chat, { extensionPath: '/x/task-tools.mjs', mcpBridgePath: BRIDGE.extensionPath });
+  assert.deepStrictEqual(withBridge.slice(withBridge.indexOf('--no-extensions')), ['--no-extensions', '-e', '/x/task-tools.mjs', '-e', BRIDGE.extensionPath]);
+  assert.ok(withBridge[withBridge.indexOf('--tools') + 1].split(',').includes('tipatask__update_task'));
+  const without = buildPiArgs(chat, { extensionPath: '/x/task-tools.mjs' });
+  assert.deepStrictEqual(without.slice(without.indexOf('--no-extensions')), ['--no-extensions', '-e', '/x/task-tools.mjs']);
+  assert.strictEqual(without[without.indexOf('--tools') + 1], 'read,grep,find,ls,tipatask_api');
+});
+
+test('spawnPiTurn: an objective turn with a bridge sets TIPATASK_PI_MCP_CONFIG, loads it and names the bridged tools', (t) => {
+  const dir = makeProjectDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const run = spawnWithBridge(t, makeSession(dir), BRIDGE);
+  assert.deepStrictEqual(run.calls, [{ projectRoot: dir, userDataRoot: config.USER_DATA_ROOT }]);
+  const { args, opts } = run.spawnCall();
+  assert.strictEqual(opts.env.TIPATASK_PI_MCP_CONFIG, BRIDGE.configPath);
+  assert.strictEqual(args[args.indexOf('-e') + 1], BRIDGE.extensionPath);
+  return new Promise((resolve) => setImmediate(resolve)).then(() => {
+    assert.match(run.stdin(), /^Pi objective planning: tools are `read` plus these read-only Tipatask MCP tools/);
+    assert.match(run.stdin(), /`tipatask__get_tag_architectures`/);
+    assert.doesNotMatch(run.stdin(), /only the read tool is available/);
+  });
+});
+
+test('spawnPiTurn: no bridge leaves TIPATASK_PI_MCP_CONFIG empty even when inherited, read-only prompt note', (t) => {
+  const dir = makeProjectDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const prev = process.env.TIPATASK_PI_MCP_CONFIG;
+  process.env.TIPATASK_PI_MCP_CONFIG = '/stale/inherited.json';
+  t.after(() => { if (prev === undefined) delete process.env.TIPATASK_PI_MCP_CONFIG; else process.env.TIPATASK_PI_MCP_CONFIG = prev; });
+  const run = spawnWithBridge(t, makeSession(dir), null);
+  const { args, opts } = run.spawnCall();
+  assert.strictEqual(opts.env.TIPATASK_PI_MCP_CONFIG, '');
+  assert.ok(!args.includes('-e'));
+  return new Promise((resolve) => setImmediate(resolve)).then(() => {
+    assert.match(run.stdin(), /^Pi objective planning: only the read tool is available/);
+  });
+});

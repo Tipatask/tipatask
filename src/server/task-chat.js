@@ -139,11 +139,29 @@ function piToolsSection(projectChat = false) {
   ].join('\n');
 }
 
-// System prompt for one task-chat turn. `provider` picks the tool vocabulary; rebuild it
-// whenever the session's provider changes. Plain prose on purpose — this is a conversation,
+// Pi with the MCP bridge loaded (providers/pi-ext/mcp-bridge.mjs): the same MCP tools Claude and
+// Codex get, under the bridge's `<server>__<tool>` names (PROFILES.taskChat.pi mcpTools).
+function piBridgedToolsSection(projectChat = false) {
+  return [
+    'Tools you have:',
+    '- Source and KB files: `read`, `grep`, `find`, `ls`. Architecture docs live in `ai/architecture/` (`GENERAL.md`, `tt-*.md`, index in `_index.json`).',
+    '- The Tipatask MCP servers, bridged as native tools named `<server>__<tool>`. Wherever shared context names `mcp__tipatask__<tool>` or `mcp__tipatask-local__<tool>`, call `tipatask__<tool>` / `tipatask-local__<tool>`.',
+    '- Code search across architecture tags: `tipatask-local__batch_grep_tags` (pass `symbols` for extra patterns).',
+    '- Knowledge base: `tipatask__list_system_tags`, `tipatask__get_tag_architecture`, `tipatask__get_tag_architectures`, `tipatask__get_project_tags`, `tipatask__list_task_resolutions`.',
+    '- Tasks: `tipatask__list_tasks`, `tipatask__get_task`, `tipatask__create_task`, `tipatask__update_task`, `tipatask__delete_task`, `tipatask__create_task_comment`.',
+    projectChat
+      ? '  - `tipatask__create_task` needs a deliberate `priority`: the chosen sprint, or 0 for the backlog.'
+      : '  - `tipatask__create_task` inherits this task\'s sprint when you omit `priority`.',
+    '- Tags: `tipatask__ensure_project_tag` (plain tags) and `tipatask__create_system_tag` (`tt-*` tags) — register a tag with a real description before putting it on a task.',
+    'There is no shell, no curl and no REST tool; if one of these tools is missing, its MCP server could not be reached — say so once.',
+  ].join('\n');
+}
+
+// System prompt for one task-chat turn. `provider` picks the tool vocabulary (and, for Pi,
+// `piMcpBridge` whether the bridged MCP tools or the REST recipe); rebuild it whenever either changes. Plain prose on purpose — this is a conversation,
 // not the objective planner. The one structured thing it asks for is the `ask_user` block
 // (task-chat-widgets.js), which the server turns into a dialog frame.
-function buildTaskChatSystemPrompt({ provider, task, project, langDirective } = {}) {
+function buildTaskChatSystemPrompt({ provider, task, project, langDirective, piMcpBridge = false } = {}) {
   const projectChat = !!project && !task;
   const key = (task && task.id) || 'this task';
   const title = task && task.title ? ` ("${task.title}")` : '';
@@ -170,7 +188,9 @@ function buildTaskChatSystemPrompt({ provider, task, project, langDirective } = 
       : `- A task you create inherits the priority of task ${key} unless the user says otherwise.`,
     '- In task descriptions, escape `~` as `\\~`.',
     '',
-    provider === 'pi' ? piToolsSection(projectChat) : mcpToolsSection(provider),
+    provider === 'pi'
+      ? (piMcpBridge ? piBridgedToolsSection(projectChat) : piToolsSection(projectChat))
+      : mcpToolsSection(provider),
     '',
     ASK_USER_CONTRACT,
     '',

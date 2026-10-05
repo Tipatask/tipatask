@@ -129,6 +129,26 @@ test('create and update calls are recognised per provider; everything else is no
   assert.equal(classifyTaskMutation({ name: 'mcp__tipatask__get_task', input: { task_key: 'TPT9' } }), null);
   assert.equal(classifyTaskMutation({ name: 'mcp__tipatask-local__batch_grep_tags' }), null);
   assert.equal(classifyTaskMutation({ name: 'mcp__other__update_task', input: { task_key: 'TPT9' } }), null);
+  // Pi's MCP bridge: `<server>__<tool>`, no `mcp__` prefix.
+  assert.deepEqual(classifyTaskMutation({ name: 'tipatask__update_task', input: { task_key: 'TPT9' } }), { action: 'updated', taskKey: 'TPT9' });
+  assert.deepEqual(classifyTaskMutation({ name: 'tipatask__create_task', input: { title: 'x' } }), { action: 'created', taskKey: '' });
+  assert.equal(classifyTaskMutation({ name: 'tipatask__get_task', input: { task_key: 'TPT9' } }), null);
+  assert.equal(classifyTaskMutation({ name: 'tipatask-local__batch_grep_tags' }), null);
+  assert.equal(classifyTaskMutation({ name: 'other__update_task', input: { task_key: 'TPT9' } }), null);
+});
+
+test('a Pi bridged MCP call is one tool record under the canonical mcp__ name and reaches the hook', async () => {
+  const calls = [];
+  const { session, send, ofType } = chat({ onTaskChatMutation: info => { calls.push(info); } });
+  toolStarted(session, send, { id: 'b1', name: 'tipatask__update_task', input: { task_key: 'TPT1', status: 'pending' } });
+  toolFinished(session, send, { id: 'b1', name: 'tipatask__update_task', result: { content: [{ type: 'text', text: '{"task":{"id":"TPT1"}}' }] } });
+  toolStarted(session, send, { id: 'b2', name: 'tipatask-local__batch_grep_tags', input: { tag_names: ['tt-task-chat'] } });
+  await flush();
+  const tools = ofType('task-chat-tool').map(f => f.tool);
+  const done = tools.find(t => t.id === 'b1' && t.status === 'done');
+  assert.deepEqual({ name: done.name, server: done.server, tool: done.tool }, { name: 'mcp__tipatask__update_task', server: 'tipatask', tool: 'update_task' });
+  assert.equal(tools.find(t => t.id === 'b2').server, 'tipatask-local');
+  assert.deepEqual(calls, [{ action: 'updated', taskKey: 'TPT1', toolId: 'b1' }]);
 });
 
 test('the created task key is read out of each result shape', () => {

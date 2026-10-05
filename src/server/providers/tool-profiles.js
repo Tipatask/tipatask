@@ -8,7 +8,8 @@
 // enforces that with its own mechanism:
 //   claude — --allowedTools/--disallowedTools plus a strict two-server MCP config
 //   codex  — read-only sandbox (fresh and resumed turns) plus per-server MCP tool filters
-//   pi     — a --tools allowlist with no bash/edit/write and one REST tool (providers/pi-ext/)
+//   pi     — a --tools allowlist with no bash/edit/write, naming the bridged MCP tools when the
+//            MCP bridge (providers/pi-ext/mcp-bridge.mjs) is loaded, else the one REST tool
 
 const TASK_CHAT = 'taskChat';
 
@@ -33,6 +34,34 @@ const TASK_CHAT_LOCAL_TOOLS = Object.freeze(['batch_grep_tags']);
 const TASK_CHAT_LOCAL_DENIED = Object.freeze(['push_knowledge', 'pull_knowledge', 'complete_task', 'git_worktree_status']);
 
 const PI_TASK_API_TOOL = 'tipatask_api';
+
+// Pi tool name the MCP bridge registers for an MCP tool: `<server>__<tool>`, the rule of
+// mcpToolName() in providers/pi-ext/mcp-bridge.mjs (both server names are already legal).
+const piBridged = server => name => `${server}__${name}`;
+
+// Read-only remote tools an objective planner may call: task reads, tag and KB lookups.
+const OBJECTIVE_REMOTE_READ_TOOLS = Object.freeze([
+  'list_tasks', 'get_task', 'list_task_id_meta', 'list_task_resolutions',
+  'list_system_tags', 'get_project_tags', 'get_tag_architecture', 'get_tag_architectures',
+]);
+
+// Bridged names a Pi task chat may call — the same lists Claude's task chat allows by name.
+const PI_TASK_CHAT_MCP_TOOLS = Object.freeze([
+  ...TASK_CHAT_REMOTE_TOOLS.map(piBridged(REMOTE_MCP)),
+  ...TASK_CHAT_LOCAL_TOOLS.map(piBridged(LOCAL_MCP)),
+]);
+const PI_OBJECTIVE_MCP_TOOLS = Object.freeze([
+  ...OBJECTIVE_REMOTE_READ_TOOLS.map(piBridged(REMOTE_MCP)),
+  ...TASK_CHAT_LOCAL_TOOLS.map(piBridged(LOCAL_MCP)),
+]);
+
+// Pi's objective (read-only planner) fence. `tools` are always on; `mcpTools` replace
+// `restTools` when the MCP bridge is loaded for the turn (piToolAllowlist()).
+const PI_OBJECTIVE_PROFILE = Object.freeze({
+  tools: Object.freeze(['read']),
+  restTools: Object.freeze([]),
+  mcpTools: PI_OBJECTIVE_MCP_TOOLS,
+});
 
 const CODEX_OBJECTIVE_PROFILE = Object.freeze({
   sandbox: 'read-only', mcpServers: [REMOTE_MCP, LOCAL_MCP],
@@ -65,7 +94,9 @@ const PROFILES = Object.freeze({
       localEnabledTools: TASK_CHAT_LOCAL_TOOLS,
     }),
     pi: Object.freeze({
-      tools: Object.freeze(['read', 'grep', 'find', 'ls', PI_TASK_API_TOOL]),
+      tools: Object.freeze(['read', 'grep', 'find', 'ls']),
+      restTools: Object.freeze([PI_TASK_API_TOOL]),
+      mcpTools: PI_TASK_CHAT_MCP_TOOLS,
     }),
   }),
 });
@@ -81,6 +112,14 @@ function toolProfileFor(session, provider) {
 function providerSupportsProfile(session, provider) {
   if (!session || !session.toolProfile) return true;
   return PROFILE_PROVIDERS.includes(provider);
+}
+
+// The `--tools` allowlist of a headless Pi turn. With the bridge, the bridged MCP tools take
+// the REST tool's place; Pi activates a tool the bridge registers in session_start only because
+// its name is on this list. Without it the REST fallback (pi-ext/task-tools.mjs) is the task tool.
+function piToolAllowlist(profile, { bridge = false } = {}) {
+  const p = profile || PI_OBJECTIVE_PROFILE;
+  return [...p.tools, ...((bridge ? p.mcpTools : p.restTools) || [])];
 }
 
 function tomlStringArray(values) {
@@ -110,7 +149,11 @@ module.exports = {
   PROFILES,
   PROFILE_PROVIDERS,
   PI_TASK_API_TOOL,
+  PI_OBJECTIVE_PROFILE,
+  PI_TASK_CHAT_MCP_TOOLS,
+  PI_OBJECTIVE_MCP_TOOLS,
   CODEX_OBJECTIVE_PROFILE,
+  piToolAllowlist,
   toolProfileFor,
   providerSupportsProfile,
   codexProfileConfigArgs,

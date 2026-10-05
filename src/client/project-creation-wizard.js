@@ -46,15 +46,24 @@ let _preset = null;
 let _onComplete = null;
 let _overlay = null;
 let _keyHandler = null;
+// Bumped by open()/close() — invalidates the in-flight stored-account check of a superseded session.
+let _openId = 0;
+// True while open() checks the account store for a live sign-in (setup:stored-account);
+// Step 1 shows a spinner until it resolves.
+let _storedAccountPending = false;
+// Set by "Use a different account" so the web sign-in page offers its account chooser
+// instead of silently handing back the browser's current session.
+let _chooseAccount = false;
 
-export async function setupAuthWeb(apiBaseUrl, invoke) {
+// opts.chooseAccount is forwarded to setup:auth-web unchanged.
+export async function setupAuthWeb(apiBaseUrl, invoke, opts) {
   const authInvoker = invoke === undefined ? globalThis.window?.electronAPI?.setupAuthWeb : invoke;
   if (typeof authInvoker !== 'function') {
     throw new Error(t('wizard.desktopSignInUnavailable'));
   }
 
   try {
-    return await authInvoker(apiBaseUrl);
+    return await authInvoker(apiBaseUrl, opts);
   } catch (error) {
     const raw = typeof error?.message === 'string' ? error.message.trim() : '';
     const detail = raw
@@ -77,9 +86,32 @@ export function open({ projectPath, onComplete }) {
   _piModels = [{ model: '', apiKey: '' }];
   _preset = null;
   _onComplete = onComplete || null;
+  _openId++;
+  _chooseAccount = false;
+  // An in-memory sign-in from an earlier session of this wizard still wins (Step 1 shows it).
+  _storedAccountPending = !_userToken && !!window.electronAPI?.setupStoredAccount;
   _render();
   _keyHandler = (e) => { if (e.key === 'Escape') close(); };
   document.addEventListener('keydown', _keyHandler);
+  if (_storedAccountPending) _adoptStoredAccount();
+}
+
+// Already signed in before the wizard opened (account store holds a live account-wide token
+// for this server) → skip Sign-in and start on Step 2. Back still reaches Step 1's
+// "Signed in as X / Use a different account" variant. Any miss or failure shows Sign-in.
+async function _adoptStoredAccount() {
+  const gen = _openId;
+  let acct = null;
+  try { acct = await window.electronAPI.setupStoredAccount(_apiBaseUrl); } catch {}
+  if (gen !== _openId || _step !== 1) return;
+  _storedAccountPending = false;
+  if (acct && acct.token && !_userToken) {
+    _userToken = acct.token;
+    _userInfo = acct.user || {};
+    _goto(2);
+    return;
+  }
+  _render();
 }
 
 export function close() {
@@ -88,6 +120,8 @@ export function close() {
   document.body.style.paddingRight = '';
   if (_keyHandler) { document.removeEventListener('keydown', _keyHandler); _keyHandler = null; }
   _onComplete = null;
+  _storedAccountPending = false;
+  _openId++;
 }
 
 function _goto(step) {
@@ -144,6 +178,15 @@ function _renderStep() {
 // ── Step 1: Sign in ──────────────────────────────────────────────────────────
 
 function _renderStep1(body, footer) {
+  if (_storedAccountPending) {
+    body.innerHTML = `<div class="setup-modal-spinner">${_esc(t('setup.checkingSignIn'))}</div>`;
+    footer.innerHTML = `
+      <button class="setup-modal-btn setup-modal-btn--secondary" id="wiz-cancel-btn">${_esc(t('common.cancel'))}</button>
+    `;
+    footer.querySelector('#wiz-cancel-btn').addEventListener('click', close);
+    return;
+  }
+
   if (_userToken) {
     const email = _userInfo?.email || t('setup.userFallback');
     body.innerHTML = `
@@ -159,6 +202,7 @@ function _renderStep1(body, footer) {
     footer.querySelector('#wiz-switch-btn').addEventListener('click', () => {
       _userToken = null;
       _userInfo = null;
+      _chooseAccount = true;
       _render();
     });
     return;
@@ -195,7 +239,7 @@ function _renderStep1(body, footer) {
     msg.textContent = '';
     hint.textContent = t('setup.openingBrowserSignIn');
     try {
-      const result = await setupAuthWeb(_apiBaseUrl);
+      const result = await setupAuthWeb(_apiBaseUrl, undefined, { chooseAccount: _chooseAccount });
       _userToken = result.token;
       _userInfo = result.user || {};
       spinner.style.display = 'none';

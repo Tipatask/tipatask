@@ -259,6 +259,8 @@ let _confirmingQuit = false;
 let _quitConfirmed = false;
 // Prevent concurrent browser-OAuth flows (authenticate() opens a system browser tab).
 let _forceReauthInFlight = false;
+// Mirror of src/client/constants.js DEFAULT_API_BASE_URL (ESM, not requirable here).
+const DEFAULT_API_BASE_URL = 'https://web.tipatask.com';
 // (C1429) Windows cleared to close without another confirmWindowClose() prompt — set
 // right before the code that already asked (project:close/project:remove handlers,
 // or a Cancel-free confirmWindowClose pass) calls w.close(). A window can only be
@@ -1307,6 +1309,35 @@ function registerIpcHandlers() {
     return await authenticate(apiBaseUrl, { chooseAccount: !!chooseAccount });
   });
 
+  // Live account-wide sign-in for one server, for the project wizards (setup-modal open() and
+  // project-creation-wizard) to skip their Sign-in step when the user signed in before starting
+  // them. Server: the argument, else production. null when nobody is signed in there, when the
+  // stored token is a legacy project-scoped one (it cannot list projects or register a device),
+  // or when GET /api/auth/me does not answer 200 — the wizard then signs in as usual.
+  // Returns the same account-wide desktop token setup:auth-web already hands the renderer.
+  ipcMain.handle('setup:stored-account', async (_event, requestedBaseUrl) => {
+    try {
+      const { readAccount, decodeTokenPayload } = require('./src/server/account-store');
+      const apiBaseUrl = String(requestedBaseUrl || '').trim().replace(/\/+$/, '') || DEFAULT_API_BASE_URL;
+      const account = readAccount(apiBaseUrl);
+      if (!account) return null;
+      if (decodeTokenPayload(account.token)?.project_id != null) return null;
+      const { request } = require('./src/cli/http');
+      const { status, data } = await request(`${apiBaseUrl}/api/auth/me`, {
+        method: 'GET', headers: { Authorization: `Bearer ${account.token}` }, timeoutMs: 5000,
+      });
+      if (status !== 200 || !data || !data.user) return null;
+      return {
+        token: account.token,
+        user: { id: data.user.id, name: data.user.name || '', email: data.user.email || account.email || '' },
+        apiBaseUrl,
+      };
+    } catch (err) {
+      console.warn('[stored-account] check failed:', err.message);
+      return null;
+    }
+  });
+
   ipcMain.handle('setup:list-projects', async (_event, { apiBaseUrl, userToken }) => {
     const res = await fetch(`${apiBaseUrl}/api/projects`, {
       headers: { Authorization: `Bearer ${userToken}` },
@@ -1418,6 +1449,37 @@ function registerIpcHandlers() {
       return { ok: state === 'connected', state };
     } catch (err) {
       console.error('[force-reauth] failed:', err.message);
+      return { ok: false, error: err.message };
+    } finally {
+      _forceReauthInFlight = false;
+    }
+  });
+
+  // Account-level sign-in / account swap. The account store is app-level, so this needs no
+  // bound project and works from the default empty window. Target server: the argument, else
+  // the most recently signed-in server in the account store, else production. Project windows
+  // on that server pick the new token up live through getApiCredentials().
+  // Returns { ok, user, apiBaseUrl } — never the token.
+  ipcMain.handle('setup:reauth-account', async (_event, requestedBaseUrl) => {
+    if (_forceReauthInFlight) return { ok: false, error: 'Re-authentication already in progress' };
+    _forceReauthInFlight = true;
+    try {
+      const { defaultAccountServer, saveAccountForServer } = require('./src/server/account-store');
+      const apiBaseUrl = String(requestedBaseUrl || '').trim().replace(/\/+$/, '')
+        || defaultAccountServer()
+        || DEFAULT_API_BASE_URL;
+      const { authenticate } = require('./src/cli/auth');
+      const { token, user } = await authenticate(apiBaseUrl, { chooseAccount: true });
+      const saved = saveAccountForServer(apiBaseUrl, { token, userId: user?.id, email: user?.email });
+      if (app.isReady()) createMenu();
+      reconcileRecentProjectsWithAccounts();
+      return {
+        ok: true,
+        user: { id: saved.userId, name: user?.name || '', email: saved.email },
+        apiBaseUrl: saved.apiBaseUrl,
+      };
+    } catch (err) {
+      console.error('[reauth-account] failed:', err.message);
       return { ok: false, error: err.message };
     } finally {
       _forceReauthInFlight = false;

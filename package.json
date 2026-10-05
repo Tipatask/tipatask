@@ -1,6 +1,6 @@
 {
   "name": "tipatask-app",
-  "version": "0.9.6",
+  "version": "0.9.7",
   "description": "TipΔTask — Electron desktop app: local task board, architecture knowledge base, and AI coding-agent orchestrator (Claude/Codex/Pi), with a CLI installer for the agent harness files.",
   "license": "Apache-2.0",
   "author": "Anton Matiienko, Apppixies",
@@ -38,6 +38,7 @@
     "probe:design": "node scripts/probe-design-mode.js",
     "probe:attention": "node scripts/probe-attention-prompts.js",
     "probe:pi-approval": "node scripts/probe-pi-approval.js",
+    "probe:pi-mcp": "node scripts/probe-pi-mcp.js",
     "probe:voice-model": "node scripts/probe-voice-model.js",
     "probe:status-roles": "node scripts/probe-status-roles.js",
     "probe:preset-seeding": "node scripts/probe-preset-seeding.js",

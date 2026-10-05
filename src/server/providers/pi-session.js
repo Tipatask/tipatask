@@ -14,8 +14,8 @@ const { buildTurnPrompt } = require('./transcript');
 const { resolveProviderModel, configForProject } = require('./registry');
 const { readProjectConfig, piEntryForModel, piDefaultEntry, piKeyEnvVars } = require('../project-config');
 const { piSpawnProvider, preparePiCustomEndpoint } = require('../pi-custom-endpoint');
-const { toolProfileFor } = require('./tool-profiles');
-const { materializePiTaskTools } = require('./pi-task-tools');
+const { toolProfileFor, piToolAllowlist, PI_OBJECTIVE_PROFILE, PI_OBJECTIVE_MCP_TOOLS } = require('./tool-profiles');
+const { materializePiTaskTools, resolvePiMcpBridge } = require('./pi-task-tools');
 const taskChatWidgets = require('../task-chat-widgets');
 
 // Prepend the current node binary's bin/ directory to the spawn PATH so that
@@ -60,27 +60,41 @@ function piEntryFor(session) {
 // (TPT189) For a `custom` row that is the generated models.json block id (piSpawnProvider). This
 // stays a pure argv builder — the file itself is written by spawnPiTurn() via
 // preparePiCustomEndpoint(), so calling this directly never touches disk.
-// A session under a tool profile (task chat) swaps the read-only `--tools read` for the
-// profile's allowlist and loads exactly one extension — `extensionPath`, the staged copy of
-// providers/pi-ext/task-tools.mjs — with extension discovery off, so no project or user
-// extension can add a tool or hook the turn.
-function buildPiArgs(session, { extensionPath } = {}) {
+// `--tools` is piToolAllowlist() of the session's profile (task chat) or of the objective
+// fence (PI_OBJECTIVE_PROFILE). Extension discovery is always off, so no project or user
+// extension can add a tool or hook the turn; only the staged copies passed here load:
+// `extensionPath` (providers/pi-ext/task-tools.mjs, profiled sessions only) and
+// `mcpBridgePath` (the MCP bridge bundle, whenever resolvePiMcpBridge() found a config). With
+// the bridge the allowlist names the bridged MCP tools instead of the REST `tipatask_api`.
+function buildPiArgs(session, { extensionPath, mcpBridgePath } = {}) {
   const profile = toolProfileFor(session, 'pi');
   const args = [
     '--mode', 'json',
     '--provider', piSpawnProvider(piEntryFor(session)),
     // (C1030) session.selectedModel (chat-model-selector) wins over config.PI_MODEL.
     '--model', piModelFor(session),
-    '--tools', profile ? profile.tools.join(',') : 'read',
+    '--tools', piToolAllowlist(profile || PI_OBJECTIVE_PROFILE, { bridge: !!mcpBridgePath }).join(','),
   ];
   args.push('--no-extensions');
-  if (profile) {
-    if (extensionPath) args.push('-e', extensionPath);
-  }
+  if (profile && extensionPath) args.push('-e', extensionPath);
+  if (mcpBridgePath) args.push('-e', mcpBridgePath);
   if (session.piSessionId) {
     args.push('--session', session.piSessionId);
   }
   return args;
+}
+
+// First line of an objective turn's prompt: which tools this planner turn really has. Shared
+// context (CLAUDE.md, the planner prompt) names MCP tools as `mcp__<server>__<tool>`; with the
+// bridge those are reachable read-only under their bridged names.
+function piObjectiveToolNote(bridge) {
+  if (!bridge) {
+    return 'Pi objective planning: only the read tool is available. No MCP, REST, shell or file-writing tools. Return proposals; ignore coding-task completion and MCP instructions in shared context.';
+  }
+  return 'Pi objective planning: tools are `read` plus these read-only Tipatask MCP tools, bridged as `<server>__<tool>`: '
+    + PI_OBJECTIVE_MCP_TOOLS.map(t => `\`${t}\``).join(', ')
+    + '. Where shared context names `mcp__<server>__<tool>`, call `<server>__<tool>` if it is in that list; any other MCP tool is unavailable. '
+    + 'No shell, file-writing or task-writing tools. Return proposals; ignore coding-task completion instructions in shared context.';
 }
 
 // ── Card parser ───────────────────────────────────────────────────────────────
@@ -356,7 +370,15 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
     }
     if (session.taskKey) env.TIPATASK_TASK_ID = session.taskKey;
   }
-  const args = buildPiArgs(session, { extensionPath });
+  // MCP bridge: the bridged tipatask / tipatask-local tools, fenced by the --tools allowlist.
+  // TIPATASK_PI_MCP_CONFIG is always set — empty without a bridge, so an inherited value never
+  // applies and task-tools.mjs registers its REST fallback.
+  const resolveBridge = deps.resolveMcpBridge || resolvePiMcpBridge;
+  let bridge = null;
+  try { bridge = resolveBridge({ projectRoot: cwd, userDataRoot: config.USER_DATA_ROOT }); }
+  catch (err) { console.warn(`[pi] MCP bridge unavailable task=${taskId}: ${err.message}`); }
+  env.TIPATASK_PI_MCP_CONFIG = bridge ? bridge.configPath : '';
+  const args = buildPiArgs(session, { extensionPath, mcpBridgePath: bridge ? bridge.extensionPath : null });
   const isFirstTurn = !session.piSessionId;
 
   // Build the prompt text to write to stdin.
@@ -367,7 +389,7 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
     includeSystemPrompt: true,
     hasProviderSession: !isFirstTurn,
   });
-  let basePrompt = (session.toolProfile ? '' : 'Pi objective planning: only the read tool is available. No MCP, REST, shell or file-writing tools. Return proposals; ignore coding-task completion and MCP instructions in shared context.\n\n') + basePromptBuilt;
+  let basePrompt = (session.toolProfile ? '' : `${piObjectiveToolNote(!!bridge)}\n\n`) + basePromptBuilt;
   if (promptMode === 'handoff') {
     console.log(`[pi] task=${taskId} switching to pi — sending full transcript (${basePrompt.length} chars)`);
   }
@@ -406,7 +428,7 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
   }
 
   emit({ type: 'objective-progress', stage: 'spawned', elapsedMs: elapsed() });
-  console.log(`[pi] Spawn task=${taskId} model=${piModelFor(session)} first=${isFirstTurn} mode=${promptMode}`);
+  console.log(`[pi] Spawn task=${taskId} model=${piModelFor(session)} first=${isFirstTurn} mode=${promptMode} mcp-bridge=${bridge ? bridge.extensionPath : 'off'}`);
 
   // Write prompt to stdin (after optional image localization).
   // stdin is the safe delivery path for large prompts under --mode json.
@@ -608,4 +630,4 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
   });
 }
 
-module.exports = { spawnPiTurn, buildPiArgs, emitPiError, assistantErrorOf };
+module.exports = { spawnPiTurn, buildPiArgs, emitPiError, assistantErrorOf, piObjectiveToolNote };

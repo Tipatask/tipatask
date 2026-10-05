@@ -20,6 +20,10 @@ const MAX_INPUT_DEPTH = 3;
 const MAX_ERROR_CHARS = 300;
 
 const REMOTE_MCP = 'tipatask';
+const LOCAL_MCP = 'tipatask-local';
+// Pi's MCP bridge names a tool `<server>__<tool>` with no `mcp__` prefix. Only the two Tipatask
+// servers are recognized, so an unrelated tool name containing `__` keeps its bare identity.
+const PI_BRIDGED_RE = new RegExp(`^(${LOCAL_MCP}|${REMOTE_MCP})__(.+)$`);
 const PI_TASK_API_TOOL = 'tipatask_api';
 
 // The dialog block is tagged `ask_user`, never `json`: a ```json fence in a chat reply is the
@@ -140,11 +144,14 @@ function emitDialogs(session, send = sessionSender(session)) {
 
 // ── Tools ─────────────────────────────────────────────────────────────────────
 
-// `mcp__<server>__<tool>` (Claude) or an explicit server + tool (Codex) -> one naming scheme.
+// `mcp__<server>__<tool>` (Claude), an explicit server + tool (Codex) or Pi's bridged
+// `<server>__<tool>` -> one naming scheme.
 function toolIdentity({ name, server, tool }) {
   if (server && tool) return { name: `mcp__${server}__${tool}`, server, tool };
   const mcp = /^mcp__(.+?)__(.+)$/.exec(name || '');
   if (mcp) return { name, server: mcp[1], tool: mcp[2] };
+  const bridged = PI_BRIDGED_RE.exec(name || '');
+  if (bridged) return { name: `mcp__${bridged[1]}__${bridged[2]}`, server: bridged[1], tool: bridged[2] };
   return { name: name || tool || 'tool', server: '', tool: name || tool || 'tool' };
 }
 

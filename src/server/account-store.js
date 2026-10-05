@@ -133,12 +133,16 @@ function listAccounts(opts) {
   return Object.values(readStore(opts).accounts).filter((a) => a && a.token);
 }
 
-function writeAccountToken(baseUrl, token, opts) {
+// The one per-API-server write. userId/email come from the caller when it has the hydrated
+// account (GET /api/auth/me after sign-in), else from the token payload.
+function saveAccountForServer(baseUrl, { token, userId, email } = {}, opts) {
   const key = normalizeBaseUrl(baseUrl);
   const value = typeof token === 'string' ? token.trim() : '';
   if (!key) throw new Error('account store needs an API base URL');
   if (!value) throw new Error('account store needs a token');
   const payload = decodeTokenPayload(value) || {};
+  const id = userId != null ? userId : payload.id;
+  const mail = typeof email === 'string' && email ? email : payload.email;
   const store = readStore(opts);
   const next = {
     version: STORE_VERSION,
@@ -146,8 +150,8 @@ function writeAccountToken(baseUrl, token, opts) {
       ...store.accounts,
       [key]: {
         token: value,
-        userId: payload.id != null ? payload.id : null,
-        email: typeof payload.email === 'string' ? payload.email : '',
+        userId: id != null ? id : null,
+        email: typeof mail === 'string' ? mail : '',
         apiBaseUrl: key,
         updatedAt: new Date().toISOString(),
       },
@@ -155,6 +159,21 @@ function writeAccountToken(baseUrl, token, opts) {
   };
   writeStore(next, opts);
   return next.accounts[key];
+}
+
+function writeAccountToken(baseUrl, token, opts) {
+  return saveAccountForServer(baseUrl, { token }, opts);
+}
+
+// The API server of the most recently signed-in account, or '' when nobody is signed in.
+// Default target for an account-level sign-in started without a project.
+function defaultAccountServer(opts) {
+  let best = null;
+  for (const a of listAccounts(opts)) {
+    if (!a.apiBaseUrl) continue;
+    if (!best || String(a.updatedAt || '') > String(best.updatedAt || '')) best = a;
+  }
+  return best ? best.apiBaseUrl : '';
 }
 
 // Sign out of one server. No-op (and no file write) when nothing is stored for it.
@@ -178,6 +197,8 @@ module.exports = {
   decodeTokenPayload,
   readAccount,
   listAccounts,
+  defaultAccountServer,
+  saveAccountForServer,
   writeAccountToken,
   clearAccountToken,
 };
