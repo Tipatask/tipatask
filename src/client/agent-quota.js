@@ -108,14 +108,21 @@ function resetLabel(value) {
 }
 
 const MINUTE_MS = 60000;
+// How often a mounted sidebar re-reads the quotas on its own (skipped while the window is hidden).
+export const REFRESH_MS = 5 * MINUTE_MS;
 
-// Time until a window resets: whole days, else whole hours, else whole minutes (an expired or
-// sub-minute reset clamps to 0m). null when the reset time is missing or unparseable.
+// Time until a window resets: whole days plus leftover whole hours ("1d 3h", hours dropped when
+// zero: "2d"), else whole hours, else whole minutes (an expired or sub-minute reset clamps to 0m).
+// null when the reset time is missing or unparseable.
 export function formatQuotaResetRemaining(resetAt, now = Date.now()) {
   const time = typeof resetAt === 'string' && resetAt ? new Date(resetAt).getTime() : NaN;
   if (!Number.isFinite(time)) return null;
   const minutes = Math.floor(Math.max(0, time - now) / MINUTE_MS);
-  if (minutes >= 1440) return t('agentQuotaSidebar.remaining.days', { n: Math.floor(minutes / 1440) });
+  if (minutes >= 1440) {
+    const d = Math.floor(minutes / 1440);
+    const h = Math.floor((minutes % 1440) / 60);
+    return h > 0 ? t('agentQuotaSidebar.remaining.daysHours', { d, h }) : t('agentQuotaSidebar.remaining.days', { n: d });
+  }
   if (minutes >= 60) return t('agentQuotaSidebar.remaining.hours', { n: Math.floor(minutes / 60) });
   return t('agentQuotaSidebar.remaining.minutes', { n: minutes });
 }
@@ -192,13 +199,16 @@ export function renderAgentQuotaSidebarBody(result, now = Date.now()) {
 }
 
 // Left-nav plan-usage block lifecycle. Requests happen ONLY from mount() (startup), from a
-// click on the refresh control, and when reset() is handed a *different* project — never
-// from hover, render passes, focus or timers. The loader scope is the sidebar's own
-// epoch:project, not location.search: onProjectChanged rewrites the URL after it resets us.
+// click on the refresh control, when reset() is handed a *different* project, and from the
+// REFRESH_MS auto-refresh armed after every completed read — never from hover, render passes,
+// focus or the countdown tick. The auto-refresh does not fetch while the document is hidden; it
+// reads once on the next visibilitychange to visible instead. The loader scope is the sidebar's
+// own epoch:project, not location.search: onProjectChanged rewrites the URL after it resets us.
 export function createAgentQuotaSidebar(root, opts = {}) {
   const setTimer = opts.setTimer || ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = opts.clearTimer || (id => clearTimeout(id));
   const now = opts.now || (() => Date.now());
+  const doc = opts.document !== undefined ? opts.document : (typeof document !== 'undefined' ? document : null);
   const els = {
     body: root.querySelector('.agent-quota-sidebar-body'),
     status: root.querySelector('.agent-quota-sidebar-status'),
@@ -213,6 +223,9 @@ export function createAgentQuotaSidebar(root, opts = {}) {
   let checkedAt = null;
   let loadedTimer = null;
   let tickTimer = null;
+  let autoTimer = null;
+  // The auto-refresh interval elapsed while hidden; read on the next visibilitychange to visible.
+  let autoDue = false;
   let renderedLocale = null;
   let mounted = false;
   let disposed = false;
@@ -249,6 +262,34 @@ export function createAgentQuotaSidebar(root, opts = {}) {
     }, MINUTE_MS - (now() % MINUTE_MS));
   }
 
+  function stopAutoRefresh() {
+    clearTimer(autoTimer);
+    autoTimer = null;
+    autoDue = false;
+  }
+
+  // One pending timer at a time, re-armed by every completed read. A hidden window does not
+  // fetch or re-arm; it only marks the read as due.
+  function scheduleAutoRefresh() {
+    stopAutoRefresh();
+    if (disposed) return;
+    autoTimer = setTimer(() => {
+      autoTimer = null;
+      if (disposed) return;
+      if (doc?.hidden) {
+        autoDue = true;
+        return;
+      }
+      void refresh();
+    }, REFRESH_MS);
+  }
+
+  function onVisibilityChange() {
+    if (disposed || doc?.hidden || !autoDue) return;
+    autoDue = false;
+    void refresh();
+  }
+
   function paintBody() {
     if (els.body) els.body.innerHTML = renderAgentQuotaSidebarBody(view, now());
     scheduleTick();
@@ -270,12 +311,15 @@ export function createAgentQuotaSidebar(root, opts = {}) {
     loaded = false;
     clearTimer(loadedTimer);
     loadedTimer = null;
+    // A manual or project read supersedes the pending auto-refresh, so it never double-fetches.
+    stopAutoRefresh();
     paintState();
     const token = epoch;
     const result = await loader.read(project ? { 'x-tipatask-project': project } : {});
     // A reset()/dispose() during the read owns the state now; this response is stale.
     if (disposed || token !== epoch) return false;
     loading = false;
+    scheduleAutoRefresh();
     if (result) {
       view = result;
       checkedAt = now();
@@ -302,6 +346,7 @@ export function createAgentQuotaSidebar(root, opts = {}) {
     loader.invalidate();
     clearTimer(loadedTimer);
     loadedTimer = null;
+    stopAutoRefresh();
     loading = false;
     loaded = false;
     view = null;
@@ -329,6 +374,7 @@ export function createAgentQuotaSidebar(root, opts = {}) {
       event?.preventDefault?.();
       void refresh();
     });
+    doc?.addEventListener?.('visibilitychange', onVisibilityChange);
     syncLocale();
     void refresh();
   }
@@ -340,6 +386,8 @@ export function createAgentQuotaSidebar(root, opts = {}) {
     clearTimer(loadedTimer);
     loadedTimer = null;
     stopTick();
+    stopAutoRefresh();
+    if (mounted) doc?.removeEventListener?.('visibilitychange', onVisibilityChange);
   }
 
   return { root, mount, refresh, reset, syncLocale, dispose };

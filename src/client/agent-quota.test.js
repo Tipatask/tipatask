@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import {
   createQuotaLoader, quotaUsageState, renderAgentQuotaSidebarBody, formatQuotaResetRemaining, createAgentQuotaSidebar,
-  initializeAgentQuotaSidebar, refreshAgentQuota, resetAgentQuota, syncAgentQuotaSidebarLocale,
+  initializeAgentQuotaSidebar, refreshAgentQuota, resetAgentQuota, syncAgentQuotaSidebarLocale, REFRESH_MS,
 } from './agent-quota.js';
 import { setLocale } from './i18n.js';
 
@@ -55,9 +55,15 @@ function harness() {
   const timers = [];
   const setTimer = (fn, ms) => timers.push({ fn, ms, cleared: false }) - 1;
   const clearTimer = id => { if (id != null && timers[id]) timers[id].cleared = true; };
-  const opts = (projectPath = '/A') => ({ projectPath, fetchImpl, setTimer, clearTimer, now: () => Date.UTC(2026, 8, 23, 21, 40) });
+  const doc = {
+    hidden: false, listeners: new Set(),
+    addEventListener(type, fn) { if (type === 'visibilitychange') this.listeners.add(fn); },
+    removeEventListener(type, fn) { if (type === 'visibilitychange') this.listeners.delete(fn); },
+    fire() { for (const fn of this.listeners) fn(); },
+  };
+  const opts = (projectPath = '/A') => ({ projectPath, fetchImpl, setTimer, clearTimer, document: doc, now: () => Date.UTC(2026, 8, 23, 21, 40) });
   return {
-    root, body, status, title, button, classes, attrs, calls, timers, opts,
+    root, body, status, title, button, classes, attrs, calls, timers, doc, opts,
     async settle(i, data) { calls[i].resolve(response(data)); await flush(); },
     async fail(i) { calls[i].reject(new Error('boom')); await flush(); },
     has: name => classes.has(`agent-quota-sidebar--${name}`),
@@ -183,12 +189,12 @@ test('loading fades the block and disables refresh; loaded flashes for 1600ms th
   assert.equal(h.attrs.get('aria-busy'), 'false');
   assert.equal(h.button.attrs.get('aria-disabled'), 'false');
   assert.equal(h.status.textContent, 'Loaded');
-  assert.equal(h.timers.length, 1);
-  assert.equal(h.timers[0].ms, 1600);
+  const loadedTimers = () => h.timers.filter(timer => timer.ms === 1600);
+  assert.equal(loadedTimers().length, 1, 'one "Loaded" timer, at 1600ms');
   assert.match(h.button.title, /^Refresh plan usage · Updated \d{1,2}:\d{2}/);
   assert.equal(h.button.attrs.get('aria-label'), h.button.title);
 
-  h.timers[0].fn();
+  loadedTimers()[0].fn();
   assert.ok(!h.has('loaded'));
   assert.equal(h.status.textContent, '');
 
@@ -196,7 +202,8 @@ test('loading fades the block and disables refresh; loaded flashes for 1600ms th
   h.button.click();
   await h.settle(1, payload('/A'));
   h.button.click();
-  assert.equal(h.timers[1].cleared, true);
+  assert.equal(loadedTimers().length, 2);
+  assert.equal(loadedTimers()[1].cleared, true);
   assert.ok(h.has('loading') && !h.has('loaded'));
   sidebar.dispose();
 });
@@ -289,7 +296,7 @@ test('a loaded 0% is a known, tinted, empty track — distinct from loading, una
     codex: agentWith('codex', [{ id: 'codex_primary', usagePercent: 5, resetAt: '2026-10-01T13:31:45.000Z', windowMinutes: 10080 }], { plan: 'prolite' }),
   } };
   const loaded = renderAgentQuotaSidebarBody({ data }, Date.UTC(2026, 8, 24, 19, 0));
-  assert.deepEqual(captions(loaded), ['Claude 5-hour | 0% (1h)', 'Claude 7-day | 0% (6d)', 'Fable 7-day | 0% (6d)', 'Codex 7-day | 5% (6d)']);
+  assert.deepEqual(captions(loaded), ['Claude 5-hour | 0% (1h)', 'Claude 7-day | 0% (6d 22h)', 'Fable 7-day | 0% (6d 22h)', 'Codex 7-day | 5% (6d 18h)']);
   assert.equal((loaded.match(/role="progressbar"/g) || []).length, 4, 'zero is a real measurement, so it is a progressbar');
   assert.equal((loaded.match(/aria-valuenow="0"/g) || []).length, 3);
   assert.match(loaded, /aria-valuetext="0% used"/);
@@ -523,7 +530,7 @@ test('block CSS: hidden when collapsed/mobile, hover only ever grows the single 
 const NOW = Date.UTC(2026, 9, 2, 12, 0, 0);
 const minute = 60000;
 
-test('formatQuotaResetRemaining: whole days, else hours, else minutes; expired clamps to 0m; bad input omitted (TPT455)', () => {
+test('formatQuotaResetRemaining: days with leftover hours, else hours, else minutes; expired clamps to 0m; bad input omitted (TPT455/TPT520)', () => {
   setLocale('en');
   const at = ms => new Date(NOW + ms).toISOString();
   const f = ms => formatQuotaResetRemaining(at(ms), NOW);
@@ -533,13 +540,21 @@ test('formatQuotaResetRemaining: whole days, else hours, else minutes; expired c
   assert.equal(f(60 * minute), '1h');
   assert.equal(f(23 * 60 * minute + 59 * minute), '23h');
   assert.equal(f(24 * 60 * minute), '1d');
-  assert.equal(f(6 * 1440 * minute + 23 * 60 * minute), '6d');
+  assert.equal(f(1440 * minute + 59 * minute + 59000), '1d', 'a sub-hour leftover drops the hours part');
+  assert.equal(f(1440 * minute + 60 * minute), '1d 1h');
+  assert.equal(f(1440 * minute + 3 * 60 * minute), '1d 3h');
+  assert.equal(f(1440 * minute + 3 * 60 * minute + 59 * minute), '1d 3h', 'minutes are floored away');
+  assert.equal(f(2 * 1440 * minute), '2d', 'an exact day count has no hours part');
+  assert.equal(f(2 * 1440 * minute + 59 * minute), '2d');
+  assert.equal(f(6 * 1440 * minute + 23 * 60 * minute), '6d 23h');
+  assert.equal(f(6 * 1440 * minute + 23 * 60 * minute + 59 * minute + 59000), '6d 23h');
   assert.equal(f(-5 * minute), '0m');
   assert.equal(f(-9 * 1440 * minute), '0m');
   for (const bad of [null, undefined, '', 'bad', 12345, {}]) assert.equal(formatQuotaResetRemaining(bad, NOW), null);
   try {
     setLocale('uk');
     assert.equal(f(2 * 1440 * minute), '2 дн');
+    assert.equal(f(1440 * minute + 3 * 60 * minute), '1д 3г');
     assert.equal(f(5 * 60 * minute), '5 год');
     assert.equal(f(7 * minute), '7 хв');
   } finally {
@@ -576,7 +591,7 @@ test('countdown ticks locally each minute, never fetches, and stops with the vie
   sidebar.mount();
   await h.settle(0, withReset(40, 61 * minute));
   assert.match(captions(h.body.innerHTML)[0], /40% \(1h\)/);
-  const tick = () => h.timers.filter(t => !t.cleared && t.ms !== 1600);
+  const tick = () => h.timers.filter(t => !t.cleared && t.ms !== 1600 && t.ms !== REFRESH_MS);
   const fire = timer => { timer.cleared = true; timer.fn(); };
   assert.equal(tick().length, 1);
   assert.equal(tick()[0].ms, minute - 20000, 'aligned to the wall-clock minute');
@@ -625,4 +640,103 @@ test('light-theme caption ink: white on a deepened fill, dark themes untouched; 
       assert.ok(ratio(text, track) >= 4.5, `${id} ${brand} text on track ${ratio(text, track).toFixed(2)}`);
     }
   }
+});
+
+// Timers still armed for the auto-refresh interval.
+const autoTimers = h => h.timers.filter(timer => !timer.cleared && timer.ms === REFRESH_MS);
+const fireTimer = timer => { timer.cleared = true; timer.fn(); };
+
+test('auto-refresh reads every 5 minutes, re-arms after errors and resets, and stops on dispose (TPT521)', async () => {
+  setLocale('en');
+  assert.equal(REFRESH_MS, 300000);
+  const h = harness();
+  const sidebar = createAgentQuotaSidebar(h.root, h.opts('/A'));
+  sidebar.mount();
+  assert.equal(autoTimers(h).length, 0, 'nothing is armed while the first read is pending');
+  await h.settle(0, payload('/A', 10));
+  assert.equal(autoTimers(h).length, 1, 'armed after the first completed read');
+
+  fireTimer(autoTimers(h)[0]);
+  assert.equal(h.calls.length, 2, 'the interval reads once');
+  assert.equal(h.calls[1].options.headers['x-tipatask-project'], '/A');
+  assert.equal(autoTimers(h).length, 0, 'no second timer while that read is pending');
+  await h.settle(1, payload('/A', 20));
+  assert.match(h.body.innerHTML, /20% used/);
+  assert.equal(autoTimers(h).length, 1, 're-armed after success');
+
+  fireTimer(autoTimers(h)[0]);
+  assert.equal(h.calls.length, 3);
+  await h.fail(2);
+  assert.match(h.body.innerHTML, /role="alert"/);
+  assert.equal(autoTimers(h).length, 1, 're-armed after an error');
+
+  // A manual refresh cancels the pending interval, so the click never stacks a second read.
+  const armed = autoTimers(h)[0];
+  h.button.click();
+  assert.equal(armed.cleared, true);
+  assert.equal(h.calls.length, 4);
+  armed.fn();
+  assert.equal(h.calls.length, 4, 'a cleared interval firing late does not read while one is pending');
+  await h.settle(3, payload('/A', 30));
+  assert.equal(autoTimers(h).length, 1);
+
+  // A different project drops the old interval; the new project's read re-arms it.
+  const before = autoTimers(h)[0];
+  assert.equal(sidebar.reset('/B'), true);
+  assert.equal(before.cleared, true);
+  assert.equal(autoTimers(h).length, 0);
+  assert.equal(h.calls.length, 5);
+  await h.settle(4, payload('/B', 40));
+  assert.equal(autoTimers(h).length, 1, 're-armed for the new project');
+  fireTimer(autoTimers(h)[0]);
+  assert.equal(h.calls[5].options.headers['x-tipatask-project'], '/B');
+  await h.settle(5, payload('/B', 41));
+
+  const last = autoTimers(h)[0];
+  sidebar.dispose();
+  assert.equal(last.cleared, true);
+  assert.equal(autoTimers(h).length, 0, 'dispose clears the interval');
+  last.fn();
+  h.doc.fire();
+  assert.equal(h.calls.length, 6, 'no reads after dispose');
+});
+
+test('auto-refresh never fetches while hidden and catches up once on becoming visible (TPT521)', async () => {
+  setLocale('en');
+  const h = harness();
+  const sidebar = createAgentQuotaSidebar(h.root, h.opts('/A'));
+  sidebar.mount();
+  assert.equal(h.doc.listeners.size, 1);
+  await h.settle(0, payload('/A', 10));
+
+  h.doc.fire();
+  assert.equal(h.calls.length, 1, 'becoming visible before the interval elapsed does not read');
+
+  h.doc.hidden = true;
+  fireTimer(autoTimers(h)[0]);
+  assert.equal(h.calls.length, 1, 'no read while hidden');
+  assert.equal(autoTimers(h).length, 0, 'and no re-arm while hidden');
+  h.doc.fire();
+  assert.equal(h.calls.length, 1, 'a visibilitychange that stays hidden does not read');
+
+  h.doc.hidden = false;
+  h.doc.fire();
+  assert.equal(h.calls.length, 2, 'the due read runs on becoming visible');
+  h.doc.fire();
+  assert.equal(h.calls.length, 2, 'only once');
+  await h.settle(1, payload('/A', 20));
+  assert.equal(autoTimers(h).length, 1, 'interval restarts from the catch-up read');
+
+  // A manual read while hidden-and-due satisfies the due read.
+  h.doc.hidden = true;
+  fireTimer(autoTimers(h)[0]);
+  h.button.click();
+  assert.equal(h.calls.length, 3);
+  await h.settle(2, payload('/A', 30));
+  h.doc.hidden = false;
+  h.doc.fire();
+  assert.equal(h.calls.length, 3, 'a manual read clears the pending catch-up');
+
+  sidebar.dispose();
+  assert.equal(h.doc.listeners.size, 0, 'dispose removes the visibility listener');
 });
