@@ -185,7 +185,11 @@ function sessionMetaRow(s) {
     ...(s.startedAt ? { startedAt: s.startedAt } : {}),
     // (TPT469) A project chat is listed in the left menu once it has a title — its first user
     // message. Untitled ones are drafts the next Start Chat reuses.
-    ...(s.chatProjectId ? { chatProjectId: s.chatProjectId, title: s.chatTitle || '' } : {}) };
+    ...(s.chatProjectId ? { chatProjectId: s.chatProjectId, title: s.chatTitle || '' } : {}),
+    // (TPT526) A started task chat is listed too, under a task key badge. A pending chat has no
+    // taskKey yet; a spec chat carries one but is not a 'taskChat'.
+    ...(s.type === 'taskChat' && s.taskKey && !s.chatProjectId
+      ? { taskKey: s.taskKey, title: s._taskChatTask?.title || '' } : {}) };
 }
 
 // Blocks starting a task assigned to someone else. Replaces the guard that used to sit

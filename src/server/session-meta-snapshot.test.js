@@ -48,6 +48,11 @@ test('sessionMetaRow includes the current paused summary for reconnecting client
   assert.equal(sessionMetaRow(fakeSession({ startedAt: 1790780000000 })).startedAt, 1790780000000);
   assert.deepEqual(sessionMetaRow(fakeSession()), { agent: 'claude', label: 'Claude Code', type: 'terminal', alive: true, paused: null });
   assert.deepEqual(sessionMetaRow({ tabId: 'X' }), { agent: null, label: '', type: 'terminal', alive: false, paused: null });
+  // (TPT526) Only a started task chat ships taskKey; a spec chat or a pending chat does not.
+  assert.equal(sessionMetaRow({ tabId: 'taskChat:TPT1', type: 'taskChat', taskKey: 'TPT1', _taskChatTask: { id: 'TPT1', title: 'Fix login' } }).taskKey, 'TPT1');
+  assert.equal(sessionMetaRow({ tabId: 'taskChat:TPT1', type: 'taskChat', taskKey: 'TPT1', _taskChatTask: { id: 'TPT1', title: 'Fix login' } }).title, 'Fix login');
+  assert.equal(sessionMetaRow({ tabId: 'specChat:TPT1', type: 'specChat', taskKey: 'TPT1' }).taskKey, undefined);
+  assert.equal(sessionMetaRow({ tabId: 'taskChat:TPT1', type: 'objective', taskKey: null }).taskKey, undefined);
   const paused = sessionMetaRow(fakeSession({ _pause: { at: 123, reason: 'memory', count: 35, threshold: 50, rssMb: 6400, limitMb: 3072 } }));
   assert.deepEqual(paused.paused, { at: 123, reason: 'memory', count: 35, threshold: 50, rssMb: 6400, limitMb: 3072 });
 });

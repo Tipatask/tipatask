@@ -1013,14 +1013,14 @@ test('(TPT469) Start Chat picks up an untitled chat the server holds; a row of a
 
 // ── Attachments (TPT473) ──
 
-test('composer and gate get the shared Embed control, paste and panel drop, all into the composer textarea', (t) => {
+test('the composer gets the shared Embed control, paste and panel drop, all into the composer textarea', (t) => {
   const h = harness(t);
   h.env.open('TPT1');
   const input = h.$('.task-chat-input');
   assert.equal(h.uploads.pastes.length, 1);
   assert.equal(h.uploads.pastes[0].textarea, input);
   assert.equal(h.uploads.pastes[0].opts.taskKey, 'TPT1');
-  assert.deepEqual(h.uploads.menus.map(x => x.wrap.parentElement.className), ['task-chat-start-embed', 'task-chat-embed-slot']);
+  assert.deepEqual(h.uploads.menus.map(x => x.wrap.parentElement.className), ['task-chat-embed-slot']);
   assert.ok(h.uploads.menus.every(x => x.textarea === input));
   assert.equal(h.uploads.drops[0].target, h.$('.task-chat-panel'));
   assert.equal(h.uploads.drops[0].textarea, input);
@@ -1058,7 +1058,7 @@ test('a failed image upload drops its placeholder; a file upload holds Send unti
   image.onUploadError({ name: 'a.png' }, new Error('boom'));
   assert.equal(input.value, 'x');
   let finish;
-  h.uploads.menus[1].opts.onFileUpload(new Promise((resolve) => { finish = resolve; }), { name: 'spec.pdf' });
+  h.uploads.menus[0].opts.onFileUpload(new Promise((resolve) => { finish = resolve; }), { name: 'spec.pdf' });
   assert.equal(h.$('.task-chat-send').disabled, true);
   finish();
   await new Promise(resolve => setImmediate(resolve));
@@ -1079,16 +1079,21 @@ test('restored history shows attachments of a user turn; a notice stays plain te
   assert.equal(h.$('.task-chat-msg--user .task-chat-user-text'), null);
 });
 
-test('files attached at the start gate wait in the composer draft and are listed on the gate', (t) => {
+test('the start gate holds only the model select and Cancel / Start; Embed waits in the composer', (t) => {
   const h = harness(t);
   h.env.open('TPT1');
   h.feed({ type: 'config', objectiveProviders: [] });
-  const box = h.$('.task-chat-start-attachments');
-  assert.equal(box.hidden, true);
+  const gate = h.$('.task-chat-start');
+  assert.equal(gate.hidden, false);
+  assert.equal(gate.querySelector('.embed-menu-wrap'), null);
+  assert.equal(gate.querySelector('.task-chat-attachments'), null);
+  assert.ok(gate.querySelector('.task-chat-start-model'));
+  assert.ok(gate.querySelector('.task-chat-start-cancel'));
+  assert.ok(gate.querySelector('.task-chat-start-go'));
   typeDraft(h, '![img](http://h/api/projects/2/images/9)');
-  assert.equal(box.hidden, false);
-  assert.ok(box.querySelector('.task-chat-attach--image'));
   click(h.$('.task-chat-start-go'));
-  assert.equal(box.hidden, true);
+  assert.equal(gate.hidden, true);
   assert.equal(h.$('.task-chat-input').value, '![img](http://h/api/projects/2/images/9)');
+  assert.equal(h.uploads.menus[0].textarea, h.$('.task-chat-input'));
+  assert.ok(h.$('.task-chat-embed-slot .embed-menu-wrap'));
 });

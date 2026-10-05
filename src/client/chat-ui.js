@@ -865,6 +865,18 @@ function renderTabBarOnly() {
   _attachTabBarHandlers(bar);
 }
 
+// (TPT525) Repaint after a save path (chat-task-preview.js bulk Save Tasks /
+// checkAllCardsHandled()) closed its chat via cleanupChat(). Same rule as closeTab()'s
+// `if (wasActive) renderActiveTab(); else renderTabBarOnly();`: a chat that finished in a
+// BACKGROUND tab while another objective tab is on screen must not reload() — that rewrites
+// #app.innerHTML and steals focus/caret from the composer the user is typing in. Only the tab
+// strip is patched; the board cache is marked stale (template.html) for the next board visit.
+export function repaintAfterSavedChatClosed({ wasVisible } = {}) {
+  if (wasVisible || state.activeTab !== 'objective') { reload(); return; }
+  renderTabBarOnly();
+  document.dispatchEvent(new Event('tiptask:board-cache-stale'));
+}
+
 // Internal version of getConfirmedTaskIds that operates on an arbitrary chatState.
 function _getConfirmedTaskIds(cs, upToMsgIdx) {
   if (!cs) return new Set();
@@ -1833,9 +1845,28 @@ function restoreObjectiveViewState(viewState) {
   }
 }
 
+// (TPT525) Focus guard for a full render (template.html's #app.innerHTML rewrite), which has no
+// viewState of its own. Captures the live composer only while it is focused AND still belongs to
+// the tab about to be rendered (#chat-input's data-tab-id === state.activeTabId) — when the
+// removed tab was the active one, the active tab changed and nothing is carried over. Message
+// scroll is left to the full render's own scroll handling. Consumed once by attachChatHandlers().
+let _pendingComposerRestore = null;
+
+function captureFocusedComposerForRerender() {
+  if (typeof document === 'undefined') return null;
+  const input = document.getElementById('chat-input');
+  if (!input || !input.isConnected || document.activeElement !== input) return null;
+  if ((input.dataset.tabId || '') !== String(state.activeTabId ?? '')) return null;
+  return { ...captureObjectiveViewState(), messagesScrollTop: null, tabId: state.activeTabId };
+}
+
 // ── Render objective tab content (returns HTML string) ──
 export function renderObjectiveContent(options = {}) {
   if (state.chatState) syncChatHistoryMeta(state.chatState);
+  // (TPT525) An explicit viewState (refreshObjectiveContent()/renderActiveTab()) is restored by
+  // its caller; only a viewState-less full render arms the one-shot restore.
+  _pendingComposerRestore = options.viewState ? null : captureFocusedComposerForRerender();
+  const composerView = options.viewState || _pendingComposerRestore;
   const layoutClass = state.chatState ? 'objective-chat--active' : 'objective-chat--empty';
 
   // Build message bubbles HTML
@@ -1914,7 +1945,7 @@ export function renderObjectiveContent(options = {}) {
     : '';
 
   // Input area
-  const liveComposer = options.viewState?.composer;
+  const liveComposer = composerView?.composer;
   const objDraft = liveComposer
     ? (liveComposer.value ? { text: liveComposer.value, height: liveComposer.height } : null)
     : loadDraft(getObjectiveDraftKey());
@@ -1992,7 +2023,7 @@ export function renderObjectiveContent(options = {}) {
         ${messagesHtml}
       </div>
       <div class="chat-input-area">
-        <textarea id="chat-input" placeholder="${escapeAttr(chatPlaceholder)}" rows="${state.chatState ? '2' : '7'}"${inputDisabled}${draftHeight ? ` style="height:${draftHeight}"` : ''}>${draftText}</textarea>
+        <textarea id="chat-input" data-tab-id="${escapeAttr(state.activeTabId ?? '')}" placeholder="${escapeAttr(chatPlaceholder)}" rows="${state.chatState ? '2' : '7'}"${inputDisabled}${draftHeight ? ` style="height:${draftHeight}"` : ''}>${draftText}</textarea>
         <div class="new-obj-image-feedback" id="new-obj-image-feedback" aria-live="polite"></div>
         ${!state.chatState && !discussKey ? '<div class="chat-brief-hint" id="chat-brief-hint"><span id="chat-word-count">0 words</span> — aim for 40+ words for detailed task cards</div>' : ''}
         ${canRetry ? `<div class="chat-retry-banner">
@@ -2313,6 +2344,15 @@ export function attachChatHandlers() {
     // (C1296) Runs unconditionally now — an empty composer recounts immediately so the long
     // multi-line placeholder fits without a scrollbar.
     requestAnimationFrame(() => autoGrowComposer(chatInput));
+
+    // (TPT525) Restore the focused composer a full render rebuilt (armed by
+    // renderObjectiveContent()). Runs after attachAudioRecorder() re-parented #chat-input above,
+    // which blurs it. One-shot, and only for the same tab it was captured on.
+    if (_pendingComposerRestore) {
+      const pending = _pendingComposerRestore;
+      _pendingComposerRestore = null;
+      if (pending.tabId === state.activeTabId) restoreObjectiveViewState(pending);
+    }
 
     // (TPT16) Apply a seed queued by spawnObjectiveTab() now that this IS the live composer
     // and every input listener above (word count, autoGrow+draft-save, prewarm) is bound, and

@@ -15,10 +15,11 @@ const fnSource = name => boardJs.match(new RegExp(`\\nfunction ${name}\\([\\s\\S
 function chatHelpers(sessionMeta) {
   const escapeAttr = v => String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
   const t = (key, params) => (params ? `${key}:${JSON.stringify(params)}` : key);
-  const state = { sessionMeta: new Map(Object.entries(sessionMeta)) };
+  const state = { sessionMeta: new Map(Object.entries(sessionMeta)), taskTitleById: new Map([['TPT3', 'Board title']]) };
   // eslint-disable-next-line no-new-func
   return new Function('escapeAttr', 't', 'state', 'CHAT_BUBBLE_SVG',
-    `${fnSource('renderChatSessionRow')}${fnSource('projectChatRows')}return { renderChatSessionRow, projectChatRows };`,
+    `${fnSource('renderChatSessionRow')}${fnSource('projectChatRows')}${fnSource('chatRowLabel')}${fnSource('taskChatRows')}`
+      + 'return { renderChatSessionRow, projectChatRows, taskChatRows };',
   )(escapeAttr, t, state, CHAT_BUBBLE_SVG);
 }
 
@@ -43,21 +44,54 @@ test('a chat row carries the chat glyph, its title and an End control, no task k
   assert.match(html, /data-tooltip="Plan &quot;the&quot; release" aria-label="Plan &quot;the&quot; release"/);
   assert.ok(html.includes(`<span class="active-session-icon">${CHAT_BUBBLE_SVG}</span>`));
   assert.match(html, /<span class="active-session-title">Plan &quot;the&quot; release<\/span>/);
-  assert.doesNotMatch(html, /active-session-key|data-task-id/);
+  assert.doesNotMatch(html, /active-session-key|left-nav-chat-key|active-session-item--task-chat|data-task-id/);
   assert.match(html, /class="active-session-close" role="button" tabindex="0" data-close-chat-id="projectChat:2:aaaaaa1" aria-label="taskChat\.nav\.end"/);
   assert.match(renderChatSessionRow({ taskId: 'projectChat:2:x', title: 'T' }, true), /class="[^"]*\bcollapsed"/);
 });
 
 test('rows are wired: chat rows reopen their chat, End confirms and terminates, task rows keep openTerminal', () => {
   assert.match(boardJs, /if \(s\.chat\) return renderChatSessionRow\(s, collapsed\);/);
-  assert.match(boardJs, /rows\.push\(\.\.\.projectChatRows\(window\.TipTask\?\.taskChat\?\.currentChatId\?\.\(\) \|\| ''\)\);/);
-  assert.match(boardJs, /\.active-session-item\[data-chat-id\]'\)\.forEach[\s\S]*?openProjectChat\?\.\(\{ chatId: btn\.dataset\.chatId \}\)/);
+  assert.match(boardJs, /const openChatId = window\.TipTask\?\.taskChat\?\.currentChatId\?\.\(\) \|\| '';\s*rows\.push\(\.\.\.taskChatRows\(openChatId\), \.\.\.projectChatRows\(openChatId\)\);/);
+  assert.match(boardJs, /\.active-session-item\[data-chat-id\]'\)\.forEach[\s\S]*?const chatId = btn\.dataset\.chatId;[\s\S]*?openProjectChat\?\.\(\{ chatId \}\)/);
   const end = boardJs.slice(boardJs.indexOf("'.active-session-close[data-close-chat-id]'"), boardJs.indexOf("'.active-session-item[data-task-id]'"));
   assert.match(end, /showActionConfirm\(/);
   assert.match(end, /terminateTaskSession\(id, \{ timeoutMs: 5000 \}\)/);
   assert.match(end, /forgetLocalSession\(id\)/);
   assert.match(boardJs, /\.active-session-item\[data-task-id\]'\)\.forEach[\s\S]*?window\.TipTask\?\.openTerminal\?\.\(id, title, '', status\)/);
   assert.match(boardJs, /function sessionRowId\(row\) \{\s*return row\.dataset\.taskId \|\| row\.dataset\.chatId \|\| '';/);
+});
+
+// (TPT526) Task chats get rows too, marked with a task key badge.
+test('started task chats become rows, oldest first; pending chats, spec chats and project chats stay out', () => {
+  const { taskChatRows } = chatHelpers({
+    'taskChat:TPT2': { type: 'taskChat', taskKey: 'TPT2', title: 'Later', startedAt: 20 },
+    'taskChat:TPT1': { type: 'taskChat', taskKey: 'TPT1', title: 'Earlier', startedAt: 10 },
+    'taskChat:TPT3': { type: 'taskChat', taskKey: 'TPT3', title: '', startedAt: 30 },
+    'taskChat:TPT4': { type: 'objective', startedAt: 40 },
+    'specChat:TPT5': { type: 'specChat', taskKey: 'TPT5', startedAt: 1 },
+    'projectChat:2:aaaaaa1': { type: 'taskChat', title: 'Project', startedAt: 1 },
+  });
+  assert.deepEqual(taskChatRows('taskChat:TPT2'), [
+    { chat: true, taskId: 'taskChat:TPT1', taskKey: 'TPT1', title: 'Earlier', isOpen: false },
+    { chat: true, taskId: 'taskChat:TPT2', taskKey: 'TPT2', title: 'Later', isOpen: true },
+    { chat: true, taskId: 'taskChat:TPT3', taskKey: 'TPT3', title: 'Board title', isOpen: false },
+  ]);
+});
+
+test('a task chat row carries the .left-nav-chat-key badge before its title; a project chat row does not', () => {
+  const { renderChatSessionRow } = chatHelpers({});
+  const html = renderChatSessionRow({ taskId: 'taskChat:TPT1', taskKey: 'TPT1', title: 'Fix "login"', isOpen: false }, false);
+  assert.match(html, /^<button type="button" class="active-session-item active-session-item--chat active-session-item--task-chat" data-chat-id="taskChat:TPT1"/);
+  assert.ok(html.includes(`<span class="active-session-icon">${CHAT_BUBBLE_SVG}</span><span class="left-nav-chat-key">TPT1</span><span class="active-session-title">Fix &quot;login&quot;</span>`));
+  assert.match(html, /data-tooltip="nav\.sessionTooltip:\{&quot;key&quot;:&quot;TPT1&quot;/);
+  assert.match(renderChatSessionRow({ taskId: 'taskChat:TPT9', taskKey: 'TPT9', title: '' }, false), /data-tooltip="TPT9" aria-label="TPT9"/);
+  assert.doesNotMatch(renderChatSessionRow({ taskId: 'projectChat:2:x', title: 'T' }, false), /left-nav-chat-key/);
+});
+
+test('a task chat row reopens its task workspace; its badge style hides with the collapsed rail', () => {
+  assert.match(boardJs, /if \(taskKey && chatId\.startsWith\('taskChat:'\)\) window\.TipTask\?\.taskChat\?\.open\?\.\(taskKey\);\s*else window\.TipTask\?\.taskChat\?\.openProjectChat\?\.\(\{ chatId \}\);/);
+  assert.match(css, /\.left-nav-chat-key \{[^}]*background: var\(--c-bg-tier\);[^}]*color: var\(--c-text-secondary\);/);
+  assert.match(css, /body\.left-nav-collapsed \.left-nav-chat-key,/);
 });
 
 test('Start Chat shows the plain outline speech bubble, shared with the chat rows', () => {

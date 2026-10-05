@@ -2739,15 +2739,21 @@ export function renderActiveSessionsList(sessions, collapsed) {
 // (TPT469) A started project chat: the chat glyph and its summary title (no task key), opened
 // with a click and ended with the trailing ✕. Drafts — chats with no user message yet — never
 // reach this list; syncActiveSessionsNav() keeps only titled chats.
+// (TPT526) A task chat row (`s.taskKey` set) adds a .left-nav-chat-key badge before the title
+// and names the task in its tooltip; a project chat row renders exactly as before.
 function renderChatSessionRow(s, collapsed) {
   const id = escapeAttr(s.taskId);
+  const taskKey = s.taskKey ? String(s.taskKey) : '';
   const title = escapeAttr(s.title);
+  const label = taskKey ? escapeAttr(chatRowLabel(s)) : title;
   const cls = 'active-session-item active-session-item--chat'
+    + (taskKey ? ' active-session-item--task-chat' : '')
     + (s.isOpen ? ' active' : '')
     + (collapsed ? ' collapsed' : '');
   const end = escapeAttr(t('taskChat.nav.end'));
-  return `<button type="button" class="${cls}" data-chat-id="${id}" data-tooltip="${title}" aria-label="${title}">`
+  return `<button type="button" class="${cls}" data-chat-id="${id}" data-tooltip="${label}" aria-label="${label}">`
     + `<span class="active-session-icon">${CHAT_BUBBLE_SVG}</span>`
+    + (taskKey ? `<span class="left-nav-chat-key">${escapeAttr(taskKey)}</span>` : '')
     + `<span class="active-session-title">${title}</span>`
     + `<span class="active-session-close" role="button" tabindex="0" data-close-chat-id="${id}" aria-label="${end}">&#x2715;</span>`
     + `</button>`;
@@ -2760,6 +2766,23 @@ function projectChatRows(openChatId) {
     .filter(([id, meta]) => /^projectChat:/.test(id) && meta?.type === 'taskChat' && meta?.title)
     .sort((a, b) => (a[1].startedAt || 0) - (b[1].startedAt || 0) || a[0].localeCompare(b[0]))
     .map(([id, meta]) => ({ chat: true, taskId: id, title: meta.title, isOpen: id === openChatId }));
+}
+
+// (TPT526) A task chat's row label: "KEY — title", or the bare key while the title is unknown.
+function chatRowLabel(s) {
+  return s.title ? t('nav.sessionTooltip', { key: s.taskKey, title: s.title }) : String(s.taskKey);
+}
+
+// (TPT526) Started task chats, oldest first. sessionMetaRow() ships `taskKey` only once a
+// `taskChat:<key>` session has started, so a pending chat never gets a row.
+function taskChatRows(openChatId) {
+  return [...state.sessionMeta.entries()]
+    .filter(([id, meta]) => /^taskChat:/.test(id) && meta?.type === 'taskChat' && meta?.taskKey)
+    .sort((a, b) => (a[1].startedAt || 0) - (b[1].startedAt || 0) || a[0].localeCompare(b[0]))
+    .map(([id, meta]) => ({
+      chat: true, taskId: id, taskKey: meta.taskKey,
+      title: meta.title || state.taskTitleById.get(meta.taskKey) || '', isOpen: id === openChatId,
+    }));
 }
 
 // ── Session row tooltip (TPT414) ──
@@ -2881,7 +2904,8 @@ export function syncActiveSessionsNav() {
       paused: state.sessionMeta.get(id)?.paused || null,
       lost: state.lostSessions.has(id),
     }));
-  rows.push(...projectChatRows(window.TipTask?.taskChat?.currentChatId?.() || ''));
+  const openChatId = window.TipTask?.taskChat?.currentChatId?.() || '';
+  rows.push(...taskChatRows(openChatId), ...projectChatRows(openChatId));
   const html = renderActiveSessionsList(rows, collapsed);
   host.hidden = rows.length === 0;
   const divider = document.getElementById('active-sessions-divider');
@@ -2897,7 +2921,11 @@ export function syncActiveSessionsNav() {
   resyncSessionTip(host);
   host.querySelectorAll('.active-session-item[data-chat-id]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      window.TipTask?.taskChat?.openProjectChat?.({ chatId: btn.dataset.chatId });
+      const chatId = btn.dataset.chatId;
+      // (TPT526) A task chat reopens in its task workspace's Chat pane.
+      const taskKey = state.sessionMeta.get(chatId)?.taskKey;
+      if (taskKey && chatId.startsWith('taskChat:')) window.TipTask?.taskChat?.open?.(taskKey);
+      else window.TipTask?.taskChat?.openProjectChat?.({ chatId });
     });
   });
   // (TPT469) Ending a chat drops its whole conversation, so it always asks first.
@@ -2908,7 +2936,8 @@ export function syncActiveSessionsNav() {
       if (x.dataset.busy) return;
       x.dataset.busy = '1';
       const id = x.dataset.closeChatId;
-      const title = state.sessionMeta.get(id)?.title || '';
+      const meta = state.sessionMeta.get(id);
+      const title = meta?.taskKey ? chatRowLabel({ taskKey: meta.taskKey, title: meta.title || '' }) : (meta?.title || '');
       const ok = await showActionConfirm({
         message: escapeAttr(t('taskChat.nav.confirmEnd', { title })),
         confirmLabel: t('taskChat.nav.end'),

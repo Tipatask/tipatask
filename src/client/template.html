@@ -1598,6 +1598,11 @@ document.addEventListener('tiptask:reload', () => {
   loadAndRender({ forceFresh: true }).catch(() => {});
 });
 
+// (TPT525) Dispatched by chat-ui.js's repaintAfterSavedChatClosed() when a background objective
+// tab's save closed it while another tab's composer is on screen — no render (that would steal
+// the composer's focus), but the saved tasks must not be served from cache on the next board visit.
+document.addEventListener('tiptask:board-cache-stale', () => staleBoardTaskCache());
+
 // (C1356) Dispatched by console-modal.js on terminal exit/close/minimize/reattach — an
 // authoritative, forced left-nav status resync independent of tiptask:reload's board
 // rebuild (which is sprint-windowed, C1259/C1324, so a session on an older sprint can't

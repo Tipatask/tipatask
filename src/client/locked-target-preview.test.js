@@ -43,7 +43,7 @@ function fixture(targetStatus, { type = 'modified', confirmed = false, origin = 
     projectHeader: () => ({}), captureCardEdits() {},
     fetchWithRetry: async (...args) => { writes.push(args); throw new Error('Unexpected write'); },
     api: { tasks: { get: async (...args) => { writes.push(args); throw new Error('Unexpected read'); } } },
-    showToast: (...args) => toasts.push(args), cleanupChat() {},
+    showToast: (...args) => toasts.push(args), cleanupChat() {}, repaintAfterSavedChatClosed() {},
   };
   vm.createContext(env);
   vm.runInContext(extract(read('./task-card.js'), 'renderCard') + '\nglobalThis.renderBoardCard = renderCard;', env);

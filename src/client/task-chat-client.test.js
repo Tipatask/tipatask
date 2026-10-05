@@ -356,9 +356,10 @@ test('task-chat.js: Embed, paste and drop come from the shared helpers, with no 
   for (const own of ['FileReader', 'api.files.upload', "'upload-image'", 'createObjectURL']) {
     assert.ok(!taskChat.includes(own), `task-chat.js does not implement uploads itself (${own})`);
   }
-  // Composer and start gate each carry the control; the drop target is the whole panel.
+  // Only the composer carries the control (never the start gate); the drop target is the whole panel.
   assert.match(taskChat, /task-chat-embed-slot">\$\{embedMenuHtml\(\{ label: '' \}\)/);
-  assert.match(taskChat, /task-chat-start-embed">\$\{embedMenuHtml\(/);
+  assert.equal(taskChat.match(/embedMenuHtml\(/g).length, 1);
+  assert.ok(!taskChat.includes('task-chat-start-embed') && !taskChat.includes('task-chat-start-attachments'));
   assert.match(taskChat, /attachFileDrop\(root\.querySelector\('\.task-chat-panel'\)/);
   // Send waits for uploads; user turns render their attachments.
   assert.match(taskChat, /send\.disabled = [^;]*uploadsPending > 0/);
@@ -378,7 +379,8 @@ test('chat-ui.js: the objective chat uses the same shared Embed control', () => 
 
 test('styles.css: attachments and the drop state are styled inside the Task Chat block', () => {
   const block = styles.slice(styles.indexOf('/* ── Task Chat window ──'), styles.indexOf('/* ── end Task Chat window ── */'));
-  for (const sel of ['.task-chat-attachments', '.task-chat-attach--image img', '.task-chat-attach--file', '.task-chat-panel--drop::after', '.task-chat-upload-status', '.task-chat-start-attachments']) {
+  for (const sel of ['.task-chat-attachments', '.task-chat-attach--image img', '.task-chat-attach--file', '.task-chat-panel--drop::after', '.task-chat-upload-status']) {
     assert.ok(block.includes(sel), `styled: ${sel}`);
   }
+  assert.ok(!styles.includes('.task-chat-start-embed') && !styles.includes('.task-chat-start-attachments'), 'the start gate has no Embed styles');
 });

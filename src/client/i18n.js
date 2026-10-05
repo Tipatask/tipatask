@@ -366,7 +366,6 @@ const en = {
   'taskChat.embed.fileTooltip': 'Attach a document or text file (max 1 MB)',
   'taskChat.embed.uploading': 'Uploading attachment…',
   'taskChat.embed.error': 'Could not upload {name}: {msg}',
-  'taskChat.embed.queued': 'Attachments will go with your first message',
   'taskChat.embed.drop': 'Drop to attach',
   'taskChat.error.noProject': 'No project is selected, so a project chat cannot start.',
   // (TPT20) Objective chat-tab × — closing a tab now always discards the whole chat (both
@@ -1655,7 +1654,6 @@ const uk = {
   'taskChat.embed.fileTooltip': 'Додати документ або текстовий файл (до 1 МБ)',
   'taskChat.embed.uploading': 'Завантаження вкладення…',
   'taskChat.embed.error': 'Не вдалося завантажити {name}: {msg}',
-  'taskChat.embed.queued': 'Вкладення буде надіслано з першим повідомленням',
   'taskChat.embed.drop': 'Відпустіть, щоб додати',
   'taskChat.error.noProject': 'Проєкт не вибрано, тому чат проєкту не можна почати.',
   'chat.confirmCloseTabUnsaved.one': 'Закрити «{title}»? Буде видалено {n} незбережену пропозицію задачі та всю історію цього чату.',

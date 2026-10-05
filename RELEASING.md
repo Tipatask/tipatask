@@ -39,7 +39,7 @@ workflow fails on purpose when `vX.Y.Z` and `package.json` disagree.
 
 The installers in a release are `TipATask-<version>-arm64.dmg`, `TipATask-<version>-x64.dmg`,
 `TipATask Setup <version>.exe`, `TipATask-<version>.AppImage`, a `.deb` and a pacman
-package (`*.pkg.tar.*`).
+package (`tipatask-app-<version>.pacman`).
 
 ## Dry run without a tag
 

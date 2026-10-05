@@ -72,11 +72,12 @@ jobs:
           #   Windows dist-electron/*.exe           "TipATask Setup <version>.exe", not .blockmap/latest.yml
           #   Linux   ubuntu-22.04, NOT latest      node-pty links the build host's glibc: 22.04 = 2.35 floor
           #           AppImage keeps its capital I; @actions/glob is case-sensitive on Linux
+          #           pacman target writes <name>-<version>.pacman, not *.pkg.tar.*
           legs='[]'
           add() { legs=$(jq -c --argjson leg "$1" '. + [$leg]' <<<"$legs"); }
           [ "$WANT_MACOS" = "true" ] && add '{"os":"macos-latest","label":"macOS (dmg, x64 + arm64)","script":"electron:ci:mac","artifact":"macos-dmg","globs":"dist-electron/*.dmg"}'
           [ "$WANT_WINDOWS" = "true" ] && add '{"os":"windows-latest","label":"Windows (NSIS installer)","script":"electron:ci:win","artifact":"windows-nsis","globs":"dist-electron/*.exe"}'
-          [ "$WANT_LINUX" = "true" ] && add '{"os":"ubuntu-22.04","label":"Linux (AppImage + deb + pacman)","script":"electron:ci:linux","artifact":"linux-packages","globs":"dist-electron/*.AppImage\ndist-electron/*.deb\ndist-electron/*.pkg.tar.*"}'
+          [ "$WANT_LINUX" = "true" ] && add '{"os":"ubuntu-22.04","label":"Linux (AppImage + deb + pacman)","script":"electron:ci:linux","artifact":"linux-packages","globs":"dist-electron/*.AppImage\ndist-electron/*.deb\ndist-electron/*.pacman\ndist-electron/*.pkg.tar.*"}'
           if [ "$legs" = "[]" ]; then
             echo "::error title=No legs selected::Tick at least one of macOS / Windows / Linux."
             exit 1

@@ -203,6 +203,7 @@ test('(TPT469) chats of one project are separate sessions; the first user messag
   assert.equal(a.chatTitle, 'Which tasks block the release?');
   assert.deepEqual(framesOf(wsA, 'project-chat-titled').map(f => f.title), ['Which tasks block the release?']);
   assert.equal(h.exports.sessionMetaRow(a).title, 'Which tasks block the release?');
+  assert.equal(h.exports.sessionMetaRow(a).taskKey, undefined, 'a project chat row carries no task key (TPT526)');
   assert.equal(b.chatTitle, undefined, 'the other chat is untouched');
   assert.equal(framesOf(wsB, 'project-chat-titled').length, 0);
   await send(wsA, { type: 'task-chat-message', content: 'And the next one?' });
@@ -301,6 +302,11 @@ test('start-task-chat seeds task JSON plus comments and spawns through the dispa
   assert.equal(session.type, 'taskChat');
   assert.equal(session.taskKey, 'TPT1');
   assert.equal(session.toolProfile, 'taskChat');
+  // (TPT526) The left menu badges task chat rows with this key.
+  const meta = h.exports.sessionMetaRow(session);
+  assert.equal(meta.taskKey, 'TPT1');
+  assert.equal(typeof meta.title, 'string');
+  assert.equal(meta.chatProjectId, undefined);
   assert.equal(session.pending, false);
   assert.equal(session.messages.length, 1);
   const seed = session.messages[0];

@@ -22,7 +22,7 @@ import {
   taskChatProviders, pickSelection, buildModelOptionsHtml, stripAskUserFence,
   visibleHistory, upsertById, shortToolName, hasWidgets, collapseTaskEvents,
   dialogSubmission, localAnswer, answerSummary, dialogWidgetHtml, toolChipHtml,
-  splitAttachmentRefs, attachmentsHtml, userMessageHtml, stripPendingImageRefs,
+  userMessageHtml, stripPendingImageRefs,
   dialogState, lastTurnMessage,
 } from './task-chat-model.js';
 
@@ -321,11 +321,6 @@ function renderWindow() {
           <h2 class="task-chat-start-title" id="task-chat-start-title"></h2>
           <p class="task-chat-start-lead"></p>
           <div class="task-chat-start-model"></div>
-          <div class="task-chat-start-embed">${embedMenuHtml({ label: '' })}</div>
-          <div class="task-chat-start-attachments" hidden>
-            <p class="task-chat-start-attachments-note"></p>
-            <div class="task-chat-start-attachments-list"></div>
-          </div>
           <p class="task-chat-start-note" role="status" hidden></p>
           <div class="task-chat-start-actions">
             <button type="button" class="task-chat-start-cancel"></button>
@@ -376,7 +371,7 @@ function renderWindow() {
   });
   root.querySelector('.task-chat-start-go').addEventListener('click', beginChat);
 
-  input.addEventListener('input', () => { rememberDraft(); growInput(); syncComposer(); syncGateAttachments(); });
+  input.addEventListener('input', () => { rememberDraft(); growInput(); syncComposer(); });
   const voiceRoot = root;
   const voiceChat = chat;
   voiceRecorder = attachAudioRecorder(input, {
@@ -482,7 +477,6 @@ function applyChromeLabels() {
     trigger.title = t('taskChat.embed.tooltip');
     trigger.setAttribute('aria-label', t('taskChat.embed.button'));
   }
-  q('.task-chat-start-attachments-note').textContent = t('taskChat.embed.queued');
   q('.task-chat-panel').dataset.dropLabel = t('taskChat.embed.drop');
   syncStartGate();
   renderedLocale = getLocale();
@@ -614,7 +608,6 @@ function syncStartGate() {
   const note = gate.querySelector('.task-chat-start-note');
   note.hidden = !noUsableModel();
   note.textContent = noUsableModel() ? t('taskChat.start.noModels') : '';
-  syncGateAttachments();
 }
 
 // Providers were offered but none of them can run a chat. With no provider list at all the start
@@ -1063,9 +1056,9 @@ function applyEditedTask(task) {
 // ── Attachments ──
 // The objective chat's Embed control (embed-menu.js), clipboard image paste (task-board.js
 // attachImagePaste) and file drop, all inserting their markdown reference into the composer
-// textarea — so the reference is part of the `task-chat-message` content. The start gate has the
-// same Embed control, and the drop target is the whole panel: anything attached before Start
-// waits in the composer draft for the first message.
+// textarea — so the reference is part of the `task-chat-message` content. The Embed control lives
+// in the composer only, never on the start gate; the drop target is the whole panel, so a file
+// dropped before Start waits in the composer draft for the first message.
 
 function wireAttachments(input) {
   const gen = ++uploadGen;
@@ -1074,7 +1067,6 @@ function wireAttachments(input) {
     if (!live()) return;
     uploadsPending++;
     syncComposer();
-    syncGateAttachments();
   };
   const settled = () => {
     if (!live()) return;
@@ -1085,7 +1077,6 @@ function wireAttachments(input) {
       if (cleaned !== input.value) { input.value = cleaned; rememberDraft(); growInput(); }
     }
     syncComposer();
-    syncGateAttachments();
   };
   const imageOpts = {
     // A task chat links its images to the task, as the spec chat does.
@@ -1112,23 +1103,8 @@ function wireAttachments(input) {
     fileTitle: () => t('taskChat.embed.fileTooltip'),
   };
   attachImagePaste(input, null, imageOpts);
-  for (const wrap of root.querySelectorAll('.embed-menu-wrap')) {
-    attachEmbedMenu(wrap, input, { imageOpts, onFileUpload, labels });
-  }
+  attachEmbedMenu(root.querySelector('.task-chat-embed-slot .embed-menu-wrap'), input, { imageOpts, onFileUpload, labels });
   attachFileDrop(root.querySelector('.task-chat-panel'), input, { imageOpts, onFileUpload, activeClass: 'task-chat-panel--drop' });
-}
-
-// At the start gate the composer is hidden: show what is attached and waiting in its draft.
-function syncGateAttachments() {
-  if (!root) return;
-  const box = root.querySelector('.task-chat-start-attachments');
-  const input = root.querySelector('.task-chat-input');
-  if (!box || !input) return;
-  const { attachments } = splitAttachmentRefs(input.value);
-  box.hidden = !awaitingStart || (!attachments.length && !uploadsPending);
-  const list = box.querySelector('.task-chat-start-attachments-list');
-  const html = attachmentsHtml(attachments, { t });
-  if (list.dataset.sig !== html) { list.innerHTML = html; list.dataset.sig = html; }
 }
 
 function growInput() {

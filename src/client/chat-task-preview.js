@@ -6,7 +6,7 @@ import { collapseCard, renderAgentBadge, renderCard as renderBoardCard } from '.
 import { api } from './api-client.js';
 import {
   getUnsavedAcceptedCountForMsg, getConfirmedTaskIds,
-  captureCardEdits, saveChatState, saveChatDraft, syncDiscussLocks,
+  captureCardEdits, saveChatState, saveChatDraft, syncDiscussLocks, repaintAfterSavedChatClosed,
 } from './chat-ui.js';
 import { cleanupChat } from './console-modal.js';
 import { showActionConfirm } from './action-confirm.js';
@@ -994,13 +994,16 @@ export function attachCardHandlers() {
         // means `cs` is no longer the visibly-active chatState — force also clears
         // LAST_PROMPT_KEY, so the explicit clearDraft() call that used to live here is gone).
         state.sessionAgent = null;
+        // (TPT525) Captured before the teardown below re-points state.chatState to a survivor.
+        const wasVisible = cs === state.chatState;
         cleanupChat(cs, { force: true });
         if (startedOnObjective && state.activeTab === 'objective') {
           state.activeTab = 'objective';
         } else {
           showToast('Objective saved');
         }
-        reload();
+        // A save that finished in a background tab must not rebuild the visible tab's composer.
+        repaintAfterSavedChatClosed({ wasVisible });
         return;
       } finally {
         hideSavingIndicator();
@@ -1411,6 +1414,7 @@ export function checkAllCardsHandled(cs = state.chatState) {
     }
     // Navigate to the board only when the finished chat is the one on screen — one finished in a
     // background tab just closes (cleanupChat re-points the active tab only if it was active).
+    const wasVisible = cs === state.chatState;
     if (cs === state.chatState) {
       state.activeTab = 'board';
       state.pendingScrollTop = true; // navigate to board → reset to top
@@ -1419,7 +1423,8 @@ export function checkAllCardsHandled(cs = state.chatState) {
     // (TPT19) force:true — same unconditional-purge reasoning as the bulk-save handler
     // above; also clears LAST_PROMPT_KEY, so the explicit clearDraft() call here is gone.
     cleanupChat(cs, { force: true });
-    reload();
+    // (TPT525) Background finish: tab strip only, never the visible tab's composer.
+    repaintAfterSavedChatClosed({ wasVisible });
     return true;
   }
   return false;

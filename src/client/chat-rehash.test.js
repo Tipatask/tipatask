@@ -25,6 +25,7 @@ function chat() {
     Date: class extends Date { static now() { return now++; } },
     state, MAX_TABS: 5, DRAFT_KEY_OBJECTIVE: 'draft', ACTIVE_NEW_TAB_KEY: 'active', CHAT_STATE_KEY: 'chat',
     _pendingComposerSeed: null, _saveChatTimer: null, discussTaskCache: new Map(),
+    _pendingComposerRestore: null, captureFocusedComposerForRerender: () => null,
     getObjectiveDraftKey: () => 'draft-' + state.activeTabId,
     loadDraft: key => drafts.get(key), saveDraft: (key, value) => drafts.set(key, value), clearDraft: key => drafts.delete(key),
     isPristineObjectiveTab: t => !t.chatState,

@@ -1287,7 +1287,27 @@
     flex: 1 1 auto;
   }
 
+  /* (TPT526) Task chat rows carry the task key as a small badge — the card .id-badge look
+     (tier background, secondary text, 4px radius) in mono. No vertical padding and a fixed
+     line-height keep it inside the row's existing height. */
+  .left-nav-chat-key {
+    flex-shrink: 0;
+    max-width: 50%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 0.6875rem;
+    font-weight: 700;
+    line-height: 1.4;
+    padding: 0 0.375rem;
+    border-radius: 4px;
+    background: var(--c-bg-tier);
+    color: var(--c-text-secondary);
+  }
+
   body.left-nav-collapsed .active-session-key,
+  body.left-nav-collapsed .left-nav-chat-key,
   body.left-nav-collapsed .active-session-title {
     display: none;
   }
@@ -9021,11 +9041,10 @@
   .task-chat-start-cancel:focus-visible,
   .task-chat-start-go:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
 
-  /* Attachments (TPT473): the shared Embed control (embed-menu.js) in the composer and at the
-     gate, the upload status, file drop on the panel, and thumbnails / chips in user turns. */
+  /* Attachments (TPT473): the shared Embed control (embed-menu.js) in the composer, the
+     upload status, file drop on the panel, and thumbnails / chips in user turns. */
   .task-chat-embed-slot { display: inline-flex; flex-shrink: 0; }
-  .task-chat-embed-slot .embed-menu-trigger,
-  .task-chat-start-embed .embed-menu-trigger { min-height: 30px; padding: 0 10px; font-size: 0.76rem; }
+  .task-chat-embed-slot .embed-menu-trigger { min-height: 30px; padding: 0 10px; font-size: 0.76rem; }
 
   .task-chat-upload-status {
     flex: 1;
@@ -9037,19 +9056,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-
-  .task-chat-start-embed { display: flex; justify-content: center; }
-
-  .task-chat-start-attachments {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.4rem;
-    max-width: 100%;
-  }
-  .task-chat-start-attachments[hidden] { display: none; }
-  .task-chat-start-attachments-note { margin: 0; font-size: 0.78rem; color: var(--c-text-faint); }
-  .task-chat-start-attachments .task-chat-attachments { justify-content: center; }
 
   .task-chat-panel--drop::after {
     content: attr(data-drop-label);

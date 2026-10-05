@@ -27,7 +27,7 @@ Grab the installer for your system from the
 | Windows | `TipATask Setup <version>.exe` | Run the installer. |
 | Linux (any distro) | `TipATask-<version>.AppImage` | Make it executable and run it. |
 | Debian / Ubuntu | `tipatask-app_<version>_amd64.deb` | `sudo apt install ./<file>.deb` |
-| Arch / Artix | `*.pkg.tar.*` | `sudo pacman -U ./<file>.pkg.tar.*` |
+| Arch / Artix | `tipatask-app-<version>.pacman` | `sudo pacman -U ./<file>.pacman` |
 
 Linux builds need glibc 2.35 or newer. TipΔTask uses the `claude` and `codex` command-line
 tools you already have, so install and sign in to the ones you want. Pi is included.
@@ -129,7 +129,7 @@ npm run electron:ci:linux
 ```
 
 Produces `dist-electron/TipATask-<version>.AppImage`, a `.deb`, and a pacman package
-(`*.pkg.tar.*`), all x64. The official builds are compiled on Ubuntu 22.04, which sets the
+(`tipatask-app-<version>.pacman`), all x64. The official builds are compiled on Ubuntu 22.04, which sets the
 glibc 2.35 floor mentioned above; a build on a newer distro needs a correspondingly newer glibc
 to run.
 
