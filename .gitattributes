@@ -1,0 +1,8 @@
+# Check text files out with LF on every platform. The server hashes the inline
+# scripts of the served HTML for its Content-Security-Policy, and builds copy
+# sources byte-for-byte, so a CRLF checkout must not reach a packaged build.
+* text=auto eol=lf
+
+# Windows command scripts keep CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf

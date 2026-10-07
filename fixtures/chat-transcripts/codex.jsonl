@@ -1,0 +1,18 @@
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"session_meta","payload":{"id":"019edf2f-cec1-75f3-9b06-15f126187e08","cwd":"/tmp/x"}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions instructions>sandbox</permissions instructions>"}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp/x\n\n<INSTRUCTIONS>rules</INSTRUCTIONS>"}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/tmp/x</cwd>\n</environment_context>"}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"You are in a task chat.\n\n{\"id\":\"TPT1\",\"title\":\"Fixture task\",\"status\":\"pending\"}\n\n## Task Comments\n(none)\n\nIntroduce yourself briefly."}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi, I can help with TPT1."}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Hi, I can help with TPT1."}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The codeword is PELICAN. Remember it.\n\n(Reminder: when I have to choose between concrete options, end your reply with one fenced ```ask_user block holding {\"question\", \"options\": [{\"label\", \"description\"}], \"multi\"} and wait for my answer.)"}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"xxx"}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Let me check the task first."}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"function_call","name":"get_task","arguments":"{\"task_key\":\"TPT1\"}","call_id":"c1"}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"{\"id\":\"TPT1\"}"}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Noted: PELICAN."}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Noted: PELICAN."}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"What is the codeword?\n\n(Reminder: when I have to choose between concrete options, end your reply with one fenced ```ask_user block holding {\"question\", \"options\": [{\"label\", \"description\"}], \"multi\"} and wait for my answer.)"}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"PELICAN"}]}}
+{"timestamp":"2026-10-06T08:00:00.000Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"PELICAN"}}

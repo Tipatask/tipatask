@@ -126,6 +126,140 @@ function parsePiSession(text) {
   return saw ? { text: msg, turnEnded } : null;
 }
 
+// ── Conversation read-back (task/project chat history resume) ──
+// The user/assistant TEXT of a native session, for display after a chat is resumed from history:
+// no tool calls, tool output, reasoning or injected instructions. Each assistant reply is the
+// text of one turn (everything the agent said between two real user prompts). When the text
+// starts at the head of the file, its first real user prompt is the chat's generated seed (task /
+// project JSON, or the system prompt + seed on Codex / Pi, or a handoff transcript) and is left
+// out. Parsers return null when the text holds no record of that provider's shape.
+
+// The resumed-turn reminder a Codex / Pi task chat appends to the user's own text
+// (task-chat-widgets.js ASK_USER_REMINDER); lazy so this module stays dependency-free.
+function stripTurnReminder(text) {
+  const { ASK_USER_REMINDER } = require('../task-chat-widgets');
+  return String(text || '').split(ASK_USER_REMINDER).join('').trim();
+}
+
+function conversationBuilder() {
+  const out = [];
+  let sawUser = false;
+  return {
+    user(text) {
+      const t = stripTurnReminder(text);
+      if (!t) return;
+      sawUser = true;
+      out.push({ role: 'user', content: t });
+    },
+    assistant(text) {
+      const t = String(text || '').trim();
+      if (!t) return;
+      const last = out[out.length - 1];
+      if (last && last.role === 'assistant') last.content += `\n\n${t}`;
+      else out.push({ role: 'assistant', content: t });
+    },
+    done(fromStart) {
+      if (fromStart && sawUser) {
+        const i = out.findIndex(m => m.role === 'user');
+        out.splice(i, 1);
+      }
+      return out;
+    },
+  };
+}
+
+function userText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return joinText(content, ['text', 'input_text']);
+}
+
+function parseClaudeConversation(text, { fromStart = true } = {}) {
+  const conv = conversationBuilder();
+  let saw = false;
+  for (const o of parseJsonLines(text)) {
+    if (o.isSidechain || (o.type !== 'user' && o.type !== 'assistant') || !o.message) continue;
+    saw = true;
+    if (o.type === 'assistant') { conv.assistant(joinText(o.message.content, ['text'])); continue; }
+    if (o.isMeta || o.isCompactSummary || o.isVisibleInTranscriptOnly) continue;
+    const t = userText(o.message.content);
+    // Interactive-CLI bookkeeping (slash commands, local command output) is not a prompt.
+    if (!t || /^\s*<(command-name|command-message|local-command-stdout|local-command-stderr)>/.test(t)) continue;
+    conv.user(t);
+  }
+  return saw ? conv.done(fromStart) : null;
+}
+
+// Context Codex injects as `user` messages ahead of the real prompt.
+const CODEX_INJECTED_RE = /^\s*(?:#\s*AGENTS\.md instructions\b|<(?:environment_context|user_instructions|permissions instructions|skills_instructions|turn_aborted|user_shell_command|subagent_notification)\b)/i;
+
+function parseCodexConversation(text, { fromStart = true } = {}) {
+  const records = parseJsonLines(text);
+  const conv = conversationBuilder();
+  let saw = false;
+  for (const o of records) {
+    const p = o.payload || {};
+    if (o.type !== 'response_item' || p.type !== 'message') continue;
+    saw = true;
+    if (p.role === 'assistant') conv.assistant(joinText(p.content, ['output_text', 'text']));
+    else if (p.role === 'user') {
+      const t = userText(p.content);
+      if (t && !CODEX_INJECTED_RE.test(t)) conv.user(t);
+    }
+  }
+  if (saw) return conv.done(fromStart);
+  // Older rollouts: event_msg user_message / agent_message only.
+  for (const o of records) {
+    const p = o.payload || {};
+    if (o.type !== 'event_msg') continue;
+    if (p.type === 'user_message' && typeof p.message === 'string') { saw = true; conv.user(p.message); }
+    else if (p.type === 'agent_message' && typeof p.message === 'string') { saw = true; conv.assistant(p.message); }
+  }
+  return saw ? conv.done(fromStart) : null;
+}
+
+function parsePiConversation(text, { fromStart = true } = {}) {
+  const conv = conversationBuilder();
+  let saw = false;
+  for (const o of parseJsonLines(text)) {
+    if (o.type !== 'message' || !o.message) continue;
+    const m = o.message;
+    if (m.role === 'assistant') { saw = true; conv.assistant(joinText(m.content, ['text'])); }
+    else if (m.role === 'user') { saw = true; conv.user(userText(m.content)); }
+  }
+  return saw ? conv.done(fromStart) : null;
+}
+
+const CONVERSATION_PARSERS = { claude: parseClaudeConversation, codex: parseCodexConversation, pi: parsePiConversation };
+const CONVERSATION_BYTES = 4 * 1024 * 1024;
+
+function clipText(text, max) {
+  return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
+}
+
+// provider + native session file → { messages: [{ role, content }] } with the newest
+// `maxMessages`, each clipped to `maxChars` and `maxTotalChars` overall; null when the file is
+// missing or unreadable or holds nothing of that provider's shape. Never throws. A file larger
+// than `maxBytes` is read from its tail (its head — and the seed — then is not in view).
+function readNativeConversation(provider, file, {
+  maxMessages = 50, maxChars = 20000, maxTotalChars = 200000, maxBytes = CONVERSATION_BYTES,
+} = {}) {
+  try {
+    const parse = CONVERSATION_PARSERS[provider];
+    if (!parse || !file) return null;
+    const size = fs.statSync(file).size;
+    const fromStart = size <= maxBytes;
+    const parsed = parse(fromStart ? fs.readFileSync(file, 'utf8') : readTail(file, maxBytes), { fromStart });
+    if (!parsed) return null;
+    let messages = parsed.slice(-maxMessages).map(m => ({ role: m.role, content: clipText(m.content, maxChars) }));
+    let total = messages.reduce((n, m) => n + m.content.length, 0);
+    while (messages.length && total > maxTotalChars) total -= messages.shift().content.length;
+    return { messages };
+  } catch {
+    return null;
+  }
+}
+
 // ── File helpers ──
 
 function readTail(file, maxBytes = TAIL_BYTES) {
@@ -266,4 +400,8 @@ module.exports = {
   readClaudeFinalMessage,
   readCodexFinalMessage,
   readPiFinalMessage,
+  parseClaudeConversation,
+  parseCodexConversation,
+  parsePiConversation,
+  readNativeConversation,
 };

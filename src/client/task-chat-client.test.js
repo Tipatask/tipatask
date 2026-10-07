@@ -154,7 +154,7 @@ test('task-chat.js: Start sends one start frame per socket, carrying the chosen 
   const begin = taskChat.slice(taskChat.indexOf('function beginChat()'), taskChat.indexOf('function focusComposer()'));
   assert.match(begin, /if \(!awaitingStart \|\| starting \|\| !connected \|\| !ws \|\| noUsableModel\(\)\) return;\s*starting = true;\s*awaitingStart = false;/);
   assert.match(begin, /sendStartFrame\(\);/);
-  assert.match(taskChat, /const type = isProjectChat\(\) \? WS_SEND_TYPES\.START_PROJECT_CHAT : WS_SEND_TYPES\.START_TASK_CHAT;\s*wsSend\(ws, type, \{ model: selection \|\| undefined \}\);/);
+  assert.match(taskChat, /const type = isProjectChat\(\) \? WS_SEND_TYPES\.START_PROJECT_CHAT : WS_SEND_TYPES\.START_TASK_CHAT;\s*wsSend\(ws, type, historyId \? \{ historyId \} : \{ model: selection \|\| undefined \}\);/);
   assert.equal(taskChat.split('WS_SEND_TYPES.START_TASK_CHAT').length - 1, 1, 'start-task-chat is sent from one place');
   assert.equal(taskChat.split('WS_SEND_TYPES.START_PROJECT_CHAT').length - 1, 1, 'start-project-chat is sent from one place');
   // Every new socket re-arms the gate; a reused one cannot start twice.
@@ -383,4 +383,36 @@ test('styles.css: attachments and the drop state are styled inside the Task Chat
     assert.ok(block.includes(sel), `styled: ${sel}`);
   }
   assert.ok(!styles.includes('.task-chat-start-embed') && !styles.includes('.task-chat-start-attachments'), 'the start gate has no Embed styles');
+});
+
+test('(TPT539) task-chat.js: the history picker resumes by historyId and never falls back to a fresh chat', () => {
+  assert.equal(WS_RECV_TYPES.CHAT_HISTORY_RESUMED, 'chat-history-resumed');
+  assert.ok(wsHandlers.includes("type: 'chat-history-resumed'"));
+  // Rows come from the project-scoped listing; the window's project goes in the header.
+  const load = taskChat.slice(taskChat.indexOf('async function loadHistory('), taskChat.indexOf('function renderHistoryPicker('));
+  assert.match(load, /fetch\(historyQuery\(\{ kind: chat\.kind, key: chat\.key, q: historySearch \}\), \{\s*headers: projectHeader\(\)/);
+  assert.match(load, /if \(seq !== historySeq \|\| chat !== target \|\| !root\) return;/, 'a stale reply is dropped');
+  // A pick sends one start frame with the historyId, through the same single sender as Start.
+  const resume = taskChat.slice(taskChat.indexOf('function beginResume('), taskChat.indexOf('function applyResumed('));
+  assert.match(resume, /if \(!awaitingStart \|\| starting \|\| !connected \|\| !ws \|\| !historyId\) return;/);
+  assert.match(resume, /sendStartFrame\(historyId\);/);
+  // Unavailable rows cannot be picked.
+  assert.match(taskChat, /if \(!item \|\| item\.getAttribute\('aria-disabled'\) === 'true'\) return;\s*beginResume\(item\.dataset\.historyId\);/);
+  // A refused resume goes back to the gate with the reason; nothing starts on its own.
+  const refused = taskChat.slice(taskChat.indexOf('function resumeRefused('), taskChat.indexOf('// ── Transcript ──'));
+  assert.match(refused, /historyError = t\('taskChat\.history\.failed'/);
+  assert.match(refused, /connect\(\);/);
+  assert.doesNotMatch(refused, /sendStartFrame|beginChat|startFresh/);
+  assert.match(taskChat, /if \(reason === 'history-unavailable'\) \{[\s\S]*?if \(resuming\) \{ resumeRefused\(msg\); break; \}/);
+  // Composer stays locked while the resume is pending.
+  assert.match(taskChat, /send\.disabled = !connected \|\| running \|\| awaitingStart \|\| resuming/);
+  for (const locale of ['en', 'uk']) {
+    for (const key of ['title', 'searchPlaceholder', 'loading', 'empty', 'emptySearch', 'error', 'newChat', 'untitled', 'resuming',
+      'resumed', 'transcriptUnavailable', 'failed', 'changed', 'reason.missing', 'reason.checkout', 'reason.provider']) {
+      assert.ok(LOCALES[locale][`taskChat.history.${key}`], `${locale} taskChat.history.${key}`);
+    }
+  }
+  // Palette tokens only in the picker rules.
+  const block = styles.slice(styles.indexOf('/* History picker (TPT539)'), styles.indexOf('.task-chat-resumed-note'));
+  assert.doesNotMatch(block.replace(/var\(--c-[a-z-]+\)/g, ''), /#[0-9a-f]{3,8}\b|rgba?\(/i);
 });

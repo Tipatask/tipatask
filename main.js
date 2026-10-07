@@ -40,6 +40,7 @@ const crypto = require('node:crypto');
 const fs = require('fs');
 const path = require('path');
 const { createDesktopNotifications } = require('./main/desktop-notifications');
+const notifyTarget = require('./main/notify-target');
 const { isTrustedTopFrame } = require('./main/ipc/external');
 const { loadWorkspace, saveWorkspace } = require('./src/server/workspace-state');
 // (C1430) Pure startup-restore precedence — no fs/electron, safe as top-level
@@ -154,6 +155,18 @@ function resolveNotifyTarget(origin) {
   if (byProject) return byProject;
   const byId = origin.windowId != null ? BrowserWindow.fromId(origin.windowId) : null;
   return (byId && !byId.isDestroyed()) ? byId : null;
+}
+
+// Live windows registered as project windows (bound or not); never the notification banner.
+function openProjectWindows() {
+  return BrowserWindow.getAllWindows()
+    .filter((w) => !w.isDestroyed() && !w.webContents.isDestroyed() && projectDirs.has(w.webContents.id));
+}
+
+// Notification actions must end with the window in front of the user, so the raise is
+// verified and repeated (main/notify-target.js) instead of trusting one focusWindow() call.
+function raiseNotifyWindow(w) {
+  return notifyTarget.raiseWindow(w, { focus: (target) => focusWindow(target, { steal: true }) });
 }
 
 // (C1141/C1318) codesign --verify result for the running .app — see src/server/
@@ -1043,20 +1056,38 @@ function registerIpcHandlers() {
       const w = BrowserWindow.getFocusedWindow();
       return w && !w.isDestroyed() && !desktopNotifications?.owns(w) && projectDirs.has(w.webContents.id) ? w : null;
     },
-    projectWindows: () => BrowserWindow.getAllWindows()
-      .filter((w) => !w.isDestroyed() && !w.webContents.isDestroyed() && projectDirs.has(w.webContents.id)),
-    // "Show More": focus the newest notification's project window; the controller then sends
-    // that window the full list (src/client/desktop-notification-panel.js).
-    onShowMore: (entry) => {
-      const w = resolveNotifyTarget(entry.origin);
-      return w && focusWindow(w, { steal: true }) ? w : null;
-    },
-    onClick: (entry) => {
-      const w = resolveNotifyTarget(entry.origin);
-      if (!w || (entry.origin.projectPath && projectDirs.get(w.webContents.id) !== entry.origin.projectPath)) return;
-      focusWindow(w, { steal: true });
-      w.webContents.send('notify:clicked', { notificationId: entry.notificationId,
-        tag: entry.tag, taskId: entry.taskId, projectPath: entry.origin.projectPath, cardSeq: entry.cardSeq ?? null });
+    projectWindows: openProjectWindows,
+    // "Show More": raise a project window for the full list — the newest notification's own
+    // window, else any other open project window, else that project reopened (see
+    // main/notify-target.js). The controller then sends the returned window the list
+    // (src/client/desktop-notification-panel.js).
+    onShowMore: (entry) => notifyTarget.resolveShowMoreTarget(entry.origin, {
+      originWindow: resolveNotifyTarget,
+      projectWindows: () => openProjectWindows().filter((w) => projectDirs.get(w.webContents.id)),
+      reopen: (projectPath) => createProjectWindow(projectPath),
+      raise: raiseNotifyWindow,
+    }).catch(() => null),
+    // A card belongs to its project: the window owning that project now, else the project
+    // reopened. `notify:clicked` waits for a window that is still loading.
+    onClick: async (entry) => {
+      try {
+        const w = await notifyTarget.resolveClickTarget(entry.origin, {
+          originWindow: resolveNotifyTarget,
+          projectOf: (target) => projectDirs.get(target.webContents.id) || null,
+          reopen: (projectPath) => createProjectWindow(projectPath),
+        });
+        if (!w) return;
+        raiseNotifyWindow(w).catch(() => {});
+        const send = () => {
+          if (w.isDestroyed()) return;
+          w.webContents.send('notify:clicked', { notificationId: entry.notificationId,
+            tag: entry.tag, taskId: entry.taskId, projectPath: entry.origin.projectPath, cardSeq: entry.cardSeq ?? null });
+        };
+        if (w.webContents.isLoading()) w.webContents.once('did-finish-load', send);
+        else send();
+      } catch (e) {
+        console.warn('[notify] click routing failed:', e.message);
+      }
     },
     // keepCard: only the callback identity is released (a newer send replaced it, or the
     // on-top setting was turned off); the renderer keeps its in-app card.

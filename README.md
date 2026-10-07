@@ -116,9 +116,10 @@ npm ci
 npm run electron:ci:win
 ```
 
-Produces `dist-electron/TipATask Setup <version>.exe` (NSIS one-click installer, x64). It is
-unsigned, so SmartScreen warns on install. `nvm` itself is not available on Windows; install a
-matching Node (for example with nvm-windows) before `npm ci`.
+Produces `dist-electron/TipATask Setup <version>.exe` (assisted per-user NSIS installer, x64; its
+details list names each install step). It is unsigned, so SmartScreen warns on install. `nvm`
+itself is not available on Windows; install a matching Node (for example with nvm-windows)
+before `npm ci`.
 
 ### Linux
 

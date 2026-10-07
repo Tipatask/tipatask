@@ -31,6 +31,16 @@ function spawnTurn(session, taskId) {
     return;
   }
   session._agentContextIdentity = identity;
+  // A chat resumed from history (ws-handlers.js resumeChatFromHistory) has no local transcript
+  // to rebuild from (its `restored` messages are display-only): without the provider's session id a turn would silently start a new
+  // conversation, so it is refused instead.
+  const resumed = session._resumedHistory;
+  if (resumed && resumed.provider === (session.providerType || config.OBJECTIVE_PROVIDER) && !providerSessionId(session)) {
+    if (session.ws?.readyState === 1) session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId,
+      reason: 'history-unavailable', status: 410, historyId: resumed.historyId,
+      detail: 'The saved session for this chat is no longer attached. Start a new chat.' }));
+    return;
+  }
   if (session.type === 'objective' && session.backend) {
     if (session._spawning || session.proc) return;
     const epoch = session._epoch || 0;
@@ -153,6 +163,9 @@ async function applyModelSelection(session, raw, { taskId } = {}) {
 
   if (providerChanged) {
     session._providerSwitchPending = true;
+    // An explicit switch leaves a resumed history entry behind: the new provider gets the
+    // in-memory handoff and a native session (and history entry) of its own.
+    session._resumedHistory = null;
     // Risk 10: any provider change nulls ALL provider session ids, so returning to a
     // provider used earlier in the same chat forces a fresh handoff instead of silently
     // --resume-ing a CLI history that's missing everything that happened in between.
@@ -170,6 +183,7 @@ async function applyModelSelection(session, raw, { taskId } = {}) {
     killColdPrewarm('model-change');
     if (!config.OBJECTIVE_MODEL_SWITCH_RESUME) {
       session._providerSwitchPending = true;
+      session._resumedHistory = null;
       registry.clearAllProviderSessionIds(session);
     }
   }

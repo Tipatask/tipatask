@@ -256,6 +256,8 @@ export const WS_RECV_TYPES = {
   OBJECTIVE_RESULT: 'objective-result',
   CHAT_HISTORY: 'chat-history',
   CHAT_HISTORY_RESET: 'chat-history-reset',
+  CHAT_HISTORY_RESUMED: 'chat-history-resumed',
+  CHAT_HISTORY_CHANGED: 'chat-history-changed',
   CHAT_READY: 'chat-ready',
   TASK_CARDS: 'task-cards',
   GENERATION_ABORTED: 'generation-aborted',

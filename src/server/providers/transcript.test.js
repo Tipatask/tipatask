@@ -345,3 +345,41 @@ test('an objective turn never carries the task-chat reminder', () => {
   const { prompt } = buildTurnPrompt(session, { includeSystemPrompt: true, hasProviderSession: true });
   assert.equal(prompt, 'LATEST');
 });
+
+test('(TPT538) a chat resumed from history sends only the new ask on the native session', () => {
+  // ws-handlers.js resumeChatFromHistory: hidden empty marker, no firstPrompt, restored id.
+  const session = {
+    type: 'taskChat', toolProfile: 'taskChat', systemPrompt: 'SYSTEM', firstPrompt: null,
+    messages: [{ role: 'user', content: '', seed: true, resumed: true }, { role: 'user', content: 'What was the codeword?' }],
+  };
+  const claude = buildTurnPrompt(session, { includeSystemPrompt: false, hasProviderSession: true });
+  assert.equal(claude.mode, 'resume');
+  assert.equal(claude.prompt, 'What was the codeword?');
+  const codex = buildTurnPrompt(session, { includeSystemPrompt: true, hasProviderSession: true });
+  assert.equal(codex.mode, 'resume');
+  assert.ok(codex.prompt.startsWith('What was the codeword?'));
+  assert.ok(!codex.prompt.includes('SYSTEM'), 'the native session already holds the system prompt');
+});
+
+test('(TPT539) restored history messages are never sent: resume sends only the new message, handoff skips them', () => {
+  const restored = [
+    { role: 'assistant', content: 'RESTORED_GREETING', restored: true },
+    { role: 'user', content: 'RESTORED_QUESTION', restored: true },
+  ];
+  const marker = { role: 'user', content: '', seed: true, resumed: true };
+  const session = {
+    type: 'taskChat', firstPrompt: null, systemPrompt: 'SYS', compressedThrough: 0,
+    messages: [...restored, marker, { role: 'user', content: 'NEW_ASK' }],
+  };
+  const resume = buildTurnPrompt(session, { includeSystemPrompt: true, hasProviderSession: true });
+  assert.equal(resume.mode, 'resume');
+  assert.match(resume.prompt, /^NEW_ASK\n\n\(Reminder:/);
+  assert.doesNotMatch(resume.prompt, /RESTORED_/);
+  session.messages.push({ role: 'assistant', content: 'REPLY' }, { role: 'user', content: 'SWITCHED_ASK' });
+  session._providerSwitchPending = true;
+  const handoff = buildTurnPrompt(session, { includeSystemPrompt: true, hasProviderSession: false });
+  assert.equal(handoff.mode, 'handoff');
+  assert.doesNotMatch(handoff.prompt, /RESTORED_/);
+  assert.match(handoff.prompt, /NEW_ASK[\s\S]*REPLY[\s\S]*SWITCHED_ASK$/);
+  assert.equal(session.messages.length, 6, 'the session itself keeps its restored messages');
+});

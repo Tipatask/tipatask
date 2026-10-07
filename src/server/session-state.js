@@ -80,6 +80,10 @@ function createSession(ws, pending, tabId, projectPath) {
     pendingResult: null,      // turn result finished while no client was attached — flushed on reconnect
     _taskChatTurn: null,      // the running turn's dialogs/tools/task events (task-chat-widgets.js); reset per turn
     onTaskChatMutation: null, // set by ws-handlers.js at start-task-chat: a create/update tool call succeeded
+    onNativeSession: null,    // set by ws-handlers.js for task/project chats: a provider emitted its session id or finished a turn (chat-history index)
+    _resumedHistory: null,    // { historyId, provider, nativeSessionId, transcriptUnavailable } when the chat continues a native session from the history index
+    _historySearchPrior: null, // { keywords, first, latest } of the resumed entry, folded into each later history record
+    _historyIds: null,        // { '<provider>:<native id>': historyId } — one index entry per provider context of this chat
     pendingTaskEdits: null,   // Map taskKey -> { task, changed, prev }: tasks the user edited by hand, told to the agent with the next user turn
     _drainedTaskEdits: null,  // the edits the running turn's user message carried — put back if that turn is aborted
     // Multi-turn objective fields

@@ -115,6 +115,17 @@ function _button(className, onClick) {
   return el;
 }
 
+// Puts `nodes` into `container` in order, dropping every other child. A node already in its
+// place is never touched: re-inserting an element between its mousedown and mouseup cancels
+// the click, and a snapshot can arrive mid-press (the press itself gives the banner focus).
+export function placeInOrder(container, nodes) {
+  const keep = new Set(nodes);
+  for (const el of [...container.children]) if (!keep.has(el)) el.remove();
+  nodes.forEach((el, index) => {
+    if (container.children[index] !== el) container.insertBefore(el, container.children[index] || null);
+  });
+}
+
 function _reveal(cards) {
   if (!cards.length) return;
   const show = () => { for (const el of cards) el.classList.add('is-shown'); };
@@ -182,14 +193,14 @@ export function renderNotificationPage(host, entries, act,
 
   const existing = new Map([...page._cards.children].map((el) => [el.dataset.id, el]));
   const created = [];
-  for (const entry of model.visible) {
+  const ordered = model.visible.map((entry) => {
     const card = { ...entry, id: String(entry.id), dismissLabel: t('notifCenter.dismiss') };
     let el = existing.get(card.id);
-    if (el) { existing.delete(card.id); updateNotificationCard(el, card); }
+    if (el) updateNotificationCard(el, card);
     else { el = createNotificationCard(card, page._handlers); created.push(el); }
-    page._cards.appendChild(el);
-  }
-  for (const el of existing.values()) el.remove();
+    return el;
+  });
+  placeInOrder(page._cards, ordered);
   _reveal(created);
   return page;
 }

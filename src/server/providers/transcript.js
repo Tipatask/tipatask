@@ -115,6 +115,12 @@ function buildHandoffPrompt(session, { includeSystemPrompt } = {}) {
  * @returns {{ prompt: string, mode: 'resume'|'fresh'|'handoff' }}
  */
 function buildTurnPrompt(session, { includeSystemPrompt, hasProviderSession } = {}) {
+  // A chat resumed from history holds the earlier conversation as `restored` messages, read
+  // back from the provider's own session for display. They are never sent: the handoff and
+  // rebuild paths below see the chat as it was before the read-back (hidden marker first).
+  if (Array.isArray(session.messages) && session.messages.some(m => m && m.restored)) {
+    session = { ...session, messages: session.messages.filter(m => !(m && m.restored)) };
+  }
   const messages = session.messages;
   const lastMsg = messages[messages.length - 1];
   const baseline = priorityBaselineLine(session);

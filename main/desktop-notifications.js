@@ -76,8 +76,11 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   let settleTimer = null;
   // Last surface state sent per project webContents, so idle windows aren't re-sent each change.
   const sentState = new Map();
-  // Project window currently showing the full list ("Show More"): { win, wc, detach }.
+  // Project window that owns the full list ("Show More"): { win, wc, opened, detach }.
+  // `opened` turns true once notify:desktop-list-open was actually sent to a loaded page.
   let panel = null;
+  // A banner Show More whose target is still being resolved (async onShowMore).
+  let showMorePending = false;
   // (TPT505) Banner dismissed with Hide: stays hidden, entries kept, until a new or changed
   // alert arrives (upsert) or Show on Top is toggled. The in-app panel is unaffected.
   let bannerHidden = false;
@@ -102,8 +105,18 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     window.setBounds({ x: area.x + area.width - width, y: area.y + area.height - height, width, height });
   }
 
-  function sendList(channel = 'notify:desktop-list') {
-    if (panelLive()) panel.wc.send(channel, snapshot());
+  // Live updates for the open list. Never precedes the open itself.
+  function sendList() {
+    if (panelLive() && panel.opened) panel.wc.send('notify:desktop-list', snapshot());
+  }
+
+  // Sends the owner its list. A page that is still loading has no listener yet and would lose
+  // the message, so that case waits for the owner's did-finish-load (attachPanel()), which
+  // passes `loaded` — isLoadingMainFrame() still reports true inside that event.
+  function openList({ loaded = false } = {}) {
+    if (!panelLive() || (!loaded && panel.wc.isLoadingMainFrame?.())) return;
+    panel.opened = true;
+    panel.wc.send('notify:desktop-list-open', snapshot());
   }
 
   // Exactly one surface holds the alerts: the in-app panel of the focused project window, or
@@ -241,23 +254,37 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   }
 
   function attachPanel(win) {
-    if (!win || win.isDestroyed()) return;
+    if (disposed || !live(win)) return;
     if (panel && panel.win !== win) {
       if (panelLive()) panel.wc.send('notify:desktop-list-close');
       detachPanel();
     }
     if (!panel) {
       const wc = win.webContents;
-      const onGone = () => { if (panel?.win === win) { detachPanel(); publish(); } };
+      const owner = { win, wc, opened: false, detach: null };
+      const onGone = () => { if (panel === owner) { detachPanel(); publish(); } };
+      // A renderer reload drops the panel DOM; stop treating that window as its owner. The
+      // first navigation of a window that is still loading is not a reload: ownership stays.
+      const onNavigate = () => { if (owner.opened) onGone(); };
+      const onLoaded = () => { if (panel === owner && !owner.opened) openList({ loaded: true }); };
+      // -3 (ERR_ABORTED): this load was replaced by another one, which reports on its own.
+      const onFailed = (_event, code, _description, _url, isMainFrame) => {
+        if (isMainFrame && code !== -3 && !owner.opened) onGone();
+      };
       win.on('closed', onGone);
-      // A renderer reload drops the panel DOM; stop treating that window as its owner.
-      wc.on('did-navigate', onGone);
-      panel = { win, wc, detach: () => {
+      wc.on('did-navigate', onNavigate);
+      wc.on('did-finish-load', onLoaded);
+      wc.on('did-fail-load', onFailed);
+      owner.detach = () => {
         win.removeListener('closed', onGone);
-        if (!wc.isDestroyed()) wc.removeListener('did-navigate', onGone);
-      } };
+        if (wc.isDestroyed()) return;
+        wc.removeListener('did-navigate', onNavigate);
+        wc.removeListener('did-finish-load', onLoaded);
+        wc.removeListener('did-fail-load', onFailed);
+      };
+      panel = owner;
     }
-    sendList('notify:desktop-list-open');
+    openList();
     publish();
   }
 
@@ -286,7 +313,13 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
       // From the in-app panel: open the full list right there, without moving focus.
       if (from) return attachPanel(from);
       const newest = [...entries.values()].at(-1);
-      if (newest) attachPanel(onShowMore(newest));
+      if (!newest || showMorePending) return;
+      // onShowMore picks, raises and returns the window for the list. It may answer later (a
+      // verified raise, a reopened project window); no window means nothing changes here.
+      const target = onShowMore(newest);
+      if (typeof target?.then !== 'function') return attachPanel(target);
+      showMorePending = true;
+      target.then(attachPanel).catch(() => {}).finally(() => { showMorePending = false; });
       return;
     }
     const entry = entries.get(id);

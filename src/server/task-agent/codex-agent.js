@@ -137,6 +137,7 @@ class CodexAgent extends BaseTaskAgent {
     try {
       ({ env } = buildCodexEnv({ projectRoot, taskId, term: 'xterm-256color' }));
       const launch = codexTerminalLaunchOptions(projectRoot, env.CODEX_HOME, effort ? toCodexEffort(effort) : undefined, env);
+      env.CODEX_HOME = launch.codexHome;
       args.unshift(...launch.args);
       console.log(`[codex:launch] task=${taskId || '(none)'} mode=${launch.mode} reason=${launch.reason}`);
     } catch (err) {

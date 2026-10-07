@@ -9,7 +9,7 @@ import { buildWsUrl, startTerminalSession, terminateTaskSession, onSystemResume 
 import { updateClaudeButtons, syncActiveSessionsNav } from './task-board.js';
 import { showActionConfirm } from './action-confirm.js';
 import { dismissNotification } from './notification-center.js';
-import { objectiveTag, clearDebounce } from './notifications.js';
+import { objectiveTag, clearDebounce, dismissTaskNotifications } from './notifications.js';
 import { forgetTaskAttention } from './attention-notifications.js';
 import { createVoiceRecorder, voiceShortcutLabel, MIC_SVG } from './audio-recorder.js';
 import { t } from './i18n.js';
@@ -1755,6 +1755,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
           return;
         }
       }
+      // (TPT537) A user close/terminate clears this task's alerts on every surface. A session
+      // that exits on its own never reaches here, so its completion card stays.
+      dismissTaskNotifications(taskId);
       finishTerminalEnded();
       await requestHostClose?.();
     } catch (err) {

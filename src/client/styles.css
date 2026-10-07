@@ -9041,6 +9041,170 @@
   .task-chat-start-cancel:focus-visible,
   .task-chat-start-go:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
 
+  /* History picker (TPT539): earlier chats under the start gate's actions — search, a scrolling
+     list of rows, a status line; unavailable rows greyed with their reason. */
+  .task-chat-history {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    width: 100%;
+    margin-top: 0.6rem;
+    padding-top: 0.9rem;
+    border-top: 1px solid var(--c-border);
+    text-align: left;
+  }
+
+  .task-chat-history-title {
+    font-size: 0.74rem;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-history-search {
+    width: 100%;
+    padding: 0.45rem 0.65rem;
+    border: 1px solid var(--c-border-input);
+    border-radius: 8px;
+    background: var(--c-bg);
+    color: var(--c-text);
+    font: inherit;
+    font-size: 0.84rem;
+  }
+
+  .task-chat-history-search::placeholder { color: var(--c-text-faint); }
+  .task-chat-history-search:focus { outline: none; border-color: var(--c-primary); box-shadow: 0 0 0 2px var(--c-primary-light); }
+  .task-chat-history-search[hidden],
+  .task-chat-history-list[hidden],
+  .task-chat-history-status[hidden],
+  .task-chat-history-error[hidden] { display: none; }
+
+  .task-chat-history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    max-height: 18rem;
+    overflow-y: auto;
+    padding: 1px;
+  }
+
+  .task-chat-history--loading .task-chat-history-list { opacity: 0.6; }
+
+  .task-chat-history-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    width: 100%;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid var(--c-border);
+    border-radius: 9px;
+    background: var(--c-bg-card);
+    color: var(--c-text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .task-chat-history-item:hover:not([aria-disabled="true"]) { border-color: var(--c-primary); background: var(--c-primary-lighter); }
+  .task-chat-history-item:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 1px; }
+
+  .task-chat-history-item--unavailable {
+    background: var(--c-bg-sub-nav);
+    color: var(--c-text-muted);
+    cursor: not-allowed;
+  }
+
+  .task-chat-history-item-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .task-chat-history-item-title {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.86rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .task-chat-history-item-time {
+    flex-shrink: 0;
+    font-size: 0.72rem;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-history-item-meta {
+    font-size: 0.74rem;
+    color: var(--c-text-secondary);
+  }
+
+  .task-chat-history-item-excerpt {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    color: var(--c-text-muted);
+    overflow-wrap: anywhere;
+  }
+
+  .task-chat-history-item-reason {
+    font-size: 0.74rem;
+    color: var(--c-warning);
+  }
+
+  .task-chat-history-status {
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--c-text-muted);
+  }
+
+  .task-chat-history-status--error { color: var(--c-danger); }
+
+  .task-chat-history-retry {
+    margin-left: 0.35rem;
+    padding: 0.15rem 0.6rem;
+    border: 1px solid currentColor;
+    border-radius: 6px;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-size: 0.76rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .task-chat-history-error {
+    width: 100%;
+    padding: 0.5rem 0.7rem;
+    border: 1px solid var(--c-danger-border);
+    border-radius: 9px;
+    background: var(--c-danger-bg);
+    color: var(--c-danger);
+    font-size: 0.82rem;
+    line-height: 1.5;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+
+  /* The resumed-session indicator where a chat from history continues. */
+  .task-chat-msg--resumed {
+    border-style: dashed;
+    border-color: var(--c-primary);
+    background: var(--c-primary-lighter);
+    color: var(--c-text-secondary);
+  }
+
+  .task-chat-msg--resumed .task-chat-body { display: flex; flex-direction: column; gap: 0.2rem; }
+  .task-chat-resumed-note { font-size: 0.78rem; color: var(--c-warning); }
+
   /* Attachments (TPT473): the shared Embed control (embed-menu.js) in the composer, the
      upload status, file drop on the panel, and thumbnails / chips in user turns. */
   .task-chat-embed-slot { display: inline-flex; flex-shrink: 0; }

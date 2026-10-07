@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
+const { createHash, randomUUID } = require('node:crypto');
 const toml = require('toml');
 
 const TIPATASK_MCP_NAME = 'tipatask';
@@ -16,6 +17,7 @@ const TIPATASK_MCP_LOCAL_NAME = 'tipatask-local';
 // running install — never a path guessed relative to the project being configured.
 const DEFAULT_MCP_SERVER_PATH = path.join(__dirname, 'mcp', 'server.js');
 const CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE = 'approve';
+const TERMINAL_DEFAULTS = 'tipatask-terminal.toml';
 
 // ── Opt-in browser-tools MCP presets (TPT95) ────────────────────────────────────
 // Playwright and Chrome DevTools are the two browser-automation MCP servers Codex
@@ -403,7 +405,7 @@ function upsertTomlKey(content, sectionName, key, value) {
 
 function removeTopLevelTomlKey(content, key) {
   const lines = content ? content.split('\n') : [];
-  const keyPattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=`);
+  const keyPattern = new RegExp(`^\\s*(?:${escapeRegExp(key)}|"${escapeRegExp(key)}"|'${escapeRegExp(key)}')\\s*=`);
   const result = [];
   let topLevel = true;
   for (const line of lines) {
@@ -707,10 +709,15 @@ function mergeGlobalCodexPreferences(projectContent, globalContent) {
 function getCodexPaths(projectRoot, { env = process.env, homeDir = os.homedir() } = {}) {
   const projectCodexDir = path.resolve(projectRoot, '.codex');
   const exportedCodexDir = env.CODEX_HOME ? path.resolve(env.CODEX_HOME) : null;
+  const terminalHome = exportedCodexDir && path.basename(path.dirname(exportedCodexDir)) === 't'
+    && /^[a-f0-9]{16}$/.test(path.basename(exportedCodexDir))
+    && fs.existsSync(path.join(path.dirname(path.dirname(exportedCodexDir)), TERMINAL_DEFAULTS));
   // Task App-spawned Codex processes export the project directory as CODEX_HOME. Do not
   // read that same file as its own "global" source; fall back to the user's normal home.
   // A different exported CODEX_HOME is a real user-level override and must be honored.
-  const globalCodexDir = exportedCodexDir && exportedCodexDir !== projectCodexDir
+  const globalCodexDir = terminalHome
+    ? path.resolve(env.TIPATASK_CODEX_GLOBAL_HOME || path.join(homeDir, '.codex'))
+    : exportedCodexDir && exportedCodexDir !== projectCodexDir
     ? exportedCodexDir
     : path.join(homeDir, '.codex');
   return {
@@ -862,10 +869,113 @@ function writeCodexMcpConfig({ targetPath, projectRoot, mcpServerPath, nodePath,
   out = upsertKeyInAllMcpServerSections(out, 'default_tools_approval_mode', tomlString(CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE));
   out = upsertTomlKey(out, 'features', 'guardian_approval', 'false');
   out = upsertProjectTrustLevel(out, projectRoot);
+  // Interactive homes own effort. A project-layer effort would mask their value.
+  // Preserve later manual edits in the defaults file; never backfill global effort
+  // into this layer once the project has migrated to native terminal homes.
+  const defaultsPath = path.join(path.dirname(targetPath), TERMINAL_DEFAULTS);
+  if (fs.existsSync(defaultsPath)) {
+    const effort = parseTomlOptional(existing)?.model_reasoning_effort;
+    if (effort !== undefined) saveTerminalDefaults(defaultsPath, effort);
+    out = removeTopLevelTomlKey(out, 'model_reasoning_effort');
+  }
   const final = out.endsWith('\n') ? out : `${out}\n`;
   try { if (fs.readFileSync(targetPath, 'utf8') === final) return; } catch { /* absent */ }
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-  fs.writeFileSync(targetPath, final, 'utf8');
+  atomicCodexWrite(targetPath, final);
+}
+
+function atomicCodexWrite(file, content) {
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, content, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } finally {
+    try { fs.unlinkSync(temporary); } catch { /* renamed or not created */ }
+  }
+}
+
+function saveTerminalDefaults(file, effort) {
+  atomicCodexWrite(file, `model_reasoning_effort = ${tomlValue(effort)}\n`);
+}
+
+// Each native home is an immutable configuration/environment snapshot. Concurrent
+// consoles cannot overwrite effort, and token or permission changes get a new
+// daemon boundary. Project MCP wiring remains in the usual project config.
+function prepareCodexTerminalHome({ projectRoot, codexHome, effort, env = {} }) {
+  if (!['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(effort)) {
+    throw new Error('Invalid Codex terminal effort');
+  }
+  const configPath = path.join(codexHome, 'config.toml');
+  let content = fs.readFileSync(configPath, 'utf8');
+  const parsed = toml.parse(content);
+  if (parsed.profile !== undefined || parsed.profiles !== undefined) {
+    throw new Error('Legacy Codex profiles are unsupported; remove profile/profiles from the project configuration');
+  }
+  const defaultsPath = path.join(codexHome, TERMINAL_DEFAULTS);
+  if (parsed.model_reasoning_effort !== undefined || !fs.existsSync(defaultsPath)) {
+    saveTerminalDefaults(defaultsPath, parsed.model_reasoning_effort ?? 'high');
+  }
+  if (parsed.model_reasoning_effort !== undefined) {
+    content = removeTopLevelTomlKey(content, 'model_reasoning_effort');
+    atomicCodexWrite(configPath, content);
+  }
+  // Bound project-layer discovery at the selected checkout, including nested
+  // projects. Ancestor effort must not override this console's selected effort.
+  const settings = {
+    model_reasoning_effort: effort,
+    project_root_markers: ['.codex'],
+    sqlite_home: parsed.sqlite_home ? path.resolve(codexHome, parsed.sqlite_home) : codexHome,
+  };
+  content = upsertProjectTrustLevel(content, fs.realpathSync(projectRoot));
+  for (const [key, value] of Object.entries(settings)) {
+    content = `${key} = ${tomlValue(value)}\n${removeTopLevelTomlKey(content, key)}`;
+  }
+  // Paths relative to the original user config keep their original meaning.
+  for (const key of ['model_catalog_json', 'model_instructions_file', 'experimental_compact_prompt_file']) {
+    if (typeof parsed[key] === 'string' && !path.isAbsolute(parsed[key])) {
+      content = `${key} = ${tomlString(path.resolve(codexHome, parsed[key]))}\n${removeTopLevelTomlKey(content, key)}`;
+    }
+  }
+  const canonical = value => JSON.stringify(value, (_key, item) =>
+    item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
+  const { tui, ...serverSettings } = toml.parse(content);
+  const { CODEX_HOME, ...serverEnv } = env;
+  const digest = createHash('sha256').update(canonical(serverSettings)).update(canonical(serverEnv)).digest('hex').slice(0, 16);
+  const home = path.join(codexHome, 't', digest);
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  const snapshotPath = path.join(home, 'config.toml');
+  if (!fs.existsSync(snapshotPath)) atomicCodexWrite(snapshotPath, content);
+  else {
+    const { tui: snapshotTui, ...snapshotSettings } = toml.parse(fs.readFileSync(snapshotPath, 'utf8'));
+    if (canonical(snapshotSettings) !== canonical(serverSettings)) {
+      throw new Error('Managed Codex terminal configuration was modified; refresh the agent harness');
+    }
+  }
+  // Share authentication, history, skills and plugin installations, while each
+  // snapshot keeps its own native daemon identity and sockets.
+  for (const name of ['sessions', 'archived_sessions', 'skills', 'plugins', 'rules', 'prompts', 'themes', 'packages']) {
+    const source = path.join(codexHome, name);
+    fs.mkdirSync(source, { recursive: true });
+    const target = path.join(home, name);
+    try { fs.symlinkSync(source, target, process.platform === 'win32' ? 'junction' : 'dir'); }
+    catch (err) {
+      if (err.code !== 'EEXIST' || fs.realpathSync(target) !== fs.realpathSync(source)) throw err;
+    }
+  }
+  const auth = path.join(codexHome, 'auth.json');
+  const snapshotAuth = path.join(home, 'auth.json');
+  if (fs.existsSync(auth)) {
+    try { fs.symlinkSync(auth, snapshotAuth); }
+    catch (err) {
+      if (err.code !== 'EEXIST' || fs.realpathSync(snapshotAuth) !== fs.realpathSync(auth)) throw err;
+    }
+  }
+  const cache = path.join(codexHome, 'models_cache.json');
+  if (fs.existsSync(cache) && !fs.existsSync(path.join(home, 'models_cache.json'))) {
+    fs.copyFileSync(cache, path.join(home, 'models_cache.json'));
+  }
+  return home;
 }
 
 function updateGlobalCodexMcpApprovalConfig({ targetPath, projectRoot, mcpServerPath, nodePath }) {
@@ -994,6 +1104,7 @@ module.exports = {
   buildCodexLocalMcpSection,
   CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE,
   ensureProjectCodexHome,
+  prepareCodexTerminalHome,
   getCodexPaths,
   listProjectMcpServerNames,
   buildScopedCodexMcpOverride,

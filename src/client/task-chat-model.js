@@ -296,10 +296,15 @@ export function stripTaskEditNote(text) {
 // Server history -> transcript entries. The generated first message (`seed: true`: task JSON,
 // comments, opening ask) is context for the agent, not part of the conversation; so is the
 // `task_edits` block a user turn may open with.
+//
+// A chat resumed from history (TPT539) holds the earlier conversation read back from the
+// provider's session (`restored: true`, shown as ordinary turns) and then the hidden resume
+// marker, which becomes the resumed-session indicator in its place.
 export function visibleHistory(serverMessages) {
   return (Array.isArray(serverMessages) ? serverMessages : [])
-    .filter(m => m && !m.seed && (m.role === 'user' || m.role === 'assistant'))
-    .map(m => ({
+    .filter(m => m && (m.resumed || (!m.seed && (m.role === 'user' || m.role === 'assistant'))))
+    .map(m => m.resumed ? resumedIndicator(m) : ({
+      ...(m.restored ? { restored: true } : {}),
       role: m.role,
       // A dialog answer shows as the picks themselves, not the server's `Answer to "…": …` line.
       content: m.role === 'user' && m.dialogAnswer
@@ -404,4 +409,76 @@ const PENDING_IMAGE_REF_RE = /!\[[^\]\n]*\]\(blob:[^)\s]*\)/g;
 export function stripPendingImageRefs(text) {
   if (typeof text !== 'string' || !text.includes('](blob:')) return typeof text === 'string' ? text : '';
   return text.replace(PENDING_IMAGE_REF_RE, '');
+}
+
+// ── Chat history picker (TPT539) ──
+
+// The transcript entry that marks where a resumed chat continues; its text is looked up with
+// t() when drawn, so it follows a language switch.
+export function resumedIndicator({ provider = '', transcriptUnavailable = false } = {}) {
+  return { role: 'system', kind: 'resumed', content: '', provider: provider || '', transcriptUnavailable: !!transcriptUnavailable };
+}
+
+const PROVIDER_NAMES = { claude: 'Claude', codex: 'Codex', pi: 'Pi' };
+
+export function providerName(id) {
+  return PROVIDER_NAMES[id] || String(id || '');
+}
+
+// "3 minutes ago" / "yesterday" in the project language; a date once it is over a month old.
+export function relativeTime(ts, { now = Date.now(), locale = 'en' } = {}) {
+  const t = Number(ts);
+  if (!Number.isFinite(t) || t <= 0) return '';
+  const seconds = Math.round((t - now) / 1000);
+  const abs = Math.abs(seconds);
+  const units = [['second', 60], ['minute', 3600], ['hour', 86400], ['day', 86400 * 30]];
+  const div = { second: 1, minute: 60, hour: 3600, day: 86400 };
+  try {
+    if (abs >= 86400 * 30) return new Date(t).toLocaleDateString(locale, { year: 'numeric', month: 'short', day: 'numeric' });
+    const rtf = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
+    if (abs < 45) return rtf.format(0, 'second');
+    for (const [unit, limit] of units) {
+      if (abs < limit) return rtf.format(Math.round(seconds / div[unit]), unit);
+    }
+  } catch { /* no Intl support for this locale */ }
+  return new Date(t).toISOString().slice(0, 10);
+}
+
+// The `/api/project/chat-history` query for one picker: a task chat lists its own task's chats,
+// a project chat lists project chats. `q` searches title, keywords and excerpts on the server.
+export function historyQuery({ kind, key, q = '', limit = 50 } = {}) {
+  const params = new URLSearchParams();
+  if (kind === 'task') params.set('taskKey', key || '');
+  else params.set('kind', 'project');
+  const needle = String(q || '').trim();
+  if (needle) params.set('q', needle);
+  params.set('limit', String(limit));
+  return `/api/project/chat-history?${params.toString()}`;
+}
+
+// Inner markup of one picker row. `label(providerId, model)` names the model.
+export function historyRowHtml(row, { t, label = (p, m) => m, now = Date.now(), locale = 'en' } = {}) {
+  const title = row.title || row.taskKey || t('taskChat.history.untitled');
+  const model = row.model ? label(row.provider, row.model) : '';
+  const meta = [providerName(row.provider), model].filter(Boolean).join(' · ');
+  const when = relativeTime(row.lastActivityAt, { now, locale });
+  const excerpt = (row.excerpts && row.excerpts.first) || '';
+  const reason = row.available ? '' : t(`taskChat.history.reason.${row.unavailableReason || 'missing'}`);
+  return `<span class="task-chat-history-item-head"><span class="task-chat-history-item-title">${esc(title)}</span>`
+    + (when ? `<span class="task-chat-history-item-time">${esc(when)}</span>` : '')
+    + '</span>'
+    + `<span class="task-chat-history-item-meta">${esc(meta)}</span>`
+    + (excerpt ? `<span class="task-chat-history-item-excerpt">${esc(excerpt)}</span>` : '')
+    + (reason ? `<span class="task-chat-history-item-reason">${esc(reason)}</span>` : '');
+}
+
+// Arrow-key movement inside the picker: the next/previous row from `index` (-1 = the search box),
+// wrapping at neither end.
+export function historyFocusIndex(index, key, count) {
+  if (!count) return -1;
+  if (key === 'ArrowDown') return Math.min(count - 1, index + 1);
+  if (key === 'ArrowUp') return index - 1; // -1 hands focus back to the search box
+  if (key === 'Home') return 0;
+  if (key === 'End') return count - 1;
+  return index;
 }

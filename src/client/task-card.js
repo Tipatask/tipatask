@@ -24,10 +24,10 @@ import { isDragStateStale, resolveDropTier, shouldDeferForDrag } from './drag-st
 import { collectFamilyIds } from './related-cards.js';
 import { HIDE_CLASS } from './sprint-tier-visibility.js';
 import { cardVariant, cardMaxWidthPx, estimateTextWidth, TITLE_CHAR_PX } from './card-width.js';
-import { hasUnmetDeps, unmetDependencyKeys } from './dependency-status.js';
+import { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps } from './dependency-status.js';
 import { expandedCardMaxHeight, clampExpandedTop, resolveAnchorTop } from './card-placement.js';
 export { isDragStateStale, resolveDropTier, shouldDeferForDrag };
-export { hasUnmetDeps, unmetDependencyKeys };
+export { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps };
 // (C1483) Shape check for "is this a real task key" (prefix+number or dashed epic form)
 // vs a synthetic client id ('new'/'new-<ts>-<seq>'/'new-obj-...'). Server-side module,
 // dependency-free CJS — safe to pull into the client bundle.
@@ -493,6 +493,10 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
   if (proposal) preview = true;
   const blocking = unmetDependencyKeys(t);
   const depsBlocked = blocking.length > 0;
+  // (TPT552) data-deps-blocked keeps the raw dependency fact; the button itself is only gated
+  // for a fresh launch. A task with a session (e.g. pending follow-ups were added as its deps
+  // after it ran) stays resumable — updateClaudeButtons() re-applies this as sessions change.
+  const startGated = depsBlocked && !hasTaskSession(t.id);
 
   const deps = t.dependencies.length
     ? `<div class="deps">Depends on: ${t.dependencies.map(d => `<span class="dep-badge">${d}</span>`).join(' ')}</div>`
@@ -608,7 +612,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
                     ? `<button class="btn-open-subtask-board btn-subtasks-show card-ctl" data-task-key="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" title="${escapeAttr(subtasksLabel)}">${_SUBTASKS_SVG}<span>${escapeAttr(subtasksLabel)}</span></button>`
                     : `<button class="btn-create-subtasks card-ctl" data-task-key="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" data-tip="${escapeAttr(translate('tooltip.createSubtasks'))}" aria-label="${escapeAttr(translate('tooltip.createSubtasks'))}">${_SUBTASKS_SVG}<span>${escapeAttr(translate('btn.startObjective'))}</span></button>`)
                 : `${(t.category === 'CODING' && t.agentAssignee !== 'human' && canStartTaskCard(t))
-                  ? `<button class="card-start-btn btn-claude card-ctl${depsBlocked ? ' deps-blocked' : ''}" data-task-id="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" data-task-desc="${escapeAttr(truncatedDesc)}" data-task-status="${t.status}"${depsBlocked ? ` disabled title="Waiting for: ${escapeAttr(blocking.join(', '))}"` : ''}>Start</button>`
+                  ? `<button class="card-start-btn btn-claude card-ctl${startGated ? ' deps-blocked' : ''}" data-task-id="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" data-task-desc="${escapeAttr(truncatedDesc)}" data-task-status="${t.status}"${startGated ? ` disabled title="Waiting for: ${escapeAttr(blocking.join(', '))}"` : ''}>Start</button>`
                   : (t.category === 'HUMAN' && isActiveName(t.status) && canStartTaskCard(t))
                     ? `<button class="card-start-btn btn-start-discussion card-ctl" data-task-id="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" data-task-desc="${escapeAttr(truncatedDesc)}" data-task-status="${t.status}">Start</button>`
                     : ''}${t.hasChildren ? `<button class="btn-open-subtask-board card-ctl" data-task-key="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}">${translate('btn.subtasks')}</button>` : ''}`}
@@ -1723,8 +1727,9 @@ export function setupCardInteractions(appEl) {
   appEl.querySelectorAll('.btn-claude').forEach(btn => {
     btn.addEventListener('click', () => {
       const card = btn.closest('.card');
-      if (card?.dataset.depsBlocked === '1') return; // blocked by incomplete dependency
       const { taskId, taskTitle, taskDesc, taskStatus } = btn.dataset;
+      // Blocked by an incomplete dependency — a fresh launch only; an existing session reopens (TPT552).
+      if (card?.dataset.depsBlocked === '1' && !hasTaskSession(taskId)) return;
       _startTaskSession(taskId, taskTitle, taskDesc, taskStatus, card);
     });
   });

@@ -7,14 +7,29 @@ const path = require('node:path');
 const test = require('node:test');
 const toml = require('toml');
 
+// Credential-writing fixtures must never use the live desktop account store.
+const originalUserData = process.env.TIPATASK_USER_DATA;
+const testUserData = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-codex-env-account-'));
+process.env.TIPATASK_USER_DATA = testUserData;
+test.after(() => {
+  if (originalUserData === undefined) delete process.env.TIPATASK_USER_DATA;
+  else process.env.TIPATASK_USER_DATA = originalUserData;
+  fs.rmSync(testUserData, { recursive: true, force: true });
+});
+
 const config = require('./config');
 const CodexAgent = require('./task-agent/codex-agent');
 const { buildCodexArgs } = require('./providers/codex-session');
-const { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, toCodexEffort } = require('./codex-env');
+const { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, terminalDaemonFallback, toCodexEffort } = require('./codex-env');
 const { writeProjectConfig: writeLiveProjectConfig } = require('./project-config');
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-codex-env-'));
+}
+
+function checkDaemon(home, env) {
+  const reason = terminalDaemonFallback(home, env, toml.parse(fs.readFileSync(path.join(home, 'config.toml'), 'utf8')));
+  return { args: reason ? ['--no-daemon'] : [], mode: reason ? 'embedded' : 'shared', reason };
 }
 
 test('codexEffortArgs pins the Codex config override to high', () => {
@@ -232,11 +247,12 @@ test('Codex terminal spawn pins high effort ahead of inherited config', async ()
       USER_DATA_ROOT: dir,
     }, 'Work on task TPT99.', '', { projectPath: projectRoot });
 
-    assert.deepEqual(spec.args.slice(0, 2), codexEffortArgs());
+    assert.ok(!spec.args.includes('-c'));
+    assert.equal(toml.parse(fs.readFileSync(path.join(spec.env.CODEX_HOME, 'config.toml'), 'utf8')).model_reasoning_effort, 'high');
     assert.match(
-      fs.readFileSync(path.join(projectRoot, '.codex', 'config.toml'), 'utf8'),
+      fs.readFileSync(path.join(projectRoot, '.codex', 'tipatask-terminal.toml'), 'utf8'),
       /model_reasoning_effort = "xhigh"/,
-      'fixture must prove the spawn override wins without rewriting inherited config'
+      'inherited default remains saved separately from the console setting'
     );
   } finally {
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -277,12 +293,14 @@ test('normal and SIMPLE_MODE terminal launches share config effort without shari
       spawn({}), spawn({ task: { effort: 'low' }, model: 'task-model' }), spawn({ task: { effort: 'max' } }),
     ]);
     assert.equal(normal.cwd, root);
-    assert.equal(normal.env.CODEX_HOME, path.join(root, '.codex'));
+    assert.equal(path.dirname(path.dirname(normal.env.CODEX_HOME)), path.join(root, '.codex'));
     assert.equal(normal.env.TIPATASK_API_TOKEN, simple ? 'simple-token' : 'normal-token');
     assert.deepEqual(normal.args.slice(0, 3), ['--model', 'project-model', '--no-alt-screen']);
     assert.equal(normal.args.some(arg => ['-c', '--config', '--profile', '--no-daemon', '--enable', '--disable', '--search'].includes(arg)), false);
-    assert.deepEqual(low.args.slice(0, 4), [...codexEffortArgs('low'), '--model', 'task-model']);
-    assert.deepEqual(max.args.slice(0, 2), codexEffortArgs('xhigh'));
+    assert.deepEqual(low.args.slice(0, 2), ['--model', 'task-model']);
+    for (const spec of [normal, low, max]) {
+      assert.equal(spec.args.some(arg => ['-c', '--config', '--profile', '--enable', '--disable', '--search'].includes(arg)), false);
+    }
     const content = fs.readFileSync(path.join(normal.env.CODEX_HOME, 'config.toml'), 'utf8');
     const parsed = toml.parse(content);
     assert.equal(parsed.model_reasoning_effort, 'high');
@@ -293,8 +311,11 @@ test('normal and SIMPLE_MODE terminal launches share config effort without shari
     assert.equal(parsed.mcp_servers.tipatask.bearer_token_env_var, 'TIPATASK_API_TOKEN');
     assert.equal(parsed.mcp_servers['tipatask-local'].env.TIPATASK_PROJECT_ROOT, root);
     assert.doesNotMatch(content, /simple-token|normal-token/);
-    assert.equal(low.env.CODEX_HOME, normal.env.CODEX_HOME);
-    assert.equal(max.env.CODEX_HOME, normal.env.CODEX_HOME);
+    assert.notEqual(low.env.CODEX_HOME, normal.env.CODEX_HOME);
+    assert.notEqual(max.env.CODEX_HOME, normal.env.CODEX_HOME);
+    assert.equal(toml.parse(fs.readFileSync(path.join(low.env.CODEX_HOME, 'config.toml'), 'utf8')).model_reasoning_effort, 'low');
+    assert.equal(toml.parse(fs.readFileSync(path.join(max.env.CODEX_HOME, 'config.toml'), 'utf8')).model_reasoning_effort, 'xhigh');
+    assert.equal(toml.parse(fs.readFileSync(path.join(root, '.codex/config.toml'), 'utf8')).model_reasoning_effort, undefined);
     const peers = await Promise.all(['TPT498', 'TPT499'].map(id => spawn({}, id)));
     for (const peer of peers) {
       assert.deepEqual(peer.env, normal.env, 'different tasks must have the same daemon environment');
@@ -313,7 +334,7 @@ test('normal and SIMPLE_MODE terminal launches share config effort without shari
   }
 });
 
-test('terminal effort preserves custom settings and falls back for ancestor config or invalid TOML', t => {
+test('terminal effort preserves defaults and isolates ancestor config without CLI overrides', t => {
   const root = makeTempDir();
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, '.git'));
@@ -323,13 +344,14 @@ test('terminal effort preserves custom settings and falls back for ancestor conf
   const content = '# custom\nmodel_reasoning_effort = "low"\n';
   fs.writeFileSync(file, content);
   assert.deepEqual(codexTerminalEffortArgs(root, home, 'low'), []);
-  assert.deepEqual(codexTerminalEffortArgs(root, home), codexEffortArgs('high'));
-  assert.equal(fs.readFileSync(file, 'utf8'), content);
+  assert.deepEqual(codexTerminalEffortArgs(root, home), []);
+  assert.equal(fs.readFileSync(path.join(home, 'tipatask-terminal.toml'), 'utf8'), 'model_reasoning_effort = "low"\n');
+  assert.match(fs.readFileSync(file, 'utf8'), /# custom/);
   const nested = path.join(root, 'nested');
   const nestedHome = path.join(nested, '.codex');
   fs.mkdirSync(nestedHome, { recursive: true });
   fs.writeFileSync(path.join(nestedHome, 'config.toml'), 'model_reasoning_effort = "high"\n');
-  assert.deepEqual(codexTerminalEffortArgs(nested, nestedHome), codexEffortArgs('high'));
+  assert.deepEqual(codexTerminalEffortArgs(nested, nestedHome), []);
   fs.writeFileSync(file, 'invalid = [');
   assert.throws(() => codexTerminalEffortArgs(root, home));
   assert.equal(fs.readFileSync(file, 'utf8'), 'invalid = [');
@@ -347,7 +369,7 @@ test('terminal daemon reuse survives module reload, preserves credentials and re
   const record = path.join(home, 'tipatask-daemon.json');
   fs.writeFileSync(file, 'model_reasoning_effort = "high"\n');
   const env = { CODEX_HOME: home, TIPATASK_API_TOKEN: 'first-secret' };
-  const launch = (extra = {}) => codexTerminalLaunchOptions(root, home, 'high', { ...env, ...extra });
+  const launch = (extra = {}) => checkDaemon(home, { ...env, ...extra });
   const daemon = { pid: process.pid, processIdentity: { startSeconds: Math.floor(Date.now() / 1000) } };
   fs.writeFileSync(marker, JSON.stringify(daemon));
   assert.equal(launch().reason, 'daemon-unrecognized');
@@ -366,7 +388,7 @@ test('terminal daemon reuse survives module reload, preserves credentials and re
   delete require.cache[modulePath];
   try {
     const reloaded = require('./codex-env');
-    assert.deepEqual(reloaded.codexTerminalLaunchOptions(root, home, 'high', env).args, [], 'fresh module must recognize persisted identity');
+    assert.equal(reloaded.terminalDaemonFallback(home, env, toml.parse(fs.readFileSync(file, 'utf8'))), null, 'fresh module must recognize persisted identity');
   } finally { require.cache[modulePath] = originalModule; }
   fs.appendFileSync(file, '\n# Native TUI bookkeeping\n[tui]\nscreen_reader_detection_done = true\n');
   assert.deepEqual(launch().args, [], 'TUI counters and formatting do not change daemon configuration');
@@ -388,7 +410,7 @@ test('daemon metadata fails closed for contention, stale identities and copied p
   fs.writeFileSync(path.join(home, 'config.toml'), 'model_reasoning_effort = "high"\n');
   const record = path.join(home, 'tipatask-daemon.json');
   const marker = path.join(home, 'app-server-daemon/daemon.pid');
-  const launch = () => codexTerminalLaunchOptions(root, home, 'high', { CODEX_HOME: home });
+  const launch = () => checkDaemon(home, { CODEX_HOME: home });
   fs.writeFileSync(`${record}.lock`, String(process.pid));
   assert.equal(launch().reason, 'daemon-record-busy');
   fs.unlinkSync(`${record}.lock`);
@@ -417,7 +439,7 @@ test('an abandoned daemon start expires without adopting an unidentified control
   fs.mkdirSync(home);
   fs.writeFileSync(path.join(home, 'config.toml'), 'model_reasoning_effort = "high"\n');
   const record = path.join(home, 'tipatask-daemon.json');
-  const launch = token => codexTerminalLaunchOptions(root, home, 'high', { CODEX_HOME: home, TIPATASK_API_TOKEN: token });
+  const launch = token => checkDaemon(home, { CODEX_HOME: home, TIPATASK_API_TOKEN: token });
   assert.equal(launch('old').mode, 'shared');
   assert.equal(launch('new').reason, 'daemon-start-pending');
   fs.writeFileSync(record, JSON.stringify({ ...JSON.parse(fs.readFileSync(record)), startedAt: Date.now() - 121000 }));

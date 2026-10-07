@@ -68,3 +68,51 @@ test('live updates, Ukrainian labels, empty state and closing', () => {
   assert.equal($('#tt-desktop-notif-panel'), null, 'main can close a list superseded by another window');
   setLocale('en');
 });
+
+test('an open while the list is mounted re-renders it in place without moving cards', () => {
+  listener('open', entries(3));
+  const panel = $('#tt-desktop-notif-panel');
+  const first = $('.tt-notif-card[data-tag="3"]');
+  const moved = [];
+  const insertBefore = panel._list.insertBefore.bind(panel._list);
+  panel._list.insertBefore = (el, ref) => { moved.push(el.dataset.tag); return insertBefore(el, ref); };
+  listener('open', entries(3));
+  listener('update', entries(3));
+  assert.equal(document.querySelectorAll('#tt-desktop-notif-panel').length, 1);
+  assert.equal($('#tt-desktop-notif-panel'), panel);
+  assert.equal($('.tt-notif-card[data-tag="3"]'), first);
+  assert.deepEqual(moved, [], 'a repeat snapshot never re-inserts a card (it would cancel a click in progress)');
+  listener('open', entries(4));
+  assert.deepEqual(moved, ['4']);
+  assert.equal([...panel._list.children].map((el) => el.dataset.tag).join(','), '4,3,2,1');
+  listener('close', []);
+});
+
+test('an open before the document has a body mounts once the body exists', () => {
+  const realBody = document.body;
+  Object.defineProperty(document, 'body', { configurable: true, get: () => null });
+  try {
+    listener('open', entries(2));
+    listener('update', entries(3));
+    listener('open', entries(4));
+    assert.equal(realBody.querySelector('#tt-desktop-notif-panel'), null);
+  } finally {
+    delete document.body;
+  }
+  assert.equal(document.body, realBody);
+  document.dispatchEvent(new win.Event('DOMContentLoaded'));
+  assert.equal(document.querySelectorAll('#tt-desktop-notif-panel').length, 1);
+  assert.equal(document.querySelectorAll('#tt-desktop-notif-panel .tt-notif-card').length, 4, 'the latest snapshot is shown');
+  // A close that overtakes the mount cancels it.
+  listener('close', []);
+  Object.defineProperty(document, 'body', { configurable: true, get: () => null });
+  try { listener('open', entries(2)); listener('close', []); } finally { delete document.body; }
+  document.dispatchEvent(new win.Event('DOMContentLoaded'));
+  assert.equal($('#tt-desktop-notif-panel'), null);
+});
+
+test('the in-app stack is hidden while the full list is mounted', async () => {
+  const { readFileSync } = await import('node:fs');
+  const css = readFileSync(new URL('./styles.css', import.meta.url), 'utf8');
+  assert.match(css, /body:has\(#tt-desktop-notif-panel\) #tt-notif-stack \{ display: none; \}/);
+});

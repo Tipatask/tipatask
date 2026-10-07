@@ -265,6 +265,7 @@ function finalizePiTurn(session, taskId, code, emit, stats) {
     turnIndex,
     code: code ?? 0,
   };
+  if (typeof session.onNativeSession === 'function') session.onNativeSession(); // turn done: refresh the chat-history entry
 
   const wsOpen = session.ws && session.ws.readyState === session.ws.OPEN;
   if (wsOpen) {
@@ -484,6 +485,7 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
           session.piSessionId = event.id;
           session._providerSwitchPending = false; // (C1030) handoff consumed — future turns resume normally
           console.log(`[pi] session_id=${event.id} version=${event.version}`);
+          if (typeof session.onNativeSession === 'function') session.onNativeSession(); // chat-history index (ws-handlers.js recordChatHistory, never throws)
         }
         if (config.OBJECTIVE_TIMING_ENABLED) {
           session.timingMilestones.claudeInitAt = Date.now();

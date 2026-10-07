@@ -277,3 +277,66 @@ test('large claude transcript: only the tail is read, final message still found'
   fs.writeFileSync(path.join(dir, `${id}.jsonl`), filler + jl(cAssistant('m1', 'end_turn', [cText('Tail message.')])));
   assert.deepEqual(readClaudeFinalMessage({ cwd, agentSessionId: id, env: { CLAUDE_CONFIG_DIR: home } }), { text: 'Tail message.', turnEnded: true });
 });
+
+// ── (TPT539) conversation read-back for task/project chat history resume ──
+{
+  const { parseClaudeConversation, parseCodexConversation, parsePiConversation, readNativeConversation } = require('./final-message');
+  const FIXTURES = path.join(__dirname, '..', '..', '..', 'fixtures', 'chat-transcripts');
+  // Every fixture holds the same chat: generated seed, greeting, a codeword turn with a tool call,
+  // provider bookkeeping (meta lines, injected instructions, reasoning, compaction), a recall turn.
+  const EXPECTED = [
+    ['assistant', 'Hi, I can help with TPT1.'],
+    ['user', 'The codeword is PELICAN. Remember it.'],
+    ['assistant', 'Let me check the task first.\n\nNoted: PELICAN.'],
+    ['user', 'What is the codeword?'],
+    ['assistant', 'PELICAN'],
+  ];
+
+  for (const provider of ['claude', 'codex', 'pi']) {
+    test(`(TPT539) ${provider}: user/assistant text only, seed and reminder stripped, one reply per turn`, () => {
+      const result = readNativeConversation(provider, path.join(FIXTURES, `${provider}.jsonl`));
+      assert.deepEqual(result.messages.map(m => [m.role, m.content]), EXPECTED);
+      const text = JSON.stringify(result);
+      assert.doesNotMatch(text, /Fixture task|AGENTS\.md|environment_context|Reminder:|sidechain|compacted summary|tool_result|\{"id":"TPT1"\}/);
+    });
+  }
+
+  test('(TPT539) a tail read keeps its first user message: the seed is not in view', () => {
+    const raw = fs.readFileSync(path.join(FIXTURES, 'pi.jsonl'), 'utf8');
+    const fromTail = parsePiConversation(raw, { fromStart: false });
+    assert.equal(fromTail[0].role, 'user');
+    assert.match(fromTail[0].content, /Fixture task/);
+  });
+
+  test('(TPT539) readNativeConversation caps count and size, and fails open', (t) => {
+    const dir = tmpDir(t);
+    const turns = [];
+    for (let i = 0; i < 40; i++) {
+      turns.push({ type: 'user', message: { role: 'user', content: i === 0 ? 'SEED' : `question ${i} ${'x'.repeat(100)}` } });
+      turns.push({ type: 'assistant', message: { id: `m${i}`, role: 'assistant', content: [{ type: 'text', text: `answer ${i}` }] } });
+    }
+    const file = path.join(dir, 's.jsonl');
+    fs.writeFileSync(file, jl(...turns));
+    const capped = readNativeConversation('claude', file, { maxMessages: 10, maxChars: 30 });
+    assert.equal(capped.messages.length, 10);
+    assert.equal(capped.messages.at(-1).content, 'answer 39');
+    assert.ok(capped.messages.every(m => m.content.length <= 30));
+    const total = readNativeConversation('claude', file, { maxTotalChars: 500 });
+    assert.ok(total.messages.reduce((n, m) => n + m.content.length, 0) <= 500);
+    assert.equal(total.messages.at(-1).content, 'answer 39', 'the newest messages are the ones kept');
+    const tail = readNativeConversation('claude', file, { maxBytes: 2000 });
+    assert.ok(tail.messages.length > 0 && tail.messages.at(-1).content === 'answer 39');
+
+    assert.equal(readNativeConversation('claude', path.join(dir, 'missing.jsonl')), null);
+    assert.equal(readNativeConversation('gemini', file), null);
+    fs.writeFileSync(path.join(dir, 'junk.jsonl'), 'not json\n{"type":"other"}\n');
+    assert.equal(readNativeConversation('codex', path.join(dir, 'junk.jsonl')), null, 'nothing of the provider shape');
+    assert.deepEqual(parseClaudeConversation(jl({ type: 'user', message: { role: 'user', content: 'SEED' } })), [],
+      'a session holding only the seed reads back as an empty conversation');
+    assert.deepEqual(parseCodexConversation(jl(
+      { type: 'event_msg', payload: { type: 'user_message', message: 'SEED' } },
+      { type: 'event_msg', payload: { type: 'agent_message', message: 'Hi' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'Q' } },
+    )).map(m => m.content), ['Hi', 'Q'], 'older rollouts without response items');
+  });
+}

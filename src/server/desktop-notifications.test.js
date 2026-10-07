@@ -539,3 +539,93 @@ test('pageHeight follows the compact page geometry', () => {
   assert.equal(pageHeight(5), 16 + 24 + 8 + 5 * 70 + 4 * 8 + 8 + 24);
   assert.equal(pageHeight(6), pageHeight(5));
 });
+
+// Project window whose page is still loading until `loaded()` is called. As in Electron,
+// isLoadingMainFrame() still reports true while did-finish-load is being emitted.
+function loadingWindow() {
+  const win = projectWindow();
+  let loading = true;
+  win.webContents.isLoadingMainFrame = () => loading;
+  win.loaded = () => { win.webContents.emit('did-finish-load'); loading = false; };
+  win.channels = () => win.webContents.sent.map((m) => m.channel).filter((c) => c.startsWith('notify:desktop-list'));
+  return win;
+}
+
+test('Show More waits for a loading target and keeps ownership across its first navigation', async () => {
+  const target = loadingWindow();
+  const f = fixture({ showMoreTarget: target, projects: [target] });
+  await show(f, 7);
+  f.action(null, 'show-more');
+  assert.deepEqual(target.channels(), [], 'nothing is sent to a page that has no listener yet');
+  target.webContents.emit('did-navigate');
+  await show(f, 1);
+  assert.deepEqual(target.channels(), [], 'an update never precedes the open');
+  target.loaded();
+  assert.deepEqual(target.channels(), ['notify:desktop-list-open']);
+  assert.equal(target.webContents.sent.at(-1).data.length, 8, 'the open carries the current snapshot');
+  // The focus settle that follows the raise leaves ownership alone.
+  f.focus(target);
+  f.focus(null);
+  const newest = f.surface.snapshot()[0];
+  f.listAction(target.webContents, 'close', newest.id);
+  assert.equal(target.channels().at(-1), 'notify:desktop-list');
+  assert.equal(target.webContents.sent.at(-1).data.length, 7);
+  // A reload after the open drops the panel DOM, so ownership ends there.
+  target.webContents.emit('did-navigate');
+  const before = target.channels().length;
+  await show(f, 1);
+  assert.equal(target.channels().length, before);
+  f.surface.dispose();
+});
+
+test('a target whose page fails to load releases the list; a replaced load does not', async () => {
+  const target = loadingWindow();
+  const f = fixture({ showMoreTarget: target, projects: [target] });
+  await show(f, 6);
+  f.action(null, 'show-more');
+  target.webContents.emit('did-fail-load', {}, -3, 'ERR_ABORTED', 'http://x', true);
+  target.webContents.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', 'http://x', false);
+  target.loaded();
+  assert.deepEqual(target.channels(), ['notify:desktop-list-open']);
+
+  const dead = loadingWindow();
+  const g = fixture({ showMoreTarget: dead, projects: [dead] });
+  await show(g, 6);
+  g.action(null, 'show-more');
+  dead.webContents.emit('did-fail-load', {}, -102, 'ERR_CONNECTION_REFUSED', 'http://x', true);
+  dead.loaded();
+  assert.deepEqual(dead.channels(), [], 'a failed page is no longer the owner');
+  assert.equal(g.surface.snapshot().length, 6);
+  f.surface.dispose();
+  g.surface.dispose();
+});
+
+test('Show More accepts an async target, coalesces repeat clicks and survives no target', async () => {
+  const target = projectWindow();
+  let resolve;
+  const f = fixture({ showMoreTarget: new Promise((r) => { resolve = r; }), projects: [target] });
+  await show(f, 7);
+  f.action(null, 'show-more');
+  f.action(null, 'show-more');
+  assert.equal(f.shownMore.length, 1, 'one target resolution at a time');
+  assert.equal(target.webContents.sent.some((m) => m.channel === 'notify:desktop-list-open'), false);
+  resolve(target);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(target.webContents.sent.find((m) => m.channel === 'notify:desktop-list-open').data.length, 7);
+  f.action(null, 'show-more');
+  assert.equal(f.shownMore.length, 2, 'a settled Show More can be repeated');
+  f.surface.dispose();
+
+  // No window could be found or reopened: nothing is lost and the banner stays up.
+  for (const none of [() => null, () => Promise.resolve(null), () => Promise.reject(new Error('no window'))]) {
+    const g = fixture({ showMoreTarget: none() });
+    await show(g, 7);
+    g.action(null, 'show-more');
+    await new Promise((r) => setImmediate(r));
+    assert.equal(g.surface.snapshot().length, 7);
+    assert.equal(g.windows[0].visible, true);
+    g.action(null, 'show-more');
+    assert.equal(g.shownMore.length, 2);
+    g.surface.dispose();
+  }
+});

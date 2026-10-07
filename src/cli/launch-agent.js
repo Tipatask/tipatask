@@ -36,7 +36,9 @@ function launch(argv = process.argv.slice(2), spawn = require('node:child_proces
   let prefix = [];
   if (provider === 'codex') {
     env = require('../server/codex-env').buildCodexEnv({ projectRoot: root, term: 'xterm-256color' }).env;
-    prefix = require('../server/codex-env').codexTerminalLaunchOptions(root, env.CODEX_HOME, undefined, env).args;
+    const launch = require('../server/codex-env').codexTerminalLaunchOptions(root, env.CODEX_HOME, undefined, env);
+    prefix = launch.args;
+    env.CODEX_HOME = launch.codexHome;
     command = resolveBin('codex');
   } else if (provider === 'pi') {
     const spec = require('../server/spawn-utils').resolvePiLaunch();

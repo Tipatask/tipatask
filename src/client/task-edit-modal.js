@@ -6,6 +6,7 @@ import { queueReasonText } from './queue-reason.js';
 import { agentModelOptions, ensureAgentModels, EFFORT_LEVELS, EFFORT_LABELS } from './constants.js';
 import { statusNames, statusLabel, statusColor, isInProgressName, startName } from './status-registry.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
+import { hasTaskSession } from './dependency-status.js';
 import { escapeAttr, insertAtCursor, renderMarkdown, renderSprintCombobox, initSprintCombobox, showToast, showBoardLoader, hideBoardLoader, showActionBanner, hideActionBanner, taskOpenErrorLabel, sprintRecordMax } from './utils.js';
 import { api } from './api-client.js';
 import { isTaskDiscussing, lockIntentOf, lockMessageKey } from './discuss-lock.js';
@@ -96,7 +97,9 @@ function _syncModalStartDependencyState(modal, task = _modalState?.draft) {
   const btn = modal?.querySelector('.modal-context-btns [data-action="start"]');
   if (!btn || !task) return;
   const taskIndex = commands._projectTaskIndex();
-  const blocked = commands.hasUnmetDeps(task, taskIndex);
+  // (TPT552) Only a fresh launch is dependency-gated: with a session already attached, the
+  // button reopens it (Resume / Show Terminal), matching the Agent Terminal tab's live dot.
+  const blocked = commands.hasUnmetDeps(task, taskIndex) && !hasTaskSession(task.id);
   const blockers = blocked ? commands.unmetDependencyKeys(task, taskIndex) : [];
   btn.disabled = blocked;
   btn.classList.toggle('deps-blocked', blocked);
@@ -1234,7 +1237,7 @@ function _renderTaskEditModal() {
   // _modalSessionButton() just below _syncModalStartDependencyState().
   const sessionBtn = _modalSessionButton(draft);
   const projectTaskIndex = commands._projectTaskIndex(); // (TPT111) falls back to state.taskStatusById pre-list
-  const startBlocked = showStart && commands.hasUnmetDeps(draft, projectTaskIndex);
+  const startBlocked = showStart && commands.hasUnmetDeps(draft, projectTaskIndex) && !hasTaskSession(draft.id); // (TPT552)
   const unmetDeps = startBlocked ? _modalUnmetDependencyKeys(draft) : [];
   const startLabel = sessionBtn.label;
   const startTitle = startBlocked
@@ -2207,7 +2210,8 @@ function _attachModalHandlers(modal) {
       // once the list is already cached (the common case — the request was fired at
       // modal open, well before a user can click Start).
       if (!Array.isArray(commands.getProjectTaskList())) await commands._ensureProjectTaskList();
-      if (commands.hasUnmetDeps(draft, commands.getProjectTaskList())) {
+      // (TPT552) An existing session is reopened below, never relaunched — no dependency gate.
+      if (!hasTaskSession(taskId) && commands.hasUnmetDeps(draft, commands.getProjectTaskList())) {
         _syncModalStartDependencyState(modal, draft);
         return;
       }
@@ -2240,7 +2244,7 @@ function _attachModalHandlers(modal) {
         if (!saved) return; // persistDraft() already toasted; modal stays open, session untouched
       }
       clearAttention(taskId, 'session-ended');
-      commands.terminateSessionFromCard(taskId);
+      commands.terminateSessionFromCard(taskId, { dismissAlerts: true });
       closeTaskEditModal(true);
     } else if (action === 'reiterate') {
       closeTaskEditModal(true);

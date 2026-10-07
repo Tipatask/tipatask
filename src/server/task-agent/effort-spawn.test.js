@@ -2,7 +2,7 @@
 
 // TPT286 — a task's persisted effort (task.effort, threaded into getSpawnSpec() as opts.task)
 // must reach every agent CLI that supports one: Claude via CLAUDE_CODE_EFFORT_LEVEL (+ --effort
-// when the installed CLI's --help lists it), Codex via config or -c (max -> xhigh),
+// when the installed CLI's --help lists it), interactive Codex via config (max -> xhigh),
 // Pi not at all (spawn unchanged).
 
 const { test } = require('node:test');
@@ -138,8 +138,8 @@ test('Codex: task effort replaces the default model_reasoning_effort, max -> xhi
   ];
   for (const [task, expected] of cases) {
     const spec = await new CodexAgent().getSpawnSpec(cfg, 'Work on task TPT99.', '', { projectPath: projectRoot, task });
-    assert.deepEqual(effortArgPairs(spec.args), expected === 'model_reasoning_effort="high"' ? [] : [expected], `task=${JSON.stringify(task)}`);
-    assert.match(fs.readFileSync(path.join(spec.env.CODEX_HOME, 'config.toml'), 'utf8'), /^model_reasoning_effort = "high"/);
+    assert.deepEqual(effortArgPairs(spec.args), [], `task=${JSON.stringify(task)}`);
+    assert.equal(require('toml').parse(fs.readFileSync(path.join(spec.env.CODEX_HOME, 'config.toml'), 'utf8')).model_reasoning_effort, expected.split('"')[1]);
   }
 });
 

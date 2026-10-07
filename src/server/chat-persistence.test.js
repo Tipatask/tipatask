@@ -192,3 +192,47 @@ test('stale crash temp is ignored and removed without replacing the live draft',
   assert.equal((await f.store.readChatDraft(project)).messages[0].content, 'saved');
   await assert.rejects(fs.stat(orphan), { code: 'ENOENT' });
 });
+
+// ── (TPT538) chat history index ─────────────────────────────────────────────────────────
+
+const { CHAT_HISTORY_MAX_ENTRIES } = require('./chat-persistence');
+
+function historyPath(userDataRoot, projectPath) {
+  const hash = crypto.createHash('md5').update(projectPath).digest('hex').slice(0, 8);
+  return path.join(userDataRoot, `chat-history-${hash}.json`);
+}
+
+test('chat history upsert merges by historyId, keeps createdAt and orders by activity', async (t) => {
+  const f = await fixture(t);
+  assert.deepEqual(await f.store.readChatHistory('/project'), [], 'no index is an empty history');
+  await f.store.upsertChatHistory('/project', { historyId: 'a', provider: 'claude', createdAt: 100, lastActivityAt: 100 });
+  await f.store.upsertChatHistory('/project', { historyId: 'b', provider: 'codex', lastActivityAt: 200 });
+  const saved = await f.store.upsertChatHistory('/project', { historyId: 'a', provider: 'claude', title: 'Renamed', lastActivityAt: 300 });
+  assert.equal(saved.createdAt, 100);
+  const entries = await f.store.readChatHistory('/project');
+  assert.deepEqual(entries.map(e => [e.historyId, e.title || '']), [['a', 'Renamed'], ['b', '']]);
+  const onDisk = JSON.parse(await fs.readFile(historyPath(f.userDataRoot, '/project'), 'utf8'));
+  assert.equal(onDisk.version, 1);
+  assert.equal(onDisk.entries.length, 2);
+  await assert.rejects(f.store.upsertChatHistory('/project', { provider: 'claude' }), { code: 'INVALID_CHAT_HISTORY' });
+});
+
+test('chat history is per project path, capped, and survives a malformed index as empty', async (t) => {
+  const f = await fixture(t);
+  await f.store.upsertChatHistory('/project-a', { historyId: 'only-a', lastActivityAt: 1 });
+  assert.deepEqual(await f.store.readChatHistory('/project-b'), []);
+  const writes = [];
+  for (let i = 0; i < CHAT_HISTORY_MAX_ENTRIES + 5; i++) {
+    writes.push(f.store.upsertChatHistory('/project-b', { historyId: `h${i}`, lastActivityAt: 1000 + i }));
+  }
+  await Promise.all(writes);
+  const entries = await f.store.readChatHistory('/project-b');
+  assert.equal(entries.length, CHAT_HISTORY_MAX_ENTRIES, 'queued writes all land; the oldest fall off the cap');
+  assert.equal(entries[0].historyId, `h${CHAT_HISTORY_MAX_ENTRIES + 4}`);
+  assert.equal(entries.some(e => e.historyId === 'h0'), false);
+  await fs.writeFile(historyPath(f.userDataRoot, '/project-a'), '{not json');
+  const original = console.warn;
+  console.warn = () => {};
+  try { assert.deepEqual(await f.store.readChatHistory('/project-a'), []); }
+  finally { console.warn = original; }
+});

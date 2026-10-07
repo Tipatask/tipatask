@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 const {
   pushNotification,
   dismissNotification,
+  dismissTaskCards,
   clearAllNotifications,
   getNotificationEntries,
 } = await import('./notification-center.js');
@@ -81,6 +82,32 @@ test('getNotificationEntries returns a copy, not the live internal array', () =>
   const entries = getNotificationEntries();
   entries.push({ tag: 'fake', title: 'injected' });
   assert.equal(getNotificationEntries().length, 1); // internal state unaffected by the mutation above
+});
+
+test('dismissTaskCards removes exactly the task\'s attention, activity and completion cards', () => {
+  for (const tag of ['C1', 'activity-C1', 'completed-C1', 'C10', 'activity-C10', 'completed-C10', 'C2']) {
+    pushNotification({ tag, title: tag });
+  }
+  dismissTaskCards('C1');
+  assert.deepEqual(getNotificationEntries().map((e) => e.tag),
+    ['C2', 'completed-C10', 'activity-C10', 'C10']);
+});
+
+test('dismissTaskCards is a no-op for an unknown or falsy task', () => {
+  pushNotification({ tag: 'C1', title: 'One' });
+  pushNotification({ tag: 'completed-C1', title: 'Done' });
+  dismissTaskCards('C999');
+  dismissTaskCards('');
+  dismissTaskCards(null);
+  assert.deepEqual(getNotificationEntries().map((e) => e.tag), ['completed-C1', 'C1']);
+});
+
+test('dismissTaskCards keeps objective cards, including one named after the task key', () => {
+  pushNotification({ tag: 'objective-tab-1', title: 'Objective' });
+  pushNotification({ tag: 'objective-C1', title: 'Objective C1' });
+  pushNotification({ tag: 'C1', title: 'Attention' });
+  dismissTaskCards('C1');
+  assert.deepEqual(getNotificationEntries().map((e) => e.tag), ['objective-C1', 'objective-tab-1']);
 });
 
 // Exercise actual event propagation: closing must not activate the card underneath.

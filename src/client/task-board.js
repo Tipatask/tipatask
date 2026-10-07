@@ -14,12 +14,12 @@ import { escapeAttr, insertAtCursor, markTruncatedCards, loadDraft, saveDraft, c
 import { computeTierWindow, HIDE_CLASS } from './sprint-tier-visibility.js';
 import { isStatusRowChecked } from './status-filter-select.js';
 import { buildWsUrl, terminateTaskSession, resumePausedTaskSession } from './ws-client.js';
-import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys } from './task-card.js';
+import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys, hasTaskSession } from './task-card.js';
 import { buildSubtasksLabel, closedDelta, applyChildStatusDelta, countChildProgress } from './subtask-count.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { createMemberCache } from './member-cache.js';
 import { api } from './api-client.js';
-import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration } from './notifications.js';
+import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration, dismissTaskNotifications } from './notifications.js';
 import { buildDepGraph, collectCycleBlocked } from './dep-graph.js';
 import { tagName } from './tag-match.js';
 import { serializeBoardFilters, sanitizeBoardFilters } from './board-filter-prefs.js';
@@ -2463,12 +2463,15 @@ export function forgetLocalSession(taskId) {
 }
 
 // ── Terminate a session directly from the card (no terminal modal) ──
-export function terminateSessionFromCard(taskId) {
+// (TPT537) `dismissAlerts`: a user close/terminate gesture also clears the task's notification
+// cards. Off for the status-driven auto-kill (task-card.js), which keeps the completion card.
+export function terminateSessionFromCard(taskId, { dismissAlerts = false } = {}) {
   const card = document.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
   if (card) card.classList.remove('needs-attention');
   clearAttention(taskId, 'session-ended');
   return terminateTaskSession(taskId, { timeoutMs: 5000 }).finally(() => {
     forgetLocalSession(taskId);
+    if (dismissAlerts) dismissTaskNotifications(taskId);
     updateClaudeButtons();
   });
 }
@@ -2517,6 +2520,12 @@ export function updateClaudeButtons() {
     }
     const isCompleted = isCompleteName(card?.dataset.status);
     const existingTermBtn = card?.querySelector('.btn-terminate');
+    // (TPT552) Resume controls follow live session state: the dependency gate rendered by
+    // renderCard() blocks a fresh launch only, so re-derive it here — the session usually
+    // lands after the card was rendered with the gate on.
+    const depsGated = card?.dataset.depsBlocked === '1' && !hasTaskSession(taskId);
+    btn.disabled = depsGated;
+    btn.classList.toggle('deps-blocked', depsGated);
     const isActive = state.activeSessions.has(taskId);
     const isExited = state.exitedSessions.has(taskId);
     // (TPT374) mode is role-derived from the card's live status, not a literal name — an
@@ -2544,7 +2553,7 @@ export function updateClaudeButtons() {
           e.stopPropagation();
           termBtn.disabled = true;
           termBtn.innerHTML = '...';
-          terminateSessionFromCard(taskId);
+          terminateSessionFromCard(taskId, { dismissAlerts: true });
         });
         btn.insertAdjacentElement('afterend', termBtn);
       }
@@ -2578,7 +2587,7 @@ export function updateClaudeButtons() {
           clearAttention(taskId, 'session-ended');
           termBtn.disabled = true;
           termBtn.innerHTML = '...';
-          terminateSessionFromCard(taskId);
+          terminateSessionFromCard(taskId, { dismissAlerts: true });
         });
         btn.insertAdjacentElement('afterend', termBtn);
       } else if (!isCompleted && existingTermBtn) {
@@ -2605,7 +2614,7 @@ export function updateClaudeButtons() {
           clearAttention(taskId, 'session-ended');
           termBtn.disabled = true;
           termBtn.innerHTML = '...';
-          terminateSessionFromCard(taskId);
+          terminateSessionFromCard(taskId, { dismissAlerts: true });
         });
         btn.insertAdjacentElement('afterend', termBtn);
       }
@@ -2616,6 +2625,11 @@ export function updateClaudeButtons() {
         btn.title = t('btn.start');
       } else {
         btn.textContent = t('btn.start');
+      }
+      if (depsGated) {
+        let deps = [];
+        try { deps = JSON.parse(card.dataset.deps || '[]'); } catch { /* malformed — generic title */ }
+        btn.title = `Waiting for: ${unmetDependencyKeys({ dependencies: deps }).join(', ')}`;
       }
       btn.classList.remove('resumable', 'session-running');
       if (card) card.classList.remove('has-active-session');
@@ -3000,6 +3014,7 @@ export function syncActiveSessionsNav() {
       x.dataset.busy = '1';
       if (state.lostSessions.has(id)) {
         dismissLostSession(id);
+        dismissTaskNotifications(id);
         if (state.activeTerminal?.taskId === id) state.activeTerminal.detach?.({ refreshBoard: false });
         state.sessionMeta.delete(id);
         syncActiveSessionsNav();
@@ -3010,7 +3025,7 @@ export function syncActiveSessionsNav() {
         return;
       }
       clearAttention(id, 'session-ended');
-      terminateSessionFromCard(id);
+      terminateSessionFromCard(id, { dismissAlerts: true });
     };
     x.addEventListener('click', kill);
     x.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') kill(e); });

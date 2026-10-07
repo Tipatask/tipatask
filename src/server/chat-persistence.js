@@ -1,6 +1,7 @@
 'use strict';
 
-// Machine-local per-project objective chat state. The API backend does not own these files.
+// Machine-local per-project objective chat state, plus the task/project chat history index
+// (native LLM session references, metadata only). The API backend does not own these files.
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -8,6 +9,9 @@ const config = require('./config');
 const { mergeHistoryWindow } = require('./objective-history');
 
 const STALE_TEMP_MS = 24 * 60 * 60 * 1000;
+// Task/project chat history index (chat-history.js): newest entries kept, oldest dropped.
+const CHAT_HISTORY_MAX_ENTRIES = 200;
+const CHAT_HISTORY_VERSION = 1;
 const CHAT_DRAFT_VERSION = 2;
 const RELATIONSHIP_FIELDS = ['parentTaskKey', 'objectiveParentKey', 'originTaskKey', 'originResolution'];
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
@@ -199,7 +203,69 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
     });
   }
 
-  return { readChatDraft, writeChatDraft, deleteChatDraft, readChatState, writeChatState, deleteChatState };
+  function chatHistoryPath(projectPath) {
+    return path.join(userDataRoot, projectPath
+      ? `chat-history-${hashProject(projectPath)}.json`
+      : 'chat-history.json');
+  }
+
+  // A missing index is an empty history. A malformed one is too (with a warning): the index
+  // only points at provider-owned sessions, so losing it must never block a chat.
+  async function readHistoryFile(filePath) {
+    let raw;
+    try { raw = await fsOps.readFile(filePath, 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed?.entries) ? parsed.entries.filter(e => e && typeof e.historyId === 'string') : [];
+    } catch {
+      console.warn(`[chat-history] ignoring malformed index ${filePath}`);
+      return [];
+    }
+  }
+
+  async function readChatHistory(projectPath) {
+    const filePath = chatHistoryPath(projectPath);
+    return forProject(projectPath, async () => {
+      await cleanupStaleTemps(filePath);
+      return readHistoryFile(filePath);
+    });
+  }
+
+  // Insert or merge one entry by historyId. createdAt of an existing entry is kept; the list is
+  // stored newest-activity first and capped, so the oldest entries fall off.
+  async function upsertChatHistory(projectPath, entry) {
+    if (!entry || typeof entry.historyId !== 'string' || !entry.historyId) {
+      const err = new Error('Chat history entry requires a historyId');
+      err.code = 'INVALID_CHAT_HISTORY';
+      throw err;
+    }
+    const filePath = chatHistoryPath(projectPath);
+    return forProject(projectPath, async () => {
+      await cleanupStaleTemps(filePath);
+      const entries = await readHistoryFile(filePath);
+      const index = entries.findIndex(e => e.historyId === entry.historyId);
+      const previous = index >= 0 ? entries[index] : null;
+      const now = Date.now();
+      const saved = {
+        ...(previous || {}),
+        ...entry,
+        createdAt: previous?.createdAt || entry.createdAt || now,
+        lastActivityAt: entry.lastActivityAt || now,
+      };
+      if (index >= 0) entries.splice(index, 1);
+      entries.unshift(saved);
+      entries.sort((a, b) => (b.lastActivityAt || 0) - (a.lastActivityAt || 0));
+      const kept = entries.slice(0, CHAT_HISTORY_MAX_ENTRIES);
+      await atomicWrite(filePath, JSON.stringify({ version: CHAT_HISTORY_VERSION, entries: kept }, null, 2));
+      return saved;
+    });
+  }
+
+  return {
+    readChatDraft, writeChatDraft, deleteChatDraft, readChatState, writeChatState, deleteChatState,
+    readChatHistory, upsertChatHistory,
+  };
 }
 
-module.exports = { ...createChatPersistence(), createChatPersistence };
+module.exports = { ...createChatPersistence(), createChatPersistence, CHAT_HISTORY_MAX_ENTRIES };

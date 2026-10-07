@@ -412,3 +412,59 @@ test('stripPendingImageRefs: drops blob placeholders and keeps uploaded refs', (
   assert.equal(m.stripPendingImageRefs('plain'), 'plain');
   assert.equal(m.stripPendingImageRefs(undefined), '');
 });
+
+// ── (TPT539) history picker ──
+test('(TPT539) visibleHistory shows restored turns and turns the resume marker into the indicator', async () => {
+  const { visibleHistory } = await import('./task-chat-model.js');
+  const shown = visibleHistory([
+    { role: 'assistant', content: 'Earlier reply', restored: true },
+    { role: 'user', content: '', seed: true, resumed: true, historyId: 'h', provider: 'codex', transcriptUnavailable: false },
+    { role: 'user', content: 'New question' },
+  ]);
+  assert.equal(shown.length, 3);
+  assert.equal(shown[0].restored, true);
+  assert.equal(shown[0].content, 'Earlier reply');
+  assert.deepEqual(shown[1], { role: 'system', kind: 'resumed', content: '', provider: 'codex', transcriptUnavailable: false });
+  assert.equal(shown[2].restored, undefined);
+  assert.equal(visibleHistory([{ role: 'user', content: 'SEED', seed: true }]).length, 0, 'a plain seed stays hidden');
+});
+
+test('(TPT539) historyQuery scopes a task chat to its task and a project chat to project chats', async () => {
+  const { historyQuery } = await import('./task-chat-model.js');
+  assert.equal(historyQuery({ kind: 'task', key: 'TPT1' }), '/api/project/chat-history?taskKey=TPT1&limit=50');
+  assert.equal(historyQuery({ kind: 'project', key: '2', q: '  flamingo plan ' }), '/api/project/chat-history?kind=project&q=flamingo+plan&limit=50');
+});
+
+test('(TPT539) historyRowHtml shows title, provider/model, time and first excerpt, escaped; unavailable rows give the reason', async () => {
+  const { historyRowHtml, relativeTime } = await import('./task-chat-model.js');
+  const t = (key) => `«${key}»`;
+  const now = Date.UTC(2026, 9, 6, 12, 0, 0);
+  const row = {
+    historyId: 'h1', title: 'Fix <login>', provider: 'claude', model: 'opus', lastActivityAt: now - 3 * 60 * 1000,
+    available: true, excerpts: { first: 'Why does <b>it</b> fail?', latest: 'x' },
+  };
+  const html = historyRowHtml(row, { t, label: (p, m) => `${m.toUpperCase()}`, now, locale: 'en' });
+  assert.match(html, /Fix &lt;login&gt;/);
+  assert.match(html, /Claude · OPUS/);
+  assert.match(html, /3 minutes ago/);
+  assert.match(html, /Why does &lt;b&gt;it&lt;\/b&gt; fail\?/);
+  assert.doesNotMatch(html, /reason/);
+  const gone = historyRowHtml({ ...row, title: '', taskKey: 'TPT9', available: false, unavailableReason: 'checkout', excerpts: {} }, { t, now });
+  assert.match(gone, /TPT9/);
+  assert.match(gone, /«taskChat\.history\.reason\.checkout»/);
+  assert.doesNotMatch(gone, /excerpt/);
+  assert.match(historyRowHtml({ ...row, title: '' }, { t, now }), /«taskChat\.history\.untitled»/);
+  assert.equal(relativeTime(now - 2 * 86400 * 1000, { now, locale: 'uk' }), 'позавчора');
+  assert.match(relativeTime(now - 90 * 86400 * 1000, { now, locale: 'en' }), /2026/);
+  assert.equal(relativeTime(0, { now }), '');
+});
+
+test('(TPT539) historyFocusIndex moves through rows and hands ArrowUp at the top back to the search box', async () => {
+  const { historyFocusIndex } = await import('./task-chat-model.js');
+  assert.equal(historyFocusIndex(-1, 'ArrowDown', 3), 0);
+  assert.equal(historyFocusIndex(2, 'ArrowDown', 3), 2);
+  assert.equal(historyFocusIndex(0, 'ArrowUp', 3), -1);
+  assert.equal(historyFocusIndex(1, 'End', 3), 2);
+  assert.equal(historyFocusIndex(2, 'Home', 3), 0);
+  assert.equal(historyFocusIndex(0, 'ArrowDown', 0), -1);
+});

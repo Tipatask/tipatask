@@ -28,8 +28,25 @@ function spyModule(calls, prefix, overrides = {}) {
   });
 }
 
-function harness({ provider = 'claude', applyModelSelection } = {}) {
+// Chat history (TPT538): the index goes to a per-harness temp dir, and native-session lookup is
+// a stub so no provider store on this machine is read.
+const os = require('node:os');
+const { createChatPersistence } = require('./chat-persistence');
+const realChatHistory = require('./chat-history');
+const realFinalMessage = require('./task-agent/final-message');
+const FIXTURES = path.join(__dirname, '..', '..', 'fixtures', 'chat-transcripts');
+const SESSION_FIELDS = { claude: 'claudeSessionId', codex: 'codexSessionId', pi: 'piSessionId', gemini: 'geminiSessionId' };
+const historyRoots = [];
+test.after(() => { for (const root of historyRoots) fs.rmSync(root, { recursive: true, force: true }); });
+
+// `readConversation`: stub for the transcript read-back (default: an empty conversation);
+// `true` uses the real parser on whatever file `locateNativeSession` names.
+function harness({ provider = 'claude', applyModelSelection, locateNativeSession, readConversation } = {}) {
   const calls = [];
+  const historyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-chat-history-'));
+  historyRoots.push(historyRoot);
+  const history = createChatPersistence({ userDataRoot: historyRoot });
+  const located = [];
   const config = { ...require('./config'), SIMPLE_MODE: false, OBJECTIVE_PROVIDER: provider,
     PROJECT_ROOT: '/proj/a', API_PROJECT_ID: null };
   const realRequire = createRequire(SOURCE);
@@ -51,8 +68,10 @@ function harness({ provider = 'claude', applyModelSelection } = {}) {
       configForProject: () => config,
       listVisibleObjectiveProviders: () => [],
       listObjectiveProviders: () => [],
-      currentSelection: session => ({ providerId: session.providerType, model: 'model-x' }),
+      currentSelection: session => ({ providerId: session.providerType, model: session.selectedModel || 'model-x' }),
       formatSelection: (providerId, model) => `${providerId}:${model}`,
+      getProviderSessionId: (session, providerId) => session[SESSION_FIELDS[providerId]] || null,
+      PROVIDER_META: Object.fromEntries(Object.entries(SESSION_FIELDS).map(([id, sessionIdField]) => [id, { label: id, sessionIdField }])),
     }),
     './task-agent': spyModule(calls, 'agent', {
       getTaskAgentInfo: () => ({ id: 'claude', label: 'Claude' }),
@@ -62,6 +81,17 @@ function harness({ provider = 'claude', applyModelSelection } = {}) {
     }),
     './arch-cache-prewarm': spyModule(calls, 'arch'),
     './websocket': spyModule(calls, 'websocket'),
+    './chat-persistence': history,
+    './chat-history': { ...realChatHistory, historyAvailability: (entry, ctx) => {
+      located.push({ entry, ctx });
+      const file = locateNativeSession ? locateNativeSession(entry, ctx) : `/native/${entry.nativeSessionId}.jsonl`;
+      return file ? { available: true, reason: null, file } : { available: false, reason: 'missing', file: null };
+    } },
+    './task-agent/final-message': {
+      ...realFinalMessage,
+      readNativeConversation: readConversation === true ? realFinalMessage.readNativeConversation
+        : (readConversation || (() => ({ messages: [] }))),
+    },
   };
   const module = { exports: {} };
   const sandbox = {
@@ -73,7 +103,7 @@ function harness({ provider = 'claude', applyModelSelection } = {}) {
   };
   vm.runInNewContext(fs.readFileSync(SOURCE, 'utf8'), sandbox, { filename: SOURCE });
   const named = prefix => calls.filter(c => c[0] === prefix);
-  return { ctx: sandbox, exports: module.exports, calls, named, config };
+  return { ctx: sandbox, exports: module.exports, calls, named, config, history, historyRoot, located };
 }
 
 function fakeWs() {
@@ -808,4 +838,358 @@ test('task-chat-task-edited is not handled on a socket that is not a task chat',
   assert.ok(sessions.get('specChat:TPT1'), 'the socket is wired, just not as a task chat');
   assert.equal(framesOf(ws, 'task-chat-task-edited').length, 0);
   assert.equal(reads, 0);
+});
+
+// ── (TPT538) chat history: native session references, resume by historyId ──────────────────
+
+const selectByRaw = (session, raw) => {
+  if (!raw) return { changed: false };
+  const [providerId, model] = raw.split(':');
+  session.providerType = providerId;
+  session.selectedModel = model;
+  return { changed: true };
+};
+
+// The provider reports its session id (or ends a turn): what the CLI stream parsers call.
+async function emitNativeSession(session, provider, id) {
+  session[SESSION_FIELDS[provider]] = id;
+  session.onNativeSession();
+  await session._historyWrite;
+}
+
+// Resume reads the index from disk, which takes more than a few event-loop turns.
+async function settleResume(ws) {
+  for (let i = 0; i < 200 && !ws.frames.some(f => f.type === 'chat-history-resumed' || f.type === 'objective-error'); i++) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+
+async function startedProjectChat(h, sessions, id = 'projectChat:2:aaaaaa1', projectPath = '/proj/a', backend = projectBackend('2', 'Alpha')) {
+  const ws = await connect(h, sessions, backend, id, projectPath);
+  await send(ws, { type: 'start-project-chat' });
+  return { ws, session: sessions.get(`${id}\0${projectPath}`), backend };
+}
+
+test('(TPT538) a chat records one metadata-only entry per provider context; kill keeps it', async () => {
+  const h = harness({ applyModelSelection: selectByRaw });
+  const sessions = new Map();
+  const { ws, session } = await startedProjectChat(h, sessions);
+  await emitNativeSession(session, 'claude', 'claude-native-1');
+  await send(ws, { type: 'task-chat-message', content: 'Remember the codeword PELICAN-42 for later.' });
+  session.onNativeSession(); // end of the follow-up turn
+  await session._historyWrite;
+  let entries = await h.history.readChatHistory('/proj/a');
+  assert.equal(entries.length, 1);
+  const [first] = entries;
+  assert.equal(first.kind, 'project');
+  assert.equal(first.projectId, '2');
+  assert.equal(first.taskKey, null);
+  assert.equal(first.provider, 'claude');
+  assert.equal(first.nativeSessionId, 'claude-native-1');
+  assert.equal(first.title, 'Remember the codeword PELICAN-42 for later', 'the title is recorded after the first user turn names the chat');
+  assert.equal(path.resolve(first.cwd), path.resolve('/proj/a'));
+  assert.ok(first.storage && typeof first.storage.claudeConfigDir === 'string');
+  const raw = fs.readFileSync(path.join(h.historyRoot, fs.readdirSync(h.historyRoot).find(n => n.startsWith('chat-history'))), 'utf8');
+  assert.doesNotMatch(raw, /PROJECT_BODY_MARKER|Alpha task/, 'no seed or transcript text in the index');
+  // Provider switch: the new native session gets its own entry; the first one stays as it was.
+  session.providerType = 'codex';
+  await emitNativeSession(session, 'codex', '019edf2f-cec1-75f3-9b06-15f126187e08');
+  entries = await h.history.readChatHistory('/proj/a');
+  assert.equal(entries.length, 2);
+  assert.notEqual(entries[0].historyId, entries[1].historyId);
+  assert.deepEqual(entries.map(e => e.provider).sort(), ['claude', 'codex']);
+  await send(ws, { type: 'kill' });
+  await flush();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  entries = await h.history.readChatHistory('/proj/a');
+  assert.equal(entries.length, 2, 'kill never deletes an entry');
+  assert.ok(entries.find(e => e.provider === 'codex').endedAt, 'the active context is stamped ended');
+  assert.equal(h.named('ctx.clearContext').length, 0);
+});
+
+test('(TPT538) start-project-chat with historyId continues the native session without a seed or a turn', async () => {
+  const h = harness({ applyModelSelection: selectByRaw });
+  {
+    const sessions = new Map();
+    const { session } = await startedProjectChat(h, sessions);
+    session.chatTitle = 'Release blockers';
+    await emitNativeSession(session, 'claude', 'claude-native-1');
+  }
+  const [entry] = await h.history.readChatHistory('/proj/a');
+  // A fresh sessions Map stands in for a restarted Task App.
+  const sessions = new Map();
+  const spawnsBefore = h.named('dispatch.spawnTurn').length;
+  const backend = projectBackend('2', 'Alpha');
+  backend.getTasksUnfiltered = async () => { throw new Error('a resumed chat needs no task list'); };
+  const ws = await connect(h, sessions, backend, 'projectChat:2:bbbbbb2', '/proj/a');
+  await send(ws, { type: 'start-project-chat', historyId: entry.historyId });
+  await settleResume(ws);
+  const session = sessions.get('projectChat:2:bbbbbb2\0/proj/a');
+  assert.ok(session, 'the resumed chat is kept');
+  assert.equal(session.claudeSessionId, 'claude-native-1');
+  assert.equal(session.providerType, 'claude');
+  assert.equal(session._providerSwitchPending, false);
+  assert.deepEqual({ ...session._resumedHistory }, {
+    historyId: entry.historyId, provider: 'claude', nativeSessionId: 'claude-native-1', transcriptUnavailable: false,
+  });
+  assert.equal(session.chatTitle, 'Release blockers');
+  assert.equal(session.firstPrompt, null);
+  assert.equal(session.messages.length, 1);
+  assert.equal(session.messages[0].content, '', 'only the hidden resume marker, no generated seed');
+  assert.equal(session.messages[0].seed, true);
+  assert.equal(session.toolProfile, 'taskChat', 'the task-chat fence applies to the resumed chat');
+  assert.match(session.systemPrompt, /PROJECT CHAT/);
+  assert.equal(h.named('dispatch.spawnTurn').length, spawnsBefore, 'resume starts no turn');
+  const resumed = framesOf(ws, 'chat-history-resumed')[0];
+  assert.equal(resumed.historyId, entry.historyId);
+  assert.equal(resumed.provider, 'claude');
+  assert.equal(resumed.nativeSessionId, undefined, 'the native id stays on the server');
+  assert.equal(framesOf(ws, 'chat-ready').length, 1);
+  await send(ws, { type: 'task-chat-message', content: 'What was the codeword?' });
+  assert.equal(h.named('dispatch.spawnTurn').length, spawnsBefore + 1);
+  assert.equal(session.messages.at(-1).content, 'What was the codeword?');
+  // The same native session keeps the same history entry.
+  session.onNativeSession();
+  await session._historyWrite;
+  const entries = await h.history.readChatHistory('/proj/a');
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].historyId, entry.historyId);
+  // Reattach tells the client the chat came from history; restart is refused.
+  ws.emit('close');
+  const back = await connect(h, sessions, backend, 'projectChat:2:bbbbbb2', '/proj/a');
+  assert.equal(framesOf(back, 'chat-history-reset')[0].resumedHistory.historyId, entry.historyId);
+  await send(back, { type: 'restart' });
+  assert.match(framesOf(back, 'error').at(-1).message, /cannot restart/);
+  assert.equal(h.named('ctx.clearContext').length, 0);
+});
+
+test('(TPT538) task chat resume is scoped to its task and project, and refuses a missing session', async () => {
+  let present = true;
+  const h = harness({ applyModelSelection: selectByRaw, locateNativeSession: entry => (present ? `/native/${entry.nativeSessionId}` : null) });
+  const backend = projectBackend('2', 'Alpha');
+  const other = { ...TASK, id: 'TPT2', title: 'Other task' };
+  backend.getTask = async key => (key === 'TPT1' ? TASK : key === 'TPT2' ? other : null);
+  {
+    const sessions = new Map();
+    const ws = await connect(h, sessions, backend, CHAT_ID, '/proj/a');
+    await send(ws, { type: 'start-task-chat', model: 'pi:pi-model' });
+    const session = sessions.get(`${CHAT_ID}\0/proj/a`);
+    await emitNativeSession(session, 'pi', 'pi-native-1');
+    // A second chat on the same task is a second entry.
+    session.piSessionId = null;
+    await emitNativeSession(session, 'pi', 'pi-native-2');
+  }
+  const entries = await h.history.readChatHistory('/proj/a');
+  assert.equal(entries.length, 2);
+  assert.ok(entries.every(e => e.kind === 'task' && e.taskKey === 'TPT1' && e.title === TASK.title && e.model === 'pi-model'));
+  const entry = entries.find(e => e.nativeSessionId === 'pi-native-1');
+
+  const attempt = async (id, projectPath, historyId, b = backend) => {
+    const sessions = new Map();
+    const ws = await connect(h, sessions, b, id, projectPath);
+    await send(ws, { type: id.startsWith('projectChat:') ? 'start-project-chat' : 'start-task-chat', historyId });
+    await settleResume(ws);
+    return { ws, sessions, error: framesOf(ws, 'objective-error')[0] };
+  };
+  const spawns = h.named('dispatch.spawnTurn').length;
+
+  const ok = await attempt(CHAT_ID, '/proj/a', entry.historyId);
+  assert.equal(ok.error, undefined);
+  const resumed = ok.sessions.get(`${CHAT_ID}\0/proj/a`);
+  assert.equal(resumed.piSessionId, 'pi-native-1');
+  assert.equal(resumed.selectedModel, 'pi-model');
+  assert.equal(h.located.at(-1).ctx.cwd, '/proj/a');
+
+  const wrongTask = await attempt('taskChat:TPT2', '/proj/a', entry.historyId);
+  assert.equal(wrongTask.error.reason, 'history-unavailable');
+  assert.equal(wrongTask.error.status, 403);
+  assert.equal(wrongTask.sessions.size, 0);
+
+  const projectScope = await attempt('projectChat:2:cccccc3', '/proj/a', entry.historyId);
+  assert.equal(projectScope.error.status, 403, 'a task entry never resumes as a project chat');
+
+  const otherProject = await attempt('projectChat:3:dddddd4', '/proj/b', entry.historyId, projectBackend('3', 'Beta'));
+  assert.equal(otherProject.error.reason, 'history-unavailable');
+  assert.equal(otherProject.error.status, 404, "another project's index does not hold the entry");
+
+  const unknown = await attempt(CHAT_ID, '/proj/a', '00000000-0000-4000-8000-000000000000');
+  assert.equal(unknown.error.status, 404);
+  const malformed = await attempt(CHAT_ID, '/proj/a', '../../etc');
+  assert.equal(malformed.error.status, 400);
+
+  present = false;
+  const missing = await attempt(CHAT_ID, '/proj/a', entry.historyId);
+  assert.equal(missing.error.reason, 'history-unavailable');
+  assert.equal(missing.error.status, 410);
+  assert.match(missing.error.message, /no longer available/);
+  assert.equal(missing.sessions.size, 0, 'nothing half-started is left');
+  assert.equal(h.named('dispatch.spawnTurn').length, spawns, 'no failed resume ever spawns a fresh turn');
+});
+
+test('(TPT538) a resumed chat that gets a different native session says so and records it apart', async () => {
+  const h = harness({ applyModelSelection: selectByRaw });
+  {
+    const sessions = new Map();
+    const { session } = await startedProjectChat(h, sessions);
+    await emitNativeSession(session, 'claude', 'claude-native-1');
+  }
+  const [entry] = await h.history.readChatHistory('/proj/a');
+  const sessions = new Map();
+  const ws = await connect(h, sessions, projectBackend('2'), 'projectChat:2:eeeeee5', '/proj/a');
+  await send(ws, { type: 'start-project-chat', historyId: entry.historyId });
+  await settleResume(ws);
+  const session = sessions.get('projectChat:2:eeeeee5\0/proj/a');
+  await emitNativeSession(session, 'claude', 'claude-native-fresh');
+  const changed = framesOf(ws, 'chat-history-changed')[0];
+  assert.equal(changed.historyId, entry.historyId);
+  assert.equal(session._resumedHistory, null);
+  const entries = await h.history.readChatHistory('/proj/a');
+  assert.equal(entries.length, 2);
+  assert.equal(entries.find(e => e.historyId === entry.historyId).nativeSessionId, 'claude-native-1', 'the old entry keeps its own session');
+});
+
+test('(TPT538) GET /api/project/chat-history lists metadata only, filtered by project, task and query', async () => {
+  const h = harness({ applyModelSelection: selectByRaw });
+  const backend = projectBackend('2', 'Alpha');
+  {
+    const sessions = new Map();
+    const ws = await connect(h, sessions, backend, CHAT_ID, '/proj/a');
+    await send(ws, { type: 'start-task-chat' });
+    await emitNativeSession(sessions.get(`${CHAT_ID}\0/proj/a`), 'claude', 'claude-task-1');
+    const { session } = await startedProjectChat(h, sessions);
+    session.chatTitle = 'Sprint review notes';
+    session.messages.push({ role: 'user', content: 'Plan the flamingo rollout for chat-picker.js', timestamp: 1 });
+    await emitNativeSession(session, 'claude', 'claude-project-1');
+  }
+  // An entry written for another project id under the same path never lists.
+  await h.history.upsertChatHistory('/proj/a', { historyId: '11111111-1111-4111-8111-111111111111', kind: 'project', projectId: '9', title: 'Foreign', provider: 'claude', nativeSessionId: 'x', cwd: '/proj/a', storage: {} });
+  const handler = h.exports.createHttpHandler(new Map(), () => backend);
+  async function get(query) {
+    const { Readable } = require('node:stream');
+    const req = Readable.from([]);
+    Object.assign(req, { method: 'GET', url: `/api/project/chat-history${query}`, headers: { 'x-tipatask-project': '/proj/a' } });
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = JSON.parse(body); } };
+    await handler(req, res);
+    return res;
+  }
+  const all = await get('');
+  assert.equal(all.status, 200);
+  assert.deepEqual(all.body.entries.map(e => e.kind).sort(), ['project', 'task']);
+  for (const row of all.body.entries) {
+    assert.deepEqual(Object.keys(row).sort(), ['available', 'createdAt', 'endedAt', 'excerpts', 'historyId', 'keywords', 'kind',
+      'lastActivityAt', 'model', 'provider', 'taskKey', 'title', 'unavailableReason']);
+    assert.equal(row.available, true);
+    assert.equal(row.unavailableReason, null);
+  }
+  assert.doesNotMatch(JSON.stringify(all.body), /claude-task-1|claude-project-1|\/proj\/a/, 'no native id or path leaves the server');
+  // (TPT539) q also matches the search data: a keyword, and text of an excerpt.
+  const byKeyword = await get('?q=flamingo');
+  assert.deepEqual(byKeyword.body.entries.map(e => e.title), ['Sprint review notes']);
+  assert.equal(byKeyword.body.entries[0].excerpts.first, 'Plan the flamingo rollout for chat-picker.js');
+  assert.ok(byKeyword.body.entries[0].keywords.includes('chat-picker.js'));
+  const byExcerpt = await get(`?q=${encodeURIComponent('the flamingo rollout')}`);
+  assert.equal(byExcerpt.body.entries.length, 1);
+  const task = await get('?taskKey=tpt1');
+  assert.deepEqual(task.body.entries.map(e => e.taskKey), ['TPT1']);
+  const query = await get('?q=sprint');
+  assert.deepEqual(query.body.entries.map(e => e.title), ['Sprint review notes']);
+  const none = await get('?taskKey=TPT99');
+  assert.deepEqual(none.body.entries, []);
+});
+
+// ── (TPT539) search data, transcript read-back ──────────────────────────────────────────────
+
+test('(TPT539) each record carries bounded keywords and excerpts from the conversation, never the seed', async () => {
+  const h = harness({ applyModelSelection: selectByRaw });
+  const sessions = new Map();
+  const { ws, session } = await startedProjectChat(h, sessions);
+  await emitNativeSession(session, 'claude', 'claude-native-1');
+  const long = `Please look at recordChatHistory in chat-history.js for TPT539 ${'and the picker '.repeat(30)}`;
+  await send(ws, { type: 'task-chat-message', content: long });
+  session.messages.push({ role: 'assistant', content: 'The keyword index lives in the history entry.', timestamp: 2 });
+  await send(ws, { type: 'task-chat-message', content: 'Latest question about PELICAN-42?' });
+  session.onNativeSession();
+  await session._historyWrite;
+  const [entry] = await h.history.readChatHistory('/proj/a');
+  assert.ok(entry.keywords.length > 0 && entry.keywords.length <= realChatHistory.KEYWORD_COUNT);
+  for (const k of ['recordchathistory', 'chat-history.js', 'tpt539', 'pelican-42', 'keyword']) assert.ok(entry.keywords.includes(k), k);
+  assert.ok(!entry.keywords.some(k => /project_body_marker|alpha/.test(k)), 'nothing from the generated seed');
+  assert.ok(entry.excerpts.first.startsWith('Please look at recordChatHistory'));
+  assert.ok(entry.excerpts.first.length <= realChatHistory.EXCERPT_CHARS && entry.excerpts.first.endsWith('…'));
+  assert.equal(entry.excerpts.latest, 'Latest question about PELICAN-42?');
+});
+
+test('(TPT539) resume reads the earlier conversation back ahead of the hidden marker; the next turn adds only the new message', async () => {
+  const h = harness({
+    applyModelSelection: selectByRaw,
+    locateNativeSession: () => path.join(FIXTURES, 'claude.jsonl'),
+    readConversation: true,
+  });
+  {
+    const sessions = new Map();
+    const { session } = await startedProjectChat(h, sessions);
+    session.chatTitle = 'Codeword chat';
+    session.messages.push({ role: 'user', content: 'The codeword is PELICAN. Remember it.', timestamp: 1 });
+    await emitNativeSession(session, 'claude', 'claude-native-1');
+  }
+  const [entry] = await h.history.readChatHistory('/proj/a');
+  assert.ok(entry.keywords.includes('pelican'));
+  const sessions = new Map();
+  const ws = await connect(h, sessions, projectBackend('2', 'Alpha'), 'projectChat:2:bbbbbb2', '/proj/a');
+  await send(ws, { type: 'start-project-chat', historyId: entry.historyId });
+  await settleResume(ws);
+  const session = sessions.get('projectChat:2:bbbbbb2\0/proj/a');
+  const restored = session.messages.filter(m => m.restored);
+  assert.deepEqual(restored.map(m => [m.role, m.content]), [
+    ['assistant', 'Hi, I can help with TPT1.'],
+    ['user', 'The codeword is PELICAN. Remember it.'],
+    ['assistant', 'Let me check the task first.\n\nNoted: PELICAN.'],
+    ['user', 'What is the codeword?'],
+    ['assistant', 'PELICAN'],
+  ]);
+  assert.ok(session.messages.at(-1).resumed, 'the hidden marker follows the restored messages');
+  assert.equal(session._resumedHistory.transcriptUnavailable, false);
+  const frame = framesOf(ws, 'chat-history-resumed')[0];
+  assert.equal(frame.messages.length, 5);
+  assert.ok(frame.messages.every(m => m.restored));
+  assert.equal(frame.transcriptUnavailable, false);
+  await send(ws, { type: 'task-chat-message', content: 'And now?' });
+  assert.equal(session.messages.at(-1).content, 'And now?');
+  // The resumed record keeps the earlier search data and folds the new turn in.
+  session.onNativeSession();
+  await session._historyWrite;
+  const [after] = await h.history.readChatHistory('/proj/a');
+  assert.equal(after.historyId, entry.historyId);
+  assert.ok(after.keywords.includes('pelican'));
+  assert.equal(after.excerpts.first, entry.excerpts.first, 'the first excerpt is the original one');
+  assert.equal(after.excerpts.latest, 'And now?');
+  // Reattach replays the restored messages; restart stays refused.
+  ws.emit('close');
+  const back = await connect(h, sessions, projectBackend('2', 'Alpha'), 'projectChat:2:bbbbbb2', '/proj/a');
+  const reset = framesOf(back, 'chat-history-reset')[0];
+  assert.equal(reset.messages.filter(m => m.restored).length, 5);
+  assert.equal(reset.resumedHistory.transcriptUnavailable, false);
+  await send(back, { type: 'restart' });
+  assert.match(framesOf(back, 'error').at(-1).message, /cannot restart/);
+});
+
+test('(TPT539) an unreadable native session file still resumes, with an empty window and a notice flag', async () => {
+  const h = harness({ applyModelSelection: selectByRaw, readConversation: () => null });
+  {
+    const sessions = new Map();
+    const { session } = await startedProjectChat(h, sessions);
+    await emitNativeSession(session, 'claude', 'claude-native-1');
+  }
+  const [entry] = await h.history.readChatHistory('/proj/a');
+  const sessions = new Map();
+  const ws = await connect(h, sessions, projectBackend('2', 'Alpha'), 'projectChat:2:bbbbbb2', '/proj/a');
+  await send(ws, { type: 'start-project-chat', historyId: entry.historyId });
+  await settleResume(ws);
+  assert.equal(framesOf(ws, 'objective-error').length, 0, 'not history-unavailable');
+  const frame = framesOf(ws, 'chat-history-resumed')[0];
+  assert.equal(frame.transcriptUnavailable, true);
+  assert.deepEqual(frame.messages, []);
+  const session = sessions.get('projectChat:2:bbbbbb2\0/proj/a');
+  assert.equal(session.messages.length, 1);
+  assert.equal(session._resumedHistory.transcriptUnavailable, true);
 });

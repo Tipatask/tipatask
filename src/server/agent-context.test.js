@@ -211,7 +211,8 @@ test('shell launcher binds all supported agents and refreshes Codex environment 
       assert.equal(call.opts.env.TIPATASK_USER_DATA, envBefore.TIPATASK_USER_DATA);
       assert.ok(!JSON.stringify(call.args).includes(token), 'argv is credential-free');
       if (provider === 'codex') {
-        assert.equal(call.opts.env.CODEX_HOME, path.join(root, '.codex'));
+        assert.equal(path.dirname(path.dirname(call.opts.env.CODEX_HOME)), path.join(root, '.codex'));
+        assert.ok(!call.args.some(arg => ['-c', '--config', '--profile', '--enable', '--disable', '--search'].includes(arg)));
         assert.ok(call.opts.env.TIPATASK_API_TOKEN === token);
       }
     }

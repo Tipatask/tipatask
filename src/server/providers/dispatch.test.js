@@ -158,3 +158,19 @@ test('abort followed by a new turn fences the old read even without an epoch cha
   assert.equal(calls.length, 1);
   assert.equal(session._proposalContext.tasks.get('TPT1').status, 'completed');
 });
+
+test('(TPT538) a chat resumed from history never spawns without its native session id', () => {
+  calls.length = 0;
+  const frames = [];
+  const session = {
+    type: 'taskChat', toolProfile: 'taskChat', providerType: 'codex', codexSessionId: null,
+    _resumedHistory: { historyId: 'h1', provider: 'codex', nativeSessionId: 'tid' },
+    ws: { readyState: 1, send: raw => frames.push(JSON.parse(raw)) },
+  };
+  spawnTurn(session, 'id-1');
+  assert.equal(calls.length, 0);
+  assert.equal(frames[0].reason, 'history-unavailable');
+  assert.equal(frames[0].historyId, 'h1');
+  session.codexSessionId = 'tid';
+  assert.equal(route(session), 'codex', 'with the restored id the turn resumes normally');
+});

@@ -1,5 +1,5 @@
 import { getLocale } from './i18n.js';
-import { activateLocalNotification, dismissTaskNotificationCards, notificationProjectPath, removeLocalNotification, taskNotificationTags } from './notification-center.js';
+import { activateLocalNotification, dismissTaskCards, notificationProjectPath, removeLocalNotification, taskNotificationTags } from './notification-center.js';
 
 const _lastNotifiedAt = new Map();
 const DEBOUNCE_MS = 30000;
@@ -27,7 +27,7 @@ export function dismissTaskNotifications(taskId) {
   if (typeof taskId !== 'string' || !taskId.trim()) return;
   const projectPath = notificationProjectPath();
   const tags = taskNotificationTags(taskId);
-  dismissTaskNotificationCards(taskId, projectPath);
+  dismissTaskCards(taskId, projectPath);
   for (const [key, entry] of _deliveries) {
     if (entry.projectPath !== projectPath || !tags.has(entry.tag)) continue;
     releaseDelivery(key);

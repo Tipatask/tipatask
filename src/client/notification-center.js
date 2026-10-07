@@ -62,9 +62,11 @@ function _removeLocal(tag, projectPath, upTo = null) {
   return entry;
 }
 
-// Remove presentation state only: no activation/dismiss callbacks or API read writes. Main's
-// matching entries are removed by notifications.js#dismissTaskNotifications (notify:dismiss-task).
-export function dismissTaskNotificationCards(taskId, projectPath = notificationProjectPath()) {
+// Removes this window's local cards for one task (attention, activity, completion tags; exact
+// match, so other tasks and objective cards stay). Presentation state only: no activation/dismiss
+// callbacks or API read writes. Main's matching entries are removed by
+// notifications.js#dismissTaskNotifications (notify:dismiss-task), which also calls this.
+export function dismissTaskCards(taskId, projectPath = notificationProjectPath()) {
   if (!taskId) return;
   const tags = taskNotificationTags(taskId);
   const before = _entries.length;

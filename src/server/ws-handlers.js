@@ -2,12 +2,13 @@
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawn: spawnChild } = require('node:child_process');
 const config = require('./config');
 const { readLastExitSince, readLostSessions, forgetLostSession } = require('./last-exit');
 const { normalizeProposals, applyRehashIntent, spawnObjectiveTurn, killObjectiveProc, escalateKill, clearRetryTimers, clearTurnDeadline, prewarmObjective, killPrewarm, teardownObjectiveSession, trackHelperProc, clearHeartbeat, prewarmObjectiveCold, killColdPrewarm, startSleepWatchdog, objectiveCacheActivity, ensureSessionStartName, computeTurnSpans } = require('./claude-session');
 const { spawnTurn, providerSessionId, clearProviderSessionId, applyModelSelection } = require('./providers/dispatch');
-const { listObjectiveProviders, listVisibleObjectiveProviders, clampSelectionToProviders, formatSelection, currentSelection, configForProject } = require('./providers/registry');
+const { listObjectiveProviders, listVisibleObjectiveProviders, clampSelectionToProviders, formatSelection, currentSelection, configForProject, getProviderSessionId, getProviderDefaultModel, PROVIDER_META } = require('./providers/registry');
 const { createSession, isAgentChatType, isAgentChatId } = require('./session-state');
 const { TASK_CHAT, isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFromChatId, buildProjectChatTitle, buildTaskChatSeed, buildTaskChatSystemPrompt } = require('./task-chat');
 const { resolvePiMcpBridge } = require('./providers/pi-task-tools');
@@ -24,7 +25,9 @@ const { ensureArchitectureDocsForChanges } = require('./architecture-docs');
 const { clearContext, resetTurnBuffers } = require('./context-manager');
 const { highestActiveCodingPriority } = require('./sprint-assign');
 const { maxNumbersByPrefix, resolveCodingPrefix, isValidTaskKey } = require('./task-key-format');
-const { readChatDraft, writeChatDraft, deleteChatDraft, readChatState, writeChatState, deleteChatState } = require('./chat-persistence');
+const { readChatDraft, writeChatDraft, deleteChatDraft, readChatState, writeChatState, deleteChatState, readChatHistory, upsertChatHistory } = require('./chat-persistence');
+const { HISTORY_PROVIDERS, isHistoryId, nativeStorageRef, historyAvailability, buildSearchData, filterHistory, publicHistoryRow } = require('./chat-history');
+const { readNativeConversation } = require('./task-agent/final-message');
 const { readProjectConfig, readVoiceSettings, buildLanguageDirective, piEntryForModel, recordLastUsedAgent, readPiEntries, buildAgentsConfigPatch, summarizeAgents, PI_PROVIDERS, piProviderEnv, piKeyEnvVars } = require('./project-config');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolvePiLaunch } = require('./spawn-utils');
 const { transcribeWithAssemblyAI, ASSEMBLYAI_ERRORS, MAX_AUDIO_BYTES: ASSEMBLYAI_MAX_AUDIO_BYTES } = require('./assemblyai-batch');
@@ -1265,6 +1268,38 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
           .filter(Boolean);
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store' });
         return res.end(JSON.stringify({ members }));
+      } catch (err) {
+        res.writeHead(err.statusCode || 500, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: err.message }));
+      }
+    }
+
+    // Task/project chat history (chat-history.js): metadata of the native LLM sessions this
+    // project's chats used, newest first, with their bounded search data (keywords, excerpts).
+    // No transcript, native id or storage path leaves here; `available` / `unavailableReason` say
+    // whether the provider still holds the session a resume would continue.
+    if (req.method === 'GET' && urlPath === '/api/project/chat-history') {
+      try {
+        const projectPath = req.headers['x-tipatask-project'] || '';
+        let projectId = '';
+        try { projectId = String(backend.getCredentials().projectId || ''); } catch { projectId = ''; }
+        if (!projectId) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'No project is selected.' }));
+        }
+        const params = new URL(req.url, 'http://localhost').searchParams;
+        const entries = filterHistory(await readChatHistory(projectPath), {
+          projectId,
+          taskKey: params.get('taskKey') || '',
+          kind: params.get('kind') || '',
+          q: params.get('q') || '',
+          limit: params.get('limit') || '',
+        });
+        const cwd = projectPath || config.PROJECT_ROOT;
+        const scanCache = new Map();
+        const rows = entries.map(e => publicHistoryRow(e, historyAvailability(e, { cwd, env: process.env }, scanCache)));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store' });
+        return res.end(JSON.stringify({ entries: rows }));
       } catch (err) {
         res.writeHead(err.statusCode || 500, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: err.message }));
@@ -4308,6 +4343,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     // its own `kill` frame does, telling a window still attached to it, then ack this socket.
     console.log(`[task-chat] Terminate-on-connect requested for ${taskId}`);
     const attached = existing.ws;
+    recordChatHistory(existing, { ended: true }); // keeps the history entry; the provider session is never deleted
     dropObjectiveSession(sessions, sessionKey, existing, taskId, 'kill');
     existing.alive = false;
     if (attached && attached !== ws && attached.readyState === attached.OPEN) {
@@ -4480,6 +4516,13 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
       hasOlderHistory: false,
       running: !!(existing.proc || existing._spawning || existing._projectChatStarting),
       objectiveSelection: _chatSel ? formatSelection(_chatSel.providerId, _chatSel.model) : '',
+      resumedHistory: existing._resumedHistory
+        ? {
+          historyId: existing._resumedHistory.historyId,
+          provider: existing._resumedHistory.provider,
+          transcriptUnavailable: !!existing._resumedHistory.transcriptUnavailable,
+        }
+        : null,
     }));
     if (existing.proc && existing.turnBuffer.length > 0) {
       ws.send(JSON.stringify({ type: 'data', tabId: existing.tabId, data: existing.turnBuffer }));
@@ -4724,6 +4767,189 @@ function ensureTaskChatSystemPrompt(session) {
   });
   session._taskChatPromptProvider = promptKey;
   session._cachedTagsSerialized = new Set();
+}
+
+// ── Chat history (native session references, chat-history.js) ──────────────────────────
+// The index only ever points at a provider's own saved session; nothing from the transcript
+// is written. One entry per provider context: a provider switch, or a new native session of
+// the same provider, gets an entry of its own.
+
+function sendChatFrame(session, frame) {
+  if (session.ws && session.ws.readyState === session.ws.OPEN) {
+    session.ws.send(JSON.stringify({ tabId: session.tabId, ...frame }));
+  }
+}
+
+function historyProjectId(session) {
+  if (session.chatProjectId) return String(session.chatProjectId);
+  try { return String(session.backend?.getCredentials?.().projectId || ''); } catch { return ''; }
+}
+
+// session.onNativeSession: the provider emitted its session id, or finished a turn. Builds the
+// entry synchronously (so a following teardown cannot change it) and queues the write; never
+// throws into the provider's stream loop. `ended` stamps endedAt (kill / terminate) — the
+// provider's session itself is never deleted.
+function recordChatHistory(session, { ended = false } = {}) {
+  try {
+    if (!session || session.type !== 'taskChat' || !session.toolProfile) return null;
+    const provider = session.providerType || config.OBJECTIVE_PROVIDER;
+    if (!HISTORY_PROVIDERS.includes(provider)) return null;
+    const nativeSessionId = getProviderSessionId(session, provider);
+    if (!nativeSessionId) return null;
+    const projectId = historyProjectId(session);
+    if (!projectId) return null;
+    const resumed = session._resumedHistory;
+    if (resumed && resumed.provider === provider && resumed.nativeSessionId !== nativeSessionId) {
+      // The provider answered from a different session than the restored one: its context is
+      // NOT the history entry's. Say so, and record the new session as an entry of its own.
+      session._resumedHistory = null;
+      console.warn(`[chat-history] ${provider} session changed after resume (${resumed.nativeSessionId} → ${nativeSessionId})`);
+      sendChatFrame(session, {
+        type: 'chat-history-changed',
+        historyId: resumed.historyId,
+        provider,
+        message: 'The provider started a new session instead of continuing the saved one; earlier context from history is not available in this reply.',
+      });
+    }
+    session._historyIds = session._historyIds || {};
+    const key = `${provider}:${nativeSessionId}`;
+    if (!session._historyIds[key]) session._historyIds[key] = crypto.randomUUID();
+    const cwd = path.resolve(session.projectPath || config.PROJECT_ROOT);
+    const sel = currentSelection(session, configForProject(session.projectPath || config.PROJECT_ROOT));
+    const now = Date.now();
+    // Bounded search data (40 keywords, two 200-char excerpts), recomputed from the chat's
+    // messages each time; a resumed chat folds in the stored entry's data.
+    const search = buildSearchData(session.messages, session._historySearchPrior || null);
+    const entry = {
+      historyId: session._historyIds[key],
+      kind: session.chatProjectId ? 'project' : 'task',
+      projectId,
+      taskKey: session.chatProjectId ? null : (session.taskKey || null),
+      chatId: session.tabId || null,
+      title: session.chatProjectId ? (session.chatTitle || '') : (session._taskChatTask?.title || ''),
+      provider,
+      model: sel?.model || null,
+      nativeSessionId,
+      cwd,
+      storage: nativeStorageRef(provider, cwd, process.env),
+      keywords: search.keywords,
+      excerpts: search.excerpts,
+      lastActivityAt: now,
+      endedAt: ended ? now : null,
+    };
+    const previous = session._historyWrite || Promise.resolve();
+    session._historyWrite = previous
+      .then(() => upsertChatHistory(session.projectPath || '', entry))
+      .catch(err => { console.warn(`[chat-history] write failed: ${err.message}`); });
+    return session._historyWrite;
+  } catch (err) {
+    console.warn(`[chat-history] record failed: ${err.message}`);
+    return null;
+  }
+}
+
+// start-task-chat / start-project-chat with a historyId: continue the recorded native session
+// instead of seeding a new one. The caller has already verified the task (or project settings)
+// and set the chat's backend and tool profile. Every failure answers `history-unavailable`,
+// removes the pending session and spawns nothing — a missing session is never replaced by a
+// fresh one. Returns true when the chat was resumed.
+async function resumeChatFromHistory(session, { sessions, sessionKey, taskId, historyId }) {
+  const fail = (message, status = 404) => {
+    if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+    console.log(`[chat-history] resume refused for ${taskId}: ${message}`);
+    sendChatFrame(session, {
+      type: 'objective-error',
+      reason: 'history-unavailable',
+      status,
+      historyId: typeof historyId === 'string' ? historyId : null,
+      message,
+      detail: message,
+    });
+    return false;
+  };
+  if (!isHistoryId(historyId)) return fail('Unknown chat history entry.', 400);
+  let entries;
+  try { entries = await readChatHistory(session.projectPath || ''); }
+  catch (err) { return fail(`Chat history could not be read: ${err.message}`, 500); }
+  const entry = entries.find(e => e.historyId === historyId);
+  if (!entry) return fail('This chat history entry does not exist for the selected project.');
+  const projectId = historyProjectId(session);
+  const inScope = !!projectId && String(entry.projectId) === projectId && (session.chatProjectId
+    ? entry.kind === 'project'
+    : entry.kind === 'task' && entry.taskKey === session.taskKey);
+  if (!inScope) return fail('This chat history entry belongs to another task or project.', 403);
+  const label = ({ claude: 'Claude', codex: 'Codex', pi: 'Pi' })[entry.provider] || String(entry.provider || 'provider');
+  if (!HISTORY_PROVIDERS.includes(entry.provider) || !providerSupportsProfile(session, entry.provider)) {
+    return fail(`${label} cannot run task chat, so this history entry cannot be resumed.`, 409);
+  }
+  const cwd = session.projectPath || config.PROJECT_ROOT;
+  const nativeFile = historyAvailability(entry, { cwd, env: process.env }).file;
+  if (!nativeFile) {
+    return fail(`The saved ${label} session for this chat is no longer available (deleted by the provider, moved, or stored for another checkout). Start a new chat.`, 410);
+  }
+  const sel = await applyModelSelection(session, formatSelection(entry.provider, entry.model || ''), { taskId });
+  if (sel && sel.error) return fail(`${label} is not available to resume this chat: ${sel.reason || sel.error}`, 409);
+  if (sessions.get(sessionKey) !== session || session._closed) return false;
+  let applied = currentSelection(session, configForProject(cwd));
+  if (applied.providerId !== entry.provider && entry.model && !session.proc && !session._spawning
+    && entry.model === getProviderDefaultModel(entry.provider, configForProject(cwd))) {
+    // The provider's configured default: a fresh chat runs it without a catalog check, so a
+    // resume does too (a cold model catalog would otherwise reject the selection).
+    session.providerType = entry.provider;
+    session.selectedModel = null;
+    applied = currentSelection(session, configForProject(cwd));
+  }
+  if (applied.providerId !== entry.provider || (entry.model && applied.model !== entry.model)) {
+    return fail(`${label}${entry.model ? ` (${entry.model})` : ''} is not available to resume this chat.`, 409);
+  }
+  const field = PROVIDER_META[entry.provider].sessionIdField;
+  session[field] = entry.nativeSessionId;
+  session._providerSwitchPending = false;
+  // The earlier conversation, read back from the provider's own session file for display only:
+  // user/assistant text, newest 50 messages. These `restored` messages sit ahead of the hidden
+  // marker, are never sent to a provider (buildTurnPrompt leaves them out) and are never written
+  // anywhere by Task App. An unreadable file costs the transcript, not the resume.
+  const conversation = readNativeConversation(entry.provider, nativeFile);
+  const transcriptUnavailable = !conversation;
+  session._resumedHistory = {
+    historyId: entry.historyId, provider: entry.provider, nativeSessionId: entry.nativeSessionId, transcriptUnavailable,
+  };
+  session._historyIds = { [`${entry.provider}:${entry.nativeSessionId}`]: entry.historyId };
+  session._historySearchPrior = {
+    keywords: Array.isArray(entry.keywords) ? entry.keywords : [],
+    first: entry.excerpts?.first || '',
+    latest: entry.excerpts?.latest || '',
+  };
+  if (session.chatProjectId) session.chatTitle = entry.title || session.chatTitle || '';
+  ensureTaskChatSystemPrompt(session);
+  // No seed: the provider's session already holds the conversation. The hidden marker keeps a
+  // reattaching client from treating an empty history as a dead chat.
+  session.firstPrompt = null;
+  const restoredAt = Date.now();
+  const restored = (conversation ? conversation.messages : [])
+    .map(m => ({ role: m.role, content: m.content, restored: true, timestamp: restoredAt }));
+  session.messages.push(...restored);
+  session.messages.push({
+    role: 'user', content: '', seed: true, resumed: true, historyId: entry.historyId,
+    provider: entry.provider, transcriptUnavailable, timestamp: restoredAt,
+  });
+  recordChatHistory(session);
+  const current = currentSelection(session, configForProject(cwd));
+  console.log(`[chat-history] Resumed ${taskId} from ${entry.historyId} provider=${entry.provider}`);
+  sendChatFrame(session, {
+    type: 'chat-history-resumed',
+    historyId: entry.historyId,
+    taskKey: session.taskKey || null,
+    projectId: session.chatProjectId || null,
+    title: session.chatProjectId ? (session.chatTitle || '') : (session._taskChatTask?.title || ''),
+    provider: entry.provider,
+    model: entry.model || null,
+    objectiveSelection: current ? formatSelection(current.providerId, current.model) : '',
+    messages: restored.map(m => ({ role: m.role, content: m.content, restored: true })),
+    transcriptUnavailable,
+  });
+  sendChatFrame(session, { type: 'chat-ready', turnIndex: session.messages.length - 1 });
+  return true;
 }
 
 // A task-chat agent created or updated a task (session.onTaskChatMutation, called from
@@ -5269,7 +5495,8 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         const projectId = session.chatProjectId;
         const [settings, tasks] = await Promise.all([
           backend.getProjectSettings ? backend.getProjectSettings({ strict: true }) : null,
-          backend.getTasksUnfiltered ? backend.getTasksUnfiltered() : backend.getTasks(),
+          // A resumed chat sends no seed, so it needs no task list.
+          msg.historyId != null ? [] : (backend.getTasksUnfiltered ? backend.getTasksUnfiltered() : backend.getTasks()),
         ]);
         if (sessions.get(sessionKey) !== session || session._closed) return;
         if (settings?.id != null && String(settings.id) !== projectId) {
@@ -5287,10 +5514,15 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         session.toolProfile = TASK_CHAT;
         session.backend = backend;
         session.onTaskChatMutation = info => handleTaskChatMutation(session, info);
+        session.onNativeSession = () => { recordChatHistory(session); };
         session._taskChatProject = project;
         if (!providerSupportsProfile(session, session.providerType || config.OBJECTIVE_PROVIDER)) {
           session.providerType = 'claude';
           session.selectedModel = null;
+        }
+        if (msg.historyId != null) {
+          await resumeChatFromHistory(session, { sessions, sessionKey, taskId, historyId: msg.historyId });
+          return;
         }
         const _sel = await applyModelSelection(session, msg.model, { taskId });
         if (_sel.error) {
@@ -5322,7 +5554,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         const [task, comments] = await Promise.all([
           backend.getTask(taskKey),
           // Comment history is context, not a precondition — a failed read starts the chat without it.
-          Promise.resolve().then(() => backend.getTaskComments(taskKey)).catch(() => []),
+          msg.historyId != null ? [] : Promise.resolve().then(() => backend.getTaskComments(taskKey)).catch(() => []),
         ]);
         if (!task) {
           if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
@@ -5336,12 +5568,17 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         session.toolProfile = TASK_CHAT;
         session.backend = backend;
         session.onTaskChatMutation = info => handleTaskChatMutation(session, info);
+        session.onNativeSession = () => { recordChatHistory(session); };
         session._taskChatTask = { id: task.id || taskKey, title: task.title || '' };
         // A server-wide default the profile cannot run on (gemini) must not be advertised
         // back to the client as this chat's provider.
         if (!providerSupportsProfile(session, session.providerType || config.OBJECTIVE_PROVIDER)) {
           session.providerType = 'claude';
           session.selectedModel = null;
+        }
+        if (msg.historyId != null) {
+          await resumeChatFromHistory(session, { sessions, sessionKey, taskId, historyId: msg.historyId });
+          return;
         }
         const _sel = await applyModelSelection(session, msg.model, { taskId });
         if (_sel.error) {
@@ -5647,6 +5884,14 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         }
         return;
       }
+      if (session._resumedHistory || session.messages.some(m => m.resumed)) {
+        // A chat resumed from history has no seed to replay; restarting would start a new
+        // conversation under the old chat.
+        if (session.ws && session.ws.readyState === session.ws.OPEN) {
+          session.ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: 'A chat resumed from history cannot restart. Start a new chat instead.' }));
+        }
+        return;
+      }
       const firstMessage = session.messages[0];
       clearContext(session, taskId);
       if (session.type === 'objective') throttle.recordAbort(taskId);
@@ -5680,6 +5925,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       if (isAgentChatType(session.type)) {
         // Timers + prewarm + turn proc + _closed guard; also resets _spawning (C1030) for any
         // in-flight closure still holding a reference to this discarded session.
+        recordChatHistory(session, { ended: true }); // keeps the history entry; the provider session is never deleted
         dropObjectiveSession(sessions, sessionKey, session, taskId, 'kill');
         session.alive = false;
         if (session.ws && session.ws.readyState === session.ws.OPEN) {
@@ -5758,6 +6004,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
 
 module.exports = {
   handleAgentQuotaRequest,
+  recordChatHistory, resumeChatFromHistory, // chat history (scripts/probe-chat-history.js drives them directly)
   maybeRefirePlanReady,
   createHttpHandler,
   handleConnection,

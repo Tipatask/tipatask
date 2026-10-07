@@ -11,7 +11,7 @@ const toml = require('toml');
 const { createHash, randomUUID } = require('node:crypto');
 const config = require('./config');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir } = require('./spawn-utils');
-const { ensureProjectCodexHome } = require('../codex-mcp-config');
+const { ensureProjectCodexHome, prepareCodexTerminalHome } = require('../codex-mcp-config');
 
 const CODEX_REASONING_EFFORT = 'high';
 const DAEMON_RECORD = 'tipatask-daemon.json';
@@ -125,34 +125,18 @@ function codexEffortArgs(level = CODEX_REASONING_EFFORT) {
   return ['-c', `model_reasoning_effort="${level}"`];
 }
 
-// Interactive Codex cannot use its shared daemon with -c OR --profile. Keep a
-// stable project default, never a last-spawn-wins task value in the shared file.
-// A differing task effort must still use an override (and embedded mode).
+// Interactive Codex must receive configuration through native files, never -c,
+// --profile, --enable, --disable or --search. Separate immutable native homes
+// allow matching consoles to share a daemon without racing task effort writes.
 function codexTerminalLaunchOptions(projectRoot, codexHome, level = CODEX_REASONING_EFFORT, env = null) {
-  const embedded = reason => ({ args: codexEffortArgs(level), mode: 'embedded', reason });
-  const configPath = path.join(codexHome, 'config.toml');
-  let content = fs.readFileSync(configPath, 'utf8');
-  const parsed = toml.parse(content);
-  if (parsed.model_reasoning_effort === undefined) {
-    content = `model_reasoning_effort = "${CODEX_REASONING_EFFORT}"\n${content}`;
-    fs.writeFileSync(configPath, content, 'utf8');
-    parsed.model_reasoning_effort = CODEX_REASONING_EFFORT;
-  }
-  // A project opened below a repository root can have higher-precedence ancestor
-  // config. Retain the explicit override when that layering is not ours to manage.
-  let dir = fs.realpathSync(projectRoot);
-  while (!fs.existsSync(path.join(dir, '.git'))) {
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-    if (fs.existsSync(path.join(dir, '.codex', 'config.toml'))) return embedded('ancestor-config');
-  }
-  if (parsed.model_reasoning_effort !== level) return embedded('effort-override');
-  const reason = env && terminalDaemonFallback(codexHome, env, parsed);
+  const home = prepareCodexTerminalHome({ projectRoot, codexHome, effort: level, env: env || {} });
+  const terminalEnv = env && { ...env, CODEX_HOME: home };
+  const parsed = toml.parse(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'));
+  const reason = terminalEnv && terminalDaemonFallback(home, terminalEnv, parsed);
   // Effort already matches. Do not manufacture a config override just to force
   // isolation: use the native explicit mode switch and report the actual cause.
-  if (reason) return { args: ['--no-daemon'], mode: 'embedded', reason };
-  return { args: [], mode: 'shared', reason: 'compatible-project-config' };
+  if (reason) return { args: ['--no-daemon'], mode: 'embedded', reason, codexHome: home };
+  return { args: [], mode: 'shared', reason: 'compatible-project-config', codexHome: home };
 }
 
 function codexTerminalEffortArgs(...args) {
@@ -196,13 +180,14 @@ function buildCodexEnv({ projectRoot, taskId, term = 'dumb' } = {}) {
     env.TIPATASK_TASK_ID = taskId;
     env.TIPATASK_TRACK_DIR = path.join(config.USER_DATA_ROOT, '.file-tracks');
   }
-  const codexHome = ensureProjectCodexHome({
+  const prepared = ensureProjectCodexHome({
     projectRoot: root,
     mcpServerPath: path.join(serverRoot, 'src', 'mcp', 'server.js'),
     nodePath: path.join(serverRoot, 'bin', wrapperName),
-  }).projectCodexDir;
-  env.CODEX_HOME = codexHome;
+  });
+  env.CODEX_HOME = prepared.projectCodexDir;
+  env.TIPATASK_CODEX_GLOBAL_HOME = prepared.globalCodexDir;
   return { env };
 }
 
-module.exports = { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, toCodexEffort };
+module.exports = { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, terminalDaemonFallback, toCodexEffort };

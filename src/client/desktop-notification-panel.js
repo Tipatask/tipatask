@@ -1,10 +1,12 @@
 // (TPT480) Full desktop-notification list inside a project window. The always-on-top banner
-// window (main/desktop-notifications.js) shows only the five newest; its "Show More" focuses
-// the newest notification's project window, and main sends that window the whole list here.
+// window (main/desktop-notifications.js) shows only the five newest; its "Show More" raises a
+// project window (the newest notification's own when it can come forward), and main sends
+// that window the whole list here once its page has loaded.
 // main owns the model — this module renders snapshots and sends per-entry actions back, so a
 // card for another project focuses that project's window (main's onClick routing).
 
 import { createNotificationCard, updateNotificationCard } from './notification-center.js';
+import { placeInOrder } from './notification-page.js';
 import { t, tc } from './i18n.js';
 
 const PANEL_ID = 'tt-desktop-notif-panel';
@@ -15,6 +17,8 @@ const CHEVRON_DOWN = _chevron('6 9 12 15 18 9');
 let _entries = [];
 let _expanded = false;
 let _installed = false;
+// An open that arrived before the document had a body; mounted on DOMContentLoaded.
+let _pendingOpen = false;
 
 const _api = () => (typeof window !== 'undefined' ? window.electronAPI : null);
 const _act = (action, id) => { try { _api()?.desktopNotificationListAction?.(action, id); } catch (_) {} };
@@ -74,23 +78,35 @@ function _render() {
   panel._empty.textContent = t('notifCenter.empty');
   panel._empty.hidden = _entries.length > 0;
 
-  // Keyed reuse by banner id — same discipline as notification-center.js's stack.
+  // Keyed reuse by banner id — same discipline as notification-center.js's stack. Cards
+  // already in place stay untouched, so an update never cancels a click in progress.
   const existing = new Map([...panel._list.children].map((el) => [el.dataset.tag, el]));
-  for (const entry of _entries) {
+  placeInOrder(panel._list, _entries.map((entry) => {
     const model = { ...entry, tag: entry.id, dismissLabel: t('notifCenter.dismiss') };
     let el = existing.get(entry.id);
-    if (el) { existing.delete(entry.id); updateNotificationCard(el, model); }
+    if (el) updateNotificationCard(el, model);
     else { el = createNotificationCard(model, _cardHandlers); el.classList.add('is-shown'); }
-    panel._list.appendChild(el);
-  }
-  for (const el of existing.values()) el.remove();
+    return el;
+  }));
+}
+
+// Mounts the panel if needed and renders the current entries. An open for a list that is
+// already mounted re-renders it in place.
+function _mount() {
+  _pendingOpen = false;
+  if (!document.getElementById(PANEL_ID)) _build();
+  _render();
 }
 
 function _onList(type, entries) {
-  if (type === 'close') { document.getElementById(PANEL_ID)?.remove(); return; }
+  if (type === 'close') { _pendingOpen = false; document.getElementById(PANEL_ID)?.remove(); return; }
   _entries = Array.isArray(entries) ? entries : [];
-  if (type === 'open' && !document.getElementById(PANEL_ID)) _build();
-  _render();
+  if (type !== 'open') { _render(); return; }
+  if (document.body) { _mount(); return; }
+  // No body yet: keep the entries (later updates replace them) and mount once it exists.
+  if (_pendingOpen) return;
+  _pendingOpen = true;
+  document.addEventListener('DOMContentLoaded', () => { if (_pendingOpen) _mount(); }, { once: true });
 }
 
 export function installDesktopNotificationPanel() {

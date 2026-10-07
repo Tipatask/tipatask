@@ -1248,6 +1248,7 @@ function spawnObjectiveTurn(session, taskId) {
         if (event.type === 'system' && event.subtype === 'init' && event.session_id) {
           session.claudeSessionId = event.session_id;
           session._providerSwitchPending = false; // handoff consumed — future turns resume normally (C1030, mirrors codex-session.js)
+          if (typeof session.onNativeSession === 'function') session.onNativeSession(); // chat-history index (ws-handlers.js recordChatHistory, never throws)
           if (config.OBJECTIVE_TIMING_ENABLED) {
             const now = Date.now();
             session.timingMilestones.claudeInitAt = now;
@@ -1742,6 +1743,7 @@ async function finalizeCloseTurn(session, code, taskId, resultPath) {
     turnIndex,
     code: code ?? 0,
   };
+  if (typeof session.onNativeSession === 'function') session.onNativeSession(); // turn done: refresh the chat-history entry
   if (session.ws && session.ws.readyState === session.ws.OPEN) {
     session.ws.send(JSON.stringify({ type: 'objective-result', tabId: session.tabId, content: cleaned, tokens: session.turnTokens, filesAddressed: assistantMsg.filesAddressed, docUpdates: assistantMsg.docUpdates, newTags: assistantMsg.newTags || [], objectiveSummary: assistantMsg.objectiveSummary || null, timingMilestones: timingPayload, cards: assistantMsg.cards }));
     session.ws.send(JSON.stringify({ type: 'chat-ready', tabId: session.tabId, turnIndex }));

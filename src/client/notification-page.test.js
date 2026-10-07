@@ -93,6 +93,35 @@ test('cards carry data-category and key/title/body spans that survive repeat pus
   host.remove();
 });
 
+test('a repeat snapshot never re-inserts a card that is already in place', () => {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const list = (...ids) => ids.map((id) => ({ id: String(id), tag: `T${id}`, title: `Title ${id}`, body: '', category: 'attention' }));
+  const page = renderNotificationPage(host, list(3, 2, 1), () => {});
+  const cards = () => [...page._cards.children].map((el) => el.dataset.id).join(',');
+  // Re-inserting a pressed element cancels its click, so count every DOM move.
+  const moved = [];
+  const insertBefore = page._cards.insertBefore.bind(page._cards);
+  page._cards.insertBefore = (el, ref) => { moved.push(el.dataset.id); return insertBefore(el, ref); };
+  page._cards.appendChild = (el) => { moved.push(el.dataset.id); return insertBefore(el, null); };
+
+  renderNotificationPage(host, list(3, 2, 1), () => {});
+  assert.deepEqual(moved, [], 'same snapshot: no card moves');
+  renderNotificationPage(host, list(4, 3, 2, 1), () => {});
+  assert.deepEqual(moved.splice(0), ['4'], 'an arrival inserts only the new card');
+  renderNotificationPage(host, list(4, 3, 1), () => {});
+  assert.deepEqual(moved, [], 'a removal moves nothing');
+  assert.equal(cards(), '4,3,1');
+  renderNotificationPage(host, list(1, 4, 3), () => {});
+  assert.deepEqual(moved.splice(0), ['1'], 'only the card whose position changed moves');
+  assert.equal(cards(), '1,4,3');
+  // Paged out by arrivals: the page keeps the five newest in order.
+  renderNotificationPage(host, list(8, 7, 6, 5, 1, 4, 3), () => {});
+  assert.equal(cards(), '8,7,6,5,1');
+  assert.deepEqual(moved.splice(0), ['8', '7', '6', '5']);
+  host.remove();
+});
+
 test('(TPT505) header action: Clear All by default, Hide on request; footer "Show" toggle acts on-top-off', () => {
   const host = document.createElement('div');
   document.body.appendChild(host);

@@ -22,6 +22,9 @@
 # missed the .chat-draft-<hash>.json files the live app actually writes.
 /.chat-draft*.json
 /.chat-draft*.json.tmp-*
+# Task/project chat history index (native session references, metadata only)
+/chat-history*.json
+/chat-history*.json.tmp-*
 /.file-tracks/
 /.task-images/
 .DS_Store

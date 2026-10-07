@@ -16,6 +16,7 @@ const {
   buildCodexMcpSection,
   buildCodexLocalMcpSection,
   getCodexPaths,
+  prepareCodexTerminalHome,
   mcpSectionHasCommand,
   mergeGlobalMcpServerTables,
   updateGlobalCodexMcpApprovalConfig,
@@ -28,6 +29,80 @@ const {
 } = require('./codex-mcp-config');
 
 const toml = require('toml');
+
+test('native terminal homes preserve MCP policies, user settings and shared auth/history across effort choices', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, '.codex');
+  fs.mkdirSync(home);
+  const original = '# user preference\n"model_reasoning_effort" = "medium"\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\n[agents]\ndefault_subagent_reasoning_effort = "low"\n[mcp_servers.tipatask]\nurl = "https://native.test/mcp"\nbearer_token_env_var = "TIPATASK_API_TOKEN"\ndisabled_tools = ["purge_stale_reservations"]\n[mcp_servers."local.with space"]\ncommand = "node"\nenabled_tools = ["read"]\n';
+  fs.writeFileSync(path.join(home, 'config.toml'), original);
+  fs.writeFileSync(path.join(home, 'auth.json'), '{}');
+  const env = { CODEX_HOME: home, TIPATASK_API_TOKEN: 'test-secret' };
+  const prepare = effort => prepareCodexTerminalHome({ projectRoot: root, codexHome: home, effort, env });
+  const high = prepare('high'), low = prepare('low');
+  assert.notEqual(high, low);
+  assert.equal(prepare('high'), high);
+  for (const [selected, effort] of [[high, 'high'], [low, 'low']]) {
+    const content = fs.readFileSync(path.join(selected, 'config.toml'), 'utf8');
+    const cfg = toml.parse(content);
+    assert.equal(cfg.model_reasoning_effort, effort);
+    assert.equal(cfg.agents.default_subagent_reasoning_effort, 'low');
+    assert.equal(cfg.approval_policy, 'on-request');
+    assert.equal(cfg.sandbox_mode, 'workspace-write');
+    assert.deepEqual(cfg.mcp_servers, toml.parse(original).mcp_servers);
+    assert.equal(cfg.sqlite_home, home);
+    assert.deepEqual(cfg.project_root_markers, ['.codex']);
+    assert.equal(fs.realpathSync(path.join(selected, 'auth.json')), fs.realpathSync(path.join(home, 'auth.json')));
+    assert.equal(fs.realpathSync(path.join(selected, 'sessions')), fs.realpathSync(path.join(home, 'sessions')));
+    assert.equal(fs.realpathSync(path.join(selected, 'packages')), fs.realpathSync(path.join(home, 'packages')));
+    assert.doesNotMatch(content, /test-secret/);
+  }
+  const shared = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
+  assert.match(shared, /# user preference/);
+  assert.equal(toml.parse(shared).model_reasoning_effort, undefined);
+  assert.equal(toml.parse(fs.readFileSync(path.join(home, 'tipatask-terminal.toml'), 'utf8')).model_reasoning_effort, 'medium');
+});
+
+test('terminal snapshots isolate credential and permission changes without overwriting an active snapshot', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, '.codex');
+  fs.mkdirSync(home);
+  const file = path.join(home, 'config.toml');
+  fs.writeFileSync(file, 'sandbox_mode = "workspace-write"\n');
+  const prepare = token => prepareCodexTerminalHome({ projectRoot: root, codexHome: home, effort: 'high', env: { TIPATASK_API_TOKEN: token } });
+  const first = prepare('first-secret');
+  const content = fs.readFileSync(path.join(first, 'config.toml'), 'utf8');
+  fs.appendFileSync(path.join(first, 'config.toml'), '\n[tui]\nscreen_reader_detection_done = true\n');
+  assert.equal(prepare('first-secret'), first);
+  assert.notEqual(prepare('rotated-secret'), first);
+  fs.writeFileSync(file, 'sandbox_mode = "read-only"\n');
+  assert.notEqual(prepare('first-secret'), first);
+  assert.equal(toml.parse(fs.readFileSync(path.join(first, 'config.toml'), 'utf8')).sandbox_mode, 'workspace-write');
+  assert.doesNotMatch(content, /first-secret|rotated-secret/);
+});
+
+test('config refresh keeps terminal effort out of project layers and shell relaunches inherit the original global home', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, '.codex');
+  fs.mkdirSync(home);
+  const file = path.join(home, 'config.toml');
+  fs.writeFileSync(file, 'model_reasoning_effort = "low"\n');
+  const selected = prepareCodexTerminalHome({ projectRoot: root, codexHome: home, effort: 'high' });
+  const globalFile = path.join(root, 'global.toml');
+  fs.writeFileSync(globalFile, 'model_reasoning_effort = "xhigh"\n');
+  const refresh = () => writeCodexMcpConfig({ targetPath: file, projectRoot: root, seedPath: globalFile, browserTools: [] });
+  refresh();
+  assert.equal(toml.parse(fs.readFileSync(file, 'utf8')).model_reasoning_effort, undefined);
+  fs.writeFileSync(file, 'model_reasoning_effort = "medium"\n' + fs.readFileSync(file, 'utf8'));
+  refresh();
+  assert.equal(toml.parse(fs.readFileSync(file, 'utf8')).model_reasoning_effort, undefined);
+  assert.equal(toml.parse(fs.readFileSync(path.join(home, 'tipatask-terminal.toml'), 'utf8')).model_reasoning_effort, 'medium');
+  const globalHome = path.join(root, 'user-codex');
+  assert.equal(getCodexPaths(root, { env: { CODEX_HOME: selected, TIPATASK_CODEX_GLOBAL_HOME: globalHome } }).globalCodexDir, globalHome);
+});
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-codex-mcp-'));

@@ -256,6 +256,7 @@ function finalizeCodexTurn(session, taskId, code, emit, usage) {
     turnIndex,
     code: code ?? 0,
   };
+  if (typeof session.onNativeSession === 'function') session.onNativeSession(); // turn done: refresh the chat-history entry
 
   const wsOpen = session.ws && session.ws.readyState === session.ws.OPEN;
   if (wsOpen) {
@@ -437,6 +438,7 @@ function spawnCodexTurn(session, taskId) {
             session.codexSessionId = event.thread_id;
             session._providerSwitchPending = false; // handoff consumed — future turns resume normally
             console.log(`[codex] thread_id=${event.thread_id}`);
+            if (typeof session.onNativeSession === 'function') session.onNativeSession(); // chat-history index (ws-handlers.js recordChatHistory, never throws)
           }
           if (config.OBJECTIVE_TIMING_ENABLED) {
             session.timingMilestones.claudeInitAt = Date.now();

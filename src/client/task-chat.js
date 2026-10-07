@@ -24,6 +24,7 @@ import {
   dialogSubmission, localAnswer, answerSummary, dialogWidgetHtml, toolChipHtml,
   userMessageHtml, stripPendingImageRefs,
   dialogState, lastTurnMessage,
+  resumedIndicator, providerName, historyQuery, historyRowHtml, historyFocusIndex,
 } from './task-chat-model.js';
 
 const SESSION_PREFIX = 'taskChat:';
@@ -34,6 +35,7 @@ const MODEL_STORAGE_KEY = 'tipatask-task-chat-model';
 const DRAFT_STORAGE_PREFIX = 'tipatask-task-chat-draft:';
 const STICK_THRESHOLD_PX = 64;
 const FRESH_START_TIMEOUT_MS = 3000;
+const HISTORY_SEARCH_DEBOUNCE_MS = 250;
 
 const ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7z"/></svg>';
 const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
@@ -60,6 +62,14 @@ let wantFresh = false;      // discard whatever session exists and start a new c
 let freshTimer = null;
 let awaitingStart = false;  // the start gate is up: connected, no session, nothing sent yet
 let starting = false;       // Start was pressed on this socket — a second press sends nothing
+let resuming = false;       // a start frame with a historyId went out; waiting for resumed / refused
+// (TPT539) History picker at the start gate: earlier chats of this task (or project chats).
+let historyRows = [];
+let historyStatus = 'idle'; // 'idle' | 'loading' | 'ready' | 'error'
+let historySearch = '';     // the search box text the rows were (or are being) fetched for
+let historySeq = 0;         // bumped per request; a slower reply to an older query is dropped
+let historyTimer = null;
+let historyError = '';      // why the last resume was refused — shown on the gate until acted on
 let stickToBottom = true;
 let renderFrame = 0;
 let focusHandle = null;
@@ -284,7 +294,15 @@ export function close() {
   wantFresh = false;
   awaitingStart = false;
   starting = false;
+  resuming = false;
   pendingAnswer = null;
+  clearTimeout(historyTimer);
+  historyTimer = null;
+  historySeq++;
+  historyRows = [];
+  historyStatus = 'idle';
+  historySearch = '';
+  historyError = '';
   if (wasProject) refreshSessionsNav();
 }
 
@@ -320,11 +338,18 @@ function renderWindow() {
           <span class="task-chat-start-mark">${ICON_CHAT}</span>
           <h2 class="task-chat-start-title" id="task-chat-start-title"></h2>
           <p class="task-chat-start-lead"></p>
+          <p class="task-chat-history-error" role="alert" hidden></p>
           <div class="task-chat-start-model"></div>
           <p class="task-chat-start-note" role="status" hidden></p>
           <div class="task-chat-start-actions">
             <button type="button" class="task-chat-start-cancel"></button>
             <button type="button" class="task-chat-start-go"></button>
+          </div>
+          <div class="task-chat-history" role="group" aria-labelledby="task-chat-history-title">
+            <h3 class="task-chat-history-title" id="task-chat-history-title"></h3>
+            <input type="search" class="task-chat-history-search" autocomplete="off" spellcheck="false">
+            <div class="task-chat-history-list" role="listbox" aria-labelledby="task-chat-history-title"></div>
+            <p class="task-chat-history-status" role="status"></p>
           </div>
         </section>
         <div class="task-chat-messages" role="log" aria-live="polite"></div>
@@ -370,6 +395,7 @@ function renderWindow() {
     else close();
   });
   root.querySelector('.task-chat-start-go').addEventListener('click', beginChat);
+  wireHistoryPicker();
 
   input.addEventListener('input', () => { rememberDraft(); growInput(); syncComposer(); });
   const voiceRoot = root;
@@ -472,6 +498,10 @@ function applyChromeLabels() {
     ? t('taskChat.start.projectLead', { project: projectLabel() })
     : t('taskChat.start.taskLead', { key: chat.key });
   q('.task-chat-start-cancel').textContent = t('btn.cancel');
+  q('.task-chat-history-title').textContent = t('taskChat.history.title');
+  const search = q('.task-chat-history-search');
+  search.placeholder = t('taskChat.history.searchPlaceholder');
+  search.setAttribute('aria-label', t('taskChat.history.searchPlaceholder'));
   for (const trigger of root.querySelectorAll('.embed-menu-trigger')) {
     trigger.querySelector('.embed-menu-label').textContent = t('taskChat.embed.button');
     trigger.title = t('taskChat.embed.tooltip');
@@ -515,6 +545,7 @@ function relabel() {
   applyChromeLabels();
   renderSelector();
   renderTranscript();
+  renderHistoryPicker();
   syncComposer();
 }
 
@@ -590,7 +621,9 @@ function setSelection(value) {
 function showStartGate() {
   awaitingStart = true;
   starting = false;
+  resuming = false;
   syncStartGate();
+  loadHistory(historySearch);
   syncEmptyState();
   syncComposer();
   const go = root && root.querySelector('.task-chat-start-go');
@@ -603,11 +636,16 @@ function syncStartGate() {
   gate.hidden = !awaitingStart;
   root.querySelector('.task-chat-panel').classList.toggle('task-chat-panel--gated', awaitingStart);
   const go = gate.querySelector('.task-chat-start-go');
-  go.textContent = t(starting ? 'taskChat.start.starting' : 'taskChat.start.button');
+  // With earlier chats on offer, Start names what it does instead of resuming one.
+  const hasHistory = historyRows.length > 0 || !!historySearch;
+  go.textContent = t(starting ? 'taskChat.start.starting' : (hasHistory ? 'taskChat.history.newChat' : 'taskChat.start.button'));
   go.disabled = !awaitingStart || starting || !connected || noUsableModel();
   const note = gate.querySelector('.task-chat-start-note');
   note.hidden = !noUsableModel();
   note.textContent = noUsableModel() ? t('taskChat.start.noModels') : '';
+  const error = gate.querySelector('.task-chat-history-error');
+  error.hidden = !historyError;
+  error.textContent = historyError;
 }
 
 // Providers were offered but none of them can run a chat. With no provider list at all the start
@@ -620,6 +658,7 @@ function beginChat() {
   if (!awaitingStart || starting || !connected || !ws || noUsableModel()) return;
   starting = true;
   awaitingStart = false;
+  historyError = '';
   syncStartGate();
   pushMessage({ role: 'assistant', content: '', streaming: true });
   setRunning(true);
@@ -637,9 +676,163 @@ function focusComposer() {
   }
 }
 
-function sendStartFrame() {
+// A history pick continues that saved session: its historyId goes instead of the model.
+function sendStartFrame(historyId = '') {
   const type = isProjectChat() ? WS_SEND_TYPES.START_PROJECT_CHAT : WS_SEND_TYPES.START_TASK_CHAT;
-  wsSend(ws, type, { model: selection || undefined });
+  wsSend(ws, type, historyId ? { historyId } : { model: selection || undefined });
+}
+
+// ── History picker (TPT539) ──
+// Earlier chats at the start gate, newest first, searchable by title, keywords and excerpts.
+// Picking one sends the start frame with its historyId instead of a model: the server continues
+// that provider session, or refuses with `history-unavailable` — never a silent fresh chat.
+
+function wireHistoryPicker() {
+  const search = root.querySelector('.task-chat-history-search');
+  const list = root.querySelector('.task-chat-history-list');
+  search.value = historySearch;
+  search.addEventListener('input', () => {
+    clearTimeout(historyTimer);
+    const value = search.value;
+    historyTimer = setTimeout(() => loadHistory(value), HISTORY_SEARCH_DEBOUNCE_MS);
+  });
+  search.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowDown') return;
+    const items = historyItems();
+    if (!items.length) return;
+    e.preventDefault();
+    items[0].focus();
+  });
+  list.addEventListener('keydown', (e) => {
+    const items = historyItems();
+    const index = items.indexOf(document.activeElement);
+    if (index < 0 || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    const next = historyFocusIndex(index, e.key, items.length);
+    if (next < 0) search.focus();
+    else items[next].focus();
+  });
+  list.addEventListener('click', (e) => {
+    const item = e.target.closest('.task-chat-history-item');
+    if (!item || item.getAttribute('aria-disabled') === 'true') return;
+    beginResume(item.dataset.historyId);
+  });
+}
+
+function historyItems() {
+  return root ? [...root.querySelectorAll('.task-chat-history-item')] : [];
+}
+
+async function loadHistory(q = '') {
+  if (!root || !chat) return;
+  const seq = ++historySeq;
+  const target = chat;
+  historySearch = String(q || '');
+  historyStatus = 'loading';
+  renderHistoryPicker();
+  let rows = null;
+  try {
+    const res = await fetch(historyQuery({ kind: chat.kind, key: chat.key, q: historySearch }), {
+      headers: projectHeader(), cache: 'no-store',
+    });
+    if (res.ok) {
+      const body = await res.json();
+      rows = Array.isArray(body && body.entries) ? body.entries : [];
+    }
+  } catch { /* shown as the error state */ }
+  if (seq !== historySeq || chat !== target || !root) return;
+  historyStatus = rows ? 'ready' : 'error';
+  if (rows) historyRows = rows;
+  renderHistoryPicker();
+  syncStartGate();
+}
+
+function renderHistoryPicker() {
+  if (!root) return;
+  const section = root.querySelector('.task-chat-history');
+  const list = section.querySelector('.task-chat-history-list');
+  const status = section.querySelector('.task-chat-history-status');
+  const search = section.querySelector('.task-chat-history-search');
+  const keepFocus = list.contains(document.activeElement) ? document.activeElement.dataset.historyId : null;
+  // No earlier chats at all and nothing searched: one quiet line, no search box.
+  const nothingYet = historyStatus === 'ready' && !historyRows.length && !historySearch.trim();
+  search.hidden = nothingYet;
+  section.classList.toggle('task-chat-history--loading', historyStatus === 'loading');
+  const now = Date.now();
+  const locale = getLocale();
+  const rows = historyStatus === 'error' ? [] : historyRows;
+  list.innerHTML = '';
+  for (const row of rows) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `task-chat-history-item${row.available ? '' : ' task-chat-history-item--unavailable'}`;
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', 'false');
+    item.dataset.historyId = row.historyId;
+    if (!row.available) item.setAttribute('aria-disabled', 'true');
+    item.innerHTML = historyRowHtml(row, { t, label: modelLabel, now, locale });
+    list.appendChild(item);
+  }
+  list.hidden = !rows.length;
+  status.innerHTML = '';
+  status.classList.toggle('task-chat-history-status--error', historyStatus === 'error');
+  if (historyStatus === 'loading' && !rows.length) {
+    status.textContent = t('taskChat.history.loading');
+  } else if (historyStatus === 'error') {
+    status.textContent = t('taskChat.history.error');
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'task-chat-history-retry';
+    retry.textContent = t('btn.retry');
+    retry.addEventListener('click', () => loadHistory(historySearch));
+    status.append(' ', retry);
+  } else if (historyStatus === 'ready' && !rows.length) {
+    status.textContent = t(historySearch.trim() ? 'taskChat.history.emptySearch' : 'taskChat.history.empty');
+  }
+  status.hidden = !status.textContent;
+  if (keepFocus) {
+    const again = historyItems().find(el => el.dataset.historyId === keepFocus);
+    if (again) again.focus({ preventScroll: true });
+  }
+}
+
+function beginResume(historyId) {
+  if (!awaitingStart || starting || !connected || !ws || !historyId) return;
+  historyError = '';
+  starting = true;
+  resuming = true;
+  awaitingStart = false;
+  syncStartGate();
+  pushNotice(t('taskChat.history.resuming'), { kind: 'resuming' });
+  syncComposer();
+  sendStartFrame(historyId);
+}
+
+// The server attached the saved session: the earlier conversation (as far as the provider's
+// file could be read) becomes the transcript, followed by the resumed-session indicator.
+function applyResumed(msg) {
+  resuming = false;
+  starting = false;
+  sawReset = true; // a session exists now: starting over must end it first
+  messages = visibleHistory(msg.messages);
+  messages.push(resumedIndicator({ provider: msg.provider, transcriptUnavailable: msg.transcriptUnavailable }));
+  if (msg.title) applyProjectChatTitle(msg.title);
+  if (msg.objectiveSelection) applyProviders(providers, msg.objectiveSelection);
+  running = false;
+  renderTranscript();
+  syncComposer();
+  focusComposer();
+}
+
+// The server refused the resume and dropped the pending session: back to a fresh gate on a new
+// socket, with the reason on top and the explicit new-chat choice.
+function resumeRefused(msg) {
+  resuming = false;
+  historyError = t('taskChat.history.failed', { reason: msg.detail || msg.message || '' }).trim();
+  messages = [];
+  setRunning(false);
+  renderTranscript();
+  connect();
 }
 
 // ── Transcript ──
@@ -673,7 +866,26 @@ function syncEmptyState() {
 
 function buildMessageEl(m) {
   const el = document.createElement('div');
-  el.className = `task-chat-msg task-chat-msg--${m.role}${m.error ? ' task-chat-msg--error' : ''}`;
+  el.className = `task-chat-msg task-chat-msg--${m.role}${m.error ? ' task-chat-msg--error' : ''}`
+    + (m.restored ? ' task-chat-msg--restored' : '') + (m.kind ? ` task-chat-msg--${m.kind}` : '');
+  if (m.kind === 'resumed') {
+    // Drawn from state, so a language switch re-translates it.
+    el.setAttribute('role', 'note');
+    el.innerHTML = '<div class="task-chat-body"></div>';
+    const body = el.querySelector('.task-chat-body');
+    const line = document.createElement('span');
+    line.className = 'task-chat-resumed-line';
+    line.textContent = t('taskChat.history.resumed', { provider: providerName(m.provider) || t('taskChat.assistant') });
+    body.appendChild(line);
+    if (m.transcriptUnavailable) {
+      const note = document.createElement('span');
+      note.className = 'task-chat-resumed-note';
+      note.textContent = t('taskChat.history.transcriptUnavailable');
+      body.appendChild(note);
+    }
+    m.el = el;
+    return el;
+  }
   if (m.role === 'assistant') {
     el.innerHTML = `<div class="task-chat-author">${escapeAttr(t('taskChat.assistant'))}</div>`
       + '<div class="task-chat-body task-chat-md"></div>'
@@ -690,7 +902,7 @@ function buildMessageEl(m) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'task-chat-retry';
-      btn.textContent = t('btn.retry');
+      btn.textContent = m.retryLabel || t('btn.retry');
       btn.addEventListener('click', m.retry);
       el.appendChild(btn);
     }
@@ -742,8 +954,8 @@ function removeMessage(m) {
   syncDialogWidgets();
 }
 
-function pushNotice(text, { error = false, retry = null } = {}) {
-  return pushMessage({ role: 'system', content: text, error, retry });
+function pushNotice(text, { error = false, retry = null, retryLabel = '', kind = '' } = {}) {
+  return pushMessage({ role: 'system', content: text, error, retry, ...(retryLabel ? { retryLabel } : {}), ...(kind ? { kind } : {}) });
 }
 
 function streamingMessage() {
@@ -1132,11 +1344,11 @@ function syncComposer() {
   const send = root.querySelector('.task-chat-send');
   const stop = root.querySelector('.task-chat-stop');
   const select = root.querySelector('#task-chat-model-select');
-  voiceRecorder?.setLocked(!connected || running || awaitingStart);
+  voiceRecorder?.setLocked(!connected || running || awaitingStart || resuming);
   send.hidden = running;
   stop.hidden = !running;
   if (!running) stop.disabled = false;
-  send.disabled = !connected || running || awaitingStart || uploadsPending > 0 || !input.value.trim();
+  send.disabled = !connected || running || awaitingStart || resuming || uploadsPending > 0 || !input.value.trim();
   const uploading = root.querySelector('.task-chat-upload-status');
   uploading.hidden = uploadsPending === 0;
   uploading.textContent = uploadsPending ? t('taskChat.embed.uploading') : '';
@@ -1151,7 +1363,7 @@ function syncComposer() {
 }
 
 function sendMessage() {
-  if (!root || !connected || running || awaitingStart || uploadsPending > 0 || ws?.readyState !== WebSocket.OPEN) return;
+  if (!root || !connected || running || awaitingStart || resuming || uploadsPending > 0 || ws?.readyState !== WebSocket.OPEN) return;
   const input = root.querySelector('.task-chat-input');
   const text = input.value.trim();
   if (!text) return;
@@ -1189,6 +1401,7 @@ function connect() {
   pendingAnswer = null;
   awaitingStart = false;
   starting = false;
+  resuming = false;
   syncStartGate();
   const socket = new WebSocket(buildWsUrl(chat.sessionId));
   ws = socket;
@@ -1278,6 +1491,15 @@ function handleFrame(msg) {
       renderTranscript();
       break;
     }
+
+    case WS_RECV_TYPES.CHAT_HISTORY_RESUMED:
+      applyResumed(msg);
+      break;
+
+    // The provider answered from a new session instead of the restored one.
+    case WS_RECV_TYPES.CHAT_HISTORY_CHANGED:
+      pushNotice(t('taskChat.history.changed'), { error: true });
+      break;
 
     // Last frame of every connect, fresh or reattached — the point where both are known.
     case 'config': {
@@ -1423,6 +1645,17 @@ function handleFrame(msg) {
 
     case 'objective-error': {
       const reason = msg.reason || 'error';
+      if (reason === 'history-unavailable') {
+        pendingAnswer = null;
+        if (resuming) { resumeRefused(msg); break; }
+        // A resumed chat lost its saved session mid-way: say so, and offer a new chat.
+        finishStreaming();
+        setRunning(false);
+        pushNotice(msg.detail || msg.message || t('taskChat.history.failed', { reason: '' }), {
+          error: true, retry: startFresh, retryLabel: t('taskChat.history.newChat'),
+        });
+        break;
+      }
       let text;
       if (reason === 'session-gone') text = t('taskChat.error.sessionGone');
       else if (reason === 'provider-unavailable' || reason === 'turn-in-progress') text = msg.detail || t('taskChat.error.selection');
