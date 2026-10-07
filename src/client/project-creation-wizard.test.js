@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fs from 'node:fs';
 
-const { setupAuthWeb } = await import('./project-creation-wizard.js');
+const { setupAuthWeb, visibleSteps } = await import('./project-creation-wizard.js');
 
 test('setupAuthWeb reports an actionable IPC failure and allows an immediate retry', async () => {
   let attempts = 0;
@@ -34,7 +34,7 @@ test('setupAuthWeb reports an actionable IPC failure and allows an immediate ret
 test('setupAuthWeb explains how to recover when desktop IPC is unavailable', async () => {
   await assert.rejects(
     setupAuthWeb('https://tt.example.test', null),
-    /Desktop sign-in is unavailable\. Restart TipATask, reopen Create Project, and try again\./,
+    /Desktop sign-in is unavailable\. Restart TipATask, reopen Open \/ Create Project, and try again\./,
   );
 });
 
@@ -85,4 +85,39 @@ test('Agent step shows the credential hint only after a blocked Next click', () 
 
   // …and edits (onChange) clear it, so it never outlives the state it described.
   assert.match(step4, /onChange:[\s\S]*?msgEl\.textContent = '';[\s\S]*?onReCheck/);
+});
+
+// (TPT557) The wizard is the single entry for an unconfigured folder: its Create Project step
+// either creates a new API project (6 steps, Preset included) or links an existing one (5 steps —
+// nothing to seed, so the Preset step is skipped and the Confirm button reads "Open Project").
+test('visibleSteps: a new project walks all six steps, an existing one skips Preset (5)', () => {
+  assert.deepEqual(visibleSteps(), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(visibleSteps({ existing: false }), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(visibleSteps({ existing: true }), [1, 2, 3, 4, 6]);
+});
+
+test('existing-project pick skips Preset on both Next and Back, and emits preset: null', () => {
+  const src = fs.readFileSync(new URL('./project-creation-wizard.js', import.meta.url), 'utf8');
+  // Dots come from visibleSteps(), never a fixed six.
+  assert.match(src, /visibleSteps\(\{ existing: _isExisting\(\) \}\)\.map\(/);
+  // Agent → (Preset | Confirm), Confirm Back → (Preset | Agent).
+  const step4 = src.slice(src.indexOf('function _renderStep4('), src.indexOf('// ── Step 5'));
+  assert.match(step4, /_goto\(_isExisting\(\) \? 6 : 5\)/);
+  const step6 = src.slice(src.indexOf('function _renderStep6('));
+  assert.match(step6, /_goto\(existing \? 4 : 5\)/);
+  // Captions + payload branch on the same flag.
+  assert.match(step6, /existing \? t\('wizard\.confirmExistingProject'\) : t\('wizard\.confirmNewProject'\)/);
+  assert.match(step6, /existing \? t\('wizard\.openProjectBtn'\) : t\('wizard\.createProjectBtn'\)/);
+  assert.match(step6, /preset: existing \|\| !_preset \? null : \{ letter: _preset\.letter/);
+});
+
+test('index.js links an existing pick through project:open-existing without adopting the window', () => {
+  const src = fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8');
+  const listener = src.slice(src.indexOf("window.addEventListener('create-project'"));
+  const branch = listener.slice(0, listener.indexOf('completeProjectWizard'));
+  assert.match(branch, /if \(detail\?\.apiProject && !detail\.apiProject\.isNew\)/);
+  assert.match(branch, /openExistingProject\?\.\(\{/);
+  assert.match(branch, /adopt: false,/);
+  // Success lands in the same Current/New Window chooser the create path uses.
+  assert.match(branch, /new CustomEvent\('project-created'/);
 });

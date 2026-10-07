@@ -1204,7 +1204,10 @@ function registerIpcHandlers() {
   // config.json + project.json + KB templates. Replaces the slim saveProjectConfig path
   // for the non-reauth open-existing flow so the window title, board, and KB all work.
   ipcMain.handle('project:open-existing', async (event, detail) => {
-    const { projectPath, apiBaseUrl, userToken, apiProject, deviceName, taskAgent: detailTaskAgent, availableAgents: detailAvailableAgents, piModels: detailPiModels } = detail;
+    // (TPT557) adopt:false — the project wizard's existing-project path: write everything,
+    // but do NOT adopt the sender window; the renderer's Current/New Window chooser then
+    // opens the project via project:open. setup-modal.js keeps the default (adopt in place).
+    const { projectPath, apiBaseUrl, userToken, apiProject, deviceName, taskAgent: detailTaskAgent, availableAgents: detailAvailableAgents, piModels: detailPiModels, adopt = true } = detail;
     try {
       const os = require('node:os');
       const machineId = getOrCreateMachineId();
@@ -1305,6 +1308,10 @@ function registerIpcHandlers() {
       try { writeProjectCodexConfig(projectPath, __dirname); } catch (e) {
         console.warn('[codex-config] open-existing write failed:', e.message);
       }
+
+      // (TPT557) Wizard existing-project path stops here — no adoption, the renderer's
+      // Current/New Window chooser opens the project through project:open.
+      if (adopt === false) return { ok: true, projectPath, adopted: false, focusedExisting: false };
 
       // 8. Adopt the setup window into the project (project.json written above → correct title)
       // (C1388) Adopt can be refused if someone else already owns projectPath (a race:
@@ -1491,7 +1498,7 @@ function registerIpcHandlers() {
   // the most recently signed-in server in the account store, else production. Project windows
   // on that server pick the new token up live through getApiCredentials().
   // Returns { ok, user, apiBaseUrl } — never the token.
-  ipcMain.handle('setup:reauth-account', async (_event, requestedBaseUrl) => {
+  ipcMain.handle('setup:reauth-account', async (event, requestedBaseUrl) => {
     if (_forceReauthInFlight) return { ok: false, error: 'Re-authentication already in progress' };
     _forceReauthInFlight = true;
     try {
@@ -1504,6 +1511,11 @@ function registerIpcHandlers() {
       const saved = saveAccountForServer(apiBaseUrl, { token, userId: user?.id, email: user?.email });
       if (app.isReady()) createMenu();
       reconcileRecentProjectsWithAccounts();
+      // (TPT556) Unbound window (no project dir): bring Get Started back once the account is
+      // swapped — the renderer defers the show while its wizard overlay is still up.
+      if (!projectDirs.get(event.sender.id) && !event.sender.isDestroyed()) {
+        event.sender.send('project:menu', 'choose');
+      }
       return {
         ok: true,
         user: { id: saved.userId, name: user?.name || '', email: saved.email },
@@ -2253,8 +2265,10 @@ function createSetupWindow(projectPath) {
     },
   });
   attachExternalLinkPolicy(w);
-  // Main process is sole title authority.
-  w.webContents.on('page-title-updated', (e) => e.preventDefault());
+  // Main process is sole title authority. (TPT556) The BrowserWindow event is the one whose
+  // preventDefault() blocks the native title — the same-named webContents event is
+  // informational only, so listening there let the renderer's <title> leak through.
+  w.on('page-title-updated', (e) => e.preventDefault());
   claimSetup(projectPath, w);
   attachCloseGuard(w);
   const wcId = w.webContents.id;
@@ -2324,11 +2338,15 @@ async function createProjectWindow(projectDir, { deferShow = false } = {}) {
   });
   attachExternalLinkPolicy(w);
   // Main process is the sole title authority; block renderer document.title from overriding.
-  w.webContents.on('page-title-updated', (e) => e.preventDefault());
+  // (TPT556) BrowserWindow-level listener — see createSetupWindow for why not webContents.
+  w.on('page-title-updated', (e) => e.preventDefault());
   if (projectDir) {
     w.setTitle(getWindowTitle(getDisplayName(projectDir)));
     claimProject(projectDir, w);
     scheduleOpenProjectsSync();
+  } else {
+    // (TPT556) Unbound window: bare brand, no project / TODO segment, until a project is bound.
+    w.setTitle(getWindowTitle(null));
   }
   const wcId = w.webContents.id;
   projectDirs.set(wcId, projectDir || null);

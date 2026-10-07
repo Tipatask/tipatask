@@ -424,6 +424,9 @@ function registerApiHandlers() {
   ipcMain.handle('api:auth.reauth-save', async (event, { config }) => {
     const { readProjectConfig, mergeRendererProjectConfig } = require('../../src/server/project-config');
     const st = getWindowState(event.sender.id);
+    // (TPT556) Unbound window: fail closed. No config exists to merge into, nothing to rebind, and
+    // the account-only wizard never calls this — refuse before readProjectConfig(null) throws.
+    if (!st.projectPath) return { ok: false, error: 'No project bound to this window' };
     const existing = readProjectConfig(st.projectPath) || st.config || {};
     const merged = mergeRendererProjectConfig(existing, config, { allowApiToken: true });
     const newState = await reconfigureWindowBackend(event.sender.id, merged);

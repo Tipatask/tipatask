@@ -81,7 +81,7 @@ function versionAtLeast(v, min) {
  * Returns { ok, binPath, version, versionOk, loggedIn, spawnHelperFixed, issues }
  */
 function checkClaudeHealth() {
-  const { resolveBin } = require('../server/spawn-utils');
+  const { resolveBin, winExecSpec } = require('../server/spawn-utils');
   const issues = [];
 
   // 1. Binary
@@ -94,11 +94,19 @@ function checkClaudeHealth() {
     };
   }
 
+  // (TPT559) A Windows .cmd launcher must run through cmd.exe — Node >= 22 EINVALs otherwise.
+  const probe = (args) => {
+    const spec = winExecSpec(binPath, args);
+    return execFileSync(spec.command, spec.args, {
+      ...spec.options, encoding: 'utf8', timeout: 5000, windowsHide: true,
+    }).trim();
+  };
+
   // 2. Version (best-effort)
   let version = null;
   let versionOk = null;
   try {
-    const out = execFileSync(binPath, ['--version'], { encoding: 'utf8', timeout: 5000 }).trim();
+    const out = probe(['--version']);
     version = parseClaudeVersion(out);
     versionOk = versionAtLeast(version, CLAUDE_MIN_VERSION);
     if (versionOk === false) {
@@ -113,7 +121,7 @@ function checkClaudeHealth() {
   // 3. Auth status
   let loggedIn = false;
   try {
-    const out = execFileSync(binPath, ['auth', 'status'], { encoding: 'utf8', timeout: 5000 }).trim();
+    const out = probe(['auth', 'status']);
     try {
       loggedIn = !!JSON.parse(out).loggedIn;
     } catch {

@@ -94,15 +94,42 @@ try {
 initApiConnection();
 
 window.addEventListener('create-project', async (e) => {
-  // (C1388, TPT160) Sole dispatcher is the unified open flow's setupKind chooser
-  // (template.html's openOrCreateProject → "Set up as a new project"), which always
-  // carries the already-picked folder in detail.projectPath. The fallback below is
+  // (C1388, TPT160, TPT557) Sole dispatcher is the unified open flow itself (template.html's
+  // openOrCreateProject → decideOpenAction 'open-wizard' for an unconfigured folder), which
+  // always carries the already-picked folder in detail.projectPath. The fallback below is
   // defensive only — no live caller omits detail.
   const folder = e?.detail?.projectPath || await window.electronAPI?.selectFolder?.();
   if (!folder) return;
   projectCreationWizard.open({
     projectPath: folder,
     onComplete: async (detail) => {
+      if (detail?.apiProject && !detail.apiProject.isNew) {
+        // (TPT557) Existing API project picked on the wizard's Create Project step: link the
+        // folder, never seed. Same IPC setup-modal.js's Confirm uses (project:open-existing —
+        // device register, token exchange, config.json, first-adoption KB templates only),
+        // minus in-place adoption: adopt:false leaves the calling window untouched so the
+        // Current/New Window chooser below decides where the project opens, exactly like the
+        // create-new path. project:create-from-wizard is wrong here — it always copies preset
+        // templates, seeds starter tasks and pushes the local KB over the existing project's.
+        const pref = detail.agentPreference || {};
+        const res = await window.electronAPI?.openExistingProject?.({
+          projectPath: detail.projectPath,
+          apiBaseUrl: detail.apiBaseUrl,
+          userToken: detail.userToken,
+          apiProject: { id: detail.apiProject.id, name: detail.apiProject.name },
+          deviceName: detail.deviceName,
+          taskAgent: pref.taskAgent || 'claude',
+          availableAgents: Array.isArray(pref.availableAgents) && pref.availableAgents.length ? pref.availableAgents : ['claude'],
+          piModels: Array.isArray(pref.piModels) ? pref.piModels : [],
+          adopt: false,
+        });
+        if (!res?.ok) {
+          utils.showToast(i18n.t('project.linkFailed', { msg: res?.error || i18n.t('project.unknownError') }), 'error');
+          return;
+        }
+        window.dispatchEvent(new CustomEvent('project-created', { detail: { projectPath: res.projectPath } }));
+        return;
+      }
       const res = await window.electronAPI?.completeProjectWizard?.(detail);
       if (!res?.ok) {
         utils.showToast(i18n.t('project.createFailed', { msg: res?.error || i18n.t('project.unknownError') }), 'error');

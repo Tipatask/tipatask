@@ -2,11 +2,13 @@
 
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { resolveBin, clearBinCache, augmentPathEnv, resolveNvmBinDir } = require('../server/spawn-utils');
+const { resolveBin, clearBinCache, augmentPathEnv, resolveNvmBinDir, winExecSpec } = require('../server/spawn-utils');
 
 /**
  * Probe `--version` output from a resolved binary path.
  * Runs under the nvm-matched node bin dir when applicable so shebang CLIs resolve.
+ * A Windows `.cmd`/`.bat` launcher (npm's `claude.cmd`) runs through cmd.exe via
+ * winExecSpec() — Node >= 22 refuses a shell-less exec of those with EINVAL.
  * Returns the trimmed version string, or null on failure.
  * @param {string} binPath
  * @returns {string|null}
@@ -16,7 +18,10 @@ function _probeVersion(binPath) {
     const env = augmentPathEnv({});
     const nvmBinDir = resolveNvmBinDir(binPath);
     if (nvmBinDir) env.PATH = `${nvmBinDir}${path.delimiter}${env.PATH}`;
-    const out = execFileSync(binPath, ['--version'], { encoding: 'utf8', timeout: 5000, env }).trim();
+    const spec = winExecSpec(binPath, ['--version']);
+    const out = execFileSync(spec.command, spec.args, {
+      ...spec.options, encoding: 'utf8', timeout: 5000, env, windowsHide: true,
+    }).trim();
     return out || null;
   } catch {
     return null;

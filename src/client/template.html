@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TipΔTask — TODO</title>
+<title>TipΔTask</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="any">
 <script src="/marked.min.js"></script>
@@ -268,10 +268,10 @@
   </div>
 </div>
 
-<!-- (C1388) Two states, one modal: "Get Started" (no path — first project) and the
-     unconfigured-folder chooser (path set — Connect-existing vs Create-new), rendered
-     by _showChooseModal({mode, path}). Actions are built dynamically since the two
-     states need a different button count (1 vs 2). -->
+<!-- (C1388) "Get Started" modal (first project — no folder bound yet), rendered by
+     _showChooseModal(). (TPT557) It no longer doubles as the unconfigured-folder chooser:
+     an unconfigured folder opens the project wizard directly. The action button is still
+     built at show time so its label stays locale-live. -->
 <div id="project-choose-modal" style="display:none;position:fixed;inset:0;z-index:9999;align-items:center;justify-content:center;background:rgba(0,0,0,0.55)">
   <div style="background:var(--c-bg-card,#fbf9f3);border:1px solid var(--c-border,#e9e4d8);color:var(--c-text,#1a1a19);border-radius:10px;padding:32px 36px;min-width:320px;max-width:440px;box-shadow:0 8px 32px rgba(0,0,0,0.4);text-align:center">
     <div id="project-choose-title" style="font-size:15px;font-weight:700;margin-bottom:8px"></div>
@@ -4221,11 +4221,17 @@ if (window.electronAPI) {
     _projModal.style.display = 'flex';
   }
 
-  // (C1388) Renders BOTH the first-run "Get Started" state (no path — single primary
-  // action) and the unconfigured-folder "setup kind" chooser (path given — Connect vs
-  // Create), one modal, rebuilt per call since the two states need a different button
-  // count. See project-open-flow.js's decideOpenAction() for how callers land here.
-  function _showChooseModal({ mode, path } = { mode: 'getStarted' }) {
+  // (C1388) Renders the first-run "Get Started" state — one primary action running the
+  // unified openOrCreateProject() flow below. (TPT557) This modal used to double as the
+  // unconfigured-folder "setup kind" chooser (Link-existing vs Create-new); that second
+  // state is gone — an unconfigured folder now opens the project wizard directly, whose
+  // Create Project step covers both outcomes. Rebuilt per call so the labels stay locale-live.
+  function _showChooseModal() {
+    // (TPT556) Get Started sits above .setup-modal (z-index 9999 vs 3200). While a wizard is up
+    // (e.g. main re-sends project:menu 'choose' from setup:reauth-account, before the account
+    // wizard's Confirm step is dismissed), don't cover it — the wizard's close path
+    // (_openAccountReauth finish) reopens Get Started for an unbound window.
+    if (document.querySelector('.setup-modal')) return;
     _chooseActions.innerHTML = '';
     const addButton = (label, primary, onClick) => {
       const btn = document.createElement('button');
@@ -4236,23 +4242,17 @@ if (window.electronAPI) {
       btn.addEventListener('click', () => { _chooseModal.style.display = 'none'; onClick(); });
       _chooseActions.appendChild(btn);
     };
-    if (mode === 'setupKind') {
-      _chooseTitle.textContent = t('project.setupKindTitle');
-      _chooseDesc.textContent = path;
-      addButton(t('project.setupKindConnect'), false, () => window.electronAPI.openSetupWindow(path));
-      addButton(t('project.setupKindCreate'), true, () => window.dispatchEvent(new CustomEvent('create-project', { detail: { projectPath: path } })));
-    } else {
-      _chooseTitle.textContent = t('project.getStartedTitle');
-      _chooseDesc.textContent = t('project.getStartedDesc');
-      addButton(t('project.getStartedAction'), true, () => openOrCreateProject());
-    }
+    _chooseTitle.textContent = t('project.getStartedTitle');
+    _chooseDesc.textContent = t('project.getStartedDesc');
+    addButton(t('project.getStartedAction'), true, () => openOrCreateProject());
     _chooseModal.style.display = 'flex';
   }
 
   // (C1388) Single entry point for "Open / Create Project" — used by BOTH the Project
   // menu's 'open' action and the Get Started modal's one button. Folder first, then
   // branch: already open elsewhere → focus it; configured → open it; unconfigured →
-  // ask Connect-existing vs Create-new (only then, since the folder is now known).
+  // (TPT557) open the project wizard straight away with the picked folder — its Create
+  // Project step is where the user creates a new API project or selects an existing one.
   async function openOrCreateProject() {
     const pick = await window.electronAPI.pickAndOpenProject();
     const focusResult = pick && await window.electronAPI.focusProjectWindow(pick.path);
@@ -4261,7 +4261,7 @@ if (window.electronAPI) {
     const d = window.TipTask.projectOpenFlow.decideOpenAction({ pick, alreadyOpen });
     if (d.action === 'none' || d.action === 'focused') return;
     if (d.action === 'open-new') { window.electronAPI.openProject(d.path, 'new'); return; }
-    if (d.action === 'choose-setup-kind') _showChooseModal({ mode: 'setupKind', path: d.path });
+    if (d.action === 'open-wizard') window.dispatchEvent(new CustomEvent('create-project', { detail: { projectPath: d.path } }));
   }
 
   function _showProjectRenameModal(currentName) {
@@ -4416,14 +4416,20 @@ if (window.electronAPI) {
 
   // Change Account with no project (default empty window): account-only wizard — sign-in through
   // setup:reauth-account, then a summary. The Get Started modal (z-index 9999) sits above
-  // .setup-modal, so hide it while the wizard is up and bring it back afterwards.
+  // .setup-modal, so hide it while the wizard is up. (TPT556) Afterwards — Done, Cancel, X or
+  // Escape alike — Get Started comes back whenever the window is still unbound
+  // (isUnboundWindow(), project-open-flow.js), not only when it happened to be visible before:
+  // an Escape-dismissed chooser used to leave the window on an empty board for good.
   function _openAccountReauth() {
-    const restoreGetStarted = _chooseModal.style.display === 'flex';
-    if (restoreGetStarted) _chooseModal.style.display = 'none';
+    _chooseModal.style.display = 'none';
     _reauthInFlight = true;
-    const finish = () => {
+    const finish = async () => {
       _reauthInFlight = false;
-      if (restoreGetStarted) _showChooseModal({ mode: 'getStarted' });
+      let ctx = null;
+      try { ctx = await window.electronAPI.api.project.config(); } catch {}
+      if (window.TipTask.projectOpenFlow.isUnboundWindow({ projectPath: ctx?.projectPath, config: ctx?.config })) {
+        _showChooseModal();
+      }
     };
     window.TipTask.setupModal.openReauth({
       chooseAccount: true,
@@ -4544,7 +4550,9 @@ if (window.electronAPI) {
     // (TPT310) Electron re-sends project:changed on every window load and on rename — resetAgentQuota()
     // ignores the same project, so only a real switch to another one refetches plan usage.
     resetAgentQuota(dir);
-    document.title = dir ? `${name || _projBasename(dir)} — TipΔTask` : 'TipΔTask — TODO';
+    // (TPT556) Unbound window: bare brand — main.js is the title authority anyway, but keep
+    // the renderer's own value neutral too (no project / TODO segment).
+    document.title = dir ? `${name || _projBasename(dir)} — TipΔTask` : 'TipΔTask';
     // Sync projectPath into location.search so buildWsUrl (ws-client.js) and all
     // location.search-based projectPath readers pick it up after an in-place adoption
     // (setup-window or target='current' rebind) where no full loadURL is issued.
@@ -4615,7 +4623,7 @@ if (window.electronAPI) {
   // above. The old two-static-button wiring is gone with the markup that backed it.
 
   window.electronAPI.onProjectMenu(async (action) => {
-    if (action === 'choose') { _showChooseModal({ mode: 'getStarted' }); return; }
+    if (action === 'choose') { _showChooseModal(); return; }
     // (C1388 §B) Renamed from a bare "open a folder" action — this now IS the
     // unified Open/Create entry point (menu label: "Open / Create Project…").
     if (action === 'open') { await openOrCreateProject(); return; }

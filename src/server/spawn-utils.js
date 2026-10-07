@@ -11,10 +11,50 @@ const IS_WIN = process.platform === 'win32';
 // Matches Unix nvm binary paths: ~/.nvm/versions/node/vX.Y.Z/bin/<name>
 const NVM_BIN_RE = /^(.+\/\.nvm\/versions\/node\/[^/]+\/bin)\//;
 
-// PATHEXT extensions to probe on Windows when exact name isn't found.
-const WIN_EXTS = IS_WIN
-  ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').toUpperCase().split(';').map(e => e.toLowerCase())
-  : [];
+// Windows launcher extensions in preference order. A CLI installed through npm ships three
+// siblings in the same dir — an extensionless POSIX sh shim (`claude`), `claude.cmd` and
+// `claude.ps1` — and `where` lists the bare shim first. Only these four extensions are ever
+// accepted: the shim and the .ps1 cannot be spawned by CreateProcess, and the other PATHEXT
+// members (.js/.vbs/...) would route through wscript. Intersected with PATHEXT at use time.
+const WIN_LAUNCHER_EXTS = ['.exe', '.cmd', '.bat', '.com'];
+
+// Launchers that are batch scripts, not PE images: CreateProcess cannot run them directly, and
+// Node >= 20.12.2 / 22 refuses execFile()/spawn() of them without a shell (EINVAL, the
+// CVE-2024-27980 fix). winExecSpec() routes these through cmd.exe.
+const WIN_SHELL_EXTS = ['.cmd', '.bat'];
+
+function winLauncherExts(pathext = process.env.PATHEXT) {
+  if (!pathext) return WIN_LAUNCHER_EXTS.slice();
+  const allowed = new Set(String(pathext).toLowerCase().split(';').map(e => e.trim()).filter(Boolean));
+  const picked = WIN_LAUNCHER_EXTS.filter(e => allowed.has(e));
+  return picked.length ? picked : WIN_LAUNCHER_EXTS.slice();
+}
+
+// Rank of a candidate path's extension within `exts` (0 = best); -1 for extensionless
+// files and extensions outside the launcher list (e.g. .ps1).
+function launcherRank(filePath, exts) {
+  const ext = path.win32.extname(String(filePath || '')).toLowerCase();
+  return ext ? exts.indexOf(ext) : -1;
+}
+
+// Picks the best launcher from `where` output (one path per line, PATH order): lowest
+// extension rank wins, ties go to the earlier line, and nothing qualifies -> ''.
+function selectWindowsLauncher(lines, { pathext } = {}) {
+  const exts = winLauncherExts(pathext);
+  const list = Array.isArray(lines) ? lines : String(lines || '').split(/\r?\n/);
+  let best = '';
+  let bestRank = Infinity;
+  for (const raw of list) {
+    const line = String(raw || '').trim();
+    if (!line) continue;
+    const rank = launcherRank(line, exts);
+    if (rank < 0 || rank >= bestRank) continue;
+    best = line;
+    bestRank = rank;
+    if (rank === 0) break;
+  }
+  return best;
+}
 
 // Dirs to probe when shell-based `which` fails, and to always prepend to PATH.
 // Order: user-local installs (Claude Code installer default) before system-wide.
@@ -55,18 +95,102 @@ const _nodeBinDirHasNode = (() => {
   } catch { return false; }
 })();
 
+// --- Windows registry Path fallback -------------------------------------------------------
+// A GUI-launched (or long-running) process keeps the PATH it was started with, so dirs the
+// user added to the user/machine Path later — `%APPDATA%\npm` after an `npm i -g`, the native
+// installer's `%LOCALAPPDATA%\Programs\...` — are invisible to `where` and to child spawns.
+// The registry holds the live values; this is the win32 counterpart of captureLoginShellPath().
+// User hive first, then machine: same "user-local before system-wide" order as PROBE_DIRS.
+const REG_PATH_KEYS = [
+  'HKCU\\Environment',
+  'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment',
+];
+
+// `reg query <key> /v Path` output -> the raw (unexpanded) value, or '' when absent.
+function parseRegQueryPath(stdout) {
+  for (const line of String(stdout || '').split(/\r?\n/)) {
+    const m = /^\s*Path\s+REG_(?:EXPAND_)?SZ\s+(.*)$/i.exec(line);
+    if (m) return m[1].trim();
+  }
+  return '';
+}
+
+// Expands %VAR% references case-insensitively from `env`; unknown names stay verbatim.
+function expandWindowsEnv(str, env = process.env) {
+  const lookup = new Map(Object.keys(env || {}).map(k => [k.toLowerCase(), env[k]]));
+  return String(str || '').replace(/%([^%]+)%/g, (whole, name) => {
+    const value = lookup.get(name.toLowerCase());
+    return value == null ? whole : String(value);
+  });
+}
+
+function _defaultRegExec() {
+  const sysRoot = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
+  const regExe = path.join(sysRoot, 'System32', 'reg.exe');
+  const cmd = _exists(regExe) ? regExe : 'reg';
+  return (args) => execFileSync(cmd, args, { encoding: 'utf8', timeout: 3000, windowsHide: true });
+}
+
+// Dirs from the user + machine registry Path values, %VAR%-expanded, de-duped (case-
+// insensitive), user dirs first. Each hive is best-effort; a failing query contributes
+// nothing. Never spawns off win32 unless an `exec` stub is injected (tests).
+function readWindowsRegistryPathDirs({ exec, env = process.env, isWin = IS_WIN } = {}) {
+  if (!isWin && !exec) return [];
+  const run = exec || _defaultRegExec();
+  const dirs = [];
+  const seen = new Set();
+  for (const key of REG_PATH_KEYS) {
+    let stdout = '';
+    try { stdout = run(['query', key, '/v', 'Path']); } catch { continue; }
+    for (const entry of expandWindowsEnv(parseRegQueryPath(stdout), env).split(';')) {
+      const dir = entry.trim();
+      if (!dir) continue;
+      const k = dir.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      dirs.push(dir);
+    }
+  }
+  return dirs;
+}
+
+// Memoized; clearBinCache() (no name) resets it so a forced re-detection also picks up dirs
+// added to the registry after this process started.
+let _registryPathDirs = null;
+function registryPathDirs() {
+  if (_registryPathDirs === null) _registryPathDirs = IS_WIN ? readWindowsRegistryPathDirs() : [];
+  return _registryPathDirs;
+}
+
 // Augmented PATH injected into every spawn env so child processes (MCP servers,
 // hooks, subprocesses spawned by claude) don't inherit a stripped PATH.
 // NODE_BIN_DIR goes first — ahead of PROBE_DIRS — so `node` always resolves to this
 // server's own binary and never to a stale PROBE_DIRS/system `node` (C1041). PROBE_DIRS
 // itself stays put; it's still needed to find Homebrew-Intel `claude`/`codex` binaries.
-const AUGMENTED_PATH = (() => {
+// Registry Path dirs (win32) are appended last: they only add what the inherited PATH
+// lacks and never reorder it. Built on first use (not module load) so a PATH the host set
+// after requiring this module — main.js's captureLoginShellPath() — is honored.
+let _augmentedPath = null;
+function augmentedPath() {
+  if (_augmentedPath !== null) return _augmentedPath;
   const base = process.env.PATH || '';
-  const dirs = [...(_nodeBinDirHasNode ? [NODE_BIN_DIR] : []), ...PROBE_DIRS, ...base.split(PATH_SEP)];
-  // De-dupe while preserving order
+  const dirs = [
+    ...(_nodeBinDirHasNode ? [NODE_BIN_DIR] : []),
+    ...PROBE_DIRS,
+    ...base.split(PATH_SEP),
+    ...registryPathDirs(),
+  ];
+  // De-dupe while preserving order (case-insensitive on Windows)
   const seen = new Set();
-  return dirs.filter(d => d && !seen.has(d) && seen.add(d)).join(PATH_SEP);
-})();
+  _augmentedPath = dirs.filter((d) => {
+    if (!d) return false;
+    const k = IS_WIN ? d.toLowerCase() : d;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  }).join(PATH_SEP);
+  return _augmentedPath;
+}
 
 // One-time diagnostic for task item 1 (C1041) — stderr, never stdout: some hook scripts
 // (push-kb-on-write.js) write a JSON hookSpecificOutput payload to stdout, and any stray
@@ -80,7 +204,11 @@ const _binInflight = new Map();
 const _binGeneration = new Map();
 function peekResolvedBin(name) { return _binCache[name]; }
 
-function _whichAsync(command, args) {
+const _firstLine = (lines) => (lines.find(l => l.trim()) || '').trim();
+
+// `pickLine(lines)` chooses the result from the probe's stdout lines; win32 callers pass
+// selectWindowsLauncher so a bare npm shim listed first by `where` never wins.
+function _whichAsync(command, args, pickLine = _firstLine) {
   return new Promise((resolve) => {
     let child;
     let settled = false;
@@ -100,7 +228,7 @@ function _whichAsync(command, args) {
       child = execFile(command, args, {
         encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
         detached: !IS_WIN, windowsHide: true,
-      }, (err, stdout) => finish(err ? '' : String(stdout || '').split(/\r?\n/)[0].trim()));
+      }, (err, stdout) => finish(err ? '' : pickLine(String(stdout || '').split(/\r?\n/))));
     } catch {
       finish('');
     }
@@ -123,7 +251,7 @@ async function resolveBinAsync(name) {
     const bundled = resolveBundledBin(name);
     if (bundled) return bundled;
     if (IS_WIN) {
-      const found = await _whichAsync('where', [name]);
+      const found = await _whichAsync('where', [name], selectWindowsLauncher);
       if (found) return found;
     } else {
       const login = await _whichAsync('/bin/sh', ['-lc', `command -v ${name}`]);
@@ -135,6 +263,10 @@ async function resolveBinAsync(name) {
       }
     }
     for (const dir of PROBE_DIRS) {
+      const found = _findExecutable(path.join(dir, name));
+      if (found) return found;
+    }
+    for (const dir of registryPathDirs()) {
       const found = _findExecutable(path.join(dir, name));
       if (found) return found;
     }
@@ -167,22 +299,28 @@ async function resolveBinAsync(name) {
   return promise;
 }
 
-// Check whether a path is executable. On Windows, X_OK is treated as F_OK
-// (no real execute-permission concept), and npm CLIs ship as .cmd wrappers, so
-// we fall through to PATHEXT probing when the bare name isn't found.
-function _findExecutable(filePath) {
-  try {
-    fs.accessSync(filePath, fs.constants.X_OK);
-    return filePath;
-  } catch { /* fall through */ }
-  if (IS_WIN) {
-    for (const ext of WIN_EXTS) {
-      const candidate = filePath + ext;
-      try {
-        fs.accessSync(candidate, fs.constants.F_OK);
-        return candidate;
-      } catch { /* not there */ }
-    }
+// Check whether a path is executable. POSIX: the X_OK bit decides. Windows has no execute
+// bit — X_OK degrades to F_OK — so an extensionless npm sh shim next to `claude.cmd` would
+// pass a plain access() check and be handed to CreateProcess, which cannot run it. On win32
+// the launcher extensions are therefore probed BEFORE the bare name: the path itself when it
+// already carries a launcher extension, then `<path>.exe/.cmd/.bat/.com` in rank order, and
+// the bare name last (only so an explicit `${NAME}_BIN` pointing at an odd file still works).
+// `isWin`/`exts` are injectable so the win32 order is unit-testable on any host.
+function _findExecutable(filePath, { isWin = IS_WIN, exts } = {}) {
+  if (!filePath) return null;
+  if (!isWin) {
+    try {
+      fs.accessSync(filePath, fs.constants.X_OK);
+      return filePath;
+    } catch { return null; }
+  }
+  const ranked = exts || winLauncherExts();
+  const candidates = [];
+  if (launcherRank(filePath, ranked) >= 0) candidates.push(filePath);
+  for (const ext of ranked) candidates.push(filePath + ext);
+  candidates.push(filePath);
+  for (const candidate of candidates) {
+    if (_exists(candidate)) return candidate;
   }
   return null;
 }
@@ -192,6 +330,43 @@ function _findExecutable(filePath) {
 // _findExecutable's job, applied once we know the launcher itself is there).
 function _exists(p) {
   try { fs.accessSync(p, fs.constants.F_OK); return true; } catch { return false; }
+}
+
+// cmd.exe to run a .cmd/.bat through: %ComSpec% (what Windows itself uses), else
+// %SystemRoot%\System32\cmd.exe, else a bare `cmd.exe` resolved via PATH.
+function _comSpec(env = process.env) {
+  if (env && env.ComSpec) return env.ComSpec;
+  const sysRoot = env && (env.SystemRoot || env.windir);
+  return sysRoot ? path.win32.join(sysRoot, 'System32', 'cmd.exe') : 'cmd.exe';
+}
+
+// How to execFile()/execFileSync() a resolved launcher so it also works for a Windows .cmd/.bat
+// (npm's `claude.cmd` / `codex.cmd`): Node >= 20.12.2 / 22 throws EINVAL on a shell-less exec
+// of those (CVE-2024-27980 fix), so they are wrapped as `cmd.exe /d /s /c "<command line>"`.
+// Anything else — .exe, POSIX paths, any host that is not win32 — passes through unchanged.
+// Returns { command, args, options }; callers spread `options` into their own exec options:
+//   const spec = winExecSpec(bin, ['--version']);
+//   execFileSync(spec.command, spec.args, { ...spec.options, encoding: 'utf8', windowsHide: true });
+// Quoting: every part is wrapped in "…" and the whole line once more (cmd's /s strips that outer
+// pair), and `windowsVerbatimArguments: true` stops Node from re-quoting/backslash-escaping the
+// line into something cmd.exe cannot parse. A part holding a double quote or a line break has no
+// safe cmd encoding and is rejected (same rule as mcp-spawn-config.js's headersHelper command
+// line). `%` is left alone: launcher paths come from `where`/the filesystem, already expanded.
+// `isWin`/`env` are injectable so the win32 branch is unit-testable on any host.
+function winExecSpec(binPath, args = [], { isWin = IS_WIN, env = process.env } = {}) {
+  const list = Array.isArray(args) ? args.map(String) : [];
+  const ext = path.win32.extname(String(binPath || '')).toLowerCase();
+  if (!isWin || !WIN_SHELL_EXTS.includes(ext)) return { command: binPath, args: list, options: {} };
+  const parts = [String(binPath), ...list];
+  for (const part of parts) {
+    if (/["\r\n]/.test(part)) throw new Error(`winExecSpec: unquotable argument ${JSON.stringify(part)}`);
+  }
+  const line = `"${parts.map(p => `"${p}"`).join(' ')}"`;
+  return {
+    command: _comSpec(env),
+    args: ['/d', '/s', '/c', line],
+    options: { windowsVerbatimArguments: true },
+  };
 }
 
 // (C1112) CLIs shipped as npm dependencies of this server instead of requiring the user to
@@ -245,10 +420,12 @@ function resolveBin(name) {
   if (bundled) return _cache(bundled);
 
   if (IS_WIN) {
-    // Strategy 1 (Windows): where.exe — respects PATH and PATHEXT
+    // Strategy 1 (Windows): where.exe — lists every PATH match (bare npm shim, .cmd, .ps1…)
+    // in PATH order; selectWindowsLauncher keeps only a spawnable launcher, best rank first.
     try {
-      const out = execFileSync('where', [name], { encoding: 'utf8', timeout: 5000 })
-        .split(/\r?\n/)[0].trim();
+      const out = selectWindowsLauncher(
+        execFileSync('where', [name], { encoding: 'utf8', timeout: 5000, windowsHide: true }).split(/\r?\n/)
+      );
       if (out) return _cache(out);
     } catch { /* fall through */ }
   } else {
@@ -270,6 +447,13 @@ function resolveBin(name) {
 
   // Strategy 3: filesystem probe of well-known install directories
   for (const dir of PROBE_DIRS) {
+    const found = _findExecutable(path.join(dir, name));
+    if (found) return _cache(found);
+  }
+
+  // Strategy 3b (Windows): dirs from the live user/machine registry Path — covers a PATH
+  // the process inherited before the CLI was installed. Empty off win32.
+  for (const dir of registryPathDirs()) {
     const found = _findExecutable(path.join(dir, name));
     if (found) return _cache(found);
   }
@@ -313,6 +497,10 @@ function resolveBin(name) {
 function clearBinCache(name) {
   if (name === undefined) {
     for (const key of new Set([...Object.keys(_binCache), ..._binInflight.keys()])) clearBinCache(key);
+    // Forced re-detection also re-reads the registry Path dirs (win32) and rebuilds the
+    // augmented PATH from them, so a CLI installed after startup is found and spawnable.
+    _registryPathDirs = null;
+    _augmentedPath = null;
   } else {
     delete _binCache[name];
     _binInflight.delete(name);
@@ -428,7 +616,7 @@ function augmentPathEnv(extras) {
   const base = { ...process.env };
   if (serverRoot) base.TIPATASK_SERVER_ROOT = serverRoot;
   else delete base.TIPATASK_SERVER_ROOT; // never hand a child an unusable asar path
-  return { ...base, ...extras, PATH: AUGMENTED_PATH };
+  return { ...base, ...extras, PATH: augmentedPath() };
 }
 
 // Resolves the model to pass on the CLI's --model flag, live-reading project
@@ -550,4 +738,14 @@ function captureLoginShellPath() {
   return null;
 }
 
-module.exports = { resolveBin, resolveBinAsync, peekResolvedBin, clearBinCache, augmentPathEnv, projectEnvExtras, resolveNvmBinDir, captureLoginShellPath, resolveSpawnModel, resolveAttentionTerminalBell, isAsarPath, resolveSpawnServerRoot, resolveBundledBin, resolvePiLaunch, resolvePiLaunchAsync, PROBE_DIRS };
+module.exports = {
+  resolveBin, resolveBinAsync, peekResolvedBin, clearBinCache, augmentPathEnv, augmentedPath,
+  projectEnvExtras, resolveNvmBinDir, captureLoginShellPath, resolveSpawnModel,
+  resolveAttentionTerminalBell, isAsarPath, resolveSpawnServerRoot, resolveBundledBin,
+  resolvePiLaunch, resolvePiLaunchAsync, PROBE_DIRS,
+  // Windows launcher/registry resolution (TPT558) — pure helpers, exported for tests
+  WIN_LAUNCHER_EXTS, winLauncherExts, selectWindowsLauncher, parseRegQueryPath,
+  expandWindowsEnv, readWindowsRegistryPathDirs, _findExecutable,
+  // (TPT559) cmd.exe wrapper for exec'ing .cmd/.bat launchers under Node >= 22
+  WIN_SHELL_EXTS, winExecSpec,
+};

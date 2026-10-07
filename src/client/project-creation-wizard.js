@@ -1,7 +1,11 @@
-// Project creation wizard — 6-step modal triggered by the create-project event.
-// Collects: auth, API project (select/create), device name, agent selection, preset (A/B).
+// Project setup wizard — modal triggered by the create-project event, which the unified
+// Open / Create Project flow dispatches as soon as the picked folder turns out to be
+// unconfigured (TPT557 — there is no separate Link-vs-Create chooser in front of it).
+// Collects: auth, API project (Create Project step: create new OR select existing), device
+// name, agent selection, preset (A/B — new project only). An existing-project pick skips
+// the Preset step (nothing to seed): 5 dots instead of 6, see visibleSteps().
 // Emits wizard-complete with all data. Does NOT write configs or call APIs — that
-// is handled by a downstream listener.
+// is handled by a downstream listener (index.js), which branches on apiProject.isNew.
 import { renderAgentSelect, loadAgents, piCredentialsMissing, computePiSaveRows } from './agent-select.js';
 import { recheckAgents } from './agent-recheck.js';
 import { headerHtml, fitHeaderPath } from './setup-modal-header.js';
@@ -46,6 +50,17 @@ let _preset = null;
 let _onComplete = null;
 let _overlay = null;
 let _keyHandler = null;
+
+// (TPT557) Step numbers shown for a wizard run — an existing API project has no Preset step
+// (step 5): nothing gets seeded, index.js links the folder through project:open-existing.
+// Pure (no DOM, no module state) so project-creation-wizard.test.js can pin it.
+export function visibleSteps({ existing = false } = {}) {
+  return existing ? [1, 2, 3, 4, 6] : [1, 2, 3, 4, 5, 6];
+}
+
+function _isExisting() {
+  return !!_apiProject && !_apiProject.isNew;
+}
 // Bumped by open()/close() — invalidates the in-flight stored-account check of a superseded session.
 let _openId = 0;
 // True while open() checks the account store for a live sign-in (setup:stored-account);
@@ -137,10 +152,11 @@ function _render() {
   _overlay.className = 'wizard-modal setup-modal';
 
   const STEP_LABELS = [t('wizard.stepSignIn'), t('wizard.stepApiProject'), t('wizard.stepDevice'), t('wizard.stepAgent'), t('wizard.stepPreset'), t('wizard.stepConfirm')];
-  const dots = STEP_LABELS.map((label, i) => {
-    const n = i + 1;
+  // (TPT557) One dot per VISIBLE step — the Preset dot disappears once an existing project
+  // is picked on step 2 (and comes back if the user goes Back and picks "Create new").
+  const dots = visibleSteps({ existing: _isExisting() }).map((n) => {
     const cls = n < _step ? 'is-done' : n === _step ? 'is-active' : '';
-    return `<span class="setup-modal-dot ${cls}" title="${label}"></span>`;
+    return `<span class="setup-modal-dot ${cls}" title="${_esc(STEP_LABELS[n - 1])}"></span>`;
   }).join('');
 
   _overlay.innerHTML = `
@@ -255,7 +271,9 @@ function _renderStep1(body, footer) {
   });
 }
 
-// ── Step 2: API project select / create ──────────────────────────────────────
+// ── Step 2: Create Project — create a new API project or select an existing one ──
+// (TPT557) This step is the one place the Open / Create flow decides between the two
+// outcomes; "+ Create new project" card first, then the account's existing projects.
 
 function _renderStep2(body, footer) {
   body.innerHTML = `
@@ -438,7 +456,7 @@ function _renderStep4(body, footer) {
       msgEl.textContent = t('agentSelect.fixOtherModelRows');
       return;
     }
-    _goto(5);
+    _goto(_isExisting() ? 6 : 5); // (TPT557) existing project → no Preset step
   });
 
   const container = body.querySelector('#wiz-agent-select');
@@ -528,11 +546,17 @@ function _renderStep5(body, footer) {
 // ── Step 6: Confirm ───────────────────────────────────────────────────────────
 
 function _renderStep6(body, footer) {
+  // (TPT557) Two outcomes share this screen: a NEW API project (Preset row, "Create Project")
+  // and an EXISTING one picked on step 2 (no Preset row, "Open Project", preset: null in the
+  // emitted detail — index.js then links instead of creating/seeding).
+  const existing = _isExisting();
   const email = _userInfo?.email || '—';
   const projName = _apiProject?.name || '—';
   const projId = _apiProject?.isNew ? 'new' : (String(_apiProject?.id ?? '—'));
   const newBadge = _apiProject?.isNew ? `<span class="setup-modal-summary-badge">${_esc(t('wizard.newBadge'))}</span>` : '';
   const presetLabel = _preset ? `${_preset.letter} — ${_preset.name}` : '—';
+  const presetRow = existing ? '' :
+    `<tr><td class="setup-modal-summary-key">${_esc(t('wizard.summaryPreset'))}</td><td class="setup-modal-summary-val">${_esc(presetLabel)}</td></tr>`;
   const agentLabel = _taskAgent || '—';
   const piEnabled = _availableAgents.includes('pi');
   // C1121 — one row per configured model. API keys are never shown in the summary.
@@ -549,7 +573,7 @@ function _renderStep6(body, footer) {
     : '';
 
   body.innerHTML = `
-    <p class="setup-modal-label">${_esc(t('wizard.confirmNewProject'))}</p>
+    <p class="setup-modal-label">${_esc(existing ? t('wizard.confirmExistingProject') : t('wizard.confirmNewProject'))}</p>
     <table class="setup-modal-summary">
       <tr><td class="setup-modal-summary-key">${_esc(t('wizard.summaryFolder'))}</td><td class="setup-modal-summary-val">${_esc(_projectPath || '—')}</td></tr>
       <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryAccount'))}</td><td class="setup-modal-summary-val">${_esc(email)}</td></tr>
@@ -557,17 +581,17 @@ function _renderStep6(body, footer) {
       <tr><td class="setup-modal-summary-key">${_esc(t('wizard.summaryDevice'))}</td><td class="setup-modal-summary-val">${_esc(_deviceName || '—')}</td></tr>
       <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryAgent'))}</td><td class="setup-modal-summary-val">${_esc(agentLabel)}</td></tr>
       ${modelRow}
-      <tr><td class="setup-modal-summary-key">${_esc(t('wizard.summaryPreset'))}</td><td class="setup-modal-summary-val">${_esc(presetLabel)}</td></tr>
+      ${presetRow}
     </table>
     <div class="setup-modal-msg" id="wiz-confirm-msg"></div>
   `;
 
   footer.innerHTML = `
     <button class="setup-modal-btn setup-modal-btn--secondary" id="wiz-back-btn">${_esc(t('common.back'))}</button>
-    <button class="setup-modal-btn setup-modal-btn--primary" id="wiz-confirm-btn">${_esc(t('wizard.createProjectBtn'))}</button>
+    <button class="setup-modal-btn setup-modal-btn--primary" id="wiz-confirm-btn">${_esc(existing ? t('wizard.openProjectBtn') : t('wizard.createProjectBtn'))}</button>
   `;
 
-  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _goto(5));
+  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _goto(existing ? 4 : 5));
 
   footer.querySelector('#wiz-confirm-btn').addEventListener('click', () => {
     const detail = {
@@ -585,7 +609,9 @@ function _renderStep6(body, footer) {
         // completeProjectWizard → project:create-from-wizard). Same helper setup-modal uses.
         piModels: piEnabled ? computePiSaveRows(_piModels) : [],
       },
-      preset: { letter: _preset.letter, mode: _preset.mode, value: _preset.value },
+      // (TPT557) null for an existing project — nothing to seed; index.js links the folder
+      // via project:open-existing instead of project:create-from-wizard.
+      preset: existing || !_preset ? null : { letter: _preset.letter, mode: _preset.mode, value: _preset.value },
       presetDescription: null,
     };
     window.dispatchEvent(new CustomEvent('wizard-complete', { detail }));

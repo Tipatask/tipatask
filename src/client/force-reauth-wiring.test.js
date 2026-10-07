@@ -90,9 +90,59 @@ test('_openAccountReauth: account-only wizard with the chooser, toast on success
   assert.match(body, /chooseAccount: true/);
   assert.match(body, /showToast\(t\('reauth\.accountSwitched', \{ email:/);
   assert.match(body, /_chooseModal\.style\.display = 'none'/);
-  assert.match(body, /if \(restoreGetStarted\) _showChooseModal\(\{ mode: 'getStarted' \}\)/);
+  // (TPT556) Get Started comes back by the unbound-window invariant on EVERY close (Done, Cancel,
+  // X, Escape) — not only when it was visible before the wizard opened.
+  assert.doesNotMatch(body, /restoreGetStarted/);
+  assert.match(body, /projectOpenFlow\.isUnboundWindow\(\{ projectPath: ctx\?\.projectPath, config: ctx\?\.config \}\)/);
+  assert.match(body, /_showChooseModal\(\)/);
   assert.match(body, /onCancel: finish/);
   assert.match(body, /_reauthInFlight = false/);
+});
+
+// ── (TPT556) Unbound-window invariant: Get Started always, account-only re-auth, neutral title ──
+
+test('openReauth forces the account-only mode for an unbound caller (isUnboundWindow)', () => {
+  const openReauth = sliceFn(setupModal, 'export function openReauth(');
+  assert.match(setupModal, /import \{ isUnboundWindow \} from '\.\/project-open-flow\.js'/);
+  assert.match(openReauth, /const unbound = isUnboundWindow\(\{ projectPath, config: existingConfig \}\)/);
+  assert.match(openReauth, /_mode = \(accountOnly \|\| unbound\) \? 'account' : 'reauth'/);
+});
+
+test('setup:reauth-account re-sends project:menu choose to an unbound sender after the swap', () => {
+  const idx = mainJs.indexOf("ipcMain.handle('setup:reauth-account'");
+  const handler = mainJs.slice(idx, mainJs.indexOf("ipcMain.handle('project:rename'", idx));
+  assert.match(handler, /async \(event, requestedBaseUrl\)/);
+  assert.match(handler, /if \(!projectDirs\.get\(event\.sender\.id\) && !event\.sender\.isDestroyed\(\)\) \{\s*event\.sender\.send\('project:menu', 'choose'\);/);
+});
+
+test('Get Started defers while a wizard overlay is up (would otherwise cover it)', () => {
+  const start = template.indexOf('function _showChooseModal(');
+  assert.ok(start >= 0);
+  const body = template.slice(start, template.indexOf('\n  }\n', start));
+  assert.match(body, /if \(document\.querySelector\('\.setup-modal'\)\) return;/);
+});
+
+test('api:auth.reauth-save fails closed for an unbound window (no config write, no rebind)', () => {
+  const apiRouter = readSource(SERVER_ROOT, 'main', 'ipc', 'api-router.js');
+  const idx = apiRouter.indexOf("ipcMain.handle('api:auth.reauth-save'");
+  assert.ok(idx >= 0);
+  const handler = apiRouter.slice(idx, apiRouter.indexOf("ipcMain.handle('api:project.config'", idx));
+  const guard = handler.indexOf("if (!st.projectPath) return { ok: false, error: 'No project bound to this window' };");
+  assert.ok(guard >= 0, 'reauth-save must refuse an unbound window');
+  assert.ok(guard < handler.indexOf('readProjectConfig(st.projectPath)'), 'the guard must precede the config read');
+  assert.ok(guard < handler.indexOf('reconfigureWindowBackend('), 'the guard must precede the rebind');
+});
+
+test('window title: BrowserWindow-level page-title-updated is blocked; unbound windows get the bare brand', () => {
+  // Only the BrowserWindow event honours preventDefault(); the same-named webContents event is
+  // informational, so the renderer's <title> used to leak into the native title of a blank window.
+  assert.doesNotMatch(mainJs, /webContents\.on\('page-title-updated'/);
+  assert.equal((mainJs.match(/\bw\.on\('page-title-updated', \(e\) => e\.preventDefault\(\)\)/g) || []).length, 2,
+    'both createSetupWindow and createProjectWindow must block renderer titles');
+  const cpw = mainJs.slice(mainJs.indexOf('async function createProjectWindow('));
+  assert.match(cpw.slice(0, cpw.indexOf("w.loadURL(")), /\} else \{\s*\/\/[^\n]*\n\s*w\.setTitle\(getWindowTitle\(null\)\);/);
+  assert.match(template, /<title>TipΔTask<\/title>/);
+  assert.doesNotMatch(template, /TipΔTask — TODO/);
 });
 
 function sliceFn(source, header) {
@@ -102,7 +152,7 @@ function sliceFn(source, header) {
 }
 
 test('setup-modal account mode: one browser trip through reauthAccount, no project writes', () => {
-  assert.match(setupModal, /_mode = accountOnly \? 'account' : 'reauth'/);
+  assert.match(setupModal, /_mode = \(accountOnly \|\| unbound\) \? 'account' : 'reauth'/);
   const signIn = sliceFn(setupModal, 'function _renderAccountSignIn(');
   assert.match(signIn, /window\.electronAPI\.reauthAccount\(/);
   const confirm = sliceFn(setupModal, 'function _renderAccountConfirm(');

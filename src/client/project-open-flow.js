@@ -9,10 +9,23 @@
 //   { action: 'none' }               — user cancelled the picker
 //   { action: 'focused' }            — an existing window was focused; caller does nothing else
 //   { action: 'open-new' }           — configured project, no existing window: open it
-//   { action: 'choose-setup-kind' }  — unconfigured folder: ask Connect-existing vs Create-new
+//   { action: 'open-wizard' }         — unconfigured folder: open the project wizard directly
+//                                      (TPT557 — its Create Project step covers both create-new
+//                                      and link-existing, so there is no separate chooser)
 export function decideOpenAction({ pick, alreadyOpen }) {
   if (!pick) return { action: 'none' };
   if (alreadyOpen) return { action: 'focused' };
-  if (pick.needsSetup) return { action: 'choose-setup-kind', path: pick.path };
+  if (pick.needsSetup) return { action: 'open-wizard', path: pick.path };
   return { action: 'open-new', path: pick.path };
+}
+
+// (TPT556) Unbound-window invariant — true when the window has no folder, or its config
+// carries no API_PROJECT_ID (a folder whose config is unreadable/incomplete counts as unbound
+// for re-auth and Get Started purposes). Shared by setup-modal.js openReauth() (forces the
+// account-only mode) and template.html's _openAccountReauth() (reopens Get Started on close).
+// Pure — no DOM, no IPC; the caller passes what api:project.config() / getProjectPath() gave it.
+export function isUnboundWindow({ projectPath, config } = {}) {
+  if (!projectPath) return true;
+  const id = config && config.API_PROJECT_ID;
+  return id == null || String(id).trim() === '';
 }

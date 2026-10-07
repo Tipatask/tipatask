@@ -8,6 +8,7 @@ import { renderAgentSelect, piCredentialsMissing, normalizePiModels, computePiSa
 import { recheckAgents, notifyServerAgentsSaved } from './agent-recheck.js';
 import { headerHtml, fitHeaderPath } from './setup-modal-header.js';
 import { DEFAULT_API_BASE_URL } from './constants.js';
+import { isUnboundWindow } from './project-open-flow.js';
 // (C1388) This module re-renders its whole overlay per step (_render()/_renderStep()),
 // so t() calls made INSIDE those render functions are naturally locale-live — never
 // capture a t() result at module scope (i18n.js's own header rule).
@@ -159,9 +160,15 @@ async function _adoptStoredAccount() {
 // accountOnly — no project at all (default empty window): Sign-in → Confirm summary only,
 // through setup:reauth-account. onComplete({ user, apiBaseUrl }) fires on the first close
 // after a successful swap (Done, X or Escape alike); onCancel when closed before one.
+// (TPT556) An unbound caller (no projectPath, or no API_PROJECT_ID on existingConfig —
+// isUnboundWindow()) is forced into the account-only mode whatever accountOnly says: project
+// re-auth would end in api:auth.reauth-save / reconfigureWindowBackend, which have nothing to
+// write to for such a window. The caller's onComplete/onCancel are expected to bring Get
+// Started back (template.html _openAccountReauth()).
 export function openReauth({ projectPath, existingConfig, onComplete, onCancel, chooseAccount, accountOnly }) {
   if (_overlay) close();
-  _mode = accountOnly ? 'account' : 'reauth';
+  const unbound = isUnboundWindow({ projectPath, config: existingConfig });
+  _mode = (accountOnly || unbound) ? 'account' : 'reauth';
   _storedAccountPending = false;
   _accountResult = null;
   _chooseAccount = !!chooseAccount;
