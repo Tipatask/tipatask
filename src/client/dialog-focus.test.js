@@ -30,7 +30,9 @@ async function withClient(run) {
     const result = await build({
       stdin: { contents: `export * as board from './src/client/task-board.js';
         export * as dialogFocus from './src/client/dialog-focus.js';
-        export * as actionConfirm from './src/client/action-confirm.js';`, resolveDir: root },
+        export * as actionConfirm from './src/client/action-confirm.js';
+        export * as wizard from './src/client/project-creation-wizard.js';
+        export * as setupModal from './src/client/setup-modal.js';`, resolveDir: root },
       bundle: true, platform: 'node', format: 'esm', write: false, loader: { '.css': 'empty' },
       plugins: [{ name: 'terminal-double', setup(build) {
         build.onResolve({ filter: /^@xterm\/(xterm|addon-fit)$/ }, args => ({ path: args.path, namespace: 'terminal-double' }));
@@ -216,6 +218,114 @@ test('generic action confirm is interactive over the workspace on every resolve 
       assert.equal(handle.isTop(), true);
       assert.equal(document.activeElement, title);
     }
+  });
+});
+
+// (TPT561) Project ▸ Open / Create Project… on an unconfigured folder while a task is open.
+test('project creation wizard is interactive over the workspace on every step', async () => {
+  await withClient(async ({ wizard, dialogFocus, window, flush }) => {
+    document.body.innerHTML = '';
+    const { workspace, handle, title } = openWorkspace(dialogFocus);
+    let workspaceEscapes = 0;
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') workspaceEscapes++; });
+    const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Sign-in step (no stored account): the Sign in button responds.
+    window.electronAPI = {};
+    title.focus();
+    wizard.open({ projectPath: '/tmp/new-project' });
+    await flush();
+    const root = document.querySelector('.wizard-modal');
+    assert.notEqual(root.inert, true, 'wizard must not be inerted by the workspace layer');
+    assert.equal(workspace.inert, true);
+    assert.ok(root.contains(document.activeElement), 'focus moves into the wizard');
+    root.querySelector('#wiz-signin-btn').click();
+    await flush();
+    assert.notEqual(root.querySelector('#wiz-auth-msg').textContent, '', 'Sign in click handled');
+    escape();
+    await flush();
+    assert.equal(document.querySelector('.wizard-modal'), null, 'Escape closes the wizard');
+    assert.notEqual(workspace.inert, true);
+    assert.equal(handle.isTop(), true);
+    assert.equal(document.activeElement, title, 'focus returns to the workspace');
+
+    // Signed-in run: step changes repaint the same root, which stays interactive.
+    window.electronAPI = {
+      setupStoredAccount: async () => ({ token: 'tok', user: { email: 'a@example.com' } }),
+      setupListProjects: async () => [{ id: 7, name: 'Seven' }],
+    };
+    wizard.open({ projectPath: '/tmp/new-project' });
+    await wait(30);
+    const root2 = document.querySelector('.wizard-modal');
+    const card = root2.querySelector('.setup-modal-project-card[data-id="7"]');
+    assert.ok(card, 'step 2 project list rendered');
+    card.click();
+    const next = root2.querySelector('#wiz-next-btn');
+    assert.equal(next.disabled, false, 'project card click enables Next');
+    next.click();
+    await flush();
+    assert.equal(document.querySelector('.wizard-modal'), root2, 'repaint keeps one overlay root');
+    assert.notEqual(root2.inert, true, 'step 3 still interactive');
+    const device = root2.querySelector('#wiz-device-input');
+    device.value = 'Laptop';
+    device.dispatchEvent(new window.Event('input', { bubbles: true }));
+    assert.equal(root2.querySelector('#wiz-next-btn').disabled, false, 'input responds');
+    root2.querySelector('#wiz-back-btn').click();
+    await wait(30);
+    assert.ok(root2.querySelector('.setup-modal-project-card'), 'Back returns to step 2');
+    assert.notEqual(root2.inert, true);
+    assert.equal(workspace.inert, true);
+    root2.querySelector('.setup-modal-close').click();
+    await flush();
+    assert.equal(document.querySelector('.wizard-modal'), null);
+    assert.notEqual(workspace.inert, true, 'close releases the wizard layer');
+    assert.equal(handle.isTop(), true);
+    assert.equal(workspaceEscapes, 0, 'Escape on the wizard never reaches the workspace closer');
+  });
+});
+
+test('setup / re-auth modal is interactive over the workspace and every dismiss path releases it', async () => {
+  await withClient(async ({ setupModal, dialogFocus, window, flush }) => {
+    document.body.innerHTML = '';
+    const { workspace, handle, title } = openWorkspace(dialogFocus);
+    let workspaceEscapes = 0;
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') workspaceEscapes++; });
+    window.electronAPI = {
+      setupAuthWeb: async () => ({ token: 'tok', user: { email: 'a@example.com' } }),
+      setupListProjects: async () => [{ id: 1, name: 'One' }],
+      setupGetAvailableAgents: async () => [{ id: 'claude', name: 'Claude Code', available: true }],
+    };
+    for (const dismiss of ['cancel', 'escape', 'close']) {
+      title.focus();
+      let cancelled = 0;
+      setupModal.openReauth({
+        projectPath: '/tmp/project', existingConfig: { API_PROJECT_ID: '1' },
+        onComplete: () => {}, onCancel: () => { cancelled++; },
+      });
+      await flush();
+      const root = document.querySelector('.setup-modal');
+      assert.notEqual(root.inert, true, `${dismiss}: re-auth must not be inerted by the workspace layer`);
+      assert.equal(workspace.inert, true);
+      assert.ok(root.contains(document.activeElement));
+      if (dismiss === 'cancel') root.querySelector('#setup-cancel-btn').click();
+      else if (dismiss === 'escape') escape();
+      else {
+        // Sign in → skips the known project → Agent step, repainted on the same root.
+        root.querySelector('#setup-signin-btn').click();
+        await new Promise(resolve => setTimeout(resolve, 500));
+        assert.equal(document.querySelector('.setup-modal'), root, 'repaint keeps one overlay root');
+        assert.ok(root.querySelector('#setup-agent-select'), 'Sign in advanced to the Agent step');
+        assert.notEqual(root.inert, true);
+        root.querySelector('.setup-modal-close').click();
+      }
+      await flush();
+      assert.equal(document.querySelector('.setup-modal'), null, `${dismiss} removes the modal`);
+      assert.equal(cancelled, 1, `${dismiss}: onCancel fired`);
+      assert.notEqual(workspace.inert, true, `${dismiss}: workspace interactive again`);
+      assert.equal(handle.isTop(), true);
+      assert.equal(document.activeElement, title, `${dismiss}: focus returns to the workspace`);
+    }
+    assert.equal(workspaceEscapes, 0, 'Escape on the modal never reaches the workspace closer');
   });
 });
 

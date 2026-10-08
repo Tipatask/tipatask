@@ -121,3 +121,29 @@ test('index.js links an existing pick through project:open-existing without adop
   // Success lands in the same Current/New Window chooser the create path uses.
   assert.match(branch, /new CustomEvent\('project-created'/);
 });
+
+test('headerHtml: closable:false leaves out the × button, default keeps it (TPT564)', async () => {
+  const { headerHtml } = await import('./setup-modal-header.js');
+  assert.match(headerHtml({ title: 'T', projectPath: '/p' }), /setup-modal-close/);
+  assert.doesNotMatch(headerHtml({ title: 'T', projectPath: '/p', closable: false }), /setup-modal-close/);
+});
+
+test('unbound window: create-project opens the wizard locked and routes every exit back to Get Started (TPT564)', () => {
+  const src = fs.readFileSync(new URL('./index.js', import.meta.url), 'utf8');
+  assert.match(src, /const unbound = !window\.electronAPI\?\.getProjectPath\?\.\(\);/);
+  assert.match(src, /locked: unbound,/);
+  assert.match(src, /onCancel: unbound \? showGetStarted : undefined,/);
+  assert.match(src, /new CustomEvent\('show-get-started'\)/);
+  // Both failed-completion branches reopen Get Started — the wizard is already closed by then.
+  assert.equal((src.match(/'error'\);\n\s+showGetStarted\(\);/g) || []).length, 2);
+});
+
+test('template.html: locked Get Started ignores Escape and comes back after a cancelled pick (TPT564)', () => {
+  const src = fs.readFileSync(new URL('./template.html', import.meta.url), 'utf8');
+  assert.match(src, /_chooseLocked = _isUnboundWindowSync\(\);/);
+  assert.match(src, /_chooseModal\?\.style\.display === 'flex' && !_chooseLocked/);
+  assert.match(src, /window\.addEventListener\('show-get-started', \(\) => _showChooseModal\(\)\);/);
+  const fn = src.slice(src.indexOf('async function openOrCreateProject()'), src.indexOf('function _showProjectRenameModal'));
+  assert.match(fn, /if \(focusResult\?\.canceled\) \{ if \(unbound\) _showChooseModal\(\); return; \}/);
+  assert.match(fn, /if \(unbound\) _showChooseModal\(\);\n\s+\}/);
+});

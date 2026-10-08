@@ -7,7 +7,7 @@ const { execFile } = require('node:child_process');
 const BaseTaskAgent = require('./base-agent');
 const config = require('../config');
 const { getStaticBundle, getTaskStartupGrepBundle } = require('../static-context');
-const { resolveBin, resolveBinAsync, augmentPathEnv, resolveNvmBinDir, resolveSpawnModel } = require('../spawn-utils');
+const { resolveBin, resolveBinAsync, augmentPathEnv, prependPathEnv, resolveNvmBinDir, resolveSpawnModel, winExecSpec } = require('../spawn-utils');
 const { buildCodexEnv, codexTerminalLaunchOptions, toCodexEffort } = require('../codex-env');
 const { matchPromptLine, CODEX_PROMPT_PATTERNS } = require('./prompt-detect');
 const { parseCodexCatalog } = require('./model-registry');
@@ -178,9 +178,8 @@ class CodexAgent extends BaseTaskAgent {
   async probeModels(config) {
     const binPath = resolveBin('codex');
     if (!binPath) return [];
-    const nvmBinDir = resolveNvmBinDir(config.CODEX_BIN);
-    const probeEnv = augmentPathEnv({});
-    if (nvmBinDir) probeEnv.PATH = `${nvmBinDir}${path.delimiter}${probeEnv.PATH}`;
+    // prependPathEnv keeps the env at one PATH key (TPT566) — never `env.PATH = …`.
+    const probeEnv = prependPathEnv(augmentPathEnv({}), resolveNvmBinDir(config.CODEX_BIN));
     try {
       const json = await CodexAgent._runDebugModels(binPath, probeEnv);
       const parsed = parseCodexCatalog(json);
@@ -204,9 +203,13 @@ class CodexAgent extends BaseTaskAgent {
     return new Date().toISOString().slice(0, 10);
   }
 
+  // argv via winExecSpec(): a Windows codex.cmd launcher runs through cmd.exe (Node >= 22
+  // rejects a shell-less execFile of a .cmd with EINVAL); .exe/POSIX paths pass through.
   static _runDebugModels(binPath, env) {
     return new Promise((resolve, reject) => {
-      execFile(binPath, ['debug', 'models'], {
+      const spec = winExecSpec(binPath, ['debug', 'models']);
+      execFile(spec.command, spec.args, {
+        ...spec.options,
         env,
         timeout: MODEL_PROBE_TIMEOUT_MS,
         maxBuffer: MODEL_PROBE_MAX_BUFFER,
@@ -219,19 +222,24 @@ class CodexAgent extends BaseTaskAgent {
 
   async detect(config) {
     const bin = await resolveBinAsync('codex');
+    // Every negative carries `detail` (TPT567) — see BaseTaskAgent.buildDetectDetail().
+    const unavailable = (reason, probe) => ({
+      id: this.id, label: this.label, available: false, reason,
+      detail: BaseTaskAgent.buildDetectDetail(bin, probe),
+    });
     if (!bin) {
-      return { id: this.id, label: this.label, available: false, reason: 'Codex CLI not found. Install codex (npm i -g @openai/codex under node 22, or brew install codex), or set CODEX_BIN=/path/to/codex in .env.' };
+      return unavailable('Codex CLI not found. Install codex (npm i -g @openai/codex under node 22, or brew install codex), or set CODEX_BIN=/path/to/codex in .env.');
     }
-    // Run the login probe under the nvm-matched node so shebang-based CLIs resolve correctly
-    const nvmBinDir = resolveNvmBinDir(bin);
-    const probeEnv = augmentPathEnv({});
-    if (nvmBinDir) probeEnv.PATH = `${nvmBinDir}${path.delimiter}${probeEnv.PATH}`;
+    // Run the login probe under the nvm-matched node so shebang-based CLIs resolve correctly.
+    // prependPathEnv keeps the env at one PATH key (TPT566) — never `env.PATH = …`.
+    const probeEnv = prependPathEnv(augmentPathEnv({}), resolveNvmBinDir(bin));
     const probe = await BaseTaskAgent.runCliProbe(bin, ['login', 'status'], { env: probeEnv });
     if (probe.error) {
       if (probe.error.code === 'ENOENT') {
-        return { id: this.id, label: this.label, available: false, reason: 'Codex CLI not found' };
+        return unavailable('Codex CLI not found', probe);
       }
-      return { id: this.id, label: this.label, available: false, reason: 'Codex is not logged in (or login status check failed)' };
+      console.log(`[task-agent:detect] codex login probe spawn error: ${probe.error.code || probe.error.message}`);
+      return unavailable('Codex is not logged in (or login status check failed)', probe);
     }
     if (isCodexLoggedIn(probe.output)) {
       return { id: this.id, label: this.label, available: true };
@@ -240,7 +248,7 @@ class CodexAgent extends BaseTaskAgent {
       `[task-agent:detect] codex login probe reported not-logged-in ` +
       `(exit=${probe.status}): ${String(probe.output || '').slice(0, 200)}`
     );
-    return { id: this.id, label: this.label, available: false, reason: 'Codex is not logged in' };
+    return unavailable('Codex is not logged in', probe);
   }
 }
 

@@ -10,6 +10,7 @@ const {
   fetchPiModels, filterPiModelSuggestions, piCatalogDisplayId,
   getAgentDisplayLabel, loadAgents, FALLBACK_AGENTS,
   stripPiModelPrefix, applyPiModelPrefix, buildPiRowState, orderPiModelsForSave, addPiModelIssue, buildAgentCardRows,
+  buildDetailLines,
 } = await import('./agent-select.js');
 const { t } = await import('./i18n.js');
 const { createRequire } = await import('node:module');
@@ -660,6 +661,60 @@ test('the any-provider form copy exists in both locales', async () => {
   for (const locale of ['en', 'uk']) {
     setLocale(locale);
     for (const k of ['apiKeyOptional', 'baseUrl', 'errBaseUrlRequired']) assert.notEqual(tt(`agentSelect.${k}`), `agentSelect.${k}`, `${locale} is missing agentSelect.${k}`);
+  }
+  setLocale('en');
+});
+
+// ── (TPT567) detection diagnostics under the reason text ─────────────────────────────────────
+const SELECT_SRC = fs.readFileSync(new URL('./agent-select.js', import.meta.url), 'utf8');
+
+test('buildAgentCardRows carries `detail` on an unavailable claude/codex row and on the single unavailable Pi card', () => {
+  const detail = { bin: 'C:\\Users\\Anton M\\AppData\\Roaming\\npm\\claude.cmd', exit: 1, output: '{"loggedIn":false}' };
+  const rows = buildAgentCardRows({
+    agents: [
+      { id: 'claude', label: 'Claude Code', available: false, reason: 'Claude is not logged in', detail },
+      { id: 'codex', label: 'Codex', available: true },
+      { id: 'pi', label: 'Pi', available: false, reason: 'Pi CLI not found', detail: { bin: null, exit: null, output: '' } },
+    ],
+    piModels: [{ model: 'x', apiKey: 'k' }],
+  });
+  assert.deepEqual(rows.find((r) => r.id === 'claude').detail, detail);
+  assert.equal(rows.find((r) => r.id === 'codex').detail, null, 'a positive never carries detail');
+  const pi = rows.filter((r) => r.id === 'pi');
+  assert.equal(pi.length, 1);
+  assert.equal(pi[0].kind, 'pi-unavailable');
+  assert.deepEqual(pi[0].detail, { bin: null, exit: null, output: '' });
+});
+
+test('buildDetailLines folds the exit code into the output line and renders nothing for an empty/absent detail', () => {
+  assert.deepEqual(buildDetailLines(undefined), { bin: '', output: '' });
+  assert.deepEqual(buildDetailLines(null), { bin: '', output: '' });
+  assert.deepEqual(buildDetailLines({ bin: null, exit: null, output: '' }), { bin: '', output: '' });
+  assert.deepEqual(buildDetailLines({ bin: '/usr/local/bin/codex', exit: 1, output: ' Not logged in\n' }),
+    { bin: '/usr/local/bin/codex', output: 'exit=1 · Not logged in' });
+  assert.deepEqual(buildDetailLines({ bin: 'C:\\x\\claude.cmd', exit: null, output: 'ENOENT' }),
+    { bin: 'C:\\x\\claude.cmd', output: 'ENOENT' });
+  assert.deepEqual(buildDetailLines({ bin: null, exit: 0, output: '{"loggedIn":false}' }),
+    { bin: '', output: 'exit=0 · {"loggedIn":false}' });
+});
+
+// _cardHtml()/_renderEmpty() are private DOM builders — pin at the source level that BOTH the
+// card grid and the all-unavailable list route the detail through the shared _detailHtml().
+test('both the card grid and the all-unavailable list render the detail block, escaped', () => {
+  assert.match(SELECT_SRC, /const detailHtml = !d\.available \? _detailHtml\(d\.detail\) : ''/);
+  assert.match(SELECT_SRC, /const diagHtml = _detailHtml\(detail\);/);
+  const fn = SELECT_SRC.slice(SELECT_SRC.indexOf('function _detailHtml('), SELECT_SRC.indexOf('\n}', SELECT_SRC.indexOf('function _detailHtml(')));
+  assert.match(fn, /_esc\(bin\)/);
+  assert.match(fn, /_esc\(output\)/);
+  assert.match(fn, /setup-modal-agent-detail-bin/);
+  assert.match(fn, /setup-modal-agent-detail-output/);
+});
+
+test('the detail labels exist in both locales', async () => {
+  const { t: tt, setLocale } = await import('./i18n.js');
+  for (const locale of ['en', 'uk']) {
+    setLocale(locale);
+    for (const k of ['detailLauncher', 'detailProbe']) assert.notEqual(tt(`agentSelect.${k}`), `agentSelect.${k}`, `${locale} is missing agentSelect.${k}`);
   }
   setLocale('en');
 });

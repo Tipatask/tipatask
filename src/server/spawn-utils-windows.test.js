@@ -12,11 +12,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
 const { execFileSync } = require('node:child_process');
+const BaseTaskAgent = require('./task-agent/base-agent');
 
 const {
   selectWindowsLauncher, winLauncherExts, parseRegQueryPath, expandWindowsEnv,
   readWindowsRegistryPathDirs, _findExecutable, winExecSpec,
+  readPathEnv, setPathEnv, prependPathEnv,
 } = require('./spawn-utils');
 
 const SPAWN_UTILS = path.join(__dirname, 'spawn-utils.js');
@@ -359,4 +363,139 @@ test('winExecSpec(win32): cmd.exe comes from ComSpec, else SystemRoot\\System32,
   assert.equal(winExecSpec('C:\\x\\a.cmd', [], { isWin: true, env: { SystemRoot: 'C:\\WINDOWS' } }).command, 'C:\\WINDOWS\\System32\\cmd.exe');
   assert.equal(winExecSpec('C:\\x\\a.cmd', [], { isWin: true, env: { windir: 'C:\\WINDOWS' } }).command, 'C:\\WINDOWS\\System32\\cmd.exe');
   assert.equal(winExecSpec('C:\\x\\a.cmd', [], { isWin: true, env: {} }).command, 'cmd.exe');
+});
+
+// --- BaseTaskAgent.runCliProbe (TPT565) ---------------------------------------------------
+// The server-side detect probes (ClaudeAgent/CodexAgent.detect() -> runCliProbe()) used to
+// spawn a .cmd launcher with `shell: true`, which hands cmd.exe the path UNQUOTED — any
+// launcher under a path with a space failed and both agents reported "not logged in". The
+// probe now builds its argv through winExecSpec(); `spawnImpl` captures the exact spawn.
+
+function captureSpawn(calls) {
+  return (command, args, options) => {
+    calls.push({ command, args, options });
+    const child = new EventEmitter();
+    child.pid = 4242;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {};
+    setImmediate(() => {
+      child.stdout.end('{"loggedIn":true}');
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+}
+
+test('runCliProbe(win32): a .cmd launcher in a path with a space spawns cmd.exe /d /s /c "<quoted line>"', async () => {
+  const calls = [];
+  const bin = 'C:\\Users\\Anton M\\AppData\\Roaming\\npm\\claude.cmd';
+  const env = { PATH: 'C:\\x' };
+  const result = await BaseTaskAgent.runCliProbe(bin, ['auth', 'status'], { spawnImpl: captureSpawn(calls), isWin: true, env });
+  assert.equal(calls.length, 1);
+  const { command, args, options } = calls[0];
+  assert.equal(path.win32.basename(command).toLowerCase(), 'cmd.exe');
+  assert.deepEqual(args, ['/d', '/s', '/c', `""${bin}" "auth" "status""`]);
+  assert.equal(options.windowsVerbatimArguments, true);
+  assert.equal(options.shell, undefined, 'never shell: true — that is what left the path unquoted');
+  assert.equal(options.windowsHide, true);
+  assert.equal(options.env, env, 'probe env passes through untouched');
+  assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
+  assert.equal(result.error, null);
+  assert.equal(result.status, 0);
+  assert.equal(result.output, '{"loggedIn":true}');
+});
+
+test('runCliProbe(win32): a plain .exe is spawned verbatim — no cmd.exe wrapper, no quoting', async () => {
+  const calls = [];
+  const bin = 'C:\\Program Files\\Codex\\codex.exe';
+  await BaseTaskAgent.runCliProbe(bin, ['login', 'status'], { spawnImpl: captureSpawn(calls), isWin: true });
+  const { command, args, options } = calls[0];
+  assert.equal(command, bin);
+  assert.deepEqual(args, ['login', 'status']);
+  assert.equal(options.windowsVerbatimArguments, undefined);
+  assert.equal(options.shell, undefined);
+});
+
+test('runCliProbe: without isWin the real platform decides, and an unquotable .cmd argv resolves as an error', async () => {
+  const calls = [];
+  const bin = '/opt/x/claude.cmd';
+  await BaseTaskAgent.runCliProbe(bin, ['--version'], { spawnImpl: captureSpawn(calls) });
+  if (process.platform === 'win32') {
+    assert.equal(path.win32.basename(calls[0].command).toLowerCase(), 'cmd.exe');
+  } else {
+    assert.equal(calls[0].command, bin);
+    assert.deepEqual(calls[0].args, ['--version']);
+  }
+  const rejected = await BaseTaskAgent.runCliProbe('C:\\x\\a.cmd', ['--flag="v"'], { spawnImpl: captureSpawn([]), isWin: true });
+  assert.match(rejected.error?.message || '', /unquotable/);
+  assert.equal(rejected.status, null);
+});
+
+// --- single PATH key (TPT566) -------------------------------------------------------------
+// process.env's key is spelled `Path` on Windows; `{ ...process.env, PATH: x }` therefore hands a
+// child both a stale `Path` and the new `PATH`, and which one cmd.exe honours is undefined.
+// setPathEnv()/prependPathEnv() collapse every spelling into the one canonical `PATH` key.
+
+const pathKeys = (env) => Object.keys(env).filter(k => k.toLowerCase() === 'path');
+
+test('setPathEnv(win32): `Path` is replaced by exactly one `PATH` key; other vars untouched', () => {
+  const env = setPathEnv({ Path: 'C:\\x', FOO: '1' }, 'C:\\y', { isWin: true });
+  assert.deepEqual(pathKeys(env), ['PATH']);
+  assert.equal(env.PATH, 'C:\\y');
+  assert.equal(env.FOO, '1');
+  assert.deepEqual(pathKeys(setPathEnv({ Path: 'a', PATH: 'b', path: 'c' }, 'd', { isWin: true })), ['PATH']);
+  assert.equal(setPathEnv({}, 'C:\\z', { isWin: true }).PATH, 'C:\\z');
+});
+
+test('prependPathEnv(win32): env { Path: "C:\\\\x" } -> one PATH key, prepended dir first', () => {
+  const env = prependPathEnv({ Path: 'C:\\x' }, 'C:\\nvm\\v22', { isWin: true });
+  assert.deepEqual(pathKeys(env), ['PATH']);
+  assert.deepEqual(env.PATH.split(';'), ['C:\\nvm\\v22', 'C:\\x']);
+  // Both spellings present: the exact `PATH` value is the one kept and prepended to.
+  const dup = prependPathEnv({ Path: 'C:\\stale', PATH: 'C:\\live' }, 'C:\\nvm', { isWin: true });
+  assert.deepEqual(pathKeys(dup), ['PATH']);
+  assert.deepEqual(dup.PATH.split(';'), ['C:\\nvm', 'C:\\live']);
+  // Falsy dir: value unchanged, duplicates still collapsed.
+  const noop = prependPathEnv({ Path: 'C:\\x' }, null, { isWin: true });
+  assert.deepEqual(noop, { PATH: 'C:\\x' });
+  assert.equal(prependPathEnv({}, 'C:\\only', { isWin: true }).PATH, 'C:\\only');
+  assert.equal(readPathEnv({ Path: 'C:\\p' }, { isWin: true }), 'C:\\p');
+  assert.equal(readPathEnv({}, { isWin: true }), '');
+});
+
+test('setPathEnv/prependPathEnv(posix): names are case-sensitive, so a `Path` variable is left alone', () => {
+  const env = setPathEnv({ Path: 'keep', PATH: 'old' }, 'new', { isWin: false });
+  assert.deepEqual(env, { Path: 'keep', PATH: 'new' });
+  const pre = prependPathEnv({ Path: 'keep', PATH: '/usr/bin' }, '/nvm/bin', { isWin: false });
+  assert.deepEqual(pre, { Path: 'keep', PATH: '/nvm/bin:/usr/bin' });
+  assert.equal(readPathEnv({ Path: 'keep' }, { isWin: false }), '');
+});
+
+test('forced win32: augmentPathEnv() collapses an inherited `Path` and an extras `Path` into one PATH key', () => {
+  const root = tmpdir('tt-tpt566-path-');
+  try {
+    const toolDir = path.join(root, 'tools');
+    fs.mkdirSync(toolDir);
+    writeExec(path.join(toolDir, 'where'), '#!/bin/sh\nexit 1\n');
+    writeExec(path.join(toolDir, 'reg'), '#!/bin/sh\nexit 1\n');
+    const out = runWin32Child(`
+      const keys = (env) => Object.keys(env).filter(k => k.toLowerCase() === 'path');
+      const inherited = su.augmentPathEnv({});
+      const viaExtras = su.augmentPathEnv({ Path: 'C:\\\\stale' });
+      process.stdout.write(JSON.stringify({
+        inheritedKeys: keys(inherited), inheritedPath: inherited.PATH,
+        extrasKeys: keys(viaExtras), extrasPath: viaExtras.PATH,
+      }));
+    `, { PATH: undefined, Path: toolDir }); // the child's process.env carries only `Path`, as on Windows
+    const result = JSON.parse(out);
+    assert.deepEqual(result.inheritedKeys, ['PATH']);
+    assert.ok(result.inheritedPath.split(';').includes(toolDir), `inherited Path dir missing: ${result.inheritedPath}`);
+    assert.deepEqual(result.extrasKeys, ['PATH']);
+    assert.equal(result.extrasPath.includes('C:\\stale'), false, 'an extras `Path` never leaks into the env');
+    assert.equal(result.extrasPath, result.inheritedPath);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

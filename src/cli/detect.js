@@ -1,8 +1,7 @@
 'use strict';
 
-const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { resolveBin, clearBinCache, augmentPathEnv, resolveNvmBinDir, winExecSpec } = require('../server/spawn-utils');
+const { resolveBin, clearBinCache, augmentPathEnv, prependPathEnv, resolveNvmBinDir, winExecSpec } = require('../server/spawn-utils');
 
 /**
  * Probe `--version` output from a resolved binary path.
@@ -15,9 +14,8 @@ const { resolveBin, clearBinCache, augmentPathEnv, resolveNvmBinDir, winExecSpec
  */
 function _probeVersion(binPath) {
   try {
-    const env = augmentPathEnv({});
-    const nvmBinDir = resolveNvmBinDir(binPath);
-    if (nvmBinDir) env.PATH = `${nvmBinDir}${path.delimiter}${env.PATH}`;
+    // prependPathEnv keeps the env at one PATH key (TPT566) — never `env.PATH = …`.
+    const env = prependPathEnv(augmentPathEnv({}), resolveNvmBinDir(binPath));
     const spec = winExecSpec(binPath, ['--version']);
     const out = execFileSync(spec.command, spec.args, {
       ...spec.options, encoding: 'utf8', timeout: 5000, env, windowsHide: true,

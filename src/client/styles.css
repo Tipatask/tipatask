@@ -12559,6 +12559,7 @@ mark.mention--agent {
    stack looked ragged. A shared min-height with lighter vertical padding evens the rhythm out. */
 .setup-modal-agent-card {
   display: flex;
+  flex-wrap: wrap; /* TPT567 — the diagnostic detail row wraps under the name/reason line */
   align-items: center;
   gap: 0.55rem;
   min-height: 2.9rem;
@@ -12596,6 +12597,44 @@ mark.mention--agent {
   color: var(--c-text-muted);
   font-style: italic;
   margin-right: 0.25rem;
+}
+/* (TPT567) Launcher path + probe exit/output under an unavailable agent — the only place a
+   packaged app shows WHY detection failed. Full-width row; long paths break anywhere. The
+   dimmed `.is-unavailable` card keeps pointer-events off, so this is read-only text. */
+.setup-modal-agent-detail {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+  font-size: 0.68rem;
+  line-height: 1.3;
+  color: var(--c-text-muted);
+  user-select: text;
+}
+/* Doubled class selectors outrank `.setup-modal-agent-empty-item code` (nowrap, margin-left:auto). */
+.setup-modal-agent-detail .setup-modal-agent-detail-bin,
+.setup-modal-agent-detail .setup-modal-agent-detail-output {
+  margin: 0;
+  padding: 0.1rem 0.35rem;
+  background: var(--c-bg-2, rgba(0,0,0,0.12));
+  border-radius: 4px;
+  font-family: var(--c-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: inherit;
+  color: var(--c-text-secondary, var(--c-text-muted));
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+.setup-modal-agent-detail .setup-modal-agent-detail-output {
+  max-height: 5.2em;
+  overflow: auto;
+}
+.setup-modal-agent-empty-item {
+  flex-wrap: wrap; /* TPT567 — detail row wraps under the name/install line */
+}
+.setup-modal-agent-empty-item .setup-modal-agent-detail {
+  margin-top: 0.2rem;
 }
 /* The name slot is `flex: 1`, so this wrap is already flush-right and identically sized on every
    card — the "Default" column lines up without a spacer. The left padding just keeps it off the

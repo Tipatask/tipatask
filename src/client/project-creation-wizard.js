@@ -6,10 +6,15 @@
 // the Preset step (nothing to seed): 5 dots instead of 6, see visibleSteps().
 // Emits wizard-complete with all data. Does NOT write configs or call APIs — that
 // is handled by a downstream listener (index.js), which branches on apiProject.isNew.
+// (TPT564) open({ locked: true }) is the first-run mode for a window with no bound project:
+// Escape does nothing, the header has no ×, and the only way out (step 1 Cancel) calls
+// onCancel, which index.js routes back to Get Started — never to the empty board. The backdrop
+// never dismisses the wizard in either mode.
 import { renderAgentSelect, loadAgents, piCredentialsMissing, computePiSaveRows } from './agent-select.js';
 import { recheckAgents } from './agent-recheck.js';
 import { headerHtml, fitHeaderPath } from './setup-modal-header.js';
 import { DEFAULT_API_BASE_URL } from './constants.js';
+import { activateDialogFocus } from './dialog-focus.js';
 // (C1388) This module re-renders its whole overlay per step (_render()/_renderStep()),
 // so t() calls made INSIDE those render functions are locale-live — never capture one
 // in a module-level constant (i18n.js's own rule). PRESETS below uses getters for
@@ -48,8 +53,17 @@ let _availableAgents = [];
 let _piModels = [{ model: '', apiKey: '' }];
 let _preset = null;
 let _onComplete = null;
+// (TPT564) User-dismissal callback (step 1 Cancel, ×, Escape) — never fired by a completed
+// run or by open() superseding an earlier session; see _cancel().
+let _onCancel = null;
+let _locked = false;
 let _overlay = null;
 let _keyHandler = null;
+// (TPT561) The wizard's dialog-focus.js layer. An open Task Edit Modal owns a layer that inerts
+// every other <body> child, so without one of its own the wizard paints on top but takes no
+// clicks. Bound to ONE overlay root for the wizard's whole life — _render() repaints its
+// contents, never replaces it (a fresh body child would be inerted by the lower layer).
+let _focusHandle = null;
 
 // (TPT557) Step numbers shown for a wizard run — an existing API project has no Preset step
 // (step 5): nothing gets seeded, index.js links the folder through project:open-existing.
@@ -90,7 +104,7 @@ export async function setupAuthWeb(apiBaseUrl, invoke, opts) {
   }
 }
 
-export function open({ projectPath, onComplete }) {
+export function open({ projectPath, onComplete, onCancel, locked = false }) {
   if (_overlay) close();
   _projectPath = projectPath;
   _step = 1;
@@ -101,13 +115,23 @@ export function open({ projectPath, onComplete }) {
   _piModels = [{ model: '', apiKey: '' }];
   _preset = null;
   _onComplete = onComplete || null;
+  _onCancel = typeof onCancel === 'function' ? onCancel : null;
+  _locked = !!locked;
   _openId++;
   _chooseAccount = false;
   // An in-memory sign-in from an earlier session of this wizard still wins (Step 1 shows it).
   _storedAccountPending = !_userToken && !!window.electronAPI?.setupStoredAccount;
   _render();
-  _keyHandler = (e) => { if (e.key === 'Escape') close(); };
-  document.addEventListener('keydown', _keyHandler);
+  // Capture-phase + stopPropagation: Escape closes only the wizard, never also reaching
+  // template.html's document-level Task Edit Modal closer underneath. Locked (TPT564): Escape
+  // is swallowed on every step — it must not reach Get Started's closer either.
+  _keyHandler = (e) => {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    if (_locked) { e.preventDefault(); return; }
+    _cancel();
+  };
+  document.addEventListener('keydown', _keyHandler, { capture: true });
   if (_storedAccountPending) _adoptStoredAccount();
 }
 
@@ -133,10 +157,21 @@ export function close() {
   if (_overlay) { _overlay.remove(); _overlay = null; }
   document.documentElement.style.overflowY = '';
   document.body.style.paddingRight = '';
-  if (_keyHandler) { document.removeEventListener('keydown', _keyHandler); _keyHandler = null; }
+  if (_keyHandler) { document.removeEventListener('keydown', _keyHandler, { capture: true }); _keyHandler = null; }
+  _focusHandle?.close();
+  _focusHandle = null;
   _onComplete = null;
+  _onCancel = null;
+  _locked = false;
   _storedAccountPending = false;
   _openId++;
+}
+
+// User dismissal (step 1 Cancel, ×, Escape when not locked): tear down, then tell the caller.
+function _cancel() {
+  const onCancel = _onCancel;
+  close();
+  if (onCancel) try { onCancel(); } catch (err) { console.warn('[wizard] onCancel failed', err); }
 }
 
 function _goto(step) {
@@ -145,11 +180,16 @@ function _goto(step) {
 }
 
 function _render() {
-  const existing = document.querySelector('.wizard-modal');
-  if (existing) existing.remove();
-
-  _overlay = document.createElement('div');
-  _overlay.className = 'wizard-modal setup-modal';
+  document.querySelectorAll('.wizard-modal').forEach((el) => { if (el !== _overlay) el.remove(); });
+  const fresh = !_overlay || !_overlay.isConnected;
+  if (fresh) {
+    _focusHandle?.close();
+    _focusHandle = null;
+    _overlay = document.createElement('div');
+    _overlay.className = 'wizard-modal setup-modal';
+    _overlay.setAttribute('role', 'dialog');
+    _overlay.setAttribute('aria-modal', 'true');
+  }
 
   const STEP_LABELS = [t('wizard.stepSignIn'), t('wizard.stepApiProject'), t('wizard.stepDevice'), t('wizard.stepAgent'), t('wizard.stepPreset'), t('wizard.stepConfirm')];
   // (TPT557) One dot per VISIBLE step — the Preset dot disappears once an existing project
@@ -162,22 +202,28 @@ function _render() {
   _overlay.innerHTML = `
     <div class="setup-modal-backdrop"></div>
     <div class="setup-modal-panel">
-      ${headerHtml({ title: t('wizard.headerTitle'), projectPath: _projectPath })}
+      ${headerHtml({ title: t('wizard.headerTitle'), projectPath: _projectPath, closable: !_locked })}
       <div class="setup-modal-steps">${dots}</div>
       <div class="setup-modal-step-body" id="wiz-step-body"></div>
       <div class="setup-modal-footer" id="wiz-footer"></div>
     </div>
   `;
 
-  document.body.appendChild(_overlay);
+  if (fresh) {
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+    document.body.style.paddingRight = scrollbarWidth + 'px';
+    document.documentElement.style.overflowY = 'hidden';
+    document.body.appendChild(_overlay);
+    // .sma-pi-suggest — agent-select.js portals its model typeahead to <body>.
+    _focusHandle = activateDialogFocus({ root: _overlay, portals: '.sma-pi-suggest' });
+  }
   fitHeaderPath(_overlay);
 
-  const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
-  document.body.style.paddingRight = scrollbarWidth + 'px';
-  document.documentElement.style.overflowY = 'hidden';
-
-  _overlay.querySelector('.setup-modal-close').addEventListener('click', close);
+  // No × in locked mode (TPT564); .setup-modal-backdrop deliberately has no click handler.
+  _overlay.querySelector('.setup-modal-close')?.addEventListener('click', _cancel);
   _renderStep();
+  // Repainting drops the focused element; steps that focus their own input already did.
+  if (!_overlay.contains(document.activeElement)) _focusHandle.focusFirst();
 }
 
 function _renderStep() {
@@ -199,7 +245,7 @@ function _renderStep1(body, footer) {
     footer.innerHTML = `
       <button class="setup-modal-btn setup-modal-btn--secondary" id="wiz-cancel-btn">${_esc(t('common.cancel'))}</button>
     `;
-    footer.querySelector('#wiz-cancel-btn').addEventListener('click', close);
+    footer.querySelector('#wiz-cancel-btn').addEventListener('click', _cancel);
     return;
   }
 
@@ -237,7 +283,7 @@ function _renderStep1(body, footer) {
   footer.innerHTML = `
     <button class="setup-modal-btn setup-modal-btn--secondary" id="wiz-cancel-btn">${_esc(t('common.cancel'))}</button>
   `;
-  footer.querySelector('#wiz-cancel-btn').addEventListener('click', close);
+  footer.querySelector('#wiz-cancel-btn').addEventListener('click', _cancel);
 
   const actions = body.querySelector('#wiz-auth-actions');
   const spinner = body.querySelector('#wiz-auth-spinner');

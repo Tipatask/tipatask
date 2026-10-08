@@ -17,8 +17,15 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+// Tokens live only in the app-level account store under TIPATASK_USER_DATA. Give this file
+// its own user-data root: the test runner's shared one is rewritten concurrently by other
+// test files, and a bare `node --test` run would otherwise write the developer's real store.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-create-assignee-data-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
+
 const { createApiBackend } = require('./api-backend');
 const { writeProjectConfig } = require('./project-config');
+const { writeAccountToken, clearAccountToken } = require('./account-store');
 
 const ME_ID = 7;
 
@@ -26,13 +33,14 @@ async function withFakeApiServer(handler, run) {
   const server = http.createServer(handler);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
+  const baseUrl = `http://127.0.0.1:${port}`;
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-create-assignee-'));
   writeProjectConfig(projectRoot, {
     TASK_BACKEND: 'api',
-    API_BASE_URL: `http://127.0.0.1:${port}`,
-    API_TOKEN: 'test-token',
+    API_BASE_URL: baseUrl,
     API_PROJECT_ID: '1',
   });
+  writeAccountToken(baseUrl, 'test-token');
   const backend = createApiBackend(null, projectRoot);
   // The resolved user id is module-level in api-backend.js, shared by every backend in this
   // process — drop it so each test starts from "identity not yet known".
@@ -41,6 +49,7 @@ async function withFakeApiServer(handler, run) {
     await run(backend);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    clearAccountToken(baseUrl);
     fs.rmSync(projectRoot, { recursive: true, force: true });
   }
 }

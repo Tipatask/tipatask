@@ -58,7 +58,7 @@ function harness(overrides = {}) {
     claimProject: (dir, win) => owners.set(dir, win),
     writeProjectMcpConfig() {}, writeProjectSkillsConfig() {}, writeProjectCodexConfig() {},
     BrowserWindow: FakeWindow, attachExternalLinkPolicy() {}, scheduleOpenProjectsSync() {},
-    getIconPath() {}, projectDirs: new Map(), attachCloseGuard() {},
+    getWindowIcon() {}, projectDirs: new Map(), attachCloseGuard() {},
     bindWindowToProject: (_, dir) => events.push(['bind', dir]),
     __dirname, path, PORT: 12345, console,
   });
@@ -192,16 +192,21 @@ test('canceling access while focusing an existing project does not fall through 
   const start = template.indexOf('  async function openOrCreateProject()');
   const end = template.indexOf('\n  }', start) + '\n  }'.length;
   let opens = 0;
+  let getStarted = 0;
   const context = vm.createContext({
     window: { electronAPI: {
       pickAndOpenProject: async () => ({ path: '/foreign' }),
       focusProjectWindow: async () => ({ ok: false, canceled: true }),
       openProject: () => { opens++; },
     } },
+    // (TPT564) An unbound window gets Get Started back instead of the empty board.
+    _isUnboundWindowSync: () => true,
+    _showChooseModal: () => { getStarted++; },
   });
   vm.runInContext(template.slice(start, end), context);
   await context.openOrCreateProject();
   assert.equal(opens, 0);
+  assert.equal(getStarted, 1);
 });
 
 test('native dialog renders English and Ukrainian from matching renderer strings', async () => {

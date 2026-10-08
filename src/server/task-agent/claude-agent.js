@@ -6,7 +6,7 @@ const { execFile } = require('node:child_process');
 const BaseTaskAgent = require('./base-agent');
 const config = require('../config');
 const { getStaticBundle, getTaskStartupGrepBundle } = require('../static-context');
-const { resolveBin, resolveBinAsync, augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolveSpawnModel, resolveAttentionTerminalBell } = require('../spawn-utils');
+const { resolveBin, resolveBinAsync, augmentPathEnv, prependPathEnv, projectEnvExtras, resolveNvmBinDir, resolveSpawnModel, resolveAttentionTerminalBell, winExecSpec } = require('../spawn-utils');
 const { matchPromptLine, CLAUDE_PROMPT_PATTERNS, CLAUDE_PENDING_PASTE_RE } = require('./prompt-detect');
 const { buildClaudeModelList } = require('./model-registry');
 const { buildHeadersHelperCommand, writeSpawnMcpConfig } = require('../mcp-spawn-config');
@@ -304,11 +304,13 @@ class ClaudeAgent extends BaseTaskAgent {
     if (!bin) return Promise.resolve(false);
     const key = claudeBinFingerprint(path.isAbsolute(bin) ? bin : (resolveBin('claude') || bin));
     if (!_effortFlagCache.has(key)) {
-      const nvmBinDir = resolveNvmBinDir(config.CLAUDE_BIN);
-      const env = augmentPathEnv({});
-      if (nvmBinDir) env.PATH = `${nvmBinDir}${path.delimiter}${env.PATH}`;
+      // prependPathEnv keeps the env at one PATH key (TPT566) — never `env.PATH = …`.
+      const env = prependPathEnv(augmentPathEnv({}), resolveNvmBinDir(config.CLAUDE_BIN));
+      // argv via winExecSpec(): a Windows claude.cmd launcher runs through cmd.exe (Node >= 22
+      // rejects a shell-less execFile of a .cmd with EINVAL); .exe/POSIX paths pass through.
+      const spec = winExecSpec(bin, ['--help']);
       _effortFlagCache.set(key, new Promise((resolve) => {
-        execFile(bin, ['--help'], { env, timeout: EFFORT_HELP_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+        execFile(spec.command, spec.args, { ...spec.options, env, timeout: EFFORT_HELP_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
           if (err) {
             console.log(`[claude-agent] --help effort probe failed: ${err.code || err.message}`);
             _effortFlagCache.delete(key); // retry on the next effort spawn
@@ -441,20 +443,24 @@ class ClaudeAgent extends BaseTaskAgent {
 
   async detect(config) {
     const bin = await resolveBinAsync('claude');
+    // Every negative carries `detail` (TPT567) — see BaseTaskAgent.buildDetectDetail().
+    const unavailable = (reason, probe) => ({
+      id: this.id, label: this.label, available: false, reason,
+      detail: BaseTaskAgent.buildDetectDetail(bin, probe),
+    });
     if (!bin) {
-      return { id: this.id, label: this.label, available: false, reason: 'Claude CLI not found. Install claude or ensure its directory is on PATH.' };
+      return unavailable('Claude CLI not found. Install claude or ensure its directory is on PATH.');
     }
-    // Run the login probe under the nvm-matched node so shebang-based CLIs resolve correctly
-    const nvmBinDir = resolveNvmBinDir(bin);
-    const probeEnv = augmentPathEnv({});
-    if (nvmBinDir) probeEnv.PATH = `${nvmBinDir}${path.delimiter}${probeEnv.PATH}`;
+    // Run the login probe under the nvm-matched node so shebang-based CLIs resolve correctly.
+    // prependPathEnv keeps the env at one PATH key (TPT566) — never `env.PATH = …`.
+    const probeEnv = prependPathEnv(augmentPathEnv({}), resolveNvmBinDir(bin));
     const probe = await BaseTaskAgent.runCliProbe(bin, ['auth', 'status'], { env: probeEnv });
     if (probe.error) {
       if (probe.error.code === 'ENOENT') {
-        return { id: this.id, label: this.label, available: false, reason: 'Claude CLI not found' };
+        return unavailable('Claude CLI not found', probe);
       }
       console.log(`[task-agent:detect] claude auth probe spawn error: ${probe.error.code || probe.error.message}`);
-      return { id: this.id, label: this.label, available: false, reason: 'Claude is not logged in' };
+      return unavailable('Claude is not logged in', probe);
     }
     const status = parseClaudeAuthStatus(probe.output);
     if (status.loggedIn) {
@@ -468,7 +474,7 @@ class ClaudeAgent extends BaseTaskAgent {
       `[task-agent:detect] claude auth probe reported not-logged-in ` +
       `(exit=${probe.status}): ${String(probe.output || '').slice(0, 200)}`
     );
-    return { id: this.id, label: this.label, available: false, reason: 'Claude is not logged in' };
+    return unavailable('Claude is not logged in', probe);
   }
 }
 

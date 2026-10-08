@@ -42,7 +42,8 @@ test('_renderTaskEditModal() still hides Comments, Notifications, Start and the 
   const body = sliceFunctionBody(editModalSrc, 'function _renderTaskEditModal(');
   assert.match(body, /data-tab="comments"\$\{isPreviewTask \? ' hidden' : ''\}/);
   assert.match(body, /data-tab="notifications"\$\{isPreviewTask \? ' hidden' : ''\}/);
-  assert.match(body, /const showStart = !isPreviewTask/);
+  assert.match(body, /const showStart = _shouldShowModalStart\(draft\);/);
+  assert.match(sliceFunctionBody(editModalSrc, 'function _shouldShowModalStart('), /!callbacks\.preloadedTask/);
   assert.match(body, /class="modal-context-btns"\$\{isPreviewTask \? ' hidden' : ''\}/);
 });
 

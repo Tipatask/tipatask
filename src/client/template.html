@@ -271,7 +271,8 @@
 <!-- (C1388) "Get Started" modal (first project — no folder bound yet), rendered by
      _showChooseModal(). (TPT557) It no longer doubles as the unconfigured-folder chooser:
      an unconfigured folder opens the project wizard directly. The action button is still
-     built at show time so its label stays locale-live. -->
+     built at show time so its label stays locale-live. (TPT564) No close control and no
+     backdrop handler; Escape dismisses it only in a window that already has a project. -->
 <div id="project-choose-modal" style="display:none;position:fixed;inset:0;z-index:9999;align-items:center;justify-content:center;background:rgba(0,0,0,0.55)">
   <div style="background:var(--c-bg-card,#fbf9f3);border:1px solid var(--c-border,#e9e4d8);color:var(--c-text,#1a1a19);border-radius:10px;padding:32px 36px;min-width:320px;max-width:440px;box-shadow:0 8px 32px rgba(0,0,0,0.4);text-align:center">
     <div id="project-choose-title" style="font-size:15px;font-weight:700;margin-bottom:8px"></div>
@@ -4226,6 +4227,11 @@ if (window.electronAPI) {
   // unconfigured-folder "setup kind" chooser (Link-existing vs Create-new); that second
   // state is gone — an unconfigured folder now opens the project wizard directly, whose
   // Create Project step covers both outcomes. Rebuilt per call so the labels stay locale-live.
+  // (TPT564) Set per show: true while the window has no bound project. Locked, Get Started
+  // ignores Escape (it has no close control or backdrop handler either), so the empty,
+  // unconfigured board is unreachable — every way out leads back here.
+  let _chooseLocked = false;
+  function _isUnboundWindowSync() { return !window.electronAPI?.getProjectPath?.(); }
   function _showChooseModal() {
     // (TPT556) Get Started sits above .setup-modal (z-index 9999 vs 3200). While a wizard is up
     // (e.g. main re-sends project:menu 'choose' from setup:reauth-account, before the account
@@ -4245,23 +4251,31 @@ if (window.electronAPI) {
     _chooseTitle.textContent = t('project.getStartedTitle');
     _chooseDesc.textContent = t('project.getStartedDesc');
     addButton(t('project.getStartedAction'), true, () => openOrCreateProject());
+    _chooseLocked = _isUnboundWindowSync();
     _chooseModal.style.display = 'flex';
   }
+  // (TPT564) index.js's create-project listener fires this when the locked wizard is cancelled
+  // or its link/create fails in an unbound window.
+  window.addEventListener('show-get-started', () => _showChooseModal());
 
   // (C1388) Single entry point for "Open / Create Project" — used by BOTH the Project
   // menu's 'open' action and the Get Started modal's one button. Folder first, then
   // branch: already open elsewhere → focus it; configured → open it; unconfigured →
   // (TPT557) open the project wizard straight away with the picked folder — its Create
   // Project step is where the user creates a new API project or selects an existing one.
+  // (TPT564) In an unbound window every outcome but the wizard leaves this window blank —
+  // picker cancelled, project already open elsewhere, or opened in a new window — so Get
+  // Started comes back instead of the empty board.
   async function openOrCreateProject() {
+    const unbound = _isUnboundWindowSync();
     const pick = await window.electronAPI.pickAndOpenProject();
     const focusResult = pick && await window.electronAPI.focusProjectWindow(pick.path);
-    if (focusResult?.canceled) return;
+    if (focusResult?.canceled) { if (unbound) _showChooseModal(); return; }
     const alreadyOpen = !!focusResult?.ok;
     const d = window.TipTask.projectOpenFlow.decideOpenAction({ pick, alreadyOpen });
-    if (d.action === 'none' || d.action === 'focused') return;
-    if (d.action === 'open-new') { window.electronAPI.openProject(d.path, 'new'); return; }
-    if (d.action === 'open-wizard') window.dispatchEvent(new CustomEvent('create-project', { detail: { projectPath: d.path } }));
+    if (d.action === 'open-wizard') { window.dispatchEvent(new CustomEvent('create-project', { detail: { projectPath: d.path } })); return; }
+    if (d.action === 'open-new') window.electronAPI.openProject(d.path, 'new');
+    if (unbound) _showChooseModal();
   }
 
   function _showProjectRenameModal(currentName) {
@@ -4534,16 +4548,20 @@ if (window.electronAPI) {
     _pendingProjectDir = null;
   });
 
+  // (TPT564) New Window / Cancel / Escape on the Current-or-New chooser leave THIS window as it
+  // was — in an unbound window that is the empty board, so Get Started comes back instead.
   _btnNew.addEventListener('click', () => {
     if (!_pendingProjectDir) return;
     window.electronAPI.openProject(_pendingProjectDir, 'new');
     _projModal.style.display = 'none';
     _pendingProjectDir = null;
+    if (_isUnboundWindowSync()) _showChooseModal();
   });
 
   _btnCancel.addEventListener('click', () => {
     _projModal.style.display = 'none';
     _pendingProjectDir = null;
+    if (_isUnboundWindowSync()) _showChooseModal();
   });
 
   window.electronAPI.onProjectChanged(async (dir, name) => {
@@ -4656,8 +4674,10 @@ if (window.electronAPI) {
       if (_projModal.style.display === 'flex') {
         _projModal.style.display = 'none';
         _pendingProjectDir = null;
+        if (_isUnboundWindowSync()) { _showChooseModal(); return; }
       }
-      if (_chooseModal?.style.display === 'flex') {
+      // (TPT564) Locked Get Started (unbound window) ignores Escape.
+      if (_chooseModal?.style.display === 'flex' && !_chooseLocked) {
         _chooseModal.style.display = 'none';
       }
     }

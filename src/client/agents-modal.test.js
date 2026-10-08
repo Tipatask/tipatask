@@ -56,3 +56,12 @@ test('agentsModal.errPi no longer talks about "rows" in either locale', () => {
     assert.doesNotMatch(s, /рядк/i, `${lang} wording updated (any case form)`);
   }
 });
+
+// (TPT567) The modal passes `detail` through untouched — agent-select.js renders it. Pin that the
+// modal never strips the status objects down to a fixed field list before handing them over.
+test('Edit Agents hands the raw agent statuses (incl. detail) to renderAgentSelect and state.agentStatuses', () => {
+  assert.match(SRC, /_lastAgentStatuses = agents;/);
+  assert.match(SRC, /renderAgentSelect\(gridEl, \{\s*agents,/);
+  assert.match(SRC, /state\.agentStatuses = _lastAgentStatuses/);
+  assert.doesNotMatch(SRC, /agents\.map\(\(?a\)? => \(\{ id: a\.id/, 'no field-whitelisting map in the modal');
+});

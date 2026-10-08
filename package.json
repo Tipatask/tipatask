@@ -1,6 +1,6 @@
 {
   "name": "tipatask-app",
-  "version": "0.9.11",
+  "version": "0.9.12",
   "description": "TipΔTask — Electron desktop app: local task board, architecture knowledge base, and AI coding-agent orchestrator (Claude/Codex/Pi), with a CLI installer for the agent harness files.",
   "license": "Apache-2.0",
   "author": "Anton Matiienko, Apppixies",
@@ -45,6 +45,7 @@
     "probe:mcp-remote": "node scripts/probe-mcp-remote.js",
     "probe:mcp-headers-helper": "node scripts/probe-mcp-headers-helper.js",
     "probe:agent-models": "node scripts/probe-agent-models.js",
+    "probe:agent-detect": "node scripts/probe-agent-detect.js",
     "probe:tag-descriptions": "node scripts/probe-tag-descriptions.js",
     "probe:kb-reindex": "node scripts/probe-kb-reindex.js",
     "probe:kb-lock": "node scripts/probe-kb-lock.js",
@@ -105,7 +106,6 @@
       "preload.js",
       "todo-server.js",
       "assets/**/*",
-      "!assets/installer.nsh",
       ".env.example",
       "src/**/*",
       "dist/**/*",
@@ -162,7 +162,10 @@
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": false
+      "allowToChangeInstallationDirectory": false,
+      "createStartMenuShortcut": true,
+      "shortcutName": "TipATask",
+      "include": "build/installer.nsh"
     },
     "linux": {
       "target": [

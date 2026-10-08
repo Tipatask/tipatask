@@ -50,6 +50,8 @@ function createChildWindow({ file, width, height, resizable, title }) {
     maximizable: resizable,
     fullscreenable: false,
     title,
+    // (TPT563) Taskbar-visible on Windows; without an icon its button shows blank.
+    ...(process.platform === 'win32' ? { icon: path.join(__dirname, '..', 'assets', 'icon.ico') } : {}),
     backgroundColor: '#f1f1ef', // matches splash.html's --splash-paper
     webPreferences: {
       preload: path.join(__dirname, 'about-preload.js'),

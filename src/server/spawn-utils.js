@@ -81,6 +81,47 @@ const PROBE_DIRS = [
 // PATH separator is ':' on POSIX, ';' on Windows.
 const PATH_SEP = IS_WIN ? ';' : ':';
 
+// --- Single PATH key (TPT566) ------------------------------------------------------------------
+// On Windows process.env's key is spelled `Path`; a plain-object copy keeps that spelling, so
+// `{ ...process.env, PATH: x }` yields an env block carrying BOTH a stale `Path` and the new
+// `PATH`. Which of two same-named-ignoring-case entries cmd.exe/CreateProcess resolves is
+// undefined — npm's claude.cmd/codex.cmd then may not find `node`, and detection reports "not
+// logged in". Every spawn env therefore holds exactly ONE PATH-named key, canonically spelled
+// `PATH` (the spelling every `env.PATH` reader/writer in this codebase uses; the OS lookup is
+// case-insensitive, so a child never notices the rename). POSIX env names are case-sensitive,
+// so only the exact `PATH` key is touched there. `isWin` is injectable for tests.
+function _pathKeys(env, isWin = IS_WIN) {
+  if (!env) return [];
+  return Object.keys(env).filter(k => (isWin ? k.toLowerCase() === 'path' : k === 'PATH'));
+}
+
+// Current PATH value of `env` regardless of key spelling ('' when absent).
+function readPathEnv(env, { isWin = IS_WIN } = {}) {
+  const keys = _pathKeys(env, isWin);
+  if (!keys.length) return '';
+  const exact = keys.includes('PATH') ? 'PATH' : keys[0];
+  return env[exact] == null ? '' : String(env[exact]);
+}
+
+// Writes `value` to the one canonical `PATH` key, deleting every other-case duplicate. Mutates
+// and returns `env`.
+function setPathEnv(env, value, { isWin = IS_WIN } = {}) {
+  for (const k of _pathKeys(env, isWin)) delete env[k];
+  env.PATH = value == null ? '' : String(value);
+  return env;
+}
+
+// Prepends `dir` to the env's PATH through setPathEnv() — the only sanctioned way to put an
+// nvm/launcher dir ahead of a spawn env's PATH (never `env.PATH = dir + env.PATH`, which on
+// win32 leaves the inherited `Path` behind). Falsy `dir` is a no-op (still collapses
+// duplicates). Mutates and returns `env`.
+function prependPathEnv(env, dir, { isWin = IS_WIN } = {}) {
+  const current = readPathEnv(env, { isWin });
+  if (!dir) return setPathEnv(env, current, { isWin });
+  const sep = isWin ? ';' : ':'; // per call, so an injected isWin also picks the right separator
+  return setPathEnv(env, current ? `${dir}${sep}${current}` : String(dir), { isWin });
+}
+
 // The Node binary this server process is itself running under. Always >= engines.node,
 // unlike an arbitrary PATH `node`, which can be a stale system install (C1041: a
 // root-owned Node 14 at /usr/local/bin/node outranked nvm in PROBE_DIRS order and crashed
@@ -173,7 +214,7 @@ function registryPathDirs() {
 let _augmentedPath = null;
 function augmentedPath() {
   if (_augmentedPath !== null) return _augmentedPath;
-  const base = process.env.PATH || '';
+  const base = readPathEnv(process.env); // `Path` spelling on win32, see setPathEnv()
   const dirs = [
     ...(_nodeBinDirHasNode ? [NODE_BIN_DIR] : []),
     ...PROBE_DIRS,
@@ -616,7 +657,9 @@ function augmentPathEnv(extras) {
   const base = { ...process.env };
   if (serverRoot) base.TIPATASK_SERVER_ROOT = serverRoot;
   else delete base.TIPATASK_SERVER_ROOT; // never hand a child an unusable asar path
-  return { ...base, ...extras, PATH: augmentedPath() };
+  // setPathEnv() after merging extras: the inherited win32 `Path` (and any `Path` an extras
+  // object carries) is collapsed into the single canonical `PATH` key (TPT566).
+  return setPathEnv({ ...base, ...extras }, augmentedPath());
 }
 
 // Resolves the model to pass on the CLI's --model flag, live-reading project
@@ -748,4 +791,6 @@ module.exports = {
   expandWindowsEnv, readWindowsRegistryPathDirs, _findExecutable,
   // (TPT559) cmd.exe wrapper for exec'ing .cmd/.bat launchers under Node >= 22
   WIN_SHELL_EXTS, winExecSpec,
+  // (TPT566) single-PATH-key env writers — the only way to set/prepend a spawn env's PATH
+  readPathEnv, setPathEnv, prependPathEnv,
 };

@@ -73,6 +73,7 @@ try {
     ['LOCKED', task('LOCKED', { status: 'in_progress', agentAssignee: 'codex' })],
     ['OTHER', task('OTHER', { assignee: 2 })],
     ['BLOCKED', task('BLOCKED', { dependencies: ['TPT2'], agentAssignee: 'codex' })],
+    ['HUMAN', task('HUMAN', { agentAssignee: 'human' })],
   ]);
   const writes = [];
   const subscriptions = [];
@@ -415,6 +416,32 @@ try {
   board.closeTaskEditModal(true);
   delete window.TipTask;
   console.log('TPT337_DOM_PASS');
+
+  // (TPT568) Saving an agent assignee adds or removes Start without reopening the modal.
+  const startBtn = () => modal().querySelector('.modal-actions-run [data-action="start"]');
+  const pickAgent = value => modal()
+    .querySelector(`.agent-picker[data-name="agentAssignee"] .agent-picker-option[data-value="${value}"]`)
+    .click();
+  await board.openTaskEditModal('HUMAN');
+  await tick();
+  assert.equal(startBtn(), null, 'human-assigned task has no Start');
+  pickAgent('claude');
+  assert.equal(startBtn(), null, 'unsaved agent change does not add Start');
+  modal().querySelector('.btn-modal-save').click();
+  await tick();
+  assert.deepEqual(writes.at(-1), { id: 'HUMAN', patch: { agent_assignee: 'claude' } });
+  assert.ok(startBtn(), 'Start appears after saving an agent assignee');
+  assert.equal(startBtn().disabled, false);
+  assert.equal(startBtn().dataset.sessionMode, 'start');
+  assert.ok(startBtn().querySelector('.btn-label'));
+  pickAgent('human');
+  modal().querySelector('.btn-modal-save').click();
+  await tick();
+  assert.deepEqual(writes.at(-1), { id: 'HUMAN', patch: { agent_assignee: 'human' } });
+  assert.equal(startBtn(), null, 'Start leaves after saving a human assignee');
+  assert.equal(modal().querySelector('.modal-actions-run [data-action="stop"]'), null);
+  board.closeTaskEditModal(true);
+  console.log('TPT568_START_SYNC_PASS');
 } catch (err) {
   console.error(err);
   exitCode = 1;

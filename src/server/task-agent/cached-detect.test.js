@@ -298,3 +298,24 @@ test('CLI probe timeout, abort, and output cap cancel the child', async () => {
   assert.equal(overflow.error?.code, 'ENOBUFS');
   assert.ok(overflow.output.length <= 1024);
 });
+
+// (TPT567) `detail` rides along with the negative untouched — gates and the peek read both see
+// the launcher/probe evidence detect() attached, and the catch-all failure negative has one too.
+test('detail on an unavailable result is served verbatim by cachedDetect() and peekDetect()', async () => {
+  const detail = { bin: 'C:\\Users\\Anton M\\AppData\\Roaming\\npm\\claude.cmd', exit: 1, output: '{"loggedIn":false}' };
+  const agent = new FakeAgent([{ ...UNAVAILABLE, detail }]);
+  const gate = await agent.cachedDetect({});
+  assert.strictEqual(gate.available, false);
+  assert.deepStrictEqual(gate.detail, detail);
+  assert.deepStrictEqual(agent.peekDetect({}).detail, detail);
+});
+
+test('a detect() that throws yields a negative whose detail carries the error message', async () => {
+  class Throwing extends BaseTaskAgent {
+    constructor() { super('fake', 'Fake'); }
+    detect() { throw new Error('registry read failed'); }
+  }
+  const res = await new Throwing().cachedDetect({});
+  assert.strictEqual(res.available, false);
+  assert.deepStrictEqual(res.detail, { bin: null, exit: null, output: 'registry read failed' });
+});

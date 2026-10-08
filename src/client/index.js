@@ -98,10 +98,18 @@ window.addEventListener('create-project', async (e) => {
   // openOrCreateProject → decideOpenAction 'open-wizard' for an unconfigured folder), which
   // always carries the already-picked folder in detail.projectPath. The fallback below is
   // defensive only — no live caller omits detail.
+  // (TPT564) A window with no bound project must never land on the empty board: the wizard
+  // opens locked (no Escape / ×) and every way out of it — Cancel, or a failed link/create
+  // after Confirm already closed it — reopens Get Started through template.html's
+  // 'show-get-started' listener. A window with a project keeps the dismissible wizard.
+  const unbound = !window.electronAPI?.getProjectPath?.();
+  const showGetStarted = () => { if (unbound) window.dispatchEvent(new CustomEvent('show-get-started')); };
   const folder = e?.detail?.projectPath || await window.electronAPI?.selectFolder?.();
-  if (!folder) return;
+  if (!folder) { showGetStarted(); return; }
   projectCreationWizard.open({
     projectPath: folder,
+    locked: unbound,
+    onCancel: unbound ? showGetStarted : undefined,
     onComplete: async (detail) => {
       if (detail?.apiProject && !detail.apiProject.isNew) {
         // (TPT557) Existing API project picked on the wizard's Create Project step: link the
@@ -125,6 +133,7 @@ window.addEventListener('create-project', async (e) => {
         });
         if (!res?.ok) {
           utils.showToast(i18n.t('project.linkFailed', { msg: res?.error || i18n.t('project.unknownError') }), 'error');
+          showGetStarted();
           return;
         }
         window.dispatchEvent(new CustomEvent('project-created', { detail: { projectPath: res.projectPath } }));
@@ -133,6 +142,7 @@ window.addEventListener('create-project', async (e) => {
       const res = await window.electronAPI?.completeProjectWizard?.(detail);
       if (!res?.ok) {
         utils.showToast(i18n.t('project.createFailed', { msg: res?.error || i18n.t('project.unknownError') }), 'error');
+        showGetStarted();
         return;
       }
       window.dispatchEvent(new CustomEvent('project-created', { detail: { projectPath: res.projectPath } }));

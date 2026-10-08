@@ -108,7 +108,9 @@ async function main() {
 
   const icoBuffer = png2icons.createICO(pngBuffer, png2icons.BICUBIC, 0, false, true);
   if (!icoBuffer) throw new Error('Failed to create ICO icon');
-  const filteredIcoBuffer = filterIcoSizes(icoBuffer, [256, 48, 32, 16]);
+  // TPT563: Windows picks 24px for the small taskbar and 64px at 125–150% DPI; a
+  // missing frame is downscaled from the next size or left blank.
+  const filteredIcoBuffer = filterIcoSizes(icoBuffer, [256, 64, 48, 32, 24, 16]);
 
   const faviconPngBuffer = await sharp(Buffer.from(faviconSvg))
     .resize(256, 256)

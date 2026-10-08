@@ -20,8 +20,10 @@ let _draft = { taskAgent: '', availableAgents: [], piModels: [], clearPiModels: 
 // or any user edit — diffed against the live _draft to show the "some agents were removed"
 // note instead of a silent surprise at Save time.
 let _loadedSnapshot = null;
-// Raw [{id,label,available,reason}] from the last loadAgents() call — Save pushes this
-// straight into state.agentStatuses so the renderer reflects it without a reload.
+// Raw [{id,label,available,reason,detail}] from the last loadAgents() call — Save pushes this
+// straight into state.agentStatuses so the renderer reflects it without a reload. (TPT567)
+// `detail` ({bin, exit, output} behind an unavailable result) is rendered by
+// agent-select.js#_detailHtml under the reason text — this modal only passes it through.
 let _lastAgentStatuses = [];
 
 export function openAgentsModal({ onSaved } = {}) {

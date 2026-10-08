@@ -52,6 +52,8 @@ function fakeRes() {
 // Machine-independent detection: every agent's detect() is the one I/O seam swapped out.
 let codexInstalled = false;
 const detectCalls = { codex: 0 };
+// (TPT567) The diagnostic payload every unavailable detect() carries — must reach the client.
+const CODEX_DETAIL = { bin: 'C:\\Users\\Anton M\\AppData\\Roaming\\npm\\codex.cmd', exit: 1, output: 'Not logged in' };
 // The model registry's I/O seam, swapped alongside detect(): an unavailable→available flip (and a
 // Re-Check) now re-probes models, which must never spawn a real CLI scan from a unit test.
 const probeCalls = { claude: 0, codex: 0, pi: 0 };
@@ -64,7 +66,7 @@ for (const id of ['claude', 'codex', 'pi']) {
       detectCalls.codex += 1;
       return codexInstalled
         ? { id, label: agent.label, available: true, reason: null }
-        : { id, label: agent.label, available: false, reason: 'Codex CLI not found' };
+        : { id, label: agent.label, available: false, reason: 'Codex CLI not found', detail: CODEX_DETAIL };
     }
     return { id, label: agent.label, available: false, reason: 'not installed (test)' };
   };
@@ -172,12 +174,16 @@ test('GET /api/agent-config?refresh=1 forces a re-detect; the bare route does no
   let res = fakeRes();
   await handler(fakeReq('GET', '/api/agent-config'), res);
   assert.equal(detectCalls.codex, before);
-  assert.equal(JSON.parse(res.body).agentStatuses.find((a) => a.id === 'codex').available, false);
+  const codexStatus = JSON.parse(res.body).agentStatuses.find((a) => a.id === 'codex');
+  assert.equal(codexStatus.available, false);
+  assert.deepEqual(codexStatus.detail, CODEX_DETAIL, 'GET /api/agent-config returns detect()\'s detail verbatim (TPT567)');
 
   res = fakeRes();
   await handler(fakeReq('GET', '/api/agent-config?refresh=1'), res);
   assert.equal(detectCalls.codex, before + 1);
-  assert.equal(JSON.parse(res.body).agentStatuses.find((a) => a.id === 'codex').available, true);
+  const codexNow = JSON.parse(res.body).agentStatuses.find((a) => a.id === 'codex');
+  assert.equal(codexNow.available, true);
+  assert.equal(codexNow.detail, undefined, 'a positive carries no detail');
   // A Re-Check also re-probes models off the request path and broadcasts once more when that
   // lands — drain it so its second frame can't leak into the next test's `sent` buffer.
   await waitFor(() => providerFrames().length >= 2);

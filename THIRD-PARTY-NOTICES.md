@@ -37,7 +37,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 This appendix lists every third-party package redistributed inside the packaged app, in two groups: TipΔTask's own production dependency closure (shipped inside `app.asar`) and the bundled Pi Coding Agent's full dependency closure (shipped as `vendor/pi/node_modules`, outside the asar — see `scripts/stage-pi-bundle.js`). All packages are under permissive licenses (no copyleft). Regenerate with `node scripts/gen-third-party-notices.js`; `--check` verifies it is current.
 
-### TipΔTask app dependencies (114 packages)
+### TipΔTask app dependencies (119 packages)
 
 | Package | License | Copyright |
 |---|---|---|
@@ -137,7 +137,12 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `shebang-command@2.0.0` | MIT | Kevin Mårtensson |
 | `shebang-regex@3.0.0` | MIT | Sindre Sorhus |
 | `sherpa-onnx-darwin-arm64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-darwin-x64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-linux-arm64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-linux-x64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
 | `sherpa-onnx-node@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-win-ia32@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
+| `sherpa-onnx-win-x64@1.13.8` | Apache-2.0 | The next-gen Kaldi team |
 | `side-channel@1.1.1` | MIT | Copyright (c) 2019 Jordan Harband |
 | `side-channel-list@1.0.1` | MIT | Copyright (c) 2024 Jordan Harband |
 | `side-channel-map@1.0.1` | MIT | Copyright (c) 2024 Jordan Harband |

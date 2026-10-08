@@ -67,7 +67,8 @@ test('task-chat.js: a task card reuses the board card and opens the edit modal e
 
 test('task-edit-modal.js: hideActions drops Start and the manage actions, onSaved fires after the write', () => {
   assert.match(editModal, /const hideActions = !!_modalState\.callbacks\.hideActions;/);
-  assert.match(editModal, /const showStart = !isPreviewTask && !readOnly && !hideActions && /);
+  assert.match(editModal, /const showStart = _shouldShowModalStart\(draft\);/);
+  assert.match(editModal, /function _shouldShowModalStart\(task\) \{[\s\S]*?!callbacks\.hideActions/);
   assert.match(editModal, /\$\{readOnly \|\| hideActions \? '' : `<div class="modal-actions-manage">/);
   const update = editModal.indexOf('updateResult = await api.tasks.update(taskId, patch);');
   const saved = editModal.indexOf('callbacks.onSaved?.(taskId)');

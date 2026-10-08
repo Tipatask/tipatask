@@ -5,7 +5,14 @@ app.setName('TipATask');
 app.name = 'TipATask';
 // (C1125) Windows silently drops native toasts for an app with no AppUserModelID —
 // same invisible-failure class as the macOS unsigned-bundle notification drop below.
-if (process.platform === 'win32') app.setAppUserModelId('com.tipatask.app');
+// (TPT563) The ID is build.appId, the AUMID electron-builder stamps on the NSIS
+// shortcuts; a mismatch splits the taskbar button from the shortcut and Windows then
+// shows a blank icon. Must run before any window opens.
+if (process.platform === 'win32') {
+  let appId = 'com.tipatask.app';
+  try { appId = require('./package.json').build.appId || appId; } catch {}
+  app.setAppUserModelId(appId);
+}
 
 // Set packaged user data before requiring server config; otherwise its paths resolve
 // inside read-only app.asar. Dev config intentionally stays rooted in the checkout.
@@ -47,6 +54,7 @@ const { loadWorkspace, saveWorkspace } = require('./src/server/workspace-state')
 // require (does not violate the C1173 no-module-scope-I/O rule below).
 const { shouldRestoreFromDevice, resolveStartupProjectPaths } = require('./src/server/window-session');
 const { readProjectConfig, writeProjectMcpConfig, writeProjectSkillsConfig } = require('./src/server/project-config');
+const { killWindowsProcessTree } = require('./src/server/process-group');
 const { getApiCredentials, getAccountUserId } = require('./src/server/api-credentials');
 const { normalizeBaseUrl, readAccount } = require('./src/server/account-store');
 const recentProjectsModel = require('./src/server/recent-projects');
@@ -111,6 +119,9 @@ function migrateUserDataDir() {
 const PORT = process.env.PORT || 4455;
 const LOCAL_SECRET = crypto.randomBytes(32).toString('base64url');
 let serverChild = null;
+// Set once the app deliberately tears the server down on quit, so its exit is not
+// reported as an unexpected crash.
+let serverStopping = false;
 let handoffDialogOpen = false;
 // webContentsId → absolute project directory path
 const projectDirs = new Map();
@@ -838,6 +849,23 @@ function getIconPath() {
   return path.join(__dirname, 'assets', 'icon' + ext);
 }
 
+// (TPT563) BrowserWindow `icon` for every taskbar-visible window. On Windows a .ico that
+// fails to load leaves a blank taskbar button with no error, so the image is loaded once
+// and an empty result is logged; the path is still returned so behavior never regresses.
+let _windowIcon = null;
+function getWindowIcon() {
+  if (_windowIcon) return _windowIcon;
+  const iconPath = getIconPath();
+  _windowIcon = iconPath;
+  if (process.platform === 'win32') {
+    const { nativeImage } = require('electron');
+    const image = nativeImage.createFromPath(iconPath);
+    if (image.isEmpty()) console.warn('[icon] failed to load window icon: %s', iconPath);
+    else _windowIcon = image;
+  }
+  return _windowIcon;
+}
+
 function getDockIconPath() {
   return path.join(__dirname, 'assets', 'icon.png');
 }
@@ -1422,7 +1450,9 @@ function registerIpcHandlers() {
         clearBinCache();
       }
       return (await listTaskAgentStatuses(config, { force }))
-        .map(a => ({ id: a.id, label: a.label, available: !!a.available, reason: a.reason || null }));
+        // `detail` (TPT567) — launcher path / probe exit / probe output behind an unavailable
+        // result; agent-select.js renders it under the reason text. Null on a positive.
+        .map(a => ({ id: a.id, label: a.label, available: !!a.available, reason: a.reason || null, detail: a.detail || null }));
     } catch {
       // No fake-claude: report all three unavailable so the empty state shows.
       return [
@@ -1814,7 +1844,7 @@ function startServer() {
         // config-write failure impossible to reach this path now — this dialog is for the
         // remaining, genuine "the server process died" case, so it's diagnosable instead of
         // a silent disappearance.
-        if (code !== 0 && code !== null) {
+        if (code !== 0 && code !== null && !serverStopping) {
           try {
             dialog.showErrorBox(
               'TipΔTask server stopped',
@@ -2162,7 +2192,7 @@ function createSplashWindow() {
     skipTaskbar: true,          // no taskbar/alt-tab entry for a few-second window
     title: 'TipΔTask',
     backgroundColor: '#f1f1ef', // == splash.html body bg (C1171 paper tone); no dark pre-paint rect
-    icon: getIconPath(),
+    icon: getWindowIcon(),
     webPreferences: {
       // No preload on purpose — preload.js exposes the whole project/task API.
       contextIsolation: true,
@@ -2252,7 +2282,7 @@ function createSetupWindow(projectPath) {
     width: 1400,
     height: 900,
     title: getWindowTitle(null),
-    icon: getIconPath(),
+    icon: getWindowIcon(),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -2324,7 +2354,7 @@ async function createProjectWindow(projectDir, { deferShow = false } = {}) {
     height: 900,
     show: !deferShow,           // C1006: startup windows stay hidden until the board is up
     title: getWindowTitle(getDisplayName(projectDir)),
-    icon: getIconPath(),
+    icon: getWindowIcon(),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -2642,7 +2672,19 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().every((w) => desktopNotifications?.owns(w))) createInitialWindows([]);
 });
 
+// Windows: child.kill() below only terminates the server process itself, orphaning its
+// agent CLIs and the ELECTRON_RUN_AS_NODE MCP servers they spawn — TipATask.exe processes
+// that keep the install directory locked and make the next NSIS upgrade fail. Kill the
+// whole tree synchronously while the parent-pid chain is still intact.
+app.on('will-quit', () => {
+  if (process.platform !== 'win32') return;
+  if (!serverChild || serverChild.exitCode !== null || serverChild.signalCode !== null) return;
+  serverStopping = true;
+  killWindowsProcessTree(serverChild.pid);
+});
+
 app.on('quit', () => {
+  serverStopping = true;
   try { if (serverChild) serverChild.kill(); } catch {}
 });
 

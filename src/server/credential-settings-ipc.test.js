@@ -5,6 +5,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+
+// writeProjectConfig() routes API_TOKEN into the account store under TIPATASK_USER_DATA.
+// Own user-data root: the test runner's shared one is rewritten concurrently by other files.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-safe-ipc-data-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
 const Module = require('node:module');
 const { writeProjectConfig, readProjectConfig } = require('./project-config');
 

@@ -1,17 +1,19 @@
 // Shared header for the project setup wizards (project-creation-wizard.js,
 // setup-modal.js): title on line 1, full absolute project path as a
-// head-truncated subheader on line 2 (C1064).
+// head-truncated subheader on line 2 (C1064). closable:false leaves out the × button —
+// used by the first-run wizard in a window with no bound project (TPT564).
 import { t } from './i18n.js';
 
-export function headerHtml({ title, projectPath }) {
+export function headerHtml({ title, projectPath, closable = true }) {
   const path = projectPath || '';
+  const closeBtn = closable === false ? '' : `<button class="setup-modal-close" aria-label="${_esc(t('common.close'))}">×</button>`;
   return `
     <div class="setup-modal-header">
       <div class="setup-modal-header-text">
         <span class="setup-modal-title">${_esc(title)}</span>
         <span class="setup-modal-header-path" data-path="${_esc(path)}" title="${_esc(path)}">${_esc(path)}</span>
       </div>
-      <button class="setup-modal-close" aria-label="${_esc(t('common.close'))}">×</button>
+      ${closeBtn}
     </div>
   `;
 }

@@ -8,6 +8,11 @@ const http = require('node:http');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+
+// writeProjectConfig() routes API_TOKEN into the account store under TIPATASK_USER_DATA.
+// Own user-data root: the test runner's shared one is rewritten concurrently by other files.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-split-origin-data-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
 const { createHttpHandler } = require('./ws-handlers');
 const { createApiBackend } = require('./api-backend');
 const { writeProjectConfig } = require('./project-config');

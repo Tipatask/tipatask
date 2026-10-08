@@ -17,7 +17,7 @@
 // 'pause' (default) SIGSTOPs the tree — resumable, nothing is killed — and 'kill' terminates
 // it (explicit opt-in: AGENT_LIMITS_WATCHDOG_ACTION=kill or TIPATASK_WATCHDOG_KILL=1).
 
-const { execFile } = require('node:child_process');
+const { execFile, spawnSync: nodeSpawnSync } = require('node:child_process');
 const os = require('node:os');
 
 const DESCENDANT_ALERT_THRESHOLD = 50;
@@ -250,6 +250,32 @@ function killProcessGroup(pid, signal) {
   try {
     process.kill(-pid, signal || 'SIGTERM');
     return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── Windows tree kill ──
+//
+// Windows has no process groups, so killProcessGroup() above refuses there and a plain
+// child.kill() is a TerminateProcess of that one pid: its descendants (ConPTY agent CLIs,
+// ELECTRON_RUN_AS_NODE MCP servers, the Pi CLI) are orphaned and keep running from the
+// install directory, which then blocks the NSIS upgrade. `taskkill /T /F` walks the
+// parent-pid chain from the root and force-kills the whole tree. Synchronous on purpose:
+// the Electron main process calls it from 'will-quit' and must not exit before the tree is
+// gone (once the root dies, its orphans are no longer reachable through /T). Same refusal
+// rules as killProcessGroup(); never throws. `spawnSync`/`platform` are test seams.
+function killWindowsProcessTree(pid, { spawnSync = nodeSpawnSync, platform = process.platform } = {}) {
+  if (platform !== 'win32') return false;
+  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false;
+  try {
+    const systemRoot = process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows';
+    const result = spawnSync(`${systemRoot}\\System32\\taskkill.exe`, ['/T', '/F', '/PID', String(pid)], {
+      windowsHide: true,
+      stdio: 'ignore',
+      timeout: 5000,
+    });
+    return !!result && result.status === 0;
   } catch {
     return false;
   }
@@ -758,6 +784,7 @@ module.exports = {
   scaleAgentLimitsForConcurrency,
   countActiveAgentSessions,
   killProcessGroup,
+  killWindowsProcessTree,
   parsePsOutput,
   snapshotProcesses,
   listDescendants,

@@ -4,14 +4,27 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 
-test('Task Edit DOM flows preserve save, locks, tabs, cleanup, and task switching', () => {
-  const runner = new URL('./task-edit-modal-dom-runner.mjs', import.meta.url);
-  const result = spawnSync(process.execPath, [fileURLToPath(runner)], {
-    encoding: 'utf8', timeout: 30_000,
-  });
+// One isolated DOM process serves every runner-backed case below.
+let runnerResult;
+function runDomRunner() {
+  if (!runnerResult) {
+    const runner = new URL('./task-edit-modal-dom-runner.mjs', import.meta.url);
+    runnerResult = spawnSync(process.execPath, [fileURLToPath(runner)], {
+      encoding: 'utf8', timeout: 30_000,
+    });
+  }
+  const result = runnerResult;
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout, /TPT337_DOM_PASS/);
+  return result;
+}
+
+test('Task Edit DOM flows preserve save, locks, tabs, cleanup, and task switching', () => {
+  assert.match(runDomRunner().stdout, /TPT337_DOM_PASS/);
+});
+
+test('Saving an agent assignee adds or removes Start without reopening (TPT568)', () => {
+  assert.match(runDomRunner().stdout, /TPT568_START_SYNC_PASS/);
 });
 
 test('Task Edit module imports without initializing board, cards, chat, or terminal', async () => {

@@ -30,6 +30,7 @@ const {
   scaleAgentLimitsForConcurrency,
   countActiveAgentSessions,
   killProcessGroup,
+  killWindowsProcessTree,
   parsePsOutput,
   snapshotProcesses,
   listDescendants,
@@ -53,6 +54,42 @@ test('createSession() exposes ptyPid and descendantWatchdog, both initially null
   const session = createSession({}, false, 'C1', '');
   assert.equal(session.ptyPid, null);
   assert.equal(session.descendantWatchdog, null);
+});
+
+// ── killWindowsProcessTree() ──
+
+test('killWindowsProcessTree is a no-op off win32', () => {
+  let called = false;
+  const spawnSync = () => { called = true; return { status: 0 }; };
+  assert.equal(killWindowsProcessTree(4242, { spawnSync, platform: 'darwin' }), false);
+  assert.equal(killWindowsProcessTree(4242, { spawnSync, platform: 'linux' }), false);
+  assert.equal(called, false);
+});
+
+test('killWindowsProcessTree refuses bad pids and its own pid', () => {
+  let called = false;
+  const spawnSync = () => { called = true; return { status: 0 }; };
+  for (const pid of [null, undefined, 0, 1, -5, 12.5, '4242', process.pid]) {
+    assert.equal(killWindowsProcessTree(pid, { spawnSync, platform: 'win32' }), false);
+  }
+  assert.equal(called, false);
+});
+
+test('killWindowsProcessTree force-kills the whole tree via taskkill /T /F, synchronously', () => {
+  const calls = [];
+  const spawnSync = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { status: 0 }; };
+  assert.equal(killWindowsProcessTree(4242, { spawnSync, platform: 'win32' }), true);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].cmd, /System32\\taskkill\.exe$/);
+  assert.deepEqual(calls[0].args, ['/T', '/F', '/PID', '4242']);
+  assert.equal(calls[0].opts.windowsHide, true);
+  assert.ok(calls[0].opts.timeout > 0);
+});
+
+test('killWindowsProcessTree reports failure without throwing', () => {
+  assert.equal(killWindowsProcessTree(4242, { spawnSync: () => ({ status: 128 }), platform: 'win32' }), false);
+  assert.equal(killWindowsProcessTree(4242, { spawnSync: () => ({ status: null, error: new Error('ETIMEDOUT') }), platform: 'win32' }), false);
+  assert.equal(killWindowsProcessTree(4242, { spawnSync: () => { throw new Error('ENOENT'); }, platform: 'win32' }), false);
 });
 
 // ── killProcessGroup() guard table ──

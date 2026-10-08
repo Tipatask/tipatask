@@ -784,6 +784,9 @@ const en = {
   'agentSelect.notLoggedIn': 'not logged in',
   'agentSelect.cliNotDetected': 'CLI not detected on this machine',
   'agentSelect.notLoggedInHint': '{reason} — run the CLI in a terminal and log in, then Re-Check',
+  // (TPT567) Launcher path / probe output shown under an unavailable agent's reason.
+  'agentSelect.detailLauncher': 'Resolved launcher',
+  'agentSelect.detailProbe': 'Login probe output (exit code · first 200 chars)',
 
   'bulk.errStartFailed': 'Failed to start tasks: {msg}',
   'bulk.allLocked': 'All selected tasks are locked (in progress or canceled) — reassignment blocked.',
@@ -2030,6 +2033,9 @@ const uk = {
   'agentSelect.notLoggedIn': 'вхід не виконано',
   'agentSelect.cliNotDetected': 'CLI не виявлено на цьому комп’ютері',
   'agentSelect.notLoggedInHint': '{reason} — увійдіть через CLI в терміналі, потім перевірте знову',
+  // (TPT567) Шлях до лаунчера / вивід перевірки входу під причиною недоступності агента.
+  'agentSelect.detailLauncher': 'Знайдений лаунчер',
+  'agentSelect.detailProbe': 'Вивід перевірки входу (код виходу · перші 200 символів)',
   'bulk.errStartFailed': 'Не вдалося запустити задачі: {msg}',
   'bulk.allLocked': 'Усі вибрані задачі заблоковано (в роботі або скасовані) — переназначення неможливе.',
   'bulk.confirmSkipLocked': 'Заблокованих задач буде пропущено: {locked}. Продовжити призначення агента {agent} для задач: {n}?',

@@ -405,12 +405,12 @@ function _piRowsIssue(models) {
  */
 export function buildAgentCardRows({ agents, piModels = [], enabledIds = [], defaultId = '', piDefaultIdx = -1, single = false }) {
   const out = [];
-  for (const { id, label, available, reason } of agents) {
+  for (const { id, label, available, reason, detail } of agents) {
     if (id !== 'pi') {
       out.push({
         kind: 'agent', id, piIdx: -1, color: AGENT_COLORS[id] || '#888', available,
         enabled: enabledIds.includes(id), isDefault: defaultId === id,
-        name: _displayName(id, label), reason, hasCheckbox: !single, hasRadio: true,
+        name: _displayName(id, label), reason, detail: detail || null, hasCheckbox: !single, hasRadio: true,
       });
       continue;
     }
@@ -418,7 +418,7 @@ export function buildAgentCardRows({ agents, piModels = [], enabledIds = [], def
     if (!available) {
       out.push({
         kind: 'pi-unavailable', id, piIdx: -1, color, available: false, enabled: false, isDefault: false,
-        name: _displayName(id, label), reason, hasCheckbox: !single, hasRadio: true,
+        name: _displayName(id, label), reason, detail: detail || null, hasCheckbox: !single, hasRadio: true,
       });
     } else if (!piModels.length) {
       out.push({
@@ -925,7 +925,7 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
 
 // Render the all-unavailable empty state: install commands per agent + Re-Check button.
 function _renderEmpty(container, agents, onReCheck) {
-  const items = agents.map(({ id, label, reason }) => {
+  const items = agents.map(({ id, label, reason, detail }) => {
     const color = AGENT_COLORS[id] || '#888';
     const cmd   = AGENT_INSTALL[id] || '';
     // Non-"not found" reason (e.g. "not logged in") — installed but broken:
@@ -934,11 +934,15 @@ function _renderEmpty(container, agents, onReCheck) {
     const detailHtml = installed
       ? `<span class="setup-modal-agent-unavailable" title="${_esc(_unavailHint(reason))}">${_esc(reason)}</span>`
       : `<code>${_esc(cmd)}</code>`;
+    // (TPT567) Same launcher/probe diagnostics as the card grid — this all-unavailable list is
+    // what a Windows user whose CLIs both fail detection actually sees.
+    const diagHtml = _detailHtml(detail);
     return `
       <li class="setup-modal-agent-empty-item">
         <span class="setup-modal-agent-dot" style="background:${color}"></span>
         <span class="setup-modal-agent-name">${_esc(_displayName(id, label))}</span>
         ${detailHtml}
+        ${diagHtml}
       </li>`;
   }).join('');
 
@@ -995,6 +999,9 @@ function _cardHtml(d) {
   const unavailHtml = !d.available
     ? `<span class="setup-modal-agent-unavailable" title="${_esc(_unavailHint(d.reason))}">${_esc(_unavailText(d.reason))}</span>`
     : '';
+  // (TPT567) Launcher path + probe exit/output behind the negative — the only place a packaged
+  // app ever shows them. Full-width row under the name/reason line (card is flex-wrap).
+  const detailHtml = !d.available ? _detailHtml(d.detail) : '';
   const isPi = d.kind === 'pi-model' || d.kind === 'pi-empty';
   const cls = `setup-modal-agent-card${isPi ? ' setup-modal-agent-card--pi' : ''}${d.isDefault ? ' is-selected' : ''}${!d.available ? ' is-unavailable' : ''}${d.kind === 'pi-model' && !d.enabled ? ' is-off' : ''}`;
 
@@ -1023,7 +1030,34 @@ function _cardHtml(d) {
         ${nameHtml}
         ${unavailHtml}${actionsHtml}
         ${radioHtml}
+        ${detailHtml}
       </div>`;
+}
+
+// (TPT567) `detail` on an unavailable agent status — `{ bin, exit, output }` from
+// BaseTaskAgent.buildDetectDetail(): the resolved launcher (null = not found), the auth/login
+// probe's exit status and the first 200 chars of its output. Renders only the parts present;
+// an absent/empty detail renders nothing, so pre-TPT567 servers and the IPC fallback rows are
+// unaffected. Shared by the card grid (_cardHtml) and the all-unavailable list (_renderEmpty).
+export function buildDetailLines(detail) {
+  if (!detail || typeof detail !== 'object') return { bin: '', output: '' };
+  const bin = detail.bin ? String(detail.bin) : '';
+  const out = detail.output ? String(detail.output).trim() : '';
+  const exit = Number.isInteger(detail.exit) ? `exit=${detail.exit}` : '';
+  const output = [exit, out].filter(Boolean).join(' · ');
+  return { bin, output };
+}
+
+function _detailHtml(detail) {
+  const { bin, output } = buildDetailLines(detail);
+  if (!bin && !output) return '';
+  const binHtml = bin
+    ? `<code class="setup-modal-agent-detail-bin" title="${_esc(t('agentSelect.detailLauncher'))}">${_esc(bin)}</code>`
+    : '';
+  const outHtml = output
+    ? `<pre class="setup-modal-agent-detail-output" title="${_esc(t('agentSelect.detailProbe'))}">${_esc(output)}</pre>`
+    : '';
+  return `<div class="setup-modal-agent-detail">${binHtml}${outHtml}</div>`;
 }
 
 // The quiet "+ Add model" row shown while no form is open, with the N/8 count.

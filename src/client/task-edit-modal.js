@@ -1231,7 +1231,7 @@ function _renderTaskEditModal() {
     : '';
 
   const hideActions = !!_modalState.callbacks.hideActions;
-  const showStart = !isPreviewTask && !readOnly && !hideActions && draft.category === 'CODING' && draft.agentAssignee !== 'human' && commands.canStartTaskCard(draft);
+  const showStart = _shouldShowModalStart(draft);
   const hasActiveSession = state.activeSessions.has(draft.id);
   // (TPT374) mode/icon/label/title for the footer Start/Resume/Show button — see
   // _modalSessionButton() just below _syncModalStartDependencyState().
@@ -2148,7 +2148,8 @@ function _attachModalHandlers(modal) {
     // (TPT374) _modalSessionButton() reads the just-updated lastSaved.status, not draft — do
     // this after the assignment above so a saved status change (e.g. Start's own in_progress
     // write) repaints this modal's own footer button, not just the board card.
-    syncTaskEditSessionButtons();
+    // (TPT568) A saved agent/category change can also add or remove Start itself.
+    _syncModalStartVisibility();
     upd();
     return true;
     } catch (err) { console.error('[modal] Save failed:', err); showToast(t('modal.errSave', { msg: err.message }), 'error'); return false; }
@@ -2604,6 +2605,33 @@ function _attachModalDepsInput(modal, onUpdate) {
     onResizeHandler: (h) => { if (_modalState) _modalState._depDropdownHandlers = { resize: h }; },
     onUpdate,
   });
+}
+
+// Footer Start is offered only for a startable task: CODING, not handed to a human, startable by
+// this member, in a live editable modal. Shared by the render and the post-save sync below.
+function _shouldShowModalStart(task) {
+  const callbacks = _modalState?.callbacks || {};
+  return !!task && !callbacks.preloadedTask && !callbacks.hideActions && !_isModalReadOnly(task)
+    && task.category === 'CODING' && task.agentAssignee !== 'human' && commands.canStartTaskCard(task);
+}
+
+// (TPT568) The footer is painted once per render, so a saved agent change (Human → Claude, or
+// back) would leave Start missing or stale until the modal reopens. Re-evaluate against the
+// saved task and add or drop the pill; syncTaskEditSessionButtons() then fills its icon, label
+// and dependency state, adds Stop for a live session and repaints the terminal empty pane.
+function _syncModalStartVisibility() {
+  if (!_modalState) return;
+  const run = document.getElementById('task-edit-modal')?.querySelector('.modal-actions-run');
+  if (run) {
+    const startBtn = run.querySelector('[data-action="start"]');
+    if (_shouldShowModalStart(_modalState.lastSaved)) {
+      if (!startBtn) run.insertAdjacentHTML('afterbegin', '<button type="button" data-action="start"></button>');
+    } else {
+      startBtn?.remove();
+      run.querySelector('[data-action="stop"]')?.remove();
+    }
+  }
+  syncTaskEditSessionButtons();
 }
 
 export function syncTaskEditSessionButtons() {

@@ -9,6 +9,7 @@ const { fetchStatusRoles, fetchStatusNames, LEGACY_STATUSES, LEGACY_ROLE_NAMES }
 const { fetchVcsSettings, buildVcsDirective } = require('../vcs-settings');
 const { fetchTagDescriptions, buildTagDescriptionDirective } = require('../tag-descriptions');
 const { resolveModels } = require('./model-registry');
+const { winExecSpec } = require('../spawn-utils');
 
 function combineCommandOutput(stdout, stderr) {
   const out = stdout ? String(stdout) : '';
@@ -21,9 +22,14 @@ const DETECT_TTL_MS = 300_000; // 5 minutes — cached positives (stale-while-re
 // poisoned at startup (e.g. keychain not yet unlocked at login, CLI mid-auto-update)
 // must never be served for long at user-facing gates (task start, setup wizard).
 const NEGATIVE_DETECT_TTL_MS = 30_000; // 30 seconds
-// Ceiling for one asynchronous CLI probe (login status etc.) — see runCliProbe().
+// Ceiling for one asynchronous CLI probe (login status etc.) — see runCliProbe(). Every probe
+// builds its argv through spawn-utils.js's winExecSpec(): a Windows .cmd/.bat launcher (npm's
+// claude.cmd / codex.cmd, possibly in a path with spaces) runs as `cmd.exe /d /s /c "…"` with
+// every part quoted — never `shell: true`, which hands cmd.exe the path unquoted.
 const CLI_PROBE_TIMEOUT_MS = 10_000;
 const CLI_PROBE_OUTPUT_BYTES = 64 * 1024;
+// Cap for the diagnostic `detail.output` on an unavailable detect() result — see buildDetectDetail().
+const DETECT_DETAIL_OUTPUT_CHARS = 200;
 
 function commentType(comment) {
   return String(comment?.comment_type || comment?.commentType || comment?.type || 'comment');
@@ -504,9 +510,10 @@ class BaseTaskAgent {
     const probe = Promise.resolve().then(() => this.detect(config)).then((result) => {
       if (!result || typeof result.available !== 'boolean') throw new Error('invalid detection result');
       return this._storeDetect(result, Date.now(), config);
-    }).catch(() => this._storeDetect({
+    }).catch((err) => this._storeDetect({
         id: this.id, label: this.label, available: false,
         reason: `${this.label} detection failed`,
+        detail: BaseTaskAgent.buildDetectDetail(null, { error: err }),
       }, Date.now(), config)).finally(() => {
       if (this._detectInflight === probe) {
         this._detectInflight = null;
@@ -579,8 +586,32 @@ class BaseTaskAgent {
     this.getAvailableModels(config, { force: true }).catch(() => { /* keep the fallback list */ });
   }
 
+  // opts.spawnImpl (default child_process.spawn) and opts.isWin (default: the real platform)
+  // are test-only injection points so the win32 argv shape is verifiable on any host.
+  // Diagnostic payload carried on every `available: false` detect() result (TPT567) so a
+  // packaged app — whose server stdout nobody sees — can still show WHICH layer failed:
+  // `bin` is the launcher resolveBin()/resolveBinAsync() settled on (null = not found),
+  // `exit` the probe's exit status (null when it never ran or was killed), `output` the
+  // first DETECT_DETAIL_OUTPUT_CHARS of the probe's combined stdout+stderr, or the spawn
+  // error code/message when there was no output. Rendered by agent-select.js under the
+  // reason text; printed by scripts/probe-agent-detect.js. Never present on a positive.
+  static buildDetectDetail(bin, probe) {
+    const err = probe && probe.error;
+    const output = String(
+      (probe && probe.output) || (err && (err.code || err.message)) || ''
+    ).trim().slice(0, DETECT_DETAIL_OUTPUT_CHARS);
+    return {
+      bin: bin || null,
+      exit: probe && Number.isInteger(probe.status) ? probe.status : null,
+      output,
+    };
+  }
+
   static runCliProbe(command, args, opts = {}) {
-    const { signal, timeout = CLI_PROBE_TIMEOUT_MS, maxOutputBytes = CLI_PROBE_OUTPUT_BYTES, ...spawnOpts } = opts;
+    const {
+      signal, timeout = CLI_PROBE_TIMEOUT_MS, maxOutputBytes = CLI_PROBE_OUTPUT_BYTES,
+      spawnImpl = spawn, isWin, ...spawnOpts
+    } = opts;
     return new Promise((resolve) => {
       let child;
       let error = null;
@@ -611,10 +642,11 @@ class BaseTaskAgent {
       };
       const abort = () => stop('ABORT_ERR');
       try {
-        child = spawn(command, args, {
+        const spec = winExecSpec(command, args, isWin === undefined ? {} : { isWin });
+        child = spawnImpl(spec.command, spec.args, {
           stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
           detached: process.platform !== 'win32',
-          shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(command),
+          ...spec.options,
           ...spawnOpts,
         });
       } catch (err) {

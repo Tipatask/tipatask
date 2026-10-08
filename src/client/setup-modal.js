@@ -9,6 +9,7 @@ import { recheckAgents, notifyServerAgentsSaved } from './agent-recheck.js';
 import { headerHtml, fitHeaderPath } from './setup-modal-header.js';
 import { DEFAULT_API_BASE_URL } from './constants.js';
 import { isUnboundWindow } from './project-open-flow.js';
+import { activateDialogFocus } from './dialog-focus.js';
 // (C1388) This module re-renders its whole overlay per step (_render()/_renderStep()),
 // so t() calls made INSIDE those render functions are naturally locale-live — never
 // capture a t() result at module scope (i18n.js's own header rule).
@@ -79,6 +80,10 @@ let _deviceName = '';
 let _onComplete = null;
 let _overlay = null;
 let _keyHandler = null;
+// (TPT561) dialog-focus.js layer — same contract as project-creation-wizard.js: an open Task Edit
+// Modal's layer inerts every other <body> child, so this modal owns a layer on ONE overlay root
+// that _render() repaints in place for the modal's whole life.
+let _focusHandle = null;
 let _busy = false;
 let _mode = 'setup'; // 'setup' | 'reauth' | 'account'
 // Setup mode only: true while open() checks the account store for a live sign-in
@@ -132,8 +137,8 @@ export function open({ projectPath, onComplete, onCancel }) {
   _accountResult = null;
   _storedAccountPending = !!window.electronAPI?.setupStoredAccount;
   _render();
-  _keyHandler = (e) => { if (e.key === 'Escape') close(); };
-  document.addEventListener('keydown', _keyHandler);
+  _keyHandler = _escapeHandler;
+  document.addEventListener('keydown', _keyHandler, { capture: true });
   if (_storedAccountPending) _adoptStoredAccount();
 }
 
@@ -207,8 +212,16 @@ export function openReauth({ projectPath, existingConfig, onComplete, onCancel, 
   _completed = false;
   _busy = false;
   _render();
-  _keyHandler = (e) => { if (e.key === 'Escape') close(); };
-  document.addEventListener('keydown', _keyHandler);
+  _keyHandler = _escapeHandler;
+  document.addEventListener('keydown', _keyHandler, { capture: true });
+}
+
+// Capture-phase + stopPropagation: Escape closes only this modal, never also reaching
+// template.html's document-level Task Edit Modal closer underneath.
+function _escapeHandler(e) {
+  if (e.key !== 'Escape') return;
+  e.stopPropagation();
+  close();
 }
 
 export function close() {
@@ -219,7 +232,10 @@ export function close() {
   if (_overlay) { _overlay.remove(); _overlay = null; }
   document.documentElement.style.overflowY = '';
   document.body.style.paddingRight = '';
-  if (_keyHandler) { document.removeEventListener('keydown', _keyHandler); _keyHandler = null; }
+  if (_keyHandler) { document.removeEventListener('keydown', _keyHandler, { capture: true }); _keyHandler = null; }
+  // Released before the callbacks run, so whatever they open lands on the layer below.
+  _focusHandle?.close();
+  _focusHandle = null;
   const cancelCb = (!completed && wasOpen) ? _onCancel : null;
   _projectPath = null;
   _onComplete = null;
@@ -257,13 +273,19 @@ function _back() {
 }
 
 function _render() {
-  const existing = document.querySelector('.setup-modal');
-  if (existing) existing.remove();
-
-  _overlay = document.createElement('div');
-  _overlay.className = 'setup-modal';
-  _overlay.setAttribute('role', 'dialog');
-  _overlay.setAttribute('aria-modal', 'true');
+  // A stray copy of this modal goes; this modal's own root stays. The create wizard
+  // (.wizard-modal.setup-modal) is left alone: it owns its own dialog-focus layer, and removing
+  // its root behind its back would leave that layer pointing at a detached element.
+  document.querySelectorAll('.setup-modal:not(.wizard-modal)').forEach((el) => { if (el !== _overlay) el.remove(); });
+  const fresh = !_overlay || !_overlay.isConnected;
+  if (fresh) {
+    _focusHandle?.close();
+    _focusHandle = null;
+    _overlay = document.createElement('div');
+    _overlay.className = 'setup-modal';
+    _overlay.setAttribute('role', 'dialog');
+    _overlay.setAttribute('aria-modal', 'true');
+  }
 
   const STEP_LABELS = {
     signin: t('setup.stepSignIn'), project: t('setup.stepProject'), device: t('wizard.stepDevice'),
@@ -286,16 +308,21 @@ function _render() {
     </div>
   `;
 
-  document.body.appendChild(_overlay);
+  if (fresh) {
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+    document.body.style.paddingRight = scrollbarWidth + 'px';
+    document.documentElement.style.overflowY = 'hidden';
+    document.body.appendChild(_overlay);
+    // .sma-pi-suggest — agent-select.js portals its model typeahead to <body>.
+    _focusHandle = activateDialogFocus({ root: _overlay, portals: '.sma-pi-suggest' });
+  }
   fitHeaderPath(_overlay);
-
-  const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
-  document.body.style.paddingRight = scrollbarWidth + 'px';
-  document.documentElement.style.overflowY = 'hidden';
 
   _overlay.querySelector('.setup-modal-close').addEventListener('click', close);
 
   _renderStep();
+  // Repainting drops the focused element; steps that focus their own input already did.
+  if (!_overlay.contains(document.activeElement)) _focusHandle.focusFirst();
 }
 
 function _renderStep() {
