@@ -88,14 +88,21 @@ test('managed guides upgrade while edited guides survive repeated full installs'
 });
 test('installed templates carry a Version Control section that matches the runtime directive', () => {
   // The first line of each directive is the marker an agent sees at the top of a task kickoff prompt.
-  const gitMarker = buildVcsDirective({ type: 'git', worktree: false, commit: true, pr: false, merge: false }).split('\n')[0];
+  const commitOn = buildVcsDirective({ type: 'git', worktree: false, commit: true, pr: false, merge: false });
+  const gitMarker = commitOn.split('\n')[0];
   const svnMarker = buildVcsDirective({ type: 'svn' }).split('\n')[0];
   const offMarker = buildVcsDirective({ type: null }).split('\n')[0].split(' — ')[0];
   assert.equal(gitMarker, 'Version control (git) is enabled for this project:');
   assert.equal(offMarker, 'Version control is OFF for this project');
+  // An enabled commit flag is mandatory: the templates must state it in the directive's own terms.
+  const commitRules = [/mandatory, not optional/i, /never ask the user whether to commit/, /never leave[^\n]*uncommitted/, /stage only/, /`<TASK_KEY>: <summary>`/];
+  for (const rule of commitRules) assert.match(commitOn, rule, 'commit-on directive');
   for (const guide of ['CLAUDE.md', 'AGENTS.md']) {
     const text = read(serverRoot, `templates/${guide}`);
     assert.match(text, /^## Version Control$/m, `${guide} template has the section`);
+    const flagsOn = text.split('\n').find(line => line.startsWith('- **Git with flags on**'));
+    assert.ok(flagsOn, `${guide} template has the git-flags-on rule`);
+    for (const rule of commitRules) assert.match(flagsOn, rule, `${guide} template's commit rule matches the directive`);
     for (const marker of [gitMarker, svnMarker, offMarker]) assert.ok(text.includes(marker), `${guide} template names the directive marker "${marker}"`);
     assert.ok(text.includes('`git_worktree_status`'), `${guide} template says where to read the setting when no directive is present`);
     assert.match(text, /off by default/i);

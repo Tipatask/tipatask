@@ -15,14 +15,14 @@ System-specific tags (`tt-*`) are the primary navigation mechanism for the archi
 
 Two MCP servers are registered — call each tool on the right one:
 
-- **`tipatask`** (remote HTTP, primary) — everything in this skill: `list_system_tags`, `get_tag_architecture`, `get_tag_architectures`, `get_project_tags`, `create_system_tag`, `ensure_project_tag`, plus all task CRUD.
-- **`tipatask-local`** (stdio, this machine only) — 4 tools that need a repo checkout or git worktree the remote API doesn't have: `batch_grep_tags`, `push_knowledge`, `pull_knowledge`, `git_worktree_status`. None of them are covered by this skill.
+- **`tipatask`** (remote HTTP, primary) — architecture and tag tools: `list_system_tags`, `get_tag_architecture`, `get_tag_architectures`, `get_project_tags`, `create_system_tag`, `ensure_project_tag`, plus task CRUD except guarded completion.
+- **`tipatask-local`** (stdio, this machine only) — 5 tools that need a repo checkout, local KB files, or Git state the remote API doesn't have: `batch_grep_tags`, `push_knowledge`, `pull_knowledge`, `git_worktree_status`, `complete_task`. Use `complete_task` for guarded completion.
 
 If a tool call fails with "tool not found," check you called it on the right server name.
 
 ## Credential recovery
 
-Project config holds only the API target; the account store under TIPATASK_USER_DATA holds credentials. Follow CLAUDE.md’s Credential recovery and completion section. Missing user-data paths are not expiry. Never print tokens or bypass local completion verification with a REST status write.
+Project config holds only the API target; the account store under `TIPATASK_USER_DATA` holds credentials. Follow `CLAUDE.md` § Credential recovery and completion, including `tt verify` / `tt complete` through the shipped credential-safe CLI when remote MCP is unavailable. Missing user-data paths are not expiry. Never print tokens or bypass local completion verification with a REST status write.
 
 ## Architecture Context Loading
 
@@ -151,7 +151,7 @@ Update architecture **before** marking the task `completed`. Stale architecture 
 
 ## Post-Task Completion Checklist
 
-Run this **before `tipatask-local.complete_task(task_key, resolution)`**. The guarded tool posts the report and completion status together; do not bypass it with `update_task`.
+Run this **before `tipatask-local.complete_task(task_key, resolution)` or `tt complete`**. The guarded tool posts the report and completion status together; do not bypass it with `update_task`.
 
 ### 1. Tags accurate?
 - Call `list_system_tags` if any touched module might need a new `tt-*` tag
@@ -176,7 +176,7 @@ This is the most commonly skipped step. Capture anything surprising — but **wh
 Write it as one or two standing lines in a "Gotchas"/"Known issues" block in the relevant `tt-*.md` — no investigation log, no dates, no task keys, no evidence tables. Cross-project/reusable (a library pattern, a framework quirk) → save a `feedback_*.md` memory file in the project memory dir and add a pointer to `MEMORY.md` instead.
 
 **Task narrative → resolution comment, never the KB.** How you found it, what you tried first, evidence tables of observed values, dated findings, and any correction of your own earlier analysis:
-- Pass the report to `tipatask-local.complete_task(task_key, resolution)` after verification; use `create_task_comment` only for separate investigation notes during work.
+- Pass one plain-English report covering changes, reasons, key files, checks, and follow-ups/caveats to `tipatask-local.complete_task(task_key, resolution)` or `tt complete`. If completion is blocked and its blockers cannot be cleared within the task, preserve the report with `create_task_comment(task_key, content, type='resolution')` and leave the task incomplete.
 - To read how a past task went, call `list_task_resolutions(tags=[...])` — that is where this narrative lives, not `ai/architecture/*.md`.
 
 **Line test**: would this line still be worth reading a year from now, with this task long forgotten? Yes → KB. No → resolution comment. Naming a task key, a date, or what you personally tried is itself the answer: resolution comment.

@@ -6,7 +6,8 @@
 const path = require('node:path');
 const { spawn: cpSpawn } = require('node:child_process');
 const config = require('../config');
-const { augmentPathEnv, projectEnvExtras: sharedProjectEnvExtras, resolveNvmBinDir, resolvePiLaunch } = require('../spawn-utils');
+const { augmentPathEnv, projectEnvExtras: sharedProjectEnvExtras, resolveNvmBinDir, resolvePiLaunch, cliSpawnSpec } = require('../spawn-utils');
+const { killWindowsChildTree } = require('../process-group');
 const { normalizeProposals } = require('../claude-session');
 const { localizeAttachments } = require('../task-agent/attachments');
 const throttle = require('../objective-throttle');
@@ -199,12 +200,17 @@ function emitPiError(session, taskId, proc, emit, reason, attempts, extraDetail)
   throttle.recordTimeout(taskId, reason);
   clearPiTimers(session);
   session._aborted = true;
-  // Kill proc group
+  // Kill proc group. win32 has no process groups, and a pi.cmd launcher runs Pi as a grandchild
+  // (behind cmd.exe, or under the npm shim's node.exe): taskkill the whole tree (TPT575).
   if (proc && !proc.killed) {
-    try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already dead */ }
-    setTimeout(() => {
-      try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already dead */ }
-    }, 3000);
+    if (process.platform === 'win32') {
+      killWindowsChildTree(proc);
+    } else {
+      try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already dead */ }
+      setTimeout(() => {
+        try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already dead */ }
+      }, 3000);
+    }
   }
   // Clean turn buffers
   session.turnBuffer = '';
@@ -416,12 +422,23 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
     };
   }
 
-  const proc = spawnFn(launch.command, [...launch.argsPrefix, ...args], {
-    cwd,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true,
-  });
+  let proc;
+  try {
+    // A pi.cmd launcher (this checkout's bin/pi.cmd, or npm's shim for a system install) is a batch
+    // file Node will not spawn shell-less on Windows: cliSpawnSpec runs the program npm's shim
+    // launches, else cmd.exe (bin/pi.cmd's argv is plain flags and paths). POSIX unchanged (TPT575).
+    const spec = cliSpawnSpec(launch.command, [...launch.argsPrefix, ...args], { env, isWin: process.platform === 'win32' });
+    proc = spawnFn(spec.command, spec.args, {
+      cwd,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true,
+      ...spec.options,
+    });
+  } catch (err) {
+    emitPiError(session, taskId, null, emit, `spawn-error:${err.message}`, session._retryAttempt || 0);
+    return;
+  }
   session.proc = proc;
 
   if (config.OBJECTIVE_TIMING_ENABLED) {

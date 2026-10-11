@@ -38,7 +38,7 @@ function harness(t) {
     OBJECTIVE_PREWARM_ENABLED: true, OBJECTIVE_PREWARM_TTL_MS: 3600000 };
   const common = {
     './config': config,
-    './spawn-utils': { augmentPathEnv: () => ({}), projectEnvExtras: () => ({}) },
+    './spawn-utils': { augmentPathEnv: () => ({}), projectEnvExtras: () => ({}), cliSpawnSpec: require('./spawn-utils').cliSpawnSpec },
     'node:child_process': { spawn() {
       const proc = fakeProc(92000 + processes.length);
       processes.push(proc);

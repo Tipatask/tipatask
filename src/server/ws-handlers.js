@@ -14,7 +14,7 @@ const { TASK_CHAT, isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFr
 const { resolvePiMcpBridge } = require('./providers/pi-task-tools');
 const { providerSupportsProfile } = require('./providers/tool-profiles');
 const { findOpenDialog, resolveDialogAnswer, replayTaskChatTurn, taskFrame, changedTaskFields, buildTaskEditNote } = require('./task-chat-widgets');
-const { killProcessGroup, resolveAgentLimits } = require('./process-group');
+const { killProcessGroup, killWindowsChildTree, resolveAgentLimits } = require('./process-group');
 const { createSessionQueue } = require('./session-queue');
 const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, replayLiveTerminal, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary } = require('./terminal-session');
 const { buildExitResolutionComment, hasSelfAuthoredResolution, waitForFinalMessage, selectFinalMessage } = require('./exit-resolution');
@@ -29,7 +29,7 @@ const { readChatDraft, writeChatDraft, deleteChatDraft, readChatState, writeChat
 const { HISTORY_PROVIDERS, isHistoryId, nativeStorageRef, historyAvailability, buildSearchData, filterHistory, publicHistoryRow } = require('./chat-history');
 const { readNativeConversation } = require('./task-agent/final-message');
 const { readProjectConfig, readVoiceSettings, buildLanguageDirective, piEntryForModel, recordLastUsedAgent, readPiEntries, buildAgentsConfigPatch, summarizeAgents, PI_PROVIDERS, piProviderEnv, piKeyEnvVars } = require('./project-config');
-const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolvePiLaunch } = require('./spawn-utils');
+const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolvePiLaunch, cliSpawnSpec } = require('./spawn-utils');
 const { transcribeWithAssemblyAI, ASSEMBLYAI_ERRORS, MAX_AUDIO_BYTES: ASSEMBLYAI_MAX_AUDIO_BYTES } = require('./assemblyai-batch');
 const { int16BufferToFloat32 } = require('./voice-stream/local-provider');
 const { getApiCredentials } = require('./api-credentials');
@@ -310,6 +310,7 @@ function queryPiModels(provider, projectRoot, deps = {}) {
   const resolveLaunch = deps.resolveLaunch || resolvePiLaunch;
   const spawn = deps.spawn || spawnChild;
   const timeoutMs = deps.timeoutMs ?? PI_MODEL_LIST_TIMEOUT_MS;
+  const isWin = deps.isWin ?? process.platform === 'win32';
   const launch = resolveLaunch();
   if (!launch) return Promise.resolve([]);
 
@@ -335,24 +336,32 @@ function queryPiModels(provider, projectRoot, deps = {}) {
       if (timer) clearTimeout(timer);
       resolve(models);
     }
+    // win32: a pi.cmd launcher runs Pi as a grandchild (behind cmd.exe or the npm shim's node.exe)
+    // and there are no process groups, so a stalled list is taskkilled as a tree (TPT575).
+    function stop() {
+      if (isWin) {
+        killWindowsChildTree(child, { killTree: deps.killTree });
+      } else {
+        try { child.kill('SIGKILL'); } catch { /* already exited */ }
+      }
+    }
     try {
-      child = spawn(
-        launch.command,
-        [...(launch.argsPrefix || []), '--list-models', '--provider', provider],
-        { cwd, env, stdio: ['ignore', 'pipe', 'ignore'] },
-      );
+      // A Windows pi.cmd is a batch file Node will not spawn shell-less: cliSpawnSpec() runs the
+      // program npm's shim launches, else cmd.exe; POSIX spawns the launch exactly as before.
+      const spec = cliSpawnSpec(launch.command, [...(launch.argsPrefix || []), '--list-models', '--provider', provider], { env, isWin });
+      child = spawn(spec.command, spec.args, { cwd, env, stdio: ['ignore', 'pipe', 'ignore'], ...spec.options });
     } catch {
       return finish([]);
     }
     timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* already exited */ }
+      stop();
       finish([]);
     }, timeoutMs);
     child.once('error', () => finish([]));
     child.stdout?.on('data', (chunk) => {
       stdout += chunk;
       if (Buffer.byteLength(stdout) > PI_MODEL_LIST_MAX_BYTES) {
-        try { child.kill('SIGKILL'); } catch { /* already exited */ }
+        stop();
         finish([]);
       }
     });

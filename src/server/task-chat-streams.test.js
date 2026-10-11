@@ -67,7 +67,7 @@ test('claude: ask_user text and tool_use events become dialog and tool frames, d
   const claude = loadInVm('claude-session.js', {
     './config': config, './objective-throttle': throttle,
     './static-context': { getStaticBundleStats: () => ({ chars: 0, sha: '' }) },
-    './spawn-utils': { augmentPathEnv: () => ({}), projectEnvExtras: () => ({}) },
+    './spawn-utils': { augmentPathEnv: () => ({}), projectEnvExtras: () => ({}), cliSpawnSpec: require('./spawn-utils').cliSpawnSpec },
     './task-agent/attachments': { localizeAttachments: async ({ prompt }) => ({ prompt }) },
     'node:fs/promises': { unlink: async () => {}, writeFile: async () => {} },
     'node:child_process': { spawn() { const proc = fakeProc(91000 + procs.length); procs.push(proc); return proc; } },

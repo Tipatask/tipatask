@@ -648,11 +648,11 @@ async function main() {
 
   server.tool(
     'create_task_comment',
-    `Post a comment on a task. Defaults to type='resolution' — call this with a real report (what was implemented and why, key files touched, how to use/verify the result, any follow-ups/caveats) in the SAME tool-call batch as the final update_task call that sets this project's completed status (C1184: a project can rename its statuses — call get_task or list_tasks if unsure which name that is). Write resolution comments in plain English prose, never in a compressed/caveman style, even if the rest of the session is running in one — this is a report read later, not a live status update. Pass type='comment' explicitly for regular discussion, or type='spec' for original objective/spec captures. ${projectScopeNote}`,
+    `Post a comment on a task. Defaults to type='resolution'. Pass a task-completion report (what was implemented and why, key files touched, how to use/verify the result, any follow-ups/caveats) to complete_task(task_key, resolution), which posts it as a type: "resolution" comment together with this project's completion status after verification. Use this tool for that report only when completion is blocked (then set on_fire when available). Write resolution comments in plain English prose, never in a compressed/caveman style, even if the rest of the session is running in one — this is a report read later, not a live status update. Pass type='comment' explicitly for regular discussion, or type='spec' for original objective/spec captures. ${projectScopeNote}`,
     {
       task_key: z.string().describe('Task key, e.g. "C192"'),
       content: z.string().min(1).describe('Comment body (non-empty)'),
-      type: z.enum(['comment', 'resolution', 'spec']).optional().default('resolution').describe("'resolution' (default) for task completion reports, 'spec' for original objective/spec captures, 'comment' for regular notes"),
+      type: z.enum(['comment', 'resolution', 'spec']).optional().default('resolution').describe("'resolution' (default) for blocked completion reports; successful completion reports go through complete_task. 'spec' for original objective/spec captures, 'comment' for regular notes"),
     },
     async ({ task_key, content, type = 'resolution' }) => {
       ensureKbSynced();
@@ -1139,7 +1139,7 @@ async function main() {
 
   server.tool(
     'git_worktree_status',
-    `Read live VCS permissions and runtime identity. With task_key, verify automatic merge completion across root and nested repos. Require verified:true before VCS writes and ready:true before completing; PR creation does not replace local merge. Never mutates git. ${projectScopeNote}`,
+    `Read live VCS permissions and runtime identity. With task_key, verify completion across root and nested repos: the task commit when commits are on, automatic merges when merge is on. Require verified:true before VCS writes and ready:true before completing; PR creation does not replace local merge. Never mutates git. ${projectScopeNote}`,
     { task_key: z.string().optional().describe('Task key to check before completion') },
     async ({ task_key }) => {
       await ensureBackend();
@@ -1158,7 +1158,7 @@ async function main() {
 
   server.tool(
     'complete_task',
-    `Verify live VCS settings and required local merges, then post one resolution report and set the project's completion status. Refuses unmerged/dirty task branches, conflicts, incorrect gitlinks, and unknown verification. Run relevant checks first. Does not perform git writes. ${projectScopeNote}`,
+    `Verify live VCS settings, the required task commit and local merges, then post one resolution report and set the project's completion status. Refuses a missing task commit (commits on), unmerged/dirty task branches, conflicts, incorrect gitlinks, and unknown verification. Run relevant checks first. Does not perform git writes. ${projectScopeNote}`,
     { task_key: z.string(), resolution: z.string().min(1).describe('Plain-English report: changes, files, verification results, follow-ups/caveats') },
     async ({ task_key, resolution }) => {
       await ensureBackend();

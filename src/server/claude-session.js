@@ -5,7 +5,8 @@ const fs = require('node:fs/promises');
 const crypto = require('node:crypto');
 const { spawn: cpSpawn } = require('node:child_process');
 const config = require('./config');
-const { augmentPathEnv, projectEnvExtras: sharedProjectEnvExtras } = require('./spawn-utils');
+const { augmentPathEnv, projectEnvExtras: sharedProjectEnvExtras, cliSpawnSpec, writeSpawnArgFile } = require('./spawn-utils');
+const { killWindowsChildTree } = require('./process-group');
 
 // Per-project env overrides for an objective-chat session — thin wrapper around
 // the shared spawn-utils helper, keyed off session.projectPath. Injects
@@ -336,6 +337,52 @@ const SLEEP_WAKE_GAP_MS = 45000;
 let _sleepWatchdogTimer = null;
 let _sleepSessionsSource = () => null;
 
+// ── Claude CLI spawn (TPT575) ──
+
+// `--append-system-prompt <text>`. On win32 the text goes to a file read via
+// --append-system-prompt-file instead: the objective prompt carries the static KB bundle, past the
+// 32,767-character command line CreateProcess accepts, and a cmd.exe-wrapped claude.cmd could not
+// carry its quotes or line breaks either. POSIX keeps the inline flag byte-for-byte.
+function appendSystemPromptArgs(text) {
+  if (process.platform === 'win32') {
+    const file = writeSpawnArgFile(config.USER_DATA_ROOT, text, '.md');
+    if (file) return ['--append-system-prompt-file', file];
+  }
+  return ['--append-system-prompt', text];
+}
+
+// `--mcp-config` value: the derived scoped file, else an empty server map (which still keeps
+// --strict-mcp-config from discovering global servers) — inline on POSIX, a file on win32, where a
+// cmd.exe-wrapped claude.cmd cannot carry the JSON's double quotes.
+const EMPTY_MCP_CONFIG = '{"mcpServers":{}}';
+function mcpConfigArg(scopedPath) {
+  if (scopedPath) return scopedPath;
+  if (process.platform === 'win32') return writeSpawnArgFile(config.USER_DATA_ROOT, EMPTY_MCP_CONFIG, '.json') || EMPTY_MCP_CONFIG;
+  return EMPTY_MCP_CONFIG;
+}
+
+// Every headless Claude CLI spawn of this module. cliSpawnSpec() makes a Windows claude.cmd
+// spawnable (the program its npm shim launches, else cmd.exe) and applies the win32 options (never
+// detached, no window); POSIX runs exactly spawn(CLAUDE_BIN, args, { cwd, env, stdio, detached }).
+// Throws like spawn() does.
+function spawnClaudeCli(args, { cwd, env }) {
+  const spec = cliSpawnSpec(config.CLAUDE_BIN, args, { env, isWin: process.platform === 'win32' });
+  return cpSpawn(spec.command, spec.args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true, ...spec.options });
+}
+
+// Signals a spawned CLI and everything it started. POSIX: the detached proc leads its own process
+// group, so the negative pid reaches its MCP servers and tool subprocesses too (the proc alone if
+// that fails). win32 has no process groups and the CLI may run as a grandchild (under an npm
+// shim's node.exe or cmd.exe), so the whole tree is taskkilled instead.
+function signalProcTree(proc, sig) {
+  if (process.platform === 'win32') { killWindowsChildTree(proc); return; }
+  try {
+    process.kill(-proc.pid, sig);
+  } catch {
+    try { proc.kill(sig); } catch { /* already dead */ }
+  }
+}
+
 // Argv for a session running under a tool profile (task chat). The profile, not the objective
 // read-only fence, decides the tool lists; the system prompt is always appended (it carries
 // the chat's rules, and SIMPLE_MODE's "no static bundle" reason does not apply to it).
@@ -351,7 +398,7 @@ function buildProfileArgs(session, profile) {
     '--permission-mode', 'default',
     '--exclude-dynamic-system-prompt-sections',
   ];
-  if (session.systemPrompt) args.push('--append-system-prompt', session.systemPrompt);
+  if (session.systemPrompt) args.push(...appendSystemPromptArgs(session.systemPrompt));
   if (session.claudeSessionId) args.push('--resume', session.claudeSessionId);
   return args;
 }
@@ -375,15 +422,15 @@ function buildObjectiveArgs(session) {
   ];
   if (!config.SIMPLE_MODE) {
     args.push('--exclude-dynamic-system-prompt-sections');
-    if (session.systemPrompt) args.push('--append-system-prompt', session.systemPrompt);
+    if (session.systemPrompt) args.push(...appendSystemPromptArgs(session.systemPrompt));
   } else if (session._rehashDirective) {
-    args.push('--append-system-prompt', session._rehashDirective);
+    args.push(...appendSystemPromptArgs(session._rehashDirective));
   }
   if (session.claudeSessionId) args.push('--resume', session.claudeSessionId);
   const scopedMcp = writeScopedMcpConfig({ projectRoot: session.projectPath || config.PROJECT_ROOT,
     userDataRoot: config.USER_DATA_ROOT, servers: ['tipatask', 'tipatask-local'], label: 'objective' });
   // An empty strict config still prevents discovering arbitrary global servers.
-  args.push('--mcp-config', scopedMcp || '{"mcpServers":{}}', '--strict-mcp-config');
+  args.push('--mcp-config', mcpConfigArg(scopedMcp), '--strict-mcp-config');
   return args;
 }
 
@@ -393,11 +440,7 @@ function killPrewarm(taskId, reason) {
   if (!pw) return null;
   _prewarmedProcs.delete(taskId);
   if (pw.ttlTimer) clearTimeout(pw.ttlTimer);
-  try {
-    process.kill(-pw.proc.pid, 'SIGTERM');
-  } catch {
-    try { pw.proc.kill('SIGTERM'); } catch { /* already dead */ }
-  }
+  signalProcTree(pw.proc, 'SIGTERM');
   console.log(`[objective:prewarm] Killed pid ${pw.proc.pid} for task ${taskId} reason=${reason}`);
   return pw.proc;
 }
@@ -419,12 +462,13 @@ function prewarmObjectiveCold(projectRoot) {
   const env = config.OBJECTIVE_DEBUG_STARTUP
     ? augmentPathEnv({ TERM: 'dumb', DEBUG: '*', TIPATASK_TURN_ID: turnId, ...projectExtras })
     : augmentPathEnv({ TERM: 'dumb', TIPATASK_TURN_ID: turnId, ...projectExtras });
-  const proc = cpSpawn(config.CLAUDE_BIN, args, {
-    cwd: root,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true,
-  });
+  let proc;
+  try {
+    proc = spawnClaudeCli(args, { cwd: root, env });
+  } catch (err) {
+    console.warn(`[objective:prewarm:cold] Spawn failed: ${err.message}`);
+    return;
+  }
   const pw = { proc, spawnedAt: Date.now(), ttlTimer: null, model: config.CLAUDE_MODEL, projectRoot: root };
   _coldPrewarm = pw;
   proc.stderr.on('data', () => {});
@@ -470,7 +514,7 @@ function killColdPrewarm(reason) {
   const pw = _coldPrewarm;
   _coldPrewarm = null;
   if (pw.ttlTimer) clearTimeout(pw.ttlTimer);
-  try { process.kill(-pw.proc.pid, 'SIGTERM'); } catch { try { pw.proc.kill('SIGTERM'); } catch { /* dead */ } }
+  signalProcTree(pw.proc, 'SIGTERM');
   console.log(`[objective:prewarm:cold] Killed pid ${pw.proc.pid} reason=${reason}`);
   return pw.proc;
 }
@@ -493,7 +537,7 @@ function killHeartbeatProc(session, reason) {
   const proc = session._heartbeatProc;
   session._heartbeatProc = null;
   if (!proc) return null;
-  try { process.kill(-proc.pid, 'SIGTERM'); } catch { try { proc.kill('SIGTERM'); } catch { /* dead */ } }
+  signalProcTree(proc, 'SIGTERM');
   console.log(`[objective:heartbeat] Killed pid ${proc.pid} reason=${reason}`);
   return proc;
 }
@@ -561,12 +605,13 @@ function prewarmObjective(session, taskId) {
     : augmentPathEnv({ TERM: 'dumb', TIPATASK_TURN_ID: turnId, TIPATASK_OBJECTIVE_TASK_ID: taskId, ..._pwProjExtras });
   const prewarmCwd = session.projectPath || config.PROJECT_ROOT;
 
-  const proc = cpSpawn(config.CLAUDE_BIN, args, {
-    cwd: prewarmCwd,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true,
-  });
+  let proc;
+  try {
+    proc = spawnClaudeCli(args, { cwd: prewarmCwd, env });
+  } catch (err) {
+    console.warn(`[objective:prewarm] Spawn failed for task ${taskId}: ${err.message}`);
+    return;
+  }
 
   const pw = { proc, spawnedAt: Date.now(), sessionId: session.claudeSessionId, ttlTimer: null, model: resolveClaudeModel(session) };
   _prewarmedProcs.set(taskId, pw);
@@ -598,14 +643,8 @@ function prewarmObjective(session, taskId) {
 function killObjectiveProc(session, signal) {
   const proc = session.proc;
   if (!proc) return;
-  const sig = signal || 'SIGTERM';
-  try {
-    // Detached spawn makes proc its own group leader; negative pid targets
-    // the whole group so MCP/tool subprocesses die too.
-    process.kill(-proc.pid, sig);
-  } catch {
-    try { proc.kill(sig); } catch { /* already dead */ }
-  }
+  // The whole tree, so MCP/tool subprocesses die too — see signalProcTree().
+  signalProcTree(proc, signal || 'SIGTERM');
 }
 
 function escalateKill(session, taskId, graceMs) {
@@ -849,12 +888,13 @@ function spawnHeartbeat(session, taskId) {
     '--tools', '',
     '--resume', session.claudeSessionId,
   ];
-  const hbProc = cpSpawn(config.CLAUDE_BIN, args, {
-    cwd: config.PROJECT_ROOT,
-    env: augmentPathEnv({ TERM: 'dumb' }),
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true,
-  });
+  let hbProc;
+  try {
+    hbProc = spawnClaudeCli(args, { cwd: config.PROJECT_ROOT, env: augmentPathEnv({ TERM: 'dumb' }) });
+  } catch (err) {
+    console.warn(`[objective] Heartbeat spawn failed for task ${taskId}: ${err.message}`);
+    return;
+  }
   session._heartbeatProc = hbProc;
   console.log(`[objective] Heartbeat pid ${hbProc.pid} for task ${taskId}`);
   let stdout = '';
@@ -862,8 +902,8 @@ function spawnHeartbeat(session, taskId) {
   const hbKillTimer = setTimeout(() => {
     if (hbDone) return;
     console.log(`[objective] Heartbeat timed out after ${config.OBJECTIVE_HEARTBEAT_TIMEOUT_MS}ms — killing pid ${hbProc.pid}`);
-    try { process.kill(-hbProc.pid, 'SIGTERM'); } catch { try { hbProc.kill('SIGTERM'); } catch {} }
-    setTimeout(() => { try { process.kill(-hbProc.pid, 'SIGKILL'); } catch { try { hbProc.kill('SIGKILL'); } catch {} } }, 2000);
+    signalProcTree(hbProc, 'SIGTERM');
+    setTimeout(() => signalProcTree(hbProc, 'SIGKILL'), 2000);
   }, config.OBJECTIVE_HEARTBEAT_TIMEOUT_MS);
   session._heartbeatKillTimer = hbKillTimer;
   hbProc.stdout.on('data', c => { stdout += c.toString(); });
@@ -998,7 +1038,7 @@ function spawnObjectiveTurn(session, taskId) {
     // Only the profile's MCP servers exist for this turn — no other project or user-level
     // server is loaded. Without a derived file (no .mcp.json) the tool lists are the fence.
     const scopedMcp = writeScopedMcpConfig({ projectRoot: cwd, userDataRoot: config.USER_DATA_ROOT, servers: profile.mcpServers, label: session.toolProfile });
-    args.push('--mcp-config', scopedMcp || '{"mcpServers":{}}', '--strict-mcp-config');
+    args.push('--mcp-config', mcpConfigArg(scopedMcp), '--strict-mcp-config');
   }
 
   // Try to adopt a pre-warmed proc (eliminates proc_startup latency on follow-up and first turns)
@@ -1032,7 +1072,15 @@ function spawnObjectiveTurn(session, taskId) {
     if (process.env.TIPATASK_PROJECT_DEBUG === '1') {
       console.log(`[proj:spawn] taskId=${taskId} cwd=${cwd} API_PROJECT_ID=${env.API_PROJECT_ID || '<none>'}`);
     }
-    proc = cpSpawn(config.CLAUDE_BIN, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    try {
+      proc = spawnClaudeCli(args, { cwd, env });
+    } catch (err) {
+      // A synchronous spawn failure (e.g. an argument a cmd.exe-wrapped launcher cannot carry)
+      // ends the turn the same way an async 'error' event does below.
+      console.error(`[objective] spawn failed task=${taskId}: ${err.message}`);
+      emitObjectiveError(session, taskId, `spawn-error:${err.message}`, session._retryAttempt || 0);
+      return;
+    }
     if (config.OBJECTIVE_TIMING_ENABLED) session.timingMilestones.procSpawnedAt = Date.now();
   }
   session.proc = proc;
@@ -1867,17 +1915,24 @@ async function spawnEfficiencyAnalysis(session, totalMs) {
   ].join('\n');
 
   return new Promise((resolve) => {
-    const eaProc = cpSpawn(config.CLAUDE_BIN, [
-      '-p', '--model', 'claude-haiku-4-5-20251001', '--output-format', 'json',
-    ], { cwd: config.PROJECT_ROOT, env: augmentPathEnv({ TERM: 'dumb' }), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    let eaProc;
+    try {
+      eaProc = spawnClaudeCli([
+        '-p', '--model', 'claude-haiku-4-5-20251001', '--output-format', 'json',
+      ], { cwd: config.PROJECT_ROOT, env: augmentPathEnv({ TERM: 'dumb' }) });
+    } catch (err) {
+      console.warn(`[objective] Efficiency analysis spawn failed: ${err.message}`);
+      resolve([]);
+      return;
+    }
     trackHelperProc(session, eaProc); // teardown kills it with the chat
     let stdout = '';
     let eaDone = false;
     const eaKillTimer = setTimeout(() => {
       if (eaDone) return;
       console.log(`[objective] Efficiency analysis timed out after ${config.OBJECTIVE_EFFICIENCY_TIMEOUT_MS}ms — killing pid ${eaProc.pid}`);
-      try { process.kill(-eaProc.pid, 'SIGTERM'); } catch { try { eaProc.kill('SIGTERM'); } catch {} }
-      setTimeout(() => { try { process.kill(-eaProc.pid, 'SIGKILL'); } catch { try { eaProc.kill('SIGKILL'); } catch {} } }, 2000);
+      signalProcTree(eaProc, 'SIGTERM');
+      setTimeout(() => signalProcTree(eaProc, 'SIGKILL'), 2000);
     }, config.OBJECTIVE_EFFICIENCY_TIMEOUT_MS);
     eaProc.stdout.on('data', c => { stdout += c.toString(); });
     eaProc.stderr.on('data', () => {});

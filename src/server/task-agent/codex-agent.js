@@ -9,7 +9,7 @@ const config = require('../config');
 const { getStaticBundle, getTaskStartupGrepBundle } = require('../static-context');
 const { resolveBin, resolveBinAsync, augmentPathEnv, prependPathEnv, resolveNvmBinDir, resolveSpawnModel, winExecSpec } = require('../spawn-utils');
 const { buildCodexEnv, codexTerminalLaunchOptions, toCodexEffort } = require('../codex-env');
-const { matchPromptLine, CODEX_PROMPT_PATTERNS } = require('./prompt-detect');
+const { matchPromptLine, CODEX_PROMPT_PATTERNS, CODEX_PENDING_PASTE_RE, CODEX_EMPTY_COMPOSER_RE } = require('./prompt-detect');
 const { parseCodexCatalog } = require('./model-registry');
 
 // (C1504) `codex debug models` is a documented subcommand that dumps the live catalog as
@@ -41,6 +41,27 @@ class CodexAgent extends BaseTaskAgent {
   isPromptLine(line) {
     return matchPromptLine(line, CODEX_PROMPT_PATTERNS) || super.isPromptLine(line);
   }
+
+  // ── Paste-injected kickoff (TPT571) ──
+  // The task prompt is delivered by terminal-session.js's bracketed-paste injector
+  // (spec.initialPrompt), exactly like Claude's — Codex 0.160 no longer consumes a positional
+  // prompt argument and boots straight to an empty composer. Codex's ratatui TUI paints a banner,
+  // then fetches the model catalog and starts MCP servers before the composer accepts input, so
+  // its boot floor is longer than Claude's Ink REPL; and a large paste triggers a full composer
+  // repaint (the `[Pasted Content N chars]` chip), so the paste-settle window is wider too.
+  // No kickoffTypedLine: Codex accepts a paste-only message (the "no words from you" refusal is
+  // Claude Code's alone).
+  getInteractiveReadyMs() { return 2500; }
+
+  getPasteSilenceMs() { return 600; }
+
+  // The `[Pasted Content N chars]` chip Codex leaves in its composer until the paste is submitted —
+  // see CODEX_PENDING_PASTE_RE in prompt-detect.js.
+  getUnsentPasteRe() { return CODEX_PENDING_PASTE_RE; }
+
+  // The bare idle-composer placeholder row — the paste never landed at all. See
+  // CODEX_EMPTY_COMPOSER_RE in prompt-detect.js.
+  getEmptyComposerRe() { return CODEX_EMPTY_COMPOSER_RE; }
 
   buildPrompt(prompt, opts = {}) {
     // C1575 — parent-task context (opts.parentTaskBlock), prepended ahead of this task's own
@@ -94,7 +115,7 @@ class CodexAgent extends BaseTaskAgent {
       // C1184: resolve the project's actual "complete" status name (role-based)
       // instead of the hardcoded literal "completed".
       opts.vcsContext
-        ? '- MANDATORY: supply ONE self-authored plain-English resolution to tipatask-local complete_task. Cover what changed and why, key files, checks, and follow-ups/caveats (none if absent). That tool posts the resolution and completion status together after verification. The automatic terminal-tail comment does not satisfy this requirement.'
+        ? '- MANDATORY: supply ONE self-authored plain-English resolution to tipatask-local complete_task. Cover what changed and why, key files, checks, and follow-ups/caveats (none if absent). That tool posts the resolution and completion status together after verification. Never also call `create_task_comment` or `update_task` to complete the task. When it refuses, fix the blockers it lists (e.g. TASK_COMMIT_MISSING: commit first) and call it again. If a blocker cannot be cleared within this task, do not complete it: post the same report with `create_task_comment(task_key, content, type="resolution")` so it is not lost, then set the task on_fire (when available) and state the blocker. The automatic terminal-tail comment does not satisfy this requirement.'
         : `- MANDATORY before marking this task \`${this.resolveStatusForRole('complete', opts)}\`: post ONE self-authored resolution comment via \`create_task_comment(task_key, content, type="resolution")\`. \`content\` must be a real report, written in plain English prose — do NOT use caveman style for this comment. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). Separate from and required IN ADDITION TO the auto-posted terminal-tail resolution comment (a raw log dump with no explanation, posted on session exit) — that one does not satisfy this step. Post it in the SAME tool-call batch as the final status update to \`${this.resolveStatusForRole('complete', opts)}\`.`,
       ...directives,
       `- ${grepNote}`,
@@ -129,7 +150,9 @@ class CodexAgent extends BaseTaskAgent {
     const _codexModel = resolveSpawnModel(opts.model, projectRoot, 'CODEX_MODEL', '');
     if (_codexModel) args.push('--model', _codexModel);
     args.push('--no-alt-screen');
-    args.push(this.buildPrompt(prompt, opts));
+    // (TPT571) The kickoff is NOT a positional argument any more — see getInteractiveReadyMs()
+    // above. terminal-session.js pastes spec.initialPrompt once the TUI is interactive.
+    const initialPrompt = this.buildPrompt(prompt, opts);
     // Use the running install's server root (config.SERVER_ROOT, this checkout) — never a
     // project-relative path; the Task App is a standalone checkout.
     // env + CODEX_HOME/MCP wiring shared with the objective-chat Codex provider (C1029) — see codex-env.js.
@@ -148,6 +171,7 @@ class CodexAgent extends BaseTaskAgent {
       args,
       cwd: projectRoot,
       env,
+      initialPrompt,
       model: _codexModel,
     };
   }
@@ -165,7 +189,8 @@ class CodexAgent extends BaseTaskAgent {
   }
 
   // (TPT354) See BaseTaskAgent#readFinalMessage. Codex offers no way to pin its rollout file, so
-  // final-message.js finds it by spawn time + this task's `Work on task <KEY>` kickoff line.
+  // final-message.js finds it by spawn time + this task's `Work on task <KEY>` kickoff line (the
+  // rollout stores the expanded paste, not the composer's `[Pasted Content]` chip — TPT571).
   readFinalMessage(session) {
     return require('./final-message').readCodexFinalMessage(session && session._transcriptHint);
   }
@@ -220,20 +245,36 @@ class CodexAgent extends BaseTaskAgent {
     });
   }
 
+  // (TPT572) `codex --version` prints `codex-cli 0.160.0`. Keeps the bare version (a pre-release
+  // suffix included); null unless some output line is nothing but a version, so a stray warning
+  // line that merely mentions one never passes for it.
+  static parseVersion(output) {
+    const m = /^(?:codex(?:-cli)?\s+)?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s*$/im.exec(String(output || ''));
+    return m ? m[1] : null;
+  }
+
   async detect(config) {
     const bin = await resolveBinAsync('codex');
-    // Every negative carries `detail` (TPT567) — see BaseTaskAgent.buildDetectDetail().
+    // Every negative carries `detail` (TPT567) — see BaseTaskAgent.buildDetectDetail(). (TPT572)
+    // Every result, the positive included, also names the CLI build in `detail.version`, so the
+    // task-start gate log and scripts/probe-codex-kickoff.js can say which Codex took a kickoff.
+    let version = null;
     const unavailable = (reason, probe) => ({
       id: this.id, label: this.label, available: false, reason,
-      detail: BaseTaskAgent.buildDetectDetail(bin, probe),
+      detail: { ...BaseTaskAgent.buildDetectDetail(bin, probe), version },
     });
     if (!bin) {
       return unavailable('Codex CLI not found. Install codex (npm i -g @openai/codex under node 22, or brew install codex), or set CODEX_BIN=/path/to/codex in .env.');
     }
     // Run the login probe under the nvm-matched node so shebang-based CLIs resolve correctly.
     // prependPathEnv keeps the env at one PATH key (TPT566) — never `env.PATH = …`.
+    // The version probe runs alongside it, in the same env; it never decides availability.
     const probeEnv = prependPathEnv(augmentPathEnv({}), resolveNvmBinDir(bin));
-    const probe = await BaseTaskAgent.runCliProbe(bin, ['login', 'status'], { env: probeEnv });
+    const [probe, versionProbe] = await Promise.all([
+      BaseTaskAgent.runCliProbe(bin, ['login', 'status'], { env: probeEnv }),
+      BaseTaskAgent.runCliProbe(bin, ['--version'], { env: probeEnv }),
+    ]);
+    version = CodexAgent.parseVersion(versionProbe.output);
     if (probe.error) {
       if (probe.error.code === 'ENOENT') {
         return unavailable('Codex CLI not found', probe);
@@ -242,7 +283,8 @@ class CodexAgent extends BaseTaskAgent {
       return unavailable('Codex is not logged in (or login status check failed)', probe);
     }
     if (isCodexLoggedIn(probe.output)) {
-      return { id: this.id, label: this.label, available: true };
+      // No probe output on a positive: `codex login status` can echo a masked API key.
+      return { id: this.id, label: this.label, available: true, detail: { bin, version } };
     }
     console.log(
       `[task-agent:detect] codex login probe reported not-logged-in ` +

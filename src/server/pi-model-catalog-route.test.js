@@ -153,9 +153,39 @@ test('queryPiModels kills a stalled Pi after the configured cap and returns []',
     resolveLaunch: () => ({ command: '/fake/pi', argsPrefix: [], env: {} }),
     spawn() { child = fakeChild(() => {}); return child; },
     timeoutMs: 5,
+    isWin: false,
   });
   assert.deepEqual(models, []);
   assert.deepEqual(child.killSignals, ['SIGKILL']);
+});
+
+// TPT575 — on Windows the launch is never detached, always hidden, and a stalled list is
+// taskkilled as a tree: a pi.cmd runs Pi as a grandchild that child.kill() never reaches.
+test('queryPiModels (win32): the launch runs attached and hidden; a stalled Pi is tree-killed, not child.kill()ed', async () => {
+  let captured;
+  let child;
+  const trees = [];
+  const exe = 'C:\\Program Files\\TipATask\\TipATask.exe';
+  const models = await queryPiModels('openrouter', ROOT, {
+    isWin: true,
+    resolveLaunch: () => ({ command: exe, argsPrefix: ['C:\\pi\\cli.js'], env: { ELECTRON_RUN_AS_NODE: '1' } }),
+    spawn(command, args, options) {
+      captured = { command, args, options };
+      child = fakeChild(() => {});
+      child.pid = 4242;
+      return child;
+    },
+    killTree: pid => { trees.push(pid); return true; },
+    timeoutMs: 5,
+  });
+  assert.deepEqual(models, []);
+  assert.equal(captured.command, exe);
+  assert.deepEqual(captured.args, ['C:\\pi\\cli.js', '--list-models', '--provider', 'openrouter']);
+  assert.equal(captured.options.detached, false);
+  assert.equal(captured.options.windowsHide, true);
+  assert.equal(captured.options.env.ELECTRON_RUN_AS_NODE, '1');
+  assert.deepEqual(trees, [4242]);
+  assert.deepEqual(child.killSignals, []);
 });
 
 test('listPiModels caches empty results and expires entries after ten minutes', async () => {

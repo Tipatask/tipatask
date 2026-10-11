@@ -472,6 +472,43 @@ test('PiAgent.buildPrompt: api path carries the status/tag-review/KB rules Claud
   }
 });
 
+for (const piMcpBridge of [false, true]) {
+  for (const hasOnFire of [false, true]) {
+    test(`PiAgent.buildPrompt: ${piMcpBridge ? 'bridge' : 'REST'} completion refusal preserves the report, on_fire=${hasOnFire}`, () => {
+      const dir = makeProjectDir({ TASK_BACKEND: 'api' });
+      try {
+        const prompt = new PiAgent().buildPrompt('Do the thing.', {
+          projectPath: dir,
+          piMcpBridge,
+          statusRoles: { start: 'Backlog', in_progress: 'Doing', complete: 'Shipped' },
+          statusNames: ['Backlog', 'Doing', 'Shipped', ...(hasOnFire ? ['on_fire'] : [])],
+        });
+        const completionTool = piMcpBridge ? 'complete_task' : 'tt complete';
+        const recoveryStart = `If ${completionTool} refuses,`;
+        const recovery = prompt.slice(prompt.indexOf(recoveryStart));
+        assert.ok(prompt.includes(recoveryStart), 'completion refusal must have a recovery rule');
+        assert.match(recovery, /^If .* refuses, fix (?:the )?listed blockers and retry\./);
+        assert.match(recovery, /If a blocker cannot be cleared within this task, leave (?:it )?incomplete/);
+        assert.match(recovery, /post (?:the )?same report/);
+        assert.match(recovery, /state (?:the )?blocker/);
+
+        if (piMcpBridge) {
+          assert.match(recovery, /tipatask__create_task_comment\(task_key, content, type: "resolution"\)/);
+          assert.match(prompt, /never set Shipped with tipatask__update_task/);
+          if (hasOnFire) assert.match(recovery, /type: "resolution"\), then set on_fire with tipatask__update_task/);
+        } else {
+          assert.match(recovery, /tt POST \/tasks\/<KEY>\/comments, stdin \{"content":"\.\.\.","type":"resolution"\}/);
+          assert.match(prompt, /Require completed:true; never use a status PATCH instead/);
+          if (hasOnFire) assert.match(recovery, /"type":"resolution"\}, then PATCH on_fire/);
+        }
+        if (!hasOnFire) assert.doesNotMatch(prompt, /on_fire/);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
 // (C1119/C1116/C1117) The whole prompt is echoed verbatim into Pi's own TUI, and both
 // prompt-detect.js consumers scan that echo for dialog/plan-ready signals. A false hit here
 // would fire the plan-ready dialog (or worse, an mcpTrust/toolApproval auto-answer) before Pi
@@ -486,8 +523,14 @@ test('PiAgent.buildPrompt: no line of the kickoff prompt can false-trigger the a
   try {
     const agent = new PiAgent();
     // (C1134) Both variants — a discovery task appends PI_DISCOVERY_MANDATE — must stay clean.
-    for (const discovery of [false, true]) {
-      const prompt = agent.buildPrompt('Do the thing.', { taskTags: ['tt-pi-session'], projectPath: dir, discovery });
+    for (const scenario of [
+      { discovery: false },
+      { discovery: true },
+      { discovery: true, tagDescriptions: { 'tt-pi-session': '' } },
+      { discovery: true, vcsSettings: { type: 'git', worktree: true, commit: true, pr: true, merge: true } },
+    ]) {
+      const { discovery } = scenario;
+      const prompt = agent.buildPrompt('Do the thing.', { taskTags: ['tt-pi-session'], projectPath: dir, ...scenario });
 
       for (const line of prompt.split('\n')) {
         assert.equal(matchPromptLine(line, PI_PROMPT_PATTERNS), null, `[discovery=${discovery}] PI table matched: ${line}`);
@@ -507,7 +550,7 @@ test('PiAgent.buildPrompt: no line of the kickoff prompt can false-trigger the a
       // present, pushing the discovery/blank-tag variants past the old ceiling), then
       // 9000 -> 9300 for the unconditional compact resource-limits directive; still leaves
       // headroom (worst measured case ~9100 chars) without inviting unbounded growth.
-      t.diagnostic(`Pi basic/discovery=${discovery}: ${prompt.length} / 9300`);
+      t.diagnostic(`Pi REST ${JSON.stringify(scenario)}: ${prompt.length} / 9300`);
       assert.ok(prompt.length < 9300, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
     }
   } finally {
@@ -761,7 +804,7 @@ test('PiAgent.buildPrompt: a project that removed on_fire entirely drops the "or
       statusNames: ['Backlog', 'Doing', 'Shipped'], // no on_fire
     };
     const prompt = agent.buildPrompt('Do the thing.', opts);
-    assert.doesNotMatch(prompt, /or on_fire if you are leaving it broken/);
+    assert.doesNotMatch(prompt, /on_fire/);
     assert.match(prompt, /PATCH status to Doing as soon as you start implementing \(right after plan approval\), and use tt complete for Shipped before your final message/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

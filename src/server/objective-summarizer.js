@@ -2,7 +2,16 @@
 
 const { spawn: cpSpawn } = require('node:child_process');
 const config = require('./config');
-const { augmentPathEnv } = require('./spawn-utils');
+const { augmentPathEnv, cliSpawnSpec } = require('./spawn-utils');
+const { killWindowsChildTree } = require('./process-group');
+
+// Signals the Haiku proc and everything it started. POSIX: its process group (it was spawned
+// detached), else the proc alone. win32 has no process groups and claude.cmd's CLI may run as a
+// grandchild (under the npm shim's node.exe or cmd.exe), so the whole tree is taskkilled (TPT575).
+function signalProc(proc, sig) {
+  if (process.platform === 'win32') { killWindowsChildTree(proc); return; }
+  try { process.kill(-proc.pid, sig); } catch { try { proc.kill(sig); } catch {} }
+}
 
 /**
  * Heuristic fallback when Haiku call fails or times out.
@@ -52,16 +61,19 @@ async function summarizeOldTurns(turnPairs, { onSpawn } = {}) {
     const killTimer = setTimeout(() => {
       if (done) return;
       done = true;
-      try { process.kill(-proc.pid, 'SIGTERM'); } catch { try { proc.kill('SIGTERM'); } catch {} }
-      setTimeout(() => { try { process.kill(-proc.pid, 'SIGKILL'); } catch { try { proc.kill('SIGKILL'); } catch {} } }, 1000);
+      signalProc(proc, 'SIGTERM');
+      setTimeout(() => signalProc(proc, 'SIGKILL'), 1000);
       console.warn(`[objective:compress] Haiku summarize timed out after ${timeoutMs}ms — using heuristic fallback`);
       resolve(heuristicSummary(turnPairs));
     }, timeoutMs);
 
     try {
-      proc = cpSpawn(config.CLAUDE_BIN, [
-        '-p', '--model', 'claude-haiku-4-5-20251001', '--output-format', 'json',
-      ], { cwd: config.PROJECT_ROOT, env: augmentPathEnv({ TERM: 'dumb' }), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      const env = augmentPathEnv({ TERM: 'dumb' });
+      // A Windows claude.cmd runs as the program its npm shim launches (else via cmd.exe), never
+      // detached there; POSIX spawns CLAUDE_BIN exactly as before (TPT575).
+      const spec = cliSpawnSpec(config.CLAUDE_BIN, ['-p', '--model', 'claude-haiku-4-5-20251001', '--output-format', 'json'],
+        { env, isWin: process.platform === 'win32' });
+      proc = cpSpawn(spec.command, spec.args, { cwd: config.PROJECT_ROOT, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true, ...spec.options });
     } catch (spawnErr) {
       clearTimeout(killTimer);
       console.warn(`[objective:compress] Failed to spawn Haiku: ${spawnErr.message} — using heuristic fallback`);

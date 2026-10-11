@@ -5,16 +5,20 @@ const os = require('node:os');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { execFile } = require('node:child_process');
-const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir } = require('../spawn-utils');
+const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, winExecSpec } = require('../spawn-utils');
 const { quotaError, reasonFor, coalesceQuota } = require('./quota-status');
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const MAX_BYTES = 1024 * 1024;
 const WINDOWS = ['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_oauth_apps', 'seven_day_cowork'];
 
-function runFile(file, args, options) {
+// argv via winExecSpec(): a Windows claude.cmd launcher runs through cmd.exe (Node >= 22
+// refuses a shell-less execFile of a .cmd with EINVAL); .exe and POSIX paths, including
+// /usr/bin/security, pass through. execFileImpl/isWin are test-only seams.
+function runFile(file, args, { execFileImpl = execFile, isWin, ...options } = {}) {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { timeout: 5000, maxBuffer: MAX_BYTES, windowsHide: true, ...options }, (err, stdout) => {
+    const spec = winExecSpec(file, args, isWin === undefined ? {} : { isWin });
+    execFileImpl(spec.command, spec.args, { timeout: 5000, maxBuffer: MAX_BYTES, windowsHide: true, ...spec.options, ...options }, (err, stdout) => {
       // `claude auth status` returns exit 1 with valid JSON when signed out.
       if (err && !(err.code === 1 && args[0] === 'auth' && stdout?.trim().startsWith('{'))) return reject(err);
       resolve(stdout);
@@ -152,4 +156,4 @@ async function readClaudeQuota(config, { projectRoot = config.PROJECT_ROOT, ...d
   } catch (err) { return { connectionState, plan, unavailableReason: reasonFor(err) }; }
 }
 
-module.exports = { readClaudeQuota, readClaudeCredential, credentialLocation, parseClaudeUsage, fetchUsage };
+module.exports = { readClaudeQuota, readClaudeCredential, credentialLocation, parseClaudeUsage, fetchUsage, runFile };

@@ -39,9 +39,9 @@ async function fetchVcsSettings(backend, opts) {
   }
 }
 
-// Build kickoff VCS rules: commit-enabled git may commit, svn uses its own
-// directive, and VCS_OFF/commit-disabled git forbid git writes. Pi receives
-// compact wording with the same restrictions.
+// Build kickoff VCS rules: commit-enabled git must commit (a mandatory completion
+// step), svn uses its own directive, and VCS_OFF/commit-disabled git forbid git
+// writes. Pi receives compact wording with the same rules.
 function buildVcsDirective(vcs, opts = {}) {
   const v = vcs || VCS_OFF;
   if (v.type === 'git') return buildGitDirective(v, opts);
@@ -61,9 +61,12 @@ function buildGitDirective(v, opts = {}) {
     }
   }
   if (v.commit) {
+    // An enabled Commits flag is a completion requirement, not a permission: agent CLIs
+    // default to committing only when asked, so both wordings say mandatory, never skip,
+    // never ask. "Stage only" keeps unrelated or concurrent edits out of the task commit.
     lines.push(compact
-      ? '- Commit once BEFORE marking the task completed, after edits. Task-key prefix. Push only with PR.'
-      : `- Commit your work exactly once, after the last code change and BEFORE you mark the task completed: run \`git add\`/\`git commit\` in the worktree first, ${v.merge ? 'then follow the merge step below before posting the resolution comment and the status update' : 'then post the resolution comment and the status update'}. A task marked completed while its worktree still has uncommitted changes is flagged to the user and blocks the Task App's merge flow until committed. Prefix the commit message with the task key. Do not push unless pull/merge-request mode is also enabled below.`);
+      ? '- Commit is MANDATORY: task not complete until `git add` + `git commit` (msg `<TASK_KEY>: <summary>`) hold its changes. Commit once per changed repo BEFORE marking the task completed, after edits. Never skip the commit, never ask the user whether to commit, never leave task changes uncommitted; stage only task files. Push only with PR.'
+      : `- Commit is MANDATORY, not optional: this project has commits enabled, which is the user's standing request to commit — do not wait to be asked. The task is not complete until its changes are staged with \`git add\` and recorded with \`git commit\`, the message starting with the task key (\`<TASK_KEY>: <summary>\`). Commit your work exactly once per repository you changed, after the last code change and BEFORE you mark the task completed: run \`git add\`/\`git commit\` in the worktree first, ${v.merge ? 'then follow the merge step below before posting the resolution comment and the status update' : 'then post the resolution comment and the status update'}. Never skip the commit, never ask the user whether to commit, and never leave this task's changes uncommitted in the working tree; stage only the files this task changed and leave unrelated edits alone. A task marked completed while its worktree still has uncommitted changes is flagged to the user and blocks the Task App's merge flow until committed. Do not push unless pull/merge-request mode is also enabled below.`);
   } else {
     // C1561 — commits are off even though git itself is on (worktree-only / pr-without-
     // commit projects still exist): same no-write/no-attribution prohibition as VCS_OFF,

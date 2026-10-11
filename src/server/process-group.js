@@ -281,6 +281,19 @@ function killWindowsProcessTree(pid, { spawnSync = nodeSpawnSync, platform = pro
   }
 }
 
+// The win32 counterpart of the detached process-group kill a headless CLI spawn gets on POSIX
+// (TPT575). Windows has no process groups, and the CLI is often not the spawned child itself: it
+// runs under the node.exe an npm shim launches (Codex's codex.js then starts codex.exe) or behind
+// cmd.exe for a batch launcher, beside its own MCP servers. So the whole tree goes via
+// killWindowsProcessTree(), falling back to child.kill() when taskkill fails. Callers invoke this
+// only on win32 and keep their POSIX kill as is. Returns whether anything was signalled; never
+// throws. `killTree` is a test seam.
+function killWindowsChildTree(child, { killTree = killWindowsProcessTree } = {}) {
+  if (!child || !child.pid) return false;
+  if (killTree(child.pid)) return true;
+  try { return child.kill() !== false; } catch { return false; }
+}
+
 // ── ps snapshot + parsing ──
 //
 // `text` is the raw stdout of `ps -Ao pgid=,pid=,ppid=,rss=,stat=,comm=` — no header (the
@@ -785,6 +798,7 @@ module.exports = {
   countActiveAgentSessions,
   killProcessGroup,
   killWindowsProcessTree,
+  killWindowsChildTree,
   parsePsOutput,
   snapshotProcesses,
   listDescendants,

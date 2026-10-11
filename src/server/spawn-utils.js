@@ -3,6 +3,7 @@
 const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const { execFile, execFileSync } = require('node:child_process');
 const { killProcessGroup } = require('./process-group');
 
@@ -392,8 +393,12 @@ function _comSpec(env = process.env) {
 // pair), and `windowsVerbatimArguments: true` stops Node from re-quoting/backslash-escaping the
 // line into something cmd.exe cannot parse. A part holding a double quote or a line break has no
 // safe cmd encoding and is rejected (same rule as mcp-spawn-config.js's headersHelper command
-// line). `%` is left alone: launcher paths come from `where`/the filesystem, already expanded.
+// line), and so is a line past cmd.exe's own 8191-character limit (CMD_MAX_LINE). `%` is left
+// alone: launcher paths come from `where`/the filesystem, already expanded — values that may hold
+// anything (prompts, JSON, TOML) belong to cliSpawnSpec() below instead.
 // `isWin`/`env` are injectable so the win32 branch is unit-testable on any host.
+const CMD_MAX_LINE = 8191;
+
 function winExecSpec(binPath, args = [], { isWin = IS_WIN, env = process.env } = {}) {
   const list = Array.isArray(args) ? args.map(String) : [];
   const ext = path.win32.extname(String(binPath || '')).toLowerCase();
@@ -403,11 +408,207 @@ function winExecSpec(binPath, args = [], { isWin = IS_WIN, env = process.env } =
     if (/["\r\n]/.test(part)) throw new Error(`winExecSpec: unquotable argument ${JSON.stringify(part)}`);
   }
   const line = `"${parts.map(p => `"${p}"`).join(' ')}"`;
+  if (line.length > CMD_MAX_LINE) {
+    throw new Error(`winExecSpec: command line of ${line.length} characters exceeds cmd.exe's ${CMD_MAX_LINE}-character limit`);
+  }
   return {
     command: _comSpec(env),
     args: ['/d', '/s', '/c', line],
     options: { windowsVerbatimArguments: true },
   };
+}
+
+// --- npm cmd-shim resolution (TPT575) ----------------------------------------------------------
+// npm writes a global CLI's Windows launcher (`claude.cmd`, `codex.cmd`, `gemini.cmd`, `pi.cmd`)
+// with cmd-shim: a batch file whose exec line runs node on the package's bin script,
+//   "%_prog%"  "%dp0%\node_modules\@anthropic-ai\claude-code\cli.js" %*     (npm >= 7)
+//   node  "%~dp0\node_modules\@anthropic-ai\claude-code\cli.js" %*          (legacy npm / yarn)
+// where `_prog` is <shim dir>\node.exe when present, else `node` from PATH — or, for a bin with
+// no shebang, the target itself ("%dp0%\node_modules\pkg\tool.exe" %*). resolveWindowsCmdShim()
+// reads that back into { command, argsPrefix }, so the CLI is spawned with no cmd.exe in between:
+// no cmd quoting rules, no %VAR% expansion of the arguments, no 8191-character line limit, and a
+// kill reaches the CLI process itself. Anything else returns null — a shim that sets variables of
+// its own (pnpm's NODE_PATH, `env -S` shebang variables), a program other than node, a custom
+// wrapper such as this checkout's bin/pi.cmd or Node's own npm.cmd, or a target that does not
+// exist — and cliSpawnSpec() falls back to winExecSpec(). `env` is the spawn env: its PATH and
+// PATHEXT decide the node lookup, exactly as they would for cmd.exe. `readFile`/`exists` are test
+// seams; paths are handled with the host's `path`, so the resolver also runs on POSIX test hosts.
+const SHIM_MAX_BYTES = 64 * 1024;
+const SHIM_VARS = new Set(['dp0', '_prog', 'pathext']);
+const SHIM_DP0_RE = /%~dp0|%dp0%/gi;
+const SHIM_NODE_PROG_RE = /^(?:(?:%~dp0|%dp0%)\\+)?node(?:\.exe)?$/i;
+
+// A Windows path from a shim as a host path. `%dp0%` ends in `\` and cmd-shim appends `\<target>`,
+// so the joined path carries a doubled separator that path.normalize() folds.
+function _shimHostPath(p) {
+  return path.normalize(path.sep === '\\' ? String(p) : String(p).replace(/\\/g, '/'));
+}
+
+// Case-insensitive env lookup: a plain-object copy of process.env keeps Windows' own key spelling.
+function _envValue(env, name) {
+  const key = Object.keys(env || {}).find(k => k.toLowerCase() === name.toLowerCase());
+  return key === undefined || env[key] == null ? '' : String(env[key]);
+}
+
+// The `node` cmd.exe would run for a shim's bare `node`: the first PATH dir holding a launcher-
+// extension `node` decides, and only a node.exe found there can be spawned directly.
+function _findShimNode(env, exists) {
+  const exts = winLauncherExts(_envValue(env, 'PATHEXT'));
+  for (const raw of readPathEnv(env, { isWin: true }).split(';')) {
+    const dir = raw.trim().replace(/^"(.*)"$/, '$1');
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = path.join(_shimHostPath(dir), `node${ext}`);
+      if (exists(candidate)) return ext === '.exe' ? candidate : null;
+    }
+  }
+  return null;
+}
+
+// Tokens of a shim exec line with the trailing `%*` dropped, or null when the line does not end in
+// `%*`. The command is the last `&`-separated segment outside quotes (npm >= 7 prefixes it with
+// `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & `); a leading `@` is cmd's echo-off.
+function _shimExecTokens(line) {
+  let segment = '';
+  let quoted = false;
+  for (const ch of String(line)) {
+    if (ch === '"') quoted = !quoted;
+    if (ch === '&' && !quoted) { segment = ''; continue; }
+    segment += ch;
+  }
+  const tokens = [];
+  const re = /"([^"]*)"|(\S+)/g;
+  let m;
+  while ((m = re.exec(segment.trim().replace(/^@/, ''))) !== null) tokens.push(m[1] !== undefined ? m[1] : m[2]);
+  return tokens.pop() === '%*' ? tokens : null;
+}
+
+function resolveWindowsCmdShim(cmdPath, { env = process.env, readFile = fs.readFileSync, exists = _exists } = {}) {
+  let text;
+  try { text = String(readFile(cmdPath, 'utf8')); } catch { return null; }
+  if (!text || text.length > SHIM_MAX_BYTES) return null;
+  const dir = path.dirname(_shimHostPath(cmdPath));
+  const expand = token => _shimHostPath(token.replace(SHIM_DP0_RE, () => `${dir}${path.sep}`));
+  const progs = [];
+  const execLines = [];
+  for (const line of text.split(/\r?\n/)) {
+    const set = /^\s*@?set\s+"?([^=\s"]+)=([^"]*)"?\s*$/i.exec(line);
+    if (set) {
+      const name = set[1].toLowerCase();
+      if (!SHIM_VARS.has(name)) return null;
+      if (name === '_prog') progs.push(set[2].trim());
+    } else if (line.includes('%*')) {
+      execLines.push(line);
+    }
+  }
+  const isNodeProg = token => (/^%_prog%$/i.test(token)
+    ? progs.length > 0 && progs.every(v => SHIM_NODE_PROG_RE.test(v))
+    : SHIM_NODE_PROG_RE.test(token));
+  let found = null;
+  for (const line of execLines) {
+    const tokens = _shimExecTokens(line);
+    if (!tokens || !tokens.length) return null;
+    let parsed;
+    if (isNodeProg(tokens[0]) && tokens.length >= 2) {
+      const rest = tokens.slice(1);
+      if (rest.some(t => t.replace(SHIM_DP0_RE, '').includes('%'))) return null;
+      parsed = { flags: rest.slice(0, -1), script: expand(rest[rest.length - 1]) };
+    } else if (tokens.length === 1 && /^(?:%~dp0|%dp0%)/i.test(tokens[0])) {
+      const target = expand(tokens[0]);
+      if (target.includes('%') || !['.exe', '.com'].includes(path.extname(target).toLowerCase())) return null;
+      parsed = { target };
+    } else {
+      return null;
+    }
+    // The legacy template's two branches must launch the same thing.
+    if (found && JSON.stringify(found) !== JSON.stringify(parsed)) return null;
+    found = parsed;
+  }
+  if (!found) return null;
+  if (found.target) return exists(found.target) ? { command: found.target, argsPrefix: [] } : null;
+  if (!exists(found.script)) return null;
+  const local = path.join(dir, 'node.exe');
+  const node = exists(local) ? local : _findShimNode(env, exists);
+  return node ? { command: node, argsPrefix: [...found.flags, found.script] } : null;
+}
+
+// How to spawn() a resolved CLI launcher on every platform (TPT575). Returns { command, args,
+// options }; callers spread `options` LAST into their own spawn options:
+//   const spec = cliSpawnSpec(bin, args, { env });
+//   spawn(spec.command, spec.args, { cwd, env, stdio, detached: true, ...spec.options });
+// POSIX: the launcher and `args` unchanged and `options: {}`, so the call is byte-identical to a
+// plain spawn(bin, args, …). win32: `options` always carries { detached: false, windowsHide: true }
+// — a detached child gets no console, so each console process it starts (the CLI behind a
+// launcher, its MCP servers) opens a visible window, and with no process groups on Windows
+// detaching buys nothing (callers tree-kill instead: process-group.js killWindowsChildTree()). A
+// .cmd/.bat launcher runs as the program its npm shim launches (resolveWindowsCmdShim), so the
+// argv reaches the CLI verbatim whatever it holds — quotes, line breaks, `%`, any length up to
+// CreateProcess's 32,767-character line; any other batch file goes through winExecSpec()'s cmd.exe
+// wrapper, which throws for an argument cmd cannot carry. `env` is the spawn env (shim node
+// lookup, ComSpec); `isWin`/`readFile`/`exists` are test seams.
+function cliSpawnSpec(binPath, args = [], { isWin = IS_WIN, env = process.env, readFile, exists } = {}) {
+  const list = Array.isArray(args) ? args.map(String) : [];
+  if (!isWin) return { command: binPath, args: list, options: {} };
+  const options = { detached: false, windowsHide: true };
+  const ext = path.win32.extname(String(binPath || '')).toLowerCase();
+  if (!WIN_SHELL_EXTS.includes(ext)) return { command: binPath, args: list, options };
+  const shim = resolveWindowsCmdShim(binPath, { env, readFile, exists });
+  if (shim) return { command: shim.command, args: [...shim.argsPrefix, ...list], options };
+  const wrapped = winExecSpec(binPath, list, { isWin, env });
+  return { command: wrapped.command, args: wrapped.args, options: { ...options, ...wrapped.options } };
+}
+
+// (TPT575) A value a Windows command line cannot carry goes to a file the CLI reads instead —
+// `claude --append-system-prompt-file`, a `--mcp-config` path. CreateProcess caps the whole line
+// at 32,767 characters (the objective system prompt alone carries the static KB bundle), and a
+// cmd.exe-wrapped launcher cannot quote `"` or line breaks at all. Files are content-addressed
+// under <userDataRoot>/spawn-args/, so concurrent spawns of the same text share one file that is
+// never rewritten while a CLI may be reading it (a new file is written to a temp name and
+// renamed into place). Reusing a file refreshes its mtime; files unused for
+// SPAWN_ARG_FILE_MAX_AGE_MS are pruned, at most once per SPAWN_ARG_PRUNE_INTERVAL_MS. Returns the
+// absolute path, or null when the file cannot be written. `now` is a test seam.
+const SPAWN_ARG_FILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const SPAWN_ARG_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+let _lastSpawnArgPrune = 0;
+
+function _pruneSpawnArgFiles(dir, keep, now) {
+  if (now - _lastSpawnArgPrune < SPAWN_ARG_PRUNE_INTERVAL_MS) return;
+  _lastSpawnArgPrune = now;
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    const file = path.join(dir, name);
+    if (file === keep) continue;
+    try {
+      if (now - fs.statSync(file).mtimeMs > SPAWN_ARG_FILE_MAX_AGE_MS) fs.rmSync(file, { force: true });
+    } catch { /* removed by a concurrent prune */ }
+  }
+}
+
+function writeSpawnArgFile(userDataRoot, text, ext = '.txt', { now = Date.now() } = {}) {
+  if (!userDataRoot) return null;
+  const content = text == null ? '' : String(text);
+  const dir = path.join(userDataRoot, 'spawn-args');
+  const file = path.join(dir, crypto.createHash('sha256').update(content).digest('hex').slice(0, 32) + ext);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    if (_exists(file)) {
+      try { fs.utimesSync(file, new Date(now), new Date(now)); } catch { /* still usable */ }
+    } else {
+      const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+      fs.writeFileSync(tmp, content, 'utf8');
+      try {
+        fs.renameSync(tmp, file);
+      } catch (err) {
+        try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+        if (!_exists(file)) throw err; // else a concurrent writer renamed the same bytes in first
+      }
+    }
+  } catch {
+    return null;
+  }
+  _pruneSpawnArgFiles(dir, file, now);
+  return file;
 }
 
 // (C1112) CLIs shipped as npm dependencies of this server instead of requiring the user to
@@ -790,7 +991,9 @@ module.exports = {
   WIN_LAUNCHER_EXTS, winLauncherExts, selectWindowsLauncher, parseRegQueryPath,
   expandWindowsEnv, readWindowsRegistryPathDirs, _findExecutable,
   // (TPT559) cmd.exe wrapper for exec'ing .cmd/.bat launchers under Node >= 22
-  WIN_SHELL_EXTS, winExecSpec,
+  WIN_SHELL_EXTS, winExecSpec, CMD_MAX_LINE,
+  // (TPT575) spawning any CLI launcher (npm cmd-shim resolution) + files for oversized argv values
+  resolveWindowsCmdShim, cliSpawnSpec, writeSpawnArgFile, SPAWN_ARG_FILE_MAX_AGE_MS,
   // (TPT566) single-PATH-key env writers — the only way to set/prepend a spawn env's PATH
   readPathEnv, setPathEnv, prependPathEnv,
 };

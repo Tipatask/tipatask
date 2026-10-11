@@ -35,7 +35,7 @@ function harness(t, overrides = {}) {
   const claude = load('claude-session.js', {
     './config': config, './objective-throttle': throttle,
     './static-context': { getStaticBundleStats: () => ({ chars: 0, sha: '' }) },
-    './spawn-utils': { augmentPathEnv: () => ({}), projectEnvExtras: () => ({}) },
+    './spawn-utils': { augmentPathEnv: () => ({}), projectEnvExtras: () => ({}), cliSpawnSpec: require('./spawn-utils').cliSpawnSpec },
     './task-agent/attachments': { localizeAttachments: async ({ prompt }) => ({ prompt }) },
     'node:fs/promises': { unlink: async () => {}, writeFile: async () => {} },
     'node:child_process': { spawn() {

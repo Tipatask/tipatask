@@ -224,6 +224,9 @@ class BaseTaskAgent {
 
   // Always include standing-KB versus task-resolution guidance. Pi receives compact,
   // MCP-free wording because its kickoff prompt is echoed and size-limited.
+  // opts.guardedCompletion (TPT576) — set by buildSharedPreamble() when the spawn carries a
+  // vcsContext, whose resolution mandate finishes through complete_task: task narrative then goes
+  // in that tool's resolution, not a separate create_task_comment. Compact wording names neither.
   buildKbHygieneDirective(opts = {}) {
     if (opts.compact) {
       return [
@@ -233,10 +236,13 @@ class BaseTaskAgent {
         '- Keep a KB line only if it stays true and useful once this task is forgotten. Anything else belongs in the resolution comment.',
       ].join('\n');
     }
+    const narrativeTarget = opts.guardedCompletion
+      ? 'All of that goes in the resolution you pass to `complete_task(task_key, resolution)` instead; it is posted as this task\'s `type: "resolution"` comment.'
+      : 'All of that goes in `create_task_comment(task_key, content, type: "resolution")` on this task instead.';
     return [
       'KB hygiene:',
       '- `ai/architecture/*.md` is reference material about how this system works — standing concepts only: module responsibilities, schema, endpoints, file inventories, invariants, and gotchas that stay true after this task ships. Write every line for a reader who has never heard of this task.',
-      '- Never put task-specific material in a KB file: investigation logs, evidence tables, query output, dated findings, "correction after reviewing the data" passages, before/after narratives, or anything that reads as an update to your own earlier analysis. All of that goes in `create_task_comment(task_key, content, type: "resolution")` on this task instead.',
+      `- Never put task-specific material in a KB file: investigation logs, evidence tables, query output, dated findings, "correction after reviewing the data" passages, before/after narratives, or anything that reads as an update to your own earlier analysis. ${narrativeTarget}`,
       '- Test every KB line before writing it: would it still be worth reading a year from now, with this task long forgotten? Yes → KB. No → resolution comment.',
       '- To see how similar work was resolved before, call `list_task_resolutions(tags=[...])`. Past-task narrative lives in task comments by design — do not go looking for it in `ai/architecture/*.md`, and do not add it there.',
     ].join('\n');
@@ -337,6 +343,8 @@ class BaseTaskAgent {
   // subclass override (pi-agent.js's compact/REST wording) still applies.
   // SIMPLE_MODE and Claude's Design Mode are NOT handled here — adapters return early, before
   // calling this, exactly where they always skipped the directives.
+  // kbHygiene gets guardedCompletion only when opts.vcsContext is present (the Claude/Codex
+  // resolution mandate then finishes through complete_task); without it, args stay `variant`.
   buildSharedPreamble(opts = {}) {
     const policy = this.getPreamblePolicy();
     const variant = policy.compact ? { compact: true } : {};
@@ -344,7 +352,7 @@ class BaseTaskAgent {
     const tagDesc = this.buildTagDescriptionDirective(opts);
     const processSafety = this.buildProcessSafetyDirective(variant);
     const resourceLimits = this.buildResourceLimitsDirective(opts.agentLimits, variant);
-    const kbHygiene = this.buildKbHygieneDirective(variant);
+    const kbHygiene = this.buildKbHygieneDirective(opts.vcsContext ? { ...variant, guardedCompletion: true } : variant);
     const taskStatus = this.buildTaskStatusDirective(variant);
     const clarify = policy.clarify ? this.buildClarifyDirective(variant) : '';
     return {
@@ -368,6 +376,13 @@ class BaseTaskAgent {
   // kickoff is still sitting unsent in the input box (terminal-session.js's submit verification).
   // null (default) = this agent has no such on-screen marker, so its Enter is never re-sent.
   getUnsentPasteRe() { return null; }
+
+  // (TPT571) Pattern for this agent's EMPTY idle composer row (prompt marker + placeholder hint,
+  // nothing typed). Seen as the last thing drawn after the kickoff paste + Enter, with the PTY
+  // silent and no paste chip ever echoed, it proves the paste never reached the composer —
+  // terminal-session.js's submit verification then re-pastes the kickoff once (bounded). null
+  // (default) = no such row is known for this agent, so a lost paste is never retried.
+  getEmptyComposerRe() { return null; }
 
   // Writes a locally-saved clipboard image's path into the PTY so the agent attaches it
   // (C809/C1003/C1051). Default: bare absolute path inside a bracketed-paste frame — no `@`,
@@ -594,7 +609,9 @@ class BaseTaskAgent {
   // `exit` the probe's exit status (null when it never ran or was killed), `output` the
   // first DETECT_DETAIL_OUTPUT_CHARS of the probe's combined stdout+stderr, or the spawn
   // error code/message when there was no output. Rendered by agent-select.js under the
-  // reason text; printed by scripts/probe-agent-detect.js. Never present on a positive.
+  // reason text; printed by scripts/probe-agent-detect.js. Absent on a positive, except that
+  // CodexAgent adds the parsed `codex --version` as `version` to every result and its positive
+  // carries `{ bin, version }` (TPT572).
   static buildDetectDetail(bin, probe) {
     const err = probe && probe.error;
     const output = String(

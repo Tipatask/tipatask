@@ -42,9 +42,11 @@ const {
   fetchTaskCommentsContext,
   unsentPasteVisible,
   SUBMIT_VERIFY_MS,
+  SUBMIT_QUIET_MS,
   SUBMIT_WATCH_MS,
   SUBMIT_MARKER_TRAILING_MAX,
   MAX_SUBMIT_RETRIES,
+  MAX_PASTE_RETRIES,
 } = require('./terminal-session');
 const { parsePsOutput } = require('./process-group');
 const config = require('./config');
@@ -2363,8 +2365,15 @@ const SPINNER = '✻ Crafting… (3s · esc to interrupt)\n';
 // What a real submit paints: the chip is replaced by the transcript, then a spinner repaints.
 const TURN_OUTPUT = `${'●'.repeat(1)} Reply with the single word READY.\n${'.'.repeat(SUBMIT_MARKER_TRAILING_MAX + 100)}\n${SPINNER}`;
 
+// (TPT571) Codex's equivalents: its boot frame, its collapsed-paste chip, and what a real submit
+// paints (the echoed submission row, then the Working spinner).
+const CODEX_BOOT = '╭─ Codex CLI ─╮\n>_ OpenAI Codex (v0.160.0)\n~/Projects/AptRabbit\nYou bring the idea. I\u2019ll bring the brackets.\n› Ask Codex to do anything\n';
+const CODEX_CHIP = '› [Pasted Content 5120 chars]\n';
+const CODEX_SPINNER = '• Working (2s • esc to interrupt)\n';
+const CODEX_TURN_OUTPUT = `› Work on task TPT571\n${'.'.repeat(SUBMIT_MARKER_TRAILING_MAX + 100)}\n${CODEX_SPINNER}`;
+
 // One spawn on a fresh session. Returns handles to feed PTY output and inspect PTY input.
-async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, sessions, captureSpawn } = {}) {
+async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, sessions, captureSpawn } = {}) {
   const writes = [];
   const sent = [];
   let dataCb = null;
@@ -2378,17 +2387,17 @@ async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364', ki
     kill: () => {},
   };
   t.mock.method(nodePty, 'spawn', () => fakePty);
-  const agent = getTaskAgent('claude');
-  t.mock.method(agent, 'cachedDetect', async () => ({ id: 'claude', label: 'Claude Code', available: true }));
+  const agent = getTaskAgent(agentId);
+  t.mock.method(agent, 'cachedDetect', async () => ({ id: agentId, label: agent.label, available: true }));
   t.mock.method(agent, 'getSpawnSpec', async (_config, prompt, taskId, opts) => {
     captureSpawn?.(agent, prompt, opts);
     return {
-      command: 'claude', args: [], cwd: os.tmpdir(), env: {}, initialPrompt, model: 'test-model',
+      command: agentId, args: [], cwd: os.tmpdir(), env: {}, initialPrompt, model: 'test-model',
       ...(kickoffTypedLine ? { kickoffTypedLine } : {}),
     };
   });
   const session = createSession(null, false, 'TPT364-tab', '');
-  session.taskAgent = 'claude';
+  session.taskAgent = agentId;
   session.ws = { OPEN: 1, readyState: 1, send: (m) => sent.push(JSON.parse(m)) };
   await spawnTerminal(session, 'raw prompt', 'TPT364', [], { sessions });
   assert.equal(session.alive, true, 'the fake spawn must have gone live');
@@ -2396,6 +2405,7 @@ async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364', ki
   const k = {
     session,
     writes,
+    sent,
     exit: () => exitCb({ exitCode: 0 }),
     feed: (chunk) => dataCb(chunk),
     // Advance in small steps so timers armed by a callback that fall inside the window still fire.
@@ -2411,6 +2421,7 @@ async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364', ki
       for (let left = ms; left > 0; left -= everyMs) { dataCb(chunk); k.advance(Math.min(everyMs, left)); }
     },
     pasteWritten: () => writes.some((w) => typeof w === 'string' && w.startsWith(PASTE_OPEN)),
+    pastes: () => writes.filter((w) => typeof w === 'string' && w.startsWith(PASTE_OPEN)).length,
     enters: () => writes.filter((w) => w === SUBMIT).length,
     notices: () => sent.filter((m) => m.type === 'data').map((m) => m.data).filter((d) => d.includes('[Task App]')),
     // Boot -> paste -> chip echo -> the first Enter has been written.
@@ -2424,6 +2435,8 @@ async function startClaudeKickoff(t, { initialPrompt = 'Work on task TPT364', ki
   };
   return k;
 }
+const startClaudeKickoff = (t, opts) => startKickoff(t, 'claude', opts);
+const startCodexKickoff = (t, opts) => startKickoff(t, 'codex', opts);
 
 // The teardown terminateTerminalSession() (ws-handlers.js) performs on Stop/Restart. It does NOT
 // touch the submit-check timer — that one relies on its own liveness guards.
@@ -2443,8 +2456,14 @@ test('TPT364 fixture guard: the chip strings match the marker, and a real turn b
   assert.equal(unsentPasteVisible(re, `${CHIP}${TURN_OUTPUT}`), false, 'real output after the chip buries it');
   assert.equal(unsentPasteVisible(re, 'no chip here'), false);
   assert.equal(unsentPasteVisible(null, CHIP), false);
-  assert.equal(getTaskAgent('codex').getUnsentPasteRe(), null, 'agents without a marker never re-send Enter');
-  assert.equal(getTaskAgent('pi').getUnsentPasteRe(), null);
+  // (TPT571) Codex has its own chip now; Pi (positional prompt) still has none.
+  const codexRe = getTaskAgent('codex').getUnsentPasteRe();
+  assert.ok(codexRe, 'Codex must expose an unsent-paste marker');
+  assert.equal(unsentPasteVisible(codexRe, CODEX_CHIP), true);
+  assert.equal(unsentPasteVisible(codexRe, `${CODEX_CHIP}${CODEX_TURN_OUTPUT}`), false, 'a running turn buries the chip');
+  assert.equal(getTaskAgent('pi').getUnsentPasteRe(), null, 'agents without a marker never re-send Enter');
+  assert.equal(getTaskAgent('pi').getEmptyComposerRe(), null);
+  assert.equal(getTaskAgent('claude').getEmptyComposerRe(), null);
 });
 
 test('TPT364 control: a submit the TUI accepts is sent exactly once, never re-sent', async (t) => {
@@ -2549,6 +2568,127 @@ test('TPT364 guard: a gate dialog on screen BEFORE the paste still holds the pas
   k.advance(5000);
   assert.equal(k.pasteWritten(), false, 'pre-paste gating must be untouched');
   assert.equal(k.enters(), 0);
+});
+
+// ── (TPT571) Codex kickoff: paste-injected like Claude's, with Codex's own markers and timing ──
+
+test('TPT571: Codex kickoff is pasted only after its boot floor, submitted after the chip settles, no typed line', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const agent = getTaskAgent('codex');
+  const k = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT571' });
+  k.feed(CODEX_BOOT);
+  k.advance(agent.getInteractiveReadyMs() - 200);
+  assert.equal(k.pasteWritten(), false, 'never paste into a still-booting ratatui composer');
+  assert.equal(k.advanceUntil(k.pasteWritten, agent.getInteractiveReadyMs() + 2000), true, 'the kickoff is pasted once the floor passes');
+  assert.equal(k.enters(), 0, 'Enter waits for the chip echo to settle');
+  k.feed(CODEX_CHIP);
+  assert.equal(k.advanceUntil(() => k.enters() >= 1), true);
+  assert.ok(!k.writes.some((w) => typeof w === 'string' && !w.startsWith(PASTE_OPEN) && w !== SUBMIT),
+    `only the paste and the Enter may be written for Codex: ${JSON.stringify(k.writes.map((w) => w.slice(0, 20)))}`);
+  k.feed(CODEX_TURN_OUTPUT);
+  k.advanceWithOutput(30_000, CODEX_SPINNER);
+  assert.equal(k.enters(), 1, 'an accepted submit is never re-sent');
+  assert.equal(k.pastes(), 1);
+});
+
+test('TPT571: a Codex chip stranded after the Enter gets the Enter re-sent (TPT364 parity)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT571' });
+  k.feed(CODEX_BOOT);
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+  k.feed(CODEX_CHIP);
+  assert.equal(k.advanceUntil(() => k.enters() >= 1), true);
+  k.advance(SUBMIT_VERIFY_MS + 100);           // silent, chip still the last thing drawn
+  assert.equal(k.enters(), 2, 'the stranded paste is submitted again');
+  assert.equal(k.pastes(), 1, 'a landed paste is never pasted twice');
+  k.feed(CODEX_TURN_OUTPUT);
+  k.advanceWithOutput(30_000, CODEX_SPINNER);
+  assert.equal(k.enters(), 2);
+});
+
+test('TPT571: a paste Codex never took (empty composer after the Enter) is pasted again once, then the user is told', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT571' });
+  k.feed(CODEX_BOOT);
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+  // No chip ever echoes: the TUI dropped the paste. The composer repaints empty after the Enter.
+  assert.equal(k.advanceUntil(() => k.enters() >= 1), true, 'the first Enter still goes out on silence');
+  k.feed('› Ask Codex to do anything\n');
+  assert.equal(k.advanceUntil(() => k.pastes() >= 2, SUBMIT_VERIFY_MS + SUBMIT_QUIET_MS + 2000), true, 'the lost kickoff is pasted again');
+  assert.match(k.notices().join('\n'), /did not reach the composer — pasting it again/);
+  assert.equal(k.enters(), 1, 'the re-paste settles before its own Enter');
+  k.feed(CODEX_CHIP);                           // this time the chip lands
+  assert.equal(k.advanceUntil(() => k.enters() >= 2), true, 'Enter follows the settled re-paste');
+  k.feed(CODEX_TURN_OUTPUT);
+  k.advanceWithOutput(30_000, CODEX_SPINNER);
+  assert.equal(k.pastes(), 2);
+  assert.equal(k.enters(), 2);
+});
+
+test('TPT571: the lost-paste re-paste is bounded — a second empty composer only produces a notice', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT571' });
+  k.feed(CODEX_BOOT);
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+  assert.equal(k.advanceUntil(() => k.enters() >= 1), true);
+  k.feed('› Ask Codex to do anything\n');
+  assert.equal(k.advanceUntil(() => k.pastes() >= 2), true);
+  assert.equal(k.advanceUntil(() => k.enters() >= 2), true);
+  k.feed('› Ask Codex to do anything\n');       // dropped again
+  k.advance(60_000);
+  assert.equal(k.pastes(), 1 + MAX_PASTE_RETRIES);
+  assert.equal(k.enters(), 2);
+  assert.match(k.notices().join('\n'), /did not reach the composer — restart the task/);
+});
+
+test('TPT571: an empty composer after a turn that already ran is never re-pasted', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT571' });
+  k.feed(CODEX_BOOT);
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+  k.feed(CODEX_CHIP);                           // the paste landed
+  assert.equal(k.advanceUntil(() => k.enters() >= 1), true);
+  // A short turn runs and ends inside the watch window; the composer is idle and empty again.
+  k.feed(`${CODEX_TURN_OUTPUT}Short reply.\n› Ask Codex to do anything\n`);
+  k.advance(60_000);
+  assert.equal(k.pastes(), 1, 'a landed paste (chip seen) is never pasted twice');
+  assert.equal(k.enters(), 1);
+  assert.deepEqual(k.notices().filter((n) => /did not reach the composer/.test(n)), []);
+});
+
+test('TPT571: a Codex tool-approval dialog on the tail before the paste holds the paste back', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT571' });
+  k.feed(`${CODEX_BOOT}bash -lc 'ls' needs your approval.\n`);
+  const gate = getAttentionPromptMatch(k.session._attentionTail, 'codex');
+  assert.equal(gate && gate.kind, 'toolApproval');
+  // The machine-fast toolApproval cap (MAX_INJECT_DIALOG_RETRIES x INJECT_DIALOG_RETRY_MS, C880)
+  // defers the paste for ~3s and then injects anyway — unchanged for Codex, now actually exercised.
+  k.advance(2500);
+  assert.equal(k.pasteWritten(), false, 'the toolApproval gate still defers injection for Codex');
+  assert.equal(k.advanceUntil(k.pasteWritten, 10_000), true, 'a stuck dialog still injects once the cap runs out (C880)');
+});
+
+test('TPT571: a "Plan ready." row painted before the kickoff Enter never flips codexPlanReady', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT571' });
+  k.session.terminalPhase = 'planning';
+  k.session.buffer = 'x'.repeat(600);
+  k.feed(`${CODEX_BOOT}Plan ready.\n`);      // the echoed kickoff instruction, pre-submit
+  k.advance(CODEX_PLAN_QUIET_MS + 500);
+  assert.equal(k.session.codexPlanReady, false, 'nothing before the Enter is a real plan');
+  assert.equal(k.session.agentPlanReady, false);
+  assert.ok(!k.sent.some((m) => m.type === 'plan-ready'), 'no plan-ready frame before the kickoff is submitted');
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+  k.feed(CODEX_CHIP);
+  assert.equal(k.advanceUntil(() => k.enters() >= 1), true);
+  assert.equal(k.session.codexPlanReady, false, 'the stale pre-submit candidate is not promoted by the Enter');
+  k.feed(CODEX_TURN_OUTPUT);
+  k.advanceWithOutput(3_000, CODEX_SPINNER);
+  k.feed('Plan ready.\n');                    // the genuine sentinel, post-submit
+  k.advance(CODEX_PLAN_QUIET_MS + 500);
+  assert.equal(k.session.codexPlanReady, true, 'the real sentinel after the submit still confirms');
+  assert.ok(k.sent.some((m) => m.type === 'plan-ready' && m.codexPlanReady === true));
 });
 
 // ── The kickoff's comments block on a restart ──

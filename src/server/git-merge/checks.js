@@ -9,8 +9,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, execFile } = require('node:child_process');
-const { killProcessGroup } = require('../process-group');
-const { resolveSpawnServerRoot, augmentPathEnv } = require('../spawn-utils');
+const { killProcessGroup, killWindowsChildTree } = require('../process-group');
+const { resolveSpawnServerRoot, augmentPathEnv, cliSpawnSpec, winExecSpec } = require('../spawn-utils');
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
@@ -57,19 +57,23 @@ function nodeMajor(execPath) {
 
 // { node, binDir, npmCli, source }. Prefers this process's own node (dev run under nvm
 // 22); under Electron (or a too-old node) asks bin/mcp-node for one. npmCli is the
-// nvm/fnm-layout npm-cli.js next to that node when present, so npm runs under the same
-// binary without a shebang lookup.
-async function resolveNodeForChecks({ projectRoot, exec = execFile, isElectron = !!process.versions.electron, execPath = process.execPath, minMajor = 22 } = {}) {
+// npm-cli.js next to that node when present, so npm runs under the same binary without a
+// shebang lookup: <prefix>/lib/node_modules (nvm/fnm on POSIX) or, on Windows, beside
+// node.exe in node_modules (the official installer, nvm-windows and fnm all use that layout).
+async function resolveNodeForChecks({ projectRoot, exec = execFile, isElectron = !!process.versions.electron, execPath = process.execPath, minMajor = 22, isWin = process.platform === 'win32' } = {}) {
   let node = null; let source = null;
   if (!isElectron && (nodeMajor(execPath) === null || nodeMajor(execPath) >= minMajor)) {
     node = execPath; source = 'process';
   } else {
     const serverRoot = resolveSpawnServerRoot(projectRoot);
     if (serverRoot) {
-      const wrapper = path.join(serverRoot, 'bin', process.platform === 'win32' ? 'mcp-node.cmd' : 'mcp-node');
+      const wrapper = path.join(serverRoot, 'bin', isWin ? 'mcp-node.cmd' : 'mcp-node');
       const found = await new Promise((resolve) => {
         try {
-          exec(wrapper, ['-e', 'process.stdout.write(process.execPath)'], { encoding: 'utf8', timeout: 15_000, windowsHide: true }, (err, stdout) => resolve(err ? null : String(stdout || '').trim()));
+          // bin/mcp-node.cmd is a batch file Node >= 22 will not execFile shell-less (EINVAL):
+          // on Windows it runs through cmd.exe (TPT575).
+          const spec = cliSpawnSpec(wrapper, ['-e', 'process.stdout.write(process.execPath)'], { isWin });
+          exec(spec.command, spec.args, { encoding: 'utf8', timeout: 15_000, windowsHide: true, ...spec.options }, (err, stdout) => resolve(err ? null : String(stdout || '').trim()));
         } catch { resolve(null); }
       });
       if (found) { node = found; source = 'mcp-node'; }
@@ -77,8 +81,10 @@ async function resolveNodeForChecks({ projectRoot, exec = execFile, isElectron =
   }
   if (!node) return { node: null, binDir: null, npmCli: null, source: null, error: 'No Node.js >= ' + minMajor + ' found for project checks (set TIPATASK_NODE)' };
   const binDir = path.dirname(node);
-  const candidate = path.join(binDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
-  const npmCli = fs.existsSync(candidate) ? path.resolve(candidate) : null;
+  const candidates = [path.join(binDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')];
+  if (isWin) candidates.push(path.join(binDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'));
+  const candidate = candidates.find(c => fs.existsSync(c));
+  const npmCli = candidate ? path.resolve(candidate) : null;
   return { node, binDir, npmCli, source, error: null };
 }
 
@@ -96,9 +102,12 @@ class OutputCapture {
 }
 
 // Runs one npm script; resolves { status, timedOut, stdout, stderr, tap, durationMs, command }.
-function runCheck({ repoPath, script, node, npmCli, binDir, timeoutMs = DEFAULT_TIMEOUT_MS, maxBytes = DEFAULT_MAX_BYTES, onOutput, signal, spawnFn = spawn }) {
+// `isWin`/`killTree` are test seams.
+function runCheck({ repoPath, script, node, npmCli, binDir, timeoutMs = DEFAULT_TIMEOUT_MS, maxBytes = DEFAULT_MAX_BYTES, onOutput, signal, spawnFn = spawn, isWin = process.platform === 'win32', killTree }) {
   const args = script === 'test' ? ['test'] : ['run', script];
-  const command = npmCli ? node : 'npm';
+  // Without npm-cli.js the npm launcher runs instead. On Windows that is npm.cmd: a shell-less
+  // spawn neither finds it (no PATHEXT lookup) nor may run it (EINVAL), so cmd.exe does both.
+  const command = npmCli ? node : (isWin ? 'npm.cmd' : 'npm');
   const argv = npmCli ? [npmCli, ...args] : args;
   const extras = { CI: '1', NO_COLOR: '1', FORCE_COLOR: '0', TIPATASK_PROJECT_ROOT: process.env.TIPATASK_PROJECT_ROOT || '' };
   const env = augmentPathEnv(extras);
@@ -119,9 +128,11 @@ function runCheck({ repoPath, script, node, npmCli, binDir, timeoutMs = DEFAULT_
       resolve({ status, timedOut, stdout, stderr, tap: parseTap(stdout + '\n' + stderr), durationMs: Date.now() - started, command: [command, ...argv].join(' '), error: spawnError ? spawnError.message : null });
     };
     try {
-      child = spawnFn(command, argv, { cwd: repoPath, env, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true });
+      const spec = !npmCli && isWin ? winExecSpec(command, argv, { isWin, env }) : { command, args: argv, options: {} };
+      child = spawnFn(spec.command, spec.args, { cwd: repoPath, env, stdio: ['ignore', 'pipe', 'pipe'], detached: !isWin, windowsHide: true, ...spec.options });
     } catch (e) { return done(null, e); }
-    const kill = () => { if (child && child.pid) { if (process.platform !== 'win32') killProcessGroup(child.pid, 'SIGTERM'); else try { child.kill(); } catch { /* gone */ } } };
+    // win32 has no process groups: taskkill the tree — npm, the script it runs and its workers.
+    const kill = () => { if (child && child.pid) { if (!isWin) killProcessGroup(child.pid, 'SIGTERM'); else killWindowsChildTree(child, { killTree }); } };
     const timer = setTimeout(() => { timedOut = true; kill(); }, timeoutMs);
     timer.unref?.();
     if (signal) { const onAbort = () => kill(); if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true }); }

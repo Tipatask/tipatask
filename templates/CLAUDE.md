@@ -37,14 +37,14 @@
    - If a touched module has no `tt-*` tag: call `create_system_tag(tag_name, description, architecture_hint)` — auto-creates stub at `ai/architecture/{tag}.md` + registers in DB
    - Call `update_task` with final tag list (3–5 tags: ≥1 feature/module + 1 action + 1+ detail)
    - **KB hygiene**: before touching any `ai/architecture/*.md`, apply the line test in § KB Hygiene below. Standing system concepts only.
-3.6. Prepare one plain-English resolution covering changes, key files, verification and caveats.
-4. After implementation, checks, tag review and permitted commits, call `tipatask-local.complete_task(task_key, resolution)` (Pi: `tt complete`) and require successful verification and saved completion status.
+3.6. Prepare one plain-English resolution covering changes, key files, verification and caveats. It is the `resolution` you pass to `complete_task` in step 4, which posts it as the task's `type: "resolution"` comment together with the completion status — do not also post it with `create_task_comment`, and never write the completion status with `update_task`.
+4. After implementation, checks, tag review and permitted commits, call `tipatask-local.complete_task(task_key, resolution)` (Pi: `tt complete`) and require successful verification and saved completion status. When it refuses, fix the listed blockers (e.g. `TASK_COMMIT_MISSING`: commit first) and call it again. If a blocker cannot be cleared within this task, do not complete it: post the same report with `create_task_comment(task_key, content, type: "resolution")` so it is not lost, then follow step 5.
 5. Blocked within this task's scope: set `on_fire` when available, explain why. Unrelated issues are caveats under § Task status scope.
 6. **ALWAYS** kill node server you start so I can run mine on that port
 
 ### KB Hygiene — architecture docs hold standing concepts only
 - `ai/architecture/*.md` is reference material about how the system works — standing concepts only: module responsibilities, schema, endpoints, file inventories, invariants, and gotchas that stay true after this task ships. Write every line for a reader who has never heard of this task.
-- Never put task-specific material in a KB file: investigation logs, evidence tables, query output, dated findings, "correction after reviewing the data" passages, before/after narratives, or anything that reads as an update to your own earlier analysis. All of that goes in `create_task_comment(task_key, content, type: "resolution")` on this task instead.
+- Never put task-specific material in a KB file: investigation logs, evidence tables, query output, dated findings, "correction after reviewing the data" passages, before/after narratives, or anything that reads as an update to your own earlier analysis. All of that goes in this task's resolution report instead — the `resolution` you pass to `tipatask-local.complete_task` (step 4), posted as its `type: "resolution"` comment.
 - **Line test**: would this KB line still be worth reading a year from now, with this task long forgotten? Yes → KB. No → resolution comment.
 - For prior-task context, call `list_task_resolutions(tags=[...])` and read the comment history — do not mine the KB for it, and do not write it back into the KB for the next agent.
 
@@ -71,15 +71,15 @@ Re-ran 3x, all green. Next agent: check this before trusting the cache.
 - **EVERY** task touched MUST be `completed` (or `on_fire`) before response ends
 - Status update is PART OF implementation — not done until the API project shows `"status": "completed"`
 - User-given plan (not from a task): check if it matches an existing task, update that too
-- Write status with the current project's `tipatask` MCP `update_task`, then call `get_task` to confirm the saved status under the active `API_PROJECT_ID`.
+- Write non-completion statuses (`in_progress`, `on_fire`) with the current project's `tipatask` MCP `update_task`, and the completion status only through `tipatask-local.complete_task` (step 4); then call `get_task` to confirm the saved status under the active `API_PROJECT_ID`.
 - If `update_task`/`get_task` results do not match the active `API_PROJECT_ID` (`.tipatask/config.json`), stop and fix MCP registration (`.mcp.json`, Claude settings, Codex config) before trusting task writes.
 - If remote MCP authentication fails, follow Credential recovery and completion; never bypass local verification.
 - **PRE-SEND CHECKLIST** — run this mentally before every response:
-  1. Did I touch a task? → status updated via MCP `update_task`?
+  1. Did I touch a task? → status updated (`update_task` for `in_progress`/`on_fire`, `complete_task` for completion)?
   2. If NO → **do it now, before sending**
   3. Tags accurate? → `list_system_tags` checked, `tt-*` tags assigned to all touched modules, missing tags created via `create_system_tag`
   4. Updated arch docs? → standing system facts only — task narrative goes in the resolution comment, never in a `tt-*.md` (§ KB Hygiene)
-  5. Task completed? → your own self-authored `type='resolution'` comment posted via `create_task_comment` before/with the status update — full report, plain English, not caveman-styled
+  5. Task completed? → through `tipatask-local.complete_task(task_key, resolution)`, with your own self-authored report as `resolution` — full report, plain English, not caveman-styled. No separate `create_task_comment` and no `update_task` completion write; only when completion is blocked does the report go through `create_task_comment` (step 4)
 - Skipping status update = incomplete work. User WILL notice. Do not skip.
 
 ### View task board
@@ -114,7 +114,7 @@ Technical reference is split across `ai/architecture/` by system tag:
 - `create_task` — create a new task
 - `update_task` — patch task fields (status, title, description, priority, tags, assignee)
 - `delete_task` — delete task by key
-- `create_task_comment` — post a comment on a task; defaults to `type='resolution'` for self-authored completion reports (plain English, not caveman-styled)
+- `create_task_comment` — post a comment on a task; defaults to `type='resolution'`. A completion report goes through `tipatask-local.complete_task` instead (step 4); use this tool for that report only when completion is blocked
 - `list_task_resolutions` — browse past task comment history by tag (all comment types, closed tasks by default). Read prior-task context from here instead of writing it into `ai/architecture/tt-*.md` (see § KB Hygiene)
 - `list_system_tags` — all `tt-*` tags with one-line descriptions (filesystem)
 - `get_tag_architecture` — full architecture doc for a specific `tt-*` tag
@@ -186,11 +186,11 @@ The project's Version Control setting (Task App Settings ▸ Version Control, or
 - **Live VCS verification**: before VCS writes, after resuming, and before completion, call `tipatask-local.git_worktree_status` with `task_key` and require `verified: true`. Current flags supersede kickoff snapshots. A failed or incomplete settings read grants no VCS writes and cannot waive an enabled merge requirement. Older tool builds: read `GET /api/projects/{API_PROJECT_ID}` with current `.tipatask/config.json` credentials (never print them), then restart the updated Task App to obtain local verification. When automatic merge is enabled, commit once per touched repository, merge nested task branches first and root last into each original checkout's CURRENT branch, preserve unrelated edits and correct gitlinks, and run relevant checks there. A PR is separate and never substitutes for local merge. Use `tipatask-local.complete_task(task_key, resolution)` for the final resolution/status pair; it rechecks settings and Git state before writing. If unavailable or verification fails, do not mark completed. Commit disabled never authorizes committing or merging.
 - **Where to read it**: the directive block at the top of a task kickoff prompt — `Version control (git) is enabled for this project:` / `Version control (svn) is enabled for this project:` / `Version control is OFF for this project`. With no such block (Claude design mode, SIMPLE_MODE, chat and other ad-hoc sessions), call the `git_worktree_status` MCP tool (served by `tipatask-local`) and read the `vcs` flags it reports (`worktree`, `commit`, `pr`, `merge`); a "Git integration is not enabled" reply, an svn setting, or an error with no `vcs` object means Version Control is off.
 - **Off, or git with commit off**: never run `git add`, `git commit`, `git push`, `git tag`, `git merge`, `git rebase`, or `git stash`, never create a branch or worktree, never open a PR, never write a commit message. Leave changes in the working tree, unstaged, and report what changed — the user commits. Only carve-outs, exactly as the kickoff directive gives them: with the worktree flag on you may create the task worktree and branch, and with the PR flag on you may push the task branch to open the PR. Read-only git (`status`, `diff`, `log`, `show`) is always fine.
-- **Git with flags on**: do exactly what the enabled flags allow and nothing beyond them (worktree, commit, merge, PR) — including when the user asks for it directly in chat. The latest verified VCS settings govern writes, including when they differ from the kickoff snapshot. svn: only the `svn commit` the directive describes.
+- **Git with flags on**: do exactly what the enabled flags allow and nothing beyond them (worktree, commit, merge, PR) — including when the user asks for it directly in chat. An enabled commit flag is **mandatory, not optional**: it is the user's standing request to commit, and the task is not complete until its changes are staged with `git add` and recorded with `git commit` (one commit per touched repository, message prefixed with the task key: `<TASK_KEY>: <summary>`), made before you mark the task completed; never skip it, never ask the user whether to commit, and never leave the task's changes uncommitted in the working tree — stage only the task's own files, never unrelated edits. The latest verified VCS settings govern writes, including when they differ from the kickoff snapshot. svn: only the `svn commit` the directive describes.
 
 ## Communication Style
 
 - **Caveman ultra (all CODING task implementation)**: At the start of every CODING task, invoke the `caveman` skill with `ultra` intensity (`Skill: caveman, args: ultra`) if available — this loads the full style guide. Task App auto-prepends `use caveman` to all Claude prompts. No manual invocation needed by user. **Exception**: the self-authored resolution comment (3.6 above) is written in plain English prose, never caveman-styled — it is a report for the user to read later, not a live status update.
 - **When blocked within this task's scope**: State the blocker in one sentence. Set task `on_fire` when available. Unrelated caveats do not block completion (§ Task status scope).
-- **When done**: First call `create_task_comment` with your own self-authored resolution report (plain English, not caveman-styled), then set task status to `completed` via MCP — **before** sending final response. Brief confirmation, plus any unrelated caveats and supporting verification evidence.
-- Confirm with `get_task` after `update_task`.
+- **When done**: Call `tipatask-local.complete_task(task_key, resolution)` with your own self-authored resolution report as `resolution` (plain English, not caveman-styled) — it verifies the task, then posts the report as the `type: "resolution"` comment and sets `completed`. Never also call `create_task_comment` or `update_task` to complete; when it refuses, fix the listed blockers and call it again, and if a blocker cannot be cleared, post the report with `create_task_comment` and set `on_fire` instead (step 4). Do this **before** sending final response. Brief confirmation, plus any unrelated caveats and supporting verification evidence.
+- Confirm with `get_task` after any status write.

@@ -37,6 +37,13 @@ function makeProjectDir(cfg) {
   return dir;
 }
 
+// TPT576 — the strict live-read context every real task-terminal spawn threads (vcs-context.js).
+const VCS_CONTEXT = Object.freeze({
+  verified: true, projectId: 2, checkedAt: '2026-01-01T00:00:00.000Z',
+  vcs: { type: 'git', worktree: false, commit: true, pr: false, merge: false },
+  runtime: { version: 'test', source: '/tmp/test', packaged: false, fingerprint: 'test', stale: false, protocol: 1 },
+});
+
 // ── BaseTaskAgent#buildKbHygieneDirective ──
 
 test('buildKbHygieneDirective: unconditional — always a non-empty string, no opts', () => {
@@ -62,6 +69,31 @@ test('buildKbHygieneDirective: compact wording is shorter, keeps the rule, drops
   assert.ok(!compact.includes('get_tag_architecture'));
   assert.ok(!compact.includes('push_knowledge'));
 });
+
+// TPT576 — with a vcsContext the resolution mandate finishes through complete_task, so task
+// narrative belongs in that tool's resolution, not in a separate create_task_comment.
+test('buildKbHygieneDirective: guardedCompletion sends task narrative to the complete_task resolution', () => {
+  const agent = new (class extends BaseTaskAgent { constructor() { super('x', 'X'); } })();
+  const guarded = agent.buildKbHygieneDirective({ guardedCompletion: true });
+  assert.match(guarded, /All of that goes in the resolution you pass to `complete_task\(task_key, resolution\)` instead/);
+  assert.match(guarded, /type: "resolution"/);
+  assert.ok(!guarded.includes('create_task_comment'), 'no separate comment call beside complete_task');
+  assert.match(guarded, /list_task_resolutions/);
+  // Compact (Pi) wording names neither tool, so the flag changes nothing there.
+  assert.equal(agent.buildKbHygieneDirective({ compact: true, guardedCompletion: true }), agent.buildKbHygieneDirective({ compact: true }));
+});
+
+for (const Agent of [ClaudeAgent, CodexAgent]) {
+  test(`${new Agent().id}: KB-hygiene line follows the completion path — complete_task with a vcsContext, create_task_comment without`, () => {
+    const agent = new Agent();
+    const guarded = agent.buildPrompt('Do the thing', { taskTags: ['tt-task-agent'], vcsContext: VCS_CONTEXT, vcsSettings: VCS_CONTEXT.vcs });
+    assert.ok(guarded.includes(agent.buildKbHygieneDirective({ guardedCompletion: true })));
+    assert.ok(!guarded.includes('All of that goes in `create_task_comment('));
+    const legacy = agent.buildPrompt('Do the thing', { taskTags: ['tt-task-agent'] });
+    assert.ok(legacy.includes(agent.buildKbHygieneDirective()));
+    assert.ok(!legacy.includes('the resolution you pass to `complete_task'));
+  });
+}
 
 test('buildKbHygieneDirective: compact variant stays inside Pi\'s echo-safety line shape (no question marks)', () => {
   const agent = new (class extends BaseTaskAgent { constructor() { super('x', 'X'); } })();
@@ -210,12 +242,13 @@ test('PiAgent.buildPrompt: KB-hygiene directive cannot false-trigger the attenti
   }
 });
 
-// Assert delivered meaning independently of buildSharedPreamble's own list.
+// Assert delivered meaning independently of buildSharedPreamble's own list — with and without
+// a vcsContext (TPT576 switches the full wording's resolution target).
 for (const Agent of [ClaudeAgent, CodexAgent, PiAgent]) {
-  test(`${new Agent().id}: kbHygiene contract survives shared assembly and detects omission/duplication`, (t) => {
+  for (const withContext of [false, true]) test(`${new Agent().id}: kbHygiene contract survives shared assembly and detects omission/duplication${withContext ? ' (vcsContext)' : ''}`, (t) => {
     const agent = new Agent();
     const verify = require('./prompt-contract-assertions').kbHygiene;
-    const opts = {};
+    const opts = withContext ? { vcsContext: VCS_CONTEXT, vcsSettings: VCS_CONTEXT.vcs } : {};
     opts.projectPath = require('./prompt-contract-assertions').projectFixture(t);
     const build = () => agent.buildPrompt('Implement fixture task.', opts);
     verify(build(), agent.id);

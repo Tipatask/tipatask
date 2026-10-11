@@ -80,14 +80,16 @@ if (process.platform === 'win32') {
       const res = await new CodexAgent().detect({});
       assert.equal(res.available, false);
       assert.match(res.reason, /not logged in/i);
-      assert.deepEqual(res.detail, { bin, exit: 1, output: 'Not logged in' });
+      // (TPT572) Codex also names its CLI build; this stub answers `--version` with the same
+      // "Not logged in" line, so no version parses.
+      assert.deepEqual(res.detail, { bin, exit: 1, output: 'Not logged in', version: null });
     } finally {
       delete process.env.CODEX_BIN;
       clearBinCache('codex');
     }
   });
 
-  test('a logged-in stub yields a positive with no detail at all', async () => {
+  test('a logged-in Codex stub yields a positive whose detail is only { bin, version } — no probe output', async () => {
     const CodexAgent = require('./codex-agent');
     const bin = stub('codex-ok', 'echo "Logged in using ChatGPT"; exit 0');
     process.env.CODEX_BIN = bin;
@@ -95,7 +97,8 @@ if (process.platform === 'win32') {
     try {
       const res = await new CodexAgent().detect({});
       assert.equal(res.available, true);
-      assert.equal('detail' in res, false);
+      // (TPT572) The version is the one thing a Codex positive reports; this stub prints no version.
+      assert.deepEqual(res.detail, { bin, version: null });
     } finally {
       delete process.env.CODEX_BIN;
       clearBinCache('codex');

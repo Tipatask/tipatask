@@ -6,6 +6,8 @@
 
 const { spawn: cpSpawn } = require('node:child_process');
 const config = require('../config');
+const { cliSpawnSpec } = require('../spawn-utils');
+const { killWindowsChildTree } = require('../process-group');
 const { buildCodexEnv, codexEffortArgs, toCodexEffort } = require('../codex-env');
 const { normalizeProposals } = require('../claude-session');
 const { buildTurnPrompt, buildNudgeMessage } = require('./transcript');
@@ -175,10 +177,16 @@ function emitCodexError(session, taskId, proc, emit, reason, attempts) {
   session._aborted = true;
   session._spawning = false;
   if (proc && !proc.killed) {
-    try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already dead */ }
-    setTimeout(() => {
-      try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already dead */ }
-    }, 3000);
+    // win32 has no process groups, and codex.cmd's CLI runs under the npm shim's node.exe
+    // (codex.js, which starts codex.exe): taskkill the whole tree (TPT575).
+    if (process.platform === 'win32') {
+      killWindowsChildTree(proc);
+    } else {
+      try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already dead */ }
+      setTimeout(() => {
+        try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already dead */ }
+      }, 3000);
+    }
   }
   session.turnBuffer = '';
   session.turnRawSse = '';
@@ -386,12 +394,24 @@ function spawnCodexTurn(session, taskId) {
     // Read after buildCodexEnv(): it has just refreshed the project's .codex/config.toml.
     const args = buildCodexArgs(session, { cwd, model, imagePaths });
     args.splice(-1, 0, '-c', mcpOverride);
-    const proc = cpSpawn(config.CODEX_BIN, args, {
-      cwd,
-      env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      detached: true,
-    });
+    let proc;
+    try {
+      // A Windows codex.cmd runs as the node.exe + codex.js its npm shim launches: the `-c` TOML
+      // values carry double quotes that no cmd.exe command line can hold (TPT575).
+      const spec = cliSpawnSpec(config.CODEX_BIN, args, { env, isWin: process.platform === 'win32' });
+      proc = cpSpawn(spec.command, spec.args, {
+        cwd,
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: true,
+        ...spec.options,
+      });
+    } catch (err) {
+      session._spawning = false;
+      console.error(`[codex] spawn failed task=${taskId}: ${err.message}`);
+      emitCodexError(session, taskId, null, emit, `spawn-error:${err.message}`, session._retryAttempt || 0);
+      return;
+    }
     session.proc = proc;
     session._spawning = false;
 

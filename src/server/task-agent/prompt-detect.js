@@ -221,6 +221,42 @@ function isClaudeReplReady(tail) {
 // re-send (the Enter is then sent exactly once, as before).
 const CLAUDE_PENDING_PASTE_RE = /\[Pasted\s*text\s*#\d+/i;
 
+// ── Codex composer markers (TPT571) ──
+// Codex's kickoff is paste-injected too (codex-agent.js sets spec.initialPrompt — Codex 0.160
+// dropped the positional prompt argument on the floor and booted to an empty composer). The two
+// markers below are consulted ONLY by terminal-session.js's submit verification (checkSubmitted())
+// after the kickoff Enter — never by the injection gate or the attention detector, and never
+// added to any *_PROMPT_PATTERNS table (see the HARD RULE at the top of this file).
+//
+// Composer placeholder rotation — the hint text Codex's ratatui composer paints while the input
+// is EMPTY (an idle composer keeps showing it during a running turn too, which is why
+// terminal-session.js's codexTurnMarker() never reads a placeholder row as a submission).
+const CODEX_COMPOSER_PLACEHOLDERS = [
+  'Ask Codex to do anything', 'Type a message', 'Find and fix a bug in @filename',
+  'Explain this codebase', 'Summarize recent commits', 'Write tests for @filename',
+  'Improve documentation in @filename', 'Implement {feature}',
+];
+
+// Landed-but-unsent paste: Codex collapses a large bracketed paste to a `[Pasted Content N chars]`
+// chip that stays in the composer until the message is submitted — the Codex twin of Claude's
+// CLAUDE_PENDING_PASTE_RE above, and the only state in which a re-sent Enter actually submits
+// something. `\s*` between the words because ratatui paints via cursor moves, so ANSI-stripped
+// output can glue them. Literal confirmed in the codex-cli 0.160.0 binary (`[Pasted Content `).
+// A CLI that stops collapsing pastes simply never matches, which disables the re-send (the Enter
+// is then sent exactly once, as before). Re-verify after CLI upgrades.
+const CODEX_PENDING_PASTE_RE = /\[Pasted\s*Content\s+[\d,]+\s*chars?\s*\]/i;
+
+// Empty idle composer: a prompt-marker row carrying nothing but one of the placeholders above.
+// Seen as the LAST thing drawn after the kickoff paste + Enter, with the PTY silent, it means the
+// paste never reached the composer at all (so a re-sent Enter would submit nothing) —
+// terminal-session.js re-pastes the kickoff once in that state. Anchored to one row; the raw
+// tail is '\n'-separated enough for the `m` flag because the composer row is painted on its own
+// line, and a placeholder prefix split across PTY writes simply doesn't match until it completes.
+const CODEX_EMPTY_COMPOSER_RE = new RegExp(
+  `^\\s*[›❯>]\\s*(?:${CODEX_COMPOSER_PLACEHOLDERS.map((t) => t.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')).join('|')})\\s*$`,
+  'im',
+);
+
 // Before first injection, Claude's AskUserQuestion menu must defer pending paste.
 // Match stable menu chrome in the raw tail without line anchors; keep it out of
 // line-scoped patterns to avoid later self-echo from docs or task text.
@@ -329,8 +365,9 @@ function buildLegacyPatternTable() {
     ...CODEX_PLAN_READY_PATTERNS.map((p) => ({ ...stripDialogOnly(p), agents: ['codex'] })),
     ...PI_PLAN_READY_PATTERNS.map((p) => ({ ...stripDialogOnly(p), agents: ['pi'] })),
     // (C1134) Deliberately NOT added here — buildLegacyPatternTable() feeds the tail-scoped
-    // inject/mcpTrust gate, which is already a no-op for Pi (positional-prompt spawn mode has
-    // injectDone=true at spawn, see terminal-session.js). Line-scoped only via PI_PROMPT_PATTERNS.
+    // inject/mcpTrust gate, which is already a no-op for Pi (the one agent still spawned with a
+    // positional prompt, so injectDone=true at spawn — see terminal-session.js). Line-scoped only
+    // via PI_PROMPT_PATTERNS.
     ...CODEX_TOOL_APPROVAL_PATTERNS.map((p) => ({ ...stripDialogOnly(p), agents: ['codex'] })),
     ...CODEX_GENERIC_PATTERNS.map((p) => ({ ...stripDialogOnly(p), agents: ['codex'] })),
     ...CLAUDE_GENERIC_PATTERNS.map((p) => ({ ...stripDialogOnly(p), agents: ['claude'] })),
@@ -352,6 +389,9 @@ module.exports = {
   CLAUDE_TOOL_APPROVAL_PATTERNS,
   CLAUDE_REPL_READY_PATTERNS,
   CLAUDE_PENDING_PASTE_RE,
+  CODEX_COMPOSER_PLACEHOLDERS,
+  CODEX_PENDING_PASTE_RE,
+  CODEX_EMPTY_COMPOSER_RE,
   CODEX_PROMPT_PATTERNS,
   CODEX_PLAN_READY_PATTERNS,
   CODEX_QUESTION_PATTERNS,

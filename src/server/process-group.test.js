@@ -31,6 +31,7 @@ const {
   countActiveAgentSessions,
   killProcessGroup,
   killWindowsProcessTree,
+  killWindowsChildTree,
   parsePsOutput,
   snapshotProcesses,
   listDescendants,
@@ -90,6 +91,35 @@ test('killWindowsProcessTree reports failure without throwing', () => {
   assert.equal(killWindowsProcessTree(4242, { spawnSync: () => ({ status: 128 }), platform: 'win32' }), false);
   assert.equal(killWindowsProcessTree(4242, { spawnSync: () => ({ status: null, error: new Error('ETIMEDOUT') }), platform: 'win32' }), false);
   assert.equal(killWindowsProcessTree(4242, { spawnSync: () => { throw new Error('ENOENT'); }, platform: 'win32' }), false);
+});
+
+// ── killWindowsChildTree() (TPT575) ──
+
+test('killWindowsChildTree taskkills the child\'s tree and leaves child.kill() alone when that works', () => {
+  const trees = [];
+  let killed = 0;
+  const child = { pid: 4242, kill() { killed++; return true; } };
+  assert.equal(killWindowsChildTree(child, { killTree: pid => { trees.push(pid); return true; } }), true);
+  assert.deepEqual(trees, [4242]);
+  assert.equal(killed, 0);
+});
+
+test('killWindowsChildTree falls back to child.kill() when taskkill fails, and never throws', () => {
+  let killed = 0;
+  const child = { pid: 4242, kill() { killed++; return true; } };
+  assert.equal(killWindowsChildTree(child, { killTree: () => false }), true);
+  assert.equal(killed, 1);
+  assert.equal(killWindowsChildTree({ pid: 4242, kill: () => false }, { killTree: () => false }), false, 'already exited');
+  assert.equal(killWindowsChildTree({ pid: 4242, kill() { throw new Error('EPERM'); } }, { killTree: () => false }), false);
+});
+
+test('killWindowsChildTree does nothing without a child or a pid', () => {
+  let called = false;
+  const killTree = () => { called = true; return true; };
+  for (const child of [null, undefined, {}, { pid: 0, kill() { called = true; } }]) {
+    assert.equal(killWindowsChildTree(child, { killTree }), false);
+  }
+  assert.equal(called, false);
 });
 
 // ── killProcessGroup() guard table ──

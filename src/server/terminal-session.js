@@ -21,7 +21,7 @@ const { refreshProjectToken } = require('./token-refresh');
 const { getApiCredentials } = require('./api-credentials');
 const { getTaskAgent } = require('./task-agent');
 const BaseTaskAgent = require('./task-agent/base-agent');
-const { buildLegacyPatternTable, sanitizePromptText, isClaudeReplReady, matchClaudeBgAgentsLine } = require('./task-agent/prompt-detect');
+const { buildLegacyPatternTable, sanitizePromptText, isClaudeReplReady, matchClaudeBgAgentsLine, CODEX_COMPOSER_PLACEHOLDERS } = require('./task-agent/prompt-detect');
 const { reflowChunk, carveReflowLines, resetReflow } = require('./screen-reflow');
 const { maxCommentId, isTerminalTailExitComment } = require('./exit-resolution');
 const { syncOnSessionStart, isSyncAsYouGoEnabled } = require('../cli/knowledge-sync');
@@ -159,6 +159,14 @@ const SUBMIT_POLL_MS = 1000;     // re-check cadence while the marker is visible
 const SUBMIT_WATCH_MS = 15000;   // stop watching this long after the last Enter
 const SUBMIT_MARKER_TRAILING_MAX = 500;  // an unsent paste is the LAST thing drawn: only footer/hint text may follow its marker in the tail
 const MAX_SUBMIT_RETRIES = 2;
+// (TPT571) Lost-paste fallback, Codex. A kickoff paste the TUI never took leaves the composer EMPTY
+// (agent.getEmptyComposerRe() — the bare placeholder row), so re-sending the Enter would submit
+// nothing. That state — the empty composer as the last thing drawn, PTY silent, no dialog, the
+// agent's paste chip never echoed after the paste, and almost no output since the Enter — gets the
+// whole kickoff pasted again, once. The byte ceiling is what separates "nothing happened" from a
+// turn that ran and ended quickly inside SUBMIT_WATCH_MS (its transcript alone is far larger).
+const MAX_PASTE_RETRIES = 1;
+const EMPTY_COMPOSER_MAX_BYTES = 2048;
 
 // True when `re` (the agent's unsent-paste marker) occurs in `tail` with at most
 // SUBMIT_MARKER_TRAILING_MAX chars after its last occurrence. The rolling tail is a stream, not a
@@ -187,13 +195,9 @@ function shouldReleasePrelude({ waitedMs, quietMs, gated, replReady }) {
 
 // Codex redraws scrollback above its live composer. A standalone sentinel is only
 // a candidate: a later submitted prompt or busy row makes it historical. Composer
-// placeholders are not submissions (they also remain visible during active work).
+// placeholders (CODEX_COMPOSER_PLACEHOLDERS, prompt-detect.js — shared with the TPT571
+// empty-composer marker) are not submissions (they also remain visible during active work).
 const CODEX_PLAN_QUIET_MS = 2000;
-const CODEX_COMPOSER_PLACEHOLDERS = [
-  'Ask Codex to do anything', 'Type a message', 'Find and fix a bug in @filename',
-  'Explain this codebase', 'Summarize recent commits', 'Write tests for @filename',
-  'Improve documentation in @filename', 'Implement {feature}',
-];
 function codexTurnMarker(line) {
   const prompt = /^\s*[›❯>]\s*(\S.*)$/.exec(line);
   // Prefixes matter too: the placeholder itself can arrive in split PTY writes.
@@ -276,6 +280,10 @@ function feedCodexPlan(session, agent, lines, carry, hit) {
     }
     const tailHit = getAttentionPromptMatch(session._attentionTail || '', 'codex', session);
     if (tailHit && tailHit.kind !== 'planReady') return;
+    // (TPT571) Codex's kickoff is paste-injected now, and the kickoff text itself carries the
+    // sentinel instruction. Nothing Codex paints before the kickoff Enter can be a real plan —
+    // leave the candidate and let the genuine post-submit sentinel re-arm this timer.
+    if (session._injectDone === false) return;
     state.ready = true;
     session.agentPlanReady = true;
     session.codexPlanReady = true;
@@ -1144,6 +1152,14 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     clearBinCache();
     status = await agent.cachedDetect(config, true);
   }
+  // (TPT572) Name the CLI build behind this start whenever detection reports one (Codex: the parsed
+  // `codex --version`), so a CLI upgrade that changes prompt intake is visible in the server log.
+  const cliVersion = status.detail && status.detail.version;
+  if (cliVersion) {
+    console.log(`[terminal:${agent.id}] start gate for task ${taskId}: ${agent.label} CLI ${cliVersion}`
+      + `${status.detail.bin ? ` (${status.detail.bin})` : ''} — `
+      + `${status.available ? 'available' : `unavailable: ${status.reason || 'no reason'}`}`);
+  }
   if (!status.available) {
     throw new Error(status.reason || `${agent.label} is unavailable`);
   }
@@ -1383,6 +1399,9 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   // timer that outlives a Stop/Restart is a no-op (terminateTerminalSession() nulls pty/alive).
   let submitRetries = 0;
   let submitWatchUntil = 0;
+  let pasteRetries = 0;        // (TPT571) lost-paste re-paste budget — see MAX_PASTE_RETRIES
+  let pasteChipSeen = false;   // (TPT571) the agent's unsent-paste chip echoed after the paste: it landed
+  let bufferLenAtEnter = 0;    // (TPT571) session.buffer length when the kickoff Enter went out
   const armSubmitCheck = (delayMs) => {
     clearTimeout(session._submitCheckTimer);
     session._submitCheckTimer = setTimeout(checkSubmitted, delayMs);
@@ -1392,7 +1411,13 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     session._submitCheckTimer = null;
     if (!session.alive || session._terminated || !session.pty) return;
     const tail = session._attentionTail || '';
-    if (!unsentPasteVisible(agent.getUnsentPasteRe(), tail)) return;  // marker gone (or buried): the prompt went in
+    const chipVisible = unsentPasteVisible(agent.getUnsentPasteRe(), tail);
+    // (TPT571) Lost paste: the EMPTY composer is the last thing drawn (never the chip), see
+    // MAX_PASTE_RETRIES. Only an agent exposing getEmptyComposerRe() (Codex) can reach this.
+    const composerEmpty = !chipVisible && !pasteChipSeen
+      && unsentPasteVisible(agent.getEmptyComposerRe(), tail)
+      && (session.buffer || '').length - bufferLenAtEnter <= EMPTY_COMPOSER_MAX_BYTES;
+    if (!chipVisible && !composerEmpty) return;  // marker gone (or buried): the prompt went in
     const now = Date.now();
     if (now >= submitWatchUntil) return;
     if (now - (session.lastOutputAt || 0) < SUBMIT_QUIET_MS) {
@@ -1402,6 +1427,28 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     const dlg = getAttentionPromptMatch(tail, session.taskAgent, session);
     if (dlg && isInjectGateKind(dlg.kind)) {
       armSubmitCheck(SUBMIT_POLL_MS);                       // a dialog owns the input — never Enter into it
+      return;
+    }
+    if (composerEmpty) {
+      if (pasteRetries >= MAX_PASTE_RETRIES) {
+        emitTerminalNotice(session, 'The task prompt did not reach the composer — restart the task.');
+        return;
+      }
+      pasteRetries++;
+      console.log(`[terminal:${agent.id}] Submit verification: kickoff for task ${taskId} never reached the composer `
+        + `(PTY silent ${now - (session.lastOutputAt || 0)}ms, ${(session.buffer || '').length - bufferLenAtEnter} bytes since the Enter) `
+        + `— pasting it again ${pasteRetries}/${MAX_PASTE_RETRIES}; tail=${JSON.stringify(tail.slice(-160))}`);
+      emitTerminalNotice(session, 'The task prompt did not reach the composer — pasting it again.');
+      // Re-enter the injector at awaitPasteAck: paste now, then the same settle -> (typed line) ->
+      // Enter -> verify sequence as the first attempt. The onData handler re-arms the silence timer
+      // per chunk while injectDone is false, exactly as during the original paste.
+      injectDone = false;
+      session._injectDone = false;
+      injectPhase = 'awaitPasteAck';
+      typedLineSent = false;
+      session.pty.write(`\x1b[200~${initialPrompt}\x1b[201~`);
+      injectPhaseStartAt = now;
+      armInjectTimer(agent.getPasteSilenceMs());
       return;
     }
     if (submitRetries >= MAX_SUBMIT_RETRIES) {
@@ -1634,8 +1681,10 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       injectPhase = 'done';
       session.pty.write('\r');
       // (TPT364) Confirm the Enter actually submitted the paste — see SUBMIT_VERIFY_MS.
+      // (TPT571) Also watches for the empty-composer lost-paste state, see MAX_PASTE_RETRIES.
       submitWatchUntil = Date.now() + SUBMIT_WATCH_MS;
-      if (agent.getUnsentPasteRe()) armSubmitCheck(SUBMIT_VERIFY_MS);
+      bufferLenAtEnter = (session.buffer || '').length;
+      if (agent.getUnsentPasteRe() || agent.getEmptyComposerRe()) armSubmitCheck(SUBMIT_VERIFY_MS);
     }
   }
 
@@ -1707,6 +1756,11 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     session._lastAttentionKind = lineKind;
     session._lastTailDialogKind = tailKind;
     if (!injectDone) {
+      // (TPT571) The paste chip echoing while the paste settles proves it reached the composer —
+      // the lost-paste fallback in checkSubmitted() must then never fire for this attempt.
+      if (injectPhase === 'awaitPasteAck' && unsentPasteVisible(agent.getUnsentPasteRe(), session._attentionTail)) {
+        pasteChipSeen = true;
+      }
       const now = Date.now();
       if (!injectFirstOutputAt) { injectFirstOutputAt = now; injectPhaseStartAt = now; }
       // Reset the silence window on every chunk; fire only once the PTY is quiet.
@@ -1726,8 +1780,11 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       session.ws.send(JSON.stringify({ type: 'data', tabId: session.tabId, data }));
     }
     const isToolApproval = attentionMatch?.kind === 'toolApproval';
+    // (TPT571) `&& injectDone`: a paste-injected kickoff (Codex now, like Claude) carries the
+    // sentinel instruction itself — nothing on screen before the kickoff Enter can be a real plan.
     const planMatched = requiresExplicitPlanReadyPattern(session)
       && session.terminalPhase === 'planning'
+      && injectDone
       && !isToolApproval
       && (attentionMatch?.kind === 'planReady' || lineHit?.kind === 'planReady');
     if (planMatched) session.agentPlanReady = true;
@@ -1984,6 +2041,8 @@ module.exports = {
   SUBMIT_WATCH_MS,
   SUBMIT_MARKER_TRAILING_MAX,
   MAX_SUBMIT_RETRIES,
+  MAX_PASTE_RETRIES,
+  EMPTY_COMPOSER_MAX_BYTES,
   unsentPasteVisible,
   emitTerminalState,
   emitTerminalNotice,

@@ -20,7 +20,8 @@
 const path = require('node:path');
 const { spawn: cpSpawn } = require('node:child_process');
 const config = require('../config');
-const { augmentPathEnv, projectEnvExtras: sharedProjectEnvExtras } = require('../spawn-utils');
+const { augmentPathEnv, projectEnvExtras: sharedProjectEnvExtras, prependPathEnv, cliSpawnSpec } = require('../spawn-utils');
+const { killWindowsChildTree } = require('../process-group');
 const { normalizeProposals } = require('../claude-session');
 const { localizeAttachments } = require('../task-agent/attachments');
 const throttle = require('../objective-throttle');
@@ -138,12 +139,17 @@ function emitGeminiError(session, taskId, proc, emit, reason, attempts) {
   throttle.recordTimeout(taskId, reason);
   clearGeminiTimers(session);
   session._aborted = true;
-  // Kill proc group
+  // Kill proc group. win32 has no process groups, and gemini.cmd's CLI runs under the npm shim's
+  // node.exe (which relaunches itself as a child): taskkill the whole tree (TPT575).
   if (proc && !proc.killed) {
-    try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already dead */ }
-    setTimeout(() => {
-      try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already dead */ }
-    }, 3000);
+    if (process.platform === 'win32') {
+      killWindowsChildTree(proc);
+    } else {
+      try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already dead */ }
+      setTimeout(() => {
+        try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already dead */ }
+      }, 3000);
+    }
   }
   // Clean turn buffers
   session.turnBuffer = '';
@@ -255,13 +261,15 @@ function spawnGeminiTurn(session, taskId, emitFn) {
   session._aborted = false;
 
   const cwd = session.projectPath || config.PROJECT_ROOT;
+  const isWin = process.platform === 'win32';
   const baseEnv = augmentPathEnv({
     TERM: 'dumb',
     ...projectEnvExtras(session),
   });
   // Prepend the current process's node bin/ dir so gemini's shebang (#!/usr/bin/env node)
-  // resolves to this server's Node version, not a potentially-incompatible system node.
-  const env = { ...baseEnv, PATH: `${NODE_BIN_DIR}:${baseEnv.PATH}` };
+  // resolves to this server's Node version, not a potentially-incompatible system node — and,
+  // on Windows, so gemini.cmd's own `node` lookup finds it first (`;`-separated there).
+  const env = prependPathEnv({ ...baseEnv }, NODE_BIN_DIR, { isWin });
   env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = require('./gemini-config').prepareGeminiSettings(config.USER_DATA_ROOT);
   delete env.API_TOKEN;
   delete env.TIPATASK_API_TOKEN;
@@ -303,12 +311,23 @@ function spawnGeminiTurn(session, taskId, emitFn) {
     };
   }
 
-  const proc = cpSpawn(config.GEMINI_BIN, args, {
-    cwd,
-    env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    detached: true,
-  });
+  let proc;
+  try {
+    // A Windows gemini.cmd runs as the node.exe + script its npm shim launches (else via cmd.exe),
+    // never detached there; POSIX spawns GEMINI_BIN exactly as before (TPT575).
+    const spec = cliSpawnSpec(config.GEMINI_BIN, args, { env, isWin });
+    proc = cpSpawn(spec.command, spec.args, {
+      cwd,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true,
+      ...spec.options,
+    });
+  } catch (err) {
+    console.error(`[gemini] spawn failed task=${taskId}: ${err.message}`);
+    emitGeminiError(session, taskId, null, emit, `spawn-error:${err.message}`, session._retryAttempt || 0);
+    return;
+  }
   session.proc = proc;
 
   if (config.OBJECTIVE_TIMING_ENABLED) {

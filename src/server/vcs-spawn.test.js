@@ -21,6 +21,11 @@ test('actual terminal launch passes fresh project settings through the real Code
   t.after(() => { if (oldHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldHome; });
   const agent = getTaskAgent('codex');
   t.mock.method(agent, 'cachedDetect', async () => ({ available: true }));
+  // (TPT571) The kickoff is paste-injected from spec.initialPrompt after boot, not an argv entry —
+  // observe the REAL spawn spec on its way through, rather than pty.spawn's argv.
+  const realGetSpawnSpec = agent.getSpawnSpec.bind(agent);
+  let spec;
+  t.mock.method(agent, 'getSpawnSpec', async (...a) => { spec = await realGetSpawnSpec(...a); return spec; });
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   let captured;
   t.mock.method(pty, 'spawn', (command, args, options) => {
@@ -41,7 +46,8 @@ test('actual terminal launch passes fresh project settings through the real Code
     session.taskAgent = 'codex';
     session.backend = backend;
     await spawnTerminal(session, 'Work on task TPT1: scratch', 'TPT1', [], { backend });
-    const prompt = captured.args.at(-1);
+    const prompt = spec.initialPrompt;
+    assert.ok(captured.args.every((a) => !a.includes('Work on task')), 'kickoff must not be a positional argv entry');
     assert.equal(captured.options.cwd, root);
     assert.equal(prompt.includes('`git merge task/'), !!merge);
     assert.match(prompt, /tipatask-local complete_task/);

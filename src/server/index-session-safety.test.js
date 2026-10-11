@@ -15,16 +15,17 @@ const pauseRunawaySession = () => null;
 
 // Execute the real bootstrap and timer callbacks without opening sockets, reading
 // credentials, running agents, or touching the user's process tree.
-async function harness(killEnv, failStartup = false, validationEnabled = false) {
+async function harness(killEnv, failStartup = false, validationEnabled = false, { platform = 'darwin', claudeBin = '/usr/local/bin/claude' } = {}) {
   const timers = new Map();
   const exits = [];
   const lines = [];
   const sweeps = [];
+  const execCalls = [];
   const memory = { starts: 0, stops: 0, ended: [], options: null };
   const validation = { samples: [], lifecycle: [], watchdog: [], stops: 0, trackerOptions: null };
   let shutdownOptions, listenCallback;
   const proc = Object.assign(new EventEmitter(), {
-    env: { TIPATASK_WATCHDOG_KILL: killEnv }, platform: 'darwin', arch: 'arm64',
+    env: { TIPATASK_WATCHDOG_KILL: killEnv }, platform, arch: 'arm64',
     exit: code => exits.push(code),
   });
   const log = { log() {}, warn() {}, error: line => lines.push(line) };
@@ -32,11 +33,11 @@ async function harness(killEnv, failStartup = false, validationEnabled = false) 
   const backend = { init: async () => { if (failStartup) throw Error('startup failed'); }, getTask: async () => ({ status: 'completed' }) };
   const mocks = {
     'node:fs': { existsSync: () => false },
-    'node:child_process': { execFileSync: () => 'caveman' },
+    'node:child_process': { execFileSync: (...args) => { execCalls.push(args); return 'caveman'; } },
     'node:http': { createServer: () => server },
     './config': { USER_NAME: 'test', USER_DATA_ROOT: '/scratch', SERVER_ROOT: '/scratch',
-      PROJECT_ROOT: '/project-a', TASK_BACKEND: 'api' },
-    './spawn-utils': { augmentPathEnv: () => ({}), isAsarPath: () => false },
+      PROJECT_ROOT: '/project-a', TASK_BACKEND: 'api', CLAUDE_BIN: claudeBin },
+    './spawn-utils': { augmentPathEnv: () => ({}), isAsarPath: () => false, cliSpawnSpec: require('./spawn-utils').cliSpawnSpec },
     './task-backend': { createBackend: () => backend, coerceBackendType: () => 'api' },
     './ws-handlers': { createHttpHandler: () => () => {}, drainSessionQueue() {}, sessionQueue: { setAdmission() {}, isRunning: () => false } },
     './session-admission': { createSessionAdmission: () => ({ start() {}, stop() {}, snapshot: () => ({ cap: 6 }) }) },
@@ -82,9 +83,25 @@ async function harness(killEnv, failStartup = false, validationEnabled = false) 
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(exits, failStartup ? [1] : [], lines.join('\n'));
   if (!failStartup) assert.ok(timers.has(10000));
-  return { sessions: module.exports.sessions, timers, proc, exits, lines, sweeps, memory, validation,
+  return { sessions: module.exports.sessions, timers, proc, exits, lines, sweeps, memory, validation, execCalls,
     server, shutdownOptions, ready: () => listenCallback(), getMemoryTelemetry: module.exports.getMemoryTelemetry };
 }
+
+// TPT575 — the boot-time caveman plugin check execs the Claude CLI through cliSpawnSpec(): POSIX
+// unchanged, win32 hidden and attached (a claude.cmd runs as the program its npm shim launches).
+test('caveman plugin check: POSIX execs CLAUDE_BIN exactly as before; win32 runs it hidden and attached', async () => {
+  const posix = await harness();
+  assert.deepEqual(JSON.parse(JSON.stringify(posix.execCalls)),
+    [['/usr/local/bin/claude', ['plugin', 'list'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: {} }]]);
+  const exe = 'C:\\Users\\a\\.local\\bin\\claude.exe';
+  const win = await harness(undefined, false, false, { platform: 'win32', claudeBin: exe });
+  const [command, args, options] = JSON.parse(JSON.stringify(win.execCalls[0]));
+  assert.equal(command, exe);
+  assert.deepEqual(args, ['plugin', 'list']);
+  assert.equal(options.windowsHide, true);
+  assert.equal(options.detached, false);
+  assert.equal(options.encoding, 'utf8');
+});
 
 test('optional session validation records lifecycle, measurements and watchdog before shutdown without disabled sampling cost', async () => {
   const disabled = await harness();

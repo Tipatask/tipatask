@@ -26,7 +26,7 @@ Use the `tipatask` MCP server whenever it is available for task CRUD, system-tag
 - Tasks live in the Tipatask API project selected by `API_PROJECT_ID` (`.tipatask/config.json`). The local `file` task backend is retired — `ai/TODO.md` is not live task state.
 - Prefer the `tipatask` MCP server over manual file edits for task updates.
 - Never verify task status against `ai/TODO.md`; verify against the configured API project instead.
-- Write status with `update_task`, then call `get_task` to confirm the saved status from the active project.
+- Write non-completion statuses with `update_task` and the completion status only through `tipatask-local.complete_task` (see Resolution Comment); then call `get_task` to confirm the saved status from the active project.
 - If MCP task results do not match the active `API_PROJECT_ID` (`.tipatask/config.json`), treat that as broken MCP registration and fix `.mcp.json` / client MCP config before trusting writes.
 
 ## Tag Rules
@@ -57,7 +57,7 @@ Skipping this step = completed task with stale tags = broken architecture naviga
 
 ## Resolution Comment
 
-Pass one resolution report to `tipatask-local.complete_task(task_key, resolution)` (or `tt complete` for Pi), in plain English prose, covering: what was implemented and why, key files touched, how to verify, and any follow-ups/caveats (write "none" if there are none). The completion guard posts the resolution and status together. This is the executing agent explaining itself in the task, distinct from the Task App's automatic terminal-tail resolution comment posted on session end.
+Pass one resolution report to `tipatask-local.complete_task(task_key, resolution)` (or `tt complete` for Pi), in plain English prose, covering: what was implemented and why, key files touched, how to verify, and any follow-ups/caveats (write "none" if there are none). The completion guard posts the resolution and status together. Never also post it with `create_task_comment` or write the completion status with `update_task`. When the guard refuses, fix the listed blockers (e.g. `TASK_COMMIT_MISSING`: commit first) and call it again; if a blocker cannot be cleared within the task, do not complete it — post the same report with `create_task_comment(task_key, content, type='resolution')` so it is not lost, then set `on_fire` when available and state the blocker. This is the executing agent explaining itself in the task, distinct from the Task App's automatic terminal-tail resolution comment posted on session end.
 
 To read how earlier tagged tasks were resolved, call `list_task_resolutions(tags=[...])` — that is where per-task narrative is stored and read back, not `ai/architecture/*.md`.
 
@@ -90,7 +90,7 @@ Require live verified VCS settings before Git writes and successful completion v
 ## Knowledge Base Hygiene
 
 - `ai/architecture/*.md` holds standing system concepts only: what a module is for, how it works today, its files/endpoints/schema/invariants — written for a reader who never saw this task.
-- Task-specific narrative never goes there: investigation logs, evidence tables of observed values, dated findings, task keys, step-by-step of what you tried, and corrections of your own earlier analysis. Those go in `create_task_comment(task_key, content, type='resolution')` on this task.
+- Task-specific narrative never goes there: investigation logs, evidence tables of observed values, dated findings, task keys, step-by-step of what you tried, and corrections of your own earlier analysis. Those go in this task's resolution report — the `resolution` you pass to `complete_task` (see Resolution Comment).
 - **Line test** before adding a line to a KB file: would it have to be deleted or rewritten once this task closes, or does it only make sense to someone who read this task? If yes — it's task narrative, not KB. Naming a task key, a date, or what you personally tried is the same verdict.
 - For context from earlier tasks call `list_task_resolutions(tags=[...])` and read the comment history — do not mine the KB for it, and do not write it back into the KB for the next agent.
 
@@ -106,7 +106,7 @@ The project's Version Control setting (Task App Settings ▸ Version Control, or
 - **Live VCS verification**: before VCS writes, after resuming, and before completion, call `tipatask-local.git_worktree_status` with `task_key` and require `verified: true`. Current flags supersede kickoff snapshots. A failed or incomplete settings read grants no VCS writes and cannot waive an enabled merge requirement. Older tool builds: read `GET /api/projects/{API_PROJECT_ID}` with current `.tipatask/config.json` credentials (never print them), then restart the updated Task App to obtain local verification. When automatic merge is enabled, commit once per touched repository, merge nested task branches first and root last into each original checkout's CURRENT branch, preserve unrelated edits and correct gitlinks, and run relevant checks there. A PR is separate and never substitutes for local merge. Use `tipatask-local.complete_task(task_key, resolution)` for the final resolution/status pair; it rechecks settings and Git state before writing. If unavailable or verification fails, do not mark completed. Commit disabled never authorizes committing or merging.
 - **Where to read it**: the directive block at the top of a task kickoff prompt — `Version control (git) is enabled for this project:` / `Version control (svn) is enabled for this project:` / `Version control is OFF for this project`. With no such block (SIMPLE_MODE, chat and other ad-hoc sessions), call the `git_worktree_status` MCP tool (served by `tipatask-local`) and read the `vcs` flags it reports (`worktree`, `commit`, `pr`, `merge`); a "Git integration is not enabled" reply, an svn setting, or an error with no `vcs` object means Version Control is off.
 - **Off, or git with commit off**: never run `git add`, `git commit`, `git push`, `git tag`, `git merge`, `git rebase`, or `git stash`, never create a branch or worktree, never open a PR, never write a commit message. Leave changes in the working tree, unstaged, and report what changed — the user commits. Only carve-outs, exactly as the kickoff directive gives them: with the worktree flag on you may create the task worktree and branch, and with the PR flag on you may push the task branch to open the PR. Read-only git (`status`, `diff`, `log`, `show`) is always fine.
-- **Git with flags on**: do exactly what the enabled flags allow and nothing beyond them (worktree, commit, merge, PR) — including when the user asks for it directly in chat. The latest verified VCS settings govern writes, including when they differ from the kickoff snapshot. svn: only the `svn commit` the directive describes.
+- **Git with flags on**: do exactly what the enabled flags allow and nothing beyond them (worktree, commit, merge, PR) — including when the user asks for it directly in chat. An enabled commit flag is **mandatory, not optional**: it is the user's standing request to commit, and the task is not complete until its changes are staged with `git add` and recorded with `git commit` (one commit per touched repository, message prefixed with the task key: `<TASK_KEY>: <summary>`), made before you mark the task completed; never skip it, never ask the user whether to commit, and never leave the task's changes uncommitted in the working tree — stage only the task's own files, never unrelated edits. The latest verified VCS settings govern writes, including when they differ from the kickoff snapshot. svn: only the `svn commit` the directive describes.
 
 ## Compatibility
 
@@ -137,7 +137,7 @@ Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
 
 **Auto-clarity:** drop caveman for security warnings, irreversible-action confirmations, multi-step sequences where fragment order risks misread, or when user asks to clarify. Resume caveman after clear part done.
 
-**Boundaries:** code/commits/PRs/docs: write normal. "stop caveman" or "normal mode": revert to normal prose. Self-authored resolution comment (`create_task_comment`, `type='resolution'`, see "Resolution Comment" above): always plain English prose, never caveman — it's a report read later, not a live status update.
+**Boundaries:** code/commits/PRs/docs: write normal. "stop caveman" or "normal mode": revert to normal prose. Self-authored resolution report (the `resolution` passed to `complete_task`, see "Resolution Comment" above): always plain English prose, never caveman — it's a report read later, not a live status update.
 
 ### Tag taxonomy lookup
 

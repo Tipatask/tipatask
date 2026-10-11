@@ -2,7 +2,7 @@
 
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir } = require('../spawn-utils');
+const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, winExecSpec } = require('../spawn-utils');
 const { quotaError, reasonFor, coalesceQuota } = require('./quota-status');
 
 function parseCodexLimits(data) {
@@ -36,8 +36,12 @@ function rpcErrorReason(error) {
 
 // A short-lived stdio RPC client. No thread/start or turn/start, no config writer,
 // login flow, MCP startup, or model request. Codex owns its native credential store.
-function openQuotaRpc(bin, env, projectRoot, { spawnImpl = spawn, timeoutMs = 15000 } = {}) {
-  const child = spawnImpl(bin, ['app-server'], { cwd: projectRoot, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+// argv via winExecSpec(): a Windows codex.cmd launcher runs through cmd.exe (Node >= 22
+// refuses a shell-less spawn of a .cmd with EINVAL); .exe and POSIX paths pass through.
+// spawnImpl/isWin are test-only seams; isWin forces the win32 branch on any host.
+function openQuotaRpc(bin, env, projectRoot, { spawnImpl = spawn, timeoutMs = 15000, isWin } = {}) {
+  const spec = winExecSpec(bin, ['app-server'], isWin === undefined ? {} : { isWin });
+  const child = spawnImpl(spec.command, spec.args, { ...spec.options, cwd: projectRoot, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   let buffer = '', bytes = 0, nextId = 1, closed = false, exited = false;
   const pending = new Map();
   const fail = error => {

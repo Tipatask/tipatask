@@ -8,11 +8,20 @@
 
 const { spawn: cpSpawn } = require('node:child_process');
 const config = require('./config');
-const { augmentPathEnv } = require('./spawn-utils');
+const { augmentPathEnv, cliSpawnSpec } = require('./spawn-utils');
+const { killWindowsChildTree } = require('./process-group');
 
 // (TPT295) Every proc still running. They are detached — their own process group — so the signal
 // that stops the server never reaches them; the shutdown reaper kills them via killAllHeadlessProcs().
 const _liveProcs = new Set();
+
+// Signals a proc and everything it started. POSIX: its process group (it was spawned detached),
+// else the proc alone. win32 has no process groups and claude.cmd's CLI may run as a grandchild
+// (under the npm shim's node.exe or cmd.exe), so the whole tree is taskkilled instead (TPT575).
+function signalProc(proc, sig) {
+  if (process.platform === 'win32') { killWindowsChildTree(proc); return; }
+  try { process.kill(-proc.pid, sig); } catch { try { proc.kill(sig); } catch {} }
+}
 
 /**
  * Spawn a one-shot, non-interactive `claude -p` call and resolve its text result.
@@ -40,16 +49,18 @@ function runHeadlessClaude(prompt, opts = {}) {
     const killTimer = setTimeout(() => {
       if (done) return;
       done = true;
-      try { process.kill(-proc.pid, 'SIGTERM'); } catch { try { proc.kill('SIGTERM'); } catch {} }
-      setTimeout(() => { try { process.kill(-proc.pid, 'SIGKILL'); } catch { try { proc.kill('SIGKILL'); } catch {} } }, 2000);
+      signalProc(proc, 'SIGTERM');
+      setTimeout(() => signalProc(proc, 'SIGKILL'), 2000);
       console.warn(`[headless-claude] timed out after ${timeoutMs}ms — pid ${proc && proc.pid}`);
       resolve(null);
     }, timeoutMs);
 
     try {
-      proc = cpSpawn(config.CLAUDE_BIN, [
-        '-p', '--model', model, '--output-format', 'json',
-      ], { cwd, env: augmentPathEnv({ TERM: 'dumb' }), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      const env = augmentPathEnv({ TERM: 'dumb' });
+      // A Windows claude.cmd runs as the program its npm shim launches (else via cmd.exe), never
+      // detached there; POSIX spawns CLAUDE_BIN exactly as before (TPT575).
+      const spec = cliSpawnSpec(config.CLAUDE_BIN, ['-p', '--model', model, '--output-format', 'json'], { env, isWin: process.platform === 'win32' });
+      proc = cpSpawn(spec.command, spec.args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true, ...spec.options });
     } catch (spawnErr) {
       clearTimeout(killTimer);
       console.warn(`[headless-claude] spawn failed: ${spawnErr.message}`);
@@ -103,7 +114,7 @@ function killAllHeadlessProcs(reason) {
   const procs = [..._liveProcs];
   _liveProcs.clear();
   for (const proc of procs) {
-    try { process.kill(-proc.pid, 'SIGTERM'); } catch { try { proc.kill('SIGTERM'); } catch {} }
+    signalProc(proc, 'SIGTERM');
     console.log(`[headless-claude] Killed pid ${proc.pid} reason=${reason}`);
   }
   return procs;

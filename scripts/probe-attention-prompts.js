@@ -184,8 +184,9 @@ async function probeAgent(agentId, opts = {}) {
     process.stdin.on('data', onStdin);
   }
 
-  // Claude's initial prompt is PTY-injected after boot (spec.initialPrompt); Codex bakes it
-  // into argv and starts immediately — see spawnTerminal()/claude-agent.js/codex-agent.js.
+  // Claude's and (TPT571) Codex's initial prompt is PTY-injected after boot (spec.initialPrompt);
+  // Pi bakes it into argv and starts immediately — see spawnTerminal()/claude-agent.js/
+  // codex-agent.js/pi-agent.js.
   // (C1219) --no-inject skips this entirely — the point of a first-run capture is to observe
   // (and, under --interactive, answer) the onboarding chain itself, not to have the script's own
   // paste+Enter confirm whatever onboarding option happens to be highlighted, which would

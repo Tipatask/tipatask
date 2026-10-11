@@ -28,6 +28,7 @@ function harness(t, overrides = {}) {
     './spawn-utils': {
       augmentPathEnv: extras => ({ ...extras }),
       projectEnvExtras: projectRoot => projectRoot ? { TIPATASK_PROJECT_ROOT: projectRoot, PROJECT_ENV_MARKER: projectRoot } : {},
+      cliSpawnSpec: require('./spawn-utils').cliSpawnSpec,
     },
     './task-agent/attachments': { localizeAttachments: async ({ prompt }) => ({ prompt }) },
     'node:fs/promises': { unlink: async () => {}, writeFile: async () => {} },

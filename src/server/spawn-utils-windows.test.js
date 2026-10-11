@@ -19,7 +19,7 @@ const BaseTaskAgent = require('./task-agent/base-agent');
 
 const {
   selectWindowsLauncher, winLauncherExts, parseRegQueryPath, expandWindowsEnv,
-  readWindowsRegistryPathDirs, _findExecutable, winExecSpec,
+  readWindowsRegistryPathDirs, _findExecutable, winExecSpec, CMD_MAX_LINE,
   readPathEnv, setPathEnv, prependPathEnv,
 } = require('./spawn-utils');
 
@@ -356,6 +356,16 @@ test('winExecSpec(win32): a double quote or line break in any part is rejected',
   assert.throws(() => winExecSpec('C:\\x\\a.cmd', ['--flag="v"'], { isWin: true, env: WIN_ENV }), /unquotable/);
   assert.throws(() => winExecSpec('C:\\x\\a.cmd', ['line\nbreak'], { isWin: true, env: WIN_ENV }), /unquotable/);
   assert.throws(() => winExecSpec('C:\\x\\we"ird.cmd', [], { isWin: true, env: WIN_ENV }), /unquotable/);
+});
+
+test('winExecSpec(win32): a line past cmd.exe\'s 8191-character limit is rejected; one at the limit passes (TPT575)', () => {
+  const bin = 'C:\\x\\a.cmd';
+  const overhead = winExecSpec(bin, [''], { isWin: true, env: WIN_ENV }).args[3].length; // `""C:\x\a.cmd" """`
+  const fits = 'v'.repeat(CMD_MAX_LINE - overhead);
+  assert.equal(winExecSpec(bin, [fits], { isWin: true, env: WIN_ENV }).args[3].length, CMD_MAX_LINE);
+  assert.throws(() => winExecSpec(bin, [fits + 'v'], { isWin: true, env: WIN_ENV }), /8191-character limit/);
+  // Off win32 nothing is wrapped, so nothing is measured.
+  assert.equal(winExecSpec(bin, ['v'.repeat(40000)], { isWin: false }).args[0].length, 40000);
 });
 
 test('winExecSpec(win32): cmd.exe comes from ComSpec, else SystemRoot\\System32, else bare cmd.exe', () => {

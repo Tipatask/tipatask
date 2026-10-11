@@ -319,17 +319,18 @@ test('normal and SIMPLE_MODE terminal launches share config effort without shari
     const peers = await Promise.all(['TPT498', 'TPT499'].map(id => spawn({}, id)));
     for (const peer of peers) {
       assert.deepEqual(peer.env, normal.env, 'different tasks must have the same daemon environment');
-      assert.deepEqual(peer.args.slice(0, -1), normal.args.slice(0, -1));
-      assert.match(peer.args.at(-1), /Work on task TPT49[89]\./);
+      // (TPT571) The kickoff is spec.initialPrompt (paste-injected), never an argv entry.
+      assert.deepEqual(peer.args, normal.args);
+      assert.match(peer.initialPrompt, /Work on task TPT49[89]\./);
     }
     const again = await spawn({}, 'TPT500');
-    assert.deepEqual(again.args.slice(0, -1), normal.args.slice(0, -1));
-    assert.match(again.args.at(-1), /Work on task TPT500\./);
+    assert.deepEqual(again.args, normal.args);
+    assert.match(again.initialPrompt, /Work on task TPT500\./);
     assert.equal(fs.readFileSync(path.join(normal.env.CODEX_HOME, 'config.toml'), 'utf8'), content);
-    if (simple) assert.equal(normal.args.at(-1), prompt);
+    if (simple) assert.equal(normal.initialPrompt, prompt);
     else {
-      assert.match(normal.args.at(-1), /Do not implement, edit files, or run mutating commands until the user approves the plan/);
-      assert.match(normal.args.at(-1), /Plan ready\./);
+      assert.match(normal.initialPrompt, /Do not implement, edit files, or run mutating commands until the user approves the plan/);
+      assert.match(normal.initialPrompt, /Plan ready\./);
     }
   }
 });

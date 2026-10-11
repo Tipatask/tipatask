@@ -12,6 +12,9 @@ const {
   CODEX_PROMPT_PATTERNS,
   CODEX_PLAN_READY_PATTERNS,
   CODEX_QUESTION_PATTERNS,
+  CODEX_COMPOSER_PLACEHOLDERS,
+  CODEX_PENDING_PASTE_RE,
+  CODEX_EMPTY_COMPOSER_RE,
   PI_PROMPT_PATTERNS,
   PI_PLAN_READY_PATTERNS,
   PI_QUESTION_PATTERNS,
@@ -601,4 +604,46 @@ test('TPT348: matchClaudeBgAgentsLine is in no prompt table and adds nothing to 
   }
   assert.ok(buildLegacyPatternTable().every((p) => !p.re.test(probe)),
     'the busy signal must not touch the tail-scoped gate behind onInjectSilence()');
+});
+
+// ── (TPT571) Codex composer markers — submit-verification only, never attention patterns ──
+// A glued Codex 0.160 boot frame, as the raw tail sees it (banner, cwd, tagline, empty composer).
+const CODEX_BOOT_FRAME = '\x1b]0;codex\x07╭─ Codex CLI ─╮\n>_ OpenAI Codex (v0.160.0)\n~/Projects/AptRabbit\n'
+  + 'You bring the idea. I’ll bring the brackets.\n› Ask Codex to do anything\n';
+
+test('TPT571: the empty-composer marker matches a glued Codex boot frame; the paste chip does not', () => {
+  assert.equal(CODEX_EMPTY_COMPOSER_RE.test(CODEX_BOOT_FRAME), true);
+  assert.equal(CODEX_PENDING_PASTE_RE.test(CODEX_BOOT_FRAME), false);
+  // \r-glued repaint of the same composer row (ratatui redraws in place)
+  assert.equal(CODEX_EMPTY_COMPOSER_RE.test('status line\r› Ask Codex to do anything\r'), true);
+  for (const text of CODEX_COMPOSER_PLACEHOLDERS) {
+    assert.equal(CODEX_EMPTY_COMPOSER_RE.test(`› ${text}`), true, text);
+    assert.equal(CODEX_EMPTY_COMPOSER_RE.test(`❯ ${text}  `), true, text);
+  }
+});
+
+test('TPT571: typed or pasted composer content is never "empty"', () => {
+  assert.equal(CODEX_EMPTY_COMPOSER_RE.test('› Ask Codex to do anything else'), false, 'placeholder prefix + typed text');
+  assert.equal(CODEX_EMPTY_COMPOSER_RE.test('› Work on task TPT571'), false);
+  assert.equal(CODEX_EMPTY_COMPOSER_RE.test('› [Pasted Content 5120 chars]'), false);
+  assert.equal(CODEX_EMPTY_COMPOSER_RE.test('Ask Codex to do anything'), false, 'no prompt marker: quoted prose, not the composer');
+});
+
+test('TPT571: the pending-paste chip matches Codex\'s collapsed large paste, glued or not', () => {
+  assert.equal(CODEX_PENDING_PASTE_RE.test('› [Pasted Content 5120 chars]'), true);
+  assert.equal(CODEX_PENDING_PASTE_RE.test('› [Pasted Content 105,312 chars]'), true, 'thousands separator');
+  assert.equal(CODEX_PENDING_PASTE_RE.test('›[PastedContent 5120chars]'), true, 'cursor-move glued');
+  assert.equal(CODEX_PENDING_PASTE_RE.test('[Pasted text #1 +42 lines]'), false, 'Claude\'s chip is not Codex\'s');
+});
+
+test('TPT571: neither Codex composer marker is wired into any attention pattern table', () => {
+  const frame = `${CODEX_BOOT_FRAME}› [Pasted Content 5120 chars]\n`;
+  for (const line of frame.split('\n')) {
+    assert.equal(matchPromptLine(line, CODEX_PROMPT_PATTERNS), null, `line-scoped Codex table matched: ${line}`);
+    assert.equal(matchPromptLine(line, GENERIC_PROMPT_PATTERNS), null, `generic table matched: ${line}`);
+  }
+  for (const { re, agents } of buildLegacyPatternTable()) {
+    if (agents && !agents.includes('codex')) continue;
+    assert.ok(!re.test(frame), `tail-scoped pattern matched the boot frame: ${re}`);
+  }
 });

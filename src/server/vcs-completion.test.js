@@ -24,6 +24,7 @@ function backend(row = { ...all }) {
     async updateTask(id, fields) { calls.push(['update', id, fields]); Object.assign(task, fields); return { ...task }; },
   };
 }
+const codes = check => check.blockers.map(x => x.code);
 
 test('replaced packaged runtime requires restart instead of granting permissions', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-runtime-stale-'));
@@ -138,8 +139,8 @@ test('completion rejects clean unmerged branches, then accepts nested-first merg
   assert.ok((await verifyTaskCompletion(args)).blockers.some(x => x.code === 'dirty_task_worktree'));
 });
 
-test('merge off never runs git; commit off never merges; failed git cannot pass; remote bypass reopens', async t => {
-  const off = backend({ ...all, vcs_merge_enabled: 0 });
+test('merge and commit off never run git; commit off never merges; failed git cannot pass; remote bypass reopens', async t => {
+  const off = backend({ ...all, vcs_merge_enabled: 0, vcs_commit_enabled: 0 });
   assert.equal((await verifyTaskCompletion({ backend: off, taskId: 'TPT1', git: () => { throw new Error('must not run'); } })).ready, true);
   const unknown = await verifyTaskCompletion({ backend: backend(), projectRoot: '/missing', taskId: 'TPT1', git: async () => ({ status: 128 }) });
   assert.equal(unknown.ready, false);
@@ -155,8 +156,60 @@ test('merge off never runs git; commit off never merges; failed git cannot pass;
   assert.equal(f.git(f.root, ['rev-parse', 'HEAD']), before);
 });
 
+test('merge and commits on: a missing task commit blocks, an unmerged branch is only unmerged_branch, a merged branch is ready', async t => {
+  if (fx.skipUnless(t)) return;
+  const f = fx.buildFixture(t);
+  const b = backend();
+  const args = { backend: b, projectRoot: f.root, taskId: 'TPT4' };
+  fx.commit(f.git, f.root, { 'src/forty.js': 'forty\n' }, 'TPT40: Another task');
+  let check = await verifyTaskCompletion(args);
+  assert.deepEqual(codes(check), ['TASK_COMMIT_MISSING'], 'no task branch and no TPT4 commit; TPT40 is another task');
+  assert.match(check.blockers[0].message, /commit .* starting with TPT4, then merge task\/TPT4/);
+  assert.deepEqual(check.repositories.map(r => r.taskCommit), [null, null]);
+  const refused = await completeVerifiedTask({ ...args, resolution: 'Added feature four. Checks passed. Follow-ups: none.' });
+  assert.equal(refused.completed, false);
+  assert.ok(!b.calls.some(c => ['comment', 'update'].includes(c[0])), 'a refused completion writes nothing');
+  const gate = await guardCompletionTransition({ session: { taskId: 'TPT4' }, backend: b, projectRoot: f.root });
+  assert.equal(gate.allowed, true, 'the terminal monitor stays merge-only');
+
+  fx.addTaskBranch(f.git, f.root, 'TPT4', { 'src/feature4.js': 'four\n' }, { title: 'Feature four' });
+  check = await verifyTaskCompletion(args);
+  assert.deepEqual(codes(check), ['unmerged_branch'], 'an unmerged task branch is not also a missing commit');
+
+  fx.commit(f.git, f.root, { 'src/other.js': 'other\n' }, 'Unrelated change');
+  f.git(f.root, ['merge', '-q', '--no-edit', 'task/TPT4']);
+  const branchHead = f.git(f.root, ['rev-parse', 'task/TPT4']);
+  assert.equal(f.git(f.root, ['rev-parse', 'HEAD^2']), branchHead, 'a real merge commit');
+  check = await verifyTaskCompletion(args);
+  assert.equal(check.ready, true, JSON.stringify(check.blockers));
+  assert.equal(check.repositories.at(-1).taskCommit, branchHead);
+});
+
+test('merge and commits on, worktrees off: a key-prefixed commit on the current branch is the task commit', async t => {
+  if (fx.skipUnless(t)) return;
+  const f = fx.buildFixture(t);
+  const args = { backend: backend({ ...all, vcs_worktree_enabled: 0 }), projectRoot: f.root, taskId: 'TPT4' };
+  let check = await verifyTaskCompletion(args);
+  assert.deepEqual(codes(check), ['TASK_COMMIT_MISSING']);
+  assert.match(check.blockers[0].message, /Commits and automatic merge are enabled .* no commit starting with TPT4 is reachable from the main checkout HEAD/);
+  const sha = fx.commit(f.git, f.root, { 'src/feature4.js': 'four\n' }, 'TPT4: Commit on the current branch');
+  check = await verifyTaskCompletion(args);
+  assert.equal(check.ready, true, JSON.stringify(check.blockers));
+  assert.deepEqual(check.repositories.map(r => r.taskCommit), [null, sha]);
+});
+
+test('commits off with merge on: merge verification is unchanged and reads no task commits', async t => {
+  if (fx.skipUnless(t)) return;
+  const f = fx.buildFixture(t);
+  const b = backend({ ...all, vcs_commit_enabled: 0 });
+  const check = await verifyTaskCompletion({ backend: b, projectRoot: f.root, taskId: 'TPT4' });
+  assert.equal(check.ready, true, JSON.stringify(check.blockers));
+  assert.ok(check.repositories.every(r => !('taskCommit' in r)), JSON.stringify(check.repositories));
+  assert.deepEqual(codes(await verifyTaskCompletion({ backend: b, projectRoot: f.root, taskId: 'TPT1' })), ['unmerged_branch', 'unmerged_branch']);
+});
+
 test('legacy slug task keys: accepted when the API has the task, blocked when unknown or malformed', async () => {
-  const off = backend({ ...all, vcs_merge_enabled: 0 });
+  const off = backend({ ...all, vcs_merge_enabled: 0, vcs_commit_enabled: 0 });
   const args = { backend: off, taskId: 'C-kb-docs-site', resolution: 'Slug-key task done. Checks passed. Follow-ups: none.' };
   const check = await verifyTaskCompletion(args);
   assert.equal(check.ready, true, JSON.stringify(check.blockers));

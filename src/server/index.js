@@ -13,7 +13,7 @@ const http = require('node:http');
 const { execFileSync } = require('node:child_process');
 const { createWebSocketGate } = require('./ws-upgrade');
 const config = require('./config');
-const { augmentPathEnv, isAsarPath } = require('./spawn-utils');
+const { augmentPathEnv, isAsarPath, cliSpawnSpec } = require('./spawn-utils');
 const { createBackend, createPerProjectBackend, coerceBackendType } = require('./task-backend');
 const { createHttpHandler, handleConnection, drainSessionQueue, sessionQueue } = require('./ws-handlers');
 const websocket = require('./websocket');
@@ -102,13 +102,19 @@ function askOnce(rl, question) {
 async function ensureCavemanPlugin() {
   try {
     const spawnEnv = augmentPathEnv({});
-    const list = execFileSync(config.CLAUDE_BIN, ['plugin', 'list'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv });
+    // A Windows claude.cmd runs as the program its npm shim launches (else via cmd.exe), with no
+    // console window; POSIX execs CLAUDE_BIN exactly as before (TPT575).
+    const claude = (args) => {
+      const spec = cliSpawnSpec(config.CLAUDE_BIN, args, { env: spawnEnv, isWin: process.platform === 'win32' });
+      return execFileSync(spec.command, spec.args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv, ...spec.options });
+    };
+    const list = claude(['plugin', 'list']);
     if (list.includes('caveman')) {
       console.log('[caveman] plugin already installed');
       return;
     }
-    execFileSync(config.CLAUDE_BIN, ['plugin', 'marketplace', 'add', 'JuliusBrussee/caveman'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv });
-    execFileSync(config.CLAUDE_BIN, ['plugin', 'install', 'caveman@caveman'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv });
+    claude(['plugin', 'marketplace', 'add', 'JuliusBrussee/caveman']);
+    claude(['plugin', 'install', 'caveman@caveman']);
     console.log('[caveman] plugin installed');
   } catch (err) {
     console.warn('[caveman] plugin install skipped:', err.message);

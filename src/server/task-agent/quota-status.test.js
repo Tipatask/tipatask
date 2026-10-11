@@ -2,10 +2,11 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { PassThrough, Writable } = require('node:stream');
 const { normalizeQuota, quotaError, coalesceQuota } = require('./quota-status');
-const { readClaudeQuota, credentialLocation, readClaudeCredential, parseClaudeUsage } = require('./claude-quota');
+const { readClaudeQuota, credentialLocation, readClaudeCredential, parseClaudeUsage, runFile } = require('./claude-quota');
 const { readCodexQuota, openQuotaRpc } = require('./codex-quota');
 const { getAgentQuotaStatus } = require('./index');
 
@@ -282,6 +283,85 @@ test('Codex RPC handles spawn failure, early exit and oversized output without a
     });
     rpc.close();
   }
+});
+
+// npm's codex.cmd / claude.cmd: Node >= 22 refuses a shell-less spawn of a .cmd (EINVAL), so both
+// quota readers build their argv through winExecSpec(). isWin forces the win32 branch on any host.
+const WIN_SPACED_NPM = 'C:\\Users\\Anton M\\AppData\\Roaming\\npm';
+
+function captureRpcSpawn(calls) {
+  return (command, args, options) => {
+    calls.push({ command, args, options });
+    return fakeChild((msg, c) => c.stdout.write(JSON.stringify({ id: msg.id, result: {} }) + '\n'));
+  };
+}
+
+test('Codex RPC (win32): a .cmd launcher in a path with a space spawns cmd.exe /d /s /c "<quoted line>"', async () => {
+  const calls = [];
+  const bin = `${WIN_SPACED_NPM}\\codex.cmd`;
+  const env = { PATH: 'C:\\x' };
+  const rpc = openQuotaRpc(bin, env, 'C:\\project', { spawnImpl: captureRpcSpawn(calls), isWin: true });
+  assert.deepEqual(await rpc.request('initialize'), {});
+  rpc.close();
+  assert.equal(calls.length, 1);
+  const { command, args, options } = calls[0];
+  assert.equal(path.win32.basename(command).toLowerCase(), 'cmd.exe');
+  assert.deepEqual(args, ['/d', '/s', '/c', `""${bin}" "app-server""`]);
+  assert.equal(options.windowsVerbatimArguments, true);
+  assert.equal(options.shell, undefined, 'never shell: true — cmd.exe would get the path unquoted');
+  assert.equal(options.windowsHide, true);
+  assert.equal(options.env, env);
+  assert.equal(options.cwd, 'C:\\project');
+  assert.deepEqual(options.stdio, ['pipe', 'pipe', 'pipe']);
+  assert.equal(Object.hasOwn(options, 'isWin'), false);
+});
+
+test('Codex RPC: a plain .exe and a POSIX path are spawned verbatim — no cmd.exe wrapper', async () => {
+  for (const [bin, isWin] of [['C:\\Program Files\\OpenAI\\codex.exe', true], ['/usr/local/bin/codex', false]]) {
+    const calls = [];
+    const rpc = openQuotaRpc(bin, {}, '/project', { spawnImpl: captureRpcSpawn(calls), isWin });
+    await rpc.request('initialize');
+    rpc.close();
+    assert.equal(calls[0].command, bin);
+    assert.deepEqual(calls[0].args, ['app-server']);
+    assert.equal(calls[0].options.windowsVerbatimArguments, undefined);
+    assert.equal(calls[0].options.shell, undefined);
+  }
+});
+
+test('Claude auth status (win32): a .cmd launcher in a path with a space runs through cmd.exe; signed-out exit 1 still resolves', async () => {
+  const calls = [];
+  const signedOut = '{"loggedIn":false}';
+  const execFileImpl = (command, args, options, done) => {
+    calls.push({ command, args, options });
+    done(Object.assign(new Error('Command failed'), { code: 1 }), signedOut);
+  };
+  const bin = `${WIN_SPACED_NPM}\\claude.cmd`;
+  const env = { PATH: 'C:\\x' };
+  assert.equal(await runFile(bin, ['auth', 'status'], { execFileImpl, isWin: true, cwd: 'C:\\project', env }), signedOut);
+  const { command, args, options } = calls[0];
+  assert.equal(path.win32.basename(command).toLowerCase(), 'cmd.exe');
+  assert.deepEqual(args, ['/d', '/s', '/c', `""${bin}" "auth" "status""`]);
+  assert.equal(options.windowsVerbatimArguments, true);
+  assert.equal(options.shell, undefined);
+  assert.equal(options.windowsHide, true);
+  assert.equal(options.timeout, 5000);
+  assert.equal(options.cwd, 'C:\\project');
+  assert.equal(options.env, env);
+  assert.equal(Object.hasOwn(options, 'execFileImpl'), false);
+  assert.equal(Object.hasOwn(options, 'isWin'), false);
+});
+
+test('Claude auth status: a plain .exe is exec\'d verbatim, and an unquotable .cmd argv rejects instead of throwing', async () => {
+  const calls = [];
+  const execFileImpl = (command, args, options, done) => { calls.push({ command, args, options }); done(null, '{}'); };
+  const bin = 'C:\\Program Files\\Claude\\claude.exe';
+  assert.equal(await runFile(bin, ['auth', 'status'], { execFileImpl, isWin: true }), '{}');
+  assert.equal(calls[0].command, bin);
+  assert.deepEqual(calls[0].args, ['auth', 'status']);
+  assert.equal(calls[0].options.windowsVerbatimArguments, undefined);
+  await assert.rejects(runFile('C:\\x\\we"ird.cmd', ['auth', 'status'], { execFileImpl, isWin: true }), /unquotable/);
+  assert.equal(calls.length, 1);
 });
 
 test('Codex simultaneous account changes cannot join another account quota read', async () => {

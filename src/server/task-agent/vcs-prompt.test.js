@@ -33,6 +33,12 @@ function makeProjectDir(cfg) {
 const GIT_ALL_ON = { type: 'git', worktree: true, commit: true, pr: true, merge: true };
 const GIT_WORKTREE_ONLY = { type: 'git', worktree: true, commit: false, pr: false, merge: false };
 const SVN = { type: 'svn', worktree: false, commit: false, pr: false, merge: false };
+// TPT576 — the strict live-read context every real task-terminal spawn threads (vcs-context.js).
+const VCS_CONTEXT = Object.freeze({
+  verified: true, projectId: 2, checkedAt: '2026-01-01T00:00:00.000Z',
+  vcs: { type: 'git', worktree: false, commit: true, pr: false, merge: false },
+  runtime: { version: 'test', source: '/tmp/test', packaged: false, fingerprint: 'test', stale: false, protocol: 1 },
+});
 
 for (const compact of [false, true]) {
   test(`buildVcsDirective: merge completion gate (compact=${compact})`, () => {
@@ -238,6 +244,60 @@ test('ClaudeAgent.buildPrompt: SIMPLE_MODE wins over vcsSettings — bare prompt
   assert.equal(out, 'Do the thing');
 });
 
+// TPT576 — with a vcsContext Claude finishes through the local complete_task guard, like Codex,
+// so the commit/merge check applies. The legacy create_task_comment + remote update_task note
+// survives only for callers without one.
+test('ClaudeAgent.buildPrompt: vcsContext -> finish through complete_task, never create_task_comment + update_task (TPT576)', () => {
+  const agent = new ClaudeAgent();
+  const prompt = agent.buildPrompt('Do the thing', { vcsContext: VCS_CONTEXT, vcsSettings: VCS_CONTEXT.vcs });
+  assert.ok(prompt.includes('`mcp__tipatask-local__complete_task(task_key, resolution)`'));
+  assert.ok(!prompt.includes('update_task(status='), 'no remote status write for completion');
+  assert.doesNotMatch(prompt, /SAME tool-call batch/);
+  assert.match(prompt, /Never also call `create_task_comment` or `update_task` to complete the task\./);
+  assert.match(prompt, /When it refuses, fix the blockers it lists \(e\.g\. TASK_COMMIT_MISSING: commit first\) and call it again\./);
+  // A blocker the agent cannot clear still leaves the report on the task.
+  assert.match(prompt, /cannot be cleared within this task, do not complete it: post the same report with `mcp__tipatask__create_task_comment\(task_key, content, type: "resolution"\)` so it is not lost/);
+  assert.match(prompt, /plain English prose — do NOT use caveman style/);
+  assert.equal([...prompt.matchAll(/MANDATORY to finish this task/g)].length, 1, 'exactly one resolution mandate');
+  assert.ok(prompt.indexOf('MANDATORY to finish this task') < prompt.indexOf('Version control (git) is enabled'), 'mandate precedes the VCS directive');
+  assert.ok(prompt.trim().endsWith('Do the thing'), 'task prompt must still be the last thing in the string');
+});
+
+test('ClaudeAgent.buildPrompt: vcsContext mandate names the project\'s complete-role status (C1184)', () => {
+  const agent = new ClaudeAgent();
+  const prompt = agent.buildPrompt('Do the thing', { vcsContext: VCS_CONTEXT, vcsSettings: VCS_CONTEXT.vcs, statusRoles: { complete: 'done' } });
+  assert.match(prompt, /posts this report as the task's resolution comment and sets `done`/);
+});
+
+test('ClaudeAgent.buildPrompt: no vcsContext -> legacy create_task_comment + update_task note unchanged', () => {
+  const agent = new ClaudeAgent();
+  const prompt = agent.buildPrompt('Do the thing', { vcsSettings: GIT_ALL_ON });
+  assert.ok(prompt.includes('`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")`'));
+  assert.ok(prompt.includes('Post it in the SAME tool-call batch as the final `update_task(status="completed")`.'));
+  assert.ok(!prompt.includes('complete_task'), 'no guarded-completion text without a vcsContext');
+});
+
+test('ClaudeAgent.buildPrompt: designMode wins over vcsContext — bare /design brief, no completion mandate', () => {
+  const agent = new ClaudeAgent();
+  const prompt = agent.buildPrompt('Do the thing', { designMode: true, vcsContext: VCS_CONTEXT, vcsSettings: VCS_CONTEXT.vcs });
+  assert.ok(prompt.startsWith('/design '));
+  assert.ok(!prompt.includes('complete_task'));
+  assert.ok(!prompt.includes('MANDATORY'));
+});
+
+test('ClaudeAgent.buildPrompt: SIMPLE_MODE wins over vcsContext — bare prompt regardless', () => {
+  const script = [
+    `process.env.SIMPLE_MODE = 'true';`,
+    `const ClaudeAgent = require(${JSON.stringify(path.join(__dirname, 'claude-agent.js'))});`,
+    `const agent = new ClaudeAgent();`,
+    `const context = ${JSON.stringify(VCS_CONTEXT)};`,
+    `const prompt = agent.buildPrompt('Do the thing', { vcsContext: context, vcsSettings: context.vcs });`,
+    `process.stdout.write(prompt);`,
+  ].join('\n');
+  const out = execFileSync(process.execPath, ['-e', script], { encoding: 'utf8' });
+  assert.equal(out, 'Do the thing');
+});
+
 // ── CodexAgent.buildPrompt ──
 
 test('CodexAgent.buildPrompt: no opts.vcsSettings -> no VCS text at all; VCS_OFF -> prohibition block', () => {
@@ -265,6 +325,23 @@ test('CodexAgent.buildPrompt: echoed kickoff instruction cannot false-trigger an
   assert.ok(instruction, 'Codex kickoff must explain the standalone sentinel output');
   assert.equal(matchPromptLine(instruction, CODEX_PROMPT_PATTERNS), null);
   assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*plan ready[.!]?\s*$/im);
+});
+
+test('CodexAgent.buildPrompt: vcsContext mandate retries on refusal and keeps the report when blocked, echo-safe (TPT576)', () => {
+  const agent = new CodexAgent();
+  const prompt = agent.buildPrompt('Do the thing', { vcsContext: VCS_CONTEXT, vcsSettings: VCS_CONTEXT.vcs });
+  const lines = prompt.split('\n');
+  const mandate = lines.find((line) => line.startsWith('- MANDATORY: supply ONE self-authored plain-English resolution to tipatask-local complete_task.'));
+  assert.ok(mandate, 'Codex vcsContext resolution mandate present');
+  assert.match(mandate, /Never also call `create_task_comment` or `update_task` to complete the task\./);
+  assert.match(mandate, /fix the blockers it lists \(e\.g\. TASK_COMMIT_MISSING: commit first\) and call it again/);
+  assert.match(mandate, /post the same report with `create_task_comment\(task_key, content, type="resolution"\)` so it is not lost/);
+  assert.ok(!prompt.includes('update_task(status='));
+  const directive = lines.find((line) => line.startsWith('Finish with tipatask-local complete_task'));
+  assert.match(directive, /verifies current settings, the required task commit \(when commits are on\) and local merges/);
+  for (const line of [mandate, directive]) {
+    assert.equal(matchPromptLine(line, CODEX_PROMPT_PATTERNS), null, `Codex table matched: ${line}`);
+  }
 });
 
 // ── PiAgent.buildPrompt ──
@@ -302,12 +379,15 @@ test('PiAgent.buildPrompt: every VCS directive shape cannot false-trigger the at
       { vcsSettings: GIT_ALL_ON, discovery: true },
       { vcsSettings: { ...GIT_ALL_ON, merge: false }, discovery: true },
       { vcsSettings: { ...GIT_ALL_ON, commit: false }, discovery: true },
+      // Commits on, nothing else: the mandatory commit line on its own (TPT573).
+      { vcsSettings: { type: 'git', worktree: false, commit: true, pr: false, merge: false }, discovery: true },
       { vcsSettings: SVN, discovery: false },
     ];
     for (const { vcsSettings, discovery } of scenarios) {
       const prompt = agent.buildPrompt('Do the thing.', { taskTags: ['tt-pi-session'], projectPath: dir, vcsSettings, discovery });
 
       assert.match(prompt, /Version control/);
+      assert.equal(prompt.includes('Commit is MANDATORY'), vcsSettings.commit === true, 'compact mandatory commit line follows the commit flag');
 
       for (const line of prompt.split('\n')) {
         assert.equal(matchPromptLine(line, PI_PROMPT_PATTERNS), null, `PI table matched: ${line}`);
@@ -359,6 +439,7 @@ test('assembled VCS permissions follow each flag for all task agents', () => {
       once(prompt, /Version control \(git\)/, `${agent.id}: one git policy`);
       assert.equal(prompt.includes('Work in a dedicated git worktree'), worktree);
       assert.equal(/Commit (?:your work exactly )?once/.test(prompt), commit);
+      assert.equal(prompt.includes('Commit is MANDATORY'), commit, `${agent.id}: mandatory commit line follows the commit flag`);
       assert.equal(prompt.includes('Do not commit:'), !commit);
       assert.equal(prompt.includes('Open a pull/merge request'), pr);
       assert.equal(prompt.includes('`git merge task/<TASK_KEY>`'), merge && commit);
@@ -385,3 +466,28 @@ test('buildVcsDirective (TPT345): current-branch base, .gitignore check, commit-
   assert.doesNotMatch(compact, /\?/);
   assert.ok(compact.includes('Work in a dedicated git worktree'));
 });
+
+// TPT573 — an enabled Commits flag is a hard completion requirement, not a permission the agent
+// may skip or hand back to the user. Full (Claude/Codex) and compact (Pi), every commit-on combo.
+for (const compact of [false, true]) {
+  test(`buildVcsDirective (TPT573): commits on -> commit is mandatory, never skipped or asked about (compact=${compact})`, () => {
+    for (const worktree of [false, true]) for (const pr of [false, true]) for (const merge of [false, true]) {
+      const label = `worktree=${worktree} pr=${pr} merge=${merge}`;
+      const directive = buildVcsDirective({ type: 'git', worktree, commit: true, pr, merge }, { compact });
+      const mandatory = directive.split('\n').filter(line => /\bmandatory\b/i.test(line));
+      assert.equal(mandatory.length, 1, `exactly one mandatory commit line (${label})`);
+      const [line] = mandatory;
+      assert.match(line, /^- Commit is MANDATORY\b/, label);
+      assert.match(line, /not complete until[^\n]*`git add`[^\n]*`git commit`/, label);
+      assert.ok(line.includes('`<TASK_KEY>: <summary>`'), `commit message must start with the task key (${label})`);
+      assert.match(line, /Never skip the commit, never ask the user whether to commit/, label);
+      assert.match(line, /never leave (?:this task's|task) changes uncommitted/, label);
+      assert.match(line, /stage only/, label);
+      assert.match(line, /BEFORE (?:you mark|marking) the task completed/, label);
+      assert.doesNotMatch(line, /\?/, label);
+    }
+    for (const vcs of [{ ...GIT_ALL_ON, commit: false }, GIT_WORKTREE_ONLY, VCS_OFF, SVN]) {
+      assert.doesNotMatch(buildVcsDirective(vcs, { compact }), /mandatory/i, 'only an enabled Commits flag makes the commit mandatory');
+    }
+  });
+}
