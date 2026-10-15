@@ -49,15 +49,27 @@ function hookCommands(serverRoot) {
 
 // Explicit env: nothing from the session that runs the tests (a Task App terminal carries
 // TIPATASK_TOOL_EXEC itself) may pick a branch. The test guard still loads in Node children.
+// Stdin comes from a file, never spawnSync `input`: the skip and wrapper branches exit without
+// reading it, and on Linux Node's write into that closed pipe fails with EPIPE.
 function run(command, env = {}, input = '{}') {
   const inherited = {};
   for (const key of ['NODE_OPTIONS', 'TIPATASK_TEST_VIOLATIONS']) {
     if (process.env[key]) inherited[key] = process.env[key];
   }
-  const result = spawnSync('/bin/sh', ['-c', command], {
-    env: { PATH: process.env.PATH, HOME: os.homedir(), ...inherited, ...env },
-    input, encoding: 'utf8', timeout: 20000,
-  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-input-'));
+  const inputFile = path.join(dir, 'stdin.json');
+  fs.writeFileSync(inputFile, input);
+  const fd = fs.openSync(inputFile, 'r');
+  let result;
+  try {
+    result = spawnSync('/bin/sh', ['-c', command], {
+      env: { PATH: process.env.PATH, HOME: os.homedir(), ...inherited, ...env },
+      stdio: [fd, 'pipe', 'pipe'], encoding: 'utf8', timeout: 20000,
+    });
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
   assert.equal(result.error, undefined);
   return result;
 }
