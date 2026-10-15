@@ -90,9 +90,9 @@ function createSessionValidationRecorder({ env = process.env, now = Date.now, cp
         waitingMs: number(at - s.queuedAt), provider: ['codex', 'claude', 'pi', 'gemini'].includes(s.taskAgent) ? s.taskAgent : 'unknown' }));
       write({ type: 'sample', host: snapshot.host, processes: snapshot.processes,
         cpuBusyPercent, loadAverage: os.loadavg(), intervalMs, queue,
-        admission: fields(admission, ['mode', 'cap', 'running', 'reason', 'coordinationReason', 'coordinated',
+        admission: fields(admission, ['mode', 'cap', 'rampCap', 'running', 'reason', 'coordinationReason', 'coordinated',
           'instances', 'censusPidCount', 'unregisteredCount', 'reservedBytes', 'requiredBytes', 'alarm', 'swapBytes']),
-        policy: fields(admission?.policy, ['mode', 'ceiling', 'fallbackCap', 'reserveMiB', 'reserveFraction', 'burstMiB',
+        policy: fields(admission?.policy, ['mode', 'ceiling', 'fallbackCap', 'rampStepMs', 'rampCeiling', 'reserveMiB', 'reserveFraction', 'burstMiB',
           'ordinaryMiB', 'unknownMiB', 'recoveryMs', 'recoveryExtraMiB', 'swapCloseMiB', 'swapReopenMiB', 'startIntervalMs']) });
       if (snapshot.host.pressure !== 'normal') log('[session-probe] STOP stage launches: host pressure is not normal; inspect before continuing');
     },
@@ -133,7 +133,7 @@ function analyzeSessionValidation(records, { stage = 6, evidence = {}, ui = [], 
     if (i && (delta <= 0 || delta > LIMITS.staleMs)) fail('sample-gaps');
     if (!host.fresh || host.status !== 'ok' || !proc.fresh || proc.status !== 'ok' || proc.truncated) fail('unknown-or-stale-metrics');
     if (host.pressure !== 'normal') fail('host-pressure');
-    if (!['static', 'pressure'].includes(s.admission?.mode) || number(s.admission?.cap) === null
+    if (!['static', 'pressure', 'ramp'].includes(s.admission?.mode) || number(s.admission?.cap) === null
       || number(s.admission?.reservedBytes) === null) fail('admission-diagnostics-unavailable');
     const count = proc.admissionSlots;
     maxConcurrency = Math.max(maxConcurrency, number(count) ?? 0);

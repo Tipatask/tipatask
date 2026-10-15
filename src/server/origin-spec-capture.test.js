@@ -257,12 +257,12 @@ test('postOriginSpecComment: zero orphan attachments -> no Attachments heading i
 
 const API_BACKEND_SRC = fs.readFileSync(require.resolve('./api-backend.js'), 'utf8');
 
-// Match the CALL site specifically (`await _rawUpdateTask(id, fields)`), not the
-// function definition (`async function _rawUpdateTask(id, fields) {`) which appears
+// Match the CALL site specifically (`await _rawUpdateTask(id, fields, opts)`), not the
+// function definition (`async function _rawUpdateTask(id, fields, opts = {}) {`) which appears
 // earlier in the file and would otherwise make both ordering checks vacuous.
-const RAW_UPDATE_CALL = 'await _rawUpdateTask(id, fields)';
+const RAW_UPDATE_CALL = 'await _rawUpdateTask(id, fields, opts)';
 
-test('api-backend.js: readOriginSpecSnapshot() is called BEFORE _rawUpdateTask(id, fields) inside updateTask', () => {
+test('api-backend.js: readOriginSpecSnapshot() is called BEFORE _rawUpdateTask(id, fields, opts) inside updateTask', () => {
   const snapshotIdx = API_BACKEND_SRC.indexOf('readOriginSpecSnapshot(');
   const rawUpdateIdx = API_BACKEND_SRC.indexOf(RAW_UPDATE_CALL);
   assert.ok(snapshotIdx > -1, 'readOriginSpecSnapshot( must be called from api-backend.js');
@@ -270,7 +270,7 @@ test('api-backend.js: readOriginSpecSnapshot() is called BEFORE _rawUpdateTask(i
   assert.ok(snapshotIdx < rawUpdateIdx, 'the snapshot must be read BEFORE the PATCH overwrites the live description');
 });
 
-test('api-backend.js: postOriginSpecComment() is called AFTER _rawUpdateTask(id, fields) inside updateTask', () => {
+test('api-backend.js: postOriginSpecComment() is called AFTER _rawUpdateTask(id, fields, opts) inside updateTask', () => {
   const postIdx = API_BACKEND_SRC.indexOf('postOriginSpecComment(');
   const rawUpdateIdx = API_BACKEND_SRC.indexOf(RAW_UPDATE_CALL);
   assert.ok(postIdx > -1, 'postOriginSpecComment( must be called from api-backend.js');

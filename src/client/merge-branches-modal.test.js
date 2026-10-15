@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fs from 'node:fs';
+import vm from 'node:vm';
 
 // (TPT345) merge-branches-modal.js imports cleanly under node (module scope only declares
 // state; every DOM access is inside a function) — the import itself catches a broken specifier
@@ -49,7 +50,7 @@ test('publish and cleanup are confirmed through showActionConfirm before calling
 
 test('Resolve with agent opens the task terminal through window.TipTask with a verbatim prompt', () => {
   assert.match(SRC, /window\.TipTask\?\.openTerminal/);
-  assert.match(SRC, /const opts = \{ prompt \}/);
+  assert.match(SRC, /const opts = \{ prompt, relaunch: true \}/, '(TPT663) relaunch replaces a retained exited session instead of reattaching to it');
   assert.match(SRC, /truncatePrompt\(c\.handoffPrompt \|\| '', MAX_DESC_LEN\)/);
   assert.doesNotMatch(SRC, /from '\.\/console-modal\.js'/, 'no static console-modal import (xterm CSS chain under node)');
   assert.match(SRC, /state\.activeSessions\?\.has\?\.\(taskKey\)/, 'resume case copies the prompt instead');
@@ -84,4 +85,85 @@ test('every await inside the modal is followed by the owningOverlay guard', () =
     if (/await /.test(body) && !/_overlay (!==|===) owningOverlay/.test(body)) missing.push(match[1]);
   }
   assert.deepEqual(missing, [], 'async functions awaiting without the stale-overlay guard');
+});
+
+// ── (TPT663) Resolve with agent under a vm harness (task-finish.test.js pattern): module source with
+// the imports stripped runs in its own context, so the non-exported `_resolveWithAgent` and the
+// job state fed through handleMergeWsMessage are reachable. No DOM: `close()` and the WS handler
+// are document-safe while no overlay is mounted, which is the exact state the hand-off runs in.
+const model = await import('./merge-branches-model.js');
+
+function harness(overrides = {}) {
+  const calls = { openTerminal: [], openAgentSelectorModal: [], clipboard: [], toasts: [] };
+  const env = {
+    window: { TipTask: {
+      openTerminal: (...args) => { calls.openTerminal.push(args); },
+      openAgentSelectorModal: (...args) => { calls.openAgentSelectorModal.push(args); },
+    } },
+    navigator: { clipboard: { writeText: async text => { calls.clipboard.push(text); } } },
+    setTimeout, clearTimeout, console,
+    state: {
+      activeSessions: new Set(), exitedSessions: new Set(['TPT1']),
+      taskTitleById: new Map([['TPT1', 'Feature one']]), taskStatusById: new Map([['TPT1', 'completed']]),
+      availableAgents: ['claude'], sessionAgent: 'claude',
+    },
+    api: { merge: {} },
+    t: (key, vars) => (vars ? `${key}:${JSON.stringify(vars)}` : key),
+    tc: key => key,
+    escapeAttr: v => String(v),
+    showToast: (msg, kind) => { calls.toasts.push([msg, kind || 'info']); },
+    showProgressToast: () => ({ update() {}, done() {}, fail() {} }),
+    showActionConfirm: async () => true,
+    activateDialogFocus: () => ({ close() {} }),
+    pushNotification: () => {},
+    MAX_DESC_LEN: 6000,
+    ...model,
+    ...overrides,
+  };
+  vm.createContext(env);
+  vm.runInContext(SRC.replace(/^import [\s\S]*?;\n/gm, '').replace(/^export /gm, ''), env);
+  env.handleMergeWsMessage({ type: 'merge:conflict', jobId: 'j1', conflict: { taskKey: 'TPT1', repoId: 'root', branch: 'task/TPT1', conflictedPaths: ['a.js'], handoffPrompt: 'Resolve the merge conflict for TPT1.' } });
+  calls.toasts.length = 0;
+  return { env, calls };
+}
+
+test('an exited-session task takes the launch path: no clipboard, openTerminal gets { prompt, relaunch: true } and the real status', async () => {
+  const { env, calls } = harness();
+  await env._resolveWithAgent();
+  assert.deepEqual(calls.clipboard, [], 'an exited session is not a resume — the prompt travels on the WS URL');
+  // JSON compare: the opts object is created inside the vm realm (its own Object.prototype).
+  assert.equal(JSON.stringify(calls.openTerminal), JSON.stringify([['TPT1', 'Feature one', '', 'completed', { prompt: 'Resolve the merge conflict for TPT1.', relaunch: true }]]));
+  assert.equal(calls.openAgentSelectorModal.length, 0);
+  assert.deepEqual(calls.toasts, [['merge.resumeHint', 'info']]);
+});
+
+test('a live session keeps the clipboard fallback; relaunch still rides along (wantsRelaunch ignores it for a live session)', async () => {
+  const { env, calls } = harness();
+  env.state.activeSessions.add('TPT1');
+  await env._resolveWithAgent();
+  assert.deepEqual(calls.clipboard, ['Resolve the merge conflict for TPT1.']);
+  assert.equal(JSON.stringify(calls.openTerminal), JSON.stringify([['TPT1', 'Feature one', '', 'completed', { prompt: 'Resolve the merge conflict for TPT1.', relaunch: true }]]));
+  assert.deepEqual(calls.toasts, [['merge.promptCopiedResume', 'info'], ['merge.resumeHint', 'info']]);
+});
+
+test('with several agents and no session agent the picker receives the same { prompt, relaunch: true } opts', async () => {
+  const { env, calls } = harness({ state: {
+    activeSessions: new Set(), exitedSessions: new Set(['TPT1']),
+    taskTitleById: new Map([['TPT1', 'Feature one']]), taskStatusById: new Map([['TPT1', 'completed']]),
+    availableAgents: ['claude', 'codex'], sessionAgent: null,
+  } });
+  await env._resolveWithAgent();
+  assert.equal(calls.openTerminal.length, 0);
+  assert.equal(JSON.stringify(calls.openAgentSelectorModal), JSON.stringify([['TPT1', 'Feature one', '', 'completed', { prompt: 'Resolve the merge conflict for TPT1.', relaunch: true }]]));
+});
+
+test('the prompt on the launch opts is capped at MAX_DESC_LEN while the clipboard copy stays whole', async () => {
+  const long = 'x'.repeat(50);
+  const { env, calls } = harness({ MAX_DESC_LEN: 10 });
+  env.handleMergeWsMessage({ type: 'merge:conflict', jobId: 'j1', conflict: { taskKey: 'TPT1', handoffPrompt: long } });
+  env.state.activeSessions.add('TPT1');
+  await env._resolveWithAgent();
+  assert.deepEqual(calls.clipboard, [long]);
+  assert.equal(calls.openTerminal[0][4].prompt, model.truncatePrompt(long, 10));
+  assert.equal(calls.openTerminal[0][4].relaunch, true);
 });

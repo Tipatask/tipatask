@@ -17,12 +17,14 @@ try {
 }
 const config = require('./config');
 const { assertCredentialsUsable, tokenExpiryMs, formatTokenExpiry } = require('./auth-guard');
+const { terminalCopy, normalizeLocale, refreshErrorCopy } = require('./terminal-copy'); // (TPT9002) project-language notices
 const { refreshProjectToken } = require('./token-refresh');
 const { getApiCredentials } = require('./api-credentials');
 const { getTaskAgent } = require('./task-agent');
 const BaseTaskAgent = require('./task-agent/base-agent');
 const { buildLegacyPatternTable, sanitizePromptText, isClaudeReplReady, matchClaudeBgAgentsLine, CODEX_COMPOSER_PLACEHOLDERS } = require('./task-agent/prompt-detect');
 const { reflowChunk, carveReflowLines, resetReflow } = require('./screen-reflow');
+const { matchClaudePlanOutcomeLine, trackTypedLine, classifyTypedSubmission } = require('./plan-approval-detect'); // (TPT654)
 const { maxCommentId, isTerminalTailExitComment } = require('./exit-resolution');
 const { syncOnSessionStart, isSyncAsYouGoEnabled } = require('../cli/knowledge-sync');
 const archCache = require('../mcp/architecture-cache');
@@ -452,6 +454,10 @@ function feedAttentionChunk(session, agent, rawChunk, cleanChunk, now = Date.now
   // feedCodexPlan below) — scanning the legacy+row union would double-count and scramble order.
   if (agent.id === 'claude') trackBgAgents(session, rowChunk == null ? legacyLines : rowLines, now);
   let hit = agent.matchPromptLines(lines);
+  // (TPT654) The answered ExitPlanMode dialog collapses to a transcript row (or the mode footer
+  // changes after a shift+tab) — a plan approved inside Claude's own TUI. Same stream-order row
+  // set as trackBgAgents() above; acts only on a planning session past its kickoff.
+  if (agent.id === 'claude') trackClaudePlanOutcome(session, rowChunk == null ? legacyLines : rowLines);
   if (agent.id === 'codex') {
     feedCodexPlan(session, agent, rowChunk == null ? legacyLines : rowLines,
       rowChunk == null ? session._attentionLineCarry : session._attentionRowCarry, hit);
@@ -772,6 +778,35 @@ function emitTerminalWarning(session, text) {
   }
 }
 
+// (TPT9002) The project's UI language, for the text this file writes into the PTY stream. Read
+// live from .tipatask/config.json (mtime-cached by readProjectConfig()), so a Settings change
+// applies to the next notice without a restart; anything unreadable → 'en'. The same lookup
+// serves the watchdog sweep (index.js passes it as `resolveLocale`).
+function sessionLocale(session) {
+  const root = (session && session.projectPath) || config.PROJECT_ROOT;
+  if (!root) return 'en';
+  try {
+    const cfg = require('./project-config').readProjectConfig(root);
+    return normalizeLocale(cfg && cfg.language);
+  } catch {
+    return 'en';
+  }
+}
+
+function sessionCopy(session, key, params) {
+  return terminalCopy(sessionLocale(session), key, params);
+}
+
+// Keyed twins of emitTerminalNotice()/emitTerminalWarning(): `key` names a terminal-copy.js
+// entry, rendered in the session's project language.
+function noticeCopy(session, key, params) {
+  emitTerminalNotice(session, sessionCopy(session, key, params));
+}
+
+function warningCopy(session, key, params) {
+  emitTerminalWarning(session, sessionCopy(session, key, params));
+}
+
 // ── API token expiry watch (TPT349) ──
 // A session's remote MCP server authenticates with the API_TOKEN it was launched with (7-day
 // JWT). Shortly before that token expires the Task App renews it — when it can — and tells the
@@ -791,16 +826,17 @@ function scheduleTokenExpiryWatch({ expMs, leadMs = TOKEN_WATCH_LEAD_MS, now = D
 
 // What to tell the user when the spawn token is about to lapse. `saved`: a newer token is now
 // in .tipatask/config.json. `headersHelper`: this agent re-reads that file on MCP reconnect.
-function buildTokenExpiryNotice({ expMs, now = Date.now(), saved, headersHelper }) {
+function buildTokenExpiryNotice({ expMs, now = Date.now(), saved, headersHelper, locale = 'en' }) {
   const when = formatTokenExpiry(expMs, now);
-  const head = `The API token this session started with ${now >= expMs ? 'expired' : 'expires'} at ${when}.`;
+  const copy = (key, params) => terminalCopy(locale, key, params);
+  const head = copy(now >= expMs ? 'notice.token.headExpired' : 'notice.token.headExpires', { when });
   if (saved && headersHelper) {
-    return { warn: false, text: `${head} A fresh token is saved — in the agent type /mcp → tipatask → Reconnect (restart the session if MCP still answers 401).` };
+    return { warn: false, text: copy('notice.token.savedReconnect', { head }) };
   }
   if (saved) {
-    return { warn: true, text: `${head} A fresh token is saved, but this agent only reads it at launch — task tools stop at ${when}, so restart the session to pick it up. Until then the agent can fall back to REST (see CLAUDE.md, MCP 401 fallback).` };
+    return { warn: true, text: copy('notice.token.savedRestart', { head, when }) };
   }
-  return { warn: true, text: `${head} It could not be refreshed automatically. Sign in again (Project ▸ Re-authenticate / Change Account), then in the agent type /mcp → tipatask → Reconnect.` };
+  return { warn: true, text: copy('notice.token.notSaved', { head }) };
 }
 
 async function onTokenExpiryNear(session, { spawnToken, expMs, headersHelper }) {
@@ -822,7 +858,7 @@ async function onTokenExpiryNear(session, { spawnToken, expMs, headersHelper }) 
     console.log(`[terminal] token expiry watch: refresh failed: ${err.message}`);
   }
   if (!session.alive || session._terminated) return;
-  const { warn, text } = buildTokenExpiryNotice({ expMs, saved, headersHelper });
+  const { warn, text } = buildTokenExpiryNotice({ expMs, saved, headersHelper, locale: sessionLocale(session) });
   (warn ? emitTerminalWarning : emitTerminalNotice)(session, text);
 }
 
@@ -856,9 +892,11 @@ function killSpawnedPty(ptyProcess) {
 // (TPT357) `{ reason, reasonText }` when the watchdog ended the session, `{}` otherwise — spread
 // into both the WS `exit` frame and the onSessionExit() payload so the console modal and the
 // resolution comment see the same reason.
-function exitReasonFields(session) {
+// (TPT9002) `display: true` picks the project-language text the console modal shows; the default
+// is the English text the resolution comment is written with (identical for an English project).
+function exitReasonFields(session, { display = false } = {}) {
   const r = session && session._exitReason;
-  return r ? { reason: r.kind, reasonText: r.text } : {};
+  return r ? { reason: r.kind, reasonText: display ? (r.display || r.text) : r.text } : {};
 }
 
 // The WS `exit` frame a naturally-exited terminal session sends its client. Split out of the
@@ -871,7 +909,7 @@ function buildTerminalExitFrame(session, exitCode, filesRead) {
     code: exitCode,
     tokens: null,
     filesRead: filesRead && filesRead.length > 0 ? filesRead : undefined,
-    ...exitReasonFields(session),
+    ...exitReasonFields(session, { display: true }),
   };
 }
 
@@ -892,17 +930,31 @@ const RUNAWAY_FORCE_KILL_MS = 1500; // SIGTERM -> SIGKILL follow-up delay, same 
 // count. A session the watchdog had paused is continued first \u2014 a stopped process does not
 // act on SIGTERM until it runs again. Returns { text, first }, or null when there is nothing
 // live to kill.
-function killRunawaySession(session, { count, threshold, rssMb = 0, limitMb = 0, reason, snapshot, summary, policy = {} } = {}) {
+// (TPT9002) The kill sentence in one language. `summary` is the process breakdown already built
+// for that language (summarizeDescendants(…, locale)).
+function buildKillText(locale, { reason, count, rssMb, threshold, limitMb, policy = {}, summary }) {
+  const text = terminalCopy(locale, 'watchdog.killed', {
+    reason: describeRunawayReason(reason, locale),
+    tree: describeTree(count, rssMb, locale),
+    policy: describeActPolicy(threshold, { limitMb, ...policy, locale }),
+  });
+  return summary ? `${text} ${terminalCopy(locale, 'watchdog.topProcesses', { summary })}` : text;
+}
+
+function killRunawaySession(session, { count, threshold, rssMb = 0, limitMb = 0, reason, snapshot, summary, summaryLocal, locale: localeOpt, policy = {} } = {}) {
   if (!session || !session.alive || !session.ptyPid) return null;
   const first = !session._exitReason;
   const byMemory = reason?.startsWith('memory');
-  const text = `Watchdog killed this session: ${describeRunawayReason(reason)}; ${describeTree(count, rssMb)} `
-    + `(kill ${describeActPolicy(threshold, { limitMb, ...policy })}).`
-    + (summary ? ` Top processes: ${summary}.` : '');
+  // (TPT9002) `text` stays English for the exit resolution comment; `display` is the same
+  // sentence in the project language — the buffer, the live notice, the exit frame and the
+  // session-runaway prompt all show that one.
+  const text = buildKillText('en', { reason, count, rssMb, threshold, limitMb, policy, summary });
+  const locale = typeof localeOpt === 'string' ? localeOpt : sessionLocale(session);
+  const display = locale === 'en' ? text : buildKillText(locale, { reason, count, rssMb, threshold, limitMb, policy, summary: summaryLocal || summary });
   if (first) {
-    session._exitReason = { kind: 'runaway-killed', count, threshold, text, ...(byMemory ? { rssMb, limitMb } : {}) };
-    session.buffer += `\r\n\x1b[90m[Task App] ${text}\x1b[0m\r\n`;
-    emitTerminalNotice(session, text);
+    session._exitReason = { kind: 'runaway-killed', count, threshold, text, display, ...(byMemory ? { rssMb, limitMb } : {}) };
+    session.buffer += `\r\n\x1b[90m[Task App] ${display}\x1b[0m\r\n`;
+    emitTerminalNotice(session, display);
   }
   if (session._pause) {
     signalTargets(session._pause.targets, 'SIGCONT');
@@ -919,7 +971,7 @@ function killRunawaySession(session, { count, threshold, rssMb = 0, limitMb = 0,
     }
   }, RUNAWAY_FORCE_KILL_MS);
   if (forceTimer.unref) forceTimer.unref();
-  return { text, first };
+  return { text: display, first };
 }
 
 // ── Watchdog pause / resume ──
@@ -949,7 +1001,7 @@ function unionTargets(a, b) {
 // SIGSTOP — and fold any new targets into the stored set. Returns { text, first }, or null
 // when there is no live session or nothing could be signaled (the caller then falls back to
 // a warning rather than reporting a pause that did not happen).
-function pauseRunawaySession(session, { count, threshold, rssMb = 0, limitMb = 0, reason, snapshot, summary, policy = {} } = {}) {
+function pauseRunawaySession(session, { count, threshold, rssMb = 0, limitMb = 0, reason, snapshot, summary, summaryLocal, locale: localeOpt, policy = {} } = {}) {
   if (!session || !session.alive || !session.ptyPid) return null;
   const signaled = signalTargets(resolveTreeTargets(snapshot, session.ptyPid), 'SIGSTOP');
   const first = !session._pause;
@@ -961,11 +1013,17 @@ function pauseRunawaySession(session, { count, threshold, rssMb = 0, limitMb = 0
     emitTerminalState(session); // (TPT443) keep the paused banner's figures current
     return { text: session._pause.text, first: false };
   }
-  const why = `${describeRunawayReason(reason)}; ${describeTree(count, rssMb)} `
-    + `(warn ≥${threshold}; pause ${describeActPolicy(threshold, { limitMb, ...policy })})`;
-  const text = `Watchdog paused this session: ${why}. Nothing was killed — every process is stopped `
-    + `and keeps its state. Resume the session to continue, or terminate it to free its memory.`
-    + (summary ? ` Top processes: ${summary}.` : '');
+  // (TPT9002) Written in the project language: the buffer, the live warning and the
+  // session-runaway prompt all show this text; nothing English-only reads it.
+  const locale = typeof localeOpt === 'string' ? localeOpt : sessionLocale(session);
+  const pausedText = terminalCopy(locale, 'watchdog.paused', {
+    reason: describeRunawayReason(reason, locale),
+    tree: describeTree(count, rssMb, locale),
+    threshold,
+    policy: describeActPolicy(threshold, { limitMb, ...policy, locale }),
+  });
+  const shownSummary = locale === 'en' ? summary : (summaryLocal || summary);
+  const text = shownSummary ? `${pausedText} ${terminalCopy(locale, 'watchdog.topProcesses', { summary: shownSummary })}` : pausedText;
   session._pause = {
     at: Date.now(),
     reason: reason || 'count',
@@ -1008,7 +1066,7 @@ function resumeRunawaySession(session) {
     state.lastRssMb = null;
     state.resumeBase = { count: pause.count || 0, rssMb: pause.rssMb || 0 };
   }
-  const text = 'Session resumed. The watchdog pauses it again only if it keeps growing.';
+  const text = sessionCopy(session, 'watchdog.resumed');
   session.buffer += `\r\n\x1b[90m[Task App] ${text}\x1b[0m\r\n`;
   emitTerminalNotice(session, text);
   emitTerminalState(session); // (TPT443) clears the paused banner on the attached client
@@ -1093,10 +1151,10 @@ function armApprovalWatchdog(session, agent, isRetry = false) {
     };
     if (!agent.approvalStalled(session, ctx)) return;
     if (isRetry) {
-      emitTerminalNotice(session, `${agent.label} approval still looks stalled after a retry (no real activity — the model may keep returning an empty or malformed reply). Check the model configured for this project.`);
+      noticeCopy(session, 'notice.approval.stalledAfterRetry', { label: agent.label });
       return;
     }
-    emitTerminalNotice(session, `${agent.label} approval looks stalled (no real activity yet) — retrying once.`);
+    noticeCopy(session, 'notice.approval.stalledRetrying', { label: agent.label });
     agent.retryApproval(session);
     armApprovalWatchdog(session, agent, true);
   }, ms);
@@ -1112,15 +1170,241 @@ function approvePlan(session) {
   session.agentPlanReady = false;
   if (session.terminalPhase === 'executing') {
     emitTerminalState(session);
-    emitTerminalNotice(session, 'Plan is already approved.');
+    noticeCopy(session, 'notice.plan.alreadyApproved');
     return;
   }
   const agent = getTaskAgent(session.taskAgent);
   session.terminalPhase = 'executing';
   emitTerminalState(session);
-  emitTerminalNotice(session, 'Plan approved. Continuing in execution mode.');
+  noticeCopy(session, 'notice.plan.approved');
   agent.approvePlan(session, config);
   armApprovalWatchdog(session, agent);
+}
+
+// ── In-TUI plan approval (TPT654) ──
+// The phase change approvePlan() makes, for a plan the user approved inside the agent's own TUI
+// instead of through the Task App: Claude's ExitPlanMode dialog answered in the xterm (`how:
+// 'dialog'`), plan mode left via shift+tab (`'mode'`), or an approval-worded line typed into
+// Codex's/Pi's composer after plan-ready latched (`'typed'`) — see plan-approval-detect.js. No
+// approval keystrokes are sent (the agent already has its go-ahead) and no watchdog is armed; the
+// VCS context directive Codex's approvePlan() pastes is not re-sent either (the kickoff carries
+// it). Without this flip the run stayed 'planning' for its whole life, so neither the idle
+// completion nudge (maybeNudgeIdleSession) nor the exit backstop (flagTaskLeftUncommitted) ever
+// guarded its commit requirement. Returns false (no-op) unless the session is still planning.
+function markPlanApprovedInTui(session, how) {
+  if (!session || session.terminalPhase !== 'planning') return false;
+  if (session.taskAgent === 'codex') invalidateCodexPlan(session);
+  if (session._planIdleTimer) { clearTimeout(session._planIdleTimer); session._planIdleTimer = null; }
+  session.codexPlanReady = false;
+  session.agentPlanReady = false;
+  if (session._attentionState?.kind === 'planReady') {
+    // The announced plan is approved — the board's "plan ready for review" ring is stale.
+    session._attentionState = null;
+    session._patternAttentionNeeded = false;
+    session.onAttentionCleared?.();
+  }
+  session.terminalPhase = 'executing';
+  session._planApprovedInTui = how;
+  emitTerminalState(session);
+  noticeCopy(session, 'notice.plan.approvedInTui');
+  console.log(`[terminal:${session.taskAgent}] Plan approved inside the agent's own TUI (${how}) for task ${session.tabId}`);
+  return true;
+}
+
+// Claude only, called per chunk from feedAttentionChunk() with the carved rows: the collapsed
+// dialog row `User approved Claude's plan` / `Exited plan mode` (answered with a Yes option) or a
+// non-plan mode footer (`accept edits on` / `auto mode on`, shift+tab) ends planning; `User
+// rejected Claude's plan:` (No, keep planning) and a `plan mode on` footer change nothing. Gated
+// on the kickoff having been delivered so nothing painted before it can count.
+function trackClaudePlanOutcome(session, lines) {
+  if (session.terminalPhase !== 'planning' || session._injectDone !== true) return;
+  for (const line of lines) {
+    const outcome = matchClaudePlanOutcomeLine(line);
+    if (outcome === 'approved') { markPlanApprovedInTui(session, 'dialog'); return; }
+    if (outcome === 'execMode') { markPlanApprovedInTui(session, 'mode'); return; }
+  }
+}
+
+// ── Idle completion nudge (TPT612) ──
+// Same wait-quiet shape as the kickoff injector (C947) and PiAgent#_submitApproval(): wait for PTY
+// silence, bracketed-paste the text, wait again, type `typedLine` when the agent refuses a
+// paste-only message (Claude, TPT445), wait again, then Enter. Every step re-checks the session,
+// so a Stop/Restart in between turns the rest into a no-op.
+function pasteAndSubmit(session, agent, text, typedLine = '') {
+  const quietMs = agent.getPasteSilenceMs();
+  const live = () => session.alive && session.pty && !session._terminated;
+  const later = (fn, ms) => { const timer = setTimeout(fn, ms); if (timer.unref) timer.unref(); };
+  // After a write, wait at least one silence window before checking: the echo of the write has
+  // not arrived yet, so lastOutputAt alone would read as already quiet.
+  const waitQuiet = (cb, afterWrite) => {
+    const ceiling = Date.now() + INJECT_MAX_WAIT_MS; // a permanently noisy PTY still gets the write
+    const check = () => {
+      if (!live()) return;
+      if (Date.now() - (session.lastOutputAt || 0) >= quietMs || Date.now() >= ceiling) { cb(); return; }
+      later(check, 100);
+    };
+    if (afterWrite) later(check, quietMs);
+    else check();
+  };
+  const steps = [() => session.pty.write(`\x1b[200~${text}\x1b[201~`)];
+  if (typedLine) steps.push(() => session.pty.write(typedLine));
+  steps.push(() => session.pty.write('\r'));
+  const run = (i) => {
+    if (i >= steps.length) return;
+    waitQuiet(() => { steps[i](); run(i + 1); }, i > 0);
+  };
+  run(0);
+}
+
+// Called by index.js's 1s sweep while terminalIdleFallbackNeeded() holds — watcher-independent.
+// Checks once per idle period (keyed on lastOutputAt) and nudges at most MAX_NUDGES times per
+// session: only an executing task session whose task is still in the in-progress role. Kind
+// 'commit' when, with commits on, the read-only check (completion-guard.js checkTaskCommit())
+// reports a commit/merge blocker; kind 'complete' (any project, TPT650) when that check is
+// verified and ready, so only the completion call is missing. A closed or blocked status, an
+// unverified settings read or a failed Git read never nudge. Never throws.
+async function maybeNudgeIdleSession(session, { backend = session && session.backend, projectRoot, deps = {} } = {}) {
+  const nudge = require('./completion-nudge');
+  if (!session || session.type !== 'terminal' || !session.alive || !session.pty || !session.taskId) return { nudged: false, reason: 'not_task_terminal' };
+  if (session.terminalPhase !== 'executing' || session._injectDone !== true) return { nudged: false, reason: 'not_executing' };
+  if (session._terminated || session._completionEmitted || session._pause) return { nudged: false, reason: 'inactive' };
+  if ((session.nudgeCount || 0) >= nudge.MAX_NUDGES) return { nudged: false, reason: 'max_nudges' };
+  if (session._nudgeInFlight || session._nudgeCheckedOutputAt === session.lastOutputAt) return { nudged: false, reason: 'already_checked' };
+  if (!backend) return { nudged: false, reason: 'no_backend' };
+  const idleSince = session.lastOutputAt;
+  session._nudgeCheckedOutputAt = idleSince;
+  session._nudgeInFlight = true;
+  try {
+    const fetchRoles = deps.fetchStatusRoles || BaseTaskAgent.fetchStatusRoles;
+    const checkCommit = deps.checkTaskCommit || require('./git-merge/completion-guard').checkTaskCommit;
+    const [task, roles] = await Promise.all([backend.getTask(session.taskId), fetchRoles(backend)]);
+    // Status first: a closed, blocked or reassigned task never costs a Git read.
+    if (!task || task.status !== roles.in_progress) return { nudged: false, reason: 'not_in_progress' };
+    const check = await checkCommit({ backend, projectRoot: projectRoot || session.projectPath || config.PROJECT_ROOT, taskId: session.taskId });
+    const blockers = check && check.verified ? check.blockers : [];
+    const kind = nudge.nudgeKind({
+      status: task.status, roles, vcs: check && check.vcs, blockers,
+      verified: !!(check && check.verified), ready: !!(check && check.ready), nudgeCount: session.nudgeCount || 0,
+    });
+    if (!kind) return { nudged: false, reason: 'no_nudge_needed' };
+    // The agent may have resumed (or the session ended) during the async checks.
+    if (!session.alive || !session.pty || session._terminated || session.lastOutputAt !== idleSince) return { nudged: false, reason: 'resumed' };
+    session.nudgeCount = (session.nudgeCount || 0) + 1;
+    const agent = getTaskAgent(session.taskAgent);
+    const count = `${session.nudgeCount}/${nudge.MAX_NUDGES}`;
+    if (kind === 'commit') {
+      console.log(`[nudge] ${session.taskId}: idle in ${task.status} with ${blockers.map(b => b.code).join(',')} — nudge ${count}`);
+      noticeCopy(session, 'notice.nudge.commit', { count });
+      pasteAndSubmit(session, agent, nudge.buildNudgePrompt(session.taskId, blockers, agent.id), session._nudgeTypedLine || '');
+    } else {
+      console.log(`[nudge] ${session.taskId}: idle in ${task.status} with completion verification ready — completion nudge ${count}`);
+      noticeCopy(session, 'notice.nudge.complete', { count });
+      pasteAndSubmit(session, agent, nudge.buildCompleteNudgePrompt(session.taskId, agent.id), session._nudgeTypedLine || '');
+    }
+    return { nudged: true, reason: 'nudged', kind };
+  } catch (err) {
+    console.error(`[nudge] ${session.taskId}: check failed: ${err.message}`);
+    return { nudged: false, reason: 'error' };
+  } finally {
+    session._nudgeInFlight = false;
+  }
+}
+
+// ── Exit backstop (TPT613) ──
+// What the backstop needs from the run that just ended, read synchronously when the exit hook
+// fires: Terminate clears alive/pty right after calling the hook, and a later run resets these
+// fields, so the backstop never reads the live session.
+function exitRunSnapshot(session) {
+  return {
+    type: session && session.type,
+    taskId: session && session.taskId,
+    projectPath: (session && session.projectPath) || '',
+    agent: (session && session.taskAgent) || '',
+    executing: !!session && session.terminalPhase === 'executing' && session._injectDone === true,
+    nudgeCount: (session && session.nudgeCount) || 0,
+    spawnedAt: (session && session._transcriptHint && session._transcriptHint.spawnedAt) || null,
+  };
+}
+
+// Called from the shared exit hook (ws-handlers.js onSessionExit) after the auto exit comment, for
+// a natural exit and for Terminate alike. A run that reached execution and left its task in the
+// in-progress role, in a project with commits on, whose read-only commit check
+// (completion-guard.js checkTaskCommit()) still reports a commit/merge blocker, is flagged:
+// on_fire when the project's strict status list has it (no legacy fallback authorizes a status
+// write), a resolution comment, and a project-scoped `task-left-uncommitted` frame. Never flagged:
+// a 'completed' exit, an objective-tab close (a confirmed bulk stop), a clean commit, an unknown
+// check, or a task a newer run (isSuperseded) or the user already picked up. Never throws.
+async function flagTaskLeftUncommitted(run, { backend, projectRoot, reason, terminateReason, exitCode, isSuperseded, deps = {} } = {}) {
+  const nudge = require('./completion-nudge');
+  if (!run || run.type !== 'terminal' || !run.taskId) return { flagged: false, reason: 'not_task_terminal' };
+  if (!run.executing) return { flagged: false, reason: 'not_executing' };
+  if (reason === 'completed' || terminateReason === 'objective-closed') return { flagged: false, reason: 'not_abandoned' };
+  if (!backend || typeof backend.getTask !== 'function' || typeof backend.createTaskComment !== 'function') return { flagged: false, reason: 'no_backend' };
+  const taskId = run.taskId;
+  const superseded = () => typeof isSuperseded === 'function' && isSuperseded() === true;
+  try {
+    const fetchRoles = deps.fetchStatusRoles || BaseTaskAgent.fetchStatusRoles;
+    const checkCommit = deps.checkTaskCommit || require('./git-merge/completion-guard').checkTaskCommit;
+    const websocket = deps.websocket || require('./websocket');
+    const [task, roles] = await Promise.all([backend.getTask(taskId), fetchRoles(backend)]);
+    // Status first: a closed, blocked or reassigned task never costs a Git read.
+    if (!task || task.status !== roles.in_progress) return { flagged: false, reason: 'not_in_progress' };
+    const check = await checkCommit({ backend, projectRoot: projectRoot || run.projectPath || config.PROJECT_ROOT, taskId });
+    const vcs = check && check.vcs;
+    const blockers = check && check.verified ? check.blockers : [];
+    if (!nudge.shouldFlagExit({ status: task.status, roles, vcs, blockers })) return { flagged: false, reason: 'no_flag_needed' };
+    let onFire = null;
+    if (typeof backend.getStatuses === 'function') {
+      try {
+        const statuses = await backend.getStatuses({ refresh: true, strict: true });
+        onFire = (statuses || []).find(s => s && s.name === 'on_fire') || null;
+      } catch { /* unknown registry: leave the status alone */ }
+    }
+    // Last look before writing: a newer run, or a status the user changed meanwhile, means the
+    // task is not abandoned.
+    if (superseded()) return { flagged: false, reason: 'superseded' };
+    const fresh = await backend.getTask(taskId);
+    if (!fresh || fresh.status !== roles.in_progress) return { flagged: false, reason: 'status_changed' };
+    let status = fresh.status;
+    if (onFire && typeof backend.updateTask === 'function') {
+      try {
+        const saved = await backend.updateTask(taskId, { status: onFire.name });
+        if (saved) {
+          status = saved.status || onFire.name;
+          websocket.emitTaskUpdated(saved, null, run.projectPath);
+        }
+      } catch (err) {
+        console.error(`[exit-backstop] ${taskId}: status write failed: ${err.message}`);
+      }
+    }
+    try {
+      await backend.createTaskComment(taskId, nudge.buildExitBackstopComment(taskId, blockers, {
+        reason, exitCode, inProgress: roles.in_progress, nudgeCount: run.nudgeCount,
+        onFire: !!onFire && status === onFire.name, merge: !!(vcs && vcs.merge),
+      }), 'resolution');
+    } catch (err) {
+      console.error(`[exit-backstop] ${taskId}: comment failed: ${err.message}`);
+    }
+    const eligible = nudge.uncommittedBlockers(blockers);
+    if (!superseded()) {
+      const exitId = `${taskId}@${run.spawnedAt || Date.now()}`;
+      // (TPT664) Server-side record first: every window rebuilds its flag from it (GET /api/sessions
+      // `leftUncommitted` + the connect replay), and a closed task:updated drops it by these names.
+      const registry = deps.leftUncommitted || require('./left-uncommitted');
+      registry.record(run.projectPath, taskId, {
+        exitId, blockers: eligible, status, agent: run.agent, nudgeCount: run.nudgeCount, at: Date.now(),
+        closedNames: [roles.complete, roles.canceled],
+      });
+      websocket.emitTaskLeftUncommitted(run.projectPath, taskId, eligible, {
+        status, nudgeCount: run.nudgeCount, agent: run.agent, exitId,
+      });
+    }
+    console.log(`[exit-backstop] ${taskId}: session ended in ${roles.in_progress} with ${eligible.map(b => b.code).join(',')} — flagged (status ${status})`);
+    return { flagged: true, reason: 'flagged', blockers: eligible, status };
+  } catch (err) {
+    console.error(`[exit-backstop] ${taskId}: check failed: ${err.message}`);
+    return { flagged: false, reason: 'error' };
+  }
 }
 
 // (C1444) Thin wrapper — flags the session as "starting" for the full duration of
@@ -1131,6 +1415,17 @@ function approvePlan(session) {
 // never leaves the flag stuck true.
 async function spawnTerminal(session, prompt, taskId, taskTags = [], opts = {}) {
   session._starting = true;
+  // (TPT664) A new run of the task supersedes the exit-backstop flag everywhere — drop the server
+  // registry entry and broadcast the cleared frame so every window's Finish button goes too. The
+  // old run's late flagTaskLeftUncommitted() cannot re-add it: isSuperseded() sees this session.
+  if (taskId && (!session.type || session.type === 'terminal')) {
+    try {
+      const removed = require('./left-uncommitted').clear(session.projectPath, taskId);
+      if (removed) require('./websocket').emitTaskLeftUncommitted(session.projectPath, taskId, [], { cleared: true, exitId: removed.exitId });
+    } catch (err) {
+      console.warn(`[exit-backstop] ${taskId}: could not clear the left-uncommitted flag: ${err.message}`);
+    }
+  }
   try {
     return await _spawnTerminal(session, prompt, taskId, taskTags, opts);
   } finally {
@@ -1161,7 +1456,13 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       + `${status.available ? 'available' : `unavailable: ${status.reason || 'no reason'}`}`);
   }
   if (!status.available) {
-    throw new Error(status.reason || `${agent.label} is unavailable`);
+    // (TPT9008) The detection code (+ its params and this agent's id) rides on the error, so
+    // ws-handlers.js startFailureFrame() sends a `reason` the console modal renders in the project
+    // language (terminal.error.ESTART.<reason>.<agent>); the message stays the English reason.
+    throw Object.assign(new Error(status.reason || `${agent.label} is unavailable`), {
+      reasonCode: status.reasonCode || null,
+      reasonParams: { ...status.reasonParams, agent: agent.id },
+    });
   }
   // (C1383) Fail closed before spawning anything: a task started with a known-dead
   // (expired/malformed) token, or a backend already latched 'unauthorized' from a prior
@@ -1321,6 +1622,9 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   session._lastTailDialogKind = null;   // (C1120) tail-scoped gate kind seen on the PREVIOUS chunk
   session._localCommandBuffer = '';
   session._interceptingApprovalCommand = false;
+  session._typedLine = '';               // (TPT654) composer line rebuilt from typed input (plan-approval-detect.js)
+  session._typedPasting = false;         // (TPT654) inside a bracketed paste split across input chunks
+  session._planApprovedInTui = null;     // (TPT654) 'dialog' | 'mode' | 'typed' once markPlanApprovedInTui() fired
   session._planFirstArmedAt = null;
   session._planReadySent = false;
   session._codexPlan = null;
@@ -1341,12 +1645,24 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   session._piApprovalRetried = false;     // (C1117) PiAgent#retryApproval()'s single-shot guard
   session.codexPlanReady = false;
   session.agentPlanReady = false;
+  session.nudgeCount = 0;                 // (TPT612) idle completion nudges sent this session
+  session._nudgeCheckedOutputAt = null;   // (TPT612) lastOutputAt of the idle period already checked
+  session._nudgeInFlight = false;
+  // (TPT612) An agent that needs typed words after a paste (Claude, kickoffTypedLine) gets them for the nudge too.
+  session._nudgeTypedLine = spec.kickoffTypedLine ? require('./completion-nudge').NUDGE_TYPED_LINE : '';
   console.log(`[terminal:${agent.id}] New session for task ${taskId} (pid ${ptyProcess.pid})`);
 
   // (TPT349) Surface the token preflight outcome, then arm the mid-session expiry watch on the
   // token the child was actually launched with (spec.env.API_TOKEN — projectEnvExtras() read).
   if (authCheck && authCheck.refreshed) {
-    emitTerminalNotice(session, `API token refreshed — valid until ${formatTokenExpiry(authCheck.expiresAt)}.`);
+    noticeCopy(session, 'notice.token.refreshed', { until: formatTokenExpiry(authCheck.expiresAt) });
+  } else if (authCheck && authCheck.warningDetail) {
+    // (TPT9002) Structured twin of `warning` — the same facts, in the project language; (TPT9008)
+    // a coded refresh failure is named in that language too.
+    warningCopy(session, 'notice.token.expiresNotRefreshed', {
+      when: authCheck.warningDetail.when,
+      error: refreshErrorCopy(sessionLocale(session), authCheck.warningDetail),
+    });
   } else if (authCheck && authCheck.warning) {
     emitTerminalWarning(session, authCheck.warning);
   }
@@ -1431,14 +1747,14 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     }
     if (composerEmpty) {
       if (pasteRetries >= MAX_PASTE_RETRIES) {
-        emitTerminalNotice(session, 'The task prompt did not reach the composer — restart the task.');
+        noticeCopy(session, 'notice.submit.notReachedRestart');
         return;
       }
       pasteRetries++;
       console.log(`[terminal:${agent.id}] Submit verification: kickoff for task ${taskId} never reached the composer `
         + `(PTY silent ${now - (session.lastOutputAt || 0)}ms, ${(session.buffer || '').length - bufferLenAtEnter} bytes since the Enter) `
         + `— pasting it again ${pasteRetries}/${MAX_PASTE_RETRIES}; tail=${JSON.stringify(tail.slice(-160))}`);
-      emitTerminalNotice(session, 'The task prompt did not reach the composer — pasting it again.');
+      noticeCopy(session, 'notice.submit.notReachedRepaste');
       // Re-enter the injector at awaitPasteAck: paste now, then the same settle -> (typed line) ->
       // Enter -> verify sequence as the first attempt. The onData handler re-arms the silence timer
       // per chunk while injectDone is false, exactly as during the original paste.
@@ -1452,7 +1768,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       return;
     }
     if (submitRetries >= MAX_SUBMIT_RETRIES) {
-      emitTerminalNotice(session, 'The task prompt is typed but was not submitted — press Enter to start it.');
+      noticeCopy(session, 'notice.submit.typedPressEnter');
       return;
     }
     submitRetries++;
@@ -1461,7 +1777,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     console.log(`[terminal:${agent.id}] Submit verification: kickoff for task ${taskId} still unsent after the Enter `
       + `(PTY silent ${now - (session.lastOutputAt || 0)}ms) — re-sending Enter ${submitRetries}/${MAX_SUBMIT_RETRIES}; `
       + `tail=${JSON.stringify(tail.slice(-160))}`);
-    emitTerminalNotice(session, 'The task prompt was typed but not submitted — pressing Enter again.');
+    noticeCopy(session, 'notice.submit.typedRetryEnter');
     session.pty.write('\r');
     submitWatchUntil = Date.now() + SUBMIT_WATCH_MS;
     armSubmitCheck(SUBMIT_VERIFY_MS);
@@ -1481,7 +1797,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
         mcpTrustAnswered = true;
         const preAnswerTail = session._attentionTail;
         session.pty.write(digit);
-        emitTerminalNotice(session, 'Auto-approved project MCP servers.');
+        noticeCopy(session, 'notice.inject.mcpAutoApproved');
         // Claude's Ink TUI doesn't emit a clear-screen or alt-screen toggle when the dialog
         // dismisses, so the stale "New MCP server…" text would otherwise sit in the rolling
         // tail and keep matching kind 'mcpTrust' on every subsequent onData chunk — reblocking
@@ -1521,10 +1837,10 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     if (dlg && dlg.kind === 'firstRun' && !isClaudeReplReady(session._attentionTail)) {
       if (!firstRunNoticeShown) {
         firstRunNoticeShown = true;
-        emitTerminalNotice(session, 'Claude Code first-run setup is waiting for your input. Answer the prompts above — the task prompt will be sent automatically once setup finishes.');
+        noticeCopy(session, 'notice.inject.firstRunWaiting');
       }
       if (injectRetries === FIRST_RUN_LONG_WAIT_RETRIES) {
-        emitTerminalNotice(session, 'Still waiting on Claude Code first-run setup.');
+        noticeCopy(session, 'notice.inject.firstRunStillWaiting');
       }
       injectRetries++;
       // Same C1047 ceiling-burn fix as the mcpTrust branch below — refresh on every deferral so
@@ -1535,7 +1851,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
         armInjectTimer(INJECT_DIALOG_RETRY_MS);
         return;
       }
-      emitTerminalNotice(session, 'Claude Code first-run setup did not finish — the task prompt was NOT sent. Finish setup, then restart the task.');
+      noticeCopy(session, 'notice.inject.firstRunNotFinished');
       injectDone = true;
       injectPhase = 'done'; // give up quietly — never paste the task prompt into an unknown screen
       return;
@@ -1550,7 +1866,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     if (dlg && dlg.kind === 'askQuestion') {
       if (!askQuestionNoticeShown) {
         askQuestionNoticeShown = true;
-        emitTerminalNotice(session, 'A question is waiting above — the task prompt will be sent once you answer it.');
+        noticeCopy(session, 'notice.inject.questionWaiting');
       }
       injectRetries++;
       // Same C1047 ceiling-burn fix as the other gate branches — refresh on every deferral.
@@ -1559,7 +1875,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
         armInjectTimer(INJECT_DIALOG_RETRY_MS);
         return;
       }
-      emitTerminalNotice(session, 'A question is waiting above — the task prompt was NOT sent. Answer it, then restart the task.');
+      noticeCopy(session, 'notice.inject.questionNotSent');
       injectDone = true;
       injectPhase = 'done'; // give up quietly — never paste the task prompt into an open menu
       return;
@@ -1580,7 +1896,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       if (injectRetries < cap) {
         if (dlg.kind === 'mcpTrust' && !mcpTrustNoticeShown) {
           mcpTrustNoticeShown = true;
-          emitTerminalNotice(session, 'Waiting for MCP server trust approval before sending task prompt.');
+          noticeCopy(session, 'notice.inject.mcpTrustWaiting');
         }
         injectRetries++;
         injectPhaseStartAt = Date.now();
@@ -1620,7 +1936,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       preludeSubmittedAt = now;
       injectPhaseStartAt = now;
       injectRetries = 0;  // fresh mcpTrust/toolApproval defer budget for /design's own dialogs
-      emitTerminalNotice(session, '/design running — the task prompt will be sent once it finishes.');
+      noticeCopy(session, 'notice.inject.designRunning');
       armInjectTimer(INJECT_DIALOG_RETRY_MS);
       return;
     }
@@ -1642,12 +1958,12 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       };
       if (waitedMs >= PRELUDE_MAX_WAIT_MS) {
         if (gated) {
-          emitTerminalNotice(session, '/design is still waiting on a dialog above — the task prompt was NOT sent. Answer it, then restart the task.');
+          noticeCopy(session, 'notice.inject.designDialogNotSent');
           injectDone = true;
           injectPhase = 'done';
           return;
         }
-        emitTerminalNotice(session, '/design is taking unusually long — sending the task prompt now.');
+        noticeCopy(session, 'notice.inject.designTooLong');
         release();
         return;
       }
@@ -1657,7 +1973,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       }
       if (!preludeLongNoticeShown && waitedMs >= PRELUDE_LONG_WAIT_MS) {
         preludeLongNoticeShown = true;
-        emitTerminalNotice(session, '/design is still running — the task prompt will be sent once it finishes.');
+        noticeCopy(session, 'notice.inject.designStillRunning');
       }
       // (C1047 ceiling-burn fix) refresh on every deferral, same discipline as the
       // mcpTrust/toolApproval/firstRun branches above — otherwise the onData handler's
@@ -1690,9 +2006,9 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
 
   emitTerminalState(session);
   if (session.planApprovalCommand) {
-    emitTerminalNotice(session, `Planning mode. Review the plan, then type ${session.planApprovalCommand} and press Enter to continue.`);
+    noticeCopy(session, 'notice.planning.command', { command: session.planApprovalCommand });
   } else {
-    emitTerminalNotice(session, 'Planning mode. Review the plan, then use the approval dialog to continue.');
+    noticeCopy(session, 'notice.planning.dialog');
   }
 
   ptyProcess.onData((data) => {
@@ -1857,6 +2173,18 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
 
 function handleTerminalInput(session, data) {
   if (!session.alive || !session.pty || typeof data !== 'string' || !data.length) return;
+  // (TPT654) Agents without a slash approval command (Codex, Pi) are approved by typing into their
+  // own composer. Rebuild the typed line and, once plan-ready has latched, treat an approval-worded
+  // submission as the go-ahead; any other line is plan feedback and keeps the run planning. Runs
+  // before the Codex Enter block below, which resets _planReadySent.
+  if (!session.planApprovalCommand && session.terminalPhase === 'planning') {
+    for (const line of trackTypedLine(session, data)) {
+      if ((session._planReadySent || session.agentPlanReady === true) && classifyTypedSubmission(line) === 'approve') {
+        markPlanApprovedInTui(session, 'typed');
+        break;
+      }
+    }
+  }
   if (session.taskAgent === 'codex' && /[\r\n]/.test(data)) {
     invalidateCodexPlan(session);
     session._attentionTail = '';
@@ -1967,12 +2295,20 @@ function imageMimeAllowed(mimeType) {
 // projectRoot is a required leading param (not an optional trailing one) so a caller can't
 // silently fall through to the wrong location when it forgets to pass it — see
 // resolveAttachmentDir() for the in-project-vs-USER_DATA_ROOT fallback rule.
+// (TPT9002) Paste failures carry a stable `code` (+ `params`) beside the English message, so the
+// console modal can render them in the project language (terminal.pasteError.* in i18n.js).
+function codedError(code, message, params) {
+  return Object.assign(new Error(message), { code, ...(params ? { params } : {}) });
+}
+
+const PASTE_IMAGE_MAX_MB = 12;
+
 function saveBase64Image(projectRoot, tabId, mimeType, base64) {
-  if (!imageMimeAllowed(mimeType)) throw new Error('Unsupported image type: ' + mimeType);
-  if (typeof base64 !== 'string' || !base64) throw new Error('Empty image data');
+  if (!imageMimeAllowed(mimeType)) throw codedError('EIMAGE_TYPE', 'Unsupported image type: ' + mimeType, { type: String(mimeType) });
+  if (typeof base64 !== 'string' || !base64) throw codedError('EIMAGE_EMPTY', 'Empty image data');
   const buf = Buffer.from(base64, 'base64');
-  if (!buf.length) throw new Error('Empty image data');
-  if (buf.length > 12 * 1024 * 1024) throw new Error('Image too large (>12 MB)');
+  if (!buf.length) throw codedError('EIMAGE_EMPTY', 'Empty image data');
+  if (buf.length > PASTE_IMAGE_MAX_MB * 1024 * 1024) throw codedError('EIMAGE_TOO_LARGE', `Image too large (>${PASTE_IMAGE_MAX_MB} MB)`, { maxMb: PASTE_IMAGE_MAX_MB });
   const dir = resolveAttachmentDir('images', projectRoot, tabId || 'terminal');
   const localPath = path.join(dir, crypto.randomUUID() + _PASTE_MIME_EXT[mimeType]);
   fs.writeFileSync(localPath, buf);
@@ -1996,7 +2332,7 @@ function verifyImageAttach(session, agent, localPath, deadline) {
   }
   if (Date.now() >= deadline) {
     console.log(`[terminal:${agent.id}] Image paste attach NOT confirmed for task ${session.tabId} (path=${localPath})`);
-    emitTerminalNotice(session, 'Image paste did not attach — the CLI may not support this on the installed version, or the paste was interrupted.');
+    noticeCopy(session, 'notice.paste.imageNotAttached');
     return;
   }
   const timer = setTimeout(() => verifyImageAttach(session, agent, localPath, deadline), IMAGE_ATTACH_VERIFY_POLL_MS);
@@ -2005,10 +2341,10 @@ function verifyImageAttach(session, agent, localPath, deadline) {
 
 function injectPastedImage(session, mimeType, dataB64) {
   if (!session || !session.alive || !session.pty) {
-    throw new Error('Terminal not running');
+    throw codedError('EIMAGE_NOT_RUNNING', 'Terminal not running');
   }
   if (typeof dataB64 !== 'string' || !dataB64) {
-    throw new Error('Missing image data');
+    throw codedError('EIMAGE_MISSING', 'Missing image data');
   }
   const localPath = saveBase64Image(session.projectPath || config.PROJECT_ROOT, session.tabId, mimeType, dataB64);
   const agent = getTaskAgent(session.taskAgent || config.TASK_AGENT);
@@ -2047,6 +2383,9 @@ module.exports = {
   emitTerminalState,
   emitTerminalNotice,
   emitTerminalWarning,
+  sessionLocale,
+  noticeCopy,
+  warningCopy,
   scheduleTokenExpiryWatch,
   buildTokenExpiryNotice,
   TOKEN_WATCH_LEAD_MS,
@@ -2063,6 +2402,7 @@ module.exports = {
   fetchTaskCommentsContext,
   fetchParentTaskBlock,
   approvePlan,
+  markPlanApprovedInTui,
   forceResumeRepaint,
   getAttentionPromptMatch,
   codexPlanReadyIsFresh,
@@ -2078,4 +2418,8 @@ module.exports = {
   imageMimeAllowed,
   saveBase64Image,
   injectPastedImage,
+  pasteAndSubmit,
+  maybeNudgeIdleSession,
+  exitRunSnapshot,
+  flagTaskLeftUncommitted,
 };

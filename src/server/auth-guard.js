@@ -16,12 +16,15 @@ const { getApiCredentials } = require('./api-credentials');
 const SEALING_REASONS = new Set(['expired', 'malformed']);
 
 class AuthCorruptedError extends Error {
-  constructor(message, { reasonCode = null, statusCode = null } = {}) {
+  constructor(message, { reasonCode = null, statusCode = null, detail = null } = {}) {
     super(message);
     this.name = 'AuthCorruptedError';
     this.code = 'EAUTH';
     this.reasonCode = reasonCode;
     if (statusCode != null) this.statusCode = statusCode;
+    // (TPT9002) { when, expiresAt, refreshError } for the expired/expiring reasons — the facts
+    // behind the English message, so the console modal can render them in the project language.
+    if (detail) this.detail = detail;
     // Back-compat: init() (api-backend.js) and main/window-state.js's backend.init()
     // catch already branch on err.authError — keep this error recognized by both.
     this.authError = true;
@@ -145,7 +148,8 @@ async function assertCredentialsUsable(backend, opts = {}) {
   const expMs = tokenExpiryMs(token);
   if (!verdict.ok) {
     if (verdict.reasonCode === 'expired' && expMs != null) {
-      throw new AuthCorruptedError(`API token expired at ${formatTokenExpiry(expMs, now)} — sign in again.`, { reasonCode: 'expired' });
+      const when = formatTokenExpiry(expMs, now);
+      throw new AuthCorruptedError(`API token expired at ${when} — sign in again.`, { reasonCode: 'expired', detail: { when, expiresAt: expMs } });
     }
     throw new AuthCorruptedError(verdict.reason || 'Authentication invalid', { reasonCode: verdict.reasonCode });
   }
@@ -166,21 +170,33 @@ async function assertCredentialsUsable(backend, opts = {}) {
       if (newExpMs != null && newExpMs > expMs) {
         return { refreshed: true, expiresAt: newExpMs, previousExpiresAt: expMs };
       }
-      failure = new Error('refresh returned no newer token');
+      failure = Object.assign(new Error('refresh returned no newer token'), { refreshCode: 'not_newer' });
     } catch (err) {
       failure = err;
     }
   }
 
   const when = formatTokenExpiry(expMs, now);
-  const why = failure ? ` and could not be refreshed (${(failure && failure.message) || 'unknown error'})` : '';
+  const refreshError = failure ? ((failure && failure.message) || 'unknown error') : null;
+  const why = failure ? ` and could not be refreshed (${refreshError})` : '';
+  // (TPT9002) `detail` / `warningDetail` carry the same facts as the English sentences, for the
+  // localized terminal warning and EAUTH error frame. (TPT9008) A coded refresh failure
+  // (token-refresh.js) adds its `refreshCode` (+ `refreshParams`) so both can name it in the
+  // project language; an uncoded one carries only the English `refreshError`.
+  const refreshCode = failure && typeof failure.refreshCode === 'string' ? failure.refreshCode : null;
+  const detail = {
+    when, expiresAt: expMs, refreshError,
+    ...(refreshCode ? { refreshCode } : {}),
+    ...(refreshCode && failure.refreshParams ? { refreshParams: failure.refreshParams } : {}),
+  };
   if (remaining < MIN_LAUNCH_MS) {
-    throw new AuthCorruptedError(`API token expires at ${when}${why} — sign in again.`, { reasonCode: 'expiring' });
+    throw new AuthCorruptedError(`API token expires at ${when}${why} — sign in again.`, { reasonCode: 'expiring', detail });
   }
   return {
     refreshed: false,
     expiresAt: expMs,
     warning: failure ? `API token expires at ${when}${why}. Task tools stop then.` : null,
+    warningDetail: failure ? detail : null,
   };
 }
 

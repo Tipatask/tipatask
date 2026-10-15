@@ -199,3 +199,22 @@ test('per-entry diagnostics refresh broadcasts without changing position or main
   assert.equal(h.changes[0].snap.queued[0].detail, 'state-invalid');
   assert.equal(h.changes[0].snap.queued[0].instances, null);
 });
+
+test('alarm and byte diagnostics broadcast changes even while the same device cap holds the queue', () => {
+  const h = harness();
+  const decision = { allowed: false, reason: 'device-cap', running: 6, cap: 6, alarm: null, requiredBytes: 35, headroomBytes: 30 };
+  h.queue.setAdmission({ tryReserve: () => decision, snapshot: () => ({ alarm: 'global-only' }) });
+  h.request('A');
+  h.changes.length = 0;
+  for (const [field, value] of [['running', 7], ['cap', 7], ['alarm', 'headroom'], ['requiredBytes', 37], ['headroomBytes', 12]]) {
+    decision[field] = value;
+    h.queue.drain();
+    assert.equal(h.changes.length, 1, `${field} change broadcasts`);
+    const row = h.changes.pop().snap.queued[0];
+    assert.deepEqual([row.position, row.reason, row.alarm, row.requiredBytes, row.headroomBytes],
+      [1, 'device-cap', decision.alarm, decision.requiredBytes, decision.headroomBytes]);
+    assert.deepEqual([row.running, row.cap], [decision.running, decision.cap]);
+    h.queue.drain();
+    assert.equal(h.changes.length, 0, 'unchanged diagnostics do not broadcast');
+  }
+});

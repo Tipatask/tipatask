@@ -107,7 +107,7 @@ test('buildReauthConfig: never writes an empty PI_MODELS array and leaves an exi
   assert.equal(cfg.OPENROUTER_API_KEY, 'oldkey');
 });
 
-test('buildReauthConfig: falls back to baseCfg TASK_AGENT/AVAILABLE_AGENTS, then claude', () => {
+test('buildReauthConfig: falls back to baseCfg TASK_AGENT/AVAILABLE_AGENTS, never to an invented claude', () => {
   const cfg = buildReauthConfig({
     baseCfg: { TASK_AGENT: 'codex', AVAILABLE_AGENTS: 'codex' },
     apiBaseUrl: 'https://web.tipatask.com',
@@ -129,8 +129,10 @@ test('buildReauthConfig: falls back to baseCfg TASK_AGENT/AVAILABLE_AGENTS, then
     availableAgents: [],
     piSaveRows: [],
   });
-  assert.equal(cfgNoFallback.TASK_AGENT, 'claude');
-  assert.equal(cfgNoFallback.AVAILABLE_AGENTS, 'claude');
+  // (TPT678) Nothing picked and nothing on disk: no key is written, so readers use their own default.
+  assert.equal(cfgNoFallback.TASK_AGENT, undefined);
+  assert.equal(cfgNoFallback.AVAILABLE_AGENTS, undefined);
+  assert.ok(!JSON.stringify(cfgNoFallback).includes('claude'));
 });
 
 test('stepsFor/nextStep: account-only mode is Sign-in then Confirm, nothing else', () => {

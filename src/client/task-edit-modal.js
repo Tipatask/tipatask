@@ -8,7 +8,7 @@ import { statusNames, statusLabel, statusColor, isInProgressName, startName } fr
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { hasTaskSession } from './dependency-status.js';
 import { escapeAttr, insertAtCursor, renderMarkdown, renderSprintCombobox, initSprintCombobox, showToast, showBoardLoader, hideBoardLoader, showActionBanner, hideActionBanner, taskOpenErrorLabel, sprintRecordMax } from './utils.js';
-import { api } from './api-client.js';
+import { api, isTransportError, errorDetail } from './api-client.js';
 import { isTaskDiscussing, lockIntentOf, lockMessageKey } from './discuss-lock.js';
 import { buildMentionCandidates, highlightMentionsInHtml, AGENT_HANDLES } from './mention-highlight.js';
 import { sanitizeMarkdownHtml } from './markdown-sanitize.js';
@@ -812,7 +812,9 @@ async function _openTaskEditModalImpl(taskId, callbacks = {}) {
         hydrateModifiedCard({ type: 'modified', task }, compareTask);
         callbacks.onCompareTaskResolved?.(compareTask);
       }
-      const configRes = await fetch('/api/config');
+      // (TPT665) A rejected fetch got no answer: marked like api-client.js's _http() does, so
+      // the catch below labels it "Network error", not "Could not open task".
+      const configRes = await fetch('/api/config').catch((err) => { err.networkError = true; throw err; });
       if (configRes.ok) { try { projectConfig = await configRes.json(); } catch {} }
     } else {
       // (TPT111) All four legs still fire concurrently, but only the task fetch gates
@@ -844,9 +846,11 @@ async function _openTaskEditModalImpl(taskId, callbacks = {}) {
       return;
     }
     // (C1392) Was alert() — the actual CDP-freezing call: this catch is what fires for the
-    // browser-mode unscoped-fetch 500 that C1391 root-caused. Toast carries the raw error;
+    // browser-mode unscoped-fetch 500 that C1391 root-caused. The toast names the cause;
     // the persistent banner carries mode-specific recovery guidance + a Retry.
-    showToast(t('common.networkError', { msg: err.message }), 'error');
+    // (TPT665) Labelled like the task writes: "Network error" only when the request got no
+    // answer, otherwise "Could not open task: …" with the server's text, IPC wrapper stripped.
+    _toastWriteFailure(err, 'modal.errOpen');
     showActionBanner({
       id: 'task-open-error-banner',
       label: taskOpenErrorLabel({ isElectron: !!window.electronAPI?.api, taskId }),
@@ -1703,6 +1707,23 @@ function _isModalDirty() {
   return JSON.stringify(_modalState.draft) !== JSON.stringify(_modalState.original);
 }
 
+// (TPT9001/TPT660) Failure toast for every task write this modal makes, and (TPT665) for the
+// task-open fetch. "Network error" only when the request got no answer (isTransportError:
+// fetch rejected, API unreachable, gateway 502/503/504); anything the server answered — a
+// validation rejection such as the TAGS_UNREGISTERED tag gate, the TPT34 author-only comment
+// 403, an auth failure on open — gets `key` ("Save failed", "Comment failed", "Could not open
+// task", …) with errorDetail(err): the server's text without Electron's IPC wrapper.
+function _toastWriteFailure(err, key, opts) {
+  showToast(t(isTransportError(err) ? 'common.networkError' : key, { msg: errorDetail(err) }), 'error', opts);
+}
+
+// persistDraft()'s toast: held 10s like the chat's save errors — a gate message is long and
+// says what to do next.
+const SAVE_ERROR_TOAST_MS = 10000;
+function _toastSaveFailure(err) {
+  _toastWriteFailure(err, 'modal.errSave', { durationMs: SAVE_ERROR_TOAST_MS });
+}
+
 function _modalUpdateButtonStates(saveBtn, resetBtn) {
   const dirty = _isModalDirty();
   saveBtn.disabled = !dirty;
@@ -2102,10 +2123,27 @@ function _attachModalHandlers(modal) {
       await callbacks.onSavePreview(draft);
       return true;
     }
+    // (TPT623) Tags the project registry doesn't have yet: the server registers them with a
+    // description written by the default LLM instead of failing the save. That takes seconds,
+    // so the Save button says so meanwhile.
+    const newTagCount = patch.tags ? (await commands.unregisteredProjectTags(patch.tags)).length : 0;
+    const saveLabel = saveBtn.textContent;
+    if (newTagCount > 0) {
+      patch.auto_register_tags = true;
+      saveBtn.disabled = true;
+      saveBtn.textContent = tc('common.registeringTags', newTagCount);
+    }
     let updateResult;
     try {
       updateResult = await api.tasks.update(taskId, patch);
-    } catch (err) { console.error('[modal] Task update failed:', err); showToast(t('common.networkError', { msg: err.message }), 'error'); return false; }
+    } catch (err) {
+      console.error('[modal] Task update failed:', err);
+      _toastSaveFailure(err);
+      return false;
+    } finally {
+      if (newTagCount > 0) { saveBtn.textContent = saveLabel; upd(); }
+    }
+    if (newTagCount > 0) commands.invalidateProjectTags();
     // Before the staleness check below: the write landed whether or not this modal is still open.
     try { callbacks.onSaved?.(taskId); } catch (err) { console.warn('[modal] onSaved callback failed:', err); }
     // (TPT466) This task's chat pane tells its agent about the hand-made edit next turn.
@@ -2152,7 +2190,7 @@ function _attachModalHandlers(modal) {
     _syncModalStartVisibility();
     upd();
     return true;
-    } catch (err) { console.error('[modal] Save failed:', err); showToast(t('modal.errSave', { msg: err.message }), 'error'); return false; }
+    } catch (err) { console.error('[modal] Save failed:', err); _toastSaveFailure(err); return false; }
   };
 
   // Save
@@ -2314,7 +2352,7 @@ function _attachModalNotifHandlers(modal) {
       }
     } catch (err) {
       checkbox.checked = !next;
-      showToast(t('common.networkError', { msg: err.message }), 'error');
+      _toastWriteFailure(err, 'modal.errNotifToggle');
     } finally {
       checkbox.disabled = false;
     }
@@ -2345,7 +2383,7 @@ function _attachModalCommentHandlers(modal) {
       _removeMentionDropdown();
       _renderModalComments(modal);
     } catch (err) {
-      showToast(t('common.networkError', { msg: err.message }), 'error');
+      _toastWriteFailure(err, 'modal.errCommentPost');
     } finally {
       submitBtn.disabled = false;
     }
@@ -2407,7 +2445,7 @@ function _attachCommentEditHandlers(modal) {
         _removeMentionDropdown();
         _renderModalComments(modal);
       } catch (err) {
-        showToast(t('common.networkError', { msg: err.message }), 'error');
+        _toastWriteFailure(err, 'modal.errSave');
         btn.disabled = false; // leave edit mode open so the user can retry
       }
     }
@@ -2726,8 +2764,8 @@ function _terminalDotState(id) {
   if (reported) return reported;
   if (state.lostSessions.has(id)) return { cls: 'disconnected', title: t('terminal.sessionLostTitle') };
   if (state.sessionMeta.get(id)?.paused) return { cls: 'paused', title: t('terminal.pausedTitle') };
-  if (state.activeSessions.has(id)) return { cls: '', title: 'Connected' };
-  if (state.exitedSessions.has(id)) return { cls: 'exited', title: 'Exited' };
+  if (state.activeSessions.has(id)) return { cls: '', title: t('terminal.status.connected') };
+  if (state.exitedSessions.has(id)) return { cls: 'exited', title: t('terminal.status.exited') };
   return null;
 }
 
@@ -2778,8 +2816,9 @@ function _showTerminalPane(modal, { focus = true } = {}) {
   const taskId = _modalState.taskId;
   const launch = _modalState.pendingTerminal;
   _modalState.pendingTerminal = null;
-  // A restart of a lost session replaces the xterm that showed the loss.
-  if (launch?.opts?.restartLost) _disposePane('terminal');
+  // A restart of a lost session replaces the xterm that showed the loss; (TPT614) so does the
+  // Finish action's relaunch of a retained exited session.
+  if (launch?.opts?.restartLost || launch?.opts?.relaunch) _disposePane('terminal');
   const current = _modalState.panes.terminal;
   if (current) { current.show({ focus }); return; }
   const mount = window.TipTask?.mountTaskTerminal;

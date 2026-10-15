@@ -272,3 +272,64 @@ test('queue diagnostics survive HTTP hydration and WS updates and clear on depar
   applyQueueSnapshot({ queued: [] });
   assert.equal(state.queueDiagnostics.size, 0);
 });
+
+// ── Exit backstop flag (TPT613) ──
+test('an exit-backstop ring survives a snapshot without its session; an ordinary ring for a gone session is still cleared', () => {
+  state.leftUncommitted.set('T1', { exitId: 'T1@1', blockers: ['TASK_COMMIT_MISSING'], status: 'on_fire', at: 1 });
+  raiseAttention('T1', { kind: 'uncommitted', blockers: ['TASK_COMMIT_MISSING'] });
+  raiseAttention('T2', { kind: 'idle' });
+  mergeSessionsSnapshot({ sessions: [], exited: [], attention: [] });
+  assert.equal(isAttentionRaised('T1'), true);
+  assert.equal(isAttentionRaised('T2'), false);
+  assert.equal(state.leftUncommitted.has('T1'), true);
+});
+
+test('pruneClosedAttention drops the exit-backstop ring and flag once the task closes; an open task keeps both', () => {
+  state.leftUncommitted.set('T1', { exitId: 'T1@1' });
+  state.leftUncommitted.set('T2', { exitId: 'T2@1' });
+  raiseAttention('T1', { kind: 'uncommitted' });
+  raiseAttention('T2', { kind: 'uncommitted' });
+  pruneClosedAttention(new Map([['T1', 'completed'], ['T2', 'on_fire']]), (s) => s === 'completed' || s === 'canceled');
+  assert.equal(isAttentionRaised('T1'), false);
+  assert.equal(state.leftUncommitted.has('T1'), false);
+  assert.equal(isAttentionRaised('T2'), true);
+  assert.equal(state.leftUncommitted.has('T2'), true);
+});
+
+test('opening the terminal clears the exit-backstop ring but not the task flag; a project switch clears both', () => {
+  state.leftUncommitted.set('T1', { exitId: 'T1@1' });
+  raiseAttention('T1', { kind: 'uncommitted' });
+  clearAttention('T1', 'opened');
+  assert.equal(isAttentionRaised('T1'), false);
+  assert.equal(state.leftUncommitted.has('T1'), true, 'the task is still left uncommitted');
+  mergeSessionsSnapshot({ sessions: [], exited: [] }, '/projects/a');
+  mergeSessionsSnapshot({ sessions: [], exited: [] }, '/projects/b');
+  assert.equal(state.leftUncommitted.size, 0);
+});
+
+// ── (TPT664) leftUncommitted snapshot adoption ──
+const LEFT = { exitId: 'L1@1', blockers: [{ code: 'TASK_COMMIT_MISSING', message: 'no commit' }], status: 'on_fire', agent: 'claude', nudgeCount: 1, at: 7 };
+
+test('mergeSessionsSnapshot adopts a server-held exit-backstop flag this window never saw (reload, second window)', () => {
+  mergeSessionsSnapshot({ sessions: [], exited: [], attention: [], leftUncommitted: { L1: LEFT } });
+  assert.deepEqual(state.leftUncommitted.get('L1'), { exitId: 'L1@1', blockers: ['TASK_COMMIT_MISSING'], status: 'on_fire', at: 7 });
+});
+
+test('mergeSessionsSnapshot never drops a flag by omission, keeps the same exit untouched and takes a newer exit', () => {
+  mergeSessionsSnapshot({ sessions: [], exited: [], attention: [], leftUncommitted: { L1: LEFT } });
+  state.leftUncommitted.get('L1').at = 99; // local bookkeeping must survive a same-exit snapshot
+  mergeSessionsSnapshot({ sessions: [], exited: [], attention: [], leftUncommitted: { L1: LEFT } });
+  assert.equal(state.leftUncommitted.get('L1').at, 99);
+  mergeSessionsSnapshot({ sessions: [], exited: [], attention: [] });
+  assert.equal(state.leftUncommitted.has('L1'), true, 'omission is not a clear');
+  mergeSessionsSnapshot({ sessions: [], exited: [], attention: [], leftUncommitted: { L1: { ...LEFT, exitId: 'L1@2', at: 8 } } });
+  assert.deepEqual(state.leftUncommitted.get('L1'), { exitId: 'L1@2', blockers: ['TASK_COMMIT_MISSING'], status: 'on_fire', at: 8 });
+});
+
+test('mergeSessionsSnapshot keeps the exit-backstop ring of an adopted flag even though its session is gone', () => {
+  raiseAttention('L1', { kind: 'uncommitted', agent: 'claude', blockers: ['TASK_COMMIT_MISSING'] }); // the connect replay raised it
+  mergeSessionsSnapshot({ sessions: [], exited: [], attention: [], leftUncommitted: { L1: LEFT } });
+  assert.equal(isAttentionRaised('L1'), true);
+  mergeSessionsSnapshot({ sessions: [], exited: [], attention: [] });
+  assert.equal(isAttentionRaised('L1'), true);
+});

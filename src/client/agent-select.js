@@ -256,8 +256,9 @@ export function piCatalogDisplayId(catalogId, provider) {
 
 // Fields beyond {model, apiKey}, shared by both row constructors — the same on-disk shape the
 // server's sanitizePiModels() persists: `provider` only on a non-OpenRouter row, `baseUrl` only
-// on a custom-endpoint row, and that row's `api` passed through untouched (no UI for it, but it
-// must survive an edit/save round-trip).
+// on a custom-endpoint row, and that row's `api` (no UI, passed through untouched) and `tools:
+// false` (the form's "Model supports tool calls" checkbox, unchecked) — both must survive an
+// edit/save round-trip.
 function _rowExtras(src, id) {
   const extra = {};
   if (id !== PI_DEFAULT_PROVIDER) extra.provider = id;
@@ -265,6 +266,7 @@ function _rowExtras(src, id) {
     extra.baseUrl = String(src?.baseUrl ?? '').trim();
     const api = String(src?.api ?? '').trim();
     if (api) extra.api = api;
+    if (src?.tools === false) extra.tools = false;
   }
   if (src?.apiKeyAction) extra.apiKeyAction = src.apiKeyAction;
   if (src?.credentialRef) extra.credentialRef = { ...src.credentialRef };
@@ -401,7 +403,8 @@ function _piRowsIssue(models) {
  *   pi-empty       pi available, no rows yet — one placeholder card  neither (nothing to enable)
  *   pi-unavailable pi CLI missing — exactly ONE dimmed card          disabled, no Add button
  * Every Pi card keeps `id: 'pi'` — the emitted taskAgent must stay the literal 'pi'; `piIdx`
- * (the row's display index) is the only discriminator between two Pi cards.
+ * (the row's display index) is the only discriminator between two Pi cards. A `pi-model` card's
+ * `noTools` is true only for a custom-endpoint row declared `tools: false` (its "No tools" badge).
  */
 export function buildAgentCardRows({ agents, piModels = [], enabledIds = [], defaultId = '', piDefaultIdx = -1, single = false }) {
   const out = [];
@@ -427,13 +430,15 @@ export function buildAgentCardRows({ agents, piModels = [], enabledIds = [], def
       });
     } else {
       piModels.forEach((row, i) => {
-        const providerLabel = piProviderMeta(row.provider).label;
+        const meta = piProviderMeta(row.provider);
+        const providerLabel = meta.label;
         const modelText = stripPiModelPrefix(row.model, row.provider);
         out.push({
           kind: 'pi-model', id, piIdx: i, color, available: true,
           enabled: row.enabled !== false, isDefault: defaultId === 'pi' && i === piDefaultIdx,
           providerLabel, modelText, storedModel: _piRow(row).model,
           name: `${providerLabel} · ${modelText}`, reason: '', hasCheckbox: !single, hasRadio: true,
+          noTools: meta.id === PI_CUSTOM_PROVIDER && row.tools === false,
         });
       });
     }
@@ -462,10 +467,11 @@ export function buildAgentCardRows({ agents, piModels = [], enabledIds = [], def
  *   async; the button shows a spinner while pending. Rendered whenever provided — in the
  *   populated grid header and in the all-unavailable empty state.
  * @param {{[agentId:string]:{label:string,options:{value:string,label:string,description?:string}[],defaultValue?:string,placeholder?:{value:string,label:string}}}} [opts.modelSelects] -
- *   (C1161) opt-in per-agent model-version `<select>`, rendered as a sibling block directly under
- *   that agent's card, toggled by the same enable checkbox. Omit entirely for callers that have
- *   no model picker (the create wizard, the open-existing/re-auth setup modal) — they get exactly
- *   the pre-C1161 markup.
+ *   (C1161, TPT637) opt-in per-agent model pick. That agent's card reads `<Agent> · <model label>`,
+ *   the same name row as a Pi card, and while the agent is enabled its ✎ opens one inline form
+ *   (the model `<select>`, Cancel / Save) under the card. Omit entirely for callers that have no
+ *   model picker (the create wizard, the open-existing/re-auth setup modal) — they get exactly the
+ *   pre-C1161 markup.
  */
 export function renderAgentSelect(container, { agents, value, onChange, onReCheck, modelSelects }) {
   const availableOnes = agents.filter(a => a.available);
@@ -499,8 +505,10 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
   // Single-installed-agent mode has no checkboxes, so its rows can never be toggled on later.
   const piRowsOn = !piAvailable || single || enabledIds.includes('pi');
   piModels.forEach((r) => { r.enabled = piRowsOn; });
-  // The Add/Edit form: { mode: 'add'|'edit', idx, draft: {provider, model, apiKey}, issue }.
-  // Lives in this closure, not in piModels — a row only enters piModels once the form validates.
+  // The one open inline form. Pi Add/Edit: { mode: 'add'|'edit', idx, draft: {provider, model,
+  // apiKey}, issue } — lives here, not in piModels; a row only enters piModels once it validates.
+  // (TPT637) Claude/Codex model: { mode: 'model', id, initial } — `initial` is the pick the form
+  // opened with, for Cancel. Opening either kind replaces the other.
   let form = null;
 
   // C1161 — one working value per opt-in model-select entry, keyed by agent id. Seeded from
@@ -583,17 +591,26 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
   const gridEl = container.querySelector('.setup-modal-agent-grid');
   const noteEl = container.querySelector('.setup-modal-agent-unchecked-note');
 
-  // Rebuilds ONLY the grid's children (cards, the Add/Edit form, the model-select blocks) from
-  // working state. Called on structural changes — checkbox, radio, Add/Save/Cancel/Edit/Remove —
-  // never on typing, so the form inputs keep their caret. All listeners are delegated on gridEl
+  // (TPT637) Card model view for an agent with a modelSelects entry, or null. An unavailable agent
+  // gets none (plain name, like the C1161 block it replaced, which was hidden there too), and only
+  // an enabled card carries the ✎ — a disabled card shows its model but cannot edit it.
+  const modelView = (d) => {
+    const entry = d.kind === 'agent' && d.available ? modelSelects?.[d.id] : null;
+    return entry ? { ...agentModelPick(entry, agentModels[d.id]), editable: d.enabled } : null;
+  };
+
+  // Rebuilds ONLY the grid's children (cards, the open inline form) from working state. Called on
+  // structural changes — checkbox, radio, Add/Save/Cancel/Edit/Remove — never on typing or a model
+  // pick, so the form controls keep their caret and focus. All listeners are delegated on gridEl
   // below, so a rebuild never needs re-wiring.
   function renderGrid() {
     const cards = buildAgentCardRows({ agents, piModels, enabledIds, defaultId, piDefaultIdx, single });
     let html = '';
     cards.forEach((d, i) => {
-      html += _cardHtml(d);
-      if (d.kind === 'agent' && modelSelects?.[d.id]) {
-        html += _modelExtraHtml(d.id, modelSelects[d.id], agentModels[d.id], d.enabled);
+      const model = modelView(d);
+      html += _cardHtml(d, model);
+      if (model?.editable && form?.mode === 'model' && form.id === d.id) {
+        html += _modelFormHtml(d.id, d.name, modelSelects[d.id], agentModels[d.id]);
       }
       if (d.kind === 'pi-model' && form?.mode === 'edit' && form.idx === d.piIdx) {
         html += _piFormHtml(form, piModels.length);
@@ -604,7 +621,6 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
       }
     });
     gridEl.innerHTML = html;
-    _syncExtras(container, enabledIds);
     // Only worth saying when SOME (not all) models are unchecked: unchecking every Pi model
     // disables Pi and leaves the stored rows alone, so nothing is lost in that case.
     const checked = piModels.filter((r) => r.enabled !== false).length;
@@ -630,6 +646,7 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
         hasApiKey: row?.hasApiKey,
         baseUrl: row?.baseUrl || '',
         api: row?.api || '', // no input for it — carried so an edit never drops it
+        tools: row?.tools, // the "Model supports tool calls" checkbox: false = unchecked, else checked
       },
       issue: '',
     };
@@ -650,6 +667,44 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     if (!hint) return;
     hint.textContent = issue;
     hint.hidden = !issue;
+  };
+
+  // ── (TPT637) Claude/Codex model form ──────────────────────────────────────
+  // A pick applies the moment the <select> changes (see the change listener), as the C1161 select
+  // did, so the host modal's own Save never drops a pick left in an open form. Cancel puts back the
+  // pick the form opened with; Save only closes it. Either way focus goes back to the card's ✎.
+  const openModelForm = (id) => {
+    if (form?.mode !== 'model' || form.id !== id) {
+      form = { mode: 'model', id, initial: agentModels[id] };
+      closeSuggest();
+      renderGrid();
+    }
+    const sel = gridEl.querySelector('.sma-model-select');
+    if (sel) {
+      sel.focus();
+      sel.closest('.setup-modal-agent-form')?.scrollIntoView?.({ block: 'nearest' });
+    }
+  };
+
+  const closeModelForm = (revert) => {
+    if (form?.mode !== 'model') return;
+    const { id, initial } = form;
+    const reverted = revert && agentModels[id] !== initial;
+    if (reverted) agentModels[id] = initial;
+    form = null;
+    renderGrid();
+    if (reverted) emit();
+    refocus('sma-model-edit', id);
+  };
+
+  // Keep the card's `<Agent> · <model>` label on the live pick without a rebuild, so the open
+  // form's <select> keeps focus while the user is still choosing.
+  const paintModelLabel = (id) => {
+    const pick = agentModelPick(modelSelects[id], agentModels[id]);
+    const label = gridEl.querySelector(`.setup-modal-agent-card[data-id="${id}"] .setup-modal-agent-model`);
+    if (!label) return;
+    label.textContent = pick.label;
+    label.title = pick.value || pick.label;
   };
 
   // ── (TPT191) Model typeahead ──────────────────────────────────────────────
@@ -685,11 +740,12 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     el.querySelector('.active')?.scrollIntoView?.({ block: 'nearest' });
   };
   async function openSuggest(input) {
-    if (!form) return;
+    if (!form?.draft) return;
     const provider = form.draft.provider;
     const ids = await fetchPiModels(provider);
-    // Stale by the time the catalog arrived: form closed, provider switched, focus moved on.
-    if (!form || form.draft.provider !== provider || !input.isConnected || document.activeElement !== input) return;
+    // Stale by the time the catalog arrived: form closed or swapped for a Claude/Codex model form
+    // (which has no draft), provider switched, focus moved on.
+    if (!form?.draft || form.draft.provider !== provider || !input.isConnected || document.activeElement !== input) return;
     const items = filterPiModelSuggestions(ids, input.value);
     if (!items.length) { closeSuggest(); return; }
     if (!suggest || suggest.input !== input) {
@@ -787,10 +843,15 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
       syncPiEnabledId();
     } else if (cb.checked) {
       if (!enabledIds.includes(id)) enabledIds.push(id);
+      // (TPT653) No usable Default — every agent was unchecked, or the Default is no longer
+      // enabled: the agent just checked takes it, as syncPiEnabledId() does for Pi.
+      if (!defaultId || !enabledIds.includes(defaultId)) defaultId = id;
     } else {
       enabledIds = enabledIds.filter((x) => x !== id);
       // If this was the default, shift to first remaining enabled agent
       if (defaultId === id) defaultId = enabledIds[0] || '';
+      // (TPT637) A disabled card has no ✎, so its open model form goes too; the pick is kept.
+      if (form?.mode === 'model' && form.id === id) form = null;
     }
     renderGrid();
     emit();
@@ -817,11 +878,19 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     const el = e.target;
     if (el.matches('.sma-cb')) onCheckbox(el);
     else if (el.matches('.sma-radio')) onRadio(el);
-    else if (el.matches('.sma-model-select')) { agentModels[el.dataset.id] = el.value; emit(); }
+    else if (el.matches('.sma-model-select')) {
+      agentModels[el.dataset.id] = el.value;
+      paintModelLabel(el.dataset.id);
+      emit();
+    }
+    // Custom endpoint only: an unchecked "Model supports tool calls" stores `tools: false`; a
+    // checked one leaves the field unset, so the default (tool-capable) is never written.
+    else if (el.matches('.sma-pi-tools') && form) form.draft.tools = el.checked ? undefined : false;
     else if (el.matches('.sma-pi-provider') && form) {
       // (TPT163/TPT191) Provider change updates the form in place — no re-render, so focus and
       // any typed text survive: placeholders, the key label ("optional" for a keyless provider)
-      // and the Base URL row (custom endpoint only). The typed model text is left alone
+      // and the Base URL and tool-support rows (custom endpoint only; a hidden row's draft value is
+      // dropped at commit by _rowExtras()). The typed model text is left alone
       // (strip/add are both no-ops off OpenRouter, and applied once at commit time under
       // whichever provider is chosen).
       const nextProvider = normalizePiProvider(el.value);
@@ -836,12 +905,14 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
       const keyInp = formEl && formEl.querySelector('.sma-pi-key');
       const keyLabel = formEl && formEl.querySelector('.sma-pi-key-label');
       const baseField = formEl && formEl.querySelector('.setup-modal-agent-extra-field--baseurl');
+      const toolsField = formEl && formEl.querySelector('.setup-modal-agent-extra-field--tools');
       if (modelInp) modelInp.placeholder = meta.modelPlaceholder;
       if (keyInp) { keyInp.placeholder = meta.keyPlaceholder; keyInp.setAttribute('aria-label', _keyLabel(meta)); }
       const clearBtn = formEl && formEl.querySelector('.sma-pi-key-clear');
       if (clearBtn && !form.draft.hasApiKey) clearBtn.hidden = true;
       if (keyLabel) keyLabel.textContent = _keyLabel(meta);
       if (baseField) baseField.hidden = !meta.supportsBaseUrl;
+      if (toolsField) toolsField.hidden = meta.id !== PI_CUSTOM_PROVIDER;
       closeSuggest();
       fetchPiModels(form.draft.provider); // warm the catalog for the model input
       setFormIssue('');
@@ -866,7 +937,7 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
   // document-level Escape that closes the whole modal, so Cancel is the button.
   gridEl.addEventListener('keydown', (e) => {
     if (e.target.matches('.sma-pi-model') && suggestKeydown(e)) return;
-    if (e.key === 'Enter' && e.target.matches('.sma-pi-model, .sma-pi-key, .sma-pi-baseurl')) {
+    if (e.key === 'Enter' && e.target.matches('.sma-pi-model, .sma-pi-key, .sma-pi-baseurl, .sma-pi-tools')) {
       e.preventDefault();
       submitForm();
     }
@@ -887,6 +958,12 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
       renderGrid();
     } else if (btn.classList.contains('sma-pi-form-save')) {
       submitForm();
+    } else if (btn.classList.contains('sma-model-edit')) {
+      openModelForm(btn.dataset.id);
+    } else if (btn.classList.contains('sma-model-form-save')) {
+      closeModelForm(false);
+    } else if (btn.classList.contains('sma-model-form-cancel')) {
+      closeModelForm(true);
     } else if (btn.classList.contains('sma-pi-key-clear') && form) {
       form.draft.apiKey = '';
       form.draft.apiKeyAction = 'clear';
@@ -984,8 +1061,10 @@ function _wireRecheck(container, onReCheck) {
 
 // One card from a buildAgentCardRows() descriptor. The Pi model rows carry data-pi-idx (the
 // display index) next to data-id="pi"; every Pi radio shares the single `sma-default` group with
-// value="pi", so the emitted taskAgent is always the literal 'pi'.
-function _cardHtml(d) {
+// value="pi", so the emitted taskAgent is always the literal 'pi'. `model` ({value, label,
+// editable}, TPT637) is set only for a Claude/Codex card the caller gave a modelSelects entry —
+// without it every card renders exactly as before.
+function _cardHtml(d, model = null) {
   const piAttr = d.kind === 'pi-model' ? ` data-pi-idx="${d.piIdx}"` : '';
   const checkHtml = d.hasCheckbox
     ? `<input type="checkbox" class="sma-cb" data-id="${_esc(d.id)}"${piAttr}${d.enabled ? ' checked' : ''}${!d.available ? ' disabled' : ''} />`
@@ -1002,8 +1081,13 @@ function _cardHtml(d) {
   // (TPT567) Launcher path + probe exit/output behind the negative — the only place a packaged
   // app ever shows them. Full-width row under the name/reason line (card is flex-wrap).
   const detailHtml = !d.available ? _detailHtml(d.detail) : '';
+  // A custom row declared `tools: false`: a badge before its ✎/×; the tooltip says what it can and
+  // cannot run.
+  const noToolsHtml = d.noTools
+    ? `<span class="setup-modal-agent-badge" title="${_esc(t('agentSelect.noToolsHint'))}">${_esc(t('agentSelect.noTools'))}</span>`
+    : '';
   const isPi = d.kind === 'pi-model' || d.kind === 'pi-empty';
-  const cls = `setup-modal-agent-card${isPi ? ' setup-modal-agent-card--pi' : ''}${d.isDefault ? ' is-selected' : ''}${!d.available ? ' is-unavailable' : ''}${d.kind === 'pi-model' && !d.enabled ? ' is-off' : ''}`;
+  const cls = `setup-modal-agent-card${isPi ? ' setup-modal-agent-card--pi' : ''}${model ? ' setup-modal-agent-card--model' : ''}${d.isDefault ? ' is-selected' : ''}${!d.available ? ' is-unavailable' : ''}${d.kind === 'pi-model' && !d.enabled ? ' is-off' : ''}`;
 
   let nameHtml;
   let actionsHtml = '';
@@ -1019,6 +1103,20 @@ function _cardHtml(d) {
   } else if (d.kind === 'pi-empty') {
     nameHtml = `<span class="setup-modal-agent-name">${_esc(d.name)}</span>
         <span class="setup-modal-agent-sub">${_esc(t('agentSelect.noModelsYet'))}</span>`;
+  } else if (model) {
+    // (TPT637) The Pi card's `<name> · <model>` row; the ✎ opens _modelFormHtml() under the card.
+    nameHtml = model.label
+      ? `<span class="setup-modal-agent-name">
+          <span class="setup-modal-agent-provider">${_esc(d.name)}</span>
+          <span class="setup-modal-agent-sep">·</span>
+          <span class="setup-modal-agent-model" title="${_esc(model.value || model.label)}">${_esc(model.label)}</span>
+        </span>`
+      : `<span class="setup-modal-agent-name">${_esc(d.name)}</span>`;
+    if (model.editable) {
+      const editLabel = _esc(t('agentSelect.editModel', { name: d.name }));
+      actionsHtml = `
+        <button type="button" class="sma-model-edit" data-id="${_esc(d.id)}" title="${editLabel}" aria-label="${editLabel}">✎</button>`;
+    }
   } else {
     nameHtml = `<span class="setup-modal-agent-name">${_esc(d.name)}</span>`;
   }
@@ -1028,7 +1126,7 @@ function _cardHtml(d) {
         ${checkHtml}
         <span class="setup-modal-agent-dot" style="background:${d.color}"></span>
         ${nameHtml}
-        ${unavailHtml}${actionsHtml}
+        ${unavailHtml}${noToolsHtml}${actionsHtml}
         ${radioHtml}
         ${detailHtml}
       </div>`;
@@ -1071,9 +1169,10 @@ function _piAddRowHtml(count) {
       </div>`;
 }
 
-// The single inline Add/Edit form (Provider · Model · API key). Rendered at the bottom of the Pi
-// group for Add, or directly under the card being edited for Edit — never both at once. The
-// inputs carry no data-idx: there is only ever one form, and typing mutates form.draft in place.
+// The single inline Add/Edit form (Provider · Model · API key; Base URL and "Model supports tool
+// calls" on a custom endpoint). Rendered at the bottom of the Pi group for Add, or directly under
+// the card being edited for Edit — never both at once. The inputs carry no data-idx: there is only
+// ever one form, and typing mutates form.draft in place.
 function _piFormHtml(form, count) {
   const meta = piProviderMeta(form.draft.provider);
   const isEdit = form.mode === 'edit';
@@ -1101,6 +1200,10 @@ function _piFormHtml(form, count) {
             <input type="url" class="setup-modal-input sma-pi-baseurl" value="${_esc(form.draft.baseUrl)}"
               placeholder="${_esc(PI_BASE_URL_PLACEHOLDER)}" autocomplete="off" spellcheck="false" aria-label="${_esc(t('agentSelect.baseUrl'))}" />
           </label>
+          <label class="setup-modal-agent-extra-field setup-modal-agent-extra-field--tools" title="${_esc(t('agentSelect.noToolsHint'))}"${meta.id === PI_CUSTOM_PROVIDER ? '' : ' hidden'}>
+            <input type="checkbox" class="sma-pi-tools"${form.draft.tools === false ? '' : ' checked'} />
+            <span class="setup-modal-agent-extra-label">${_esc(t('agentSelect.supportsTools'))}</span>
+          </label>
         </div>
         <p class="setup-modal-agent-extra-note">${_esc(t('agentSelect.providerHint'))}</p>
         <p class="setup-modal-agent-extra-hint"${form.issue ? '' : ' hidden'}>${_esc(form.issue)}</p>
@@ -1123,19 +1226,38 @@ function _providerOptionsHtml(selected) {
   return all.map((p) => `<option value="${_esc(p.id)}"${p.id === selected ? ' selected' : ''}>${_esc(p.label)}</option>`).join('');
 }
 
-// C1161 — markup for one opt-in model-version <select>, rendered as a sibling under its
-// own agent card, keyed by `data-for="{id}"`. `visible` controls the starting `hidden` state,
-// kept in sync afterward by _syncExtras(). Rebuilt with the rest of the grid on every
-// renderGrid(), from the working value in `current`.
-function _modelExtraHtml(id, entry, current, visible) {
-  const options = _modelOptionsHtml(entry, current);
+/**
+ * (TPT637) What a modelSelects entry shows for a working value — the card's model label and the
+ * form's selected option. `value` is the working value, else the entry's own default
+ * (`defaultValue`, e.g. claude's 'opusplan') or `placeholder.value` (codex's '' — "codex default");
+ * `label` is the placeholder's or the matching option's label, or the raw id for a stored model the
+ * option list doesn't carry (e.g. one the live registry dropped) — never another option's label.
+ */
+export function agentModelPick(entry, current) {
+  const value = current || entry?.defaultValue || entry?.placeholder?.value || '';
+  if (entry?.placeholder && value === entry.placeholder.value) return { value, label: entry.placeholder.label };
+  const option = (entry?.options || []).find((o) => o.value === value);
+  return { value, label: option ? option.label : value };
+}
+
+// (TPT637) The inline model form under a Claude/Codex card: the Pi Add/Edit form's shell holding
+// one Model <select> (options/placeholder from the modelSelects entry) and Cancel / Save. Like the
+// Pi form there is only ever one open, so its controls carry no index; the select's data-id is
+// what the grid's change listener applies a pick to.
+function _modelFormHtml(id, name, entry, current) {
   return `
-    <div class="setup-modal-agent-extra" data-for="${_esc(id)}"${visible ? '' : ' hidden'}>
-      <label class="setup-modal-agent-extra-field setup-modal-agent-extra-field--select">
-        <span class="setup-modal-agent-extra-label">${_esc(entry.label)}</span>
-        <select class="sma-model-select" data-id="${_esc(id)}" aria-label="${_esc(entry.label)}">${options}</select>
-      </label>
-    </div>`;
+      <div class="setup-modal-agent-form setup-modal-agent-form--model" data-for="${_esc(id)}" role="group" aria-label="${_esc(t('agentSelect.changeModel', { name }))}">
+        <div class="setup-modal-agent-form-fields">
+          <label class="setup-modal-agent-extra-field">
+            <span class="setup-modal-agent-extra-label">${_esc(entry.label)}</span>
+            <select class="setup-modal-input sma-model-select" data-id="${_esc(id)}" aria-label="${_esc(entry.label)}">${_modelOptionsHtml(entry, current)}</select>
+          </label>
+        </div>
+        <div class="setup-modal-agent-form-actions">
+          <button type="button" class="setup-modal-btn setup-modal-btn--secondary sma-model-form-cancel">${_esc(t('common.cancel'))}</button>
+          <button type="button" class="setup-modal-btn setup-modal-btn--primary sma-model-form-save">${_esc(t('agentSelect.saveModel'))}</button>
+        </div>
+      </div>`;
 }
 
 function _modelOptionsHtml(entry, current) {
@@ -1143,21 +1265,17 @@ function _modelOptionsHtml(entry, current) {
   // entry's own default (e.g. claude's 'opusplan') rather than leaving the browser to fall
   // back to whatever option happens to render first. An entry with a `placeholder` instead
   // of a `defaultValue` (codex) already treats '' as its own real, selectable option, so this
-  // is a no-op there.
-  const selected = current || entry.defaultValue || entry.placeholder?.value || '';
+  // is a no-op there. A stored id the list doesn't carry keeps an option of its own, so the
+  // select shows the real pick rather than the first option.
+  const { value: selected } = agentModelPick(entry, current);
+  const options = entry.options || [];
+  const known = options.some((o) => o.value === selected) || entry.placeholder?.value === selected;
+  const all = selected && !known ? [...options, { value: selected, label: selected }] : options;
   const placeholderHtml = entry.placeholder
     ? `<option value="${_esc(entry.placeholder.value)}"${selected === entry.placeholder.value ? ' selected' : ''}>${_esc(entry.placeholder.label)}</option>`
     : '';
-  const optionsHtml = (entry.options || []).map((o) => `<option value="${_esc(o.value)}"${o.value === selected ? ' selected' : ''}${o.description ? ` title="${_esc(o.description)}"` : ''}>${_esc(o.label)}</option>`).join('');
+  const optionsHtml = all.map((o) => `<option value="${_esc(o.value)}"${o.value === selected ? ' selected' : ''}${o.description ? ` title="${_esc(o.description)}"` : ''}>${_esc(o.label)}</option>`).join('');
   return placeholderHtml + optionsHtml;
-}
-
-// Keep every per-agent model-select extra block (C1161) in sync with current enable state.
-// Called after every renderGrid(). (The Pi rows are top-level cards now, not an extra block.)
-function _syncExtras(container, enabledIds) {
-  container.querySelectorAll('.setup-modal-agent-extra[data-for]').forEach((extra) => {
-    extra.hidden = !enabledIds.includes(extra.dataset.for);
-  });
 }
 
 // Shared gate: true when Pi ("Other Model") is enabled and its rows aren't usable — any

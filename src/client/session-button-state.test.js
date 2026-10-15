@@ -105,7 +105,7 @@ test('task-edit-modal.js resolves the footer button from _modalSessionButton()/s
 
 test('task-card.js refreshCard() repaints the console-control button on a status change', () => {
   const src = readSource('task-card.js');
-  assert.match(src, /import \{ showBulkAgentStartModal, terminateSessionFromCard, refreshParentSubtaskLabel, updateClaudeButtons \} from '\.\/task-board\.js';/);
+  assert.match(src, /import \{[^}]*\bupdateClaudeButtons\b[^}]*\} from '\.\/task-board\.js';/);
   const start = src.indexOf('export function refreshCard(');
   const end = src.indexOf('\n// ── Sprint regroup', start);
   const body = src.slice(start, end);

@@ -12,7 +12,8 @@ import { escapeAttr, renderMarkdown, truncateMarkdownAtParagraph, renderTagBadge
 // collision chat-task-preview.js already works around this way.
 import { t as translate } from './i18n.js';
 import { startTerminalSession } from './ws-client.js';
-import { showBulkAgentStartModal, terminateSessionFromCard, refreshParentSubtaskLabel, updateClaudeButtons } from './task-board.js';
+import { trackQueuedStart } from './queued-start-rollback.js';
+import { showBulkAgentStartModal, terminateSessionFromCard, refreshParentSubtaskLabel, updateClaudeButtons, toastStartFailures, revertRefusedStarts } from './task-board.js';
 import { agentNotice } from './console-modal.js';
 import { groupTitle, getSprintsEnabled } from './group-label.js';
 import { perfStart, perfEnd } from './perf-log.js';
@@ -20,6 +21,7 @@ import { buildSubtasksLabel } from './subtask-count.js';
 import { attentionClass, isAttentionRaised, clearAttention } from './attention-state.js';
 import { activityChipHtml, refreshActivityChip } from './task-activity.js';
 import { MERGE_DOT, mergeButtonHtml, syncTaskMergeCard, initializeTaskMerge } from './task-merge.js';
+import { FINISH_DOT, finishButtonHtml, syncTaskFinishCard, initializeTaskFinish } from './task-finish.js';
 import { isDragStateStale, resolveDropTier, shouldDeferForDrag } from './drag-state.js';
 import { collectFamilyIds } from './related-cards.js';
 import { HIDE_CLASS } from './sprint-tier-visibility.js';
@@ -32,6 +34,8 @@ export { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps }
 // vs a synthetic client id ('new'/'new-<ts>-<seq>'/'new-obj-...'). Server-side module,
 // dependency-free CJS — safe to pull into the client bundle.
 import { isTaskKeyLike } from '../server/task-key-format.js';
+import { loadTaskForAction } from './task-fetch.js';
+import { piTaskPinHint } from './pi-task-models.js';
 
 // ── Callback references (set once via registerCardCallbacks) ──
 let _onLoadAndRender = null;
@@ -241,7 +245,11 @@ function _startTaskSessionCore(taskId, taskTitle, taskDesc, taskStatus, { agentA
     cardMode: state.expandedCardMode === 'pinned' ? 'pinned' : null,
   };
   collapseCard();
-  const hasSession = state.activeSessions.has(taskId) || state.exitedSessions.has(taskId);
+  // (TPT614) extraOpts.relaunch (the Finish card action): a retained exited session is replaced by
+  // a fresh run, so the agent ladder below runs instead of the reattach branch. A live session
+  // still reattaches — the server ignores a prompt on it (task-finish.js never asks for that).
+  const relaunch = !!(extraOpts && extraOpts.relaunch) && !state.activeSessions.has(taskId);
+  const hasSession = !relaunch && (state.activeSessions.has(taskId) || state.exitedSessions.has(taskId));
   const pinnedAgent = (agentAssignee === 'claude' || agentAssignee === 'codex' || agentAssignee === 'pi') ? agentAssignee : null;
   // (C1133) per-task Pi model pin, carried alongside pinnedAgent — undefined for
   // claude/codex (their per-task model resolves server-side from the task record) and
@@ -270,18 +278,6 @@ function _startTaskSessionCore(taskId, taskTitle, taskDesc, taskStatus, { agentA
   }
 }
 
-// (C1559) Fetch one task through whichever transport this window uses — same
-// electronAPI-vs-fetch branch template.html's _fetchTaskForHandoff() uses (not reachable
-// from here, that's inline-script scope, not this ES module).
-async function _fetchTaskForStart(taskId) {
-  if (window.electronAPI?.api?.tasks?.get) {
-    return window.electronAPI.api.tasks.get(taskId);
-  }
-  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, { headers: projectHeader() });
-  if (!r.ok) throw new Error(r.statusText || 'Failed to load task');
-  return r.json();
-}
-
 // (C1559) Card-independent entry point for starting a task's terminal session — the
 // /start-task web-button dispatch's "regular task" and "first startable child" branches
 // (see template.html's 'start-task' IPC listener) call this, since neither has a
@@ -289,15 +285,11 @@ async function _fetchTaskForStart(taskId) {
 // resolves agentAssignee/piModel from its own live fields instead, then shares the exact
 // same ladder _startTaskSession() (bindCardEvents, below) uses for a card-driven Start.
 export async function startTaskById(taskId, extraOpts = {}) {
-  let task;
-  try {
-    task = await _fetchTaskForStart(taskId);
-  } catch (err) {
-    showToast(err.message || `Failed to load task ${taskId}`, 'error');
-    return;
-  }
+  // (TPT672) A task the account lost access to (403/404), a missing one, or a failed read
+  // toasts and starts nothing — see task-fetch.js for the labels.
+  const { task, message } = await loadTaskForAction(taskId, 'card.errStartLoad');
   if (!task) {
-    showToast(`Task ${taskId} not found`, 'error');
+    showToast(message, 'error');
     return;
   }
   _startTaskSessionCore(taskId, task.title || taskId, task.description || '', task.status,
@@ -367,6 +359,8 @@ export function renderAgentBadge(t) {
     // (C1302) show the pinned model id, not the bare 'Pi' — matches console-modal.js's
     // agent selector and task-board.js's picker, which already resolve the model.
     icon = PI_BADGE_SVG; label = t.piModel ? shortModelName(t.piModel) : 'Pi';
+    const hint = piTaskPinHint(state.objectiveProviders, t.piModel, translate);
+    if (hint) label += ` — ${hint}`;
   } else {
     icon = HUMAN_BADGE_SVG; label = 'Human';
   }
@@ -556,7 +550,12 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
   const isPendingSync = !preview && (state.pendingTaskIds && state.pendingTaskIds.has(t.id) || t._pendingSync);
   const manualMerge = !preview && state.taskMergeStatus?.vcs?.type === 'git' && state.taskMergeStatus.vcs.merge === false && state.taskMergeStatus.tasks?.[t.id]?.unmerged === true;
   const mergeBtn = manualMerge ? mergeButtonHtml(t.id) : '';
-  const selectBtn = `<button class="btn-select-card${isSelected ? ' checked' : ''}" data-task-id="${escapeAttr(t.id)}" data-tip="${escapeAttr(translate('tooltip.selectCard'))}" aria-label="${escapeAttr(translate('tooltip.selectCard'))}"><span class="select-dot"></span>${manualMerge ? MERGE_DOT : ''}</button>`;
+  // (TPT614) Exit-backstop flag → Finish action (task-finish.js). Same optional-chaining tolerance
+  // as the merge snapshot above, so a vm harness without the Map still renders; the role check
+  // matches isLeftUncommitted() (closed = complete or canceled role).
+  const leftUncommitted = !preview && !!state.leftUncommitted?.has?.(t.id) && !isCompleteName(t.status) && !isCanceledName(t.status);
+  const finishBtn = leftUncommitted ? finishButtonHtml(t.id) : '';
+  const selectBtn = `<button class="btn-select-card${isSelected ? ' checked' : ''}" data-task-id="${escapeAttr(t.id)}" data-tip="${escapeAttr(translate('tooltip.selectCard'))}" aria-label="${escapeAttr(translate('tooltip.selectCard'))}"><span class="select-dot"></span>${manualMerge ? MERGE_DOT : ''}${leftUncommitted ? FINISH_DOT : ''}</button>`;
   const agentBadge = proposal ? '' : renderAgentBadge(t);
   const effortBadge = proposal ? '' : renderEffortBadge(t);
   const memberBadge = proposal ? '' : renderMemberBadge(t);
@@ -597,7 +596,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
           ${activityChip}
           <span class="card-title${proposal ? ' preview-title' : ''}"${proposal ? ' data-field="title" contenteditable="false"' : ''} ${idAttr}="${escapeAttr(t.id)}" title="${escapeAttr(t.title)}"><span class="card-title-inner">${escapeAttr(t.title)}</span></span>
           ${preview ? '' : `<div class="card-btn-group">
-            ${selectBtn}<div class="card-action-menu" role="group" aria-label="${escapeAttr(translate('card.actionsMenu'))}">${editBtn}${chatBtn}${chainBtn}${reiterateBtn}${deleteBtn}${mergeBtn}</div>
+            ${selectBtn}<div class="card-action-menu" role="group" aria-label="${escapeAttr(translate('card.actionsMenu'))}">${editBtn}${chatBtn}${chainBtn}${reiterateBtn}${deleteBtn}${mergeBtn}${finishBtn}</div>
           </div>`}
         </div>
         ${preview ? previewMetaHtml : `<div class="task-card-hover-controls">
@@ -701,6 +700,7 @@ export function expandCard(card, mode = 'pinned') {
   card.style.width = rect.width + 'px';
   // (C1433) kept in sync with .card.chain-hl's z-index: 100 in styles.css — an
   // expanded objective card must stack above the ringed subtask cards behind it.
+  // (TPT635) Must stay below .bulk-action-bar's z-index: 105.
   card.style.zIndex = '101';
   // (TPT303) A chat proposal overlay may use the whole viewport height (10px margins) so most
   // proposals open without scrolling; board cards keep 80vh. Preview overlays still scroll as a
@@ -1353,6 +1353,7 @@ export function refreshCard(t) {
   const card = document.querySelector(`.card[data-id="${CSS.escape(t.id)}"]`);
   if (!card) return; // card detached (e.g. sprint move pending reload) — no-op
   if (state.taskMergeStatus) syncTaskMergeCard(card);
+  syncTaskFinishCard(card); // (TPT614) the Finish button follows the flag + the card's live status
 
   // (TPT374) The console-control button's icon/caption now depends on status (an in-progress
   // task with a live session paints a spinner, not the plain play icon) — a status-only patch
@@ -1680,6 +1681,7 @@ export function setupCardInteractions(appEl) {
   hideBtnTip();
   ensureButtonTooltips(appEl);
   initializeTaskMerge(appEl);
+  initializeTaskFinish(appEl);
 
   // ── Status select change handlers ──
   appEl.querySelectorAll('.status-select').forEach(sel => {
@@ -2127,12 +2129,16 @@ export function setupCardInteractions(appEl) {
         const humanWork = humanTasks.map(t => _patchStatus(t, { status: inProgressName() }));
 
         // Assigned (claude/codex): patch in_progress + open terminal
-        const assignedWork = assignedTasks.map(async t => {
+        const assignedWork = assignedTasks.map(t => trackQueuedStart(t, async () => {
           await _patchStatus(t, { status: inProgressName() });
           return _openTerminalWs(t, t.agentAssignee);
-        });
+        }));
 
-        await Promise.allSettled([...humanWork, ...assignedWork]);
+        const [, assignedStarts] = await Promise.all([Promise.allSettled(humanWork), Promise.allSettled(assignedWork)]);
+        // (TPT9010) No terminal is open for these starts — the server's refusal is toasted here.
+        toastStartFailures(assignedTasks, assignedStarts);
+        // (TPT9013) A refused start goes back to its previous status.
+        await revertRefusedStarts(assignedTasks, assignedStarts, _patchStatus);
         if (_onFetchActiveSessions) await _onFetchActiveSessions();
       } catch (err) {
         // (C1392) Was alert() — see subtask-radio handler above.
@@ -2147,12 +2153,14 @@ export function setupCardInteractions(appEl) {
                 unassigned.map(t => _patchStatus(t, { agent_assignee: 'human', status: inProgressName() }))
               );
             } else {
-              await Promise.allSettled(
-                unassigned.map(t => _patchStatus(t, { agent_assignee: choice, status: inProgressName() }))
+              const unassignedStarts = await Promise.allSettled(
+                unassigned.map(t => trackQueuedStart(t, async () => {
+                  await _patchStatus(t, { agent_assignee: choice, status: inProgressName() });
+                  return _openTerminalWs(t, choice);
+                }, { restoreAgent: true, agent: choice }))
               );
-              await Promise.allSettled(
-                unassigned.map(t => _openTerminalWs(t, choice))
-              );
+              toastStartFailures(unassigned, unassignedStarts);
+              await revertRefusedStarts(unassigned, unassignedStarts, _patchStatus, { restoreAgent: true });
             }
             if (_onFetchActiveSessions) await _onFetchActiveSessions();
           } catch (err) {

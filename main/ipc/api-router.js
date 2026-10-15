@@ -4,6 +4,7 @@ const { ipcMain, app } = require('electron');
 const { getWindowState, reconfigureWindowBackend } = require('../window-state');
 const serverConfig = require('../../src/server/config');
 const { applyReopenToPatch } = require('../../src/server/reopen-closed-task');
+const { resolveCodingPrefix } = require('../../src/server/task-key-format');
 
 let _taskAgentInfo = null;
 function getAgentInfo() {
@@ -42,6 +43,32 @@ function b(event) {
   return getWindowState(event.sender.id).backend;
 }
 
+// (TPT9001) A thrown error as a plain, structured-clone-safe value — the fields the renderer
+// needs to label a failure (api-client.js isTransportError()).
+function ipcErrorValue(err) {
+  return {
+    message: (err && err.message) || String(err),
+    code: err && typeof err.code === 'string' ? err.code : null,
+    statusCode: err && Number.isInteger(err.statusCode) ? err.statusCode : null,
+    networkError: !!(err && err.networkError),
+  };
+}
+
+// (TPT660) Electron's invoke bridge keeps only the message of a thrown Error. A handler wrapped
+// here answers a failure as { _ipcError: ipcErrorValue(err) } when the renderer sent
+// opts.errorAsValue (api-client.js always does), so it can label the failure by
+// isTransportError(); callers without the flag still get a rejected promise.
+function withErrorEnvelope(fn) {
+  return async (event, args) => {
+    try {
+      return await fn(event, args);
+    } catch (err) {
+      if (args && args.opts && args.opts.errorAsValue) return { _ipcError: ipcErrorValue(err) };
+      throw err;
+    }
+  };
+}
+
 function registerApiHandlers() {
   // ── Tasks ────────────────────────────────────────────────────────────────────
 
@@ -73,7 +100,8 @@ function registerApiHandlers() {
   // typeahead (C1093: dependencies included so the client can build a dep graph and
   // filter cycle-causing candidates). (TPT59) Also carries dbId/parentDbId when present
   // — see the twin ws-handlers.js GET /api/project/tasks comment for why these are
-  // conditional spreads rather than `?? null`.
+  // conditional spreads rather than `?? null`. (TPT642) And priority, for the New Task
+  // Preview's dependency sprint floor on deps outside the board's window.
   ipcMain.handle('api:tasks.listAll', async (event) => {
     const backend = b(event);
     if (!backend) return [];
@@ -87,12 +115,17 @@ function registerApiHandlers() {
         dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
         ...(t.dbId != null ? { dbId: t.dbId } : {}),
         ...(t.parentDbId != null ? { parentDbId: t.parentDbId } : {}),
+        ...(t.priority != null ? { priority: t.priority } : {}),
       }));
   });
 
-  ipcMain.handle('api:tasks.get', async (event, id) => {
+  // (TPT665) Takes a bare id (older callers) or { id, opts }. Any failure other than the 403
+  // below answers as { _ipcError } under opts.errorAsValue, like the task writes further down,
+  // so the edit modal's task-open toast can label it by isTransportError().
+  ipcMain.handle('api:tasks.get', withErrorEnvelope(async (event, arg) => {
     const backend = b(event);
     if (!backend) return null;
+    const id = typeof arg === 'string' ? arg : arg && arg.id;
     try { return await backend.getTask(id); }
     catch (err) {
       // Electron's invoke bridge serializes Error.message but drops custom statusCode.
@@ -100,15 +133,22 @@ function registerApiHandlers() {
       if (err.statusCode === 403) return { _taskAccessDenied: true };
       throw err;
     }
-  });
+  }));
 
   ipcMain.handle('api:tasks.create', async (event, task) => {
     const backend = b(event);
     if (!backend) throw new Error('No project loaded');
-    return backend.createTask(task);
+    // TPT623: client-only directive — register unknown tags with an LLM-written description.
+    let autoRegisterTags = false;
+    if (task && 'auto_register_tags' in task) {
+      autoRegisterTags = task.auto_register_tags === true;
+      task = { ...task };
+      delete task.auto_register_tags;
+    }
+    return backend.createTask(task, { autoRegisterTags });
   });
 
-  ipcMain.handle('api:tasks.update', async (event, { id, patch }) => {
+  async function handleTaskUpdate(event, { id, patch }) {
     const backend = b(event);
     if (!backend) throw new Error('No project loaded');
     // Backlog signal: frontend sends sprint_id:null; normalize to priority 0
@@ -130,7 +170,15 @@ function registerApiHandlers() {
       delete patch.reopen_if_closed;
       await applyReopenToPatch(backend, id, patch, 'chat-patch-ipc');
     }
-    const updateResult = await backend.updateTask(id, patch);
+    // TPT623: client-only directive from the edit modal — register unknown tags with an
+    // LLM-written description instead of failing. Stripped like reopen_if_closed above.
+    let autoRegisterTags = false;
+    if (patch && 'auto_register_tags' in patch) {
+      autoRegisterTags = patch.auto_register_tags === true;
+      patch = { ...patch };
+      delete patch.auto_register_tags;
+    }
+    const updateResult = await backend.updateTask(id, patch, { autoRegisterTags });
     if (!updateResult) return null;
     const fresh = (await backend.getTask(id)) || updateResult;
     // The main process has no initialized WebSocket server. Its one window per project
@@ -138,14 +186,25 @@ function registerApiHandlers() {
     // Preserve parentRescheduled from PATCH when rereading the fresh task.
     if (updateResult._parentRescheduled) fresh.parentRescheduled = updateResult._parentRescheduled;
     return fresh;
-  });
+  }
 
-  ipcMain.handle('api:tasks.delete', async (event, id) => {
+  // (TPT9001) Same invoke-bridge limit as api:tasks.get above: a thrown Error reaches the
+  // renderer as message text only, so the edit modal could not tell a save the API rejected
+  // (the TAGS_UNREGISTERED tag gate, a 4xx) from a request that got no answer. With
+  // opts.errorAsValue — api-client.js always sets it — a failure comes back as
+  // { _ipcError: { message, code, statusCode, networkError } }, which api-client.js rethrows
+  // as an Error carrying those fields. Callers without the flag (template.html's direct
+  // status writes) still get a rejected promise.
+  ipcMain.handle('api:tasks.update', withErrorEnvelope(handleTaskUpdate));
+
+  // (TPT660) Takes a bare id (older callers) or { id, opts } — opts.errorAsValue as above.
+  ipcMain.handle('api:tasks.delete', withErrorEnvelope(async (event, arg) => {
     const backend = b(event);
     if (!backend) throw new Error('No project loaded');
+    const id = typeof arg === 'string' ? arg : arg && arg.id;
     // (C1269) No broadcast needed — see the invariant note on api:tasks.update above.
     return backend.deleteTask(id);
-  });
+  }));
 
   ipcMain.handle('api:tasks.saveAll', async (event, tasks) => {
     const backend = b(event);
@@ -189,19 +248,21 @@ function registerApiHandlers() {
     return backend.getTaskComments(taskKey);
   });
 
-  ipcMain.handle('api:tasks.comments.create', async (event, { taskKey, content, type }) => {
+  // (TPT660) Both comment writes answer a failure as { _ipcError } under opts.errorAsValue.
+  ipcMain.handle('api:tasks.comments.create', withErrorEnvelope(async (event, { taskKey, content, type }) => {
     const backend = b(event);
     if (!backend) throw new Error('No project loaded');
     return backend.createTaskComment(taskKey, content, type);
-  });
+  }));
 
   // TPT34 — author-only comment edit; a mismatched-author 403 rides through as a thrown
-  // Error (see api-backend.js's updateTaskComment + apiRequest allowForbidden branch).
-  ipcMain.handle('api:tasks.comments.update', async (event, { taskKey, commentId, content }) => {
+  // Error (see api-backend.js's updateTaskComment + apiRequest allowForbidden branch), which
+  // the envelope above turns into a value carrying statusCode 403.
+  ipcMain.handle('api:tasks.comments.update', withErrorEnvelope(async (event, { taskKey, commentId, content }) => {
     const backend = b(event);
     if (!backend) throw new Error('No project loaded');
     return backend.updateTaskComment(taskKey, commentId, content);
-  });
+  }));
 
   // TPT17 — Notifications tab: task-wide event log + subscription toggle
   ipcMain.handle('api:tasks.events.list', async (event, taskKey) => {
@@ -210,11 +271,11 @@ function registerApiHandlers() {
     return backend.getTaskEvents(taskKey);
   });
 
-  ipcMain.handle('api:tasks.events.setSubscription', async (event, { taskKey, subscribed }) => {
+  ipcMain.handle('api:tasks.events.setSubscription', withErrorEnvelope(async (event, { taskKey, subscribed }) => {
     const backend = b(event);
     if (!backend) throw new Error('No project loaded');
     return backend.setTaskSubscription(taskKey, subscribed);
-  });
+  }));
 
   // ── Tags ─────────────────────────────────────────────────────────────────────
 
@@ -294,6 +355,9 @@ function registerApiHandlers() {
         ? true : !!project.use_objective_grouping,
       // C1577 — sprint_sort_order, kept identical to ws-handlers.js's GET /api/project/settings.
       sprintSortOrder: project?.sprint_sort_order === 'desc' ? 'desc' : 'asc',
+      // TPT632 — task_prefix through resolveCodingPrefix() (legacy 'C' fallback), kept
+      // identical to ws-handlers.js's GET /api/project/settings.
+      taskPrefix: resolveCodingPrefix(project?.task_prefix),
       // TPT61 — vcs_type/vcs_*_enabled, kept identical to ws-handlers.js's GET
       // /api/project/settings (raw stored values, not normalizeVcsSettings()-masked — see
       // that route's comment for why).
@@ -315,6 +379,17 @@ function registerApiHandlers() {
     if (!backend) throw new Error('No project loaded');
     const project = await backend.updateProject(fields);
     return { project };
+  });
+
+  // TPT659 — the key the API would allocate for the next keyless create (New Task Preview
+  // badge). Per-window `b(event)` like api:project.settings above. Shape kept identical to
+  // ws-handlers.js's GET /api/project/next-task-key: { taskKey: string|null }, null for no
+  // project, a backend without the method, or any failure (getNextTaskKey() fails open).
+  ipcMain.handle('api:project.nextTaskKey', async (event, args) => {
+    const backend = b(event);
+    if (!backend || typeof backend.getNextTaskKey !== 'function') return { taskKey: null };
+    const taskKey = await backend.getNextTaskKey(args && args.category === 'HUMAN' ? 'HUMAN' : 'CODING');
+    return { taskKey: typeof taskKey === 'string' ? taskKey : null };
   });
 
   // TPT12 — the caller's per-project `notifications` inbox rows (activity chip + OS push).

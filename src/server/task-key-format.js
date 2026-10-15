@@ -81,8 +81,51 @@ function maxNumbersByPrefix(keys) {
 // This project's own CODING prefix, degraded to the legacy global 'C' when the value
 // isn't a real derived prefix (e.g. a project row still on the raw DB column default —
 // see api/src/lib/task-prefix.js's isValidTaskPrefix, C1480). Never throws.
+// TPT622: the fallback warns once per process (stderr — safe beside the stdio MCP
+// transport), so a stale/missing project prefix is visible instead of silently minting C.
+let _codingPrefixFallbackWarned = false;
 function resolveCodingPrefix(taskPrefix) {
-  return typeof taskPrefix === 'string' && /^[A-Z]{2,8}$/.test(taskPrefix) ? taskPrefix : 'C';
+  if (typeof taskPrefix === 'string' && /^[A-Z]{2,8}$/.test(taskPrefix)) return taskPrefix;
+  if (!_codingPrefixFallbackWarned) {
+    _codingPrefixFallbackWarned = true;
+    console.warn(`[task-key-format] task_prefix ${JSON.stringify(taskPrefix ?? null)} is not a derived project prefix — falling back to legacy 'C'`);
+  }
+  return 'C';
+}
+
+function _resetCodingPrefixFallbackWarning() {
+  _codingPrefixFallbackWarned = false;
+}
+
+// ── TPT9004 — single-allocator reconciliation ──
+// New task keys exist only from the API: allocateTaskKeyOnCreate() behind a keyless
+// POST /tasks, or reserveTaskKeys() behind POST /tasks/reserve. Nothing in the Task App
+// sends a key it computed itself (api-backend.js _rawCreateTask() drops `task_key`
+// outright), so the two places that still derive a "next number" locally — id-remap.js's
+// collision remap and ws-handlers.js's agent-facing next-id hint — exist only to label
+// proposals, and defer to the API's own read-only peek (GET /tasks/next-key) when one is
+// available. These helpers are that deference.
+
+// How far a locally derived next number (max suffix + 1 over a task list) may sit above
+// the API's peek before it is treated as evidence of keys written around the allocator (a
+// caller-supplied task_key) rather than real growth.
+const SUSPECT_KEY_GAP = 500;
+
+// Picks the next number for `prefix`. The peek is what the allocator hands out next, so it
+// wins whenever it is known (`source: 'peek'`); the local number is only the fallback for
+// an API without the next-key route (`source: 'local'`). `suspect` is true when the local
+// number is more than SUSPECT_KEY_GAP above the peek — callers log it. `taken` (optional
+// Set of live keys) steps a peek-based candidate past rows the counter never issued, so the
+// result never names an existing key.
+function reconcileNextNumber({ prefix, localNext, peekNext, taken } = {}) {
+  const local = Number.isSafeInteger(localNext) && localNext >= 1 ? localNext : 1;
+  const peekKnown = Number.isSafeInteger(peekNext) && peekNext >= 1;
+  const suspect = peekKnown && local > peekNext + SUSPECT_KEY_GAP;
+  let next = peekKnown ? peekNext : local;
+  if (taken && typeof taken.has === 'function') {
+    while (taken.has(`${prefix}${next}`)) next += 1;
+  }
+  return { next, suspect, source: peekKnown ? 'peek' : 'local' };
 }
 
 module.exports = {
@@ -96,4 +139,7 @@ module.exports = {
   isLegacyTaskKey,
   maxNumbersByPrefix,
   resolveCodingPrefix,
+  _resetCodingPrefixFallbackWarning,
+  SUSPECT_KEY_GAP,
+  reconcileNextNumber,
 };

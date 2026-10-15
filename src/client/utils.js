@@ -988,6 +988,8 @@ export function renderTagBadge(name, descriptions) {
 // ── API connectivity banner ──
 // Singleton #api-status-banner: bottom-right corner, z-index 10000.
 // state: 'reconnecting' | 'disconnected' | 'connected'
+// (TPT9007) Copy is apiStatus.*, resolved per call; `message` (the api-status frame's raw transport
+// error) is shown verbatim and never parsed as HTML.
 export function showApiStatusBanner(apiState, message, pendingCount = 0) {
   // Inject keyframes once
   if (!document.getElementById('api-status-banner-style')) {
@@ -1004,7 +1006,7 @@ export function showApiStatusBanner(apiState, message, pendingCount = 0) {
     clearTimeout(banner._dismissTimer);
     banner.style.background = '#2ea043';
     banner.style.opacity = '1';
-    banner.innerHTML = 'Reconnected';
+    banner.textContent = t('apiStatus.reconnected');
     banner._dismissTimer = setTimeout(() => {
       banner.style.opacity = '0';
       setTimeout(() => banner && banner.remove(), 300);
@@ -1027,16 +1029,16 @@ export function showApiStatusBanner(apiState, message, pendingCount = 0) {
     banner.style.background = '#444';
     const spinSvg = '<svg width="12" height="12" viewBox="0 0 12 12" style="animation:api-banner-spin 1s linear infinite;flex-shrink:0"><circle cx="6" cy="6" r="4.5" fill="none" stroke="rgba(255,255,255,0.3)" stroke-width="2"/><path d="M6 1.5A4.5 4.5 0 0 1 10.5 6" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>';
     const label = pendingCount
-      ? `Reconnecting… (${pendingCount} update${pendingCount === 1 ? '' : 's'} queued)`
-      : (message || 'Reconnecting…');
-    banner.innerHTML = spinSvg + label;
+      ? tc('apiStatus.reconnectingQueued', pendingCount)
+      : (message || t('apiStatus.reconnecting'));
+    banner.innerHTML = spinSvg + escapeAttr(label);
   } else {
     // disconnected
     banner.style.background = '#c53030';
-    banner.innerHTML = 'Offline — ' + (message || 'API unreachable');
+    banner.textContent = t('apiStatus.offline', { msg: message || t('apiStatus.unreachable') });
   }
   const closeBtn = document.createElement('button');
-  closeBtn.setAttribute('aria-label', 'Dismiss');
+  closeBtn.setAttribute('aria-label', t('btn.dismiss'));
   closeBtn.textContent = '×';
   closeBtn.style.cssText = 'background:none;border:none;color:inherit;cursor:pointer;padding:0 0 0 0.5rem;font-size:1.1rem;line-height:1;opacity:0.7;flex-shrink:0;margin-left:auto;';
   closeBtn.onclick = () => {

@@ -532,6 +532,44 @@ test('a custom row round-trips through the picker with baseUrl and api intact', 
   assert.deepEqual(buildPiRowState({ piModels: [OLLAMA] }).rows, [{ ...OLLAMA, enabled: true }]);
 });
 
+test('a custom row\'s tools:false round-trips through the picker and never rides on another row', () => {
+  const stored = { model: 'recraft-v3', apiKey: '', provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', tools: false };
+  assert.deepEqual(normalizePiModels({ piModels: [stored] }), [stored]);
+  assert.deepEqual(computePiSaveRows(normalizePiModels({ piModels: [stored, OLLAMA] })), [stored, OLLAMA]);
+  assert.deepEqual(computePiSaveRows([{ ...OLLAMA, tools: true }]), [OLLAMA], 'only false is carried: true is the default');
+  assert.deepEqual(computePiSaveRows([{ model: 'a/b', apiKey: 'k', tools: false }]), [{ model: 'openrouter/a/b', apiKey: 'k' }]);
+});
+
+// ── (TPT694) the form's "Model supports tool calls" checkbox and the "No tools" card badge ──────
+
+test('a checked "Model supports tool calls" (draft tools left undefined) saves no tools field', () => {
+  assert.equal(Object.hasOwn(computePiSaveRows([{ ...OLLAMA, tools: undefined }])[0], 'tools'), false);
+  assert.deepEqual(computePiSaveRows([{ ...OLLAMA, tools: false }]), [{ ...OLLAMA, tools: false }]);
+});
+
+test('buildAgentCardRows flags noTools only on a custom row declared tools:false', () => {
+  const pi = _cards({
+    piModels: [
+      { ...OLLAMA, tools: false, enabled: true },
+      { ...OLLAMA, model: 'llama3.2:3b', enabled: true },
+      { ...OLLAMA, model: 'qwen3:8b', tools: true, enabled: true },
+      { model: 'a/b', apiKey: 'k', tools: false, enabled: true },
+    ],
+    enabledIds: ['pi'], defaultId: 'pi', piDefaultIdx: 0,
+  }).filter((c) => c.kind === 'pi-model');
+  assert.deepEqual(pi.map((c) => c.noTools), [true, false, false, false]);
+  assert.equal(pi[0].name, 'Custom endpoint · llama3.1:8b', 'the badge leaves the card name alone');
+});
+
+test('the tool-support copy exists in both locales', async () => {
+  const { t: tt, setLocale } = await import('./i18n.js');
+  for (const locale of ['en', 'uk']) {
+    setLocale(locale);
+    for (const k of ['supportsTools', 'noTools', 'noToolsHint']) assert.notEqual(tt(`agentSelect.${k}`), `agentSelect.${k}`, `${locale} is missing agentSelect.${k}`);
+  }
+  setLocale('en');
+});
+
 test('addPiModelIssue: key optional for a keyless provider, baseUrl required for a custom endpoint', () => {
   assert.equal(addPiModelIssue([], { model: 'gemini', apiKey: '', provider: 'google-vertex' }), null);
   assert.equal(addPiModelIssue([], { model: 'claude', apiKey: '', provider: 'anthropic' }), t('agentSelect.errApiKeyRequired'));

@@ -2,9 +2,13 @@
 
 const http = require('node:http');
 const https = require('node:https');
+const zlib = require('node:zlib');
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+// Sent unless the caller sets its own Accept-Encoding: the API's front end compresses a response
+// only when the request asks for it.
+const ACCEPT_ENCODING = 'gzip, deflate';
 
 // A request destroy()ed before any response arrived (deadline, caller abort) makes Node emit a
 // deferred "socket hang up" (ECONNRESET) 'error' on it from the socket's close handler — on a
@@ -13,9 +17,27 @@ const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 // by then, so the settle path leaves this no-op behind to absorb the late event.
 function ignoreLateRequestError() {}
 
+// A zlib decoder reports a bad body by destroying itself with the error and emitting it on a later
+// tick. A call that already settled (deadline, caller abort, wire error) leaves this no-op on the
+// decoder, so that late event cannot become an uncaught exception — zlib codes are not
+// network-class, so the server's crash guard would treat one as fatal.
+function ignoreLateDecoderError() {}
+
+// The content coding of a response body this helper decodes, or null when the body is used as
+// received (no Content-Encoding, identity, or a coding it never asked for). HTTP's "deflate" is
+// the zlib-wrapped format, which is what createInflate() expects.
+function responseCoding(headers) {
+  const value = String((headers && headers['content-encoding']) || '').trim().toLowerCase();
+  if (value === 'gzip' || value === 'x-gzip') return 'gzip';
+  if (value === 'deflate') return 'deflate';
+  return null;
+}
+
 /**
  * Make an HTTP/HTTPS request with JSON support.
  * timeoutMs is a deadline for the whole operation, including the response body.
+ * Asks for a gzip or deflate response unless opts.headers sets Accept-Encoding, and decodes one;
+ * the response size limit applies to the decoded body.
  * @param {string} url
  * @param {{ method?: string, headers?: object, body?: object, timeoutMs?: number, signal?: AbortSignal }} opts
  * @returns {Promise<{ status: number, data: any }>}
@@ -29,6 +51,9 @@ function request(url, opts = {}) {
       ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
 
     const headers = { ...opts.headers };
+    if (!Object.keys(headers).some((name) => name.toLowerCase() === 'accept-encoding')) {
+      headers['Accept-Encoding'] = ACCEPT_ENCODING;
+    }
     if (payload) {
       headers['Content-Type'] = 'application/json';
       headers['Content-Length'] = Buffer.byteLength(payload);
@@ -42,6 +67,8 @@ function request(url, opts = {}) {
 
     let req;
     let res;
+    let coding = null;
+    let decoder;
     let timer;
     let settled = false;
     let responseBytes = 0;
@@ -78,6 +105,18 @@ function request(url, opts = {}) {
       }
       chunks.push(buffer);
     };
+    // Compressed body bytes. The decoder starts on the first of them, so a bodyless reply that
+    // still names a coding (HEAD, 204, 304) never reaches zlib, which rejects empty input as a
+    // truncated stream.
+    const onEncodedData = (chunk) => {
+      if (!decoder) {
+        decoder = coding === 'gzip' ? zlib.createGunzip() : zlib.createInflate();
+        decoder.on('data', onResponseData);
+        decoder.on('end', onBodyEnd);
+        decoder.on('error', onResponseError);
+      }
+      decoder.write(chunk);
+    };
     const onResponseEnd = () => {
       if (res.complete === false) {
         const err = new Error(`Response from ${url} ended before completion`);
@@ -85,6 +124,17 @@ function request(url, opts = {}) {
         finish(err, undefined, true);
         return;
       }
+      if (decoder) {
+        // The wire body is complete; from here the decoder's 'end' or 'error' settles the call.
+        // Node closes the response right after this 'end', before the decoder has flushed, so
+        // that close no longer means a cut-off reply.
+        res.off('close', onResponseClose);
+        decoder.end();
+        return;
+      }
+      onBodyEnd();
+    };
+    const onBodyEnd = () => {
       const raw = Buffer.concat(chunks, responseBytes).toString();
       let data;
       try {
@@ -114,10 +164,18 @@ function request(url, opts = {}) {
       }
       if (res) {
         res.off('data', onResponseData);
+        res.off('data', onEncodedData);
         res.off('end', onResponseEnd);
         res.off('error', onResponseError);
         res.off('aborted', onResponseAborted);
         res.off('close', onResponseClose);
+      }
+      if (decoder) {
+        decoder.off('data', onResponseData);
+        decoder.off('end', onBodyEnd);
+        decoder.off('error', onResponseError);
+        decoder.on('error', ignoreLateDecoderError);
+        decoder.destroy();
       }
       if (opts.signal) opts.signal.removeEventListener('abort', onAbort);
       if (err) reject(err);
@@ -138,7 +196,8 @@ function request(url, opts = {}) {
           return;
         }
         res = response;
-        res.on('data', onResponseData);
+        coding = responseCoding(res.headers);
+        res.on('data', coding ? onEncodedData : onResponseData);
         res.on('end', onResponseEnd);
         res.on('error', onResponseError);
         res.on('aborted', onResponseAborted);

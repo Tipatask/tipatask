@@ -10,6 +10,17 @@ const { buildCodexArgs } = require('./codex-session');
 const { buildGeminiArgs } = require('./gemini-session');
 const { buildPiArgs } = require('./pi-session');
 
+test('diagnostic at-mention neutralization covers paths without changing e-mail addresses', () => {
+  const { neutralizeAtMentions } = require('./transcript');
+  const input = '@src/app.js\n(@/tmp/photo.png) `@../notes.md` "@~/docs/a.md" [@C:\\work\\file.txt] @"/tmp/a b.png" @файл.md';
+  assert.equal(neutralizeAtMentions(input), input.replaceAll('@', '＠'));
+  const emails = 'user@example.com <first.last+tag@example.org> (hello@host.test) https://user@host.test/path';
+  assert.equal(neutralizeAtMentions(emails), emails);
+  assert.equal(neutralizeAtMentions('mail user@example.com; read @src/app.js'), 'mail user@example.com; read ＠src/app.js');
+  assert.equal(neutralizeAtMentions(null), '');
+  assert.equal(neutralizeAtMentions(neutralizeAtMentions(input)), neutralizeAtMentions(input));
+});
+
 // The only per-provider knob buildTurnPrompt() takes is transport: claude ships the system
 // prompt as a CLI flag, the other three fold it into stdin.
 const PROVIDERS = [

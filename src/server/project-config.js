@@ -156,6 +156,9 @@ function piKeyEnvVars(entry) {
 // endpoint is dropped, like a row without a model) and `api` (written only when it differs from
 // PI_CUSTOM_DEFAULT_API). Every other provider's row is written without either field, so a stray
 // `baseUrl` on e.g. an openrouter row is discarded and existing on-disk shapes never churn.
+// (TPT634) Same for `tools`: a custom row whose model takes no tool definitions declares
+// `tools: false` (boolean false only — anything else is the default, true) and only that value
+// is written; see pi-custom-endpoint.js piRowSupportsTools().
 function sanitizePiModels(value, max = PI_MAX_MODELS) {
   const raw = Array.isArray(value) ? value
     : Array.isArray(value?.piModels) ? value.piModels
@@ -163,7 +166,7 @@ function sanitizePiModels(value, max = PI_MAX_MODELS) {
   const rows = raw
     ? raw.map((e) => (typeof e === 'string'
         ? { model: e, apiKey: '' }
-        : { model: String(e?.model ?? ''), apiKey: String(e?.apiKey ?? ''), provider: e?.provider, baseUrl: e?.baseUrl, api: e?.api }))
+        : { model: String(e?.model ?? ''), apiKey: String(e?.apiKey ?? ''), provider: e?.provider, baseUrl: e?.baseUrl, api: e?.api, tools: e?.tools }))
     : [{ model: String(value?.piModel ?? ''), apiKey: String(value?.piApiKey ?? '') }];
 
   const seen = new Set();
@@ -184,9 +187,11 @@ function sanitizePiModels(value, max = PI_MAX_MODELS) {
     seen.add(key);
     if (provider === PI_CUSTOM_PROVIDER) {
       const api = normalizePiApi(r.api);
-      out.push(api === PI_CUSTOM_DEFAULT_API
-        ? { model, apiKey, provider, baseUrl }
-        : { model, apiKey, provider, baseUrl, api });
+      out.push({
+        model, apiKey, provider, baseUrl,
+        ...(api !== PI_CUSTOM_DEFAULT_API ? { api } : {}),
+        ...(r.tools === false ? { tools: false } : {}),
+      });
     } else {
       out.push(provider === PI_DEFAULT_PROVIDER ? { model, apiKey } : { model, apiKey, provider });
     }
@@ -225,9 +230,9 @@ function piConfiguredModelIds(cfg) {
 // Read-side compat shim (C1121 decision: config.json's flat PI_MODEL/OPENROUTER_API_KEY
 // keys are retired going forward — PI_MODELS is now the sole source). Returns the
 // project's configured pi rows as [{model, apiKey}] — plus `provider` on a non-OpenRouter row,
-// plus `baseUrl`/`api?` on a `custom` row (same shape sanitizePiModels() writes) — or [] when
-// none are set. Resolve a row's provider and key env var with piProviderEnv(), never by reading
-// `.provider` directly.
+// plus `baseUrl`/`api?`/`tools?` on a `custom` row (same shape sanitizePiModels() writes) — or []
+// when none are set. Resolve a row's provider and key env var with piProviderEnv(), never by
+// reading `.provider` directly.
 function readPiEntries(cfg) {
   if (!cfg) return [];
   return sanitizePiModels(Array.isArray(cfg.PI_MODELS) ? cfg.PI_MODELS : []);
@@ -240,11 +245,12 @@ function rendererPiModels(cfg) {
   if (!rows.length && cfg?.PI_MODEL) {
     rows.push({ model: cfg.PI_MODEL, apiKey: cfg.OPENROUTER_API_KEY || '' });
   }
-  return rows.map(({ model, apiKey, provider, baseUrl, api }) => ({
+  return rows.map(({ model, apiKey, provider, baseUrl, api, tools }) => ({
     model,
     ...(provider ? { provider } : {}),
     ...(baseUrl ? { baseUrl } : {}),
     ...(api ? { api } : {}),
+    ...(tools === false ? { tools: false } : {}),
     hasApiKey: !!apiKey,
     apiKeyAction: apiKey ? 'preserve' : 'clear',
     credentialRef: { model, provider: provider || PI_DEFAULT_PROVIDER },

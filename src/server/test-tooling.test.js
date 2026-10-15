@@ -107,6 +107,37 @@ test('runner fails for swallowed guard violations in inherited Node children', t
   assert.match(result.stderr, /Unit test attempted external fetch to example\.invalid/);
 });
 
+test('runner fails when a test or its helper writes the shared account store, not a private one', t => {
+  const fixture = runnerFixture(t);
+  const seed = "require('node:fs').writeFileSync(require('node:path').join(process.env.TIPATASK_USER_DATA, '.tipatask-account.json'), '{}');";
+  // The helper inherits the worker's env, so it writes whichever store TIPATASK_USER_DATA names.
+  const accountStore = JSON.stringify(require.resolve('./account-store'));
+  const helper = `
+    const helper = require('node:child_process').spawnSync(process.execPath, ['-e',
+      ${JSON.stringify(`require(${accountStore}).writeAccountToken('http://127.0.0.1:9', 'fixture-token')`)}], { encoding: 'utf8' });
+    require('node:assert/strict').equal(helper.status, 0, helper.stderr);
+  `;
+  // A private project root alone leaves the user-data root shared.
+  fixture.write(`process.env.TIPATASK_PROJECT_ROOT = require('node:os').tmpdir(); ${seed} ${helper}`);
+  const shared = fixture.run();
+  assert.equal(shared.status, 1, shared.stdout + shared.stderr);
+  for (const op of ['writeFileSync', 'renameSync']) {
+    assert.match(shared.stderr, new RegExp(`fs\\.${op} into the runner's shared account store from src/nested/behavior\\.test\\.cjs\\. .*tt-ci\\.md`));
+  }
+
+  // A private user-data root passes, even when it is also the project root.
+  fixture.write(`
+    const fs = require('node:fs');
+    const dir = fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'tt-fixture-userdata-'));
+    process.env.TIPATASK_USER_DATA = dir;
+    process.env.TIPATASK_PROJECT_ROOT = dir;
+    try { ${seed} ${helper} } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  `);
+  const isolated = fixture.run();
+  assert.equal(isolated.status, 0, isolated.stdout + isolated.stderr);
+  assert.doesNotMatch(isolated.stderr, /shared account store/);
+});
+
 test('test discovery includes root and deeply nested tests, ignores helpers and symlinks', t => {
   const dir = scratch(t);
   fs.mkdirSync(path.join(dir, 'a', 'b'), { recursive: true });
@@ -122,14 +153,32 @@ test('actual Electron file matcher keeps runtime files and excludes tests and he
   const root = path.resolve(__dirname, '../..');
   const filter = new FileMatcher(root, '/unused', x => x, pkg.build.files).createFilter();
   const stat = { isDirectory: () => false };
-  for (const file of ['main.js', 'preload.js', 'src/server/config.js', 'src/mcp/auth-header-helper.js', 'src/server/git-merge/git-runner.js']) {
+  for (const file of ['main.js', 'preload.js', 'src/server/config.js', 'src/mcp/auth-header-helper.js', 'src/server/git-merge/git-runner.js',
+    'scripts/push-kb-on-write.js', 'scripts/tool-result-cache.js', 'scripts/track-file-access.js']) {
     assert.equal(filter(path.join(root, file), stat), true, file);
   }
   for (const file of ['src/server/config.test.js', 'src/server/task-agent/file-attach.test.js', 'main/window.test.cjs',
     'src/client/task-edit-modal-dom-runner.mjs', 'src/client/new-task-assignee-dom-runner.mjs',
-    'src/server/git-merge/test-fixture.js', 'coverage/index.html']) {
+    'src/server/git-merge/test-fixture.js', 'coverage/index.html', 'scripts/probe-kb-lock.js', 'bin/mcp-node']) {
     assert.equal(filter(path.join(root, file), stat), false, file);
   }
+});
+
+test('every script the Claude settings template hooks run exists and is packaged', () => {
+  const root = path.resolve(__dirname, '../..');
+  const filter = new FileMatcher(root, '/unused', x => x, pkg.build.files).createFilter();
+  const stat = { isDirectory: () => false };
+  const scripts = afterPack.hookScriptsFromSettings(fs.readFileSync(path.join(root, afterPack.HARNESS_SETTINGS), 'utf8'));
+  assert.deepEqual(scripts, ['scripts/push-kb-on-write.js', 'scripts/tool-result-cache.js', 'scripts/track-file-access.js']);
+  for (const script of scripts) {
+    assert.ok(fs.existsSync(path.join(root, script)), script);
+    assert.equal(filter(path.join(root, script), stat), true, script);
+  }
+  // Non-script hooks (the ExitPlanMode plan saver) and malformed groups contribute nothing.
+  assert.deepEqual(afterPack.hookScriptsFromSettings(JSON.stringify({ hooks: {
+    PreToolUse: [{ hooks: [{ command: "jq -r '.tool_input.plan' > plan.md" }] }, { hooks: [] }],
+    PostToolUse: 'not-a-list',
+  } })), []);
 });
 
 // A packaged tree whose versions all agree with package-lock.json: asar (source files plus one
@@ -151,6 +200,12 @@ function packagedFixture(t) {
   fs.writeFileSync(path.join(source, 'main.js'), 'module.exports = {};');
   fs.writeFileSync(path.join(source, 'preload.js'), '');
   fs.writeFileSync(path.join(source, 'todo-server.js'), '');
+  // The real settings template names the hook scripts the archive must ship; stubs stand in for them.
+  const template = fs.readFileSync(path.resolve(__dirname, '../..', afterPack.HARNESS_SETTINGS), 'utf8');
+  fs.mkdirSync(path.join(source, path.dirname(afterPack.HARNESS_SETTINGS)), { recursive: true });
+  fs.writeFileSync(path.join(source, afterPack.HARNESS_SETTINGS), template);
+  fs.mkdirSync(path.join(source, 'scripts'));
+  for (const script of afterPack.hookScriptsFromSettings(template)) fs.writeFileSync(path.join(source, script), '');
   for (const file of ['package.json', 'src/server/vcs-settings.js', 'src/server/vcs-context.js',
     'src/server/vcs-runtime.js', 'src/server/task-agent/base-agent.js', 'src/server/task-agent/codex-agent.js',
     'src/server/terminal-session.js', 'src/server/ws-handlers.js', 'src/server/index.js', 'src/server/api-backend.js',
@@ -221,6 +276,36 @@ test('packaged require guard checks archive entry points and all main modules re
   });
   await assert.rejects(afterPack({ appOutDir: f.dir, electronPlatformName: 'linux', packager: {} }),
     /Unresolved packaged requires/);
+});
+
+test('packaged require guard checks every script the settings template hooks run', async t => {
+  const f = packagedFixture(t);
+  const archive = path.join(f.resources, 'app.asar');
+  fs.mkdirSync(path.join(f.source, 'lib'));
+  fs.writeFileSync(path.join(f.source, 'lib', 'index.js'), '');
+  fs.writeFileSync(path.join(f.source, 'scripts', 'track-file-access.js'), "require('../lib');");
+  await f.repack();
+  afterPack.assertPackagedRequires(archive);
+
+  // A hook script missing from the archive, or one of its own requires, fails packaging.
+  fs.unlinkSync(path.join(f.source, 'scripts', 'push-kb-on-write.js'));
+  fs.writeFileSync(path.join(f.source, 'scripts', 'tool-result-cache.js'), "require('../src/mcp/missing-budget');");
+  await f.repack();
+  assert.throws(() => afterPack.assertPackagedRequires(archive), error => {
+    assert.match(error.message, /templates\/\.claude\/settings\.json: scripts\/push-kb-on-write\.js/);
+    assert.match(error.message, /scripts\/tool-result-cache\.js: \.\.\/src\/mcp\/missing-budget/);
+    return true;
+  });
+
+  // So does an archive without the template, or with one that is not JSON.
+  fs.rmSync(path.join(f.source, 'templates'), { recursive: true });
+  await f.repack();
+  assert.throws(() => afterPack.assertPackagedRequires(archive),
+    /templates\/\.claude\/settings\.json: templates\/\.claude\/settings\.json/);
+  fs.mkdirSync(path.join(f.source, path.dirname(afterPack.HARNESS_SETTINGS)), { recursive: true });
+  fs.writeFileSync(path.join(f.source, afterPack.HARNESS_SETTINGS), '{ broken');
+  await f.repack();
+  assert.throws(() => afterPack.assertPackagedRequires(archive), /Unreadable templates\/\.claude\/settings\.json/);
 });
 
 test('packaged versions pass when consistent and each mismatch is reported by name', async t => {

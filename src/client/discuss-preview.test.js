@@ -9,6 +9,7 @@ import vm from 'node:vm';
 // vm with stubbed collaborators, and wiring that can't be exercised is source-scanned.
 const read = name => readFileSync(new URL('./' + name, import.meta.url), 'utf8');
 import { MERGE_DOT, mergeButtonHtml } from './task-merge.js';
+import { FINISH_DOT, finishButtonHtml } from './task-finish.js';
 
 function extract(text, name) {
   const start = text.indexOf(`function ${name}(`);
@@ -56,6 +57,22 @@ test('renderCard shows merge controls only for manual unmerged board cards', () 
   assert.doesNotMatch(env.renderCard(task, { preview: true }), /btn-merge-task|merge-attention-dot/);
   env.state.taskMergeStatus.vcs.merge = true;
   assert.doesNotMatch(env.renderCard(task), /btn-merge-task|merge-attention-dot/);
+});
+
+// (TPT614) The Finish action follows the exit-backstop flag, board cards only, never a closed task.
+test('renderCard shows the Finish control only for a flagged, open board card', () => {
+  const env = cardEnv({ FINISH_DOT, finishButtonHtml });
+  env.state.leftUncommitted = new Map([[task.id, { exitId: `${task.id}@1`, blockers: ['TASK_COMMIT_MISSING'], status: 'on_fire', at: 1 }]]);
+  const html = env.renderCard(task);
+  assert.match(html, /\$\{mergeBtn\}|btn-finish-task/);
+  assert.match(html, /<button type="button" class="btn-finish-task" data-task-id="TPT179"/);
+  assert.equal((html.match(/finish-attention-dot/g) || []).length, 2);
+  assert.doesNotMatch(env.renderCard(task, { preview: true }), /btn-finish-task|finish-attention-dot/);
+  env.isCompleteName = () => true;
+  assert.doesNotMatch(env.renderCard(task), /btn-finish-task|finish-attention-dot/);
+  env.isCompleteName = () => false;
+  env.state.leftUncommitted.clear();
+  assert.doesNotMatch(env.renderCard(task), /btn-finish-task|finish-attention-dot/);
 });
 
 test('renderCard(preview) keeps what a card shows and drops every control and board lookup attribute', () => {
@@ -258,7 +275,7 @@ test('chat-ui.js wiring: preview sits outside .chat-body, hint/placeholder are d
   const previewAt = shell.indexOf('${discussPreviewHtml}');
   assert.ok(previewAt !== -1, 'preview slot missing from the chat shell');
   assert.ok(previewAt < shell.indexOf('<div class="chat-body">'), 'preview must be a sibling ABOVE .chat-body (outside the .chat-messages scroller)');
-  assert.match(src, /!state\.chatState && !discussKey \? '<div class="chat-brief-hint"/);
+  assert.match(src, /!state\.chatState && !discussKey \? [`']<div class="chat-brief-hint"/);
   assert.match(src, /t\('chat\.discussPlaceholder', \{ key: discussKey \}\)/);
   assert.match(src, /openTaskEditModal\(card\.dataset\.discussTask, \{ readOnly: true \}\)/);
   // Errors must stay cached so a permanently failing key can't refetch on every re-render.

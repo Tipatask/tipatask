@@ -65,7 +65,7 @@ function buildGitDirective(v, opts = {}) {
     // default to committing only when asked, so both wordings say mandatory, never skip,
     // never ask. "Stage only" keeps unrelated or concurrent edits out of the task commit.
     lines.push(compact
-      ? '- Commit is MANDATORY: task not complete until `git add` + `git commit` (msg `<TASK_KEY>: <summary>`) hold its changes. Commit once per changed repo BEFORE marking the task completed, after edits. Never skip the commit, never ask the user whether to commit, never leave task changes uncommitted; stage only task files. Push only with PR.'
+      ? '- Commit is MANDATORY: task not complete until `git add` + `git commit` (msg `<TASK_KEY>: <summary>`) hold its changes. Commit once per changed repo BEFORE marking the task completed. Never skip the commit, never ask the user whether to commit, never leave task changes uncommitted; stage only task files. Push only with PR.'
       : `- Commit is MANDATORY, not optional: this project has commits enabled, which is the user's standing request to commit — do not wait to be asked. The task is not complete until its changes are staged with \`git add\` and recorded with \`git commit\`, the message starting with the task key (\`<TASK_KEY>: <summary>\`). Commit your work exactly once per repository you changed, after the last code change and BEFORE you mark the task completed: run \`git add\`/\`git commit\` in the worktree first, ${v.merge ? 'then follow the merge step below before posting the resolution comment and the status update' : 'then post the resolution comment and the status update'}. Never skip the commit, never ask the user whether to commit, and never leave this task's changes uncommitted in the working tree; stage only the files this task changed and leave unrelated edits alone. A task marked completed while its worktree still has uncommitted changes is flagged to the user and blocks the Task App's merge flow until committed. Do not push unless pull/merge-request mode is also enabled below.`);
   } else {
     // C1561 — commits are off even though git itself is on (worktree-only / pr-without-
@@ -95,7 +95,20 @@ function buildGitDirective(v, opts = {}) {
       ? '- Open a pull/merge request: `gh pr create`, else `git push -u origin task/<TASK_KEY>` + compare URL; never guess forge host.'
       : '- Open a pull/merge request for the task branch: use `gh pr create` if the `gh` CLI is available. If it is not, push the branch (`git push -u origin task/<TASK_KEY>`) and report the compare URL in your resolution comment for the user to open manually — do not guess a forge host or hand-construct a PR URL.');
   }
+  if (v.commit) lines.push(buildDefinitionOfDone(v, compact));
   return lines.join('\n');
+}
+
+// TPT611 — agents otherwise report "done" with changes uncommitted and the task still in
+// progress, or hand the commit back ("ready to commit when you confirm"). Done is gated on
+// three checkable facts, and the final message must carry them. Last line of the git block,
+// commit-on only; never uses the word "mandatory" (the commit line owns it).
+function buildDefinitionOfDone(v, compact) {
+  const logCmd = v.worktree ? '`git log -1 task/<TASK_KEY>`' : '`git log -1`';
+  if (compact) {
+    return `- Done only when ${logCmd} shows the \`<TASK_KEY>:\` commit, \`git status\` lists no task files and complete_task/tt complete returned completed; final message gives the sha and that result. Never end with "ready to commit when you confirm".`;
+  }
+  return `- Definition of done: this task is NOT done until all three hold — (1) ${logCmd} shows a commit whose message starts with \`<TASK_KEY>:\` in every repository you changed; (2) \`git status\` lists none of this task's files as modified, staged or untracked; (3) \`complete_task\` returned the task as completed${v.merge ? ' after the merge and checks above' : ''}. Until then never report the task as done, finished or ready, and never end with "ready to commit when you confirm" or any other offer to commit or complete later — run the commit and the completion yourself. If one of them cannot be met, the task is blocked: follow the blocker path in the resolution mandate instead of calling it done.`;
 }
 
 // C1561 — shared no-attribution sentence, used by both the git commit-off sub-line above

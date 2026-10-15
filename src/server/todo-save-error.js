@@ -5,9 +5,10 @@
 //
 // The status is the save's retry contract with the client, so 500 is kept for the one case
 // it describes: an unexpected failure inside this server. Everything with a known cause gets
-// its own status — a payload the save rejects (4xx), the Tipatask API failing or unreachable
-// behind this server (502/503) — and the body always carries the real message, the step
-// that threw, and a stable code where there is one.
+// its own status — a payload the save rejects (4xx), the Tipatask API failing (502) or
+// unreachable behind this server (503, including a reverse-proxy gateway status) — and the
+// body always carries the real message, the step that threw, and a stable code where there
+// is one.
 
 const CODE_STATUS = {
   TODO_PAYLOAD_INVALID: 400,
@@ -32,13 +33,16 @@ function classifySaveError(err, step = null) {
   } else if (Number.isInteger(upstream) && upstream >= 400 && upstream < 500) {
     // The API (or the local auth guard) rejected the request — its status is the answer.
     status = upstream;
+  } else if (err && err.networkError) {
+    // Unreachable wins over a 5xx status: a reverse-proxy 502/503/504 carries both
+    // (api-backend.js flags gateway statuses as network failures) and is an outage, not
+    // an API error. A bare 5xx below is the app itself failing.
+    status = 503;
+    code = 'API_UNREACHABLE';
   } else if (Number.isInteger(upstream) && upstream >= 500) {
     status = 502;
     code = 'API_ERROR';
     error = `Tipatask API error: ${message}`;
-  } else if (err && err.networkError) {
-    status = 503;
-    code = 'API_UNREACHABLE';
   } else if (code && CODE_STATUS[code]) {
     status = CODE_STATUS[code];
   }

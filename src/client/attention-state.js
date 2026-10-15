@@ -3,6 +3,7 @@
 // transient WS snapshot or board rerender must not erase unread attention.
 
 import state from './state.js';
+import { clearQueuedStarts, forgetQueuedStart } from './queued-start-rollback.js';
 
 // Tasks the user has already dismissed by opening the terminal, or that were pruned as closed.
 // A /api/sessions snapshot must not resurrect these off a stale `attention[]` entry — the
@@ -79,11 +80,13 @@ export function clearAttention(taskId, reason = 'server') {
 export function mergeSessionsSnapshot(data, project = data?.projectPath || '') {
   if (!data) return;
   if (_snapshotProject !== undefined && _snapshotProject !== project) {
+    clearQueuedStarts();
     state.activeSessions.clear();
     state.lostSessions.clear();
     state.sessionMeta.clear();
     state.attentionSessions.clear();
     state.attentionDetails.clear();
+    state.leftUncommitted.clear();
     _dismissedLosses.clear();
     _suppressed.clear();
   }
@@ -91,6 +94,9 @@ export function mergeSessionsSnapshot(data, project = data?.projectPath || '') {
   const attention = new Set(data.attention || []);
   const details = data.attentionDetails || {};
   const sessions = new Set(data.sessions || []);
+  for (const id of sessions) {
+    if (data.sessionMeta?.[id]?.alive === true) forgetQueuedStart(id);
+  }
   const exited = new Set(data.exited || []);
   // (TPT444) Start-queue entries are neither active nor exited, but they are NOT gone — without
   // this they would be marked lost below.
@@ -101,8 +107,22 @@ export function mergeSessionsSnapshot(data, project = data?.projectPath || '') {
     state.attentionSessions.add(id);
     if (details[id]) state.attentionDetails.set(id, details[id]); // never blank a live detail
   }
+  // (TPT664) Exit-backstop flags the server still holds (`leftUncommitted: { KEY: { exitId,
+  // blockers: [{code}], status, at } }`): adopt additively, same rule as attention above — a
+  // snapshot can rebuild a flag this window never saw (reload, second window) but never drops
+  // one by omission; the server's `cleared` frame does that. A different exitId is a newer exit.
+  for (const [id, entry] of Object.entries(data.leftUncommitted || {})) {
+    if (!id || !entry) continue;
+    const have = state.leftUncommitted.get(id);
+    if (have && have.exitId === entry.exitId) continue;
+    const blockers = (Array.isArray(entry.blockers) ? entry.blockers : []).map(b => (b && b.code) || b).filter(Boolean);
+    state.leftUncommitted.set(id, { exitId: entry.exitId, blockers, status: entry.status || '', at: Number(entry.at) || Date.now() });
+  }
   for (const id of [...state.attentionSessions]) {
     if (sessions.has(id) || exited.has(id) || queued.has(id)) continue; // session still known to the server — keep
+    // (TPT613) An exit-backstop ring is about the task, raised after its session already ended —
+    // a snapshot without that session is expected, not a reason to drop it.
+    if (state.leftUncommitted.has(id)) continue;
     clearAttention(id, 'gone');
   }
   for (const id of [..._suppressed]) {
@@ -162,6 +182,11 @@ export function pruneClosedAttention(taskStatusById, isClosedFn) {
     const status = taskStatusById.get(id);
     if (status !== undefined && isClosedFn(status)) clearAttention(id, 'closed');
   }
+  // (TPT613) A closed task is no longer left uncommitted — whatever closed it, the flag is done.
+  for (const id of [...state.leftUncommitted.keys()]) {
+    const status = taskStatusById.get(id);
+    if (status !== undefined && isClosedFn(status)) state.leftUncommitted.delete(id);
+  }
 }
 
 // Re-applies `.needs-attention` to every mounted card from state.attentionSessions — the
@@ -187,5 +212,6 @@ export function _resetAttentionState() {
   _snapshotProject = undefined;
   _dismissedLosses.clear();
   state.lostSessions.clear();
+  state.leftUncommitted.clear();
   _suppressed.clear();
 }

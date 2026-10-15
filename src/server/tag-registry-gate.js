@@ -6,6 +6,12 @@
 // in api-backend.js, decisions live in a plain, bare-node-testable module. See
 // ai/architecture/tt-tag-system.md § C1439 and tt-api-backend.md for the full writeup.
 
+const { isPlaceholderDescription } = require('../mcp/tag-description');
+
+// Longest description an automatic registration keeps (tags.description is TEXT, but a
+// tag description is a one-line summary read by planners/agents to pick tags).
+const AUTO_DESCRIPTION_MAX_CHARS = 200;
+
 // Normalize a tag name for comparison. Matches the tags table's collation
 // (utf8mb4_uca1400_ai_ci — case-insensitive, no explicit COLLATE in migration
 // 002_tags.js) and the API's trim-on-write (api/src/routes/tags.js:104). This check
@@ -72,11 +78,14 @@ function resolveTagNames(wanted, index) {
   return { unknown, canonical };
 }
 
-function unregisteredTagError(unknown, { projectId, registrySize } = {}) {
+// note: optional extra sentence appended to the message (e.g. why automatic registration
+// could not describe these names — TPT623).
+function unregisteredTagError(unknown, { projectId, registrySize, note } = {}) {
   const sizeNote = registrySize != null ? ` (registry has ${registrySize} tag${registrySize === 1 ? '' : 's'})` : '';
   const err = new Error(
     `Unregistered tag(s) ${unknown.map(n => `"${n}"`).join(', ')} in project ${projectId ?? '?'}${sizeNote} — register each ` +
-    'with a real one-line description first (MCP ensure_project_tag for plain tags, create_system_tag for tt-* tags), then retry.'
+    'with a real one-line description first (MCP ensure_project_tag for plain tags, create_system_tag for tt-* tags), then retry.' +
+    (note ? ` ${note}` : '')
   );
   err.code = 'TAGS_UNREGISTERED';
   err.missing = [...unknown];
@@ -100,6 +109,34 @@ function selectTasksToWrite(parsedById, liveById, newTaskIdSet, tasksDiffer) {
   return out;
 }
 
+// TPT623 — Task App UI saves may register unknown tags with an LLM-written description
+// (tag-auto-register.js). missing: names the gate could not resolve. described:
+// Map<name, description> (or a plain object) from the model. Returns
+// { registrations: [{name, description}], undescribed: [name] } — a registration only for a
+// name with a real one-line description (quotes stripped, whitespace collapsed, capped,
+// never empty or C1038 placeholder text). tt-* names are never auto-registered: they need an
+// architecture doc via create_system_tag, so they always land in `undescribed` and keep the gate error.
+function buildAutoRegistrations(missing, described) {
+  const lookup = described instanceof Map ? described : new Map(Object.entries(described || {}));
+  const byFolded = new Map();
+  for (const [name, desc] of lookup) byFolded.set(foldTagName(name), desc);
+  const registrations = [];
+  const undescribed = [];
+  for (const raw of new Set((missing || []).filter(Boolean))) {
+    const name = String(raw).trim();
+    if (!name || /^tt-/i.test(name)) { undescribed.push(raw); continue; }
+    const desc = sanitizeAutoDescription(lookup.has(raw) ? lookup.get(raw) : byFolded.get(foldTagName(raw)));
+    if (!desc || isPlaceholderDescription(desc)) { undescribed.push(raw); continue; }
+    registrations.push({ name, description: desc });
+  }
+  return { registrations, undescribed };
+}
+
+function sanitizeAutoDescription(text) {
+  if (typeof text !== 'string') return '';
+  return text.replace(/\s+/g, ' ').trim().replace(/^["'`]+|["'`]+$/g, '').trim().slice(0, AUTO_DESCRIPTION_MAX_CHARS).trim();
+}
+
 module.exports = {
   foldTagName,
   parseTagRegistryResponse,
@@ -107,4 +144,6 @@ module.exports = {
   resolveTagNames,
   unregisteredTagError,
   selectTasksToWrite,
+  buildAutoRegistrations,
+  sanitizeAutoDescription,
 };

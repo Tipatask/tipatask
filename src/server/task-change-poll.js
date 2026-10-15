@@ -4,13 +4,19 @@
 // among windows, so a singleton hash misses other projects. Broadcast per project;
 // retain the rootless fallback for single-project callers.
 
-// TPT12 — how often (in ticks, i.e. every Nth 10s tick) the poll also fetches unread
-// `notifications` inbox rows and diffs them into a `task-activity` broadcast. Task changes
-// need the fast 10s cadence; a teammate's comment does not, so this runs 3x slower — cuts
-// the added DB load (one joined SELECT + two COUNT(*) per project, see
-// api/src/routes/notifications.js) to ~2 req/min/project instead of 6. A named export so
-// tests can drive it directly instead of calling tick() 3 times.
-const NOTIFICATIONS_EVERY_N_TICKS = 3;
+// TPT12 — how often (in ticks; index.js runs one tick every TIPATASK_TASK_POLL_MS, default
+// 30s) the poll also fetches unread `notifications` inbox rows and diffs them into a
+// `task-activity` broadcast. A teammate's comment does not need the task cadence, so this
+// runs every 2nd tick (~60s) — one joined SELECT + two COUNT(*) per project per run, see
+// api/src/routes/notifications.js. A named export so tests can drive it directly.
+const NOTIFICATIONS_EVERY_N_TICKS = 2;
+
+// TPT610 — when the backend serves the cheap change stamp (getTaskChangeStamp(), TPT609's
+// GET /tasks/changes), ticks hash the stamp instead of the full task list. The stamp misses
+// tag-only edits (task_tags never bumps tasks.updated_at) and edits landing in the same
+// second as the previous read (updated_at is DATETIME), so a tick with no list baseline yet
+// and every Nth tick also hash the full list as a safety net — every 10th tick, ~5 min at 30s.
+const FULL_RECONCILE_EVERY_N_TICKS = 10;
 
 /**
  * @param {object} opts
@@ -24,13 +30,16 @@ const NOTIFICATIONS_EVERY_N_TICKS = 3;
  *   a watched client with no `_projectPath` is skipped with a once-per-boot warning instead
  *   of throwing every tick against dead credentials.
  * @param {number} [opts.notificationsEveryNTicks] TEST SEAM — overrides NOTIFICATIONS_EVERY_N_TICKS.
+ * @param {number} [opts.fullReconcileEveryNTicks] TEST SEAM — overrides FULL_RECONCILE_EVERY_N_TICKS.
  * @returns {{ tick: () => Promise<void> }}
  */
 function createTaskChangePoll({
   wss, getBackendForPath, websocket, log = console.log, warn = console.warn,
   isSingletonUnbound = () => false, notificationsEveryNTicks = NOTIFICATIONS_EVERY_N_TICKS,
+  fullReconcileEveryNTicks = FULL_RECONCILE_EVERY_N_TICKS,
 }) {
-  const _lastHashByProject = new Map(); // projectPath ('' = singleton) → md5 hex
+  const _lastHashByProject = new Map(); // projectPath ('' = singleton) → md5 hex of the full task list
+  const _lastStampHashByProject = new Map(); // projectPath → md5 hex of the change stamp (TPT610)
   const _lastActivityHashByProject = new Map(); // projectPath → md5 hex of the reduced activity snapshot
   const _tickCountByProject = new Map(); // projectPath → number of ticks seen (for the every-Nth gate)
   let _warnedUnboundSingleton = false;
@@ -95,6 +104,16 @@ function createTaskChangePoll({
     _lastActivityHashByProject.set(projectPath, hash);
   }
 
+  // Stores md5(value) for projectPath in `hashes`; true when it differs from a previous
+  // observation. The first observation is a baseline and never counts as a change.
+  function _diff(hashes, projectPath, value) {
+    const crypto = require('node:crypto');
+    const hash = crypto.createHash('md5').update(JSON.stringify(value)).digest('hex');
+    const last = hashes.has(projectPath) ? hashes.get(projectPath) : null;
+    hashes.set(projectPath, hash);
+    return last !== null && hash !== last;
+  }
+
   function _watchedProjectPaths() {
     const paths = new Set();
     for (const client of wss.clients) {
@@ -114,22 +133,33 @@ function createTaskChangePoll({
       return;
     }
     const backend = getBackendForPath(projectPath);
-    const tasks = await (backend.getTasksUnfiltered ? backend.getTasksUnfiltered() : backend.getTasks());
-    const crypto = require('node:crypto');
-    const hash = crypto.createHash('md5').update(JSON.stringify(tasks)).digest('hex');
-    const lastHash = _lastHashByProject.has(projectPath) ? _lastHashByProject.get(projectPath) : null;
-    if (lastHash !== null && hash !== lastHash) {
+    const tickCount = (_tickCountByProject.get(projectPath) || 0) + 1;
+    _tickCountByProject.set(projectPath, tickCount);
+
+    // TPT610 — stamp first. null means the deployment predates GET /tasks/changes: hash the
+    // full list every tick, as before. A throw (network, decode, auth) rejects this project's
+    // tick without touching any stored hash, so the next tick tries the stamp again rather
+    // than switching to the full list for good.
+    const stamp = typeof backend.getTaskChangeStamp === 'function'
+      ? await backend.getTaskChangeStamp()
+      : null;
+    let changed = false;
+    if (stamp) changed = _diff(_lastStampHashByProject, projectPath, stamp);
+    const reconcileDue = !_lastHashByProject.has(projectPath) || tickCount % fullReconcileEveryNTicks === 0;
+    if (!stamp || reconcileDue) {
+      const tasks = await (backend.getTasksUnfiltered ? backend.getTasksUnfiltered() : backend.getTasks());
+      // Not short-circuited: the list baseline must advance even when the stamp already changed.
+      if (_diff(_lastHashByProject, projectPath, tasks)) changed = true;
+    }
+    if (changed) {
       log(`[poll] project=${projectPath || '<default>'} tasks changed, broadcasting tasks-updated`);
       websocket.broadcastToProject(projectPath, 'tasks-updated');
     }
-    _lastHashByProject.set(projectPath, hash);
 
     // TPT12 — every Nth tick, also diff unread notifications into a task-activity broadcast.
     // Own try/catch: a notifications-fetch failure (transient API hiccup, a deployment that
     // predates this route, a project mid-auth-trouble) must never suppress the tasks-updated
     // broadcast above, and must never make this project's whole tick() entry reject.
-    const tickCount = (_tickCountByProject.get(projectPath) || 0) + 1;
-    _tickCountByProject.set(projectPath, tickCount);
     if (tickCount % notificationsEveryNTicks === 0) {
       try {
         await _tickProjectActivity(projectPath, backend);
@@ -155,4 +185,4 @@ function createTaskChangePoll({
   return { tick };
 }
 
-module.exports = { createTaskChangePoll, NOTIFICATIONS_EVERY_N_TICKS };
+module.exports = { createTaskChangePoll, NOTIFICATIONS_EVERY_N_TICKS, FULL_RECONCILE_EVERY_N_TICKS };

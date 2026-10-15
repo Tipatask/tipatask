@@ -83,8 +83,10 @@ function createSessionAdmission({ getSessions, getTelemetry, isRunning, resolveP
       const unregistered = unregisteredCount > 0;
       const doubtful = o => o.orphaned || o.stopped || time < o.at || time - o.at > policy.staleMs;
       const uncertain = owners.some(doubtful);
-      const coordinated = censusFresh && census?.includes(coordinator.pid) && !unregistered && !uncertain
-        && owners.every(o => o.fingerprint === policy.fingerprint);
+      // Boolean: a failed census (`null`) must not reach decideAdmission() as `undefined`,
+      // which its `coordinated = true` default would read as verified coordination.
+      const coordinated = Boolean(censusFresh && census?.includes(coordinator.pid) && !unregistered && !uncertain
+        && owners.every(o => o.fingerprint === policy.fingerprint));
       const slots = owners.flatMap(o => o.slots);
       // Conservative count: every slot of a stopped/orphaned/stale owner and one
       // slot per unregistered server count as running, whatever their flags say.
@@ -138,11 +140,14 @@ function createSessionAdmission({ getSessions, getTelemetry, isRunning, resolveP
         unregisteredPids, unregisteredCount: unregisteredPids?.length ?? null };
     });
     // Failed transactions cannot establish ownership; never reuse a previous owner
-    // count or report unknown unregistered servers as zero.
+    // count or report unknown unregistered servers as zero. The shared ramp state was
+    // not read either, so its cap, ceiling and next step stay unknown.
     const censusFresh = censusAt !== null && time >= censusAt && time - censusAt <= policy.staleMs;
     diagnostic = tx.ok ? tx.result : { allowed: false, reason: 'coordination', detail: tx.detail,
       coordinationReason: null, instances: null, unregisteredPids: null, unregisteredCount: null,
-      censusPidCount: censusFresh && census ? census.length : null, policy, cap: policy.fallbackCap };
+      censusPidCount: censusFresh && census ? census.length : null, policy, cap: policy.fallbackCap,
+      alarm: null, requiredBytes: null, headroomBytes: telemetry?.host?.reclaimableEstimateBytes ?? null,
+      rampCap: null, rampCeiling: null, rampNextStepAt: null };
     return diagnostic;
   }
   async function poll() {

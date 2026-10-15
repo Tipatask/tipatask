@@ -363,12 +363,18 @@ function upsertTopLevelTomlKey(content, key, value) {
 function upsertTomlKey(content, sectionName, key, value) {
   const lines = content ? content.split('\n') : [];
   const result = [];
-  const keyPattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=`);
+  const keyPattern = new RegExp(`^\\s*(?:${escapeRegExp(key)}|"${escapeRegExp(key)}"|'${escapeRegExp(key)}')\\s*=`);
+  const section = JSON.stringify(parseTomlOptional(`[${sectionName}]`));
   let i = 0;
   let sectionFound = false;
 
   while (i < lines.length) {
-    if (lines[i].trim() !== `[${sectionName}]`) {
+    // Inherited preferences can use quoted table names and keys. Match their
+    // TOML identity so refresh does not append duplicate [features] tables.
+    const header = lines[i].trim();
+    const matches = header === `[${sectionName}]` || (/^\[(?!\[).+\]\s*(?:#.*)?$/.test(header)
+      && JSON.stringify(parseTomlOptional(header)) === section);
+    if (!matches) {
       result.push(lines[i]);
       i += 1;
       continue;
@@ -404,16 +410,48 @@ function upsertTomlKey(content, sectionName, key, value) {
 }
 
 function removeTopLevelTomlKey(content, key) {
-  const lines = content ? content.split('\n') : [];
-  const keyPattern = new RegExp(`^\\s*(?:${escapeRegExp(key)}|"${escapeRegExp(key)}"|'${escapeRegExp(key)}')\\s*=`);
-  const result = [];
-  let topLevel = true;
-  for (const line of lines) {
-    if (topLevel && line.trim().startsWith('[')) topLevel = false;
-    if (topLevel && keyPattern.test(line)) continue;
-    result.push(line);
+  // Read complete TOML statements, not individual lines: notify commands can be
+  // multiline arrays, and other multiline strings can contain key-like text.
+  const lines = (content || '').match(/[^\n]*\n|[^\n]+$/g) || [];
+  let result = '', statement = '';
+  for (let i = 0; i < lines.length; i++) {
+    if (!statement && lines[i].trimStart().startsWith('[')) {
+      return result + lines.slice(i).join(''); // the remaining keys belong to tables
+    }
+    statement += lines[i];
+    const parsed = parseTomlOptional(statement);
+    if (!parsed) continue;
+    result += Object.hasOwn(parsed, key) ? tomlComments(statement) : statement;
+    statement = '';
   }
-  return result.join('\n');
+  return result + statement;
+}
+
+// Keep comments from a removed assignment, including comments inside arrays.
+// Hashes inside quoted command arguments are data, not comments.
+function tomlComments(statement) {
+  let quote = null, multiline = false, comments = '';
+  for (let i = 0; i < statement.length; i++) {
+    const ch = statement[i];
+    if (quote) {
+      if (quote === '"' && ch === '\\') { i++; continue; }
+      if (ch !== quote) continue;
+      if (!multiline) { quote = null; continue; }
+      let end = i;
+      while (statement[end] === quote) end++;
+      if (end - i >= 3) quote = null;
+      i = end - 1;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      multiline = statement.slice(i, i + 3) === ch.repeat(3);
+      if (multiline) i += 2;
+    } else if (ch === '#') {
+      const end = statement.indexOf('\n', i);
+      comments += statement.slice(i, end < 0 ? statement.length : end + 1);
+      i = end < 0 ? statement.length : end;
+    }
+  }
+  return comments;
 }
 
 // A hand-tuned global tipatask-local section keeps its command/args/env during
@@ -696,7 +734,7 @@ function mergeGlobalCodexPreferences(projectContent, globalContent) {
   }
   function visit(defaults, current, prefix = []) {
     for (const [key, value] of Object.entries(defaults)) {
-      if (!prefix.length && ['mcp_servers', 'projects', 'default_tools_approval_mode'].includes(key)) continue;
+      if (!prefix.length && ['mcp_servers', 'projects', 'default_tools_approval_mode', 'notify'].includes(key)) continue;
       const keys = [...prefix, key];
       if (!Object.prototype.hasOwnProperty.call(current, key)) add(keys, value);
       else if (isTable(value) && isTable(current[key])) visit(value, current[key], keys);
@@ -851,9 +889,25 @@ function writeCodexMcpConfig({ targetPath, projectRoot, mcpServerPath, nodePath,
   if (existing.trim() && !parseTomlOptional(existing)) {
     throw new Error(`Invalid Codex configuration at ${targetPath}; existing file preserved`);
   }
+  const project = parseTomlOptional(existing);
+  const global = parseTomlOptional(globalSeed);
+  const defaultsPath = path.join(path.dirname(targetPath), TERMINAL_DEFAULTS);
+  const defaults = readTerminalDefaults(defaultsPath);
+  // Explicit project edits win, then saved defaults, then the user's initial
+  // default. In particular, [] must keep notifications disabled across refreshes.
+  const notify = project.notify ?? defaults.notify ?? global?.notify;
+  const terminalDefaults = {};
+  if (notify !== undefined) terminalDefaults.notify = notify;
+  const nativeDefaults = fs.existsSync(defaultsPath) || notify !== undefined;
+  if (nativeDefaults) {
+    terminalDefaults.model_reasoning_effort = project.model_reasoning_effort
+      ?? defaults.model_reasoning_effort ?? global?.model_reasoning_effort ?? 'high';
+  }
+  const cleanProject = removeTopLevelTomlKey(existing, 'notify');
+  const cleanGlobal = global ? removeTopLevelTomlKey(globalSeed, 'notify') : '';
   const seed = existing
-    ? mergeGlobalCodexPreferences(mergeGlobalMcpServerTables(existing, globalSeed), globalSeed)
-    : (parseTomlOptional(globalSeed) ? globalSeed : '');
+    ? mergeGlobalCodexPreferences(mergeGlobalMcpServerTables(cleanProject, cleanGlobal), cleanGlobal)
+    : cleanGlobal;
   let out = removeTomlSections(seed, isMcpToolApprovalSection);
   out = removeTopLevelTomlKey(out, 'default_tools_approval_mode');
   // upsertTomlSection replaces a whole section body when present, so this cleanly
@@ -872,13 +926,13 @@ function writeCodexMcpConfig({ targetPath, projectRoot, mcpServerPath, nodePath,
   // Interactive homes own effort. A project-layer effort would mask their value.
   // Preserve later manual edits in the defaults file; never backfill global effort
   // into this layer once the project has migrated to native terminal homes.
-  const defaultsPath = path.join(path.dirname(targetPath), TERMINAL_DEFAULTS);
-  if (fs.existsSync(defaultsPath)) {
-    const effort = parseTomlOptional(existing)?.model_reasoning_effort;
-    if (effort !== undefined) saveTerminalDefaults(defaultsPath, effort);
+  if (nativeDefaults) {
     out = removeTopLevelTomlKey(out, 'model_reasoning_effort');
   }
   const final = out.endsWith('\n') ? out : `${out}\n`;
+  toml.parse(final);
+  // Persist the command before removing its only copy from the project layer.
+  if (nativeDefaults) saveTerminalDefaults(defaultsPath, terminalDefaults);
   try { if (fs.readFileSync(targetPath, 'utf8') === final) return; } catch { /* absent */ }
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   atomicCodexWrite(targetPath, final);
@@ -894,8 +948,29 @@ function atomicCodexWrite(file, content) {
   }
 }
 
-function saveTerminalDefaults(file, effort) {
-  atomicCodexWrite(file, `model_reasoning_effort = ${tomlValue(effort)}\n`);
+function readTerminalDefaults(file) {
+  let content;
+  try { content = fs.readFileSync(file, 'utf8'); }
+  catch (err) { if (err.code === 'ENOENT') return {}; throw err; }
+  const parsed = parseTomlOptional(content);
+  if (!parsed) throw new Error(`Invalid Codex terminal defaults at ${file}; existing file preserved`);
+  return parsed;
+}
+
+function saveTerminalDefaults(file, updates) {
+  const existing = readTerminalDefaults(file);
+  let content = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  const original = content;
+  for (const [key, value] of Object.entries(updates)) {
+    if (value === undefined || JSON.stringify(existing[key]) === JSON.stringify(value)) continue;
+    content = `${key} = ${tomlValue(value)}\n${removeTopLevelTomlKey(content, key)}`;
+  }
+  const parsed = toml.parse(content);
+  if (content !== original) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    atomicCodexWrite(file, content);
+  }
+  return parsed;
 }
 
 // Each native home is an immutable configuration/environment snapshot. Concurrent
@@ -912,16 +987,20 @@ function prepareCodexTerminalHome({ projectRoot, codexHome, effort, env = {} }) 
     throw new Error('Legacy Codex profiles are unsupported; remove profile/profiles from the project configuration');
   }
   const defaultsPath = path.join(codexHome, TERMINAL_DEFAULTS);
-  if (parsed.model_reasoning_effort !== undefined || !fs.existsSync(defaultsPath)) {
-    saveTerminalDefaults(defaultsPath, parsed.model_reasoning_effort ?? 'high');
-  }
-  if (parsed.model_reasoning_effort !== undefined) {
+  const previousDefaults = readTerminalDefaults(defaultsPath);
+  const defaults = saveTerminalDefaults(defaultsPath, {
+    model_reasoning_effort: parsed.model_reasoning_effort ?? previousDefaults.model_reasoning_effort ?? 'high',
+    notify: parsed.notify,
+  });
+  if (parsed.model_reasoning_effort !== undefined || parsed.notify !== undefined) {
     content = removeTopLevelTomlKey(content, 'model_reasoning_effort');
+    content = removeTopLevelTomlKey(content, 'notify');
     atomicCodexWrite(configPath, content);
   }
   // Bound project-layer discovery at the selected checkout, including nested
   // projects. Ancestor effort must not override this console's selected effort.
   const settings = {
+    ...(defaults.notify !== undefined ? { notify: defaults.notify } : {}),
     model_reasoning_effort: effort,
     project_root_markers: ['.codex'],
     sqlite_home: parsed.sqlite_home ? path.resolve(codexHome, parsed.sqlite_home) : codexHome,

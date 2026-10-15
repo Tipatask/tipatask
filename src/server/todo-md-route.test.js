@@ -179,3 +179,33 @@ test('GET /TODO.md?window=active&assignees=bogus — unrecognized value falls th
   assert.equal(stub._lastBoardOpts.unscoped, false);
   assert.equal('assignees' in data, false);
 });
+
+// ── TPT9004: the next-id hint reports the API's own next-key peek when the backend has one ──
+
+test('GET /TODO.md?status=pending — hint reports the API next-key peek over the local max+1', async () => {
+  const stub = makeStub();
+  stub.getNextTaskKey = async (category) => (category === 'HUMAN' ? 'H125' : 'C9005');
+  const res = await run(stub, '/TODO.md?status=pending&_=123');
+  assert.equal(res.statusCode, 200);
+  assert.match(res.body, /Next available task IDs \(across ALL statuses, assigned by the API — never pass your own task_key\): C9005, H125\./);
+});
+
+test('GET /TODO.md?status=pending — a local max+1 more than 500 above the peek is logged and the peek wins', async (t) => {
+  const stub = makeStub();
+  stub.getTasksUnfiltered = async () => [
+    { id: 'C1', title: 'Mine', status: 'pending', assignee: 1 },
+    { id: 'C1300', title: 'Minted around the allocator', status: 'pending', assignee: 9 },
+  ];
+  stub.getNextTaskKey = async (category) => (category === 'HUMAN' ? null : 'C705');
+  const warnings = [];
+  t.mock.method(console, 'warn', (...args) => warnings.push(args.join(' ')));
+  const res = await run(stub, '/TODO.md?status=pending&_=123');
+  assert.equal(res.statusCode, 200);
+  assert.match(res.body, /: C705, H1\./, 'CODING from the peek, HUMAN from the local list (peek null)');
+  assert.ok(warnings.some(w => w.includes('C1301') && w.includes('500') && w.includes('C705')), `expected a suspect warning, got ${JSON.stringify(warnings)}`);
+});
+
+test('GET /TODO.md?status=pending — a backend without getNextTaskKey keeps the local derivation', async () => {
+  const res = await run(makeStub(), '/TODO.md?status=pending&_=123');
+  assert.match(res.body, /: C3, H1\./);
+});

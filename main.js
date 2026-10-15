@@ -1096,16 +1096,18 @@ function registerIpcHandlers() {
       raise: raiseNotifyWindow,
     }).catch(() => null),
     // A card belongs to its project: the window owning that project now, else the project
-    // reopened. `notify:clicked` waits for a window that is still loading.
+    // reopened. It gets the same verified raise as Show More, and `notify:clicked` only after
+    // that raise settled (or on did-finish-load for a window still loading), so the task opens
+    // in a window that is in front. The controller keeps the banner up until this resolves.
     onClick: async (entry) => {
       try {
         const w = await notifyTarget.resolveClickTarget(entry.origin, {
           originWindow: resolveNotifyTarget,
           projectOf: (target) => projectDirs.get(target.webContents.id) || null,
           reopen: (projectPath) => createProjectWindow(projectPath),
+          raise: raiseNotifyWindow,
         });
         if (!w) return;
-        raiseNotifyWindow(w).catch(() => {});
         const send = () => {
           if (w.isDestroyed()) return;
           w.webContents.send('notify:clicked', { notificationId: entry.notificationId,

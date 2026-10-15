@@ -5,6 +5,8 @@
 // Never write the row's secret to disk or argv: models.json references the key's
 // environment variable. Keyless endpoints use a non-secret placeholder because
 // Pi hides models without configured auth.
+// Also home to the row-capability helpers both spawn paths share: whether a row's model takes
+// tools at all, the sentence shown when it does not, and which row a task terminal may run.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -13,10 +15,12 @@ const crypto = require('node:crypto');
 const {
   PI_PROVIDERS,
   PI_CUSTOM_PROVIDER,
+  normalizePiProvider,
   normalizePiApi,
   isPiCustomEntry,
   piProviderEnv,
   readPiEntries,
+  piEntryForModel,
   readProjectConfig,
 } = require('./project-config');
 
@@ -46,6 +50,49 @@ function piSpawnProvider(entry) {
 
 function _hostOf(baseUrl) {
   try { return new URL(baseUrl).host; } catch { return String(baseUrl); }
+}
+
+// (TPT634) Whether a readPiEntries() row's model takes tool definitions. Only a custom row can say
+// it does not (`tools: false`, kept by sanitizePiModels()); every built-in row, and null (the
+// legacy OpenRouter default), is tool-capable. A headless objective turn on such a row runs with
+// no tools from the first attempt; a task terminal or a task/project chat refuses to start.
+function piRowSupportsTools(entry) {
+  return !(isPiCustomEntry(entry) && entry.tools === false);
+}
+
+// Where a PI_MODELS row's requests go, for user-facing error copy: a custom row's endpoint host,
+// otherwise the provider's label (OpenRouter, DeepSeek, …). A null/legacy row is OpenRouter.
+function piRowHost(entry) {
+  if (isPiCustomEntry(entry)) {
+    try { return new URL(entry.baseUrl).host || String(entry.baseUrl); } catch { return String(entry.baseUrl); }
+  }
+  return PI_PROVIDERS[normalizePiProvider(entry && entry.provider)].label;
+}
+
+// The one sentence every surface shows for a model without tool support: the model, where it
+// runs, why, what to do. `declared` (the row sets `tools: false`) replaces the reason a
+// tool-compat failure gives, where the endpoint itself rejected the request.
+function toolCompatMessage(model, host, { declared = false } = {}) {
+  const why = declared ? 'its PI_MODELS row sets tools: false' : 'the endpoint rejected the request';
+  return `Model "${model}" at ${host} does not support tool calls (${why}). Choose a tool-capable model.`;
+}
+
+// The row a Pi task terminal runs when no model is named: the first row whose model takes tools —
+// row 0 unless it sets `tools: false`. A tool-less row 0 stays the objective-chat default, but must
+// not block a task start while a tool-capable row exists. null when no row takes tools.
+function piTaskDefaultEntry(cfg) {
+  return readPiEntries(cfg).find((entry) => piRowSupportsTools(entry)) || null;
+}
+
+// Whether a requested model id may run a Pi task terminal: { entry } for a configured row whose model
+// takes tools; otherwise { entry: null, reason } — 'unknown' (not one of the project's PI_MODELS rows)
+// or 'no-tools' (its row sets tools: false). ws-handlers.js checks the launch-time pick and a task's
+// saved pi_model with this; either miss falls back to the task default (piTaskDefaultEntry()).
+function piTaskEntryForModel(cfg, modelId) {
+  const entry = piEntryForModel(cfg, modelId);
+  if (!entry) return { entry: null, reason: 'unknown' };
+  if (!piRowSupportsTools(entry)) return { entry: null, reason: 'no-tools' };
+  return { entry, reason: null };
 }
 
 // The models.json object for a set of rows. Non-custom rows are ignored. Deliberately built from
@@ -168,6 +215,11 @@ module.exports = {
   PI_CUSTOM_NO_KEY,
   piCustomProviderId,
   piSpawnProvider,
+  piRowSupportsTools,
+  piRowHost,
+  toolCompatMessage,
+  piTaskDefaultEntry,
+  piTaskEntryForModel,
   buildPiModelsJson,
   serializePiModelsJson,
   piRealAgentDir,

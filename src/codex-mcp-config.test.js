@@ -16,7 +16,9 @@ const {
   buildCodexMcpSection,
   buildCodexLocalMcpSection,
   getCodexPaths,
+  ensureProjectCodexHome,
   prepareCodexTerminalHome,
+  removeTopLevelTomlKey,
   mcpSectionHasCommand,
   mergeGlobalMcpServerTables,
   updateGlobalCodexMcpApprovalConfig,
@@ -107,6 +109,138 @@ test('config refresh keeps terminal effort out of project layers and shell relau
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-codex-mcp-'));
 }
+
+test('notify removal handles complete TOML statements and preserves comments and nested keys', () => {
+  const content = '# before\r\n"not\\u0069fy" = [ # command\r\n'
+    + '  "sh", # executable\r\n  """line 1\n# argument, not a comment\n""",\r\n'
+    + '  "value#with]bracket",\r\n] # end\r\n'
+    + 'instructions = """\nnotify = ["keep this text"]\n[not_a_table]\n"""\n'
+    + '[custom]\nnotify = ["nested"]\n';
+  const output = removeTopLevelTomlKey(content, 'notify');
+  const parsed = toml.parse(output);
+  assert.equal(parsed.notify, undefined);
+  assert.equal(parsed.instructions, toml.parse(content).instructions);
+  assert.deepEqual(parsed.custom.notify, ['nested']);
+  assert.match(output, /^# before\r\n# command\r\n# executable\r\n# end\r\n/);
+  assert.doesNotMatch(output, /argument, not a comment|value#with/);
+  assert.equal(removeTopLevelTomlKey(output, 'notify'), output);
+});
+
+test('every project refresh migrates notify and preserves custom defaults instead of reseeding global notify', t => {
+  const root = makeTempDir();
+  const globalHome = path.join(root, 'global');
+  fs.mkdirSync(globalHome);
+  const globalFile = path.join(globalHome, 'config.toml');
+  fs.writeFileSync(globalFile, '# global\nnotify = ["global-hook", "global-arg"]\nmodel_reasoning_effort = "medium"\n');
+  const previousHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = globalHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  for (const initial of ['fresh', 'legacy', 'migrated', 'disabled']) {
+    const projectRoot = path.join(root, initial);
+    const home = path.join(projectRoot, '.codex');
+    const file = path.join(home, 'config.toml');
+    const defaultsFile = path.join(home, 'tipatask-terminal.toml');
+    fs.mkdirSync(home, { recursive: true });
+    const custom = ['project-hook', 'argument # literal'];
+    if (initial !== 'fresh') {
+      fs.writeFileSync(file, '# keep project comment\n'
+        + (initial === 'legacy' ? 'notify = [\n  "project-hook", # hook comment\n  "argument # literal",\n]\n' : '')
+        + 'model = "custom-model"\n');
+    }
+    if (initial === 'migrated' || initial === 'disabled') {
+      fs.writeFileSync(defaultsFile, '# keep defaults comment\nmodel_reasoning_effort = "low"\n'
+        + `notify = ${JSON.stringify(initial === 'disabled' ? [] : custom)}\n`
+        + '[custom]\nkeep = true\n');
+    }
+    const expected = initial === 'fresh' ? ['global-hook', 'global-arg'] : initial === 'disabled' ? [] : custom;
+    const refresh = () => ensureProjectCodexHome({ projectRoot, browserTools: [] });
+    refresh();
+    const projectContent = fs.readFileSync(file, 'utf8');
+    const defaultsContent = fs.readFileSync(defaultsFile, 'utf8');
+    assert.equal(toml.parse(projectContent).notify, undefined, initial);
+    assert.deepEqual(toml.parse(defaultsContent).notify, expected, initial);
+    const selected = prepareCodexTerminalHome({ projectRoot, codexHome: home, effort: 'high' });
+    assert.deepEqual(toml.parse(fs.readFileSync(path.join(selected, 'config.toml'), 'utf8')).notify, expected);
+    refresh();
+    assert.equal(fs.readFileSync(file, 'utf8'), projectContent, initial);
+    assert.equal(fs.readFileSync(defaultsFile, 'utf8'), defaultsContent, initial);
+    assert.equal(prepareCodexTerminalHome({ projectRoot, codexHome: home, effort: 'high' }), selected);
+    if (initial !== 'fresh') {
+      assert.match(projectContent, /# keep project comment/);
+      assert.equal(toml.parse(projectContent).model, 'custom-model');
+    }
+    if (initial === 'legacy') assert.match(projectContent, /# hook comment/);
+    if (initial === 'migrated' || initial === 'disabled') {
+      assert.match(defaultsContent, /# keep defaults comment/);
+      assert.equal(toml.parse(defaultsContent).custom.keep, true);
+    }
+    // A subsequent explicit project edit must replace the saved command and
+    // select a new immutable snapshot, without erasing unrelated defaults.
+    fs.writeFileSync(file, 'notify = ["new-hook"]\nmodel_reasoning_effort = "xhigh"\n' + projectContent);
+    refresh();
+    const updated = toml.parse(fs.readFileSync(defaultsFile, 'utf8'));
+    assert.deepEqual(updated.notify, ['new-hook']);
+    assert.equal(updated.model_reasoning_effort, 'xhigh');
+    if (initial === 'migrated' || initial === 'disabled') assert.equal(updated.custom.keep, true);
+    assert.equal(toml.parse(fs.readFileSync(file, 'utf8')).notify, undefined);
+    const next = prepareCodexTerminalHome({ projectRoot, codexHome: home, effort: 'high' });
+    assert.notEqual(next, selected);
+    assert.deepEqual(toml.parse(fs.readFileSync(path.join(next, 'config.toml'), 'utf8')).notify, ['new-hook']);
+    assert.deepEqual(toml.parse(fs.readFileSync(path.join(selected, 'config.toml'), 'utf8')).notify, expected);
+  }
+  assert.deepEqual(toml.parse(fs.readFileSync(globalFile, 'utf8')).notify, ['global-hook', 'global-arg']);
+  assert.match(fs.readFileSync(globalFile, 'utf8'), /# global/);
+});
+
+test('terminal preparation directly migrates legacy notify and effort without erasing saved defaults', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, '.codex');
+  fs.mkdirSync(home);
+  const file = path.join(home, 'config.toml');
+  const defaultsFile = path.join(home, 'tipatask-terminal.toml');
+  fs.writeFileSync(file, "'notify' = [\n 'custom', 'arg',\n] # keep notify comment\nmodel_reasoning_effort = 'low'\n");
+  fs.writeFileSync(defaultsFile, '# keep defaults\nnotify = ["old"]\n[custom]\nkeep = true\n');
+  const selected = prepareCodexTerminalHome({ projectRoot: root, codexHome: home, effort: 'high' });
+  const defaults = toml.parse(fs.readFileSync(defaultsFile, 'utf8'));
+  assert.deepEqual(defaults.notify, ['custom', 'arg']);
+  assert.equal(defaults.model_reasoning_effort, 'low');
+  assert.equal(defaults.custom.keep, true);
+  assert.match(fs.readFileSync(defaultsFile, 'utf8'), /# keep defaults/);
+  assert.match(fs.readFileSync(file, 'utf8'), /# keep notify comment/);
+  assert.equal(toml.parse(fs.readFileSync(file, 'utf8')).notify, undefined);
+  assert.deepEqual(toml.parse(fs.readFileSync(path.join(selected, 'config.toml'), 'utf8')).notify, ['custom', 'arg']);
+});
+
+test('notify migration preserves source files when terminal defaults are malformed or cannot be saved', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, '.codex');
+  fs.mkdirSync(home);
+  const file = path.join(home, 'config.toml');
+  const defaultsFile = path.join(home, 'tipatask-terminal.toml');
+  const original = 'notify = ["custom"]\nmodel = "mine"\n';
+  fs.writeFileSync(file, original);
+  fs.writeFileSync(defaultsFile, 'notify = [');
+  const refresh = () => writeCodexMcpConfig({ targetPath: file, projectRoot: root, browserTools: [] });
+  const prepare = () => prepareCodexTerminalHome({ projectRoot: root, codexHome: home, effort: 'high' });
+  for (const run of [refresh, prepare]) {
+    assert.throws(run, /Invalid Codex terminal defaults.*existing file preserved/);
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+    assert.equal(fs.readFileSync(defaultsFile, 'utf8'), 'notify = [');
+  }
+  fs.writeFileSync(defaultsFile, '# unchanged\n');
+  t.mock.method(fs, 'renameSync', () => { throw new Error('simulated write failure'); });
+  for (const run of [refresh, prepare]) {
+    assert.throws(run, /simulated write failure/);
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+    assert.equal(fs.readFileSync(defaultsFile, 'utf8'), '# unchanged\n');
+  }
+});
 
 const TEST_BROWSER_RUNTIME = {
   available: true,
@@ -996,7 +1130,7 @@ test('preference inheritance handles quoted tables, arrays and inline project ov
   const parsed = toml.parse(mergeGlobalCodexPreferences(local, global));
   assert.equal(parsed.profiles['custom.profile'].model, 'mine');
   assert.equal(parsed.profiles['custom.profile'].model_reasoning_effort, 'high');
-  assert.deepEqual(parsed.notify, ['sh', 'notify.sh']);
+  assert.equal(parsed.notify, undefined, 'user-level notify must not be backfilled into a project layer');
   assert.equal(mergeGlobalCodexPreferences(local, 'broken = ['), local);
   const inline = 'features = { custom = false }\n';
   assert.equal(mergeGlobalCodexPreferences(inline, '[features]\ncustom = true\n'), inline);

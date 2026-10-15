@@ -3,11 +3,13 @@
 const config = require('./config');
 const { getApiCredentials, createTokenWatch } = require('./api-credentials');
 const { request } = require('../cli/http');
+const { STATUS_CODES } = require('node:http');
 const recipesStore = require('./recipes-store');
 const { ensureArchitectureDocs, buildStub } = require('./architecture-docs');
 const { selectLinkCandidates, prepareTagDocs, linkTagDocs } = require('./tag-doc-link');
 const { withProjectLock } = require('./project-mutex');
 const { isReservationPlaceholder } = require('./reservation-placeholder');
+const { isTaskKeyLike } = require('./task-key-format');
 const { readProjectConfig } = require('./project-config');
 const { buildSpecCommentBody, stripSpecCommentHeader } = require('./spec-comment');
 const { readOriginSpecSnapshot, postOriginSpecComment } = require('./origin-spec-capture');
@@ -24,6 +26,7 @@ const {
   buildTagIndex,
   resolveTagNames,
   unregisteredTagError,
+  buildAutoRegistrations,
   selectTasksToWrite,
 } = require('./tag-registry-gate');
 const { AuthCorruptedError, inspectToken, validateCredentials: validateCredentialsGuard } = require('./auth-guard');
@@ -44,6 +47,12 @@ const STATUSES_FALLBACK_TTL_MS = 5_000; // synthesized (legacy) result re-probes
 const PROJECT_SETTINGS_CACHE_TTL_MS = 30_000;
 const PROJECT_SETTINGS_FALLBACK_TTL_MS = 5_000;
 const RECONNECT_BACKOFF_MS_TABLE = [2000, 4000, 8000, 16000, 30000];
+// Statuses a reverse proxy answers with when the API process behind it is down or not
+// answering (production: Apache in front of web.tipatask.com). No answer from the app
+// itself, so apiRequest() treats them as an outage — same contract as a transport failure
+// (queue, disconnect, replay) — rather than as a rejected request. Mirrors the renderer's
+// GATEWAY_STATUSES in src/client/api-client.js (isTransportError()).
+const GATEWAY_STATUSES = new Set([502, 503, 504]);
 
 // Scope Task App board tasks to current assignee even for a project owner, whose
 // API assignee filter is otherwise ignored. If current user lookup fails, keep
@@ -199,6 +208,10 @@ function _eachListCache(fn) {
 const RECONNECT_BACKOFF_MS = RECONNECT_BACKOFF_MS_TABLE;
 let _connectionState = null; // null until init() completes
 let _reconnectTimer = null;
+// False until the first successful contact has run the post-connect setup
+// (_completeFirstConnect). When init() fails on a network error, the reconnect probe
+// finishes that setup instead.
+let _firstConnectDone = false;
 let _reconnectAttempt = 0;
 const _stateListeners = new Set();
 // Token value that triggered the current 'unauthorized' latch — used by the
@@ -218,9 +231,21 @@ let _reverifyAfter = 0; // 0 = current latch is not re-verifiable
 // Buffers write mutations (update/create/delete) while offline so callers get
 // an optimistic value instead of an error. Drains in insertion order once the
 // reconnect probe succeeds, before _markConnected() fires.
+// Entry args mirror the raw helper's signature, OPTIONS INCLUDED: update → [id, fields, opts],
+// create → [task, opts], delete → [id]. A queued Task App UI save keeps its
+// `autoRegisterTags` flag (TPT623) this way, so the replay still registers unknown tags
+// instead of walking straight into the API's TAGS_UNREGISTERED 400 (TPT662).
 let _pendingMutations = [];      // [{ op, args, timestamp, taskId }]
 const _pendingTaskIds = new Set(); // task ids currently in queue (for _pendingSync enrichment)
-const _drainListeners = new Set(); // cb(replayedTasks[], remainingCount)
+// cb(replayedTasks[], remainingCount, dropped[]) — `dropped` lists every entry this drain
+// gave up on (non-network, non-auth failure on replay): { op, taskId, title, code,
+// statusCode, message }. Listeners written before the third argument existed keep working.
+const _drainListeners = new Set();
+
+// (TPT673) Set by dispose() when a registry evicts this instance. A disposed instance stays
+// usable for a caller still holding it, but never re-arms the reconnect timer on its own —
+// unless a write was queued after dispose, which still needs a reconnect to replay.
+let _disposed = false;
 
 function _isOffline() {
   return _connectionState === 'disconnected' || _connectionState === 'reconnecting';
@@ -233,10 +258,17 @@ function _enqueueMutation(op, args, taskId) {
   _notifyState(_connectionState, null);
 }
 
-function _notifyDrain(replayedTasks, remainingCount) {
+function _notifyDrain(replayedTasks, remainingCount, dropped = []) {
   for (const cb of _drainListeners) {
-    try { cb(replayedTasks, remainingCount); } catch (e) { console.warn('[api-backend] drain listener error:', e.message); }
+    try { cb(replayedTasks, remainingCount, dropped); } catch (e) { console.warn('[api-backend] drain listener error:', e.message); }
   }
+}
+
+// The user-facing label for a queued entry: the title the edit carried, when it carried one.
+function _queuedEntryTitle(entry) {
+  const payload = entry.op === 'create' ? entry.args[0] : entry.args[1];
+  const title = payload && typeof payload.title === 'string' ? payload.title.trim() : '';
+  return title || null;
 }
 
 async function _drainPendingMutations() {
@@ -244,6 +276,7 @@ async function _drainPendingMutations() {
   const snapshot = _pendingMutations.slice();
   _pendingMutations = [];
   const replayedTasks = [];
+  const dropped = [];
 
   for (let i = 0; i < snapshot.length; i++) {
     const entry = snapshot[i];
@@ -272,7 +305,8 @@ async function _drainPendingMutations() {
       if (err.networkError) {
         // Re-queue remaining (including this entry) and re-arm backoff
         _pendingMutations.unshift(...snapshot.slice(i));
-        _notifyDrain(replayedTasks, _pendingMutations.length);
+        if (dropped.length) _cacheInvalidate();
+        _notifyDrain(replayedTasks, _pendingMutations.length, dropped);
         _armReconnect();
         return;
       }
@@ -283,15 +317,29 @@ async function _drainPendingMutations() {
       // generic 4xx/5xx branch below and the write was silently dropped.
       if (err.authError) {
         _pendingMutations.unshift(...snapshot.slice(i));
-        _notifyDrain(replayedTasks, _pendingMutations.length);
+        if (dropped.length) _cacheInvalidate();
+        _notifyDrain(replayedTasks, _pendingMutations.length, dropped);
         return;
       }
-      // Non-network, non-auth error (other 4xx/5xx) — drop entry, log, continue draining
+      // Non-network, non-auth error (other 4xx/5xx, or the local tag gate — e.g. a tt-* tag
+      // automatic registration can never describe): the entry can't be replayed, so it leaves
+      // the queue — but never silently (TPT662). It is reported to every drain listener as a
+      // `dropped` record, and the list cache is invalidated below so the optimistic row that
+      // still carries the lost edit is re-read from the API instead of lingering until TTL.
       console.warn(`[api-backend:queue] Dropping ${entry.op} for ${entry.taskId}: ${err.message}`);
       _pendingTaskIds.delete(entry.taskId);
+      dropped.push({
+        op: entry.op,
+        taskId: entry.taskId,
+        title: _queuedEntryTitle(entry),
+        code: err.code || null,
+        statusCode: err.statusCode || null,
+        message: err.message,
+      });
     }
   }
-  _notifyDrain(replayedTasks, _pendingMutations.length);
+  if (dropped.length) _cacheInvalidate();
+  _notifyDrain(replayedTasks, _pendingMutations.length, dropped);
 }
 
 function _notifyState(state, message) {
@@ -341,6 +389,7 @@ function _clearUnauthorized() {
 
 function _armReconnect() {
   if (_reconnectTimer) return;
+  if (_disposed && _pendingMutations.length === 0) return;
   const delay = RECONNECT_BACKOFF_MS[Math.min(_reconnectAttempt, RECONNECT_BACKOFF_MS.length - 1)];
   _reconnectAttempt++;
   if (_connectionState !== 'reconnecting') {
@@ -386,6 +435,23 @@ async function _fetchCurrentUserId() {
   return _currentUserId;
 }
 
+// The work a successful first contact does once: local recipes dir, the current user id
+// (assignee stamping on creates), and the "Connected" log line. Run by init() on success, or
+// by the first successful reconnect probe when init() hit a network failure.
+async function _completeFirstConnect(taskCount) {
+  // (C1346) Non-fatal: a local-recipes-dir problem must never fail connect/reauth. See
+  // _localRecipesDir() above for why this is per-project, not the global fileOps singleton.
+  try {
+    const dir = _localRecipesDir();
+    if (dir) await recipesStore.ensureRecipesDir(dir);
+  } catch (e) {
+    console.warn('[api-backend] local recipes dir unavailable (non-fatal):', e.message);
+  }
+  await _fetchCurrentUserId();
+  _firstConnectDone = true;
+  console.log(`[api-backend] Connected — ${taskCount} tasks in project`);
+}
+
 async function _probeConnection() {
   try {
     const { baseUrl, token, projectId } = getCredentials();
@@ -409,6 +475,17 @@ async function _probeConnection() {
       return;
     }
     if (res.status < 500) {
+      if (!_firstConnectDone) {
+        // init() never succeeded. A 404 here is init()'s own "project not found" failure:
+        // keep backing off rather than announce a connection to a project that isn't there.
+        if (res.status === 404) {
+          console.warn('[api-backend] reconnect probe: project not found — check API_PROJECT_ID in .tipatask/config.json');
+          _armReconnect();
+          return;
+        }
+        // Before the drain, so replayed creates stamp the assignee from the resolved user id.
+        await _completeFirstConnect(((res.data && res.data.tasks) || []).length);
+      }
       _cacheInvalidate();
       await _drainPendingMutations();
       // If drain re-armed reconnect (partial failure), don't call _markConnected yet
@@ -454,10 +531,15 @@ async function _readTagRegistry() {
 // already has in hand (overwriteRaw reuses its existingTagRows read here — no extra
 // network on the happy path). extraKnown: tags this same save is registering via
 // POST /tags (tagRegistrations / new_tags) — count as known even before a re-read.
+// autoRegister (TPT623, Task App UI saves only): names still unknown after the re-read get
+// an LLM-written description (tag-auto-register.js) and are registered via POST /tags
+// before this returns; `context` ({title, description} of the task being saved) feeds that
+// prompt. Whatever can't be described (tt-* names, empty/placeholder output, LLM or POST
+// failure) still throws the gate error.
 // Returns Map<incomingName, canonicalDbName> for every task tag, unchanged when empty.
 // Throws TAG_REGISTRY_UNREADABLE (via _readTagRegistry) or the "Unregistered tag(s)"
 // error (via unregisteredTagError) — never silently swallows either failure.
-async function _assertTagsRegistered(taskTags, { primaryRows = null, extraKnown = [] } = {}) {
+async function _assertTagsRegistered(taskTags, { primaryRows = null, extraKnown = [], autoRegister = false, context = null } = {}) {
   const wanted = (taskTags || []).filter(Boolean);
   if (wanted.length === 0) return new Map();
 
@@ -476,10 +558,55 @@ async function _assertTagsRegistered(taskTags, { primaryRows = null, extraKnown 
     index = buildTagIndex(rows, extraKnown);
     ({ unknown, canonical } = resolveTagNames(wanted, index));
   }
+  if (unknown.length > 0 && autoRegister) {
+    const registered = await _autoRegisterTags(unknown, context);
+    if (registered.length > 0) {
+      index = buildTagIndex(rows, [...extraKnown, ...registered]);
+      ({ unknown, canonical } = resolveTagNames(wanted, index));
+    }
+    if (unknown.length > 0) {
+      throw unregisteredTagError(unknown, {
+        projectId,
+        registrySize: rows.length,
+        note: 'Automatic registration could not describe these tags (tt-* tags always need create_system_tag).',
+      });
+    }
+  }
   if (unknown.length > 0) {
     throw unregisteredTagError(unknown, { projectId, registrySize: rows.length });
   }
   return canonical;
+}
+
+// The first tagged task of a save, as describe-prompt context for auto-registration.
+function _tagContextFor(tasks) {
+  const t = (tasks || []).find(x => x && Array.isArray(x.tags) && x.tags.length > 0);
+  return t ? { title: t.title, description: t.description } : null;
+}
+
+// TPT623 — describe + register unknown tags for a Task App UI save. Returns the
+// registrations POST /tags accepted ([] on any failure — the caller then throws the gate
+// error). Never registers a tt-* tag or a blank/placeholder description (C1038).
+async function _autoRegisterTags(names, context) {
+  let described;
+  try {
+    const { describeTagsWithLlm } = require('./tag-auto-register');
+    described = await describeTagsWithLlm(names, { projectRoot: _projectRoot || config.PROJECT_ROOT, context });
+  } catch (err) {
+    console.warn(`[api-backend] tag auto-register: describe failed: ${err.message}`);
+    return [];
+  }
+  const { registrations, undescribed } = buildAutoRegistrations(names, described);
+  if (undescribed.length) console.warn(`[api-backend] tag auto-register: no usable description for ${undescribed.join(', ')}`);
+  if (registrations.length === 0) return [];
+  try {
+    await apiRequest('POST', '/tags', { tags: registrations });
+  } catch (err) {
+    console.warn(`[api-backend] tag auto-register: POST /tags failed: ${err.message}`);
+    return [];
+  }
+  console.log(`[api-backend] tag auto-register: registered ${registrations.map(r => r.name).join(', ')}`);
+  return registrations;
 }
 
 // ── HTTP helper ──
@@ -540,7 +667,9 @@ async function apiRequest(method, urlPath, body, opts = {}) {
     // Every transport-level failure (ECONNRESET / socket hang up, ETIMEDOUT, ECONNREFUSED, DNS,
     // ...) surfaces as a rejected call — never an unhandled 'error' event. `networkError` is the
     // marker the mutation queue and stale-cache fallbacks key on; `retryable` states the same
-    // thing for callers outside this file, and `code`/`cause` keep the underlying error.
+    // thing for callers outside this file, and `code`/`cause` keep the underlying error. A
+    // reverse-proxy gateway status (GATEWAY_STATUSES, below the response checks) carries the
+    // same two markers: the proxy answered, the API did not.
     if (err.code === 'ETIMEDOUT') {
       const e = new Error(`API timed out at ${url} after ${timeoutMs}ms`, { cause: err });
       e.code = err.code;
@@ -594,6 +723,23 @@ async function apiRequest(method, urlPath, body, opts = {}) {
   }
   if (res.status === 404) return { _notFound: true };
 
+  if (GATEWAY_STATUSES.has(res.status)) {
+    // The reverse proxy answered for an API that is down (502/503/504): an outage, not a
+    // rejected write. Same contract as a transport failure above — `networkError` queues the
+    // mutation for replay and moves the backend to 'disconnected' so the reconnect probe
+    // takes over; `statusCode`/`body` stay for callers that key on the HTTP status. No
+    // transport `code`: there was no socket failure. The message keeps the `API <status>: `
+    // shape but swaps the proxy's HTML error page for the reason phrase — that text ends up
+    // in a "Network error: …" toast.
+    const e = new Error(`API ${res.status}: ${gatewayDetail(res)}`);
+    e.statusCode = res.status;
+    e.body = res.data;
+    e.networkError = true;
+    e.retryable = true;
+    _markDisconnected(e.message);
+    throw e;
+  }
+
   if (res.status >= 400) {
     const detail = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
     const err = new Error(`API ${res.status}: ${detail}`);
@@ -607,6 +753,16 @@ async function apiRequest(method, urlPath, body, opts = {}) {
   }
 
   return res.data;
+}
+
+// Detail text for a gateway-status error: a JSON body verbatim, a text body as is, an HTML
+// error page (Apache's default) replaced by the status's reason phrase.
+function gatewayDetail(res) {
+  const data = res.data;
+  if (data && typeof data === 'object') return JSON.stringify(data);
+  const text = typeof data === 'string' ? data.trim() : '';
+  if (!text || text.startsWith('<')) return STATUS_CODES[res.status] || 'Gateway error';
+  return text;
 }
 
 // C1182 — Workflow tab CRUD errors: api/src/routes/statuses.js returns structured 400/409
@@ -911,7 +1067,7 @@ function _mapRawTasks(raw) {
 
 // ── Raw mutation helpers (no queue logic — used directly in drain loop) ──
 
-async function _rawUpdateTask(id, fields) {
+async function _rawUpdateTask(id, fields, opts = {}) {
   const body = {};
   if (fields.status !== undefined) body.status = fields.status;
   if (fields.description !== undefined) body.description = fields.description.trim();
@@ -923,6 +1079,15 @@ async function _rawUpdateTask(id, fields) {
   if (fields.assignee !== undefined) body.assignee = fields.assignee;
   if (fields.priority !== undefined) body.priority = fields.priority;
   if (fields.tags !== undefined) body.tags = fields.tags;
+  // TPT623: only a Task App UI edit (opts.autoRegisterTags) gates + auto-registers tags here;
+  // every other PATCH leaves unknown tags to the API's own TAGS_UNREGISTERED 400, as before.
+  if (opts.autoRegisterTags === true && Array.isArray(body.tags) && body.tags.length > 0) {
+    const canonical = await _assertTagsRegistered(body.tags, {
+      autoRegister: true,
+      context: { title: fields.title, description: fields.description },
+    });
+    body.tags = body.tags.map(n => canonical.get(n) ?? n);
+  }
   // category/type — needed so the finalize/Save-Tasks path (C980) can PATCH a
   // pre-reserved placeholder row's real content in one call instead of a bulk PUT.
   if (fields.category !== undefined) body.category = fields.category;
@@ -970,7 +1135,7 @@ async function _rawDeleteTask(id) {
   return true;
 }
 
-async function _rawCreateTask(task) {
+async function _rawCreateTask(task, opts = {}) {
   _syncCredentialWatch();
   const body = toApi(task);
   // An explicit assignee (e.g. the New Task form's Member Assignee pick) wins; otherwise
@@ -979,6 +1144,21 @@ async function _rawCreateTask(task) {
   if (task.assignee == null && _currentUserId == null) await _fetchCurrentUserId();
   body.assignee = task.assignee ?? _currentUserId ?? null;
   if (task.parentId) body.parent_id = await resolveParentDbId(task.parentId);
+
+  // TPT9004: single-allocator rule — a create never carries a task_key. The API's
+  // allocateTaskKeyOnCreate() is the only source of new keys (keyless POST /tasks), and
+  // reserveTaskKeys() (POST /tasks/reserve) the only way to hold one ahead of time; a
+  // reserved key is finalized by PATCH, never re-POSTed (the API answers 409). Whatever the
+  // caller put in `id` — the manual New Task form's synthetic new-<ts>-<seq>, an offline
+  // tmp- id, or an agent's own max+1 guess — is dropped here, so no Task App path can
+  // persist a number the counter never issued. (Replaces TPT622's createKeyForProject(),
+  // which still forwarded a guess that happened to sit in the project's own namespace, e.g.
+  // TPT701 while the counter stood at TPT9003.) Only a key-shaped drop is logged: that is
+  // the "someone computed a key locally" signal worth seeing; synthetic ids are the norm.
+  if (body.task_key && isTaskKeyLike(body.task_key)) {
+    console.log(`[api-backend] create: dropped client key ${body.task_key} — task keys are allocated by the API, never by the caller`);
+  }
+  delete body.task_key;
 
   // C1038: no more silent auto-registration with a placeholder description (the API
   // now rejects placeholders anyway — see api/src/lib/tag-descriptions.js). An unknown
@@ -991,7 +1171,12 @@ async function _rawCreateTask(task) {
   // body.tags to it, since the API's own resolveTagIds does a case-SENSITIVE JS lookup
   // after its case-INSENSITIVE SQL match (see tag-registry-gate.js's resolveTagNames).
   if (Array.isArray(body.tags) && body.tags.length > 0) {
-    const canonical = await _assertTagsRegistered(body.tags);
+    // TPT623: opts.autoRegisterTags (Task App UI saves only) registers unknown tags with
+    // an LLM-written description instead of failing; MCP agents keep the strict gate.
+    const canonical = await _assertTagsRegistered(body.tags, {
+      autoRegister: opts.autoRegisterTags === true,
+      context: { title: task.title, description: task.description },
+    });
     body.tags = body.tags.map(n => canonical.get(n) ?? n);
   }
 
@@ -1013,26 +1198,27 @@ const backend = {
       if (data && data._notFound) {
         throw new Error('Project not found — check API_PROJECT_ID in .tipatask/config.json');
       }
-      // (C1346) Non-fatal: a local-recipes-dir problem must never fail connect/reauth. See
-      // _localRecipesDir() above for why this is per-project, not the global fileOps singleton.
-      try {
-        const dir = _localRecipesDir();
-        if (dir) await recipesStore.ensureRecipesDir(dir);
-      } catch (e) {
-        console.warn('[api-backend] local recipes dir unavailable (non-fatal):', e.message);
-      }
-      await _fetchCurrentUserId();
+      await _completeFirstConnect((data.tasks || []).length);
       // Through the notifier, not a raw assignment: a successful (re)init after a latch
       // must emit 'connected' or the renderer keeps its reauth prompt up forever.
       _unauthorizedToken = null;
       _reverifyAfter = 0;
       _markConnected();
-      console.log(`[api-backend] Connected — ${(data.tasks || []).length} tasks in project`);
     } catch (err) {
       if (err && (err.authError || err.missingCredentials)) {
         // State already pushed via _markUnauthorized (or surface here for missing creds).
         if (err.missingCredentials) _markUnauthorized(err.message);
         return; // soft-fail; reauth modal handles recovery in renderer
+      }
+      if (err && err.networkError && _connectionState === null) {
+        // API down at first contact (connection refused, timeout, proxy 502/503/504).
+        // apiRequest()'s _markDisconnected() only leaves 'connected', so enter the offline
+        // state here: writes queue, the renderer shows offline, and the reconnect probe
+        // finishes the connect (see _completeFirstConnect) once the API answers. Still
+        // rejects — callers log it.
+        _connectionState = 'disconnected';
+        _notifyState('disconnected', err.message);
+        _armReconnect();
       }
       throw err;
     }
@@ -1405,6 +1591,22 @@ const backend = {
     }
   },
 
+  // TPT659 — the key the API would allocate next for this category (`GET /tasks/next-key`,
+  // a read-only peek at task_key_counters — no reservation, no write). Feeds the New Task
+  // Preview badge, so it fails open like getProjectSettings(): any failure — network, 4xx,
+  // a deployment predating the route (`_notFound`), a malformed body — returns null and the
+  // caller keeps its local guess. Never throws.
+  async getNextTaskKey(category) {
+    const cat = category === 'HUMAN' ? 'HUMAN' : 'CODING';
+    try {
+      const data = await apiRequest('GET', `/tasks/next-key?category=${cat}`);
+      if (!data || data._notFound) return null;
+      return typeof data.task_key === 'string' && data.task_key ? data.task_key : null;
+    } catch {
+      return null;
+    }
+  },
+
   // C1271 — PATCH this project's row (language, task_group_label, color_scheme,
   // sprints_enabled, kb_sync_as_you_go, use_objective_grouping, sprint_sort_order, and —
   // since TPT61 — vcs_type/vcs_worktree_enabled/vcs_commit_enabled/vcs_pr_enabled, C1213/
@@ -1521,6 +1723,22 @@ const backend = {
     }
   },
 
+  // TPT610 — the project's cheap change stamp (`GET /tasks/changes`, TPT609): one aggregate
+  // over every task row, reservations included, instead of the full task list. Used by
+  // task-change-poll.js to decide whether to broadcast tasks-updated. Only a 404 — a
+  // deployment predating the route — returns null so the poll falls back to hashing the
+  // full list; transport/decode/auth failures keep throwing from apiRequest() and must not
+  // switch the poll onto the full-list path. Fixed key order keeps the caller's hash stable.
+  async getTaskChangeStamp() {
+    const data = await apiRequest('GET', '/tasks/changes');
+    if (!data || data._notFound) return null;
+    return {
+      count: data.count ?? 0,
+      max_id: data.max_id ?? null,
+      max_updated_at: data.max_updated_at ?? null,
+    };
+  },
+
   // TPT12 — the caller's per-project `notifications` inbox rows (TPT10). Distinct from
   // getTaskEvents() below (TPT17): that reads the task-wide `task_events` audit log with no
   // per-user read state; this reads the recipient inbox that already excludes the actor's
@@ -1595,14 +1813,15 @@ const backend = {
     return data.files || [];
   },
 
-  async updateTask(id, fields) {
+  // opts.autoRegisterTags (TPT623): Task App UI edits only — see _rawUpdateTask.
+  async updateTask(id, fields, opts = {}) {
     if (!_isOffline()) {
       // Capture original objective text before adoption PATCH, but post its spec
       // comment only after a successful write. A failed PATCH must not leave a
       // comment that suppresses capture on retry. Offline replay bypasses this.
       const specSnapshot = await readOriginSpecSnapshot(this, id, fields);
       try {
-        const result = await _rawUpdateTask(id, fields);
+        const result = await _rawUpdateTask(id, fields, opts);
         if (specSnapshot) {
           const lang = (readProjectConfig(_projectRoot) || {}).language || 'en';
           await postOriginSpecComment(this, id, specSnapshot, lang);
@@ -1613,7 +1832,7 @@ const backend = {
         // Fell offline during request — fall through to queue
       }
     }
-    _enqueueMutation('update', [id, fields], id);
+    _enqueueMutation('update', [id, fields, opts], id);
     // Optimistic: mutate cached row in both unfiltered and scoped caches
     let _found = null;
     _eachListCache(cache => {
@@ -1664,16 +1883,17 @@ const backend = {
     return true;
   },
 
-  async createTask(task) {
+  // opts.autoRegisterTags (TPT623): Task App UI creates only — see _rawCreateTask.
+  async createTask(task, opts = {}) {
     if (!_isOffline()) {
       try {
-        return await _rawCreateTask(task);
+        return await _rawCreateTask(task, opts);
       } catch (err) {
         if (!err.networkError) throw err;
       }
     }
     const tmpId = `tmp-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    _enqueueMutation('create', [task], tmpId);
+    _enqueueMutation('create', [task, opts], tmpId);
     const optimistic = {
       // created_by mirrors what the server will stamp on replay (req.user.id) so the row
       // survives filterToOwnOrUnassigned() even if assignee is later reassigned offline.
@@ -1777,6 +1997,8 @@ const backend = {
         await _saveStep('tag-registry', () => _assertTagsRegistered(newTaskTagNames, {
           primaryRows: existingTagRows,
           extraKnown: tagRegistrations,
+          autoRegister: parsed.autoRegisterTags === true,
+          context: _tagContextFor(incomingNewTasks),
         }));
 
         // Must be unfiltered — ID assignment needs to see all existing task keys
@@ -1930,9 +2152,13 @@ const backend = {
     // primaryRows reuses the existingTagRows read from above (no extra network on the
     // happy path); extraKnown folds in tagRegistrations (tags/new_tags this same save
     // just registered via POST /tags) so they count as known without another round trip.
+    // TPT623: `autoRegisterTags: true` in the payload (the Task App's manual New Task form
+    // only) registers still-unknown tags with an LLM-written description instead of failing.
     const canonicalTagNames = await _saveStep('tag-registry', () => _assertTagsRegistered(writtenTagNames, {
       primaryRows: existingTagRows,
       extraKnown: tagRegistrations,
+      autoRegister: parsed.autoRegisterTags === true,
+      context: _tagContextFor(tasksToWrite.map(([, t]) => t)),
     }));
     // Rewrite each written task's tags to the registry's canonical spelling — see
     // tag-registry-gate.js's resolveTagNames for why this matters (the API's own
@@ -1966,7 +2192,12 @@ const backend = {
             // guaranteed every "new" id is a live row by this point. Create directly
             // rather than silently dropping the task if that guarantee ever breaks.
             console.warn(`[overwriteRaw] "new" task ${id} has no live placeholder row — creating directly`);
-            await this.createTask(t);
+            // TPT9004: the create is keyless (_rawCreateTask drops task_key), so the row
+            // comes back under the API's own key, not `id` — the manual New Task form's
+            // synthetic new-<ts>-<seq> id always lands here. Log the allocated key so a
+            // client reference to `id` that now dangles can be traced.
+            const created = await this.createTask(t);
+            console.log(`[overwriteRaw] "new" task ${id} created as ${created && created.id ? created.id : '(unknown key)'}`);
           }
         } else {
           await this.updateTask(id, t);
@@ -2226,6 +2457,7 @@ const backend = {
     _resetUserContext(reason);
   },
 
+  // cb(replayedTasks, remainingCount, dropped) — see _drainListeners above for `dropped`.
   onMutationsDrained(cb) {
     _drainListeners.add(cb);
     return () => _drainListeners.delete(cb);
@@ -2254,8 +2486,29 @@ const backend = {
     if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
     _reconnectAttempt = 0;
     _connectionState = null;
+    _firstConnectDone = false;
     await this.init();
     return _connectionState;
+  },
+
+  // (TPT673) Release this instance when a per-project registry evicts it (index.js
+  // getBackendForPath(), main/window-state.js _backendCache): stops the reconnect timer,
+  // drops every cache and every state/drain listener. Never touches the pending-mutation
+  // queue — registries evict only when getPendingMutationCount() === 0. Idempotent; the
+  // instance still answers calls from a holder that grabbed it before eviction.
+  dispose() {
+    _disposed = true;
+    if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+    _reconnectAttempt = 0;
+    _cacheInvalidate();
+    _statusesEntry = null;
+    _projectSettingsEntry = null;
+    _stateListeners.clear();
+    _drainListeners.clear();
+  },
+
+  isDisposed() {
+    return _disposed;
   },
 
   // Explicit credential-cache reset — clears the task-list cache and the 'unauthorized'

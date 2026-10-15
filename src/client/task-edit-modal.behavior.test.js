@@ -27,6 +27,14 @@ test('Saving an agent assignee adds or removes Start without reopening (TPT568)'
   assert.match(runDomRunner().stdout, /TPT568_START_SYNC_PASS/);
 });
 
+test('A rejected save says "Save failed", only a lost request says "Network error" (TPT9001)', () => {
+  assert.match(runDomRunner().stdout, /TPT9001_SAVE_ERROR_LABEL_PASS/);
+});
+
+test('A failed open says "Could not open task", only a lost request says "Network error" (TPT665)', () => {
+  assert.match(runDomRunner().stdout, /TPT665_OPEN_ERROR_LABEL_PASS/);
+});
+
 test('Task Edit module imports without initializing board, cards, chat, or terminal', async () => {
   const editor = await import('./task-edit-modal.js');
   assert.equal(typeof editor.openTaskEditModal, 'function');

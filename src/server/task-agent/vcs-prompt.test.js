@@ -274,7 +274,9 @@ test('ClaudeAgent.buildPrompt: no vcsContext -> legacy create_task_comment + upd
   const prompt = agent.buildPrompt('Do the thing', { vcsSettings: GIT_ALL_ON });
   assert.ok(prompt.includes('`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")`'));
   assert.ok(prompt.includes('Post it in the SAME tool-call batch as the final `update_task(status="completed")`.'));
-  assert.ok(!prompt.includes('complete_task'), 'no guarded-completion text without a vcsContext');
+  // The commit-on definition-of-done line (TPT611) names complete_task; the mandate itself must not.
+  assert.ok(!prompt.includes('mcp__tipatask-local__complete_task'), 'no guarded-completion mandate without a vcsContext');
+  assert.doesNotMatch(prompt, /MANDATORY to finish this task|Final-message checklist/);
 });
 
 test('ClaudeAgent.buildPrompt: designMode wins over vcsContext — bare /design brief, no completion mandate', () => {
@@ -440,6 +442,7 @@ test('assembled VCS permissions follow each flag for all task agents', () => {
       assert.equal(prompt.includes('Work in a dedicated git worktree'), worktree);
       assert.equal(/Commit (?:your work exactly )?once/.test(prompt), commit);
       assert.equal(prompt.includes('Commit is MANDATORY'), commit, `${agent.id}: mandatory commit line follows the commit flag`);
+      assert.equal(/Definition of done:|Done only when/.test(prompt), commit, `${agent.id}: definition-of-done line follows the commit flag`);
       assert.equal(prompt.includes('Do not commit:'), !commit);
       assert.equal(prompt.includes('Open a pull/merge request'), pr);
       assert.equal(prompt.includes('`git merge task/<TASK_KEY>`'), merge && commit);
@@ -489,5 +492,64 @@ for (const compact of [false, true]) {
     for (const vcs of [{ ...GIT_ALL_ON, commit: false }, GIT_WORKTREE_ONLY, VCS_OFF, SVN]) {
       assert.doesNotMatch(buildVcsDirective(vcs, { compact }), /mandatory/i, 'only an enabled Commits flag makes the commit mandatory');
     }
+  });
+}
+
+// TPT611 — commits on: a definition-of-done line gates "done" on the recorded task commit, a
+// clean status and a completed complete_task result, and forbids handing the commit back.
+for (const compact of [false, true]) {
+  test(`buildVcsDirective (TPT611): commits on -> one definition-of-done line, absent otherwise (compact=${compact})`, () => {
+    const dodRe = compact ? /^- Done only when / : /^- Definition of done: /;
+    for (const worktree of [false, true]) for (const pr of [false, true]) for (const merge of [false, true]) {
+      const label = `worktree=${worktree} pr=${pr} merge=${merge}`;
+      const directive = buildVcsDirective({ type: 'git', worktree, commit: true, pr, merge }, { compact });
+      const lines = directive.split('\n').filter(line => dodRe.test(line));
+      assert.equal(lines.length, 1, `exactly one definition-of-done line (${label})`);
+      const [line] = lines;
+      assert.equal(directive.split('\n').at(-1), line, `definition of done closes the git block (${label})`);
+      assert.ok(line.includes(worktree ? '`git log -1 task/<TASK_KEY>`' : '`git log -1`'), label);
+      if (!worktree) assert.ok(!line.includes('git log -1 task/'), label);
+      assert.ok(line.includes('`<TASK_KEY>:`'), label);
+      assert.ok(line.includes('`git status`'), label);
+      assert.match(line, /complete_task/, label);
+      assert.match(line, /[Nn]ever end with "ready to commit when you confirm"/, label);
+      if (compact) assert.match(line, /final message gives the sha/, label);
+      else assert.match(line, /NOT done until/, label);
+      assert.doesNotMatch(line, /\?/, label);
+      assert.doesNotMatch(line, /mandatory/i, `the commit line alone owns "mandatory" (${label})`);
+    }
+    for (const vcs of [{ ...GIT_ALL_ON, commit: false }, GIT_WORKTREE_ONLY, VCS_OFF, SVN]) {
+      assert.doesNotMatch(buildVcsDirective(vcs, { compact }), /Definition of done|Done only when|ready to commit when you confirm/);
+    }
+  });
+}
+
+// TPT611 — the Claude/Codex guarded-completion mandate closes with a final-message checklist:
+// commit sha (commits on only) and the complete_task result, after follow-up capture.
+for (const Agent of [ClaudeAgent, CodexAgent]) {
+  test(`${new Agent().id}: vcsContext mandate ends with the final-message checklist (TPT611)`, () => {
+    const agent = new Agent();
+    for (const commit of [true, false]) {
+      const context = { ...VCS_CONTEXT, vcs: { ...VCS_CONTEXT.vcs, commit } };
+      const prompt = agent.buildPrompt('Do the thing', { vcsContext: context, vcsSettings: context.vcs });
+      const checklists = [...prompt.matchAll(/Final-message checklist: [^\n]*/g)].map(m => m[0]);
+      assert.equal(checklists.length, 1, `one checklist (commit=${commit})`);
+      const [checklist] = checklists;
+      assert.match(checklist, /after Follow-up capture and `?complete_task`?/, 'follow-up capture stays ahead of complete_task');
+      assert.match(checklist, /`?complete_task`? result \(completed, or the blockers it listed and the on_fire fallback/);
+      assert.equal(checklist.includes('commit sha'), commit, `sha clause follows the commit flag (commit=${commit})`);
+      assert.match(checklist, /follow-up task keys/);
+      assert.doesNotMatch(checklist, /\?/);
+      assert.ok(!prompt.includes('update_task(status='), 'still finishes through complete_task');
+      assert.ok(prompt.indexOf('Final-message checklist') > prompt.indexOf('complete_task'), 'checklist follows the complete_task mandate');
+      assert.equal(/Definition of done:/.test(prompt), commit, 'definition-of-done line follows the commit flag');
+      if (agent.id === 'codex') {
+        const mandate = prompt.split('\n').find(line => line.startsWith('- MANDATORY: supply ONE'));
+        assert.ok(mandate.includes('Final-message checklist'), 'Codex checklist stays on the mandate line');
+        assert.equal(matchPromptLine(mandate, CODEX_PROMPT_PATTERNS), null);
+      }
+    }
+    const legacy = agent.buildPrompt('Do the thing', { vcsSettings: GIT_ALL_ON });
+    assert.ok(!legacy.includes('Final-message checklist'), 'no checklist on the legacy (no vcsContext) mandate');
   });
 }

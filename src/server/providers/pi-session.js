@@ -14,7 +14,7 @@ const throttle = require('../objective-throttle');
 const { buildTurnPrompt } = require('./transcript');
 const { resolveProviderModel, configForProject } = require('./registry');
 const { readProjectConfig, piEntryForModel, piDefaultEntry, piKeyEnvVars } = require('../project-config');
-const { piSpawnProvider, preparePiCustomEndpoint } = require('../pi-custom-endpoint');
+const { piSpawnProvider, preparePiCustomEndpoint, piRowSupportsTools, piRowHost, toolCompatMessage } = require('../pi-custom-endpoint');
 const { toolProfileFor, piToolAllowlist, PI_OBJECTIVE_PROFILE, PI_OBJECTIVE_MCP_TOOLS } = require('./tool-profiles');
 const { materializePiTaskTools, resolvePiMcpBridge } = require('./pi-task-tools');
 const taskChatWidgets = require('../task-chat-widgets');
@@ -67,18 +67,24 @@ function piEntryFor(session) {
 // `extensionPath` (providers/pi-ext/task-tools.mjs, profiled sessions only) and
 // `mcpBridgePath` (the MCP bridge bundle, whenever resolvePiMcpBridge() found a config). With
 // the bridge the allowlist names the bridged MCP tools instead of the REST `tipatask_api`.
-function buildPiArgs(session, { extensionPath, mcpBridgePath } = {}) {
+// `noTools` (the tool-compat retry, see isToolCompatError()) emits an EMPTY `--tools` allowlist —
+// Pi parses '' as zero active tools, exactly like --no-tools — and loads neither extension, so the
+// request reaches the provider with no tool definitions at all. (TPT634) A row declared
+// `tools: false` (piRowSupportsTools()) gets the same argv without being asked.
+function buildPiArgs(session, { extensionPath, mcpBridgePath, noTools = false } = {}) {
   const profile = toolProfileFor(session, 'pi');
+  const entry = piEntryFor(session);
+  const toolless = noTools || !piRowSupportsTools(entry);
   const args = [
     '--mode', 'json',
-    '--provider', piSpawnProvider(piEntryFor(session)),
+    '--provider', piSpawnProvider(entry),
     // (C1030) session.selectedModel (chat-model-selector) wins over config.PI_MODEL.
     '--model', piModelFor(session),
-    '--tools', piToolAllowlist(profile || PI_OBJECTIVE_PROFILE, { bridge: !!mcpBridgePath }).join(','),
+    '--tools', toolless ? '' : piToolAllowlist(profile || PI_OBJECTIVE_PROFILE, { bridge: !!mcpBridgePath }).join(','),
   ];
   args.push('--no-extensions');
-  if (profile && extensionPath) args.push('-e', extensionPath);
-  if (mcpBridgePath) args.push('-e', mcpBridgePath);
+  if (!toolless && profile && extensionPath) args.push('-e', extensionPath);
+  if (!toolless && mcpBridgePath) args.push('-e', mcpBridgePath);
   if (session.piSessionId) {
     args.push('--session', session.piSessionId);
   }
@@ -87,8 +93,13 @@ function buildPiArgs(session, { extensionPath, mcpBridgePath } = {}) {
 
 // First line of an objective turn's prompt: which tools this planner turn really has. Shared
 // context (CLAUDE.md, the planner prompt) names MCP tools as `mcp__<server>__<tool>`; with the
-// bridge those are reachable read-only under their bridged names.
-function piObjectiveToolNote(bridge) {
+// bridge those are reachable read-only under their bridged names. `noTools` is the tool-compat
+// retry or a `tools: false` row (buildPiArgs noTools): the turn has no tool at all, and the note
+// says so.
+function piObjectiveToolNote(bridge, noTools = false) {
+  if (noTools) {
+    return 'Pi objective planning: no tools are available in this turn — not even `read`; this model\'s endpoint rejects tool definitions. Plan only from the context in this prompt; where shared context says to read files or call MCP tools, skip that step. Return proposals; ignore coding-task completion and MCP instructions in shared context.';
+  }
   if (!bridge) {
     return 'Pi objective planning: only the read tool is available. No MCP, REST, shell or file-writing tools. Return proposals; ignore coding-task completion and MCP instructions in shared context.';
   }
@@ -193,33 +204,66 @@ function assistantErrorOf(event) {
   return String(msg.errorMessage || `request ${msg.stopReason}`);
 }
 
+// ── Tool-compat failure ──────────────────────────────────────────────────────
+
+// A provider refusing the request because the model takes no tool definitions. OpenRouter answers
+// 404 with "No endpoints found that support tool use" and `failed_routing_step: "Filter by Tool
+// Compatibility"` (an image model, a completion-only model); OpenAI-compatible local servers
+// (Ollama, vLLM) say "<model> does not support tools". The remedy is the same: send no tools, or
+// pick another model. An unrelated 404 (unknown model id) does not match.
+const TOOL_COMPAT_PATTERNS = [
+  /No endpoints found that support tool use/i,
+  /failed_routing_step"?\s*:\s*"?Filter by Tool Compatibility/i,
+  /\bdoes not support tools?\b/i,
+];
+function isToolCompatError(text) {
+  const s = String(text || '');
+  return TOOL_COMPAT_PATTERNS.some(re => re.test(s));
+}
+
+// objective-error reason for a model nothing can route around: a tool-compat failure in a task
+// chat or on the no-tools retry, or a task/project chat on a row declared `tools: false`. `detail`
+// carries toolCompatMessage() (pi-custom-endpoint.js, with piRowHost()); the client shows it verbatim.
+const MODEL_NO_TOOLS = 'model-no-tools';
+
+// Kill the Pi process group. win32 has no process groups, and a pi.cmd launcher runs Pi as a
+// grandchild (behind cmd.exe, or under the npm shim's node.exe): taskkill the whole tree (TPT575).
+function killPiProc(proc) {
+  if (!proc || proc.killed) return;
+  if (process.platform === 'win32') {
+    killWindowsChildTree(proc);
+    return;
+  }
+  try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already dead */ }
+  setTimeout(() => {
+    try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already dead */ }
+  }, 3000);
+}
+
 // ── Error helper ──────────────────────────────────────────────────────────────
 
+// A MODEL_NO_TOOLS reason is this session's model choice, not a provider outage: it releases the
+// throttle slot as an abort so it never counts toward the circuit breaker (claude-session.js does
+// the same for its cli-error:* reasons), and `detail` is the sentence alone — the stderr tail is
+// already in the Debug Console (pi-stderr frames) and must not truncate it.
 function emitPiError(session, taskId, proc, emit, reason, attempts, extraDetail) {
   if (session._aborted) return; // one objective-error per turn
-  throttle.recordTimeout(taskId, reason);
+  const modelProblem = reason === MODEL_NO_TOOLS;
+  if (modelProblem) throttle.recordAbort(taskId);
+  else throttle.recordTimeout(taskId, reason);
   clearPiTimers(session);
   session._aborted = true;
-  // Kill proc group. win32 has no process groups, and a pi.cmd launcher runs Pi as a grandchild
-  // (behind cmd.exe, or under the npm shim's node.exe): taskkill the whole tree (TPT575).
-  if (proc && !proc.killed) {
-    if (process.platform === 'win32') {
-      killWindowsChildTree(proc);
-    } else {
-      try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already dead */ }
-      setTimeout(() => {
-        try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already dead */ }
-      }, 3000);
-    }
-  }
+  killPiProc(proc);
   // Clean turn buffers
   session.turnBuffer = '';
   session.turnRawSse = '';
   session._resultFinalized = false;
   const model = piModelFor(session);
   // detail = the full provider error (when `reason` had to truncate it) + the stderr tail.
-  const tail = [extraDetail, (session._piStderrTail || '').trim()].filter(Boolean).join('\n');
-  const detail = tail ? tail.slice(-STDERR_DETAIL_MAX) : undefined;
+  const tail = modelProblem
+    ? String(extraDetail || '')
+    : [extraDetail, (session._piStderrTail || '').trim()].filter(Boolean).join('\n');
+  const detail = !tail ? undefined : (modelProblem ? tail : tail.slice(-STDERR_DETAIL_MAX));
   console.error(`[pi] objective-error task=${taskId} model=${model} reason=${reason}${tail ? ` stderr=${JSON.stringify(detail)}` : ''}`);
   // C1031 — see claude-session.js emitObjectiveError. model/detail name what failed and why.
   emit({ type: 'objective-error', reason, attempts, provider: 'pi', model, detail });
@@ -316,6 +360,11 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
     return;
   }
   const spawnFn = deps.spawn || cpSpawn;
+  // The tool-compat retry (isToolCompatError): the same turn spawned once more with no tools at
+  // all (deps.noTools). The failed attempt's `session` event already renamed piSessionId and
+  // consumed a pending provider handoff, so the retry restores both before rebuilding the prompt.
+  const priorPiSessionId = session.piSessionId;
+  const priorSwitchPending = session._providerSwitchPending;
   // Build the per-frame emitter — always adds tabId for client routing.
   const emit = emitFn
     ? (frame) => emitFn({ ...frame, tabId: session.tabId })
@@ -364,12 +413,22 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
   // (TPT189) A `custom` row additionally needs its models.json written and Pi pointed at it
   // (PI_CODING_AGENT_DIR + the pinned sessions dir); an empty env for every other row, no disk.
   const piEntry = piEntryFor(session);
+  const profile = toolProfileFor(session, 'pi');
+  // (TPT634) A row declared `tools: false` (piRowSupportsTools) runs with no tools from the first
+  // attempt: the retry's shape without the failed request, and nothing left to retry. A profiled
+  // chat's tools are the point, so it is refused before anything is written or spawned.
+  if (profile && !piRowSupportsTools(piEntry)) {
+    emitPiError(session, taskId, null, emit, MODEL_NO_TOOLS, session._retryAttempt || 0,
+      toolCompatMessage(piModelFor(session), piRowHost(piEntry), { declared: true }));
+    return;
+  }
+  const noTools = !!deps.noTools || !piRowSupportsTools(piEntry);
   Object.assign(env, piKeyEnvVars(piEntry), preparePiCustomEndpoint(cwd, piEntry, env).env);
 
   // A profiled chat's only task tool is the staged extension — without it the turn could
   // read but silently never change a task, so refuse instead of spawning.
   let extensionPath = null;
-  if (toolProfileFor(session, 'pi')) {
+  if (profile) {
     extensionPath = materializePiTaskTools(config.USER_DATA_ROOT);
     if (!extensionPath) {
       emitPiError(session, taskId, null, emit, 'spawn-error:task-tools-unavailable', session._retryAttempt || 0);
@@ -380,12 +439,15 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
   // MCP bridge: the bridged tipatask / tipatask-local tools, fenced by the --tools allowlist.
   // TIPATASK_PI_MCP_CONFIG is always set — empty without a bridge, so an inherited value never
   // applies and task-tools.mjs registers its REST fallback.
+  // A no-tools spawn (the retry, or a `tools: false` row) loads no bridge: nothing could call it.
   const resolveBridge = deps.resolveMcpBridge || resolvePiMcpBridge;
   let bridge = null;
-  try { bridge = resolveBridge({ projectRoot: cwd, userDataRoot: config.USER_DATA_ROOT }); }
-  catch (err) { console.warn(`[pi] MCP bridge unavailable task=${taskId}: ${err.message}`); }
+  if (!noTools) {
+    try { bridge = resolveBridge({ projectRoot: cwd, userDataRoot: config.USER_DATA_ROOT }); }
+    catch (err) { console.warn(`[pi] MCP bridge unavailable task=${taskId}: ${err.message}`); }
+  }
   env.TIPATASK_PI_MCP_CONFIG = bridge ? bridge.configPath : '';
-  const args = buildPiArgs(session, { extensionPath, mcpBridgePath: bridge ? bridge.extensionPath : null });
+  const args = buildPiArgs(session, { extensionPath, mcpBridgePath: bridge ? bridge.extensionPath : null, noTools });
   const isFirstTurn = !session.piSessionId;
 
   // Build the prompt text to write to stdin.
@@ -396,7 +458,7 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
     includeSystemPrompt: true,
     hasProviderSession: !isFirstTurn,
   });
-  let basePrompt = (session.toolProfile ? '' : `${piObjectiveToolNote(!!bridge)}\n\n`) + basePromptBuilt;
+  let basePrompt = (session.toolProfile ? '' : `${piObjectiveToolNote(!!bridge, noTools)}\n\n`) + basePromptBuilt;
   if (promptMode === 'handoff') {
     console.log(`[pi] task=${taskId} switching to pi — sending full transcript (${basePrompt.length} chars)`);
   }
@@ -446,7 +508,7 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
   }
 
   emit({ type: 'objective-progress', stage: 'spawned', elapsedMs: elapsed() });
-  console.log(`[pi] Spawn task=${taskId} model=${piModelFor(session)} first=${isFirstTurn} mode=${promptMode} mcp-bridge=${bridge ? bridge.extensionPath : 'off'}`);
+  console.log(`[pi] Spawn task=${taskId} model=${piModelFor(session)} first=${isFirstTurn} mode=${promptMode} mcp-bridge=${bridge ? bridge.extensionPath : 'off'}${noTools ? ' tools=none' : ''}`);
 
   // Write prompt to stdin (after optional image localization).
   // stdin is the safe delivery path for large prompts under --mode json.
@@ -588,6 +650,32 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
         // With text already streamed the turn is kept; with none it is a hard error.
         const failure = assistantErrorOf(event);
         if (failure && !session.turnBuffer.trim()) {
+          if (isToolCompatError(failure)) {
+            if (!profile && !noTools) {
+              // Objective turn, first attempt: the planner can still answer from the prompt's own
+              // context, so run the same turn once more with no tools at all. The old proc's
+              // handlers all bail on `session.proc !== proc` once the respawn replaces it.
+              console.warn(`[pi] tool-compat error task=${taskId} model=${piModelFor(session)} — retrying once without tools: ${failure.slice(0, 300)}`);
+              emit({ type: 'objective-progress', stage: 'pi-no-tools-retry', detail: failure.slice(0, 300), elapsedMs: elapsed() });
+              clearPiTimers(session);
+              killPiProc(proc);
+              session.proc = null;
+              session.turnBuffer = '';
+              session.turnRawSse = '';
+              session._lastEmittedCardsJson = null;
+              session._piStderrTail = '';
+              session.piSessionId = priorPiSessionId;
+              session._providerSwitchPending = priorSwitchPending;
+              spawnPiTurn(session, taskId, emitFn, { ...deps, noTools: true });
+              return;
+            }
+            // A task chat needs its tools, and a no-tools attempt that still fails has nothing
+            // left to drop: name the model and where it ran, not the provider's JSON.
+            console.error(`[pi] model has no tool support task=${taskId}: ${failure.slice(0, 300)}`);
+            emitPiError(session, taskId, proc, emit, MODEL_NO_TOOLS, session._retryAttempt || 0,
+              toolCompatMessage(piModelFor(session), piRowHost(piEntry)));
+            return;
+          }
           console.error(`[pi] provider error task=${taskId}: ${failure.slice(0, 300)}`);
           emitPiError(session, taskId, proc, emit, `pi-error:${failure.slice(0, 120)}`, session._retryAttempt || 0,
             failure.length > 120 ? failure : undefined);
@@ -649,4 +737,34 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
   });
 }
 
-module.exports = { spawnPiTurn, buildPiArgs, emitPiError, assistantErrorOf, piObjectiveToolNote };
+// TPT623 — launch spec for a one-shot, tool-less Pi prompt (providers/one-shot.js). Same
+// launcher, PATH, key env and `custom` endpoint preparation as spawnPiTurn(); no tools, no
+// extensions, no MCP bridge and no saved session. The prompt goes to stdin.
+// (TPT701) Already tool- and extension-free (`--no-tools --no-extensions`); `cwd` moves only the
+// working directory — the model row and custom endpoint still come from the project.
+function piOneShotSpec({ projectRoot, model, cwd: runCwd } = {}) {
+  const cwd = projectRoot || config.PROJECT_ROOT;
+  const session = { projectPath: cwd, selectedModel: model || null };
+  const launch = resolvePiLaunch() || { command: 'pi', argsPrefix: [], env: {} };
+  const baseEnv = augmentPathEnv({ TERM: 'dumb', ...projectEnvExtras(session), ...launch.env });
+  const pathParts = [NODE_BIN_DIR];
+  const piNvmBinDir = resolveNvmBinDir(launch.command);
+  if (piNvmBinDir) pathParts.push(piNvmBinDir);
+  pathParts.push(baseEnv.PATH);
+  const env = { ...baseEnv, PATH: pathParts.join(path.delimiter) };
+  const piEntry = piEntryFor(session);
+  Object.assign(env, piKeyEnvVars(piEntry), preparePiCustomEndpoint(cwd, piEntry, env).env);
+  env.TIPATASK_PI_MCP_CONFIG = '';
+  const args = [
+    '--mode', 'json',
+    '--provider', piSpawnProvider(piEntry),
+    '--model', piModelFor(session),
+    '--no-tools', '--no-extensions', '--no-session',
+  ];
+  return { command: launch.command, args: [...launch.argsPrefix, ...args], env, cwd: runCwd || cwd };
+}
+
+module.exports = {
+  spawnPiTurn, buildPiArgs, emitPiError, assistantErrorOf, piObjectiveToolNote, piOneShotSpec,
+  isToolCompatError, piRowHost, toolCompatMessage, MODEL_NO_TOOLS,
+};

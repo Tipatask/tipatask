@@ -1,4 +1,5 @@
 // ── WebSocket shared helpers ──
+import { forgetQueuedStart } from './queued-start-rollback.js';
 
 // One IPC bridge per renderer. Socket owners subscribe independently, including
 // retained terminals whose viewport listeners are detached while minimized.
@@ -58,6 +59,7 @@ export function startTerminalSession(taskId, extraParams, opts = {}) {
         sawConfig = true;
         if (terminalState) finish(true, terminalState);
       } else if (msg.type === 'terminal-state') {
+        forgetQueuedStart(taskId);
         terminalState = msg;
         if (sawConfig) finish(true, msg);
       } else if (msg.type === 'session-queued') {
@@ -281,6 +283,8 @@ export const WS_RECV_TYPES = {
   TASKS_FINALIZED: 'tasks:finalized',
   // API connectivity state broadcasts
   API_STATUS: 'api-status',
+  // (TPT662) Offline-queued writes the reconnect drain gave up on — { entries }
+  MUTATIONS_DROPPED: 'mutations-dropped',
   // (C1463) Objective tab close — see terminateObjectiveSessions() above
   OBJECTIVE_CLOSE_NEEDS_CONFIRM: 'objective-close-needs-confirm',
   OBJECTIVE_SESSIONS_TERMINATED: 'objective-sessions-terminated',

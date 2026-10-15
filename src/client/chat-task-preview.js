@@ -1150,6 +1150,11 @@ export async function saveTaskChange(change, { msg } = {}) {
     // Mirror bulk-save Phase 2.5: resolve sprint assignment so single-accept
     // lands in the current sprint instead of AI's proposed priority.
     // A temporary/proposal ID must be set above before calling resolve-sprints.
+    // (TPT624) A manual New Task save arrives pinned (_stepPinned from the form's explicit
+    // sprint pick) — the server keeps that sprint. Its Preview already applied the dependency
+    // floor, so a 422 here means a dependency moved since; fail visibly instead of saving a
+    // task that sits at or below its dependency.
+    let manualConflict = null;
     try {
       const resolveRes = await fetchWithRetry('/api/resolve-sprints', {
         method: 'POST',
@@ -1170,8 +1175,15 @@ export async function saveTaskChange(change, { msg } = {}) {
         if (resolved && typeof resolved.task.priority === 'number') {
           change.task.priority = resolved.task.priority;
         }
+      } else if (change._manual && resolveRes.status === 422) {
+        const body = await resolveRes.json().catch(() => ({}));
+        const c = Array.isArray(body.conflicts) ? body.conflicts[0] : null;
+        manualConflict = c
+          ? translate('form.sprintDepConflict', { sprint: groupTitle(c.taskStep), dep: c.depId, depSprint: groupTitle(c.depStep) })
+          : (body.error || 'step_dependency_conflict');
       }
     } catch { /* graceful degradation — keep AI's priority */ }
+    if (manualConflict) throw new Error(manualConflict);
     const samePriority = data.tasks.filter(t => t.priority === change.task.priority);
     const maxOrder = samePriority.length > 0 ? Math.max(...samePriority.map(t => t.order ?? 0)) : 0;
     change.task.order = maxOrder + 1;
@@ -1232,6 +1244,10 @@ export async function saveTaskChange(change, { msg } = {}) {
   // the registry doesn't have yet always 400'd. Same `!change._manual` guard as the spec
   // payload below — a manual New Task form save has no LLM proposal (`msg` is undefined).
   if (!change._manual) attachNewTagsPayload(data, msg && msg.newTags, [change]);
+  // TPT623: a manual New Task form save asks the server to register any tag the registry
+  // doesn't have yet (LLM-written description) instead of failing the C1439 tag gate.
+  if (change._manual) data.autoRegisterTags = true;
+  else delete data.autoRegisterTags;
 
   // C1245: state.chatState is global, not tab-scoped — a manual New Task save
   // (change._manual) must never attach an unrelated objective's spec comment or

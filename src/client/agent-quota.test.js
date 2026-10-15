@@ -740,3 +740,111 @@ test('auto-refresh never fetches while hidden and catches up once on becoming vi
   sidebar.dispose();
   assert.equal(h.doc.listeners.size, 0, 'dispose removes the visibility listener');
 });
+
+// (TPT689) A stale agent is the server's last good reading, kept while fresh reads fail transiently:
+// windows and checkedAt describe the reading, unavailableReason says why the fresh read failed.
+const staleClaude = (checkedAt, windows) => agentWith('claude', windows || [
+  { id: 'five_hour', usagePercent: 45, resetAt: new Date(NOW + 2 * 60 * minute).toISOString(), windowMinutes: 300 },
+  { id: 'seven_day', usagePercent: null, resetAt: null, windowMinutes: 10080 },
+  { id: 'seven_day_fable', usagePercent: 0, resetAt: new Date(NOW + 3 * 1440 * minute).toISOString(), windowMinutes: 10080 },
+], { stale: true, unavailableReason: 'rate_limited', checkedAt });
+const titles = html => [...html.matchAll(/ title="([^"]*)"/g)].map(m => m[1]);
+
+test('a stale reading keeps its known bars, faded via --stale, with the reading time leading the tooltip (TPT689)', () => {
+  setLocale('en');
+  const data = { projectRoot: '/A', agents: {
+    claude: staleClaude(new Date(NOW - 20 * minute).toISOString()),
+    codex: agentWith('codex', [{ id: 'codex_primary', usagePercent: 5, resetAt: null, windowMinutes: 10080 }]),
+  } };
+  const html = renderAgentQuotaSidebarBody({ data }, NOW);
+  assert.deepEqual(captions(html), ['Claude 5-hour | 45% (2h)', 'Claude 7-day | —', 'Fable 7-day | 0% (3d)', 'Codex 7-day | 5%']);
+  // Known rows of the stale agent only; the window that reset since the reading stays a dashed row.
+  assert.equal((html.match(/class="agent-quota-sidebar-row agent-quota-sidebar-row--stale agent-quota-sidebar-row--claude" tabindex="0" role="progressbar"/g) || []).length, 2);
+  assert.match(html, /class="agent-quota-sidebar-row agent-quota-sidebar-row--claude" tabindex="0" role="img" aria-label="Claude 7-day: Usage unavailable"/);
+  assert.match(html, /class="agent-quota-sidebar-row agent-quota-sidebar-row--codex" tabindex="0" role="progressbar"/);
+  assert.equal((html.match(/--stale/g) || []).length, 2);
+  // Same known markup as a fresh bar: tinted track, a fill only when usage > 0, both caption layers.
+  assert.deepEqual(bars(html), ['agent-quota-sidebar-bar agent-quota-sidebar-bar--known', 'agent-quota-sidebar-bar agent-quota-sidebar-bar--unavailable',
+    'agent-quota-sidebar-bar agent-quota-sidebar-bar--known', 'agent-quota-sidebar-bar agent-quota-sidebar-bar--known']);
+  assert.equal((html.match(/class="agent-quota-sidebar-fill"/g) || []).length, 2);
+  assert.match(html, /aria-valuetext="45% used · Last good reading: \d{1,2}:\d{2}[^"]*"/);
+  const [five, week, fable, codex] = titles(html);
+  assert.match(five, /^Last good reading: \d{1,2}:\d{2}[^\n]*\nClaude Code · max\nResets: [^\n]+\nClaude Code is limiting usage checks\./);
+  assert.match(fable, /^Last good reading: /);
+  assert.equal(week, 'Claude Code · max\nClaude Code is limiting usage checks. Wait a moment, then refresh.');
+  assert.doesNotMatch(codex, /Last good reading/);
+
+  // Another day's reading names the date; an unreadable time still marks the row stale.
+  const older = renderAgentQuotaSidebarBody({ data: { ...data, agents: { ...data.agents, claude: staleClaude(new Date(NOW - 48 * 60 * minute).toISOString()) } } }, NOW);
+  assert.match(titles(older)[0], /^Last good reading: [A-Z][a-z]{2} \d{1,2}, \d{1,2}:\d{2}/);
+  const unknownTime = renderAgentQuotaSidebarBody({ data: { ...data, agents: { ...data.agents, claude: staleClaude('bad') } } }, NOW);
+  assert.match(titles(unknownTime)[0], /^Last good reading: —\n/);
+  // A stale value at its limit still announces the limit, then the reading time.
+  const full = renderAgentQuotaSidebarBody({ data: { ...data, agents: { ...data.agents, claude: staleClaude(new Date(NOW - 5 * minute).toISOString(),
+    [{ id: 'seven_day', usagePercent: 100, resetAt: null, windowMinutes: 10080 }]) } } }, NOW);
+  assert.match(full, /aria-valuetext="100% used · Limit reached · Last good reading: \d{1,2}:\d{2}[^"]*"/);
+  // A fresh payload never draws the stale variant.
+  assert.doesNotMatch(renderAgentQuotaSidebarBody({ data: payload('/A', 45) }, NOW), /--stale|Last good reading/);
+  try {
+    setLocale('uk');
+    assert.match(titles(renderAgentQuotaSidebarBody({ data }, NOW))[0], /^Останні отримані дані: \d{1,2}:\d{2}/);
+  } finally {
+    setLocale('en');
+  }
+});
+
+test('no snapshot yet: a transient failure without a stale reading stays the dashed bare-name row (TPT689)', () => {
+  setLocale('en');
+  const html = renderAgentQuotaSidebarBody({ data: { projectRoot: '/A', agents: {
+    claude: agentWith('claude', [], { status: 'unavailable', unavailableReason: 'rate_limited', stale: false }),
+    codex: agentWith('codex', [{ id: 'codex_primary', usagePercent: 5, resetAt: null, windowMinutes: 10080 }]),
+  } } }, NOW);
+  assert.deepEqual(captions(html), ['Claude | —', 'Codex 7-day | 5%']);
+  assert.match(html, /role="img" aria-label="Claude: Usage unavailable"/);
+  assert.equal(bars(html)[0], 'agent-quota-sidebar-bar agent-quota-sidebar-bar--unavailable');
+  assert.equal(titles(html)[0], 'Claude Code · max\nClaude Code is limiting usage checks. Wait a moment, then refresh.');
+  assert.doesNotMatch(html, /--stale|Last good reading/);
+});
+
+test('five resting states keep five different row + bar markups: loading, fresh, stale, unavailable, failed (TPT689)', () => {
+  setLocale('en');
+  const signature = html => `${/<div class="(agent-quota-sidebar-row[^"]*)"/.exec(html)[1]} | ${/<div class="(agent-quota-sidebar-bar[^"]*)">/.exec(html)[1]}`;
+  const one = claude => renderAgentQuotaSidebarBody({ data: { projectRoot: '/A', agents: { claude, codex: null } } }, NOW);
+  const window = { id: 'seven_day', usagePercent: 0, resetAt: null, windowMinutes: 10080 };
+  const states = [
+    renderAgentQuotaSidebarBody(null),
+    one(agentWith('claude', [window])),
+    one(staleClaude(new Date(NOW - minute).toISOString(), [window])),
+    one(agentWith('claude', [], { status: 'unavailable', unavailableReason: 'rate_limited' })),
+    renderAgentQuotaSidebarBody({ error: 'request_failed' }),
+  ].map(signature);
+  assert.equal(new Set(states).size, 5, states.join('\n'));
+  assert.equal(states[2], 'agent-quota-sidebar-row agent-quota-sidebar-row--stale agent-quota-sidebar-row--claude | agent-quota-sidebar-bar agent-quota-sidebar-bar--known');
+});
+
+test('stale CSS: lighter track and dimmed fill in the provider hue at rest, full strength on hover/focus, no filter (TPT689)', () => {
+  const css = read('./styles.css');
+  const block = css.slice(css.indexOf('(TPT310) Agent plan usage'), css.indexOf('(C1144) Active agent sessions'));
+  const rule = selector => {
+    const m = block.match(new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{([^}]*)\\}`));
+    assert.ok(m, selector);
+    return m[1];
+  };
+  const tint = body => Number(/background:\s*color-mix\(in srgb, var\(--agent-quota-brand\) (\d+)%, transparent\)/.exec(body)[1]);
+  const opacity = body => Number(/opacity:\s*([\d.]+)/.exec(body)[1]);
+  const known = tint(rule('.agent-quota-sidebar-bar--known'));
+  const restTrack = tint(rule('.agent-quota-sidebar-row--stale .agent-quota-sidebar-bar--known'));
+  assert.ok(restTrack > 0 && restTrack < known, `stale track ${restTrack}% is lighter than the known ${known}%`);
+  const restFill = opacity(rule('.agent-quota-sidebar-row--stale .agent-quota-sidebar-fill'));
+  assert.ok(restFill > 0 && restFill < 1);
+  // Hover/focus shows the caption, so the bar returns to the full-strength colours its contrast was checked on.
+  assert.equal(tint(rule('.agent-quota-sidebar-row--stale:is(:hover, :focus-visible) .agent-quota-sidebar-bar--known')), known);
+  assert.equal(opacity(rule('.agent-quota-sidebar-row--stale:is(:hover, :focus-visible) .agent-quota-sidebar-fill')), 1);
+  // A focused stale row shrunk by another row's hover fades again.
+  const shrunk = '.agent-quota-sidebar-body:has(.agent-quota-sidebar-row:hover) .agent-quota-sidebar-row--stale:not(:hover)';
+  assert.equal(tint(rule(`${shrunk} .agent-quota-sidebar-bar--known`)), restTrack);
+  assert.equal(opacity(rule(`${shrunk} .agent-quota-sidebar-fill`)), restFill);
+  assert.doesNotMatch(block, /filter\s*:/, 'no filter: the hue is what tells a loaded track from the grey placeholder');
+  assert.match(rule('.agent-quota-sidebar-fill'), /transition:\s*opacity/);
+  assert.match(css, /prefers-reduced-motion: reduce\)\s*\{[^}]*\.agent-quota-sidebar-fill[^{}]*\{\s*transition:\s*none/);
+});

@@ -135,6 +135,25 @@ try {
   await tick();
   assert.deepEqual(unhandled, [], 'New Task form handlers must not leave an unhandled rejection');
 
+  // (TPT624) The sprint combo re-shows the user's raw pick after a draft restore or Back
+  // from Preview — including Backlog (0 / 'null') and "+ New", never an empty "-- Select --".
+  const renderSprint = () => {
+    document.body.innerHTML = board.renderNewTaskForm([], [1, 2, 3]);
+    const combo = document.querySelector('#new-task-form .sprint-combo[data-id="new-task-priority"]');
+    return { current: combo.dataset.current, label: combo.querySelector('.sprint-combo-input').value };
+  };
+  for (const [stored, current] of [[0, 'null'], ['null', 'null'], ['__new__', '__new__'], ['1', '1'], [2, '2']]) {
+    reset(7);
+    sessionStorage.setItem(DRAFT_KEY, JSON.stringify({ title: 'Draft', priority: stored }));
+    const restored = renderSprint();
+    assert.equal(restored.current, current, `draft priority ${JSON.stringify(stored)}`);
+    assert.notEqual(restored.label, '', `draft priority ${JSON.stringify(stored)} must show a label`);
+  }
+  reset(7);
+  state.manualTaskState = { ...board.ensureManualTaskState(), title: 'Back', priority: 'null', phase: 'form' };
+  assert.deepEqual(renderSprint(), { current: 'null', label: 'Backlog' }, 'Back from Preview keeps Backlog');
+  reset(7);
+
   console.log('TPT350_DOM_PASS');
 } catch (err) {
   console.error(err);

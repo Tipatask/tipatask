@@ -292,3 +292,34 @@ test('minStepForDeps: mix of known and unknown deps uses only the known ones', (
   const map = new Map([['C1', 4]]);
   assert.equal(minStepForDeps(['C1', 'C999'], map), 5);
 });
+
+// (TPT624) Manual New Task: the form's explicit sprint pick arrives pinned. Unpinned, the
+// same task is moved into the newest active sprint — the reported "selected sprint ignored".
+test('manual New Task: pinned older sprint survives a newer active sprint', async () => {
+  const tasks = [
+    { id: 'TPT1', category: 'CODING', status: 'pending', priority: 1 },
+    { id: 'TPT2', category: 'CODING', status: 'in_progress', priority: 3 },
+  ];
+  const sprints = [1, 2, 3].map(number => ({ name: `Sprint ${number}`, number }));
+  const pinned = [{ type: 'new', task: { id: 'TPT9', category: 'CODING', priority: 1, dependencies: [] } }];
+  await resolveAndAssign(pinned, makeBackend({ tasks, sprints }), {}, new Set(['TPT9']));
+  assert.equal(pinned[0].task.priority, 1);
+
+  const unpinned = [{ type: 'new', task: { id: 'TPT9', category: 'CODING', priority: 1, dependencies: [] } }];
+  await resolveAndAssign(unpinned, makeBackend({ tasks, sprints }), {});
+  assert.equal(unpinned[0].task.priority, 3, 'unpinned resolution replaces the pick with the newest active sprint');
+});
+
+test('manual New Task: pinned Backlog stays 0 and a pinned new sprint number is created', async () => {
+  const tasks = [{ id: 'TPT1', category: 'CODING', status: 'in_progress', priority: 3 }];
+  const sprints = [1, 2, 3].map(number => ({ name: `Sprint ${number}`, number }));
+  const backend = makeBackend({ tasks, sprints });
+  const changes = [
+    { type: 'new', task: { id: 'TPT8', category: 'CODING', priority: 0, dependencies: [] } },
+    { type: 'new', task: { id: 'TPT9', category: 'CODING', priority: 4, dependencies: [] } },
+  ];
+  await resolveAndAssign(changes, backend, {}, new Set(['TPT8', 'TPT9']));
+  assert.equal(changes[0].task.priority, 0);
+  assert.equal(changes[1].task.priority, 4);
+  assert.deepEqual(backend.createdSprints, [{ name: 'Sprint 4', number: 4 }]);
+});

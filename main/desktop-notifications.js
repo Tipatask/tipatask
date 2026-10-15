@@ -12,6 +12,9 @@ const PAD = 16, HEADER = 24, GAP = 8, CARD = 70, MORE = 24, WIDTH = 336;
 // Blur → focus gap while the user switches between two Tipatask windows. The surface waits this
 // long before re-deciding, so the banner never flashes up in between.
 const SURFACE_SETTLE_MS = 120;
+// Longest a card click keeps the banner up while its onClick raises the project window. The
+// raise settles in about 1.4 s at most; a reopened project can wait on an access dialog.
+const CLICK_HOLD_MS = 3000;
 const CATEGORIES = ['attention', 'completed', 'objective', 'activity', 'merge'];
 const THEME_KEYS = ['bg', 'text', 'muted', 'border', 'primary', 'warning', 'success', 'shadow'];
 // Live native notifications retained until their terminal event (TPT487); FIFO backstop.
@@ -84,6 +87,11 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   // (TPT505) Banner dismissed with Hide: stays hidden, entries kept, until a new or changed
   // alert arrives (upsert) or Show on Top is toggled. The in-app panel is unaffected.
   let bannerHidden = false;
+  // (TPT645) Card clicks whose onClick (raise the project window, then deliver the click) has
+  // not settled. While one is pending the banner is not hidden, so the desktop never flashes
+  // between banner and window; `hideHeld` remembers a hide that was skipped for it.
+  let clicksPending = 0;
+  let hideHeld = false;
   // (TPT487) "Show on Top" off: one transient OS notification per alert, keyed like entries.
   // Referenced until click/close/failed so V8 can't collect one before the OS shows it.
   const natives = new Map();
@@ -121,6 +129,7 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
 
   // Exactly one surface holds the alerts: the in-app panel of the focused project window, or
   // the always-on-top banner while another app is focused. Never focuses or raises anything.
+  // A pending card click keeps the banner up (minus that card) until its window is raised.
   function renderSurface() {
     const list = snapshot();
     const current = hostLive();
@@ -135,7 +144,9 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     if (!window || window.isDestroyed() || loading) return;
     layout();
     window.webContents.send('notify:desktop-state', { entries: list, theme });
+    hideHeld = false;
     if (list.length && enabled && !current && !bannerHidden) window.showInactive();
+    else if (clicksPending && enabled && !bannerHidden) hideHeld = true;
     else window.hide();
   }
 
@@ -298,7 +309,7 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
 
   // (TPT505) Banner Hide: the banner steps aside without touching the registry or any project
   // window — no onClick/onShowMore, no focus()/show(). The banner is a non-activating panel
-  // (ensureWindow()), so the click itself never brings Tipatask forward either.
+  // without a title bar (ensureWindow()), so the click itself never brings Tipatask forward.
   function hideBanner() {
     if (!entries.size) return;
     bannerHidden = true;
@@ -324,11 +335,35 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     }
     const entry = entries.get(id);
     if (!entry) return;
-    remove(entry);
-    publish();
     // Remove first: opening a task may itself produce another alert.
-    if (action === 'click') onClick(entry);
-    else onDismiss(entry, { keepCard: false });
+    remove(entry);
+    if (action !== 'click') {
+      publish();
+      return onDismiss(entry, { keepCard: false });
+    }
+    clicksPending += 1;
+    publish();
+    let result = null;
+    try { result = onClick(entry); } catch {}
+    settleClick(result);
+  }
+
+  // Ends one card click's banner hold once its onClick settles (at most CLICK_HOLD_MS), then
+  // applies a hide the hold skipped: by then the raised project window hosts the alerts.
+  function settleClick(result) {
+    let timer = null;
+    let settled = false;
+    const release = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clicksPending -= 1;
+      if (!disposed && !clicksPending && hideHeld) renderSurface();
+    };
+    if (typeof result?.then !== 'function') return release();
+    timer = setTimeout(release, CLICK_HOLD_MS);
+    timer.unref?.();
+    result.then(release, release);
   }
 
   async function ensureWindow(origin) {
@@ -340,10 +375,13 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     const w = window = new BrowserWindow({
       // hasShadow: false — macOS traces a window shadow around a transparent window's opaque
       // pixels, drawing a jagged second outline around every card (TPT498); cards carry their own.
-      // (TPT505) Clicking the banner must not activate Tipatask: on macOS an activated app makes
-      // its next window key once the banner hides, raising a project window. A 'panel' is a
-      // non-activating NSPanel; Windows gets the same from focusable: false (WS_EX_NOACTIVATE).
-      ...(platform === 'darwin' ? { type: 'panel' } : platform === 'win32' ? { focusable: false } : {}),
+      // (TPT505/TPT645) Clicking the banner must not activate Tipatask. On macOS a 'panel' is a
+      // non-activating NSPanel, but a frameless window with rounded corners is still a titled
+      // window with a hidden title-bar strip across its top, and a click there activates the app
+      // like any title-bar click (that is where Hide sits). roundedCorners: false makes it a
+      // borderless window, with no title bar. Windows gets the same from focusable: false
+      // (WS_EX_NOACTIVATE).
+      ...(platform === 'darwin' ? { type: 'panel', roundedCorners: false } : platform === 'win32' ? { focusable: false } : {}),
       width: WIDTH, height: pageHeight(1), show: false, frame: false, transparent: true, hasShadow: false,
       alwaysOnTop: true, skipTaskbar: true, resizable: false, minimizable: false,
       maximizable: false, fullscreenable: false, title: 'TipATask',
@@ -489,4 +527,4 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   };
 }
 
-module.exports = { createDesktopNotifications, PAGE_SIZE, pageHeight, SURFACE_SETTLE_MS };
+module.exports = { createDesktopNotifications, PAGE_SIZE, pageHeight, SURFACE_SETTLE_MS, CLICK_HOLD_MS };

@@ -329,6 +329,131 @@ test('PiAgent.getSpawnSpec: a models.json write failure is logged and the spawn 
   }
 });
 
+// (TPT634) Task execution needs tools, so a row declared `tools: false` is refused by getSpawnSpec()
+// with the user-facing sentence, before models.json, the MCP bridge or any argv; another row of the
+// same project still spawns.
+const TOOLLESS_ROW = { model: 'recraft-v3', apiKey: 'sk-or-row', provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', tools: false };
+const TOOLLESS_MESSAGE = 'Model "recraft-v3" at openrouter.ai does not support tool calls (its PI_MODELS row sets tools: false). Choose a tool-capable model.';
+
+test('PiAgent.getSpawnSpec: a tools:false row is refused with a clear reason and nothing is written', async () => {
+  const dir = makeProjectDir({ PI_MODELS: [TOOLLESS_ROW] });
+  try {
+    await assert.rejects(
+      new PiAgent().getSpawnSpec(FAKE_CONFIG, 'Work on task C1.', 'C1', { projectPath: dir }),
+      { message: TOOLLESS_MESSAGE },
+    );
+    assert.strictEqual(fs.existsSync(path.join(dir, '.pi')), false, 'refused before models.json is written');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('PiAgent.getSpawnSpec: opts.model naming a tool-capable row spawns while row 0 is tools:false', async () => {
+  const dir = makeProjectDir({ PI_MODELS: [TOOLLESS_ROW, { model: 'a/b', apiKey: 'sk-or-row1' }] });
+  try {
+    const spec = await new PiAgent().getSpawnSpec(FAKE_CONFIG, 'Work on task C1.', 'C1', { projectPath: dir, model: 'a/b' });
+    const argsAfterPrefix = spec.args.slice(expectedLaunch().argsPrefix.length);
+    assert.deepStrictEqual(argsAfterPrefix.slice(0, 5), ['--provider', 'openrouter', '--model', 'a/b', '--approve']);
+    await assert.rejects(
+      new PiAgent().getSpawnSpec(FAKE_CONFIG, 'Work on task C1.', 'C1', { projectPath: dir, model: 'recraft-v3' }),
+      { message: TOOLLESS_MESSAGE },
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// (TPT695) A start that names no model (bulk start, a pinned agent without a model, a single-agent
+// board) runs the first tool-capable row, so a tools:false row 0 — still the objective-chat default —
+// no longer blocks it.
+test('PiAgent.getSpawnSpec: with no opts.model a tools:false row 0 gives way to the first tool-capable row', async () => {
+  const dir = makeProjectDir({ PI_MODELS: [TOOLLESS_ROW, { model: 'a/b', apiKey: 'sk-or-row1' }] });
+  try {
+    const spec = await new PiAgent().getSpawnSpec(FAKE_CONFIG, 'Work on task C1.', 'C1', { projectPath: dir });
+    const argsAfterPrefix = spec.args.slice(expectedLaunch().argsPrefix.length);
+    assert.deepStrictEqual(argsAfterPrefix.slice(0, 5), ['--provider', 'openrouter', '--model', 'a/b', '--approve']);
+    assert.strictEqual(spec.model, 'a/b');
+    assert.strictEqual(spec.env.OPENROUTER_API_KEY, 'sk-or-row1', 'authenticates with the chosen row\'s own key');
+    assert.strictEqual(fs.existsSync(path.join(dir, '.pi')), false, 'the tool-less custom row is never prepared');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('spawnTerminal: a Pi task on a tools:false row fails to start with that sentence and never reaches pty.spawn', async (t) => {
+  // The real start path down to pty.spawn: CLI detection and node-pty are faked, getSpawnSpec() is not.
+  const nodePty = require('node-pty');
+  const { spawnTerminal } = require('../terminal-session');
+  const { getTaskAgent } = require('./index');
+  const { createSession } = require('../session-state');
+  const dir = makeProjectDir({ PI_MODELS: [TOOLLESS_ROW] });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ptySpawn = t.mock.method(nodePty, 'spawn', () => { throw new Error('pty.spawn must not be reached'); });
+  const agent = getTaskAgent('pi');
+  t.mock.method(agent, 'cachedDetect', async () => ({ id: 'pi', label: agent.label, available: true }));
+  const session = createSession(null, false, 'C1-tab', dir);
+  session.taskAgent = 'pi';
+  session.projectPath = dir;
+  await assert.rejects(
+    spawnTerminal(session, 'Work on task C1.', 'C1', [], { sessions: new Map() }),
+    // (TPT9008) Coded, so the ESTART frame carries `reason` + params the terminal translates.
+    {
+      message: TOOLLESS_MESSAGE,
+      reasonCode: 'no_tool_calls',
+      reasonParams: { agent: 'pi', model: 'recraft-v3', host: 'openrouter.ai' },
+    },
+  );
+  assert.strictEqual(ptySpawn.mock.callCount(), 0);
+  assert.strictEqual(session.alive, false, 'the session never went live');
+  assert.strictEqual(fs.existsSync(path.join(dir, '.pi')), false);
+});
+
+// (TPT9008) Every detect() negative carries a DETECT_REASONS code; its sentence stays the reason.
+// The documented PI_BIN override points detect() at a stub launcher (POSIX shell stubs).
+if (process.platform === 'win32') {
+  test.skip('PiAgent.detect() reason codes against a stub launcher (POSIX shell stubs)', () => {});
+} else {
+  async function detectWithPiStub(t, script) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-pi-detect-'));
+    const bin = path.join(dir, 'pi');
+    fs.writeFileSync(bin, script, { mode: 0o755 });
+    const previous = process.env.PI_BIN;
+    t.after(() => {
+      if (previous === undefined) delete process.env.PI_BIN;
+      else process.env.PI_BIN = previous;
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+    process.env.PI_BIN = bin;
+    return new PiAgent().detect({});
+  }
+
+  test('PiAgent.detect(): a failing --version probe with output -> probe_failed_output naming its first line', async (t) => {
+    const res = await detectWithPiStub(t, '#!/bin/sh\necho "Error: Cannot find module x $&"\necho "second line"\nexit 1\n');
+    assert.strictEqual(res.available, false);
+    assert.strictEqual(res.reasonCode, 'probe_failed_output');
+    assert.deepStrictEqual(res.reasonParams, { output: 'Error: Cannot find module x $&' });
+    assert.strictEqual(res.reason, 'Pi CLI probe failed: Error: Cannot find module x $&');
+  });
+
+  test('PiAgent.detect(): a silent failing probe -> probe_failed', async (t) => {
+    const res = await detectWithPiStub(t, '#!/bin/sh\nexit 3\n');
+    assert.strictEqual(res.reasonCode, 'probe_failed');
+    assert.strictEqual(res.reason, PiAgent.DETECT_REASONS.probe_failed);
+    assert.strictEqual(res.reasonParams, undefined);
+  });
+
+  test('PiAgent.detect(): a launcher that cannot run (missing interpreter) -> cli_missing', async (t) => {
+    const res = await detectWithPiStub(t, '#!/nonexistent/tipatask-interpreter\n');
+    assert.strictEqual(res.reasonCode, 'cli_missing');
+    assert.strictEqual(res.reason, PiAgent.DETECT_REASONS.cli_missing);
+  });
+
+  test('PiAgent.detect(): a working probe is available and carries no reason', async (t) => {
+    const res = await detectWithPiStub(t, '#!/bin/sh\necho 1.2.3\n');
+    assert.deepStrictEqual(res, { id: 'pi', label: 'Other Model', available: true });
+  });
+}
+
 // No opts.model → row 0 for both --model and the key (unchanged C1121 default behavior).
 test('PiAgent.getSpawnSpec: no opts.model falls back to row 0 for both --model and OPENROUTER_API_KEY', async () => {
   const dir = makeProjectDir({
@@ -548,10 +673,11 @@ test('PiAgent.buildPrompt: no line of the kickoff prompt can false-trigger the a
       // raised 8000 -> 8500 for C1566's compact process-safety directive, then 8500 -> 9000
       // for C1542's unconditional compact KB-hygiene directive (same reasoning: always
       // present, pushing the discovery/blank-tag variants past the old ceiling), then
-      // 9000 -> 9300 for the unconditional compact resource-limits directive; still leaves
-      // headroom (worst measured case ~9100 chars) without inviting unbounded growth.
-      t.diagnostic(`Pi REST ${JSON.stringify(scenario)}: ${prompt.length} / 9300`);
-      assert.ok(prompt.length < 9300, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
+      // 9000 -> 9300 for the unconditional compact resource-limits directive, then
+      // 9300 -> 9600 for the commit-on compact definition-of-done line (TPT611, only the
+      // git all-on scenario carries it); still bounded without inviting unbounded growth.
+      t.diagnostic(`Pi REST ${JSON.stringify(scenario)}: ${prompt.length} / 9600`);
+      assert.ok(prompt.length < 9600, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

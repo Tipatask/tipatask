@@ -979,6 +979,56 @@ test('model-id de-dupe is id-only across providers, custom included', () => {
   );
 });
 
+// ── (TPT634) `tools: false` on a custom row ─────────────────────────────────
+
+const TOOLLESS = { model: 'recraft-v3', apiKey: 'sk-or-1', provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1' };
+
+test('a custom row keeps tools:false; true, a non-boolean or no value is the default and is not written', () => {
+  assert.deepEqual(sanitizePiModels([{ ...TOOLLESS, tools: false }]), [{ ...TOOLLESS, tools: false }]);
+  for (const tools of [true, 'false', 0, null, undefined]) {
+    assert.deepEqual(sanitizePiModels([{ ...TOOLLESS, tools }]), [TOOLLESS], `tools ${JSON.stringify(tools)} is the default`);
+  }
+  assert.deepEqual(
+    Object.keys(sanitizePiModels([{ ...TOOLLESS, api: 'openai-responses', tools: false }])[0]),
+    ['model', 'apiKey', 'provider', 'baseUrl', 'api', 'tools'],
+  );
+});
+
+test('tools on a non-custom row is discarded, and rows without the field read back unchanged', () => {
+  assert.deepEqual(
+    sanitizePiModels([
+      { model: 'a/b', apiKey: 'k1', tools: false },
+      { model: 'deepseek-v4-flash', apiKey: 'k2', provider: 'deepseek', tools: false },
+    ]),
+    [{ model: 'a/b', apiKey: 'k1' }, { model: 'deepseek-v4-flash', apiKey: 'k2', provider: 'deepseek' }],
+  );
+  const rows = [
+    { model: 'a/b', apiKey: 'k1' },
+    { model: 'llama3.1:8b', apiKey: '', provider: 'custom', baseUrl: OLLAMA },
+    { model: 'gpt-4o-mini', apiKey: 'sk', provider: 'custom', baseUrl: 'https://gw.example.com/v1', api: 'openai-responses' },
+  ];
+  const read = readPiEntries({ PI_MODELS: rows });
+  assert.deepEqual(read, rows);
+  assert.ok(read.every((r) => !Object.hasOwn(r, 'tools')), 'no existing row gains a tools key');
+});
+
+test('tools:false reaches the renderer DTO and survives a Settings save through config.json', (t) => {
+  const root = makeRoot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const row = { ...TOOLLESS, tools: false };
+  const cfg = { PI_MODELS: [row, { model: 'a/b', apiKey: 'k' }] };
+  const safe = rendererPiModels(cfg);
+  assert.deepStrictEqual(safe[0], {
+    model: 'recraft-v3', provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', tools: false,
+    hasApiKey: true, apiKeyAction: 'preserve', credentialRef: { model: 'recraft-v3', provider: 'custom' },
+  });
+  assert.strictEqual(Object.hasOwn(safe[1], 'tools'), false);
+  writeProjectConfig(root, buildAgentsConfigPatch(cfg, { taskAgent: 'pi', availableAgents: ['pi'], piModels: safe }));
+  const back = readProjectConfig(root);
+  assert.deepEqual(back.PI_MODELS, cfg.PI_MODELS, 'the saved key is kept and tools:false is not dropped');
+  assert.deepEqual(piEntryForModel(back, 'recraft-v3'), row);
+});
+
 test('writeProjectConfig routes API_TOKEN to the account store and never writes it to config.json', (t) => {
   const root = makeRoot();
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

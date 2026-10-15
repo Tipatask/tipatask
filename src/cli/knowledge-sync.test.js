@@ -9,6 +9,11 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
+// Tokens live only in the app-level account store under TIPATASK_USER_DATA. Give this file
+// its own, so parallel test files never race on one shared store file.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-knowledge-sync-data-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
+
 const {
   fireSessionSync, syncProjectKb, fireAutoReindex,
   acquireLock, pushFile, pushAll, autoPushOnEdit, getLocalVersions, saveLocalVersions,

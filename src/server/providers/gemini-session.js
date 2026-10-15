@@ -458,4 +458,19 @@ function spawnGeminiTurn(session, taskId, emitFn) {
   });
 }
 
-module.exports = { spawnGeminiTurn, buildGeminiArgs };
+// TPT623 — launch spec for a one-shot Gemini prompt (providers/one-shot.js): the chat turn's
+// env and argv, for a synthetic session that has no Gemini session to resume.
+// (TPT701) Already extension- and MCP-free; `toolless` is accepted for symmetry and `cwd` moves
+// only the working directory (settings still derive from the project).
+function geminiOneShotSpec({ projectRoot, model, cwd } = {}) {
+  const root = projectRoot || config.PROJECT_ROOT;
+  const session = { projectPath: root, selectedModel: model || null };
+  const isWin = process.platform === 'win32';
+  const env = prependPathEnv(augmentPathEnv({ TERM: 'dumb', ...projectEnvExtras(session) }), NODE_BIN_DIR, { isWin });
+  env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = require('./gemini-config').prepareGeminiSettings(config.USER_DATA_ROOT);
+  delete env.API_TOKEN;
+  delete env.TIPATASK_API_TOKEN;
+  return { command: config.GEMINI_BIN, args: buildGeminiArgs(session), env, cwd: cwd || root };
+}
+
+module.exports = { spawnGeminiTurn, buildGeminiArgs, geminiOneShotSpec };

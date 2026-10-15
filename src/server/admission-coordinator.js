@@ -3,7 +3,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { DEVICE_DIRECTORY, initialPressureState } = require('./admission-policy');
+const { DEVICE_DIRECTORY, FIELDS, initialPressureState } = require('./admission-policy');
+// A persisted ramp cap can never exceed the largest configurable ramp ceiling.
+const RAMP_CAP_MAX = FIELDS.rampCeiling[3];
 
 function pidAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid < 2) return false;
@@ -17,11 +19,12 @@ function validState(state) {
   if (state?.version !== 1 || !state.instances || Array.isArray(state.instances)
     || Object.keys(state.instances).length > 128 || !p || !['pressure', 'swap', 'headroom', null].includes(p.alarm)
     || !time(p.normalSince) || !time(p.lastStartAt) || !Array.isArray(p.samples) || p.samples.length > 128
+    || !(p.rampCap === undefined || p.rampCap === null || (natural(p.rampCap) && p.rampCap > 0 && p.rampCap <= RAMP_CAP_MAX))
     || (state.nextTicket !== undefined && !natural(state.nextTicket))) return false;
   if (!p.samples.every(s => natural(s.at) && natural(s.swap) && natural(s.page) && s.page > 0
     && ['normal', 'warning', 'critical'].includes(s.pressure))) return false;
   return Object.values(state.instances).every(o => natural(o.pid) && o.pid > 1 && natural(o.at)
-    && typeof o.fingerprint === 'string' && ['static', 'pressure'].includes(o.mode)
+    && typeof o.fingerprint === 'string' && ['static', 'pressure', 'ramp'].includes(o.mode)
     && natural(o.staticCap) && o.staticCap > 0 && natural(o.fallbackCap) && o.fallbackCap > 0
     && Array.isArray(o.slots) && o.slots.length <= 256
     && o.slots.every(s => typeof s.id === 'string' && typeof s.project === 'string' && typeof s.running === 'boolean'

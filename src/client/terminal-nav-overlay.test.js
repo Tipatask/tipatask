@@ -79,7 +79,7 @@ test('every fit syncs the PTY; dedup is against the last size sent', () => {
   const refresh = fnBody(modal, 'function refreshTerminalViewport(');
   assert.match(refresh, /sendResize\(\{ force: send \}\);/);
   assert.doesNotMatch(refresh, /if \(send\) sendResize/);
-  assert.match(modal, /setStatus\('', 'Connected'\);\s*lastSentSize = null;[^\n]*\n\s*fitAndSendResize\(\);/);
+  assert.match(modal, /setStatus\('', t\('terminal\.status\.connected'\)\);\s*lastSentSize = null;[^\n]*\n\s*fitAndSendResize\(\);/);
 });
 
 test('backdrop mousedown still minimizes only when the overlay itself is the target', () => {

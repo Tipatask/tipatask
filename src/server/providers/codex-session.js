@@ -541,4 +541,22 @@ function spawnCodexTurn(session, taskId) {
   })();
 }
 
-module.exports = { spawnCodexTurn, resolveCodexModel, buildCodexArgs, extractLocalImagePaths };
+// TPT623 — launch spec for a one-shot, tool-less Codex prompt (providers/one-shot.js): the
+// same env a chat turn gets (buildCodexEnv refreshes the project CODEX_HOME), a read-only
+// sandbox, no session to resume. The prompt goes to stdin (`-`).
+// (TPT701) `toolless` replaces the project's whole MCP server map with an empty one
+// (`-c mcp_servers={}`, the same whole-map override a scoped chat turn uses), so the run has
+// no Tipatask tools; the read-only sandbox's built-in file reads remain. `cwd` moves only the
+// working directory — CODEX_HOME (auth, config) stays the project's `.codex`.
+function buildCodexOneShotArgs({ model, toolless = false, cwd } = {}) {
+  return ['exec', ...(model ? ['-m', model] : []), ...(toolless ? ['-c', 'mcp_servers={}'] : []),
+    '--json', '-s', 'read-only', '--skip-git-repo-check', '-C', cwd, '-'];
+}
+function codexOneShotSpec({ projectRoot, model, toolless = false, cwd } = {}) {
+  const root = projectRoot || config.PROJECT_ROOT;
+  const runCwd = cwd || root;
+  const { env } = buildCodexEnv({ projectRoot: root });
+  return { command: config.CODEX_BIN, args: buildCodexOneShotArgs({ model, toolless, cwd: runCwd }), env, cwd: runCwd };
+}
+
+module.exports = { spawnCodexTurn, resolveCodexModel, buildCodexArgs, extractLocalImagePaths, codexOneShotSpec, buildCodexOneShotArgs };

@@ -214,3 +214,39 @@ test('prefetchObjectiveWorkflow: renders the referenced-task block only when the
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// TPT627 — unfinalized reserve_task_keys placeholders stay out of the planner's active list
+// and referenced-task prefetch, but their keys still count toward maxByPrefix.
+const { RESERVED_PLACEHOLDER_DESCRIPTION } = require('./reservation-placeholder');
+
+function placeholderRows() {
+  return [
+    { id: 'TPT20', title: 'Real', status: 'pending', category: 'CODING', priority: 3, tags: ['x'], description: 'real work', isReservation: false },
+    { id: 'TPT21', title: 'New task', status: 'pending', category: 'CODING', priority: 0, tags: [], description: RESERVED_PLACEHOLDER_DESCRIPTION, isReservation: true },
+    // Legacy row from an API that predates the is_reservation flag — sentinel fallback.
+    { id: 'TPT30', title: 'New task', status: 'pending', category: 'CODING', priority: 0, tags: [], description: RESERVED_PLACEHOLDER_DESCRIPTION },
+  ];
+}
+
+test('buildReferencedTasksSection: reservation placeholders named in the objective are never picked', () => {
+  const active = new Set(['pending']);
+  const section = sc.buildReferencedTasksSection(placeholderRows(), 'touch TPT21, TPT30 and TPT20', active);
+  const rows = JSON.parse(section.match(/```json\n([\s\S]*?)\n```/)[1]);
+  assert.deepEqual(rows.map(r => r.id), ['TPT20']);
+  assert.equal(sc.buildReferencedTasksSection(placeholderRows(), 'only TPT21 and TPT30', active), '');
+});
+
+test('prefetchObjectiveWorkflow: active excludes reservation placeholders, maxByPrefix still counts them', async () => {
+  const root = mkProject('tpt627-reservations');
+  try {
+    const backend = fakeBackend({ tags: [] });
+    backend.getTasksUnfiltered = async () => placeholderRows();
+    const { bundle } = await sc.prefetchObjectiveWorkflow(backend, 'new', root, 'update TPT21');
+    const meta = JSON.parse(bundle.match(/### list_task_id_meta\n```json\n([\s\S]*?)\n```/)[1]);
+    assert.deepEqual(meta.active.map(t => t.id), ['TPT20']);
+    assert.equal(meta.maxByPrefix.TPT, 30);
+    assert.doesNotMatch(bundle, /### Referenced task descriptions/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -8,6 +8,9 @@ import fs from 'node:fs';
 // same pattern project-creation-wizard.test.js uses for the wizard's save path. The helpers'
 // own behavior (prefix round trip, DeepSeek passthrough, default-first ordering) is covered
 // in agent-select.test.js; this file only pins that THIS modal routes through them.
+// The modal's DOM behaviour runs in agent-select-model-form.test.js instead, against the real
+// modal bundled with esbuild in happy-dom: the Claude/Codex model cards (TPT637), the Save gate,
+// Re-Check, and the selection Save hands to saveAgents().
 const SRC = fs.readFileSync(new URL('./agents-modal.js', import.meta.url), 'utf8');
 
 const { normalizePiModels, computePiSaveRows } = await import('./agent-select.js');

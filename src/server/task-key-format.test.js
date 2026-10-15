@@ -3,7 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { isLegacyTaskKey, TASK_KEY_RE, isValidTaskKey, parseTaskKey, isTaskKeyLike, maxNumbersByPrefix, resolveCodingPrefix, HUMAN_TASK_PREFIX, EPIC_KEY_RE } = require('./task-key-format');
+const { isLegacyTaskKey, TASK_KEY_RE, isValidTaskKey, parseTaskKey, isTaskKeyLike, maxNumbersByPrefix, resolveCodingPrefix, HUMAN_TASK_PREFIX, EPIC_KEY_RE, SUSPECT_KEY_GAP, reconcileNextNumber } = require('./task-key-format');
 
 test('isValidTaskKey accepts prefix+number keys (legacy C/H and per-project prefixes)', () => {
   for (const key of ['C214', 'H3', 'TPT214', 'TSK1', 'A0']) {
@@ -62,6 +62,28 @@ test('resolveCodingPrefix returns the project prefix when valid, else degrades t
   }
 });
 
+// ── TPT622: fallback warning + create-key namespace check ──
+
+test('resolveCodingPrefix passes a derived prefix through without warning', (t) => {
+  const { _resetCodingPrefixFallbackWarning } = require('./task-key-format');
+  _resetCodingPrefixFallbackWarning();
+  const warn = t.mock.method(console, 'warn', () => {});
+  assert.equal(resolveCodingPrefix('MNY'), 'MNY');
+  assert.equal(resolveCodingPrefix('TPT'), 'TPT');
+  assert.equal(warn.mock.callCount(), 0);
+});
+
+test('resolveCodingPrefix warns exactly once per process when it falls back to C', (t) => {
+  const { _resetCodingPrefixFallbackWarning } = require('./task-key-format');
+  _resetCodingPrefixFallbackWarning();
+  const warn = t.mock.method(console, 'warn', () => {});
+  assert.equal(resolveCodingPrefix(null), 'C');
+  assert.equal(resolveCodingPrefix('C'), 'C');
+  assert.equal(resolveCodingPrefix('tpt'), 'C');
+  assert.equal(warn.mock.callCount(), 1);
+  assert.match(warn.mock.calls[0].arguments[0], /falling back to legacy 'C'/);
+});
+
 test('HUMAN_TASK_PREFIX and EPIC_KEY_RE match the api/src/lib twin', () => {
   assert.equal(HUMAN_TASK_PREFIX, 'H');
   assert.equal(EPIC_KEY_RE.source, '^[A-Z]{1,8}-[0-9]+$');
@@ -95,4 +117,36 @@ test('taskKeyFormatError names the offending slug and the contract regex', () =>
     assert.ok(msg.includes(JSON.stringify(key)), `message should name ${JSON.stringify(key)}`);
     assert.ok(msg.includes('^(H|[A-Z]{1,6})[0-9]+$'));
   }
+});
+
+// ── TPT9004: single-allocator reconciliation ──
+
+test('SUSPECT_KEY_GAP is the 500-key tolerance named in ai/architecture/tt-api-backend.md', () => {
+  assert.equal(SUSPECT_KEY_GAP, 500);
+});
+
+test('reconcileNextNumber prefers the API peek over the local max+1 whenever the peek is known', () => {
+  assert.deepEqual(reconcileNextNumber({ prefix: 'TPT', localNext: 701, peekNext: 9005 }), { next: 9005, suspect: false, source: 'peek' });
+  assert.deepEqual(reconcileNextNumber({ prefix: 'TPT', localNext: 9005, peekNext: 9005 }), { next: 9005, suspect: false, source: 'peek' });
+});
+
+test('reconcileNextNumber falls back to the local number without a usable peek', () => {
+  assert.deepEqual(reconcileNextNumber({ prefix: 'TPT', localNext: 701 }), { next: 701, suspect: false, source: 'local' });
+  assert.deepEqual(reconcileNextNumber({ prefix: 'TPT', localNext: 701, peekNext: null }), { next: 701, suspect: false, source: 'local' });
+  assert.deepEqual(reconcileNextNumber({ prefix: 'TPT', localNext: 701, peekNext: 0 }), { next: 701, suspect: false, source: 'local' });
+  assert.deepEqual(reconcileNextNumber({ prefix: 'TPT', localNext: 701, peekNext: NaN }), { next: 701, suspect: false, source: 'local' });
+  assert.deepEqual(reconcileNextNumber({ prefix: 'TPT' }), { next: 1, suspect: false, source: 'local' }, 'no numbers at all -> 1');
+});
+
+test('reconcileNextNumber flags a local number more than SUSPECT_KEY_GAP above the peek and still answers with the peek', () => {
+  assert.deepEqual(reconcileNextNumber({ prefix: 'TPT', localNext: 1205, peekNext: 705 }), { next: 705, suspect: false, source: 'peek' }, 'exactly +500 is not suspect');
+  assert.deepEqual(reconcileNextNumber({ prefix: 'TPT', localNext: 1206, peekNext: 705 }), { next: 705, suspect: true, source: 'peek' }, '+501 is');
+  assert.equal(reconcileNextNumber({ prefix: 'TPT', localNext: 701, peekNext: 9005 }).suspect, false, 'a peek ahead of the local list is never suspect — deleted rows and the allocator itself do that');
+});
+
+test('reconcileNextNumber steps a candidate past keys that are already taken', () => {
+  const taken = new Set(['TPT705', 'TPT706', 'H3']);
+  assert.equal(reconcileNextNumber({ prefix: 'TPT', localNext: 1300, peekNext: 705, taken }).next, 707);
+  assert.equal(reconcileNextNumber({ prefix: 'H', localNext: 4, peekNext: 3, taken }).next, 4, 'the H set is separate');
+  assert.equal(reconcileNextNumber({ prefix: 'TPT', localNext: 10, taken: new Set(['TPT10']) }).next, 11, 'a taken local candidate moves on too');
 });

@@ -12,6 +12,11 @@ const {
   PI_CUSTOM_NO_KEY,
   piCustomProviderId,
   piSpawnProvider,
+  piRowSupportsTools,
+  piRowHost,
+  toolCompatMessage,
+  piTaskDefaultEntry,
+  piTaskEntryForModel,
   buildPiModelsJson,
   serializePiModelsJson,
   piRealAgentDir,
@@ -131,6 +136,69 @@ test('buildPiModelsJson ignores non-custom rows and tolerates nothing at all', (
 test('a non-default api is carried into the block', () => {
   const json = buildPiModelsJson([{ ...KEYLESS, api: 'anthropic-messages' }]);
   assert.equal(Object.values(json.providers)[0].api, 'anthropic-messages');
+});
+
+// ── row tool capability (TPT634) ────────────────────────────────────────────
+
+test('piRowSupportsTools: only a custom row declaring tools:false is tool-less', () => {
+  assert.equal(piRowSupportsTools({ ...KEYED, tools: false }), false);
+  assert.equal(piRowSupportsTools(KEYED), true);
+  assert.equal(piRowSupportsTools({ ...KEYLESS, tools: true }), true);
+  assert.equal(piRowSupportsTools({ model: 'a/b', apiKey: 'k', tools: false }), true, 'only a custom row carries the flag');
+  assert.equal(piRowSupportsTools({ model: 'x', apiKey: 'k', provider: 'deepseek', tools: false }), true);
+  assert.equal(piRowSupportsTools(null), true);
+  assert.equal(piRowSupportsTools(undefined), true);
+});
+
+test('tools:false leaves the generated models.json and the provider id byte-identical', () => {
+  const toolless = { ...KEYED, tools: false };
+  assert.equal(piCustomProviderId(toolless), piCustomProviderId(KEYED));
+  assert.equal(serializePiModelsJson([toolless, KEYLESS]), serializePiModelsJson([KEYED, KEYLESS]));
+});
+
+test('toolCompatMessage: the endpoint-rejected reason by default, the declared one for a tools:false row', () => {
+  assert.equal(
+    toolCompatMessage('m', 'gw.example.com'),
+    'Model "m" at gw.example.com does not support tool calls (the endpoint rejected the request). Choose a tool-capable model.',
+  );
+  assert.equal(
+    toolCompatMessage('gpt-4o-mini', piRowHost({ ...KEYED, tools: false }), { declared: true }),
+    'Model "gpt-4o-mini" at gw.example.com does not support tool calls (its PI_MODELS row sets tools: false). Choose a tool-capable model.',
+  );
+});
+
+// ── which row a task terminal runs (TPT695) ─────────────────────────────────
+
+const TOOLLESS = { ...KEYED, tools: false };
+const OPENROUTER = { model: 'openrouter/a/b', apiKey: 'sk-or-row' };
+
+test('piTaskDefaultEntry: the first tool-capable row — row 0 unless it sets tools:false', () => {
+  assert.equal(piTaskDefaultEntry({ PI_MODELS: [OPENROUTER, TOOLLESS] }).model, 'openrouter/a/b');
+  assert.equal(piTaskDefaultEntry({ PI_MODELS: [TOOLLESS, OPENROUTER] }).model, 'openrouter/a/b');
+  assert.equal(piTaskDefaultEntry({ PI_MODELS: [TOOLLESS, KEYLESS] }).model, 'llama3.1:8b', 'a custom row without the flag takes tools');
+  assert.equal(piTaskDefaultEntry({ PI_MODELS: [TOOLLESS] }), null, 'no row takes tools');
+  assert.equal(piTaskDefaultEntry({ PI_MODEL: 'openrouter/x', OPENROUTER_API_KEY: 'k' }), null, 'legacy flat pair: no rows to pick from');
+  assert.equal(piTaskDefaultEntry({}), null);
+  assert.equal(piTaskDefaultEntry(null), null);
+});
+
+test('piTaskEntryForModel: a configured tool-capable row, otherwise the reason it cannot run a task', () => {
+  const cfg = { PI_MODELS: [TOOLLESS, OPENROUTER] };
+  const ok = piTaskEntryForModel(cfg, 'openrouter/a/b');
+  assert.equal(ok.entry.model, 'openrouter/a/b');
+  assert.equal(ok.reason, null);
+  assert.equal(piTaskEntryForModel(cfg, '  OPENROUTER/A/B ').entry.model, 'openrouter/a/b', 'same case- and space-insensitive match as piEntryForModel');
+  assert.deepEqual(piTaskEntryForModel(cfg, 'gpt-4o-mini'), { entry: null, reason: 'no-tools' });
+  assert.deepEqual(piTaskEntryForModel(cfg, 'nope/model'), { entry: null, reason: 'unknown' });
+  assert.deepEqual(piTaskEntryForModel(cfg, ''), { entry: null, reason: 'unknown' });
+  assert.deepEqual(piTaskEntryForModel(null, 'openrouter/a/b'), { entry: null, reason: 'unknown' });
+});
+
+// No harness drives handleConnection() with a `model` param, so pin the two task-start checks in source.
+test('ws-handlers.js checks the launch-time Pi pick and a task\'s saved pi_model with piTaskEntryForModel', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'ws-handlers.js'), 'utf8');
+  assert.match(src, /const _pickCheck = piTaskEntryForModel\(_piCfg, modelParam\);\s*if \(_pickCheck\.entry\) \{\s*_piModelParam = modelParam;/);
+  assert.match(src, /const _pinCheck = piTaskEntryForModel\(_piCfgForTask, _task\.piModel\);\s*if \(_pinCheck\.entry\) \{\s*_taskModel = _task\.piModel;/);
 });
 
 // ── writer ──────────────────────────────────────────────────────────────────

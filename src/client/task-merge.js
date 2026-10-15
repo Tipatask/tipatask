@@ -31,7 +31,8 @@ export function syncTaskMergeCard(card) {
   if (select) {
     select.querySelector('.merge-attention-dot')?.remove();
     if (show) select.insertAdjacentHTML('beforeend', MERGE_DOT);
-    const label = t('tooltip.selectCard') + (show ? ` — ${t('card.unmergedWorktree')}` : '');
+    // (TPT614) Select's label carries every collapsed-tray marker; task-finish.js composes the same way.
+    const label = t('tooltip.selectCard') + (show ? ` — ${t('card.unmergedWorktree')}` : '') + (card.classList.contains('has-left-uncommitted') ? ` — ${t('card.leftUncommitted')}` : '');
     select.setAttribute('aria-label', label);
     select.dataset.tip = label;
   }
@@ -39,7 +40,10 @@ export function syncTaskMergeCard(card) {
   if (!show) button?.remove();
   else if (menu) {
     if (!button) {
-      menu.insertAdjacentHTML('beforeend', mergeButtonHtml(card.dataset.id));
+      // (TPT614) Merge stays ahead of the Finish item when both show.
+      const finish = menu.querySelector('.btn-finish-task');
+      if (finish) finish.insertAdjacentHTML('beforebegin', mergeButtonHtml(card.dataset.id));
+      else menu.insertAdjacentHTML('beforeend', mergeButtonHtml(card.dataset.id));
       button = menu.querySelector('.btn-merge-task');
     }
     button.disabled = submitting || ['running', 'conflict'].includes(snapshot.job?.state);

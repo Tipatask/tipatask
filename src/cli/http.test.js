@@ -4,12 +4,14 @@ const assert = require('node:assert/strict');
 const { EventEmitter, getEventListeners } = require('node:events');
 const http = require('node:http');
 const test = require('node:test');
+const zlib = require('node:zlib');
 const { request, MAX_RESPONSE_BYTES } = require('./http');
 
-function fakeTransport(t, statusCode = 200) {
+function fakeTransport(t, statusCode = 200, headers = {}) {
   const req = new EventEmitter();
   const res = new EventEmitter();
   res.statusCode = statusCode;
+  res.headers = headers;
   req.write = () => {};
   req.end = () => {};
   req.destroy = () => { req.destroyed = true; };
@@ -221,4 +223,109 @@ test('response body limit rejects without buffering more data', async (t) => {
   await assert.rejects(pending, { code: 'ERR_RESPONSE_TOO_LARGE' });
   assert.equal(fake.req.destroyed, true);
   assertClean(fake);
+});
+
+test('requests ask for gzip or deflate unless the caller sets Accept-Encoding', async (t) => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ acceptEncoding: req.headers['accept-encoding'] ?? null }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  assert.deepEqual(
+    await request(url, { timeoutMs: 1000 }),
+    { status: 200, data: { acceptEncoding: 'gzip, deflate' } },
+  );
+  // Header names are case-insensitive: a lower-case caller header replaces the default.
+  assert.deepEqual(
+    await request(url, { headers: { 'accept-encoding': 'identity' }, timeoutMs: 1000 }),
+    { status: 200, data: { acceptEncoding: 'identity' } },
+  );
+});
+
+test('real socket: a gzip-encoded JSON body is decoded before parsing', async (t) => {
+  const rows = Array.from({ length: 5000 }, (_, i) => ({ id: `TPT${i}`, title: `Task ${i}`, status: 'pending' }));
+  const body = zlib.gzipSync(JSON.stringify({ tasks: rows }));
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' });
+    const half = Math.floor(body.length / 2);
+    res.write(body.subarray(0, half));
+    setImmediate(() => res.end(body.subarray(half)));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  // Node closes the response before the decoder flushes; that close must not read as a cut-off reply.
+  assert.deepEqual(
+    await request(`http://127.0.0.1:${server.address().port}/`, { timeoutMs: 2000 }),
+    { status: 200, data: { tasks: rows } },
+  );
+});
+
+test('a deflate-encoded body is decoded even when the response closes before the decoder flushes', async (t) => {
+  const fake = fakeTransport(t, 200, { 'content-encoding': 'deflate' });
+  const body = zlib.deflateSync(JSON.stringify({ ok: true, items: [1, 2, 3] }));
+  const pending = request('http://example.test/tasks');
+  fake.respond();
+  fake.res.emit('data', body.subarray(0, 5));
+  fake.res.emit('data', body.subarray(5));
+  fake.res.emit('end');
+  fake.res.emit('close');
+  assert.deepEqual(await pending, { status: 200, data: { ok: true, items: [1, 2, 3] } });
+  assertClean(fake);
+});
+
+test('the response body limit counts decoded bytes, not compressed ones', async (t) => {
+  const fake = fakeTransport(t, 200, { 'content-encoding': 'gzip' });
+  const pending = request('http://example.test/tasks');
+  fake.respond();
+  // About 32 KB on the wire, one byte over the limit once inflated.
+  fake.res.emit('data', zlib.gzipSync(Buffer.alloc(MAX_RESPONSE_BYTES + 1)));
+  fake.res.emit('end');
+  await assert.rejects(pending, { code: 'ERR_RESPONSE_TOO_LARGE' });
+  assert.equal(fake.req.destroyed, true);
+  assert.equal(fake.res.destroyed, true);
+  assertClean(fake);
+});
+
+test('a corrupt gzip body rejects with the zlib error and leaves no uncaught error', async (t) => {
+  const fake = fakeTransport(t, 200, { 'content-encoding': 'gzip' });
+  const pending = request('http://example.test/tasks');
+  fake.respond();
+  fake.res.emit('data', Buffer.from('{"tasks":[]} is not gzip'));
+  fake.res.emit('end');
+  fake.res.emit('close');
+  await assert.rejects(pending, (err) => {
+    assert.equal(err.code, 'Z_DATA_ERROR');
+    assert.equal(err.cause.code, 'Z_DATA_ERROR');
+    return true;
+  });
+  assert.equal(fake.res.destroyed, true);
+  assertClean(fake);
+  // A decoder 'error' emitted after the call settled would surface here as an uncaught exception.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+});
+
+test('a bodyless reply that names a content coding resolves like a plain empty body', async (t) => {
+  const fake = fakeTransport(t, 204, { 'content-encoding': 'gzip' });
+  const pending = request('http://example.test/tasks');
+  fake.respond();
+  fake.res.emit('end');
+  fake.res.emit('close');
+  assert.deepEqual(await pending, { status: 204, data: '' });
+  assertClean(fake);
+});
+
+test('caller abort mid-decode settles once and leaves no late decoder error', async (t) => {
+  const fake = fakeTransport(t, 200, { 'content-encoding': 'gzip' });
+  const controller = new AbortController();
+  const body = zlib.gzipSync(JSON.stringify({ tasks: Array.from({ length: 1000 }, (_, i) => i) }));
+  const pending = request('http://example.test/tasks', { signal: controller.signal });
+  fake.respond();
+  fake.res.emit('data', body.subarray(0, Math.floor(body.length / 2)));
+  controller.abort();
+  await assert.rejects(pending, { code: 'EABORT' });
+  assert.equal(fake.res.destroyed, true);
+  assertClean(fake, controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 20));
 });

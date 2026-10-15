@@ -9,8 +9,10 @@ const DEVICE_DIRECTORY = path.join(os.homedir(), '.tipatask');
 // These are pilot safety floors, not a statement of hardware capacity. Projects
 // cannot override this device file; the existing project session cap still applies.
 const FIELDS = {
-  mode: ['MODE', 'static', ['static', 'pressure']],
+  mode: ['MODE', 'ramp', ['static', 'pressure', 'ramp']],
   ceiling: ['CEILING', null, 1, 32],
+  rampStepMs: ['RAMP_STEP_MS', 300000, 60000, 3600000],
+  rampCeiling: ['RAMP_CEILING', null, 1, 32],
   reserveMiB: ['RESERVE_MIB', 6144, 6144, 1048576],
   reserveFraction: ['RESERVE_FRACTION', 0.125, 0.125, 0.9],
   burstMiB: ['BURST_MIB', 1024, 1024, 1048576],
@@ -62,7 +64,12 @@ function resolveAdmissionPolicy({ env = process.env, directory, hardware, platfo
   // Opting in stages the studied machine at eight; elsewhere opt-in alone never
   // raises the static ceiling. Expansion beyond twelve is a separate explicit edit.
   const requested = out.ceiling ?? (studied ? 8 : staticCap);
-  out.ceiling = out.mode === 'static' ? staticCap : Math.min(requested, Math.max(1, Math.min(16, hw.cores || 1)));
+  const bound = Math.max(1, Math.min(16, hw.cores || 1));
+  // Ramp steps from the static cap one slot at a time; its ceiling is never below
+  // that cap (a lower value would make the ramp meaningless) and never above the
+  // same CPU bound as pressure. CEILING itself stays a pressure-mode setting.
+  out.rampCeiling = Math.max(staticCap, Math.min(out.rampCeiling ?? staticCap + 2, bound));
+  out.ceiling = out.mode === 'static' ? staticCap : out.mode === 'ramp' ? out.rampCeiling : Math.min(requested, bound);
   out.fallbackCap = Math.min(out.fallbackCap ?? staticCap, staticCap, out.ceiling);
   out.unknownMiB = Math.max(out.unknownMiB, out.ordinaryMiB);
   out.swapReopenMiB = Math.min(out.swapReopenMiB, out.swapCloseMiB);
@@ -92,7 +99,9 @@ function resolveWorkload(config, env = process.env) {
   return { admissionClass: 'unknown', admissionClassSource: 'default' };
 }
 
-function initialPressureState() { return { alarm: null, normalSince: null, samples: [], lastStartAt: null }; }
+// rampCap null means "at the static cap"; it is shared state, so a reset never
+// stores an instance-local clamped number that another owner could inherit.
+function initialPressureState() { return { alarm: null, normalSince: null, samples: [], lastStartAt: null, rampCap: null }; }
 
 function observePressure(state, telemetry, policy, now) {
   const host = telemetry?.host;
@@ -123,36 +132,80 @@ function observePressure(state, telemetry, policy, now) {
 
 function decideAdmission({ policy, state, telemetry, now, running, reservedBytes = 0, peakGapBytes = 0,
   estimateBytes, coordinated = true, projectBlocked = false }) {
-  const observation = policy.mode === 'pressure' || state.alarm
+  const ramp = policy.mode === 'ramp';
+  const observation = policy.mode !== 'static' || state.alarm
     ? observePressure(state, telemetry, policy, now) : { fresh: false, swapBytes: null };
   const processFresh = telemetry?.processes?.fresh && ['ok', 'partial'].includes(telemetry.processes.status)
     && !telemetry.processes.truncated && now >= telemetry.processes.sampledAt
     && now - telemetry.processes.sampledAt <= policy.staleMs;
+  // The shared quiet window (ramp's step window, every mode's alarm recovery window) must
+  // be coordinated with fresh process telemetry for its whole length, not just at the
+  // moment it is checked: either one in doubt restarts it, as observePressure() already
+  // does on stale host telemetry and non-normal pressure. This runs before the cap
+  // checks, so a poll refused at the device or project cap restarts it too.
+  if (!processFresh || !coordinated) state.normalSince = null;
   const dynamic = policy.mode === 'pressure' && observation.fresh && processFresh && coordinated;
-  const cap = dynamic ? policy.ceiling : (policy.mode === 'static' ? policy.staticCap : policy.fallbackCap);
-  const result = { allowed: false, reason: null, cap, mode: dynamic ? 'pressure' : 'static',
+  const host = telemetry?.host;
+  const reserve = Math.max(policy.reserveMiB * MiB, (host?.physicalBytes || 0) * policy.reserveFraction);
+  const required = reserve + policy.burstMiB * MiB + peakGapBytes + reservedBytes + estimateBytes;
+  const margin = required + policy.recoveryExtraMiB * MiB;
+  // A ramp step budgets one more session, not the unspent peaks of every live
+  // session. Keep the full budget at the ceiling and in pressure mode.
+  const rampStepRequiredBytes = reserve + policy.burstMiB * MiB + estimateBytes + policy.recoveryExtraMiB * MiB;
+  const belowRampCeiling = ramp && (state.rampCap ?? policy.staticCap) < policy.rampCeiling;
+  const headroomRequired = belowRampCeiling ? rampStepRequiredBytes : required;
+  const recoveryRequired = belowRampCeiling ? rampStepRequiredBytes : margin;
+  // Quiet means: fresh coordinated normal-pressure host and process telemetry, a fully
+  // observed minute with swap-outs under the reopen threshold, and headroom above the
+  // admission threshold plus the recovery margin, held since `since` for `windowMs`.
+  const quietFor = (since, windowMs, requiredHeadroom = recoveryRequired) => observation.fresh && processFresh && coordinated && host.pressure === 'normal'
+    && since !== null && host.sampledAt - since >= windowMs
+    && observation.swapBytes !== null && observation.swapBytes < policy.swapReopenMiB * MiB
+    && host.reclaimableEstimateBytes >= requiredHeadroom;
+  const latchHeadroom = () => {
+    if (observation.fresh && host.reclaimableEstimateBytes < headroomRequired) { state.alarm = 'headroom'; state.normalSince = null; }
+  };
+  const recover = () => { if (state.alarm && quietFor(state.normalSince, policy.recoveryMs)) state.alarm = null; };
+  if (ramp) {
+    // Ramp evaluates alarms, recovery and the step BEFORE the cap check so an alarm
+    // still clears (and the cap still drops) while starts under the static floor
+    // are being admitted. Any alarm, stale host/process telemetry or coordination
+    // doubt drops straight back to the static cap; with the window restart above, a
+    // raise needs one whole window coordinated with fresh process telemetry, not just
+    // the step moment, and starts a fresh one.
+    latchHeadroom(); recover();
+    if (!observation.fresh || !processFresh || !coordinated || state.alarm) state.rampCap = null;
+    else if (quietFor(state.normalSince, policy.rampStepMs, rampStepRequiredBytes)) {
+      state.rampCap = Math.min((state.rampCap ?? policy.staticCap) + 1, policy.rampCeiling);
+      state.normalSince = host.sampledAt;
+    }
+  }
+  // Keep non-ramp alarm tracking current even while a cap refuses starts: a
+  // headroom dip restarts recovery, and a recovered alarm clears in diagnostics.
+  // Static mode without an inherited alarm has no fresh observation to consult.
+  if (!ramp) { latchHeadroom(); recover(); }
+  const rampCap = Math.min(Math.max(state.rampCap ?? policy.staticCap, policy.staticCap), policy.rampCeiling);
+  // Earliest time the next one-slot step can land if telemetry stays quiet: the shared
+  // window start (a step resets it) plus one step. Null when no step is pending (at the
+  // ceiling, alarm, stale host/process telemetry, coordination doubt). It can already be
+  // past while the rolling-minute swap or the headroom margin still holds the step.
+  const rampNextStepAt = ramp && rampCap < policy.rampCeiling && observation.fresh && processFresh && coordinated
+    && !state.alarm && state.normalSince !== null ? state.normalSince + policy.rampStepMs : null;
+  const cap = dynamic ? policy.ceiling : ramp ? rampCap : policy.mode === 'static' ? policy.staticCap : policy.fallbackCap;
+  const result = { allowed: false, reason: null, cap, mode: dynamic ? 'pressure' : ramp ? 'ramp' : 'static',
     fallback: policy.mode === 'pressure' && !dynamic, swapBytes: observation.swapBytes,
-    headroomBytes: telemetry?.host?.reclaimableEstimateBytes ?? null };
+    rampCap: ramp ? rampCap : null, rampCeiling: ramp ? policy.rampCeiling : null, rampNextStepAt,
+    requiredBytes: required, headroomBytes: host?.reclaimableEstimateBytes ?? null };
   const reject = reason => ({ ...result, reason });
   if (projectBlocked) return reject('project-cap');
   if (running >= cap) return reject('device-cap');
   if (policy.mode === 'static' && !state.alarm) return { ...result, allowed: true };
-  const host = telemetry?.host;
-  const reserve = Math.max(policy.reserveMiB * MiB, (host?.physicalBytes || 0) * policy.reserveFraction);
-  const required = reserve + policy.burstMiB * MiB + peakGapBytes + reservedBytes + estimateBytes;
-  result.requiredBytes = required;
-  if (observation.fresh && host.reclaimableEstimateBytes < required) {
-    state.alarm = 'headroom'; state.normalSince = null;
-  }
-  if (state.alarm) {
-    if (!observation.fresh || !coordinated || host.pressure !== 'normal'
-      || state.normalSince === null || host.sampledAt - state.normalSince < policy.recoveryMs
-      || observation.swapBytes === null || observation.swapBytes >= policy.swapReopenMiB * MiB
-      || host.reclaimableEstimateBytes < required + policy.recoveryExtraMiB * MiB) return reject(state.alarm);
-    state.alarm = null;
-  }
+  // The static floor never consults memory, exactly as static mode: an alarm
+  // only closes the ramp slots above it.
+  if (ramp && running < policy.staticCap) return { ...result, allowed: true };
+  if (state.alarm) return reject(state.alarm);
   if (dynamic && observation.swapBytes === null) return reject('swap-history');
-  if (policy.mode === 'pressure' && state.lastStartAt !== null && now - state.lastStartAt < policy.startIntervalMs) {
+  if ((policy.mode === 'pressure' || ramp) && state.lastStartAt !== null && now - state.lastStartAt < policy.startIntervalMs) {
     result.retryAfterMs = policy.startIntervalMs - (now - state.lastStartAt); return reject('spacing');
   }
   return { ...result, allowed: true };

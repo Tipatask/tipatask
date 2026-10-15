@@ -3,7 +3,10 @@
 //   auth:expired  — when backend reports 'unauthorized'
 //   auth:refreshed — when backend reports 'connected' (after re-auth)
 
-import { showApiStatusBanner } from './utils.js';
+import { showApiStatusBanner, showToast } from './utils.js';
+import { pushNotification } from './notification-center.js';
+import { describeDroppedMutation } from './mutation-drop-notice.js';
+import { t } from './i18n.js';
 
 let _reauthInFlight = false;
 
@@ -37,6 +40,23 @@ async function _openBrowserReauthModal() {
   } catch {
     _reauthInFlight = false;
   }
+}
+
+// (TPT662) Offline-queued writes the reconnect drain could not replay — one persistent
+// notification card per task plus a toast, so a save the user already saw succeed
+// optimistically never vanishes silently. entries: [{ op, taskId, title, code, statusCode,
+// message }], arriving as the `mutations-dropped` WS frame (browser mode / forked server) or
+// the `api:mutations-dropped` IPC push (Electron main-process backend) — both wired in
+// template.html, which also clears the pending-sync marks and re-reads the board.
+export function handleMutationsDropped(entries) {
+  const list = Array.isArray(entries) ? entries.filter(Boolean) : [];
+  if (list.length === 0) return;
+  for (const entry of list) {
+    const { tag, title, body } = describeDroppedMutation(entry, t);
+    pushNotification({ tag, title, body, category: 'attention' });
+  }
+  const first = describeDroppedMutation(list[0], t);
+  showToast(list.length === 1 ? `${first.title} — ${first.body.split('\n')[0]}` : `${first.title} (${list.length})`, 'error', { durationMs: 8000 });
 }
 
 let _initialized = false;

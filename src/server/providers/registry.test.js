@@ -239,6 +239,70 @@ test('configForProject: PI_CONFIGURED_MODELS view field holds exactly the projec
   }
 });
 
+// ── TPT695: toolLessModels — configured rows a task or task chat cannot run ──
+
+const TOOLLESS_PI_ROW = { model: 'recraft-v3', apiKey: 'sk-or-row0', provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', tools: false };
+const TOOL_PI_ROW = { model: 'openrouter/openai/gpt-4o-mini', apiKey: 'sk-or-row1' };
+
+test('configForProject: PI_TOOLLESS_MODELS holds the ids whose row sets tools:false, and only those', () => {
+  const dir = makeProjectDir({ PI_MODELS: [TOOLLESS_PI_ROW, TOOL_PI_ROW] });
+  try {
+    const view = registry.configForProject(dir);
+    assert.deepEqual(view.PI_TOOLLESS_MODELS, ['recraft-v3']);
+    assert.deepEqual(view.PI_CONFIGURED_MODELS, ['recraft-v3', 'openrouter/openai/gpt-4o-mini'], 'a tool-less row is still configured');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('configForProject: PI_TOOLLESS_MODELS is unset when no row sets tools:false (including the legacy flat pair)', () => {
+  for (const cfg of [
+    { PI_MODELS: [TOOL_PI_ROW, { ...TOOLLESS_PI_ROW, tools: true }] },
+    { PI_MODEL: 'openrouter/moonshotai/kimi-k3', OPENROUTER_API_KEY: 'sk-or-legacy' },
+  ]) {
+    const dir = makeProjectDir(cfg);
+    try {
+      assert.equal(registry.configForProject(dir).PI_TOOLLESS_MODELS, undefined);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('listObjectiveProviders: pi.toolLessModels lists the tool-less configured ids; the objective chat still offers them', () => {
+  const dir = makeProjectDir({ AVAILABLE_AGENTS: 'claude,pi', PI_MODELS: [TOOLLESS_PI_ROW, TOOL_PI_ROW] });
+  try {
+    const view = registry.configForProject(dir);
+    const pi = registry.listObjectiveProviders(view).find((p) => p.id === 'pi');
+    assert.deepEqual(pi.toolLessModels, ['recraft-v3']);
+    for (const id of pi.toolLessModels) assert.ok(pi.configuredModels.includes(id), `${id} is a configured id`);
+    // Objective planning runs on a tool-less row, so nothing else narrows: it stays offered,
+    // selectable and the project default.
+    assert.deepEqual(pi.configuredModels, ['recraft-v3', 'openrouter/openai/gpt-4o-mini']);
+    assert.deepEqual(pi.models.map((m) => m.value), pi.configuredModels);
+    assert.equal(pi.selectable, true);
+    assert.equal(pi.defaultModel, 'recraft-v3');
+    assert.ok(!JSON.stringify(pi).includes('sk-or-'), 'ids only, never an apiKey');
+    // The wire list ships the entry unchanged.
+    const wirePi = registry.listVisibleObjectiveProviders(view).find((p) => p.id === 'pi');
+    assert.deepEqual(wirePi.toolLessModels, ['recraft-v3']);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('listObjectiveProviders: toolLessModels is [] for every non-pi provider and for a project with no tools:false row', () => {
+  const dir = makeProjectDir({ PI_MODELS: [TOOL_PI_ROW] });
+  try {
+    for (const entry of registry.listObjectiveProviders(registry.configForProject(dir))) {
+      assert.deepEqual(entry.toolLessModels, [], entry.id);
+    }
+    for (const entry of registry.listObjectiveProviders(config)) assert.deepEqual(entry.toolLessModels, [], entry.id);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // (TPT163) A model id with no "vendor/" slash (a non-OpenRouter row) is a first-class id:
 // configured, valid as a selection, and offered by the chat selector's pi entry.
 test('configForProject: a bare slash-less deepseek row is configured, valid, and offered', () => {

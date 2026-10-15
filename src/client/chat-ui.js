@@ -16,6 +16,7 @@ export { renderComposerHeader };
 import { buildWsUrl } from './ws-client.js';
 import { cleanupChat, closeConsoleIfOpen } from './console-modal.js';
 import { appendProgressLog, noteTurnBoundary, pushThinking, flushThinking, stageLogText } from './objective-progress-log.js';
+import { errorFrameText } from './terminal-frame-text.js';
 import { saveRecipe } from './recipe-sidebar.js';
 import { renderCardHtml, ensureExistingSnapshot, renderDiscussPreviewHtml, getLockedCardTarget } from './chat-task-preview.js';
 import { countPendingSubtaskCards, hasProposalCards } from './subtask-preview.js';
@@ -111,7 +112,7 @@ function effectiveObjectiveModel() {
 // Falls back to that tab's own selection (old server / new client), then a neutral noun.
 function providerLabelFor(cs, providerId) {
   const id = providerId || (((cs && cs.objectiveModel) || state.objectiveModel || '').split(':')[0]);
-  if (!id) return 'The model';
+  if (!id) return t('chat.error.modelLabel');
   const entry = (state.objectiveProviders || []).find(p => p.id === id);
   return (entry && entry.label) || (id.charAt(0).toUpperCase() + id.slice(1));
 }
@@ -123,9 +124,16 @@ function providerLabelFor(cs, providerId) {
 // gemini/codex 'exit-code-spawn-error'; pi 'spawn-error'; codex env-build 'spawn-error:*' and
 // 'codex:*'; ws-handlers throttle gate 'circuit-open'/'queue-full'; applyModelSelection
 // 'provider-unavailable'/'turn-in-progress'; finalize race 'finalize-timeout'; ws-handlers
-// 'session-gone' (turn request or reconnect reached a server session that was already torn down).
+// 'session-gone' (turn request or reconnect reached a server session that was already torn down);
+// claude-session.js result handler 'cli-error:<subtype>' (the CLI's `result` event reported
+// is_error / a non-success subtype — an API "prompt is too long", error_during_execution — with
+// the CLI's own text in `message`); pi-session.js 'model-no-tools' (the model's endpoint rejects
+// tool definitions — isToolCompatError() — and the no-tools retry failed too, or the session is a
+// task chat; `detail` is the server's own sentence, shown verbatim).
 function objectiveErrorCategory(reason) {
   if (reason === 'stream-stalled') return 'stall';
+  if (reason.startsWith('cli-error:')) return 'cli';
+  if (reason === 'model-no-tools') return 'model';
   if (reason === 'session-gone') return 'gone';
   if (reason === 'provider-unavailable' || reason === 'turn-in-progress') return 'selection';
   if (reason === 'circuit-open' || reason === 'queue-full') return 'throttle';
@@ -145,46 +153,68 @@ function objectiveErrorMessage(reason, attempts, detail, label, model) {
       return t('chat.error.stalled');
     case 'gone':
       return t('chat.error.sessionGone');
+    case 'cli': {
+      // `detail` is the CLI's own error text, shown verbatim — it names the real cause (an API
+      // "prompt is too long", a context-limit refusal) the generic stream copy would hide.
+      const subtype = reason.slice('cli-error:'.length);
+      return detail
+        ? t('chat.error.cliError', { label, subtype, message: String(detail) })
+        : t('chat.error.cliErrorNoMessage', { label, subtype });
+    }
     case 'selection':
-      return detail || `Model selection failed (${reason}). Retry or pick a different model.`;
+      return detail || t('chat.error.selection', { reason });
     case 'throttle':
-      return reason === 'circuit-open'
-        ? 'The server paused new AI turns after repeated failures. Wait about 30 seconds and Retry, or pick a different model.'
-        : 'The server is busy — too many AI turns are queued. Wait a moment, then Retry.';
-    case 'spawn': {
-      const why = reason.startsWith('spawn-error:') ? ` (${reason.slice('spawn-error:'.length)})` : '';
-      return `${label}'s CLI could not be started${why}. Check that it is installed and signed in, or pick a different model.`;
-    }
+      return reason === 'circuit-open' ? t('chat.error.circuitOpen') : t('chat.error.queueFull');
+    case 'spawn':
+      return reason.startsWith('spawn-error:')
+        ? t('chat.error.spawnDetail', { label, detail: reason.slice('spawn-error:'.length) })
+        : t('chat.error.spawn', { label });
     case 'history':
-      return 'This chat lost its message history and could not continue. Retry restarts from your original prompt, or start a new objective.';
+      return t('chat.error.history');
     case 'finalize':
-      return 'Saving the task cards timed out. Nothing was lost — Retry.';
-    default: {
+      return t('chat.error.finalize');
+    case 'model':
+      // `detail` is pi-session.js toolCompatMessage(): the model, where it ran, what to do.
+      return detail ? String(detail) : t('chat.error.modelNoTools', { label, model: model || '?' });
+    default:
       // model/detail are sent by providers that know them (pi): which model id was actually
-      // run, and the CLI's own stderr / provider error text.
-      const tried = attempts > 0 ? ` after ${attempts} retry attempt(s)` : '';
-      const which = model ? ` Model: ${model}.` : '';
-      const why = detail ? ` Details: ${detail}` : '';
-      return `${label} stream failed${tried} (${reason}).${which}${why} Retry or refine your prompt.`;
-    }
+      // run, and the CLI's own stderr / provider error text. (TPT9007) Sentence parts joined with
+      // single spaces — the same text the old template literal produced in English.
+      return [
+        attempts > 0
+          ? t('chat.error.streamFailedRetried', { label, n: attempts, reason })
+          : t('chat.error.streamFailed', { label, reason }),
+        model ? t('chat.error.streamModel', { model }) : '',
+        detail ? t('chat.error.streamDetails', { detail }) : '',
+        t('chat.error.retryOrRefine'),
+      ].filter(Boolean).join(' ');
   }
 }
 
 // C1031 — short actionable line for the retry banner above the input. Returns PLAIN text
-// (including the raw parse preview); the caller escapes once.
-function objectiveRetryBannerText(cs, previewSnippetRaw) {
+// (including the raw parse preview); the caller escapes once. `previewRaw` is the unparsed
+// reply's first characters, or empty.
+function objectiveRetryBannerText(cs, previewRaw) {
   const reason = cs && cs._lastErrorReason;
   const label = providerLabelFor(cs, cs && cs._lastErrorProvider);
-  if (!reason) return `${label} didn't produce task cards.${previewSnippetRaw} Retry or send refined instructions.`;
+  if (!reason) {
+    return [
+      t('chat.error.noCards', { label }),
+      previewRaw ? t('chat.error.noCardsGot', { preview: previewRaw }) : '',
+      t('chat.error.retryOrRefineInstructions'),
+    ].filter(Boolean).join(' ');
+  }
   switch (objectiveErrorCategory(reason)) {
     case 'stall':     return t('chat.error.stalledRetry');
     case 'gone':      return t('chat.error.sessionGoneRetry');
-    case 'selection': return 'That model selection was rejected. Pick a different model, then Retry.';
-    case 'throttle':  return 'The server is busy right now. Wait a moment, then Retry.';
-    case 'spawn':     return `${label}'s CLI didn't start. Pick a different model, or Retry.`;
-    case 'history':   return 'This chat lost its history. Retry restarts from your original prompt.';
-    case 'finalize':  return 'Saving timed out. Retry to finish.';
-    default:          return `${label} didn't finish this turn (${reason}). Retry or send refined instructions.`;
+    case 'cli':       return t('chat.error.cliErrorRetry');
+    case 'selection': return t('chat.error.selectionRetry');
+    case 'throttle':  return t('chat.error.throttleRetry');
+    case 'spawn':     return t('chat.error.spawnRetry', { label });
+    case 'history':   return t('chat.error.historyRetry');
+    case 'finalize':  return t('chat.error.finalizeRetry');
+    case 'model':     return t('chat.error.modelNoToolsRetry');
+    default:          return t('chat.error.streamRetry', { label, reason });
   }
 }
 
@@ -403,7 +433,7 @@ function clearObjectiveReadyMemory(tabId) {
 
 function getObjectiveReadyTitle(tabId, cs) {
   const tab = state.tabsState.find(t => t.tabId === tabId);
-  if (tab && tab.title && tab.title !== 'New objective') return tab.title;
+  if (tab && tab.title) return tab.title;
   return deriveTabTitle(cs || (tab && tab.chatState));
 }
 
@@ -426,7 +456,7 @@ function initObjectiveReadyBroadcastListener() {
     rememberObjectiveReady(msg);
     notifyObjectiveStatusChanged();
     if (document.visibilityState === 'visible') {
-      showToast(`Objective ready: ${msg.title || 'New objective'}`);
+      showToast(t('chat.objectiveReady', { title: msg.title || t('chat.tab.newObjective') }));
     }
   });
 }
@@ -447,10 +477,12 @@ function notifyObjectiveCardsReady(message, count, tabId) {
   rememberObjectiveReady(payload);
   notifyObjectiveStatusChanged();
   broadcastObjectiveReady(payload);
-  const summary = `${count} task suggestion(s) ready`;
+  const summary = t('chat.objectiveReadyBody', { n: count });
   // (C1137) Same project-disambiguation reasoning as attention-notifications.js's
   // buildNotificationTitle — several projects can run in separate Electron windows.
-  const notifTitle = state.projectName ? `${state.projectName} · Objective complete` : 'Objective complete';
+  const notifTitle = state.projectName
+    ? `${state.projectName} · ${t('chat.objectiveComplete')}`
+    : t('chat.objectiveComplete');
   const onClick = () => focusObjectiveSession(tabId);
   // In-app stacked card — persists regardless of OS notification style, and (unlike the toast
   // 2s below) shown even when the window IS visible, since the toast alone vanishes fast too.
@@ -458,7 +490,7 @@ function notifyObjectiveCardsReady(message, count, tabId) {
     pushNotification({ tag: objectiveTag(tabId), title: notifTitle, body: summary, onClick, category: 'objective' });
   }
   if (document.visibilityState === 'visible') {
-    showToast(`Objective ready: ${title}`);
+    showToast(t('chat.objectiveReady', { title: title || t('chat.tab.newObjective') }));
   } else {
     notify(notifTitle, summary, objectiveTag(tabId), { category: 'objective', onClick });
   }
@@ -480,9 +512,15 @@ function computeTabStatus(cs) {
   return 'idle';
 }
 
+// (TPT9007) '' = untitled: the first user message names the tab once there is one, and
+// tabDisplayTitle() renders an untitled tab as chat.tab.newObjective in the project language.
 function deriveTabTitle(cs) {
   const first = cs && cs.messages && cs.messages.find(m => m.role === 'user');
-  return first ? (first.content.slice(0, 30).replace(/\s+/g, ' ').trim() || 'New objective') : 'New objective';
+  return first ? first.content.slice(0, 30).replace(/\s+/g, ' ').trim() : '';
+}
+
+function tabDisplayTitle(tab) {
+  return (tab && tab.title) || t('chat.tab.newObjective');
 }
 
 function syncActiveChatState() {
@@ -492,7 +530,7 @@ function syncActiveChatState() {
   t.status = computeTabStatus(state.chatState);
   // (C1162) titlePinned tabs (spawnObjectiveTab() opts.title) keep their label —
   // deriveTabTitle() would otherwise overwrite it with the first message's text.
-  if (!t.titlePinned && (!t.title || t.title === 'New objective')) t.title = deriveTabTitle(state.chatState);
+  if (!t.titlePinned && !t.title) t.title = deriveTabTitle(state.chatState);
 }
 
 function clearActiveTab() {
@@ -541,7 +579,7 @@ function openNewTab() {
   // re-read live. See utils.js captureSubtaskCtx() comment for the bug this replaces.
   // (C1559) originTaskKey: null — never inherited from a prior tab; only
   // spawnObjectiveTab()'s explicit opts.originTaskKey sets it.
-  state.tabsState.push({ tabId, title: 'New objective', status: 'idle', chatState: null, subtaskCtx: captureSubtaskCtx(state.subtaskStack), originTaskKey: null });
+  state.tabsState.push({ tabId, title: '', status: 'idle', chatState: null, subtaskCtx: captureSubtaskCtx(state.subtaskStack), originTaskKey: null });
   state.activeTabId = tabId;
   state.chatState = null;
   renderActiveTab();
@@ -573,7 +611,7 @@ export function spawnObjectiveTab(seedText, opts = {}) {
     // (C1156) Dismiss OUTGOING tab's card before reassign — see openNewTab() above.
     if (state.activeTabId) dismissObjectiveNotification(state.activeTabId);
     tabId = `obj-new-${Date.now()}`;
-    state.tabsState.push({ tabId, title: 'New objective', status: 'idle', chatState: null });
+    state.tabsState.push({ tabId, title: '', status: 'idle', chatState: null });
     state.activeTabId = tabId;
     state.chatState = null;
   }
@@ -713,7 +751,7 @@ export async function closeTab(tabId) {
     const pending = countUnsavedProposals(state.tabsState[idx].chatState);
     if (pending > 0) {
       const ok = await showActionConfirm({
-        message: tc('chat.confirmCloseTabUnsaved', pending, { title: escapeAttr(state.tabsState[idx].title) }),
+        message: tc('chat.confirmCloseTabUnsaved', pending, { title: escapeAttr(tabDisplayTitle(state.tabsState[idx])) }),
         confirmLabel: t('btn.discard'),
         danger: true,
         overlayClass: 'modal-overlay--over-chat',
@@ -789,14 +827,15 @@ async function _abortTab(tabId) {
 }
 
 function _buildTabBarInnerHtml() {
-  const tabs = state.tabsState.map(t => {
-    const isActive = t.tabId === state.activeTabId;
-    const icon = t.status === 'streaming'
+  // `tab`, never `t` — the callback needs the imported t() for its labels.
+  const tabs = state.tabsState.map(tab => {
+    const isActive = tab.tabId === state.activeTabId;
+    const icon = tab.status === 'streaming'
       ? '<span class="chat-tab-spinner"></span>'
-      : t.status === 'done' ? '<span class="chat-tab-tick">&#x2713;</span>'
-      : t.status === 'error' ? '<span class="chat-tab-err">!</span>'
+      : tab.status === 'done' ? '<span class="chat-tab-tick">&#x2713;</span>'
+      : tab.status === 'error' ? '<span class="chat-tab-err">!</span>'
       : '';
-    return `<button class="chat-tab${isActive ? ' chat-tab--active' : ''}" data-tab-id="${escapeAttr(t.tabId)}">${icon}<span class="chat-tab-title">${escapeAttr(t.title)}</span><span class="chat-tab-close" data-close-tab-id="${escapeAttr(t.tabId)}" title="Close tab">&#x2715;</span></button>`;
+    return `<button class="chat-tab${isActive ? ' chat-tab--active' : ''}" data-tab-id="${escapeAttr(tab.tabId)}">${icon}<span class="chat-tab-title">${escapeAttr(tabDisplayTitle(tab))}</span><span class="chat-tab-close" data-close-tab-id="${escapeAttr(tab.tabId)}" title="${escapeAttr(t('chat.tab.close'))}">&#x2715;</span></button>`;
   }).join('');
   const addDisabled = state.tabsState.length >= MAX_TABS ? ' disabled' : '';
   return tabs + `<button class="chat-tab-add" id="chat-tab-add"${addDisabled}>+</button>`;
@@ -1620,7 +1659,7 @@ function openImageLightbox(src, alt) {
   const img = document.createElement('img');
   img.className = 'img-lightbox-img';
   img.src = src;
-  img.alt = alt || 'Image preview';
+  img.alt = alt || t('modal.imagePreview');
   overlay.appendChild(img);
   document.body.appendChild(overlay);
   _lightboxOverlay = overlay;
@@ -1725,7 +1764,7 @@ function appendNewObjectiveImagePreview(file, url) {
   wrap.style.display = 'none';
   const img = document.createElement('img');
   img.className = 'new-obj-img-preview';
-  img.alt = file?.name ? `${file.name} preview` : 'Uploaded image preview';
+  img.alt = file?.name ? t('chat.image.previewAlt', { name: file.name }) : t('chat.image.uploadedAlt');
   img.style.maxWidth = '180px';
   img.style.borderRadius = '6px';
   img.dataset.uploadedUrl = url;
@@ -1737,8 +1776,8 @@ function appendNewObjectiveImagePreview(file, url) {
   const removeBtn = document.createElement('button');
   removeBtn.type = 'button';
   removeBtn.className = 'new-obj-img-preview-remove';
-  removeBtn.title = 'Remove image';
-  removeBtn.setAttribute('aria-label', 'Remove image');
+  removeBtn.title = t('chat.image.remove');
+  removeBtn.setAttribute('aria-label', t('chat.image.remove'));
   removeBtn.textContent = '×';
   removeBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -1784,13 +1823,13 @@ function appendNewObjectiveUploadError(file, err) {
 
   const msg = document.createElement('span');
   const name = file?.name ? `${file.name}: ` : '';
-  msg.textContent = `Image upload failed: ${name}${err?.message || 'Upload failed'}`;
+  msg.textContent = t('common.errImageUpload', { msg: `${name}${err?.message || t('chat.image.uploadFailed')}` });
 
   const close = document.createElement('button');
   close.type = 'button';
   close.className = 'new-obj-upload-error-dismiss';
   close.textContent = 'x';
-  close.title = 'Dismiss';
+  close.title = t('btn.dismiss');
   close.addEventListener('click', () => banner.remove());
 
   banner.appendChild(msg);
@@ -1930,17 +1969,15 @@ export function renderObjectiveContent(options = {}) {
   const parseErr = state.chatState && state.chatState.lastParseError;
   // C1031 — raw (unescaped); objectiveRetryBannerText() composes it and the single call site
   // below escapes the whole line once. Escaping here too would double-escape.
-  const previewSnippetRaw = parseErr && parseErr.preview
-    ? ` Got: ${parseErr.preview.slice(0, 120)}…`
-    : '';
+  const previewRaw = parseErr && parseErr.preview ? parseErr.preview.slice(0, 120) : '';
   const hiddenHistoryCount = state.chatState
     ? Math.max(0, (state.chatState.historyWindowStart || 1) - 1)
     : 0;
   const loadEarlierCount = Math.min(OBJECTIVE_HISTORY_PAGE_MESSAGES, hiddenHistoryCount);
   const historyBannerHtml = hiddenHistoryCount > 0
     ? `<div class="chat-history-banner">
-        <button class="btn-chat-history-load" id="btn-load-earlier-history">Load ${loadEarlierCount} earlier message${loadEarlierCount === 1 ? '' : 's'}</button>
-        <span class="chat-history-meta">${hiddenHistoryCount} older hidden</span>
+        <button class="btn-chat-history-load" id="btn-load-earlier-history">${escapeAttr(tc('chat.loadEarlier', loadEarlierCount))}</button>
+        <span class="chat-history-meta">${escapeAttr(t('chat.olderHidden', { n: hiddenHistoryCount }))}</span>
       </div>`
     : '';
 
@@ -1956,10 +1993,10 @@ export function renderObjectiveContent(options = {}) {
   // (TPT179) Rehash → Discuss: the discussed task's key, or null for every other chat.
   const discussKey = tabDiscussKey();
   const chatPlaceholder = state.chatState
-    ? 'Send feedback to refine tasks...'
+    ? t('chat.placeholderFollowUp')
     : discussKey
     ? t('chat.discussPlaceholder', { key: discussKey })
-    : 'What do you want to build or fix?\n\nBe specific — include:\n• Context: what exists today and what\'s broken/missing\n• Goal: exact behaviour you want after the change\n• Constraints: files to avoid, APIs to use, edge cases to handle\n• Acceptance: how you\'ll verify it works\n\nExample: "The objective chat textarea resets to 2 rows on every reload, losing the user\'s typed brief. Store draft text + height in sessionStorage on input and restore on mount. Don\'t change the placeholder logic or the send-button disabled state."';
+    : t('chat.placeholderBrief');
 
   // Console toggle (only when state.chatState is active)
   const consoleToggle = state.chatState ? `<button class="chat-console-toggle" id="chat-console-toggle">
@@ -1996,7 +2033,7 @@ export function renderObjectiveContent(options = {}) {
   const originTaskKey = tabOriginTaskKey(); // active tab's own captured origin, never live
   const originTab = originTaskKey ? getActiveTab() : null;
   const originBannerHtml = originTaskKey
-    ? `<div class="subtask-context-banner origin-context-banner">Planning <strong>${escapeAttr(originTaskKey)}${originTab && originTab.title ? ' — ' + escapeAttr(originTab.title) : ''}</strong> <button class="btn-clear-origin-ctx" title="Exit planning mode">&#x2715;</button></div>`
+    ? `<div class="subtask-context-banner origin-context-banner">${escapeAttr(t('chat.originCaption'))} <strong>${escapeAttr(originTaskKey)}${originTab && originTab.title ? ' — ' + escapeAttr(originTab.title) : ''}</strong> <button class="btn-clear-origin-ctx" title="${escapeAttr(t('chat.originExit'))}">&#x2715;</button></div>`
     : '';
 
   // (TPT179) Outside .chat-body/.chat-messages on purpose — never scrolls with the transcript and
@@ -2011,7 +2048,7 @@ export function renderObjectiveContent(options = {}) {
     <div class="chat-container ${layoutClass}">
       ${renderComposerHeader(`${consoleToggle}<button class="btn-archive" id="btn-archive">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-            History
+            ${escapeAttr(t('chat.historyButton'))}
           </button>`, tabBarHtml)}
       ${subtaskBannerHtml}
       ${subtaskSummaryHtml}
@@ -2025,32 +2062,32 @@ export function renderObjectiveContent(options = {}) {
       <div class="chat-input-area">
         <textarea id="chat-input" data-tab-id="${escapeAttr(state.activeTabId ?? '')}" placeholder="${escapeAttr(chatPlaceholder)}" rows="${state.chatState ? '2' : '7'}"${inputDisabled}${draftHeight ? ` style="height:${draftHeight}"` : ''}>${draftText}</textarea>
         <div class="new-obj-image-feedback" id="new-obj-image-feedback" aria-live="polite"></div>
-        ${!state.chatState && !discussKey ? '<div class="chat-brief-hint" id="chat-brief-hint"><span id="chat-word-count">0 words</span> — aim for 40+ words for detailed task cards</div>' : ''}
+        ${!state.chatState && !discussKey ? `<div class="chat-brief-hint" id="chat-brief-hint"><span id="chat-word-count">${escapeAttr(tc('chat.wordCount', 0))}</span> ${escapeAttr(t('chat.wordCountHint'))}</div>` : ''}
         ${canRetry ? `<div class="chat-retry-banner">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-          <span>${escapeAttr(objectiveRetryBannerText(state.chatState, previewSnippetRaw))}</span>
+          <span>${escapeAttr(objectiveRetryBannerText(state.chatState, previewRaw))}</span>
         </div>` : ''}
         <div class="chat-input-actions">
           ${buildModelSelectorHtml(inputDisabled)}
           <div class="chat-input-action-controls">
             ${buildEmbedMenuHtml(inputDisabled)}
             <div class="import-menu-wrap"><button class="import-menu-trigger" type="button" aria-haspopup="true">${t('nav.import')}${DROPDOWN_CARET_SVG}</button></div>
-            ${hasDraft ? '<button class="btn-clear-draft" id="clear-objective-draft">Clear Draft</button>' : ''}
+            ${hasDraft ? `<button class="btn-clear-draft" id="clear-objective-draft">${escapeAttr(t('form.clearDraft'))}</button>` : ''}
             ${canRetry
               ? `<button class="btn-chat-retry" id="btn-chat-retry">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-                  Retry
+                  ${escapeAttr(t('btn.retry'))}
                 </button>`
               : ''
             }
             ${isStreaming
               ? `<button class="btn-chat-stop" id="btn-chat-stop">
                   <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-                  Stop
+                  ${escapeAttr(t('btn.stop'))}
                 </button>`
               : `<button class="btn-chat-send" id="btn-chat-send"${inputDisabled}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                  Send
+                  ${escapeAttr(t('btn.send'))}
                 </button>`
             }
           </div>
@@ -2223,7 +2260,7 @@ export function attachChatHandlers() {
     if (wordCountEl) {
       const updateWordCount = () => {
         const words = chatInput.value.trim().split(/\s+/).filter(Boolean).length;
-        wordCountEl.textContent = `${words} word${words !== 1 ? 's' : ''}`;
+        wordCountEl.textContent = tc('chat.wordCount', words);
         const hint = wordCountEl.closest('.chat-brief-hint');
         if (hint) {
           hint.setAttribute('aria-live', 'polite');
@@ -2776,23 +2813,26 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       // later unrelated "no cards" outcome doesn't render stale error copy.
       cs._lastErrorReason = null;
       cs._lastErrorProvider = null;
-      // Transient progress chip — shows Claude's internal stage without polluting the buffer
-      const PROGRESS_LABELS = {
-        spawned:                 'Starting model…',
-        'cli-init':              'Initializing tools…',
-        'model-thinking':        'Thinking…',
-        working:                 'Working…',
-        'pi-retry':              'Provider retrying…',
-        'pi-compaction':         'Compacting context…',
-        'tool:mcp__tipatask__list_tasks':          'Scanning tasks…',
-        'tool:mcp__tipatask__list_system_tags':    'Reading tag taxonomy…',
-        'tool:mcp__tipatask__get_tag_architecture': 'Reading architecture…',
-        'tool:mcp__tipatask__get_tag_architectures':'Reading architectures…',
-        'tool:mcp__tipatask__get_task':            'Loading task…',
-        'tool:mcp__tipatask-local__batch_grep_tags': 'Batch source scan…',
+      // Transient progress chip — shows Claude's internal stage without polluting the buffer.
+      // (TPT9007) Stage/tool → i18n key; the label is resolved here, per frame.
+      const PROGRESS_LABEL_KEYS = {
+        spawned:                 'chat.progress.spawned',
+        'cli-init':              'chat.progress.cliInit',
+        'model-thinking':        'chat.progress.modelThinking',
+        working:                 'chat.progress.working',
+        'pi-retry':              'chat.progress.piRetry',
+        'pi-no-tools-retry':     'chat.progress.piNoToolsRetry',
+        'pi-compaction':         'chat.progress.piCompaction',
+        'tool:mcp__tipatask__list_tasks':          'chat.progress.listTasks',
+        'tool:mcp__tipatask__list_system_tags':    'chat.progress.listSystemTags',
+        'tool:mcp__tipatask__get_tag_architecture': 'chat.progress.getTagArchitecture',
+        'tool:mcp__tipatask__get_tag_architectures':'chat.progress.getTagArchitectures',
+        'tool:mcp__tipatask__get_task':            'chat.progress.getTask',
+        'tool:mcp__tipatask-local__batch_grep_tags': 'chat.progress.batchGrepTags',
       };
       const key = msg.stage === 'tool' ? `tool:${msg.name}` : msg.stage;
-      const label = PROGRESS_LABELS[key] || (msg.stage === 'tool' ? `Tool: ${msg.name}…` : null);
+      const labelKey = PROGRESS_LABEL_KEYS[key];
+      const label = labelKey ? t(labelKey) : (msg.stage === 'tool' ? t('chat.progress.tool', { name: msg.name }) : null);
       // tool-end keeps the current label visible until the next signal clears it
       if (msg.stage !== 'tool-end' && label) {
         cs.progressStage = label;
@@ -2816,7 +2856,7 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       cs.thinkingPreview = combined.length > 400 ? combined.slice(-400) : combined;
       // Show last line of thinking as the progress chip label
       const lastLine = cs.thinkingPreview.trimEnd().split('\n').pop().trim();
-      if (lastLine) cs.progressStage = `Thinking: ${lastLine.slice(0, 60)}${lastLine.length > 60 ? '…' : ''}`;
+      if (lastLine) cs.progressStage = t('chat.progress.thinking', { text: `${lastLine.slice(0, 60)}${lastLine.length > 60 ? '…' : ''}` });
       // C1255 — coalesced into the Debug Console log (one line per idle/newline/char-threshold
       // flush, not per token — see objective-progress-log.js pushThinking()).
       pushThinking(cs, msg.data);
@@ -2850,8 +2890,11 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       if (isActiveTab) updateProgressChip();
       // C1255 — Debug Console log: mark turn completion with card/token summary.
       const cardCount = msg.cards ? msg.cards.length : 0;
-      const tokSummary = msg.tokens ? ` · ${msg.tokens.input ?? 0}/${msg.tokens.output ?? 0} tokens` : '';
-      appendProgressLog(cs, { kind: 'result', text: `${cardCount} card${cardCount === 1 ? '' : 's'}${tokSummary}` });
+      const resultText = [
+        tc('console.resultCards', cardCount),
+        msg.tokens ? t('console.resultTokens', { input: msg.tokens.input ?? 0, output: msg.tokens.output ?? 0 }) : '',
+      ].filter(Boolean).join(' · ');
+      appendProgressLog(cs, { kind: 'result', text: resultText });
       cs.cleanContent = msg.content;
       const lastMsgOR = cs.messages[cs.messages.length - 1];
       if (lastMsgOR && lastMsgOR.role === 'assistant') {
@@ -2905,11 +2948,11 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       cs.progressStage = null;   // C1031 — parity with data/objective-result
       cs.thinkingPreview = '';
       if (cs.term) {
-        cs.term.write('\r\n\x1b[90m--- Process exited ---\x1b[0m\r\n');
+        cs.term.write(`\r\n\x1b[90m--- ${t('console.processExited')} ---\x1b[0m\r\n`);
         (cs.termScroll ?? cs.term.scrollToBottom.bind(cs.term))();
         if (isActiveTab) {
           const closeBtn = document.querySelector('#objective-console .btn-close-terminal');
-          if (closeBtn) closeBtn.textContent = 'Close';
+          if (closeBtn) closeBtn.textContent = t('btn.close');
         }
       }
       // Parse result and update last assistant message
@@ -2966,7 +3009,7 @@ export function connectObjectiveWS(taskId, prompt, opts) {
               '(b) the specific function or variable name to add/change, ' +
               '(c) a one-sentence verification (e.g. "confirm endpoint returns 200", "board renders without console errors"). ' +
               'Minimum 200 characters per description.';
-            cs.messages.push({ role: 'system', content: '(Auto-requesting richer descriptions...)', cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now() });
+            cs.messages.push({ role: 'system', content: t('chat.autoRevising'), cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now() });
             setTimeout(() => {
               if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'revise', ...rehashPayload(cs), tabId: wsTabId, accepted: [], rejected: [], feedback: revisionMsg, model: (cs && cs.objectiveModel) || state.objectiveModel || null }));
@@ -3002,7 +3045,7 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       // Auto-retry once silently when code=0, content present, but no cards
       if (msg.code === 0 && cs.cleanContent && !hasCards && !cs.pendingCardsUpdate && cs.autoRetryCount < 1) {
         cs.autoRetryCount++;
-        cs.messages.push({ role: 'system', content: 'No tasks parsed — retrying automatically...', cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now() });
+        cs.messages.push({ role: 'system', content: t('chat.noTasksRetrying'), cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now() });
         repaint();
         const originalText = cs.originalUserText;
         if (ws.readyState === WebSocket.OPEN) {
@@ -3050,8 +3093,10 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       // exactly where the turn died. Read-only console, no in-flight state to lose.
       cs.progressStage = null;   // C1031 — parity with data/objective-result
       cs.thinkingPreview = '';
-      appendProgressLog(cs, { kind: 'error', text: `turn failed: ${msg.message || 'unknown error'}` });
-      cs.messages.push({ role: 'system', content: `Error: ${msg.message}`, cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now() });
+      // (TPT9007) A coded frame renders its terminal.error.* key; an uncoded one keeps the server text.
+      const errorText = errorFrameText(msg) || t('console.unknownError');
+      appendProgressLog(cs, { kind: 'error', text: t('console.turnFailed', { msg: errorText }) });
+      cs.messages.push({ role: 'system', content: t('common.error', { msg: errorText }), cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now() });
       const lastMsg = cs.messages.find(m => m.streaming);
       if (lastMsg) lastMsg.streaming = false;
       cs.retryable = true;
@@ -3072,11 +3117,11 @@ export function connectObjectiveWS(taskId, prompt, opts) {
         lastAssistantForRetry.streaming = true;
       }
       const attempt = msg.attempt != null ? msg.attempt : '?';
-      const reason = msg.reason || 'stream interrupted';
-      appendProgressLog(cs, { kind: 'retry', text: `attempt ${attempt} — ${reason}` }); // C1255
+      const reason = msg.reason || t('console.streamInterrupted');
+      appendProgressLog(cs, { kind: 'retry', text: t('console.retryAttempt', { attempt, reason }) }); // C1255
       cs.messages.push({
         role: 'system',
-        content: `Retrying Claude (attempt ${attempt}) — ${reason}. Press Stop to cancel.`,
+        content: t('chat.retrying', { attempt, reason }),
         cards: [], acceptedMask: [], confirmedMask: [],
         discarded: false, streaming: false, timestamp: Date.now(),
       });
@@ -3099,14 +3144,17 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       for (const m of cs.messages) { if (m.streaming) m.streaming = false; }
       const reason = msg.reason || 'unknown';
       const attempts = msg.attempts != null ? msg.attempts : 0;
-      appendProgressLog(cs, { kind: 'error', text: `turn failed: ${reason} (${attempts} ${attempts === 1 ? 'try' : 'tries'})${msg.model ? ` model=${msg.model}` : ''}` });
-      if (msg.detail) appendProgressLog(cs, { kind: 'error', text: String(msg.detail).replace(/\s*\n\s*/g, ' | ') });
+      // `detail` (Pi's stderr tail) and `message` (the Claude CLI's own result error text for a
+      // `cli-error:*` reason) are the same thing to the copy and the Debug Console log.
+      const detail = msg.detail || msg.message || null;
+      appendProgressLog(cs, { kind: 'error', text: `${tc('console.turnFailedTries', attempts, { reason })}${msg.model ? ` model=${msg.model}` : ''}` });
+      if (detail) appendProgressLog(cs, { kind: 'error', text: String(detail).replace(/\s*\n\s*/g, ' | ') });
       cs._lastErrorReason = reason;
       // C1031 — server-sent, authoritative (see providerLabelFor). Absent on an old server.
       cs._lastErrorProvider = msg.provider || null;
       // C1029/C1031 — reason-aware copy. See objectiveErrorMessage() for the category map.
       const errMsg = objectiveErrorMessage(
-        reason, attempts, msg.detail,
+        reason, attempts, detail,
         providerLabelFor(cs, cs._lastErrorProvider),
         msg.model,
       );
@@ -3259,7 +3307,7 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       syncChatHistoryMeta(cs);
       if (cs.term) {
         cs.term.clear();
-        cs.term.write('\x1b[90m--- Restarted ---\x1b[0m\r\n');
+        cs.term.write(`\x1b[90m--- ${t('console.restarted')} ---\x1b[0m\r\n`);
         (cs.termScroll ?? cs.term.scrollToBottom.bind(cs.term))();
       }
       if (tab) tab.status = 'streaming';
@@ -3268,13 +3316,13 @@ export function connectObjectiveWS(taskId, prompt, opts) {
     } else if (msg.type === 'context-trimmed') {
       cs.messages.push({
         role: 'system',
-        content: `Context trimmed to ${msg.messagesKept} messages for optimal performance.`,
+        content: t('chat.contextTrimmed', { n: msg.messagesKept }),
         cards: [], acceptedMask: [], confirmedMask: [],
         discarded: false, streaming: false, timestamp: Date.now(),
       });
       // C1255 — routed through the log now (was a one-off cs.term.write) so it survives a
       // console close/reopen instead of only appearing if the console happened to be open.
-      appendProgressLog(cs, { kind: 'note', text: `context trimmed (${msg.messagesKept} messages kept)` });
+      appendProgressLog(cs, { kind: 'note', text: t('console.contextTrimmed', { n: msg.messagesKept }) });
       repaint();
     } else if (msg.type === 'cards-update') {
       // Deferred efficiency hint cards appended after turn delivery (C371).
@@ -3301,9 +3349,10 @@ export function connectObjectiveWS(taskId, prompt, opts) {
   };
 
   ws.onclose = () => {
-    // Route via taskId, not state.chatState (user may have switched tabs)
-    const t = state.tabsState.find(t => t.tabId === taskId);
-    const cs = t ? t.chatState : null;
+    // Route via taskId, not state.chatState (user may have switched tabs). `tab`, never `t` —
+    // the system messages below need the imported t().
+    const tab = state.tabsState.find(entry => entry.tabId === taskId);
+    const cs = tab ? tab.chatState : null;
     if (!cs) return;
     if (cs.ws !== ws) return; // superseded by a newer socket
     const isActive = state.activeTabId === taskId;
@@ -3321,7 +3370,7 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       // Surface the reconnect attempt so the user isn't staring at a frozen bubble.
       if (attempts === 0) {
         cs.messages.push({
-          role: 'system', content: 'Connection lost — reconnecting…',
+          role: 'system', content: t('chat.connectionLostReconnecting'),
           cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now(),
         });
         if (isActive) reload();
@@ -3342,10 +3391,10 @@ export function connectObjectiveWS(taskId, prompt, opts) {
             for (const m of cs.messages) { if (m.streaming) m.streaming = false; }
             cs.retryable = true;
             cs.messages.push({
-              role: 'system', content: 'Connection lost unexpectedly. Retry or refine your prompt.',
+              role: 'system', content: t('chat.connectionLostRetry'),
               cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now(),
             });
-            if (t) t.status = 'error';
+            if (tab) tab.status = 'error';
             if (isActive) reload(); else renderTabBarOnly();
           });
       }, delay);
@@ -3355,10 +3404,10 @@ export function connectObjectiveWS(taskId, prompt, opts) {
     for (const m of cs.messages) { if (m.streaming) m.streaming = false; }
     cs.retryable = true;
     cs.messages.push({
-      role: 'system', content: 'Connection lost unexpectedly.',
+      role: 'system', content: t('chat.connectionLost'),
       cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now(),
     });
-    if (t) t.status = 'error';
+    if (tab) tab.status = 'error';
     if (isActive) reload(); else renderTabBarOnly();
   };
 }
@@ -3490,7 +3539,7 @@ window.addEventListener('auth:cancelled', () => {
     cs.retryable = false;
     cs.messages.push({
       role: 'system',
-      content: 'Session expired — please sign in to continue.',
+      content: t('chat.sessionExpired'),
       cards: [], acceptedMask: [], confirmedMask: [],
       discarded: false, streaming: false, timestamp: Date.now(),
     });

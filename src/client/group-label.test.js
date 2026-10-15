@@ -1,15 +1,18 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { setLocale } from './i18n.js';
+import { api } from './api-client.js';
 
 const {
   TASK_GROUP_LABELS, DEFAULT_TASK_GROUP_LABEL,
-  setGroupLabel, getGroupLabel, resetGroupLabel,
+  setGroupLabel, getGroupLabel, resetGroupLabel, loadGroupLabel,
   groupNoun, groupTitle, groupNewLabel, groupShowMore, groupEmpty, groupPriorityFieldLabel,
   groupPluralFor, isGeneratedGroupName,
   setSprintsEnabled, getSprintsEnabled, resetSprintsEnabled,
   setObjectiveGroupingEnabled, getObjectiveGroupingEnabled, resetObjectiveGroupingEnabled,
   setSprintSortOrder, getSprintSortOrder, resetSprintSortOrder,
+  setTaskPrefix, getTaskPrefix, resetTaskPrefix, nextTaskKeyGuess, fetchNextTaskKey,
 } = await import('./group-label.js');
 
 test('default seed is Batches', () => {
@@ -220,6 +223,74 @@ test('resetGroupLabel also resets sprintSortOrder', () => {
   assert.equal(getSprintSortOrder(), 'asc');
 });
 
+// (TPT632) task_prefix — the settings route already ran it through resolveCodingPrefix();
+// the client still adopts only a derived-prefix shape and falls back to the legacy 'C'.
+test('default seed for taskPrefix is the legacy C', () => {
+  resetTaskPrefix();
+  assert.equal(getTaskPrefix(), 'C');
+});
+
+test('setTaskPrefix: adopts a derived prefix, anything else -> legacy C', () => {
+  setTaskPrefix('MNY');
+  assert.equal(getTaskPrefix(), 'MNY');
+  setTaskPrefix('TPT');
+  assert.equal(getTaskPrefix(), 'TPT');
+  for (const bad of [null, undefined, '', 'mny', 'C', 'MNY1', 'TOOLONGPREFIX', 42]) {
+    setTaskPrefix('MNY');
+    setTaskPrefix(bad);
+    assert.equal(getTaskPrefix(), 'C', `rejects ${JSON.stringify(bad)}`);
+  }
+});
+
+test('resetGroupLabel also resets taskPrefix', () => {
+  setTaskPrefix('MNY');
+  resetGroupLabel();
+  assert.equal(getTaskPrefix(), 'C');
+});
+
+test('loadGroupLabel stores taskPrefix from the settings bundle, and falls back to C on a failed read', async () => {
+  const original = api.project.settings;
+  try {
+    api.project.settings = async () => ({ taskGroupLabel: 'Sprints', taskPrefix: 'MNY' });
+    await loadGroupLabel();
+    assert.equal(getTaskPrefix(), 'MNY');
+    api.project.settings = async () => { throw new Error('offline'); };
+    await loadGroupLabel();
+    assert.equal(getTaskPrefix(), 'C');
+  } finally {
+    api.project.settings = original;
+    resetGroupLabel();
+  }
+});
+
+test('nextTaskKeyGuess: one past the highest key with the project prefix (CODING) or H (HUMAN)', () => {
+  const tasks = [
+    { id: 'MNY3' }, { id: 'MNY12' }, { id: 'C40' }, { id: 'H4' }, { id: 'new-abc' }, { id: 'MNY-2' },
+  ];
+  setTaskPrefix('MNY');
+  assert.equal(nextTaskKeyGuess(tasks, 'CODING'), 'MNY13');
+  assert.equal(nextTaskKeyGuess(tasks, 'HUMAN'), 'H5');
+  assert.equal(nextTaskKeyGuess([], 'CODING'), 'MNY1');
+  assert.equal(nextTaskKeyGuess(null, 'CODING'), 'MNY1');
+  assert.equal(nextTaskKeyGuess([{ id: 'C7' }], 'HUMAN'), 'H1');
+  resetTaskPrefix();
+  assert.equal(nextTaskKeyGuess(tasks, 'CODING'), 'C41', 'unknown prefix keeps the legacy C guess');
+});
+
+test('wiring: New Task Preview guesses with the project prefix and Confirm never sends the guess', () => {
+  const template = readFileSync(new URL('./template.html', import.meta.url), 'utf8');
+  assert.match(template, /nextTaskKeyGuess, fetchNextTaskKey \} = window\.TipTask\.groupLabel;/);
+  assert.match(template, /const nextId = nextTaskKeyGuess\(tasks, category\);/);
+  assert.doesNotMatch(template, /category === 'HUMAN' \? 'H' : 'C'/, 'no hardcoded C guess');
+  assert.match(template, /const \{ _sprintMove, id: _previewKeyGuess, \.\.\.previewTask \} = state\.manualTaskState\.previewTask;/);
+  // (TPT659) The API's own next key replaces the guess — fire-and-forget (never awaited before
+  // the render), applied only while this very Preview is still showing.
+  assert.match(template, /loadAndRender\(\);\s*\n(?:\s*\/\/.*\n)*\s*fetchNextTaskKey\(category\)\.then\(/);
+  assert.doesNotMatch(template, /await fetchNextTaskKey\(/, 'Preview must not block on the request');
+  assert.match(template, /if \(!key \|\| !ms \|\| ms\.phase !== 'preview' \|\| ms\.previewTask !== previewTask\) return;/);
+  assert.match(template, /previewTask\.id = key;/);
+});
+
 // (C1395) isGeneratedGroupName — every auto-created sprint row's name is literally
 // "Sprint ${n}" (sprint-assign.js/mcp/server.js/cli/migrate-tasks.js), never the
 // project's own noun. A boilerplate name isn't a custom name — _tierTitleFor() in
@@ -269,4 +340,25 @@ test('isGeneratedGroupName: empty/null name is never boilerplate', () => {
   assert.equal(isGeneratedGroupName('', 5), false);
   assert.equal(isGeneratedGroupName(null, 5), false);
   assert.equal(isGeneratedGroupName(undefined, 5), false);
+});
+
+test('fetchNextTaskKey: returns the API key, forwards the category, never throws', async () => {
+  const original = api.project.nextTaskKey;
+  const asked = [];
+  try {
+    api.project.nextTaskKey = async (category) => { asked.push(category); return { taskKey: category === 'HUMAN' ? 'H9' : 'MNY42' }; };
+    assert.equal(await fetchNextTaskKey('CODING'), 'MNY42');
+    assert.equal(await fetchNextTaskKey('HUMAN'), 'H9');
+    assert.equal(await fetchNextTaskKey(undefined), 'MNY42', 'anything but HUMAN asks for CODING');
+    assert.deepEqual(asked, ['CODING', 'HUMAN', 'CODING']);
+
+    for (const bad of [{ taskKey: null }, {}, null, { taskKey: 'new-123-1' }, { taskKey: 42 }, { taskKey: '' }]) {
+      api.project.nextTaskKey = async () => bad;
+      assert.equal(await fetchNextTaskKey('CODING'), null, `malformed ${JSON.stringify(bad)} -> null`);
+    }
+    api.project.nextTaskKey = async () => { throw new Error('offline'); };
+    assert.equal(await fetchNextTaskKey('CODING'), null, 'a failed request falls back to null');
+  } finally {
+    api.project.nextTaskKey = original;
+  }
 });

@@ -191,3 +191,65 @@ test('refreshProjectToken: an unreachable API rejects with the network code, not
 test('refreshProjectToken: missing inputs reject up front', async () => {
   await assert.rejects(() => refreshProjectToken({ projectRoot: '/x', baseUrl: '', token: 't', projectId: '1' }), /needs projectRoot/);
 });
+
+// (TPT9008) Every refresh failure carries a stable refreshCode (+ refreshParams) beside its English
+// message, and both string tables that name it — the launch warning's (terminal-copy.js) and the
+// EAUTH frame's (client i18n.js) — say exactly that message in English and translate it in Ukrainian.
+test('refreshProjectToken: every failure is coded, and both string tables say its message in English', async (t) => {
+  const { terminalCopy } = require('./terminal-copy');
+  const { t: translate, setLocale } = await import('../client/i18n.js');
+  t.after(() => setLocale('en'));
+  const oldTok = makeJwt(nowSec() + 300);
+  const jwt = (payload) => `${b64url({ alg: 'HS256', typ: 'JWT' })}.${b64url({ exp: nowSec() + 86400, ...payload })}.sig`;
+  const seen = new Set();
+  const check = (err, code, params) => {
+    assert.strictEqual(err.refreshCode, code, err.message);
+    assert.deepStrictEqual(err.refreshParams, params, code);
+    seen.add(code);
+    setLocale('en');
+    assert.strictEqual(terminalCopy('en', `notice.token.refreshError.${code}`, params), err.message, `${code}: terminal-copy.js en`);
+    assert.strictEqual(translate(`terminal.error.EAUTH.refresh.${code}`, params), err.message, `${code}: i18n.js en`);
+    setLocale('uk');
+    for (const uk of [terminalCopy('uk', `notice.token.refreshError.${code}`, params), translate(`terminal.error.EAUTH.refresh.${code}`, params)]) {
+      assert.notStrictEqual(uk, err.message, `${code}: uk is translated`);
+      assert.doesNotMatch(uk, /\{\w+\}|refreshError\.|terminal\.|undefined/, code);
+    }
+  };
+  const rejectWith = async (run, code, params) => {
+    await assert.rejects(run, (err) => { check(err, code, params); return true; });
+  };
+
+  for (const [status, payload, code, params] of [
+    [503, '{"error":"busy"}', 'rejected', { status: 503 }],
+    [200, '{"token":"not-a-jwt"}', 'no_usable_token', undefined],
+    [200, 'not json', 'unreadable_response', undefined],
+    [200, JSON.stringify({ token: jwt({ id: 9, project_id: 2 }) }), 'scope_changed', undefined],
+    [200, JSON.stringify({ token: jwt({ id: 1, project_id: 3 }) }), 'project_scope', undefined],
+  ]) {
+    await withApi((req, res) => { res.writeHead(status); res.end(payload); }, async (baseUrl) => {
+      const root = makeProject({ API_BASE_URL: baseUrl, API_TOKEN: oldTok, API_PROJECT_ID: '2' });
+      t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+      await rejectWith(() => refreshProjectToken({ projectRoot: root, baseUrl, token: oldTok, projectId: '2' }), code, params);
+    });
+  }
+  // A server that never answers in time, then one that refuses the connection outright.
+  await withApi((req, res) => { setTimeout(() => res.end(), 1500); }, async (baseUrl) => {
+    await rejectWith(() => refreshProjectToken({ projectRoot: '/x', baseUrl, token: oldTok, projectId: '2', timeoutMs: 200 }), 'request_timeout', undefined);
+  });
+  const closedPort = await new Promise((resolve) => {
+    const probe = http.createServer().listen(0, '127.0.0.1', () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
+  });
+  await assert.rejects(
+    () => refreshProjectToken({ projectRoot: '/x', baseUrl: `http://127.0.0.1:${closedPort}`, token: oldTok, projectId: '2', timeoutMs: 2000 }),
+    (err) => { check(err, 'request_failed_cause', { cause: 'ECONNREFUSED' }); return true; });
+  // A transport that fails with no network code at all.
+  await rejectWith(() => refreshProjectToken({ projectRoot: '/x', baseUrl: 'http://api', token: oldTok, projectId: '2',
+    fetchImpl: async () => { throw new Error('socket hang up'); } }), 'request_failed', undefined);
+  // Up-front refusals: missing input, no fetch, a stored token scoped to another project.
+  await rejectWith(() => refreshProjectToken({ projectRoot: '/x', baseUrl: '', token: oldTok, projectId: '2' }), 'missing_input', undefined);
+  await rejectWith(() => refreshProjectToken({ projectRoot: '/x', baseUrl: 'http://api', token: oldTok, projectId: '2', fetchImpl: {} }), 'fetch_unavailable', undefined);
+  await rejectWith(() => refreshProjectToken({ projectRoot: '/x', baseUrl: 'http://api', token: oldTok, projectId: '3' }), 'project_scope', undefined);
+  // auth-guard.js's own `not_newer` is checked in auth-guard.test.js; every other code is covered here.
+  assert.deepStrictEqual([...seen].sort(), ['fetch_unavailable', 'missing_input', 'no_usable_token', 'project_scope', 'rejected',
+    'request_failed', 'request_failed_cause', 'request_timeout', 'scope_changed', 'unreadable_response']);
+});

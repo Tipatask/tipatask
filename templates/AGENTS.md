@@ -20,6 +20,12 @@ Use the `tipatask` MCP server whenever it is available for task CRUD, system-tag
 - Identify the relevant `tt-*` tags for the task or touched modules.
 - Read `ai/architecture/{tag}.md` for each relevant tag before editing code in that area.
 - Keep `ai/architecture/*.md` in sync with any changed endpoints, schema, env vars, file structure, or behavior — standing system facts only. Task investigation notes, evidence tables, dated findings and corrections go in the task's resolution comment, never in a `tt-*.md` — see § Knowledge Base Hygiene.
+- **Follow-up capture** (after implementation, before the completion call — never while planning, which forbids task writes): Zero follow-ups is the normal result. Only capture a defect, data risk or security issue in shipped behavior, or a manual step the user must take. Never file improvements, refactors, extra tests, doc ideas, nice-to-haves or things already covered by this task.
+  - For an eligible finding, search outstanding tasks first: only `pending` and `on_fire` (the project's not-started and urgent statuses) count. Call `list_tasks` for each of those statuses, then `get_task` on likely matches. Never file a duplicate of an existing task.
+  - Prefer a comment on an existing outstanding task: `create_task_comment(task_key, content, type: "comment")` naming the source task key, the finding and its consequence for that task. Edit its description only when one of its steps is now wrong. Never touch `in_progress`, `completed` or `canceled` tasks.
+  - At most 2 new tasks per run, each with one sentence of evidence. Only when no outstanding task covers an eligible finding, file one concern per task: `reserve_task_keys` (category `HUMAN` only for steps only the user can do), then `update_task` on each reserved key. Self-contained description (problem, evidence, files, numbered steps, verification); registered tags (`tt-*` module + action + detail — register a new tag with a real description first); the current task's priority (same sprint) unless dependencies push it later; escape every `~` as `\~`.
+  - Skip trivia nobody would act on. Never file work the task's own scope requires — finish it (§ Task status scope).
+  - List every task filed or updated, by key, in the resolution's follow-ups and in the final reply; otherwise report "none".
 
 ## Task Source Of Truth
 
@@ -168,4 +174,4 @@ Never invent `tt-*` tags without first calling `list_system_tags` to verify no e
 
 ### Status discipline
 
-For task execution after plan approval, keep task status current; planning and chat follow their session contract. `in_progress` when starting, `completed` or `on_fire` before sending reply. Use `update_task` for non-completion status changes; complete through the guarded completion tool with one resolution report.
+For task execution after plan approval, keep task status current; planning and chat follow their session contract. `in_progress` when starting, `completed` or `on_fire` before sending reply. Before the completion call, finish Follow-up capture (Core Workflow): zero follow-ups is normal; only eligible findings qualify, prefer existing outstanding-task comments after searching `pending`/`on_fire`, never duplicate, and file at most 2 new tasks per run, each with one sentence of evidence. List every filed or updated key in the resolution and reply, or "none". Use `update_task` for non-completion status changes; complete through the guarded completion tool with one resolution report.

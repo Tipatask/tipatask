@@ -6,7 +6,7 @@ const runtimeConfig = require('../config');
 const { getStaticBundle, getTaskStartupGrepBundle } = require('../static-context');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolveSpawnModel, resolvePiLaunch, resolvePiLaunchAsync } = require('../spawn-utils');
 const { readProjectConfig, piDefaultEntry, piEntryForModel, piKeyEnvVars } = require('../project-config');
-const { preparePiCustomEndpoint } = require('../pi-custom-endpoint');
+const { preparePiCustomEndpoint, piRowSupportsTools, piRowHost, toolCompatMessage, piTaskDefaultEntry } = require('../pi-custom-endpoint');
 const { matchPromptLine, PI_PROMPT_PATTERNS } = require('./prompt-detect');
 const { LEGACY_STATUSES, LEGACY_ROLE_NAMES, sanitizeStatusName } = require('../status-roles');
 const { buildVcsDirective } = require('../vcs-settings');
@@ -32,8 +32,8 @@ function buildTipataskRestRecipe(opts = {}) {
     ? `${cleanNames.slice(0, 12).join(' | ')} | … (${cleanNames.length - 12} more — GET /statuses for the full list)`
     : cleanNames.join(' | ');
   return [
-    '- Pi uses REST, not MCP. The selected project config holds API_BASE_URL/API_PROJECT_ID; the account store holds the token. Never print tokens or read them into a shell variable.',
-    '- Use the credential-safe command below; it reads the current account on every call. JSON bodies and the completion report go on stdin. On missing store/path, check TIPATASK_USER_DATA; on scope mismatch or expired credentials, sign in again. Never bypass completion verification with a status PATCH.',
+    '- The selected project config holds API_BASE_URL/API_PROJECT_ID; the account store holds the token. Never print tokens or read them into a shell variable.',
+    '- Use the credential-safe command below; JSON bodies and the completion report go on stdin. Missing store/path: check TIPATASK_USER_DATA; expired or mismatched credentials: sign in again.',
     '```sh',
     'tt() { ELECTRON_RUN_AS_NODE=1 "$TIPATASK_TOOL_EXEC" "$TIPATASK_TOOL_SCRIPT" "$@"; }',
     'tt GET "/tasks/$TIPATASK_TASK_ID"',
@@ -43,7 +43,7 @@ function buildTipataskRestRecipe(opts = {}) {
     'tt GET /tags',
     `tt GET "/tasks?status=${startName}&fields=summary&limit=20"`,
     '# Register tags with POST /tags and a {"tags":[{"name":"...","description":"..."}]} JSON body.',
-    '# Update task fields/tags with PATCH /tasks/<KEY>; comments with POST /tasks/<KEY>/comments.',
+    '# Create with keyless POST /tasks; update fields/tags with PATCH /tasks/<KEY>; comments with POST /tasks/<KEY>/comments.',
     '# Read /tasks, /members, /sprints, /statuses, /knowledge; push KB with POST /knowledge.',
     '# Before Git writes and completion, require verified:true from:',
     'tt verify "$TIPATASK_TASK_ID"',
@@ -83,11 +83,11 @@ function buildPiMcpToolMap() {
 // THIS task only: questions come before the plan, not after.
 function piDiscoveryMandateLines(bridge = false) {
   return [
-    `- This is a discovery task: before asking anything, read what already exists — ai/architecture/GENERAL.md (its ## Source Documents and ## Existing Code sections), any root README/docs, and any manifest file — so your questions are grounded in the real project, not assumptions.`,
+    `- This is a discovery task: before asking anything, read what already exists — ai/architecture/GENERAL.md (## Source Documents, ## Existing Code), any root README/docs, any manifest file — so your questions fit the real project.`,
     bridge
       ? `- Then read the other tasks in this project (tipatask__list_tasks) and their comment history (tipatask__list_task_resolutions) so you never re-ask something a sibling task already recorded.`
       : `- Then read the other tasks in this project and their comments (the GET /tasks and GET /tasks/<key>/comments curls above) so you never re-ask something a sibling task already recorded.`,
-    `- Only then ask the user with the Clarifying questions mechanism above, in batches of 3-5, repeating for follow-up batches until the task's own question list is answered — this overrides the earlier instruction to write the plan immediately: for THIS task, the plan comes after the answers. If the user says "you decide", record it as an explicit Assumption line in the deliverable instead of silently choosing.`,
+    `- Only then ask the user with the Clarifying questions mechanism above, batch by batch until the task's own question list is answered — this overrides the earlier instruction to write the plan immediately: for THIS task, the plan comes after the answers. If the user says "you decide", record it as an explicit Assumption line in the deliverable.`,
   ];
 }
 
@@ -104,7 +104,20 @@ function piDiscoveryMandateLines(bridge = false) {
 const PI_PROMPT_BUDGET = 12000;
 const PI_PARENT_BLOCK_MAX_CHARS = 2000;
 
+// (TPT9008) detect()'s negatives by stable code (BaseTaskAgent#unavailableResult(), `{output}` filled
+// from its params). Each sentence is the English `reason`; the terminal shows
+// terminal.error.ESTART.<code>.pi (i18n.js) instead, whose English value must stay
+// "Failed to start {label}: " + this sentence.
+const DETECT_REASONS = Object.freeze({
+  cli_not_found: 'Pi CLI not found. Run npm install in the Task App checkout to get the bundled copy, install pi globally, or set PI_BIN=/path/to/pi in .env.',
+  cli_missing: 'Pi CLI not found',
+  probe_failed: 'Pi CLI probe failed',
+  probe_failed_output: 'Pi CLI probe failed: {output}',
+});
+
 class PiAgent extends BaseTaskAgent {
+  static DETECT_REASONS = DETECT_REASONS;
+
   constructor() {
     // (C1136) 'Other Model' — matches the wizard/setup-modal/agents-modal naming
     // (AGENT_DISPLAY_NAMES in agent-select.js) and providers/registry.js's PROVIDER_META.pi
@@ -121,7 +134,7 @@ class PiAgent extends BaseTaskAgent {
   }
 
   // C1215 — Pi's kickoff prompt is echoed verbatim into its own TUI and budgeted under
-  // 9300 chars (pi-agent.test.js), and Pi has no MCP support at all — the base directive's
+  // 9600 chars with git all-on (pi-agent.test.js; 9900 in vcs-prompt.test.js), and Pi has no MCP support at all — the base directive's
   // MCP-specific caveat doesn't apply here. See buildVcsDirective's opts.compact doc in
   // vcs-settings.js for what compact mode drops/shortens. C1561: same absent-key '' guard
   // as base-agent.js's resolveVcsDirective() — buildVcsDirective() itself no longer has a
@@ -173,8 +186,8 @@ class PiAgent extends BaseTaskAgent {
     const grepNote = ttTags.length >= 2
       ? `Cross-reference scan for [${ttTags.join(', ')}] is already complete in startup context. Use shell grep/rg only for identifiers absent from that section.`
       : 'Use rg for source search.';
-    // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status) plus the
-    // separate clarify slot — see base-agent.js#buildSharedPreamble. All compact by policy
+    // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status,
+    // follow-up capture) plus the separate clarify slot — see base-agent.js#buildSharedPreamble. All compact by policy
     // (getPreamblePolicy() above): plain prose/bullet lines with no dialog-shaped phrasing, so
     // they stay safe under the HARD RULE above (no bare "Plan ready.", no "❯ n." prefix, no
     // "[y/n]", no "do you want to …?" etc.) and inside the echo-verbatim prompt budget —
@@ -187,8 +200,8 @@ class PiAgent extends BaseTaskAgent {
     // Without the bridge (bundle not built, no .mcp.json, no project target), Pi gets the
     // no-MCP framing and the credential-safe `tt` REST recipe instead.
     const intro = bridge ? [buildPiMcpToolMap()] : [
-      'You are running inside Pi Coding Agent. Pi has NO MCP support at all — that is Pi\'s design (its README says "No MCP."), not a broken setup. A missing `tipatask` MCP server here is expected and is NOT a bug: never report it to the user, never investigate it, never read or edit `.mcp.json`, and never stop work over it. Use Pi built-in shell/read/edit tools only.',
-      'Pi auto-loads this repo\'s AGENTS.md / CLAUDE.md, which were written for MCP-capable agents (Claude Code, Codex). Every instruction there to call a `tipatask` MCP tool — list_system_tags, get_project_tags, get_tag_architecture, get_tag_architectures, create_system_tag, batch_grep_tags, list_tasks, get_task, create_task, update_task, create_task_comment, push_knowledge — does NOT apply to you, and neither does the "MCP Tool Schemas" section of your system prompt. Read architecture docs straight off disk (ai/architecture/*.md) and use the REST command below for task operations and verified completion.',
+      'You are running inside Pi Coding Agent. Pi has NO MCP support at all — by design, not a broken setup. A missing `tipatask` MCP server is expected and is NOT a bug: never report or investigate it, never read or edit `.mcp.json`, never stop work over it. Use Pi built-in shell/read/edit tools only.',
+      'Pi auto-loads this repo\'s AGENTS.md / CLAUDE.md, written for MCP-capable agents. Their `tipatask` MCP tool calls — list_system_tags, get_project_tags, get_tag_architecture, get_tag_architectures, create_system_tag, batch_grep_tags, list_tasks, get_task, create_task, update_task, create_task_comment, push_knowledge — do NOT apply to you, nor does the "MCP Tool Schemas" section of your system prompt. Use the REST command below for task operations and verified completion.',
     ];
     // "on_fire" carries no role flag by design — unlike "canceled" (which got a 4th
     // role flag, is_workflow_canceled, in C1187), on_fire was never meant to have
@@ -207,9 +220,9 @@ class PiAgent extends BaseTaskAgent {
       // instead of writing the literal names into the prompt.
       buildTipataskRestRecipe(opts),
       `- Task status: PATCH status to ${inProgressName} as soon as you start implementing (right after plan approval), and use tt complete for ${completeName}${hasOnFire ? ' — or on_fire if this task is blocked —' : ''} before your final message. Re-GET the task afterwards to confirm the saved status.`,
-      '- Before marking this task complete: if a module you touched has no tt-* tag, GET /tags to check, then POST /tags to register it (description required), then create the ai/architecture/tt-*.md stub yourself with your write tool, then PATCH the task tags. That order matters: an unregistered name inside a PATCH tags array is rejected with 400 "tags not registered". There is no create_system_tag here to write the stub for you.',
+      '- Before completion, for a touched module with no tt-* tag: GET /tags to check, then POST /tags to register it (description required), then create the ai/architecture/tt-*.md stub yourself with your write tool, then PATCH the task tags — in that order, since an unregistered name in a PATCH tags array is rejected with 400 "tags not registered".',
       `- MANDATORY before marking this task ${completeName}: pass ONE self-authored plain-English resolution to tt complete. Cover changes/why, files, checks, follow-ups/caveats (none if absent). Require completed:true; never use a status PATCH instead. If tt complete refuses, fix listed blockers and retry. If a blocker cannot be cleared within this task, leave incomplete: post same report via tt POST /tasks/<KEY>/comments, stdin {"content":"...","type":"resolution"}${hasOnFire ? ', then PATCH on_fire' : ''}; state blocker. Terminal log never replaces this report.`,
-      '- KB push: nothing auto-pushes your ai/architecture/*.md edits from this session (that hook is Claude Code only, and Task App session start only pulls). After your LAST edit to an arch doc, push it with the arch-doc command above. If jq is unavailable, skip the push and say so in the resolution comment — the file on disk stays authoritative.',
+      '- KB push: nothing auto-pushes your ai/architecture/*.md edits from this session (that hook is Claude Code only). After your LAST arch-doc edit, push it with POST /knowledge; if that fails, say so in the resolution — the file on disk stays authoritative.',
     ];
 
     const lines = [
@@ -228,7 +241,7 @@ class PiAgent extends BaseTaskAgent {
       'Project context:',
       '- General architecture and tag taxonomy are pre-loaded in the system prompt.',
       `- ${tagNote}`,
-      '- After any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task to reflect changed endpoints, schema, env vars, file structure, or behavior. Never write ai/ARCHITECTURE.md — deprecated path, no agent loads it. During exploration, if a STANDING fact is missing from a tt-*.md (undocumented endpoint, missing file row, changed schema, behavioral nuance), fix that doc immediately with that fact alone.',
+      '- After any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task (endpoints, schema, env vars, file structure, behavior). Never write ai/ARCHITECTURE.md — deprecated, no agent loads it. During exploration, if a STANDING fact is missing from a tt-*.md, fix that doc immediately with that fact alone.',
       ...taskOps,
       `- ${grepNote}`,
       ...directives,
@@ -284,7 +297,10 @@ class PiAgent extends BaseTaskAgent {
     // config.json field resolveSpawnModel() falls back to (pre-C1121 projects only).
     let piCfg;
     try { piCfg = readProjectConfig(projectRoot); } catch { piCfg = null; }
-    const piEntry = piCfg && piDefaultEntry(piCfg);
+    // With no model named, a task runs the first tool-capable row (piTaskDefaultEntry), so a row 0
+    // declared `tools: false` — still the objective-chat default — does not block the start. Row 0
+    // stays the fallback when no row takes tools; the refusal below then names it.
+    const piEntry = piCfg && (piTaskDefaultEntry(piCfg) || piDefaultEntry(piCfg));
     const piModel = (typeof opts.model === 'string' && opts.model.trim())
       || piEntry?.model
       || resolveSpawnModel(opts.model, projectRoot, 'PI_MODEL', config.PI_MODEL);
@@ -302,6 +318,16 @@ class PiAgent extends BaseTaskAgent {
     // PI_CODING_AGENT_DIR/PI_CODING_AGENT_SESSION_DIR env Pi needs to find it. For every other row
     // it returns the row's own provider id and an empty env without touching disk.
     const selEntry = (piCfg && piEntryForModel(piCfg, piModel)) || piEntry || null;
+    // (TPT634) Task execution needs tools (file edits, shell, the Tipatask MCP/REST tools), so a
+    // row declared `tools: false` is refused here, before models.json, the MCP bridge or a PTY.
+    // The start handler shows this sentence in the terminal instead of a 404 mid-run; (TPT9008) its
+    // code + params let the terminal render it in the project language (terminal.error.ESTART.no_tool_calls.pi).
+    if (!piRowSupportsTools(selEntry)) {
+      const host = piRowHost(selEntry);
+      throw Object.assign(new Error(toolCompatMessage(piModel, host, { declared: true })), {
+        reasonCode: 'no_tool_calls', reasonParams: { agent: this.id, model: piModel, host },
+      });
+    }
     const { provider: piProvider, env: piEndpointEnv } = preparePiCustomEndpoint(projectRoot, selEntry, env);
     Object.assign(env, piKeyEnvVars(selEntry), piEndpointEnv);
 
@@ -433,27 +459,20 @@ class PiAgent extends BaseTaskAgent {
     // (C1112) launch is null only when Pi is unresolvable by any strategy — bundled dependency
     // (checkout), extraResources copy (packaged Electron), PI_BIN override, or system PATH.
     const launch = await resolvePiLaunchAsync();
-    if (!launch) {
-      return {
-        id: this.id, label: this.label, available: false,
-        reason: 'Pi CLI not found. Run npm install in the Task App checkout to get the bundled copy, install pi globally, or set PI_BIN=/path/to/pi in .env.',
-      };
-    }
+    if (!launch) return this.unavailableResult('cli_not_found');
     const nvmBinDir = resolveNvmBinDir(launch.command);
     const probeEnv = augmentPathEnv({ PI_SKIP_VERSION_CHECK: '1', ...launch.env });
     if (nvmBinDir) probeEnv.PATH = `${nvmBinDir}${path.delimiter}${probeEnv.PATH}`;
     const probe = await BaseTaskAgent.runCliProbe(launch.command, [...launch.argsPrefix, '--version'], { env: probeEnv });
     if (probe.error) {
-      if (probe.error.code === 'ENOENT') {
-        return { id: this.id, label: this.label, available: false, reason: 'Pi CLI not found' };
-      }
-      return { id: this.id, label: this.label, available: false, reason: 'Pi CLI probe failed' };
+      return this.unavailableResult(probe.error.code === 'ENOENT' ? 'cli_missing' : 'probe_failed');
     }
     if (probe.status === 0) {
       return { id: this.id, label: this.label, available: true };
     }
-    const reason = probe.output ? `Pi CLI probe failed: ${probe.output.split('\n')[0]}` : 'Pi CLI probe failed';
-    return { id: this.id, label: this.label, available: false, reason };
+    return probe.output
+      ? this.unavailableResult('probe_failed_output', { params: { output: probe.output.split('\n')[0] } })
+      : this.unavailableResult('probe_failed');
   }
 }
 

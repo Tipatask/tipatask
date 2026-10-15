@@ -20,6 +20,7 @@ function projectEnvExtras(session) {
 const { shouldTrimContext, trimContext } = require('./context-manager');
 const throttle = require('./objective-throttle');
 const { localizeAttachments } = require('./task-agent/attachments');
+const { measureStdin, formatPromptSizeLine, buildPromptDump } = require('./objective-prompt-dump');
 const archCache = require('../mcp/architecture-cache');
 const { prewarmArchCache } = require('./arch-cache-prewarm');
 const { addTagsForTask } = require('./tag-cache');
@@ -755,8 +756,14 @@ function armIdleWatchdog(session, taskId) {
   }, config.OBJECTIVE_STREAM_IDLE_MS);
 }
 
-function emitObjectiveError(session, taskId, reason, attempts) {
-  throttle.recordTimeout(taskId, reason);
+// `extra` — optional diagnostic fields copied onto the WS frame (e.g. `message`: the CLI's own
+// error text for a `cli-error:<subtype>` reason). A CLI result error is this session's input
+// problem (an oversized prompt, a refused request), not a provider outage: it releases the
+// throttle slot as an abort so it never counts toward the circuit breaker that pauses every
+// other chat.
+function emitObjectiveError(session, taskId, reason, attempts, extra) {
+  if (typeof reason === 'string' && reason.startsWith('cli-error:')) throttle.recordAbort(taskId);
+  else throttle.recordTimeout(taskId, reason);
   clearRetryTimers(session);
   clearTurnDeadline(session);
   session._retrying = false;
@@ -787,7 +794,7 @@ function emitObjectiveError(session, taskId, reason, attempts) {
     // background tab). Literal 'claude', not session.providerType: dispatch.js routes specChat
     // to spawnObjectiveTurn regardless of providerType, and this file only runs the claude bin.
     // Siblings that must stay in sync: gemini-session.js, pi-session.js, codex-session.js.
-    session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId, reason, attempts, provider: 'claude' }));
+    session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId, reason, attempts, provider: 'claude', ...(extra || {}) }));
   }
 }
 
@@ -1015,6 +1022,10 @@ function spawnObjectiveTurn(session, taskId) {
 
   const resultPath = path.join(config.USER_DATA_ROOT, 'objective-result.md');
   fs.unlink(resultPath).catch(() => {});
+  // The exact stdin text of this turn plus a size breakdown — written right before the stdin
+  // write below, so an oversized request can be explained even when no `result` ever arrives.
+  const promptPath = path.join(config.USER_DATA_ROOT, 'objective-prompt.md');
+  fs.unlink(promptPath).catch(() => {});
 
   const cwd = session.projectPath || config.PROJECT_ROOT;
   const turnId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
@@ -1255,7 +1266,35 @@ function spawnObjectiveTurn(session, taskId) {
     }
     catch (err) { console.warn(`[objective] attachment localize failed task=${taskId}: ${err.message}`); }
     if (session.proc !== proc) return; // session replaced during downloads; skip stale proc
+    // Size accounting on the exact text about to be sent (post-localize: attachment refs are
+    // already rewritten to @<path>). Logged first; the file write runs beside the stdin write
+    // and never delays it.
+    const sizeCtx = {
+      taskId,
+      turnIdx: session._lastTurnProfile ? session._lastTurnProfile.turnIdx : turnNum,
+      mode: promptMode,
+      systemPromptChars: config.SIMPLE_MODE ? 0 : (session.systemPrompt?.length ?? 0),
+      stdin: out,
+      metrics: measureStdin(out),
+    };
+    console.log(formatPromptSizeLine(sizeCtx));
+    if (session._lastTurnProfile) {
+      Object.assign(session._lastTurnProfile, {
+        mode: promptMode,
+        stdinChars: sizeCtx.metrics.chars,
+        stdinBytes: sizeCtx.metrics.bytes,
+        mentions: sizeCtx.metrics.mentions,
+        attachmentRefs: sizeCtx.metrics.attachmentRefs,
+      });
+    }
     try { proc.stdin.write(out); proc.stdin.end(); } catch { /* proc may have already exited */ }
+    try {
+      const dump = buildPromptDump({ ...sizeCtx, profile: session._lastTurnProfile });
+      fs.writeFile(promptPath, dump.header + dump.body, 'utf8')
+        .catch(writeErr => console.error(`[objective] Failed to write prompt file: ${writeErr.message}`));
+    } catch (dumpErr) {
+      console.error(`[objective] prompt dump failed task=${taskId}: ${dumpErr.message}`);
+    }
   })();
 
   // Parse stream-json (SSE) events
@@ -1267,6 +1306,8 @@ function spawnObjectiveTurn(session, taskId) {
   // Track accumulated input JSON for get_tag_architecture(s) tool calls this turn
   let _archToolBuf = null;   // string being accumulated, or null if not tracking
   let _archToolName = null;  // tool name being tracked
+  // Event types whose handler threw this turn — each is logged once, not per line
+  const _sseHandlerErrLogged = new Set();
   proc.stdout.on('data', (chunk) => {
     if (session.proc !== proc) return;
     touchStallWatchdog();
@@ -1286,8 +1327,9 @@ function spawnObjectiveTurn(session, taskId) {
       if (!trimmed) continue;
       const jsonStr = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed;
       if (!jsonStr.startsWith('{')) continue;
+      let event;
+      try { event = JSON.parse(jsonStr); } catch { continue; } // unparseable line — skip silently
       try {
-        const event = JSON.parse(jsonStr);
         // --include-partial-messages wraps raw Anthropic SSE events in {type:"stream_event",event:{...}}.
         // Unwrap so content_block_delta/start/stop handlers see the inner event directly.
         const inner = (event.type === 'stream_event' && event.event) ? event.event : event;
@@ -1432,15 +1474,42 @@ function spawnObjectiveTurn(session, taskId) {
             // Last-resort: if no text or tool signals arrived, result itself is first signal
             if (!session.timingMilestones.firstSignalAt) session.timingMilestones.firstSignalAt = now;
           }
+          // A failed CLI run (`is_error`, or any subtype other than `success`: an API
+          // "prompt is too long", error_during_execution, error_max_turns) is not a reply.
+          // Its text never reaches turnBuffer or the early-finalize path below; the turn ends
+          // as an objective-error carrying the CLI's own message, logged with the size profile.
+          if (event.is_error === true || (event.subtype && event.subtype !== 'success')) {
+            const subtype = event.subtype || 'error';
+            const message = [
+              event.result,
+              ...(Array.isArray(event.errors) ? event.errors : []),
+              event.error && (typeof event.error === 'string' ? event.error : event.error.message),
+            ].filter(s => typeof s === 'string' && s.trim()).map(s => s.trim()).join(' | ')
+              || `CLI result subtype=${subtype}`;
+            console.error(
+              `[objective:cli-error] task=${taskId} subtype=${subtype} is_error=${event.is_error === true}` +
+              ` api_error_status=${event.api_error_status ?? 'n/a'} num_turns=${event.num_turns ?? 'n/a'}\n` +
+              `  message=${message}\n` +
+              `  profile=${JSON.stringify(session._lastTurnProfile || null)}`
+            );
+            emitObjectiveError(session, taskId, `cli-error:${subtype}`, session._retryAttempt || 0, { message });
+            continue;
+          }
           // Only use result text as fallback — don't overwrite buffer already populated by streaming deltas
           if (event.result && !session.turnBuffer.trim()) session.turnBuffer = event.result;
-          if (event.input_tokens != null || event.output_tokens != null) {
+          // Declared here, not inside the token block: the metrics trail and the early-finalize
+          // step below read it too, and a throw there skips both (logged as [objective:sse-handler]).
+          const p = session._lastTurnProfile;
+          // The CLI reports token counts under `usage` and the cost as `total_cost_usd`; older
+          // builds put the same fields at the top level. Read both shapes.
+          const usage = (event.usage && typeof event.usage === 'object') ? event.usage : event;
+          if (usage.input_tokens != null || usage.output_tokens != null) {
             session.turnTokens = {
-              input: event.input_tokens || 0,
-              output: event.output_tokens || 0,
-              cacheCreation: event.cache_creation_input_tokens || 0,
-              cacheRead: event.cache_read_input_tokens || 0,
-              costUsd: event.cost_usd || 0,
+              input: usage.input_tokens || 0,
+              output: usage.output_tokens || 0,
+              cacheCreation: usage.cache_creation_input_tokens || 0,
+              cacheRead: usage.cache_read_input_tokens || 0,
+              costUsd: event.total_cost_usd ?? event.cost_usd ?? 0,
             };
             session.totalTokens.input += session.turnTokens.input;
             session.totalTokens.output += session.turnTokens.output;
@@ -1454,7 +1523,6 @@ function spawnObjectiveTurn(session, taskId) {
             const hitRatio = total > 0 ? (cr / total * 100).toFixed(1) : '0.0';
             const cacheReadDelta = cr - session._priorCacheRead;
             session._priorCacheRead = cr;
-            const p = session._lastTurnProfile;
             const turnIdx = p ? p.turnIdx : session.messages.filter(m => m.role === 'assistant').length;
             if (p) {
               const estTok = n => Math.ceil(n / 4);
@@ -1543,7 +1611,15 @@ function spawnObjectiveTurn(session, taskId) {
             });
           }
         }
-      } catch {}
+      } catch (err) {
+        // A handler bug, not bad input: log once per event type per turn, keep reading the stream.
+        const evType = (event && event.type === 'stream_event' && event.event?.type)
+          ? `stream_event:${event.event.type}` : ((event && event.type) || 'unknown');
+        if (!_sseHandlerErrLogged.has(evType)) {
+          _sseHandlerErrLogged.add(evType);
+          console.error(`[objective:sse-handler] task=${taskId} event=${evType}`, err?.stack || String(err));
+        }
+      }
     }
   });
 

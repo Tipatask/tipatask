@@ -15,7 +15,9 @@ const pauseRunawaySession = () => null;
 
 // Execute the real bootstrap and timer callbacks without opening sockets, reading
 // credentials, running agents, or touching the user's process tree.
-async function harness(killEnv, failStartup = false, validationEnabled = false, { platform = 'darwin', claudeBin = '/usr/local/bin/claude' } = {}) {
+// The task-change poll runs on TIPATASK_TASK_POLL_MS (default 30000, the watchdog's own delay);
+// the harness keys timers by delay, so it defaults the poll to a distinct one.
+async function harness(killEnv, failStartup = false, validationEnabled = false, { platform = 'darwin', claudeBin = '/usr/local/bin/claude', taskPollMs = '20000' } = {}) {
   const timers = new Map();
   const exits = [];
   const lines = [];
@@ -23,9 +25,11 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
   const execCalls = [];
   const memory = { starts: 0, stops: 0, ended: [], options: null };
   const validation = { samples: [], lifecycle: [], watchdog: [], stops: 0, trackerOptions: null };
+  const flagLoads = [];
+  const quotaLoads = [];
   let shutdownOptions, listenCallback;
   const proc = Object.assign(new EventEmitter(), {
-    env: { TIPATASK_WATCHDOG_KILL: killEnv }, platform, arch: 'arm64',
+    env: { TIPATASK_WATCHDOG_KILL: killEnv, TIPATASK_TASK_POLL_MS: taskPollMs }, platform, arch: 'arm64',
     exit: code => exits.push(code),
   });
   const log = { log() {}, warn() {}, error: line => lines.push(line) };
@@ -39,6 +43,8 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
       PROJECT_ROOT: '/project-a', TASK_BACKEND: 'api', CLAUDE_BIN: claudeBin },
     './spawn-utils': { augmentPathEnv: () => ({}), isAsarPath: () => false, cliSpawnSpec: require('./spawn-utils').cliSpawnSpec },
     './task-backend': { createBackend: () => backend, coerceBackendType: () => 'api' },
+    './backend-broadcasts': require('./backend-broadcasts'),
+    './backend-eviction': require('./backend-eviction'),
     './ws-handlers': { createHttpHandler: () => () => {}, drainSessionQueue() {}, sessionQueue: { setAdmission() {}, isRunning: () => false } },
     './session-admission': { createSessionAdmission: () => ({ start() {}, stop() {}, snapshot: () => ({ cap: 6 }) }) },
     './session-validation': { createSessionValidationRecorder: () => ({
@@ -66,6 +72,8 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
       proc, exit: proc.exit, log, recordExit() {} }) },
     './project-config': {},
     './local-access': { createLocalAccess: () => ({}), LOCAL_HOST: '127.0.0.1' },
+    './left-uncommitted': { load: opts => { flagLoads.push({ ...opts, listening: listenCallback !== undefined }); return { restored: 0, dropped: 0 }; } },
+    './task-agent/quota-status': { loadQuotaSnapshots: opts => { quotaLoads.push({ ...opts, listening: listenCallback !== undefined }); return { restored: 0, dropped: 0 }; } },
   };
   const module = { exports: {} };
   const filename = path.join(__dirname, 'index.js');
@@ -79,13 +87,32 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
     setInterval: (fn, ms) => { timers.set(ms, fn); return { unref() {} }; },
     setTimeout, clearTimeout, setImmediate() {},
   }, { filename });
-  // Let the async boot chain install the actual 10-second polling callback.
+  // Let the async boot chain install the completion sweep and task-change poll callbacks.
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(exits, failStartup ? [1] : [], lines.join('\n'));
   if (!failStartup) assert.ok(timers.has(10000));
+  if (!failStartup && taskPollMs === '20000') assert.ok(timers.has(20000));
   return { sessions: module.exports.sessions, timers, proc, exits, lines, sweeps, memory, validation, execCalls,
-    server, shutdownOptions, ready: () => listenCallback(), getMemoryTelemetry: module.exports.getMemoryTelemetry };
+    server, shutdownOptions, flagLoads, quotaLoads, ready: () => listenCallback(), getMemoryTelemetry: module.exports.getMemoryTelemetry };
 }
+
+// TPT670 — the exit backstop's left-uncommitted registry is restored from USER_DATA_ROOT once, at
+// module load, so the first GET /api/sessions and connect replay after a relaunch already carry it.
+test('bootstrap restores the left-uncommitted flag registry from USER_DATA_ROOT once, before the server listens', async () => {
+  const { flagLoads, ready } = await harness();
+  assert.deepEqual(flagLoads, [{ root: '/scratch', listening: false }]);
+  ready();
+  assert.equal(flagLoads.length, 1, 'never reloaded after listen');
+});
+
+// TPT699 — the plan-usage sidebar's last good Claude readings are restored from USER_DATA_ROOT once,
+// at module load, so a 429 hold right after a relaunch already has a reading to serve stale.
+test('bootstrap restores the saved quota readings from USER_DATA_ROOT once, before the server listens', async () => {
+  const { quotaLoads, ready } = await harness();
+  assert.deepEqual(quotaLoads, [{ root: '/scratch', listening: false }]);
+  ready();
+  assert.equal(quotaLoads.length, 1, 'never reloaded after listen');
+});
 
 // TPT575 — the boot-time caveman plugin check execs the Claude CLI through cliSpawnSpec(): POSIX
 // unchanged, win32 hidden and attached (a claude.cmd runs as the program its npm shim launches).
@@ -135,12 +162,12 @@ test('bootstrap guard reads live sessions in any project on every exception', as
   assert.deepEqual(h.exits, [1]);
 });
 
-test('actual 10s poll callback rejects safely without changing live sessions', async () => {
+test('actual task-change poll callback rejects safely without changing live sessions', async () => {
   const h = await harness();
   const session = { alive: true, type: 'terminal' };
   h.sessions.set('b/project-b', session);
   let rejection;
-  try { await h.timers.get(10000)(); } catch (err) { rejection = err; }
+  try { await h.timers.get(20000)(); } catch (err) { rejection = err; }
   assert.match(rejection?.message, /poll failed/);
   h.proc.emit('unhandledRejection', rejection);
   assert.deepEqual(h.exits, []);
@@ -185,9 +212,30 @@ test('completion sweep freezes task memory history even while terminal remains a
   const h = await harness();
   const s = { type: 'terminal', alive: true, taskId: 'TPT1', _terminalOutputSeen: true, onSessionExit() {} };
   h.sessions.set('TPT1', s);
-  await assert.rejects(h.timers.get(10000)(), /poll failed/);
+  await h.timers.get(10000)(); // the completion sweep alone — no longer chained to the task-change poll
   assert.equal(s.alive, true);
   assert.equal(h.memory.ended.length, 1);
   assert.equal(h.memory.ended[0][0], s);
   assert.equal(h.memory.ended[0][1], 'completed');
+});
+
+// TPT610 — the task-change poll defaults to 30s and runs on its own interval, apart from
+// the 10s completion sweep. win32 registers no 30s watchdog, so the 30000 slot is the poll's.
+test('task-change poll defaults to a 30s interval separate from the 10s completion sweep', async () => {
+  const h = await harness(undefined, false, false, { platform: 'win32', taskPollMs: '' });
+  assert.ok(h.timers.has(30000));
+  await assert.rejects(h.timers.get(30000)(), /poll failed/);
+  await h.timers.get(10000)(); // completion sweep never calls the poll
+  const bad = await harness(undefined, false, false, { platform: 'win32', taskPollMs: '50' });
+  assert.ok(bad.timers.has(30000), 'a sub-second value falls back to the default');
+  assert.equal(bad.timers.has(50), false);
+});
+
+// TPT673 — the idle per-project backend eviction sweep is registered on its own interval and
+// a sweep with only the singleton in the registry evicts nothing and never throws.
+test('bootstrap registers the idle backend eviction sweep', async () => {
+  const { BACKEND_EVICT_SWEEP_MS } = require('./backend-eviction');
+  const h = await harness('');
+  assert.ok(h.timers.has(BACKEND_EVICT_SWEEP_MS));
+  h.timers.get(BACKEND_EVICT_SWEEP_MS)();
 });

@@ -8,12 +8,14 @@
 // column default ('Batches'). Callers kick off loadGroupLabel() (async) at fixed trigger
 // points (template.html boot/project-switch); every other call site reads synchronously.
 //
-// Dependency-light on purpose: only imports i18n.js (dependency-free) and api-client.js
-// (already `typeof window !== 'undefined'`-guarded). Keeps this importable under bare
+// Dependency-light on purpose: only imports i18n.js (dependency-free), api-client.js
+// (already `typeof window !== 'undefined'`-guarded) and the server's pure task-key-format.js
+// (dependency-free, the same import task-card.js makes). Keeps this importable under bare
 // `node --test`.
 
 import { t, tc } from './i18n.js';
 import { api } from './api-client.js';
+import { maxNumbersByPrefix, isTaskKeyLike, HUMAN_TASK_PREFIX } from '../server/task-key-format.js';
 
 // Mirrors api/src/lib/task-group-labels.js exactly.
 export const TASK_GROUP_LABELS = ['Sprints', 'Batches', 'Bags', 'Jars', 'Groups', 'Steps'];
@@ -46,6 +48,12 @@ let _objectiveGroupingEnabled = true;
 // task-board.js's renderBoardContent()/renderListContent(). Default 'asc' matches
 // migration 064's column default (ascending, lowest sprint first).
 let _sprintSortOrder = 'asc';
+// (TPT632) This project's CODING task-key prefix — project.task_prefix, already run through
+// the server's resolveCodingPrefix(). Same settings bundle/load-trigger reasoning as the
+// flags above. Read SYNCHRONOUSLY by nextTaskKeyGuess() below (the New Task Preview's id
+// badge). Default 'C' matches the server's own legacy fallback.
+const LEGACY_TASK_PREFIX = 'C';
+let _taskPrefix = LEGACY_TASK_PREFIX;
 
 function _keyFor(label) {
   return LABEL_TO_KEY[label] || LABEL_TO_KEY[DEFAULT_TASK_GROUP_LABEL];
@@ -66,6 +74,7 @@ export function resetGroupLabel() {
   resetSprintsEnabled();
   resetObjectiveGroupingEnabled();
   resetSprintSortOrder();
+  resetTaskPrefix();
 }
 
 // (C1332) Sets sprints_enabled. Unknown/null/undefined -> true (never adopt a falsy value
@@ -114,10 +123,52 @@ export function resetSprintSortOrder() {
   _sprintSortOrder = 'asc';
 }
 
-// Fetches this project's task_group_label + sprints_enabled + use_objective_grouping via
-// api.project.settings() (IPC in Electron, same-origin GET /api/project/settings in browser
-// — see ws-handlers.js). Never throws — api.project.settings() itself degrades to the
-// default on any failure (mirrors getProjectSettings()'s fail-open contract server-side).
+// (TPT632) Sets task_prefix. Adopts only a derived-prefix shape (2-8 capitals, what
+// resolveCodingPrefix() accepts); anything else -> legacy 'C', mirroring setGroupLabel()'s
+// "never adopt an invalid value" discipline.
+export function setTaskPrefix(value) {
+  _taskPrefix = typeof value === 'string' && /^[A-Z]{2,8}$/.test(value) ? value : LEGACY_TASK_PREFIX;
+}
+
+export function getTaskPrefix() {
+  return _taskPrefix;
+}
+
+// Project switch -> back to legacy 'C' until loadGroupLabel() resolves.
+export function resetTaskPrefix() {
+  _taskPrefix = LEGACY_TASK_PREFIX;
+}
+
+// (TPT632) The New Task Preview's id badge: one past the highest key in `tasks` carrying
+// this category's prefix — H for HUMAN, the project's own prefix for CODING. A display
+// guess only: the board's task list is assignee-scoped and sprint-windowed, so the key the
+// API allocates on save can be a later number. template.html's Confirm handler never sends
+// it as the task key.
+export function nextTaskKeyGuess(tasks, category) {
+  const prefix = category === 'HUMAN' ? HUMAN_TASK_PREFIX : _taskPrefix;
+  return `${prefix}${(maxNumbersByPrefix(tasks || []).get(prefix) ?? 0) + 1}`;
+}
+
+// (TPT659) The key the API would actually allocate for the next keyless create of `category`
+// — api.project.nextTaskKey() (IPC in Electron, same-origin GET /api/project/next-task-key in
+// browser), a read-only peek at the API's task_key_counters that nextTaskKeyGuess() above
+// cannot see (deleted tasks, purged reservations, keys outside this board's window). Resolves
+// a key-shaped string or null; never throws and never blocks — template.html's Preview handler
+// shows the guess first and swaps in this answer when it arrives.
+export async function fetchNextTaskKey(category) {
+  try {
+    const result = await api.project.nextTaskKey(category === 'HUMAN' ? 'HUMAN' : 'CODING');
+    const key = result && result.taskKey;
+    return isTaskKeyLike(key) ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+// Fetches this project's task_group_label + sprints_enabled + use_objective_grouping +
+// sprint_sort_order + task_prefix via api.project.settings() (IPC in Electron, same-origin
+// GET /api/project/settings in browser — see ws-handlers.js). Never throws — a failed read
+// falls back to every default (mirrors getProjectSettings()'s fail-open contract server-side).
 export async function loadGroupLabel() {
   try {
     const result = await api.project.settings();
@@ -125,11 +176,13 @@ export async function loadGroupLabel() {
     setSprintsEnabled(result?.sprintsEnabled);
     setObjectiveGroupingEnabled(result?.useObjectiveGrouping);
     setSprintSortOrder(result?.sprintSortOrder);
+    setTaskPrefix(result?.taskPrefix);
   } catch {
     setGroupLabel(null); // -> DEFAULT
     setSprintsEnabled(null); // -> true
     setObjectiveGroupingEnabled(null); // -> true
     setSprintSortOrder(null); // -> 'asc'
+    setTaskPrefix(null); // -> 'C'
   }
   return _label;
 }

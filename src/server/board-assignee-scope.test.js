@@ -16,6 +16,11 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+// Tokens live only in the app-level account store under TIPATASK_USER_DATA. Give this file
+// its own, so parallel test files never race on one shared store file.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-assignee-scope-data-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
+
 const { createApiBackend, filterToOwnOrUnassigned } = require('./api-backend');
 
 // Same throwaway-project harness as reserve-task-keys.test.js.

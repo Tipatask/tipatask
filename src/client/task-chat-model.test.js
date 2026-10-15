@@ -69,6 +69,37 @@ test('buildModelOptionsHtml: escapes provider-supplied text', () => {
   assert.match(html, /value="pi:a&quot;b"/);
 });
 
+// A Pi row whose PI_MODELS entry sets `tools: false` can plan an objective but cannot run a task
+// chat; the server lists it in the pi entry's `toolLessModels`.
+const toolLessPi = {
+  id: 'pi', label: 'Other Model', available: true, defaultModel: 'recraft-v3',
+  models: [{ value: 'recraft-v3' }, { value: 'a/b' }], toolLessModels: ['recraft-v3'],
+};
+
+test('taskChatProviders: drops the tool-less Pi models and leaves the input and other providers alone', () => {
+  const list = [providers[0], toolLessPi];
+  const out = m.taskChatProviders(list);
+  assert.deepEqual(out.find(p => p.id === 'pi').models, [{ value: 'a/b' }]);
+  assert.equal(out.find(p => p.id === 'claude'), providers[0], 'a provider with nothing to drop is passed through as is');
+  assert.deepEqual(toolLessPi.models, [{ value: 'recraft-v3' }, { value: 'a/b' }], 'the objective chat list is not mutated');
+  const allToolLess = m.taskChatProviders([{ ...toolLessPi, models: [{ value: 'recraft-v3' }] }]);
+  assert.deepEqual(allToolLess.map(p => [p.id, p.models]), [['pi', []]], 'the pi entry stays, with no models');
+});
+
+test('task chat selection never lands on a tool-less Pi model', () => {
+  const list = [providers[0], toolLessPi];
+  assert.equal(m.isSelectable(list, 'pi:recraft-v3'), false);
+  assert.equal(m.isSelectable(list, 'pi:a/b'), true);
+  assert.equal(m.pickSelection({ providers: list, serverSelection: 'pi:recraft-v3', stored: 'pi:recraft-v3', fallback: 'pi:recraft-v3' }), 'claude:sonnet');
+  assert.equal(m.pickSelection({ providers: [toolLessPi] }), 'pi:a/b', 'the pi default is tool-less: its first usable model');
+  const html = m.buildModelOptionsHtml(list, 'pi:a/b');
+  assert.doesNotMatch(html, /recraft-v3/);
+  assert.match(html, /<option value="pi:a\/b" selected>/);
+  const onlyToolLess = [{ ...toolLessPi, models: [{ value: 'recraft-v3' }] }];
+  assert.equal(m.buildModelOptionsHtml(onlyToolLess, ''), '', 'no optgroup for a provider with nothing left');
+  assert.equal(m.pickSelection({ providers: onlyToolLess }), '', 'nothing usable: the start gate reports it');
+});
+
 test('stripAskUserFence: removes a complete block and keeps the prose', () => {
   const text = 'Where should it go?\n\n```ask_user\n{"question":"Where?","options":["A","B"]}\n```';
   assert.equal(m.stripAskUserFence(text), 'Where should it go?');

@@ -131,3 +131,38 @@ test('installed guide templates agree on task-local status, caveats, and relevan
   }
   assert.equal(sections[0], sections[1]);
 });
+
+test('installed guide templates carry the follow-up capture rules', () => {
+  const templates = path.resolve(__dirname, '../../../templates');
+  const guides = {
+    'AGENTS.md': { start: '- **Follow-up capture**', checkpoint: /finish Follow-up capture \(Core Workflow\)/ },
+    'CLAUDE.md': { start: '3.7. **Follow-up capture**', checkpoint: /5\. Follow-ups captured\? → step 3\.7/ },
+    '.claude/skills/tipatask-expert/SKILL.md': { start: '### 4. Follow-ups captured?' },
+  };
+  for (const [name, { start, checkpoint }] of Object.entries(guides)) {
+    const guide = fs.readFileSync(path.join(templates, name), 'utf8');
+    const section = guide.split(start)[1]?.split(/\n(?:\d+\. |## |### )/)[0];
+    assert.ok(section, `${name}: missing follow-up capture step`);
+    assert.match(section, /Zero follow-ups is the normal result\./, name);
+    assert.match(section, /Only capture a defect, data risk or security issue in shipped behavior, or a manual step the user must take\./, name);
+    assert.match(section, /Never file improvements, refactors, extra tests, doc ideas, nice-to-haves or things already covered by this task\./, name);
+    assert.match(section, /Prefer a comment on an existing outstanding task/, name);
+    assert.match(section, /At most 2 new tasks per run, each with one sentence of evidence\./, name);
+    assert.match(section, /Only when no outstanding task covers an eligible finding/, name);
+    assert.match(section, /otherwise report "none"/, name);
+    assert.match(section, /`pending` and `on_fire` \(the project's not-started and urgent statuses\)/, name);
+    assert.match(section, /`list_tasks` for each of those statuses, then `get_task` on likely matches/, name);
+    assert.match(section, /[Nn]ever (?:file a )?duplicate/, name);
+    assert.match(section, /create_task_comment\(task_key, content, type: "comment"\)/, name);
+    assert.match(section, /Never touch `in_progress`, `completed` or `canceled` tasks/, name);
+    assert.match(section, /`reserve_task_keys` \(category `HUMAN` only for steps only the user can do\), then `update_task`/, name);
+    assert.match(section, /escaped? (?:every `~` )?as `\\~`|every `~` escaped as `\\~`/, name);
+    assert.match(section, /never file work (?:the|this) task's own scope requires/i, name);
+    assert.match(section, /List every task filed or updated, by key/, name);
+    assert.doesNotMatch(section, /buildFollowUpDirective|ai\/todo\/server|tt-task-agent\.md/, `${name}: repo-only reference`);
+    if (checkpoint) assert.match(guide, checkpoint, name);
+    if (name === 'CLAUDE.md') {
+      assert.match(guide, /5\. Follow-ups captured\?[^\n]*zero is normal[^\n]*at most 2 new tasks per run, each with one sentence of evidence/);
+    }
+  }
+});

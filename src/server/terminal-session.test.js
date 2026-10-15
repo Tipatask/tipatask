@@ -47,8 +47,13 @@ const {
   SUBMIT_MARKER_TRAILING_MAX,
   MAX_SUBMIT_RETRIES,
   MAX_PASTE_RETRIES,
+  pasteAndSubmit,
+  maybeNudgeIdleSession,
+  exitRunSnapshot,
+  flagTaskLeftUncommitted,
+  markPlanApprovedInTui,
 } = require('./terminal-session');
-const { parsePsOutput } = require('./process-group');
+const { parsePsOutput, sweepDescendantWatchdog } = require('./process-group');
 const config = require('./config');
 const { getTaskAgent } = require('./task-agent');
 const BaseTaskAgent = require('./task-agent/base-agent');
@@ -2054,7 +2059,7 @@ test('killRunawaySession records the reason, appends a [Task App] notice to the 
     assert.match(result.text, /^Watchdog killed this session: resource watchdog intervention; 127 descendant processes/);
     assert.match(result.text, /\u226550/);
     assert.match(result.text, /\u2265150/);
-    assert.deepEqual(session._exitReason, { kind: 'runaway-killed', count: 127, threshold: 50, text: result.text });
+    assert.deepEqual(session._exitReason, { kind: 'runaway-killed', count: 127, threshold: 50, text: result.text, display: result.text });
     // Buffer: reconnect replay + the resolution-comment tail both read it.
     assert.ok(session.buffer.startsWith('agent output\r\n'));
     assert.ok(session.buffer.includes(`[Task App] ${result.text}`));
@@ -2298,6 +2303,41 @@ test('resumeAllRunawaySessions resumes every paused session and leaves the other
   });
 });
 
+test('a watchdog sweep pauses with a whole-MiB tree RSS, reports it, and resumes from it (TPT9009)', () => {
+  runWithStubbedKill(() => {
+    const { session, sent } = makeRunawaySession({ type: 'terminal', descendantWatchdog: { threshold: 50, lastCount: 0 } });
+    const sessions = new Map([['T1', session]]);
+    const frames = [];
+    const notices = [];
+    const deps = {
+      resolveLimits: () => ({ warnDescendants: 50, maxTreeRssMb: 3072, watchdogAction: 'pause' }),
+      pauseRunawaySession,
+      killRunawaySession,
+      emitTerminalNotice: (s, text) => notices.push(text),
+      emitSessionRunaway: (projectPath, detail) => frames.push(detail),
+      log() {},
+    };
+    // 150 descendants reach the count ceiling at once; the leader's KB total is not a whole MiB.
+    const tree = (leaderKb) => parsePsOutput([`  424242  424242  1  ${leaderKb}  S  node`,
+      ...Array.from({ length: 150 }, (_, i) => `  424242  ${500000 + i}  424242  0  S  npm`)].join('\n'));
+    sweepDescendantWatchdog(sessions, tree(6384200), { ...deps, sampledAt: 30000 }); // 6234.5703125 MiB
+
+    assert.match(session._pause.text, /; 150 descendant processes using 6235 MiB \(warn ≥50;/);
+    assert.equal(session._pause.rssMb, 6235);
+    // the paused banner's tooltip figures
+    assert.equal(sent.filter(m => m.type === 'terminal-state').at(-1).paused.rssMb, 6235);
+    assert.deepEqual({ paused: frames[0].paused, rssMb: frames[0].rssMb }, { paused: true, rssMb: 6235 });
+
+    resumeRunawaySession(session);
+    assert.deepEqual(session.descendantWatchdog.resumeBase, { count: 150, rssMb: 6235 });
+    // A whole-MiB resume base keeps the raised action mark (6235 + 25% of 3072) printable.
+    sweepDescendantWatchdog(sessions, tree(9626184), { ...deps, sampledAt: 60000 }); // 9400.5703125 MiB
+    assert.match(notices.at(-1), /uses 9401 MiB; RSS warning threshold 3072 MiB \(150 descendant processes\)/);
+    assert.match(notices.at(-1), /RSS stays >7003 MiB for 3 30-second samples/);
+    assert.equal(frames.at(-1).rssMb, 9401);
+  });
+});
+
 test('killRunawaySession continues a paused tree before terminating it', () => {
   runWithStubbedKill((calls) => {
     const { session } = makeRunawaySession();
@@ -2348,6 +2388,29 @@ test('buildTerminalExitFrame adds reason/reasonText for a runaway kill and omits
     type: 'exit', tabId: 'T1', code: 143, tokens: null, filesRead: ['a.js'],
     reason: 'runaway-killed', reasonText: 'watchdog text',
   });
+});
+
+// (TPT9008) The start gate rethrows an agent-detection negative with its stable code, the
+// detection's params and the agent id, so ws-handlers.js startFailureFrame() can send a `reason`
+// the console modal translates. The English message is the detection's own sentence.
+test('spawnTerminal: an unavailable agent fails the start with its detection code, params and agent id', async (t) => {
+  const ptySpawn = t.mock.method(nodePty, 'spawn', () => { throw new Error('pty.spawn must not be reached'); });
+  const agent = getTaskAgent('claude');
+  const negative = agent.unavailableResult('cli_not_found', { detail: { bin: null, exit: null, output: '' } });
+  const detect = t.mock.method(agent, 'cachedDetect', async () => negative);
+  const session = createSession(null, false, 'TPT9008-tab', '');
+  session.taskAgent = 'claude';
+  await assert.rejects(spawnTerminal(session, 'Work on task TPT9008', 'TPT9008', [], { sessions: new Map() }), {
+    message: 'Claude CLI not found. Install claude or ensure its directory is on PATH.',
+    reasonCode: 'cli_not_found',
+    reasonParams: { agent: 'claude' },
+  });
+  assert.equal(detect.mock.callCount(), 2, 'a negative is re-probed once with a cleared bin cache');
+  assert.equal(ptySpawn.mock.callCount(), 0);
+  // An uncoded negative (an older or third-party detect()) still fails the start, without a code.
+  detect.mock.mockImplementation(async () => ({ id: 'claude', label: agent.label, available: false, reason: 'gone' }));
+  await assert.rejects(spawnTerminal(session, 'Work on task TPT9008', 'TPT9008', [], { sessions: new Map() }),
+    { message: 'gone', reasonCode: null, reasonParams: { agent: 'claude' } });
 });
 
 // ── Kickoff submit across a stop -> restart ──
@@ -2804,3 +2867,756 @@ test('terminal spawn and natural exit notify memory lifetime tracker exactly onc
   assert.deepEqual(calls, [['start', k.session], ['exited', k.session]]);
   assert.equal(k.session.ptyPid, null);
 });
+
+// ── Idle completion nudge (TPT612) ──
+const NUDGE_ROLES = { start: 'pending', in_progress: 'in_progress', complete: 'completed', canceled: 'canceled' };
+const NUDGE_VCS = { type: 'git', worktree: false, commit: true, pr: false, merge: false };
+function makeNudgeSession(overrides = {}) {
+  const writes = [];
+  const session = {
+    type: 'terminal', alive: true, taskId: 'TPT1', taskAgent: 'codex', terminalPhase: 'executing',
+    _injectDone: true, lastOutputAt: Date.now() - 120000, nudgeCount: 0, _nudgeTypedLine: '',
+    pty: { write: (d) => writes.push(d) }, ...overrides,
+  };
+  return { session, writes };
+}
+function nudgeBackend(status = 'in_progress') {
+  return { getTask: async (id) => ({ id, status }) };
+}
+function nudgeDeps(check, calls = []) {
+  return {
+    fetchStatusRoles: async () => NUDGE_ROLES,
+    checkTaskCommit: async (args) => { calls.push(args); return check; },
+  };
+}
+const MISSING_CHECK = { verified: true, vcs: NUDGE_VCS, ready: false, blockers: [{ code: 'TASK_COMMIT_MISSING', message: 'no commit starting with TPT1' }] };
+
+test('maybeNudgeIdleSession: in-progress task without its commit gets one pasted nudge per idle period, max 2', async (t) => {
+  const { session, writes } = makeNudgeSession();
+  t.after(() => { session.alive = false; });
+  const calls = [];
+  const opts = { backend: nudgeBackend(), projectRoot: '/p', deps: nudgeDeps(MISSING_CHECK, calls) };
+  let r = await maybeNudgeIdleSession(session, opts);
+  assert.equal(r.nudged, true);
+  assert.equal(session.nudgeCount, 1);
+  assert.equal(writes.length, 1, 'paste is written at once on an idle PTY');
+  assert.match(writes[0], /^\x1b\[200~\[Tipatask\] Task TPT1 is still in progress/);
+  assert.match(writes[0], /call complete_task\(TPT1, resolution\).*\x1b\[201~$/);
+  assert.deepEqual(calls[0], { backend: opts.backend, projectRoot: '/p', taskId: 'TPT1' });
+
+  r = await maybeNudgeIdleSession(session, opts);
+  assert.equal(r.reason, 'already_checked', 'same idle period is never re-checked');
+  assert.equal(calls.length, 1);
+
+  session.lastOutputAt -= 1; // a new idle period
+  assert.equal((await maybeNudgeIdleSession(session, opts)).nudged, true);
+  assert.equal(session.nudgeCount, 2);
+  session.lastOutputAt -= 1;
+  assert.equal((await maybeNudgeIdleSession(session, opts)).reason, 'max_nudges');
+  assert.equal(calls.length, 2);
+});
+
+test('maybeNudgeIdleSession: closed status, planning phase, commits off and unknown verification never nudge', async () => {
+  for (const status of ['completed', 'canceled', 'on_fire']) {
+    const { session, writes } = makeNudgeSession();
+    const calls = [];
+    const r = await maybeNudgeIdleSession(session, { backend: nudgeBackend(status), deps: nudgeDeps(MISSING_CHECK, calls) });
+    assert.equal(r.reason, 'not_in_progress', status);
+    assert.equal(calls.length, 0, `${status}: no git check`);
+    assert.deepEqual(writes, []);
+    assert.equal(session.nudgeCount, 0);
+  }
+  for (const overrides of [{ terminalPhase: 'planning' }, { _injectDone: false }, { _completionEmitted: true }, { _pause: { at: 1 } }, { alive: false }]) {
+    const { session, writes } = makeNudgeSession(overrides);
+    const r = await maybeNudgeIdleSession(session, { backend: nudgeBackend(), deps: nudgeDeps(MISSING_CHECK) });
+    assert.equal(r.nudged, false, JSON.stringify(overrides));
+    assert.deepEqual(writes, []);
+  }
+  for (const check of [
+    { ...MISSING_CHECK, vcs: { ...NUDGE_VCS, commit: false }, blockers: [] },
+    { verified: false, vcs: NUDGE_VCS, ready: false, blockers: [{ code: 'settings_unavailable' }] },
+    { ...MISSING_CHECK, blockers: [{ code: 'git_verification_failed' }] },
+  ]) {
+    const { session, writes } = makeNudgeSession();
+    assert.equal((await maybeNudgeIdleSession(session, { backend: nudgeBackend(), deps: nudgeDeps(check) })).nudged, false);
+    assert.deepEqual(writes, []);
+  }
+  const { session } = makeNudgeSession();
+  const throwing = { getTask: async () => { throw new Error('offline'); } };
+  assert.equal((await maybeNudgeIdleSession(session, { backend: throwing, deps: nudgeDeps(MISSING_CHECK) })).reason, 'error');
+  assert.equal(session._nudgeInFlight, false);
+});
+
+test('maybeNudgeIdleSession: output during the async check cancels the nudge', async () => {
+  const { session, writes } = makeNudgeSession();
+  const deps = nudgeDeps(MISSING_CHECK);
+  const inner = deps.checkTaskCommit;
+  deps.checkTaskCommit = async (a) => { session.lastOutputAt = Date.now(); return inner(a); };
+  assert.equal((await maybeNudgeIdleSession(session, { backend: nudgeBackend(), deps })).reason, 'resumed');
+  assert.deepEqual(writes, []);
+  assert.equal(session.nudgeCount, 0);
+});
+
+test('maybeNudgeIdleSession: a reachable <KEY>: commit (real Git fixture) gets the completion-only nudge', async (t) => {
+  const fx = require('./git-merge/test-fixture');
+  fx.applyFixtureEnvToProcess();
+  if (fx.skipUnless(t)) return;
+  const f = fx.buildFixture(t);
+  const row = { id: 7, vcs_type: 'git', vcs_worktree_enabled: 0, vcs_commit_enabled: 1, vcs_pr_enabled: 0, vcs_merge_enabled: 0 };
+  const backend = {
+    getCredentials: () => ({ projectId: 7 }),
+    async getProjectSettings() { return { ...row }; },
+    async getTask(id) { return { id, status: 'in_progress' }; },
+  };
+  const deps = { fetchStatusRoles: async () => NUDGE_ROLES };
+  const { session, writes } = makeNudgeSession({ projectPath: f.root });
+  t.after(() => { session.alive = false; });
+  const first = await maybeNudgeIdleSession(session, { backend, deps });
+  assert.equal(first.kind, 'commit', 'no TPT1 commit yet');
+  writes.length = 0;
+  fx.commit(f.git, f.nested, { 'src/fix1.js': 'fix\n' }, 'TPT1: Fix the nested server');
+  session.lastOutputAt -= 1;
+  const r = await maybeNudgeIdleSession(session, { backend, deps });
+  assert.equal(r.kind, 'complete', 'commit reachable, completion call still missing');
+  assert.equal(writes.length, 1);
+  assert.match(writes[0], /TPT1 is still in progress and its completion check passes/);
+  assert.doesNotMatch(writes[0], /commit/i);
+  assert.equal(session.nudgeCount, 2);
+});
+
+// ── Completion-only nudge (TPT650) ──
+const READY_CHECK = { verified: true, vcs: NUDGE_VCS, ready: true, blockers: [] };
+
+test('maybeNudgeIdleSession: ready verification with an in-progress task gets the completion-only nudge in any project', async (t) => {
+  for (const vcs of [NUDGE_VCS, { ...NUDGE_VCS, commit: false }, { type: 'off', worktree: false, commit: false, pr: false, merge: false }]) {
+    const { session, writes } = makeNudgeSession();
+    t.after(() => { session.alive = false; });
+    const r = await maybeNudgeIdleSession(session, { backend: nudgeBackend(), deps: nudgeDeps({ ...READY_CHECK, vcs }) });
+    assert.deepEqual(r, { nudged: true, reason: 'nudged', kind: 'complete' }, JSON.stringify(vcs));
+    assert.equal(session.nudgeCount, 1);
+    assert.equal(writes.length, 1);
+    assert.match(writes[0], /^\x1b\[200~\[Tipatask\] Task TPT1 is still in progress and its completion check passes/);
+    assert.match(writes[0], /call complete_task\(TPT1, resolution\).*\x1b\[201~$/);
+    assert.doesNotMatch(writes[0], /commit/i);
+  }
+  // Same MAX_NUDGES budget and once-per-idle-period gate as the blocker nudge.
+  const { session, writes } = makeNudgeSession();
+  t.after(() => { session.alive = false; });
+  const opts = { backend: nudgeBackend(), deps: nudgeDeps(READY_CHECK) };
+  assert.equal((await maybeNudgeIdleSession(session, opts)).kind, 'complete');
+  assert.equal((await maybeNudgeIdleSession(session, opts)).reason, 'already_checked');
+  session.lastOutputAt -= 1;
+  assert.equal((await maybeNudgeIdleSession(session, opts)).kind, 'complete');
+  session.lastOutputAt -= 1;
+  assert.equal((await maybeNudgeIdleSession(session, opts)).reason, 'max_nudges');
+  assert.equal(writes.length, 2);
+});
+
+test('maybeNudgeIdleSession: a completed task or an unverified ready read gets no completion nudge', async () => {
+  for (const status of ['completed', 'canceled', 'on_fire']) {
+    const { session, writes } = makeNudgeSession();
+    const calls = [];
+    const r = await maybeNudgeIdleSession(session, { backend: nudgeBackend(status), deps: nudgeDeps(READY_CHECK, calls) });
+    assert.equal(r.reason, 'not_in_progress', status);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(writes, []);
+  }
+  const { session, writes } = makeNudgeSession();
+  const r = await maybeNudgeIdleSession(session, { backend: nudgeBackend(), deps: nudgeDeps({ ...READY_CHECK, verified: false }) });
+  assert.equal(r.reason, 'no_nudge_needed');
+  assert.deepEqual(writes, []);
+});
+
+// ── Exit backstop (TPT613) ──
+function exitRun(overrides = {}) {
+  return { type: 'terminal', taskId: 'TPT1', projectPath: '/projects/a', agent: 'claude', executing: true, nudgeCount: 1, spawnedAt: 111, ...overrides };
+}
+const EXIT_STATUSES = [{ name: 'pending' }, { name: 'in_progress', is_in_progress: true }, { name: 'on_fire' }, { name: 'completed', is_workflow_complete: true }];
+// Every write lands in `log`, in order. The first getTask returns `status`, later ones `freshStatus`.
+function exitBackstopFakes({ status = 'in_progress', freshStatus = status, statuses = EXIT_STATUSES, check = MISSING_CHECK, statusesThrow = false } = {}) {
+  const log = [];
+  const checks = [];
+  let reads = 0;
+  const backend = {
+    async getTask(id) { reads++; return { id, status: reads === 1 ? status : freshStatus }; },
+    async getStatuses(opts) { log.push(['getStatuses', opts]); if (statusesThrow) throw new Error('offline'); return statuses; },
+    async updateTask(id, fields) { log.push(['updateTask', id, fields]); return { id, ...fields }; },
+    async createTaskComment(id, content, type) { log.push(['comment', id, content, type]); return { id: 1 }; },
+  };
+  const deps = {
+    fetchStatusRoles: async () => NUDGE_ROLES,
+    checkTaskCommit: async (args) => { checks.push(args); return check; },
+    websocket: {
+      emitTaskUpdated: (task, opts, projectPath) => log.push(['task:updated', task, projectPath]),
+      emitTaskLeftUncommitted: (projectPath, taskKey, blockers, extra) => log.push(['frame', projectPath, taskKey, blockers, extra]),
+    },
+    // (TPT664) the server-side flag registry every window rebuilds from
+    leftUncommitted: { record: (projectPath, taskKey, entry) => log.push(['record', projectPath, taskKey, entry]) },
+  };
+  return { backend, deps, log, checks };
+}
+
+test('flagTaskLeftUncommitted: an executing run that left its task in progress without the commit gets on_fire, a comment and a frame, in that order', async () => {
+  const f = exitBackstopFakes();
+  const r = await flagTaskLeftUncommitted(exitRun(), { backend: f.backend, projectRoot: '/p', reason: 'user-terminated', deps: f.deps });
+  assert.equal(r.flagged, true);
+  assert.equal(r.status, 'on_fire');
+  assert.deepEqual(f.checks, [{ backend: f.backend, projectRoot: '/p', taskId: 'TPT1' }]);
+  assert.deepEqual(f.log.map(e => e[0]), ['getStatuses', 'updateTask', 'task:updated', 'comment', 'record', 'frame']);
+  assert.deepEqual(f.log[0][1], { refresh: true, strict: true }, 'on_fire only from the strict registry');
+  assert.deepEqual(f.log[1].slice(1), ['TPT1', { status: 'on_fire' }]);
+  assert.equal(f.log[2][2], '/projects/a', 'task:updated is project-scoped');
+  const [, id, content, type] = f.log[3];
+  assert.equal(id, 'TPT1');
+  assert.equal(type, 'resolution');
+  assert.match(content, /^Agent exited without committing \/ completing: no task commit found\n\n- no commit starting with TPT1\n\n/);
+  assert.match(content, /terminated by the user while the task was still in_progress, after 1 idle completion nudge\. .*Status set to on_fire\.$/);
+  // (TPT664) Recorded server-side before the frame, under the run's project, with the closed role
+  // names a later task:updated is judged against — never a hardcoded literal.
+  const [, recProject, recKey, rec] = f.log[4];
+  assert.equal(recProject, '/projects/a');
+  assert.equal(recKey, 'TPT1');
+  assert.deepEqual({ ...rec, at: 0 }, { exitId: 'TPT1@111', blockers: [{ code: 'TASK_COMMIT_MISSING', message: 'no commit starting with TPT1' }],
+    status: 'on_fire', agent: 'claude', nudgeCount: 1, at: 0, closedNames: [NUDGE_ROLES.complete, NUDGE_ROLES.canceled] });
+  assert.ok(rec.at > 0);
+  assert.deepEqual(f.log[5].slice(1), ['/projects/a', 'TPT1',
+    [{ code: 'TASK_COMMIT_MISSING', message: 'no commit starting with TPT1' }],
+    { status: 'on_fire', nudgeCount: 1, agent: 'claude', exitId: 'TPT1@111' }]);
+});
+
+test('flagTaskLeftUncommitted: nothing is recorded server-side unless the frame goes out; spawnTerminal() retires the flag for a new run', async () => {
+  const f = exitBackstopFakes();
+  assert.equal((await flagTaskLeftUncommitted(exitRun(), { backend: f.backend, deps: f.deps, isSuperseded: () => true })).reason, 'superseded');
+  assert.equal(f.log.some(e => e[0] === 'record'), false);
+  const g = exitBackstopFakes({ check: { verified: true, vcs: NUDGE_VCS, ready: true, blockers: [] } });
+  await flagTaskLeftUncommitted(exitRun(), { backend: g.backend, deps: g.deps });
+  assert.equal(g.log.some(e => e[0] === 'record'), false);
+  // _spawnTerminal() is not unit-runnable (CLI detection, token gate); pin the wrapper's clear by source.
+  const src = require('node:fs').readFileSync(require.resolve('./terminal-session'), 'utf8');
+  const wrapper = src.slice(src.indexOf('async function spawnTerminal('), src.indexOf('async function _spawnTerminal('));
+  assert.match(wrapper, /require\('\.\/left-uncommitted'\)\.clear\(session\.projectPath, taskId\)/);
+  assert.match(wrapper, /emitTaskLeftUncommitted\(session\.projectPath, taskId, \[\], \{ cleared: true, exitId: removed\.exitId \}\)/);
+});
+
+test('flagTaskLeftUncommitted: a clean commit posts nothing', async () => {
+  const f = exitBackstopFakes({ check: { verified: true, vcs: NUDGE_VCS, ready: true, blockers: [] } });
+  assert.deepEqual(await flagTaskLeftUncommitted(exitRun(), { backend: f.backend, deps: f.deps }), { flagged: false, reason: 'no_flag_needed' });
+  assert.equal(f.checks.length, 1);
+  assert.deepEqual(f.log, [], 'no status write, no comment, no frame');
+});
+
+test('flagTaskLeftUncommitted: a closed or blocked task never reads Git; planning, completed, objective close and unknown checks never flag', async () => {
+  for (const status of ['completed', 'canceled', 'on_fire', 'pending']) {
+    const f = exitBackstopFakes({ status });
+    assert.equal((await flagTaskLeftUncommitted(exitRun(), { backend: f.backend, deps: f.deps })).reason, 'not_in_progress', status);
+    assert.equal(f.checks.length, 0, `${status}: no git check`);
+    assert.deepEqual(f.log, []);
+  }
+  for (const [run, opts, reason] of [
+    [exitRun({ executing: false }), {}, 'not_executing'],
+    [exitRun({ type: 'taskChat' }), {}, 'not_task_terminal'],
+    [exitRun(), { reason: 'completed' }, 'not_abandoned'],
+    [exitRun(), { reason: 'user-terminated', terminateReason: 'objective-closed' }, 'not_abandoned'],
+  ]) {
+    const f = exitBackstopFakes();
+    assert.equal((await flagTaskLeftUncommitted(run, { backend: f.backend, deps: f.deps, ...opts })).reason, reason);
+    assert.equal(f.checks.length, 0);
+    assert.deepEqual(f.log, []);
+  }
+  for (const check of [
+    { verified: false, vcs: NUDGE_VCS, ready: false, blockers: [{ code: 'settings_unavailable' }] },
+    { ...MISSING_CHECK, vcs: { ...NUDGE_VCS, commit: false } },
+    { ...MISSING_CHECK, blockers: [...MISSING_CHECK.blockers, { code: 'git_verification_failed' }] },
+  ]) {
+    const f = exitBackstopFakes({ check });
+    assert.equal((await flagTaskLeftUncommitted(exitRun(), { backend: f.backend, deps: f.deps })).flagged, false);
+    assert.deepEqual(f.log, []);
+  }
+  assert.equal((await flagTaskLeftUncommitted(exitRun(), { backend: null })).reason, 'no_backend');
+  const offline = exitBackstopFakes();
+  offline.backend.getTask = async () => { throw new Error('offline'); };
+  assert.equal((await flagTaskLeftUncommitted(exitRun(), { backend: offline.backend, deps: offline.deps })).reason, 'error');
+});
+
+test('flagTaskLeftUncommitted: a newer run, or a status the user changed meanwhile, wins: nothing is written', async () => {
+  const f = exitBackstopFakes();
+  assert.equal((await flagTaskLeftUncommitted(exitRun(), { backend: f.backend, deps: f.deps, isSuperseded: () => true })).reason, 'superseded');
+  assert.deepEqual(f.log.map(e => e[0]), ['getStatuses']);
+  const g = exitBackstopFakes({ freshStatus: 'completed' });
+  assert.equal((await flagTaskLeftUncommitted(exitRun(), { backend: g.backend, deps: g.deps })).reason, 'status_changed');
+  assert.deepEqual(g.log.map(e => e[0]), ['getStatuses']);
+});
+
+test('flagTaskLeftUncommitted: no on_fire status, an unreadable registry or a failed status write leave the status alone; comment and frame still go out', async () => {
+  for (const opts of [{ statuses: [{ name: 'in_progress' }, { name: 'completed' }] }, { statusesThrow: true }]) {
+    const f = exitBackstopFakes(opts);
+    const r = await flagTaskLeftUncommitted(exitRun(), { backend: f.backend, deps: f.deps, reason: 'user-terminated' });
+    assert.equal(r.flagged, true);
+    assert.equal(r.status, 'in_progress');
+    assert.deepEqual(f.log.map(e => e[0]), ['getStatuses', 'comment', 'record', 'frame']);
+    assert.doesNotMatch(f.log[1][2], /on_fire/, 'the comment never claims a status it did not set');
+    assert.equal(f.log[2][3].status, 'in_progress', 'the registry entry carries the status actually left');
+    assert.equal(f.log[3][4].status, 'in_progress');
+  }
+  const h = exitBackstopFakes();
+  h.backend.updateTask = async () => { throw new Error('400 invalid status'); };
+  assert.equal((await flagTaskLeftUncommitted(exitRun(), { backend: h.backend, deps: h.deps })).flagged, true);
+  assert.deepEqual(h.log.map(e => e[0]), ['getStatuses', 'comment', 'record', 'frame']);
+  assert.doesNotMatch(h.log[1][2], /on_fire/);
+});
+
+test('exitRunSnapshot: reads the run that just ended', () => {
+  assert.deepEqual(
+    exitRunSnapshot({ type: 'terminal', taskId: 'TPT1', projectPath: '/a', taskAgent: 'codex', terminalPhase: 'executing', _injectDone: true, nudgeCount: 2, _transcriptHint: { spawnedAt: 5 } }),
+    { type: 'terminal', taskId: 'TPT1', projectPath: '/a', agent: 'codex', executing: true, nudgeCount: 2, spawnedAt: 5 });
+  assert.equal(exitRunSnapshot({ type: 'terminal', terminalPhase: 'planning', _injectDone: true }).executing, false);
+  assert.equal(exitRunSnapshot({ type: 'terminal', terminalPhase: 'executing', _injectDone: false }).executing, false);
+});
+
+test('flagTaskLeftUncommitted: real Git fixture — no task commit flags the task, a reachable <KEY>: commit posts nothing', async (t) => {
+  const fx = require('./git-merge/test-fixture');
+  fx.applyFixtureEnvToProcess();
+  if (fx.skipUnless(t)) return;
+  const f = fx.buildFixture(t);
+  const row = { id: 7, vcs_type: 'git', vcs_worktree_enabled: 0, vcs_commit_enabled: 1, vcs_pr_enabled: 0, vcs_merge_enabled: 0 };
+  const posted = [];
+  const frames = [];
+  const backend = {
+    getCredentials: () => ({ projectId: 7 }),
+    async getProjectSettings() { return { ...row }; },
+    async getTask(id) { return { id, status: 'in_progress' }; },
+    async getStatuses() { return [{ name: 'in_progress' }, { name: 'on_fire' }]; },
+    async updateTask(id, fields) { posted.push(['status', fields.status]); return { id, ...fields }; },
+    async createTaskComment(id, content) { posted.push(['comment', content]); },
+  };
+  const deps = { fetchStatusRoles: async () => NUDGE_ROLES, websocket: { emitTaskUpdated() {}, emitTaskLeftUncommitted: (...a) => frames.push(a) } };
+  const run = exitRun({ projectPath: f.root });
+  assert.equal((await flagTaskLeftUncommitted(run, { backend, deps, reason: 'user-terminated' })).flagged, true, 'no TPT1 commit yet');
+  assert.deepEqual(posted.map(p => p[0]), ['status', 'comment']);
+  assert.equal(frames.length, 1);
+  posted.length = 0;
+  frames.length = 0;
+  fx.commit(f.git, f.nested, { 'src/fix1.js': 'fix\n' }, 'TPT1: Fix the nested server');
+  assert.equal((await flagTaskLeftUncommitted(run, { backend, deps, reason: 'user-terminated' })).reason, 'no_flag_needed');
+  assert.deepEqual(posted, []);
+  assert.deepEqual(frames, []);
+});
+
+test('pasteAndSubmit: paste, then typed line, then Enter, each after a silence window', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000000 });
+  const writes = [];
+  const session = { alive: true, lastOutputAt: 0, pty: { write: (d) => { writes.push(d); session.lastOutputAt = Date.now(); } } };
+  const agent = { getPasteSilenceMs: () => 400 };
+  pasteAndSubmit(session, agent, 'Finish the task.', 'Please finish the steps pasted above.');
+  assert.deepEqual(writes, ['\x1b[200~Finish the task.\x1b[201~']);
+  t.mock.timers.tick(399);
+  assert.equal(writes.length, 1, 'waits for the echo to settle');
+  t.mock.timers.tick(1);
+  assert.deepEqual(writes.slice(1), ['Please finish the steps pasted above.']);
+  t.mock.timers.tick(400);
+  assert.deepEqual(writes.slice(2), ['\r']);
+  const late = { alive: true, lastOutputAt: 0, pty: { write: (d) => writes.push(d) } };
+  const before = writes.length;
+  pasteAndSubmit(late, agent, 'x');
+  late.alive = false;
+  t.mock.timers.tick(5000);
+  assert.equal(writes.length, before + 1, 'a stopped session gets no Enter');
+});
+
+// ── In-TUI plan approval (TPT654) ──
+// A plan approved inside the agent's own TUI (Claude's ExitPlanMode dialog answered in the xterm,
+// a typed go-ahead to Codex/Pi) must flip terminalPhase exactly like approvePlan() does, because
+// the idle nudge and the exit backstop above only act on an executing run. Claude cases replay
+// recorded PTY output (fixtures/attention/claude-plan-*.jsonl); Codex/Pi cases latch plan-ready
+// the way the existing plan-ready tests do and then type into the composer.
+
+function tuiSession(agentId, overrides = {}) {
+  const { session, events } = makeAttentionSession();
+  const messages = [];
+  Object.assign(session, {
+    type: 'terminal', taskId: 'TPT1', tabId: 'TPT1', taskAgent: agentId, terminalPhase: 'planning',
+    _injectDone: true, alive: true, buffer: 'x'.repeat(501), _attentionTail: '', _attentionRowCarry: '',
+    planApprovalCommand: getTaskAgent(agentId).approvalCommand,
+    pty: { write() {} },
+    ws: { OPEN: 1, readyState: 1, send: msg => messages.push(JSON.parse(msg)) },
+    ...overrides,
+  });
+  return { session, events, messages };
+}
+
+// The dialog frame and its collapsed outcome rows, painted the way Ink does (cursor-addressed rows,
+// each frame ending in a line break so the legacy newline-carved stream keeps pace with the reflow
+// stream, as in the recorded captures).
+const CLAUDE_PLAN_DIALOG_CHUNK = '\x1b[H\x1b[3;2H╭──────────────────────────────────────────╮\x1b[4;2H│ Ready to code?                           │'
+  + "\x1b[6;2H│ Claude has written up a plan and is ready to execute. Would you like to proceed? │"
+  + '\x1b[8;2H│ ❯ 1. Yes, auto-accept edits               │\x1b[9;2H│   2. Yes, manually approve edits          │\x1b[10;2H│   3. No, keep planning                     │'
+  + '\x1b[11;2H╰──────────────────────────────────────────╯\r\n';
+const CLAUDE_APPROVED_CHUNK = "\x1b[H\x1b[2K\x1b[3;2H⏺ User approved Claude's plan\x1b[4;4HPlan saved to: /tmp/plan.md\x1b[6;2H⏺ Creating hello.txt now.\x1b[8;2H╭──────────────────────────╮\x1b[9;2H│ >                        │\x1b[10;2H╰──────────────────────────╯\x1b[11;4H⏵⏵ accept edits on (shift+tab to cycle)\r\n";
+const CLAUDE_REJECTED_CHUNK = "\x1b[H\x1b[2K\x1b[3;2H⏺ User rejected Claude's plan:\x1b[4;4HMake the plan a single line.\x1b[6;2H⏺ Revising the plan.\x1b[8;2H╭──────────────────────────╮\x1b[9;2H│ >                        │\x1b[10;2H╰──────────────────────────╯\x1b[11;4H⏸ plan mode on (shift+tab to cycle)\r\n";
+
+// Each chunk lands 10s after the previous one, so the detector's redraw grace never keeps a
+// dismissed dialog's attention state alive across the replay.
+function feedClaude(session, chunks) {
+  session._tuiClock = session._tuiClock || Date.now();
+  for (const raw of chunks) { session._tuiClock += 10000; feedRaw(session, getTaskAgent('claude'), raw, session._tuiClock); }
+}
+
+test('TPT654 step 1: a Claude dialog left unanswered keeps planning — no nudge, no exit backstop (the pre-fix life of every in-TUI approval)', async () => {
+  const { session, events, messages } = tuiSession('claude', { lastOutputAt: Date.now() - 120000, nudgeCount: 0, _nudgeTypedLine: '' });
+  feedClaude(session, [CLAUDE_PLAN_DIALOG_CHUNK]);
+  assert.equal(session.terminalPhase, 'planning');
+  assert.ok(events.some(e => e.type === 'raise'), 'the dialog itself raises attention (its option row wins the last-match rule)');
+  assert.deepEqual(messages, [], 'no terminal-state while the dialog waits');
+  const writes = [];
+  session.pty = { write: d => writes.push(d) };
+  assert.equal((await maybeNudgeIdleSession(session, { backend: nudgeBackend(), deps: nudgeDeps(MISSING_CHECK) })).reason, 'not_executing');
+  assert.deepEqual(writes, []);
+  const run = exitRunSnapshot(session);
+  assert.equal(run.executing, false);
+  const f = exitBackstopFakes();
+  assert.equal((await flagTaskLeftUncommitted(run, { backend: f.backend, deps: f.deps, reason: 'user-terminated' })).reason, 'not_executing');
+  assert.deepEqual(f.log, []);
+});
+
+test('TPT654 Claude: the answered dialog\'s "User approved Claude\'s plan" row flips the phase once, with a terminal-state + notice and the planReady ring cleared', () => {
+  const { session, events, messages } = tuiSession('claude');
+  feedClaude(session, [CLAUDE_PLAN_DIALOG_CHUNK, CLAUDE_APPROVED_CHUNK]);
+  assert.equal(session.terminalPhase, 'executing');
+  assert.equal(session._planApprovedInTui, 'dialog');
+  assert.equal(session.agentPlanReady, false);
+  const states = messages.filter(m => m.type === 'terminal-state');
+  assert.equal(states.length, 1);
+  assert.equal(states[0].phase, 'executing');
+  assert.equal(states[0].tabId, 'TPT1');
+  assert.ok(messages.some(m => m.type === 'data' && /Plan approved inside the agent/.test(m.data)));
+  assert.ok(events.some(e => e.type === 'clear'), 'the dialog ring is withdrawn');
+  assert.equal(session._attentionState, null);
+  // The same row repainted later (scrollback redraw) is a no-op.
+  feedClaude(session, [CLAUDE_APPROVED_CHUNK]);
+  assert.equal(messages.filter(m => m.type === 'terminal-state').length, 1);
+  assert.equal(session.terminalPhase, 'executing');
+});
+
+test('TPT654 Claude: "No, keep planning" stays planning; the later approval still flips', () => {
+  const { session, messages } = tuiSession('claude');
+  feedClaude(session, [CLAUDE_PLAN_DIALOG_CHUNK, CLAUDE_REJECTED_CHUNK]);
+  assert.equal(session.terminalPhase, 'planning');
+  assert.equal(session._planApprovedInTui, undefined);
+  assert.deepEqual(messages.filter(m => m.type === 'terminal-state'), []);
+  feedClaude(session, [CLAUDE_PLAN_DIALOG_CHUNK, CLAUDE_APPROVED_CHUNK]);
+  assert.equal(session.terminalPhase, 'executing');
+});
+
+test('TPT654 Claude: leaving plan mode via shift+tab (mode footer) counts; a plan-mode footer and pre-kickoff rows do not', () => {
+  const { session } = tuiSession('claude');
+  feedClaude(session, ['\x1b[H\x1b[11;4H⏸ plan mode on (shift+tab to cycle)\n']);
+  assert.equal(session.terminalPhase, 'planning');
+  feedClaude(session, ['\x1b[H\x1b[11;4H⏵⏵ accept edits on (shift+tab to cycle)\n']);
+  assert.equal(session.terminalPhase, 'executing');
+  assert.equal(session._planApprovedInTui, 'mode');
+  const early = tuiSession('claude', { _injectDone: false });
+  feedClaude(early.session, [CLAUDE_PLAN_DIALOG_CHUNK, CLAUDE_APPROVED_CHUNK, '\x1b[H⏵⏵ accept edits on (shift+tab to cycle)\n']);
+  assert.equal(early.session.terminalPhase, 'planning', 'nothing painted before the kickoff can approve');
+  // Only Claude reads these rows: the same text in a Codex/Pi terminal means nothing.
+  for (const agentId of ['codex', 'pi']) {
+    const other = tuiSession(agentId);
+    for (const raw of [CLAUDE_APPROVED_CHUNK, '⏵⏵ accept edits on\n']) feedRaw(other.session, getTaskAgent(agentId), raw);
+    assert.equal(other.session.terminalPhase, 'planning', agentId);
+  }
+});
+
+test('TPT654 Codex: an approval typed into the composer after plan-ready latched flips the phase; feedback keeps planning and the revised plan re-fires', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const { session, messages } = replayAgentKind(['Plan ready.\n'], 'codex', 'planReady', { tick: ms => t.mock.timers.tick(ms), details: true });
+  Object.assign(session, { type: 'terminal', taskId: 'TPT1', planApprovalCommand: null, _injectDone: true });
+  assert.equal(session._planReadySent, true);
+  assert.equal(messages.filter(m => m.type === 'plan-ready').length, 1);
+  const writes = [];
+  session.pty = { write: d => writes.push(d) };
+  // Feedback first: the run stays planning and the Enter still invalidates the announced plan.
+  handleTerminalInput(session, 'Please revise step 2\r');
+  assert.equal(session.terminalPhase, 'planning');
+  assert.equal(codexPlanReadyIsFresh(session), false);
+  assert.equal(session._planReadySent, false);
+  // The revised plan is announced again — the pre-existing re-fire path is intact.
+  feedRaw(session, getTaskAgent('codex'), 'Revised.\nPlan ready.\n');
+  t.mock.timers.tick(CODEX_PLAN_QUIET_MS);
+  assert.equal(messages.filter(m => m.type === 'plan-ready').length, 2);
+  assert.equal(session._planReadySent, true);
+  // Typed char by char, with a typo fixed by backspace: "go" + Enter.
+  for (const ch of ['g', 'p', '\x7f', 'o', '\r']) handleTerminalInput(session, ch);
+  assert.equal(session.terminalPhase, 'executing');
+  assert.equal(session._planApprovedInTui, 'typed');
+  assert.equal(codexPlanReadyIsFresh(session), false);
+  assert.deepEqual(writes, ['Please revise step 2\r', 'g', 'p', '\x7f', 'o', '\r'], 'every keystroke still reaches the PTY untouched');
+  const last = messages.at(-1);
+  assert.equal(last.type, 'data');
+  assert.match(last.data, /Plan approved inside the agent/);
+  const lastState = messages.filter(m => m.type === 'terminal-state').at(-1);
+  assert.equal(lastState.phase, 'executing');
+  assert.equal(lastState.codexPlanReady, false);
+  // Executing now: typing no longer goes through the classifier.
+  handleTerminalInput(session, 'go\r');
+  assert.equal(messages.filter(m => m.type === 'terminal-state' && m.phase === 'executing').length, 1);
+});
+
+test('TPT654 Pi: typed approval after the recorded "Plan ready." sentinel flips; bare Enter, pre-latch typing and feedback never do', () => {
+  const chunks = loadAttentionFixture('pi-plan-ready.jsonl');
+  const { session, messages } = replayAgentKind(chunks, 'pi', 'planReady', { details: true });
+  Object.assign(session, { type: 'terminal', taskId: 'TPT1', planApprovalCommand: null, _injectDone: true, pty: { write() {} } });
+  // Before the onData timer announces the plan, a typed line is just a message to Pi.
+  session._planReadySent = false;
+  session.agentPlanReady = false;
+  handleTerminalInput(session, 'go\r');
+  assert.equal(session.terminalPhase, 'planning');
+  session._planReadySent = true; // what onData's quiet timer sets once it sends plan-ready
+  handleTerminalInput(session, '\r');
+  assert.equal(session.terminalPhase, 'planning', 'a bare Enter is not an approval');
+  handleTerminalInput(session, 'What about the tests?\r');
+  assert.equal(session.terminalPhase, 'planning', 'a question is feedback');
+  handleTerminalInput(session, '\x1b[200~looks good\x1b[201~');
+  handleTerminalInput(session, '\r');
+  assert.equal(session.terminalPhase, 'executing', 'a pasted approval + Enter counts');
+  assert.equal(session._planApprovedInTui, 'typed');
+  assert.equal(messages.filter(m => m.type === 'terminal-state').at(-1).phase, 'executing');
+});
+
+test('TPT654: Claude\'s typed input never goes through the composer classifier (its /approve-plan interception is unchanged)', () => {
+  const { session, messages } = tuiSession('claude');
+  const writes = [];
+  session.pty = { write: d => writes.push(d) };
+  session._planReadySent = true;
+  handleTerminalInput(session, 'go\r');
+  assert.equal(session.terminalPhase, 'planning');
+  assert.equal(session._typedLine, undefined);
+  handleTerminalInput(session, '/approve-plan\r');
+  assert.equal(session.terminalPhase, 'executing');
+  assert.equal(session._planApprovedInTui, undefined, 'approvePlan(), not the in-TUI path');
+  assert.ok(messages.some(m => m.type === 'data' && /Plan approved\. Continuing in execution mode/.test(m.data)));
+  assert.ok(writes.includes('go\r'));
+});
+
+test('TPT654: Proceed after an in-TUI approval is the existing "already approved" no-op', () => {
+  const { session, messages } = tuiSession('claude');
+  feedClaude(session, [CLAUDE_PLAN_DIALOG_CHUNK, CLAUDE_APPROVED_CHUNK]);
+  const before = messages.length;
+  approvePlan(session);
+  assert.equal(session.terminalPhase, 'executing');
+  assert.ok(messages.slice(before).some(m => m.type === 'data' && /Plan is already approved/.test(m.data)));
+  assert.equal(markPlanApprovedInTui(session, 'typed'), false);
+  assert.equal(markPlanApprovedInTui(null, 'typed'), false);
+});
+
+test('TPT654 end to end: an in-TUI-approved run is guarded — idle nudge pasted, exit backstop comment on Terminate', async (t) => {
+  const { session } = tuiSession('claude', { nudgeCount: 0, _nudgeTypedLine: '' });
+  feedClaude(session, [CLAUDE_PLAN_DIALOG_CHUNK, CLAUDE_APPROVED_CHUNK]);
+  session.lastOutputAt = Date.now() - 120000;
+  const writes = [];
+  session.pty = { write: d => writes.push(d) };
+  t.after(() => { session.alive = false; });
+  const r = await maybeNudgeIdleSession(session, { backend: nudgeBackend(), projectRoot: '/p', deps: nudgeDeps(MISSING_CHECK) });
+  assert.equal(r.nudged, true);
+  assert.match(writes[0], /Task TPT1 is still in progress/);
+  const run = exitRunSnapshot(session);
+  assert.equal(run.executing, true);
+  assert.equal(run.nudgeCount, 1);
+  const f = exitBackstopFakes();
+  const flagged = await flagTaskLeftUncommitted(run, { backend: f.backend, projectRoot: '/p', reason: 'user-terminated', deps: f.deps });
+  assert.equal(flagged.flagged, true);
+  const comment = f.log.find(e => e[0] === 'comment');
+  assert.match(comment[2], /^Agent exited without committing \/ completing/);
+  assert.match(comment[2], /after 1 idle completion nudge/);
+});
+
+// Literal claude 2.1.296 captures (fixtures/attention/claude-plan-*.jsonl): the kickoff paste, the
+// plan, the ExitPlanMode dialog and the user's answer typed inside the TUI. Replays every chunk
+// through feedRaw() as a post-kickoff planning session and reports where the phase flipped.
+function replayClaudePlanFixture(name) {
+  const chunks = loadAttentionFixture(name);
+  const { session, events, messages } = tuiSession('claude');
+  const agent = getTaskAgent('claude');
+  const marks = { dialogAt: -1, approvedRowAt: -1, rejectedRowAt: -1, flipAt: -1 };
+  let clock = Date.now();
+  chunks.forEach((raw, i) => {
+    const text = stripAnsi(raw);
+    if (marks.dialogAt === -1 && /written\s*up\s*a\s*plan/i.test(text)) marks.dialogAt = i;
+    if (marks.rejectedRowAt === -1 && /User\s*rejected\s*Claude/i.test(text)) marks.rejectedRowAt = i;
+    if (marks.approvedRowAt === -1 && /User\s*approved\s*Claude/i.test(text)) marks.approvedRowAt = i;
+    clock += 50;
+    feedRaw(session, agent, raw, clock);
+    if (marks.flipAt === -1 && session.terminalPhase === 'executing') marks.flipAt = i;
+  });
+  return { session, events, messages, marks, count: chunks.length };
+}
+
+test('TPT654 Claude (recorded 2.1.296): the ExitPlanMode dialog answered Yes inside the TUI flips the phase at the collapsed "User approved" row', () => {
+  const { session, events, messages, marks } = replayClaudePlanFixture('claude-plan-approved.jsonl');
+  assert.ok(marks.dialogAt > 0, 'the capture holds the dialog');
+  assert.ok(marks.approvedRowAt > marks.dialogAt, 'the capture holds the answered row after the dialog');
+  assert.equal(marks.flipAt, marks.approvedRowAt, 'planning until the very chunk that paints the collapsed row');
+  assert.equal(session.terminalPhase, 'executing');
+  assert.equal(session._planApprovedInTui, 'dialog');
+  assert.ok(events.some(e => e.type === 'raise'), 'the dialog raised attention first');
+  const states = messages.filter(m => m.type === 'terminal-state');
+  assert.equal(states.length, 1, 'one flip, even though the row is repainted later in the capture');
+  assert.equal(states[0].phase, 'executing');
+});
+
+test('TPT654 Claude (recorded 2.1.296): "No, keep planning" answered inside the TUI stays planning; the revised plan\'s dialog answered Yes flips', () => {
+  const { session, messages, marks } = replayClaudePlanFixture('claude-plan-keep-planning.jsonl');
+  assert.ok(marks.dialogAt > 0, 'the capture holds the first dialog');
+  assert.ok(marks.rejectedRowAt > marks.dialogAt, 'the capture holds the "User rejected" row after it');
+  assert.ok(marks.approvedRowAt > marks.rejectedRowAt, 'the capture holds the later approval');
+  assert.equal(marks.flipAt, marks.approvedRowAt, 'planning through the rejection and the re-plan, executing at the approved row');
+  assert.equal(session.terminalPhase, 'executing');
+  assert.equal(session._planApprovedInTui, 'dialog');
+  const states = messages.filter(m => m.type === 'terminal-state');
+  assert.equal(states.length, 1);
+  assert.equal(states[0].phase, 'executing');
+});
+
+// ── (TPT9002) Project-language notices ──
+// The server writes its [Task App] notices in the project's language (read live from
+// .tipatask/config.json), the buffer and the exit frame included; the exit resolution comment
+// keeps the English text.
+{
+  const tsMod = require('./terminal-session');
+  const { LOCALES: COPY } = require('./terminal-copy');
+  const sub = (text, params) => Object.entries(params).reduce((s, [k, v]) => s.split(`{${k}}`).join(String(v)), text);
+
+  function ukProject(t, language = 'uk') {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-locale-'));
+    fs.mkdirSync(path.join(root, '.tipatask'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.tipatask', 'config.json'), JSON.stringify({ language }));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    return root;
+  }
+
+  test('sessionLocale reads the project language from .tipatask/config.json and falls back to en', (t) => {
+    assert.equal(tsMod.sessionLocale({ projectPath: ukProject(t) }), 'uk');
+    assert.equal(tsMod.sessionLocale({ projectPath: ukProject(t, 'en') }), 'en');
+    assert.equal(tsMod.sessionLocale({ projectPath: ukProject(t, 'xx') }), 'en');
+    assert.equal(tsMod.sessionLocale({ projectPath: path.join(os.tmpdir(), 'tt-no-such-project-' + process.pid) }), 'en');
+    assert.equal(tsMod.sessionLocale({ projectPath: '' }), 'en');
+  });
+
+  test('noticeCopy / warningCopy write the Ukrainian notice for a uk project, with the [Task App] prefix and colours in code', (t) => {
+    const sent = [];
+    const session = { tabId: 'T1', projectPath: ukProject(t), ws: { OPEN: 1, readyState: 1, send: (m) => sent.push(JSON.parse(m)) } };
+    tsMod.noticeCopy(session, 'notice.plan.alreadyApproved');
+    tsMod.warningCopy(session, 'notice.token.expiresNotRefreshed', { when: '09:05', error: 'offline' });
+    assert.deepEqual(sent.map((f) => f.type), ['data', 'data']);
+    assert.equal(sent[0].data, `\r\n\x1b[90m[Task App] ${COPY.uk['notice.plan.alreadyApproved']}\x1b[0m\r\n`);
+    assert.equal(sent[1].data, `\r\n\x1b[33m[Task App] ${sub(COPY.uk['notice.token.expiresNotRefreshed'], { when: '09:05', error: 'offline' })}\x1b[0m\r\n`);
+    // An English project keeps the exact wording the server always printed.
+    const enSent = [];
+    tsMod.noticeCopy({ tabId: 'T2', projectPath: ukProject(t, 'en'), ws: { OPEN: 1, readyState: 1, send: (m) => enSent.push(JSON.parse(m)) } }, 'notice.plan.alreadyApproved');
+    assert.equal(enSent[0].data, '\r\n\x1b[90m[Task App] Plan is already approved.\x1b[0m\r\n');
+  });
+
+  test('approvePlan(): a stalled approval on a uk project reports the retry and the final notice in Ukrainian', (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const agent = require('./task-agent').getTaskAgent('pi');
+    const original = {
+      approvePlan: agent.approvePlan,
+      getApprovalWatchdogMs: agent.getApprovalWatchdogMs,
+      approvalStalled: agent.approvalStalled,
+      retryApproval: agent.retryApproval,
+    };
+    const stalledVerdicts = [true, true];
+    agent.approvePlan = () => {};
+    agent.getApprovalWatchdogMs = () => 5000;
+    agent.approvalStalled = () => stalledVerdicts.shift();
+    agent.retryApproval = () => {};
+    const sent = [];
+    const session = {
+      tabId: 'test-approve-watchdog-uk', taskAgent: 'pi', alive: true, pty: { write: () => {} }, buffer: '',
+      terminalPhase: 'planning', projectPath: ukProject(t),
+      ws: { OPEN: 1, readyState: 1, send: (msg) => sent.push(JSON.parse(msg)) },
+    };
+    try {
+      tsMod.approvePlan(session);
+      assert.ok(sent.some((f) => f.type === 'data' && f.data.includes(`[Task App] ${COPY.uk['notice.plan.approved']}`)));
+      t.mock.timers.tick(5000);
+      assert.ok(sent.some((f) => f.type === 'data' && f.data.includes(sub(COPY.uk['notice.approval.stalledRetrying'], { label: agent.label }))));
+      t.mock.timers.tick(5000);
+      assert.ok(sent.some((f) => f.type === 'data' && f.data.includes(sub(COPY.uk['notice.approval.stalledAfterRetry'], { label: agent.label }))));
+      assert.ok(!sent.some((f) => f.type === 'data' && /looks stalled/.test(f.data)), 'no English notice on a uk project');
+      tsMod.approvePlan(session);
+      assert.ok(sent.some((f) => f.type === 'data' && f.data.includes(`[Task App] ${COPY.uk['notice.plan.alreadyApproved']}`)));
+    } finally {
+      Object.assign(agent, original);
+      t.mock.timers.reset();
+    }
+  });
+
+  test('killRunawaySession on a uk project: buffer, notice, exit frame and prompt in Ukrainian; the comment text stays English', (t) => {
+    runWithStubbedKill(() => {
+      const { session, sent } = makeRunawaySession({ projectPath: ukProject(t) });
+      const result = tsMod.killRunawaySession(session, { count: 127, threshold: 50, snapshot: RUNAWAY_SNAPSHOT, summary: 'npm ×24, 3 other', summaryLocal: 'npm ×24, інших: 3' });
+      assert.equal(result.first, true);
+      assert.match(result.text, /^Сторож завершив цю сесію: втручання сторожа ресурсів; дочірніх процесів: 127 \(завершення після 2 поспіль перевірок/);
+      assert.match(result.text, /Найбільше процесів: npm ×24, інших: 3\.$/);
+      assert.match(session._exitReason.text, /^Watchdog killed this session: resource watchdog intervention; 127 descendant processes \(kill after 2 consecutive checks/);
+      assert.match(session._exitReason.text, /Top processes: npm ×24, 3 other\.$/);
+      assert.equal(session._exitReason.display, result.text);
+      assert.ok(session.buffer.includes(`[Task App] ${result.text}`));
+      assert.ok(!session.buffer.includes('Watchdog killed'));
+      assert.equal(sent[0].type, 'data');
+      assert.ok(sent[0].data.includes(`[Task App] ${result.text}`));
+      // The exit frame shows the Ukrainian text; the onSessionExit payload (resolution comment) the English one.
+      assert.equal(tsMod.buildTerminalExitFrame(session, 143, []).reasonText, result.text);
+      assert.deepEqual(tsMod.exitReasonFields(session), { reason: 'runaway-killed', reasonText: session._exitReason.text });
+      assert.deepEqual(tsMod.exitReasonFields(session, { display: true }), { reason: 'runaway-killed', reasonText: result.text });
+    });
+  });
+
+  test('pauseRunawaySession / resumeRunawaySession on a uk project write Ukrainian into the buffer and the live stream', (t) => {
+    runWithStubbedKill(() => {
+      const { session, sent } = makeRunawaySession({ projectPath: ukProject(t) });
+      const paused = tsMod.pauseRunawaySession(session, { count: 60, threshold: 50, snapshot: RUNAWAY_SNAPSHOT });
+      assert.equal(paused.first, true);
+      assert.match(paused.text, /^Сторож призупинив цю сесію: втручання сторожа ресурсів; дочірніх процесів: 60 \(попередження ≥50; призупинення після 2 поспіль/);
+      assert.match(paused.text, /Нічого не завершено — усі процеси зупинено, їхній стан збережено\./);
+      assert.equal(session._pause.text, paused.text);
+      assert.ok(session.buffer.includes(`\x1b[33m[Task App] ${paused.text}`));
+      assert.ok(sent.some((f) => f.type === 'data' && f.data.includes(`[Task App] ${paused.text}`)));
+      const resumed = tsMod.resumeRunawaySession(session);
+      assert.equal(resumed.text, COPY.uk['watchdog.resumed']);
+      assert.ok(session.buffer.includes(`\x1b[90m[Task App] ${COPY.uk['watchdog.resumed']}`));
+    });
+  });
+
+  test('buildTokenExpiryNotice follows the locale; the English default is unchanged', () => {
+    const expMs = Date.now() + 10 * 60 * 1000;
+    const uk = tsMod.buildTokenExpiryNotice({ expMs, saved: true, headersHelper: true, locale: 'uk' });
+    assert.equal(uk.warn, false);
+    assert.match(uk.text, /^Термін дії API-токена, з яким запущено цю сесію, спливає \(\d{2}:\d{2}\)\. Новий токен збережено — в агенті введіть \/mcp → tipatask → Reconnect/);
+    const ukNotSaved = tsMod.buildTokenExpiryNotice({ expMs, now: expMs + 1, saved: false, headersHelper: false, locale: 'uk' });
+    assert.match(ukNotSaved.text, /^Термін дії API-токена, з яким запущено цю сесію, минув \(.*\)\. Автоматично оновити його не вдалося\. Увійдіть знову \(Проєкт ▸ Повторна автентифікація \/ Змінити акаунт\)/);
+    const en = tsMod.buildTokenExpiryNotice({ expMs, saved: false, headersHelper: false });
+    assert.match(en.text, /^The API token this session started with expires at \d{2}:\d{2}\. It could not be refreshed automatically\. Sign in again \(Project ▸ Re-authenticate \/ Change Account\), then in the agent type \/mcp → tipatask → Reconnect\.$/);
+  });
+
+  test('paste failures carry a stable code and params beside the English message', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-paste-'));
+    try {
+      assert.throws(() => tsMod.saveBase64Image(root, 'T', 'image/bmp', 'AAAA'),
+        (err) => err.code === 'EIMAGE_TYPE' && err.message === 'Unsupported image type: image/bmp' && err.params.type === 'image/bmp');
+      assert.throws(() => tsMod.saveBase64Image(root, 'T', undefined, 'AAAA'),
+        (err) => err.code === 'EIMAGE_TYPE' && err.message === 'Unsupported image type: undefined' && err.params.type === 'undefined');
+      assert.throws(() => tsMod.saveBase64Image(root, 'T', 'image/png', ''),
+        (err) => err.code === 'EIMAGE_EMPTY' && err.message === 'Empty image data' && err.params === undefined);
+      assert.throws(() => tsMod.saveBase64Image(root, 'T', 'image/png', '!!!!'),
+        (err) => err.code === 'EIMAGE_EMPTY' && err.message === 'Empty image data');
+      assert.throws(() => tsMod.saveBase64Image(root, 'T', 'image/png', Buffer.alloc(12 * 1024 * 1024 + 1).toString('base64')),
+        (err) => err.code === 'EIMAGE_TOO_LARGE' && err.message === 'Image too large (>12 MB)' && err.params.maxMb === 12);
+      assert.throws(() => tsMod.injectPastedImage({ alive: false }, 'image/png', 'AAAA'),
+        (err) => err.code === 'EIMAGE_NOT_RUNNING' && err.message === 'Terminal not running');
+      assert.throws(() => tsMod.injectPastedImage({ alive: true, pty: {} }, 'image/png', ''),
+        (err) => err.code === 'EIMAGE_MISSING' && err.message === 'Missing image data');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}

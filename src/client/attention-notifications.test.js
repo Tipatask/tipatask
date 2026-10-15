@@ -352,3 +352,50 @@ test('buildNotificationTitle is independent of attention state', () => {
   clearAttention('C1', 'opened');
   assert.equal(buildNotificationTitle('C1', 'Task Title'), 'C1: Task Title');
 });
+
+// ── Exit backstop (TPT613) ──
+test('buildAttentionBody builds the uncommitted body from the blocker codes, localized and de-duplicated', () => {
+  assert.equal(buildAttentionBody({ kind: 'uncommitted', blockers: ['TASK_COMMIT_MISSING'] }),
+    'Agent exited without committing or completing the task: no task commit');
+  assert.equal(buildAttentionBody({ kind: 'uncommitted', blockers: ['TASK_WORKTREE_DIRTY', 'dirty_task_worktree', 'unmerged_branch', 'gitlink_mismatch'] }),
+    'Agent exited without committing or completing the task: uncommitted changes in the task worktree; task branch not merged');
+  assert.equal(buildAttentionBody({ kind: 'uncommitted', blockers: ['something_else'] }), 'Agent exited without committing or completing the task');
+  assert.equal(buildAttentionBody({ kind: 'uncommitted' }), 'Agent exited without committing or completing the task');
+});
+
+test('an uncommitted verdict notifies even while the task is in focus: the ended session shows it nowhere', () => {
+  state.selectedCardId = 'C1'; // would suppress a live prompt
+  assert.equal(isTaskInUserFocus('C1'), true);
+  assert.equal(notifyTaskNeedsAttention('C1', { kind: 'uncommitted', blockers: ['TASK_COMMIT_MISSING'] }), true);
+  assert.equal(lastNotification.options.body, 'Agent exited without committing or completing the task: no task commit');
+  assert.equal(getNotificationEntries().length, 1, 'the in-app card too');
+});
+
+test('clicking an uncommitted banner never launches an agent: no session opens the workspace, an exited session reconnects', () => {
+  hasFocus = false;
+  const calls = [];
+  const originalTipTask = window.TipTask;
+  window.TipTask = {
+    openTerminal: (...args) => calls.push(['openTerminal', ...args]),
+    openTaskWorkspace: (...args) => calls.push(['openTaskWorkspace', ...args]),
+  };
+  const detail = { kind: 'uncommitted', blockers: ['TASK_COMMIT_MISSING'] };
+  try {
+    state.activeSessions = new Set();
+    state.exitedSessions = new Set();
+    notifyTaskNeedsAttention('C1', detail);
+    lastNotification.onclick();
+    assert.deepEqual(calls, [['openTaskWorkspace', 'C1']]);
+
+    calls.length = 0;
+    forgetTaskAttention('C1');
+    clearDebounce('C1');
+    state.exitedSessions = new Set(['C1']);
+    notifyTaskNeedsAttention('C1', detail);
+    lastNotification.onclick();
+    assert.deepEqual(calls, [['openTerminal', 'C1', 'Task Title', '', 'in_progress']]);
+  } finally {
+    window.TipTask = originalTipTask;
+    state.exitedSessions = new Set();
+  }
+});

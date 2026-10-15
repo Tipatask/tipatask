@@ -116,7 +116,8 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
           const decision = decisionFor(entry);
           if (!decision.allowed) {
             const diagnostic = {};
-            for (const field of ['reason', 'coordinationReason', 'detail', 'instances', 'censusPidCount', 'unregisteredCount', 'unregisteredPids']) {
+            for (const field of ['reason', 'running', 'cap', 'coordinationReason', 'detail', 'instances', 'censusPidCount', 'unregisteredCount', 'unregisteredPids',
+              'rampCap', 'rampCeiling', 'rampNextStepAt', 'alarm', 'requiredBytes', 'headroomBytes']) {
               if (decision[field] !== undefined) diagnostic[field] = decision[field];
             }
             if (JSON.stringify(entry.diagnostic) !== JSON.stringify(diagnostic)) touched.add(entry.projectPath);

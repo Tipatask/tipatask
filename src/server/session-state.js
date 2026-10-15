@@ -70,6 +70,9 @@ function createSession(ws, pending, tabId, projectPath) {
     _userInteracted: false,
     _localCommandBuffer: '',
     _interceptingApprovalCommand: false,
+    _typedLine: '',               // (TPT654) composer line rebuilt from typed input, for the Codex/Pi in-TUI approval rule (plan-approval-detect.js trackTypedLine())
+    _typedPasting: false,         // (TPT654) a bracketed paste is open across input chunks
+    _planApprovedInTui: null,     // (TPT654) 'dialog' | 'mode' | 'typed' once terminal-session.js markPlanApprovedInTui() flipped the phase; null for a Task App approval
     // Per-project scoping (Electron multi-window)
     projectPath: '',
     // Task chat fields (taskChat / projectChat)

@@ -9,9 +9,18 @@
 // though the `config` frame's objectiveProviders list still carries it.
 export const TASK_CHAT_PROVIDER_IDS = Object.freeze(['claude', 'codex', 'pi']);
 
+// A Pi row whose PI_MODELS entry sets `tools: false` cannot run a task or project chat (the
+// server refuses it with `model-no-tools`), so the ids the pi entry lists in `toolLessModels`
+// are dropped from a copy of its models. The pi entry stays even when nothing is left, so the
+// start gate still reports that no model is usable. The objective chat reads the unfiltered list.
 export function taskChatProviders(providers) {
   return (Array.isArray(providers) ? providers : [])
-    .filter(p => p && TASK_CHAT_PROVIDER_IDS.includes(p.id));
+    .filter(p => p && TASK_CHAT_PROVIDER_IDS.includes(p.id))
+    .map((p) => {
+      const toolLess = p.id === 'pi' && Array.isArray(p.toolLessModels) ? p.toolLessModels : [];
+      if (!toolLess.length || !Array.isArray(p.models)) return p;
+      return { ...p, models: p.models.filter(m => !(m && toolLess.includes(m.value))) };
+    });
 }
 
 function splitSelection(raw) {

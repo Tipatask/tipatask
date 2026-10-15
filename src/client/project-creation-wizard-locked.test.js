@@ -7,8 +7,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 import { Window } from 'happy-dom';
 
-// (TPT564) The wizard's locked first-run mode, driven in happy-dom with the real module.
-// Same bundling harness as dialog-focus.test.js; electronAPI is stubbed per test.
+// (TPT564) The wizard's locked first-run mode — and (TPT653) its Agent step's Default — driven in
+// happy-dom with the real module. Same bundling harness as dialog-focus.test.js; electronAPI is
+// stubbed per test.
 async function withWizard(electronAPI, run) {
   const window = new Window({ url: 'http://localhost:4455/' });
   const scratch = mkdtempSync(join(tmpdir(), 'tt-wizard-locked-'));
@@ -100,5 +101,52 @@ test('unlocked: × is present and Escape closes the wizard through onCancel', as
     escape();
     assert.equal(overlay(), null, 'Escape closes the wizard');
     assert.equal(cancels, 1);
+  });
+});
+
+// (TPT653) Unchecking every agent leaves no Default, so Next answers "Select a default agent.";
+// checking one again makes it the Default and Next goes on — no radio click in between.
+test('Agent step: re-checking an agent after unchecking all makes it the Default, and Next goes on', async () => {
+  const electronAPI = {
+    setupStoredAccount: async () => ({ token: 'tok', user: { email: 'a@b.c' } }),
+    setupListProjects: async () => [{ id: 7, name: 'Proj' }],
+    setupGetDeviceName: async () => 'Mac',
+    setupGetAvailableAgents: async () => [
+      { id: 'claude', label: 'Claude Code', available: true },
+      { id: 'codex', label: 'Codex', available: true },
+      { id: 'pi', label: 'Pi', available: false, reason: 'pi not found' },
+    ],
+  };
+  await withWizard(electronAPI, async ({ wizard, flush }) => {
+    wizard.open({ projectPath: '/tmp/p' });
+    await flush();
+    const $ = (sel) => overlay().querySelector(sel);
+    $('.setup-modal-project-card[data-id="7"]').click();
+    $('#wiz-next-btn').click();
+    await flush(); // device-name prefill
+    $('#wiz-next-btn').click();
+    await flush(); // agent detection
+    assert.ok($('#wiz-agent-select .sma-cb[data-id="codex"]'), 'on the Agent step');
+
+    const toggle = (id, checked) => {
+      const cb = $(`.sma-cb[data-id="${id}"]`);
+      cb.checked = checked;
+      cb.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    toggle('claude', false);
+    toggle('codex', false);
+    assert.equal($('#wiz-next-btn').disabled, false);
+    $('#wiz-next-btn').click();
+    assert.equal($('#wiz-agent-msg').textContent, 'Select a default agent.', 'nothing enabled: Next answers and stays');
+
+    toggle('codex', true);
+    assert.equal($('.sma-radio[data-id="codex"]').checked, true, 'Codex took the empty Default');
+    assert.equal($('#wiz-agent-msg').textContent, '');
+    assert.equal($('#wiz-next-btn').disabled, false);
+    $('#wiz-next-btn').click();
+    assert.equal($('#wiz-agent-select'), null, 'left the Agent step');
+    const agentRow = [...overlay().querySelectorAll('.setup-modal-summary tr')]
+      .find((tr) => tr.querySelector('.setup-modal-summary-key')?.textContent === 'Agent');
+    assert.equal(agentRow?.querySelector('.setup-modal-summary-val').textContent, 'codex', 'Confirm shows Codex');
   });
 });

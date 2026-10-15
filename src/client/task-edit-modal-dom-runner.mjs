@@ -1,6 +1,7 @@
 // Runs the real client modules in a DOM process isolated from node:test globals.
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -81,8 +82,10 @@ try {
   let events = [];
   state.currentUserId = 1;
   state.projectMembers = [{ id: 1, user_id: 1, name: 'Alice' }, { id: 2, user_id: 2, name: 'Bob' }];
+  const httpTasksGet = api.tasks.get; // (TPT665) the real _http() GET, for the open-error labels below
   api.tasks.get = async id => structuredClone(tasks.get(id));
   api.tasks.listAll = async () => [...tasks.values()];
+  const httpTasksUpdate = api.tasks.update; // (TPT9001) the real _http() PATCH, for the save-error labels below
   api.tasks.update = async (id, patch) => { writes.push({ id, patch }); return {}; };
   api.members.list = async () => state.projectMembers;
   api.tasks.comments.list = async () => comments;
@@ -278,6 +281,7 @@ try {
   assert.ok(modal().querySelector('.task-edit-overlay--rail'));
   const termDot = () => tab('terminal').querySelector('.task-modal-tab-dot');
   assert.equal(termDot().hidden, false, 'a live session lights the tab dot');
+  assert.equal(termDot().title, 'Connected', 'the board-state fallback names the live session');
   tab('terminal').click();
   assert.equal(mounts.terminal.length, 1);
   assert.equal(mounts.terminal[0].host, paneEl('terminal'));
@@ -442,6 +446,87 @@ try {
   assert.equal(modal().querySelector('.modal-actions-run [data-action="stop"]'), null);
   board.closeTaskEditModal(true);
   console.log('TPT568_START_SYNC_PASS');
+
+  // (TPT9001) A save the server rejects says "Save failed"; only a request that got no answer
+  // says "Network error". Real _http() PATCH path, real tag-gate message.
+  const { unregisteredTagError } = createRequire(import.meta.url)('../server/tag-registry-gate.js');
+  const gateMessage = unregisteredTagError(['tt-save-label-probe'], {
+    projectId: 2,
+    registrySize: 1,
+    note: 'Automatic registration could not describe these tags (tt-* tags always need create_system_tag).',
+  }).message;
+  globalThis.requestAnimationFrame ??= callback => setTimeout(callback, 0); // toasts fade in on a frame
+  const lastErrorToast = () => [...document.querySelectorAll('.tt-toast--error .tt-saving-label')].at(-1)?.textContent;
+  const fetchBeforeSaveErrors = globalThis.fetch;
+  const patches = [];
+  let answerPatch = null;
+  globalThis.fetch = async (url, options = {}) => {
+    if (options.method !== 'PATCH') return fetchBeforeSaveErrors(url, options);
+    patches.push({ url, body: JSON.parse(options.body) });
+    return answerPatch();
+  };
+  api.tasks.update = httpTasksUpdate;
+  await board.openTaskEditModal('TPT1');
+  await tick();
+  const tagInput = modal().querySelector('.modal-tag-input');
+  tagInput.value = 'tt-save-label-probe';
+  tagInput.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  answerPatch = async () => ({ ok: false, status: 500, json: async () => ({ error: gateMessage }) });
+  modal().querySelector('.btn-modal-save').click();
+  await tick();
+  assert.deepEqual(patches.at(-1), {
+    url: '/api/tasks/TPT1',
+    body: { tags: ['tt-save-label-probe'], auto_register_tags: true },
+  });
+  assert.equal(lastErrorToast(), `Save failed: ${gateMessage}`);
+  assert.equal(modal().querySelector('.btn-modal-save').disabled, false, 'draft stays dirty for a retry');
+  answerPatch = async () => { throw new TypeError('Failed to fetch'); };
+  modal().querySelector('.btn-modal-save').click();
+  await tick();
+  assert.equal(patches.length, 2);
+  assert.equal(lastErrorToast(), 'Network error: Failed to fetch');
+  board.closeTaskEditModal(true);
+  globalThis.fetch = fetchBeforeSaveErrors;
+  console.log('TPT9001_SAVE_ERROR_LABEL_PASS');
+
+  // (TPT665) A task open the server answered with a failure says "Could not open task"; only a
+  // request that got no answer says "Network error". Real _http() GET path. The Retry banner is
+  // still offered, and a recovered open still clears it.
+  const openErrorBanner = () => document.getElementById('task-open-error-banner');
+  const fetchBeforeOpenErrors = globalThis.fetch;
+  let answerGet = null;
+  globalThis.fetch = async (url, options = {}) => (options.method === 'GET' && url === '/api/tasks/TPT1'
+    ? answerGet()
+    : fetchBeforeOpenErrors(url, options));
+  const stubbedTasksGet = api.tasks.get;
+  api.tasks.get = httpTasksGet;
+  answerGet = async () => ({ ok: false, status: 500, json: async () => ({ error: 'Authentication required for this project' }) });
+  await board.openTaskEditModal('TPT1');
+  assert.equal(lastErrorToast(), 'Could not open task: Authentication required for this project');
+  assert.equal(modal().hidden, true, 'a failed open paints no modal');
+  assert.ok(openErrorBanner(), 'the Retry banner is still offered');
+  answerGet = async () => { throw new TypeError('Failed to fetch'); };
+  await board.openTaskEditModal('TPT1');
+  assert.equal(lastErrorToast(), 'Network error: Failed to fetch');
+  // A main process older than this renderer rejects without the envelope: the IPC wrapper never
+  // reaches the toast.
+  api.tasks.get = async () => { throw new Error("Error invoking remote method 'api:tasks.get': Error: API 500: boom"); };
+  await board.openTaskEditModal('TPT1');
+  assert.equal(lastErrorToast(), 'Could not open task: API 500: boom');
+  // A proposal open whose config fetch got no answer is a network error too.
+  globalThis.fetch = async (url, options = {}) => {
+    if (url === '/api/config') throw new TypeError('Failed to fetch');
+    return fetchBeforeOpenErrors(url, options);
+  };
+  await board.openTaskEditModal('new-3', { preloadedTask: task('new-3'), onSavePreview: async () => {} });
+  assert.equal(lastErrorToast(), 'Network error: Failed to fetch');
+  globalThis.fetch = fetchBeforeOpenErrors;
+  api.tasks.get = stubbedTasksGet;
+  await board.openTaskEditModal('TPT1');
+  assert.equal(modal().dataset.taskId, 'TPT1');
+  assert.equal(openErrorBanner(), null, 'a recovered open clears the banner');
+  board.closeTaskEditModal(true);
+  console.log('TPT665_OPEN_ERROR_LABEL_PASS');
 } catch (err) {
   console.error(err);
   exitCode = 1;

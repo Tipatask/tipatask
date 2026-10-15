@@ -332,3 +332,64 @@ test('assertCredentialsUsable: opaque and no-exp tokens are never refreshed', as
 });
 
 module.exports = { makeJwt, writeConfig };
+
+// (TPT9002) Structured twins of the English sentences — the facts the localized terminal
+// warning and the coded EAUTH error frame are rendered from.
+test('assertCredentialsUsable: expired/expiring errors and the warning carry a structured detail', async () => {
+  const exp = NOW - 30 * MIN;
+  await assert.rejects(() => assertCredentialsUsable(stubBackend({ token: jwtExpiringIn(-30 * MIN) }), { now: NOW }), (err) => {
+    assert.strictEqual(err.reasonCode, 'expired');
+    assert.strictEqual(err.detail.when, formatTokenExpiry(exp, NOW));
+    assert.strictEqual(typeof err.detail.expiresAt, 'number');
+    assert.ok(!('refreshError' in err.detail));
+    return true;
+  });
+  const token = jwtExpiringIn(5 * MIN);
+  await assert.rejects(
+    () => assertCredentialsUsable(stubBackend({ token }), { now: NOW, refresh: async () => { throw new Error('token refresh rejected (HTTP 503)'); } }),
+    (err) => {
+      assert.strictEqual(err.reasonCode, 'expiring');
+      assert.deepStrictEqual(err.detail, { when: formatTokenExpiry(NOW + 5 * MIN, NOW), expiresAt: tokenExpiryMs(token), refreshError: 'token refresh rejected (HTTP 503)' });
+      return true;
+    });
+  await assert.rejects(
+    () => assertCredentialsUsable(stubBackend({ token }), { now: NOW }),
+    (err) => err.reasonCode === 'expiring' && err.detail.refreshError === null);
+  const warned = await assertCredentialsUsable(stubBackend({ token: jwtExpiringIn(20 * 60 * MIN) }), { now: NOW, refresh: async () => { throw new Error('offline'); } });
+  assert.deepStrictEqual(warned.warningDetail, { when: formatTokenExpiry(NOW + 20 * 60 * MIN, NOW), expiresAt: warned.expiresAt, refreshError: 'offline' });
+  assert.match(warned.warning, /could not be refreshed \(offline\)/);
+  const quiet = await assertCredentialsUsable(stubBackend({ token: jwtExpiringIn(2 * 60 * MIN) }), { now: NOW });
+  assert.strictEqual(quiet.warning, null);
+  assert.strictEqual(quiet.warningDetail, null);
+  // A failure without a message is still a string, never an Error object, in the frame-bound detail.
+  const noMsg = await assertCredentialsUsable(stubBackend({ token: jwtExpiringIn(20 * 60 * MIN) }), { now: NOW, refresh: async () => { throw new Error(''); } });
+  assert.strictEqual(noMsg.warningDetail.refreshError, 'unknown error');
+});
+
+// (TPT9008) A coded refresh failure (token-refresh.js) hands its refreshCode/refreshParams to the
+// frame-bound detail, so the EAUTH frame and the launch warning can name it in the project language;
+// the gate's own "no newer token" outcome is coded too.
+test('assertCredentialsUsable: a coded refresh failure carries refreshCode/refreshParams in its detail', async () => {
+  const token = jwtExpiringIn(5 * MIN);
+  const coded = Object.assign(new Error('token refresh rejected (HTTP 503)'), { refreshCode: 'rejected', refreshParams: { status: 503 } });
+  await assert.rejects(
+    () => assertCredentialsUsable(stubBackend({ token }), { now: NOW, refresh: async () => { throw coded; } }),
+    (err) => {
+      assert.deepStrictEqual(err.detail, {
+        when: formatTokenExpiry(NOW + 5 * MIN, NOW), expiresAt: tokenExpiryMs(token),
+        refreshError: 'token refresh rejected (HTTP 503)', refreshCode: 'rejected', refreshParams: { status: 503 },
+      });
+      return true;
+    });
+  const warned = await assertCredentialsUsable(stubBackend({ token: jwtExpiringIn(20 * 60 * MIN) }), {
+    now: NOW, refresh: async () => { throw Object.assign(new Error('token refresh request failed (timeout)'), { refreshCode: 'request_timeout' }); },
+  });
+  assert.strictEqual(warned.warningDetail.refreshCode, 'request_timeout');
+  assert.ok(!('refreshParams' in warned.warningDetail), 'a code without params adds no refreshParams');
+  // A refresh that resolves without a newer token is the gate's own coded failure.
+  const stale = await assertCredentialsUsable(stubBackend({ token: jwtExpiringIn(20 * 60 * MIN) }), {
+    now: NOW, refresh: async () => ({ token: jwtExpiringIn(20 * 60 * MIN) }),
+  });
+  assert.strictEqual(stale.warningDetail.refreshError, 'refresh returned no newer token');
+  assert.strictEqual(stale.warningDetail.refreshCode, 'not_newer');
+});

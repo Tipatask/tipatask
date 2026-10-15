@@ -38,6 +38,19 @@ export function openTaskTerminalFromNotification(taskId, fallbackStatus, opts = 
   else window.TipTask?.openTerminal?.(taskId, title, '', status);
 }
 
+// (TPT613) An exit-backstop banner's session is exited or gone. Exited: reconnect, which replays
+// its last output. Gone: open the task workspace instead — openTerminal() would launch a fresh
+// agent run for a task with no session, and a click on a banner must never start one.
+function openLeftUncommittedTask(taskId, fallbackStatus) {
+  if (state.activeSessions?.has(taskId) || state.exitedSessions?.has(taskId)) {
+    openTaskTerminalFromNotification(taskId, fallbackStatus);
+    return;
+  }
+  try { window.electronAPI?.focusSelf?.(); } catch (_) {}
+  Promise.resolve(window.TipTask?.openTaskWorkspace?.(taskId))
+    .catch((err) => debugNotifyLog('openTaskWorkspace failed', taskId, err));
+}
+
 function _windowHasUserFocus() {
   if (typeof document === 'undefined') return false;
   if (document.visibilityState !== 'visible') return false;
@@ -74,8 +87,28 @@ export function buildAttentionBody(detail) {
     case 'planReady': return t('attention.planReady');
     case 'idle': return t('attention.idle');
     case 'runaway': return t(detail.killed ? 'attention.runawayKilled' : detail.paused ? 'attention.runawayPaused' : 'attention.runaway'); // (C1565, TPT357, TPT443) fallback only — server always sends promptText
+    case 'uncommitted': return _uncommittedBody(detail.blockers); // (TPT613) built here, so it is localized
     default: return t('attention.default');
   }
+}
+
+// (TPT613) Exit-backstop reasons by blocker code (the frame's blocker codes, see attention-ws.js).
+const UNCOMMITTED_REASON_KEYS = {
+  TASK_COMMIT_MISSING: 'attention.uncommittedNoCommit',
+  TASK_WORKTREE_DIRTY: 'attention.uncommittedDirty',
+  dirty_task_worktree: 'attention.uncommittedDirty',
+  unmerged_branch: 'attention.uncommittedUnmerged',
+  gitlink_mismatch: 'attention.uncommittedUnmerged',
+};
+
+function _uncommittedBody(codes) {
+  const reasons = [];
+  for (const code of Array.isArray(codes) ? codes : []) {
+    const key = UNCOMMITTED_REASON_KEYS[code];
+    const reason = key ? t(key) : '';
+    if (reason && !reasons.includes(reason)) reasons.push(reason);
+  }
+  return reasons.length ? `${t('attention.uncommitted')}: ${reasons.join('; ')}` : t('attention.uncommitted');
 }
 
 // (C1137) Banner title names the project + task, not just the task title — several projects
@@ -100,7 +133,9 @@ export function notifyTaskNeedsAttention(taskId, detail = state.attentionDetails
     return false; // already told the user this exact prompt
   }
 
-  if (isTaskInUserFocus(taskId)) {
+  // (TPT613) A live prompt in focus is on screen already; an exit-backstop verdict is on screen
+  // nowhere (the session has ended), so focus never suppresses it.
+  if (detail?.kind !== 'uncommitted' && isTaskInUserFocus(taskId)) {
     _notifiedPrompts.set(taskId, sig); // seen live — a later replay of the same prompt stays silent
     debugNotifyLog('suppressed: task in user focus', taskId, sig);
     return false;
@@ -113,7 +148,9 @@ export function notifyTaskNeedsAttention(taskId, detail = state.attentionDetails
     || state.taskTitleById?.get(taskId) || taskId;
   const status = card?.dataset?.status || inProgressName();
   const body = buildAttentionBody(detail);
-  const onClick = () => openTaskTerminalFromNotification(taskId, status);
+  const onClick = detail?.kind === 'uncommitted'
+    ? () => openLeftUncommittedTask(taskId, status)
+    : () => openTaskTerminalFromNotification(taskId, status);
 
   // (C1137) In-app stacked card — persists until dismissed, independent of the OS banner's
   // own 30s debounce/platform auto-dismiss (see notification-center.js). Tag-keyed upsert, so

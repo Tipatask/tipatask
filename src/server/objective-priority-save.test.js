@@ -110,3 +110,34 @@ test('resolve-sprints keeps explicit Backlog pins after ID collision remapping',
   assert.notEqual(res.body.changes[0].task.id, 'TPT1');
   assert.equal(res.body.changes[0].task.priority, 0);
 });
+
+// ── TPT9004: resolve-sprints seeds the collision remap from the API next-key peek ──
+
+test('resolve-sprints remaps a colliding id to the API next-key peek when the backend exposes one', async () => {
+  const { backend } = fixture();
+  backend.getNextTaskKey = async (category) => (category === 'HUMAN' ? 'H3' : 'TPT9005');
+  const res = await request(backend, {
+    changes: [{ type: 'new', task: { id: 'TPT1', title: 'Different proposal', priority: 0 } }], pinned: ['TPT1'],
+  }, '/api/resolve-sprints');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.changes[0].task.id, 'TPT9005');
+  assert.deepEqual(res.body.idRemap, { TPT1: 'TPT9005' });
+  assert.equal(res.body.changes[0].task.priority, 0, 'the Backlog pin follows the remapped id');
+});
+
+test('resolve-sprints logs a local max+1 more than 500 above the peek and uses the peek', async (t) => {
+  const { backend } = fixture();
+  backend.getTasksUnfiltered = async () => [
+    { id: 'TPT1', category: 'CODING', status: 'in_progress', priority: 42 },
+    { id: 'TPT1300', category: 'CODING', status: 'completed', priority: 50 },
+  ];
+  backend.getNextTaskKey = async () => 'TPT705';
+  const warnings = [];
+  t.mock.method(console, 'warn', (...args) => warnings.push(args.join(' ')));
+  const res = await request(backend, {
+    changes: [{ type: 'new', task: { id: 'TPT1', title: 'Different proposal', priority: 0 } }], pinned: ['TPT1'],
+  }, '/api/resolve-sprints');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.changes[0].task.id, 'TPT705');
+  assert.ok(warnings.some(w => w.includes('TPT1301') && w.includes('TPT705')), JSON.stringify(warnings));
+});

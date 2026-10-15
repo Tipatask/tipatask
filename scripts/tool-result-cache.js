@@ -21,6 +21,7 @@ if (nodeMajor < 22) {
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { ARCH_REPLY_CHAR_BUDGET } = require('../src/mcp/arch-budget');
 
 const CACHE_FILE = path.join(os.tmpdir(), `tipatask-tool-cache-${TURN_ID}.json`);
 const MAX_ENTRIES = 64;
@@ -142,6 +143,13 @@ function extractResponseText(response) {
     if (t) return t.text || '';
   }
   return JSON.stringify(response);
+}
+
+function isFullArchitectureContent(content) {
+  if (typeof content !== 'string') return false;
+  // Single-tag outlines are JSON text; batch outlines are objects. Neither is a
+  // full document and neither can be reused as one on later calls.
+  try { return JSON.parse(content)?.truncated !== true; } catch { return true; }
 }
 
 function readArchCache() {
@@ -280,6 +288,8 @@ process.stdin.on('end', () => {
 
     // ── arch-doc tools (project-scoped per-tag cache) ───────────────────────
     if (ARCH_TOOLS.has(tool) && ARCH_CACHE_FILE) {
+      // Section bodies must never overwrite or hit a full-document cache slot.
+      if (event.tool_input && event.tool_input.section !== undefined) process.exit(0);
       const tagNames = resolveTagNames(tool, event.tool_input);
       if (!tagNames) process.exit(0);
       const isBatch = tool === 'mcp__tipatask__get_tag_architectures';
@@ -295,7 +305,7 @@ process.stdin.on('end', () => {
           let map;
           try { map = JSON.parse(extractResponseText(event.tool_response)); } catch { process.exit(0); }
           for (const [tag, content] of Object.entries(map)) {
-            if (content == null) continue;
+            if (!isFullArchitectureContent(content)) continue;
             evictOldestArch(cache);
             const entry = { content, mtime: getTagMtime(tag), ts: now };
             if (OBJECTIVE_TASK_ID) { entry.mtimeCheckedAt = now; entry.objSessionId = OBJECTIVE_TASK_ID; }
@@ -304,6 +314,7 @@ process.stdin.on('end', () => {
         } else {
           // Single tag — content is the plain text
           const content = extractResponseText(event.tool_response);
+          if (!isFullArchitectureContent(content)) process.exit(0);
           const tag = tagNames[0];
           evictOldestArch(cache);
           const entry = { content, mtime: getTagMtime(tag), ts: now };
@@ -325,7 +336,7 @@ process.stdin.on('end', () => {
         // Returns true if entry is valid (either via session fast-path or mtime check).
         // Refreshes session fields in-place when stat confirms mtime unchanged.
         function validateEntry(tag, entry) {
-          if (!entry || !entry.content) return false;
+          if (!entry || !isFullArchitectureContent(entry.content)) return false;
           // Fast-path: same objective session, within 15-min stat-skip window
           if (OBJECTIVE_TASK_ID && entry.objSessionId === OBJECTIVE_TASK_ID &&
               entry.mtimeCheckedAt && (now - entry.mtimeCheckedAt) < ARCH_OBJSESS_TTL_MS) {
@@ -363,13 +374,17 @@ process.stdin.on('end', () => {
           `Cached ${tool} result (project ${PROJECT_ID}, mtime-validated). ` +
           `No need to call again — result:\n\n${responseText}`;
 
-        process.stdout.write(JSON.stringify({
+        const output = JSON.stringify({
           hookSpecificOutput: {
             hookEventName: 'PreToolUse',
             permissionDecision: 'deny',
             permissionDecisionReason: reason,
           },
-        }));
+        });
+        // Includes hook framing and JSON escaping. A legacy large cache entry or
+        // a combined batch over the cap falls through to the budgeted MCP tools.
+        if (output.length > ARCH_REPLY_CHAR_BUDGET) process.exit(0);
+        process.stdout.write(output);
         process.exit(0);
       }
 

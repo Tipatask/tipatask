@@ -50,7 +50,8 @@ export { computePiSaveRows };
 // there are no complete rows; the legacy flat PI_MODEL/OPENROUTER_API_KEY are deleted ONLY
 // when a fresh non-empty array replaces them — reauthSave is a full-file replace via
 // writeProjectConfig, so this is the one place a pre-C1121 project's flat pair actually
-// gets cleaned off disk (C1122).
+// gets cleaned off disk (C1122). An empty agent pick (unreachable past the Agent step's Next gate)
+// carries the existing TASK_AGENT/AVAILABLE_AGENTS forward and never invents one (TPT678).
 export function buildReauthConfig({ baseCfg, apiBaseUrl, scopedToken, selectedProject, taskAgent, availableAgents, piSaveRows }) {
   const savedConfig = {
     ...baseCfg,
@@ -59,8 +60,8 @@ export function buildReauthConfig({ baseCfg, apiBaseUrl, scopedToken, selectedPr
     API_BASE_URL: apiBaseUrl,
     API_TOKEN: scopedToken,
     API_PROJECT_ID: String(selectedProject.id),
-    TASK_AGENT: taskAgent || baseCfg.TASK_AGENT || 'claude',
-    AVAILABLE_AGENTS: availableAgents.length ? availableAgents.join(',') : (baseCfg.AVAILABLE_AGENTS || 'claude'),
+    TASK_AGENT: taskAgent || baseCfg.TASK_AGENT,
+    AVAILABLE_AGENTS: availableAgents.length ? availableAgents.join(',') : baseCfg.AVAILABLE_AGENTS,
     ...(piSaveRows.length ? { PI_MODELS: piSaveRows } : {}),
   };
   if (piSaveRows.length) { delete savedConfig.PI_MODEL; delete savedConfig.OPENROUTER_API_KEY; }
@@ -643,12 +644,17 @@ function _renderAgent(body, footer) {
     <button class="setup-modal-btn setup-modal-btn--primary" id="setup-next-btn">${_esc(t('common.next'))}</button>
   `;
   const nextBtn = footer.querySelector('#setup-next-btn');
+  const msgEl = body.querySelector('#setup-agent-msg');
   // Back retraces the actual path (history stack): 'device' in setup mode, 'signin' or
   // 'project' in reauth depending on whether the project picker was skipped.
   footer.querySelector('#setup-back-btn').addEventListener('click', _back);
+  // Same contract as project-creation-wizard.js _renderStep4() (TPT174): Next stays enabled and
+  // validates on click; the message answers that blocked click and any edit clears it. Every agent
+  // unchecked leaves no Default — Confirm must never save an agent the user didn't pick.
   nextBtn.addEventListener('click', () => {
+    if (!_taskAgent) { msgEl.textContent = t('wizard.selectDefaultAgent'); return; }
     if (piCredentialsMissing({ availableAgents: _availableAgents, piModels: _piModels })) {
-      body.querySelector('#setup-agent-msg').textContent = t('agentSelect.fixOtherModelRows');
+      msgEl.textContent = t('agentSelect.fixOtherModelRows');
       return;
     }
     _goto('confirm');
@@ -672,11 +678,11 @@ function _renderAgent(body, footer) {
         _availableAgents = availableAgents;
         _taskAgent = taskAgent;
         _piModels = piModels;
-        nextBtn.disabled = piCredentialsMissing({ availableAgents, piModels });
+        msgEl.textContent = '';
       },
       onReCheck: reCheck,
     });
-    nextBtn.disabled = piCredentialsMissing({ availableAgents: _availableAgents, piModels: _piModels });
+    msgEl.textContent = '';
   };
 
   // Server-first (agent-recheck.js): Electron main's detection cache is not the forked server's,
@@ -781,8 +787,8 @@ function _renderConfirm(body, footer) {
             userToken: _userToken,
             apiProject: { id: _selectedProject.id, name: _selectedProject.name },
             deviceName: _deviceName,
-            taskAgent: _taskAgent || 'claude',
-            availableAgents: _availableAgents.length ? _availableAgents : ['claude'],
+            taskAgent: _taskAgent,
+            availableAgents: _availableAgents,
             piModels: piSaveRows,
           });
           if (!res?.ok) throw new Error(res?.error || t('setup.setupFailed'));
@@ -793,8 +799,8 @@ function _renderConfirm(body, footer) {
             TASK_BACKEND: 'api',
             API_BASE_URL: _apiBaseUrl,
             API_PROJECT_ID: String(_selectedProject.id),
-            TASK_AGENT: _taskAgent || 'claude',
-            AVAILABLE_AGENTS: _availableAgents.length ? _availableAgents.join(',') : 'claude',
+            TASK_AGENT: _taskAgent,
+            AVAILABLE_AGENTS: _availableAgents.join(','),
           };
         }
       } else {
@@ -806,8 +812,8 @@ function _renderConfirm(body, footer) {
           API_BASE_URL: _apiBaseUrl,
           API_TOKEN: _userToken,
           API_PROJECT_ID: String(_selectedProject.id),
-          TASK_AGENT: _taskAgent || 'claude',
-          AVAILABLE_AGENTS: _availableAgents.length ? _availableAgents.join(',') : 'claude',
+          TASK_AGENT: _taskAgent,
+          AVAILABLE_AGENTS: _availableAgents.join(','),
           // C1122 — PI_MODELS array. This route is a {...existing, ...parsed} merge
           // (ws-handlers.js POST /api/project-config), so a stale flat PI_MODEL/
           // OPENROUTER_API_KEY on disk can survive here — harmless, every reader prefers
@@ -829,8 +835,8 @@ function _renderConfirm(body, footer) {
       // _projectPath explicitly — a dedicated setup window has no ?projectPath= in location.search
       // until project:changed rewrites it. Fire-and-forget: nothing below depends on it.
       void notifyServerAgentsSaved(_projectPath, {
-        taskAgent: _taskAgent || 'claude',
-        availableAgents: _availableAgents.length ? _availableAgents : ['claude'],
+        taskAgent: _taskAgent,
+        availableAgents: _availableAgents,
       });
 
       msg.textContent = isReauth ? t('setup.reauthenticatedOk') : t('setup.setupCompleteOk');

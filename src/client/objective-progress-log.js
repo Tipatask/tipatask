@@ -7,21 +7,29 @@
 // Pure state + formatting only — no DOM, no WS. Producer: chat-ui.js WS handlers. Consumer:
 // console-modal.js. Kept as its own module so console-modal.js (no chat-ui.js import today)
 // doesn't have to start importing chat-ui.js back.
+//
+// (TPT9007) Text comes from i18n.js `console.*` keys: a stage label is resolved when its entry is
+// appended (the entry stores the text), the turn divider and the `+N.Ns` unit when a line is
+// formatted. The `═══` rule, glyphs and ANSI colours stay here, outside the translations.
+
+import { t } from './i18n.js';
 
 export const MAX_LOG_ENTRIES = 500;
 const THINKING_FLUSH_IDLE_MS = 400;
 const THINKING_FLUSH_CHARS = 200;
 
-const STAGE_TEXT = {
-  spawned: 'spawned',
-  'cli-init': 'cli-init',
-  'model-thinking': 'thinking',
-  working: 'working',
-  'pi-stderr': 'stderr',
-  'pi-retry': 'provider retry',
-  'pi-retry-end': 'provider retry ended',
-  'pi-compaction': 'compacting context',
-  'pi-compaction-end': 'compaction done',
+// Stage id → i18n key (key names only, never translated text — see i18n.js's header rule).
+const STAGE_KEYS = {
+  spawned: 'console.stage.spawned',
+  'cli-init': 'console.stage.cliInit',
+  'model-thinking': 'console.stage.modelThinking',
+  working: 'console.stage.working',
+  'pi-stderr': 'console.stage.piStderr',
+  'pi-retry': 'console.stage.piRetry',
+  'pi-retry-end': 'console.stage.piRetryEnd',
+  'pi-no-tools-retry': 'console.stage.piNoToolsRetry',
+  'pi-compaction': 'console.stage.piCompaction',
+  'pi-compaction-end': 'console.stage.piCompactionEnd',
 };
 
 // Glyph + ANSI color per entry kind — matches the approved console mockup.
@@ -34,6 +42,7 @@ const KIND_STYLE = {
   'pi-stderr':      { glyph: 'ℹ', color: '33' }, // yellow — CLI's own stderr line
   'pi-retry':       { glyph: '⟳', color: '33' },
   'pi-retry-end':   { glyph: '⟳', color: '33' },
+  'pi-no-tools-retry': { glyph: '⟳', color: '33' },
   'tool-end':       { glyph: '◂', color: '90' }, // dim
   thinking:         { glyph: '·', color: '90' },
   retry:            { glyph: '⟳', color: '33' }, // yellow
@@ -51,8 +60,8 @@ function shortToolName(name) {
 }
 
 function fmtElapsed(ms) {
-  if (ms == null || Number.isNaN(ms)) return '+?s';
-  return `+${(ms / 1000).toFixed(1)}s`;
+  if (ms == null || Number.isNaN(ms)) return `+${t('console.elapsed', { s: '?' })}`;
+  return `+${t('console.elapsed', { s: (ms / 1000).toFixed(1) })}`;
 }
 
 // Ensure the log + thinking coalescer state exist on this chatState — lazily created so
@@ -79,7 +88,7 @@ function pushEntry(cs, entry) {
 // console-modal.js — see e.g. its own '--- Process exited ---' writes).
 export function formatProgressLine(entry) {
   if (entry.kind === 'turn') {
-    return `\x1b[90m═══ turn ${entry.turnIndex} ═══\x1b[0m\r\n`;
+    return `\x1b[90m═══ ${t('console.turnDivider', { n: entry.turnIndex })} ═══\x1b[0m\r\n`;
   }
   const style = KIND_STYLE[entry.kind] || { glyph: '·', color: '90' };
   const prefix = `[${fmtElapsed(entry.elapsedMs)}]`;
@@ -120,17 +129,18 @@ export function appendProgressLog(cs, { kind, text, elapsedMs, toolName } = {}) 
     cs._openTools.delete(toolName);
     if (startMs != null && ms != null) {
       const durS = ((ms - startMs) / 1000).toFixed(1);
-      return pushEntry(cs, { kind, text: `${text} (${durS}s)`, elapsedMs: ms });
+      return pushEntry(cs, { kind, text: `${text} (${t('console.elapsed', { s: durS })})`, elapsedMs: ms });
     }
   }
   return pushEntry(cs, { kind, text, elapsedMs: ms });
 }
 
-// `detail` is free text a provider attaches to a stage (stderr line, retry reason).
+// `detail` is free text a provider attaches to a stage (stderr line, retry reason). An unknown
+// stage prints its raw id.
 export function stageLogText(stage, name, detail) {
   if (stage === 'tool') return shortToolName(name);
   if (stage === 'tool-end') return shortToolName(name) || 'tool';
-  const base = STAGE_TEXT[stage] || stage;
+  const base = STAGE_KEYS[stage] ? t(STAGE_KEYS[stage]) : stage;
   return detail ? `${base}: ${String(detail).replace(/[\r\n]+/g, ' ')}` : base;
 }
 

@@ -34,12 +34,15 @@ import { buildPresetSeedReport } from './preset-seed-report.js'; // (TPT203) wiz
 import * as projectOpenFlow from './project-open-flow.js';
 import * as audioRecorder from './audio-recorder.js';
 import { initApiConnection } from './api-connection.js';
+import * as apiConnection from './api-connection.js'; // (TPT662) template.html needs handleMutationsDropped()
 import * as perfLog from './perf-log.js';
 import { ensureFileLinkHandler } from './file-attach.js';
 import * as tagMatch from './tag-match.js';
 import * as statusFilterSelect from './status-filter-select.js';
+import * as newTaskSprint from './new-task-sprint.js'; // (TPT624) manual New Task sprint selection rules, used by template.html's Preview handler
 import * as agentQuota from './agent-quota.js'; // (TPT310) left-nav plan-usage block; template.html mounts it and resets it on project change
 import * as mergeBranchesModal from './merge-branches-modal.js'; // (TPT345) Merge task branches panel; template.html reaches it via the Project menu
+import * as taskFetch from './task-fetch.js'; // (TPT672) template.html's Objective hand-off + parent-pane task reads
 
 notifications.requestPermission();
 // (TPT484) Shared alert registry: click/dismiss bridge plus main's surface decision for this window.
@@ -47,7 +50,7 @@ notifications.ensureNotificationBridge();
 notificationCenter.installNotificationSurface();
 
 // Expose modules globally so the inline <script> in template.html can access them.
-window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, ...consoleModal, ...recipeSidebar, chatUI, chatTaskPreview, specChat, taskChat, setupModal, notifications, attentionNotifications, completionNotifications, attentionWs, attentionState, taskActivity, activityNotifications, notificationCenter, projectCreationWizard, projectOpenFlow, audioRecorder, perfLog, tagMatch, statusFilterSelect, agentQuota, mergeBranchesModal };
+window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, ...consoleModal, ...recipeSidebar, chatUI, chatTaskPreview, specChat, taskChat, setupModal, notifications, attentionNotifications, completionNotifications, attentionWs, attentionState, taskActivity, activityNotifications, notificationCenter, apiConnection, projectCreationWizard, projectOpenFlow, audioRecorder, perfLog, tagMatch, statusFilterSelect, newTaskSprint, agentQuota, mergeBranchesModal, taskFetch };
 // Terminal task-title links need a page-level bridge: task-board.js owns the modal,
 // while template.html owns loadAndRender() and can select Project Board first.
 window.TipTask.openTaskEditModal = taskBoard.openTaskEditModalFromTerminal;

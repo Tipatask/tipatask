@@ -2,6 +2,8 @@
 import state from './state.js';
 import { t, tc, setLocale } from './i18n.js';
 import { queueReasonText } from './queue-reason.js';
+import { startFailureText, refusedStartTasks } from './terminal-frame-text.js';
+import { trackQueuedStart } from './queued-start-rollback.js';
 import { isTaskDiscussing } from './discuss-lock.js';
 import { DRAFT_KEY_TASK, ensureAgentModels, CHAT_BUBBLE_SVG } from './constants.js';
 import {
@@ -18,10 +20,11 @@ import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADG
 import { buildSubtasksLabel, closedDelta, applyChildStatusDelta, countChildProgress } from './subtask-count.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { createMemberCache } from './member-cache.js';
-import { api } from './api-client.js';
+import { api, isTransportError, errorDetail } from './api-client.js';
 import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration, dismissTaskNotifications } from './notifications.js';
 import { buildDepGraph, collectCycleBlocked } from './dep-graph.js';
 import { tagName } from './tag-match.js';
+import { unregisteredTagNames } from './tag-registration.js';
 import { serializeBoardFilters, sanitizeBoardFilters } from './board-filter-prefs.js';
 import { openAgentsModal } from './agents-modal.js';
 import { activateDialogFocus } from './dialog-focus.js';
@@ -35,10 +38,13 @@ import { renderComposerHeader } from './composer-header.js';
 import { showActionConfirm } from './action-confirm.js';
 export { showActionConfirm };
 import { clearAttention, dismissLostSession, mergeSessionsSnapshot, syncAttentionClasses } from './attention-state.js';
+import { syncAllFinishCards } from './task-finish.js';
 import { syncActivityChips } from './task-activity.js';
 import { taskHasNullSprint, tasksForActiveTab, taskHiddenByGrouping, tasksVisibleUnderGrouping } from './board-count-domain.js';
+import { formSprintValue } from './new-task-sprint.js';
 import { VCS_TYPES, VCS_GIT_FLAGS, buildVcsPatchBody } from './vcs-form.js';
 import { shouldTypeToFilter } from './type-to-filter.js';
+import { piTaskModelIds, piOnlyToolLess, piTaskPinHint } from './pi-task-models.js';
 import {
   configureTaskEditModal, openTaskEditModal, closeTaskEditModal,
   requestCloseTaskEditModal, openTaskEditModalFromTerminal,
@@ -469,7 +475,8 @@ function _manualTaskStateFields(src = {}) {
   return {
     title: src.title || '',
     description: src.description || '',
-    priority: src.priority || '',
+    // (TPT624) Raw sprint-combo value; formSprintValue keeps a Backlog pick (0 / 'null').
+    priority: formSprintValue(src.priority),
     type: src.type || 'task',
     tags: Array.isArray(src.tags) ? src.tags : [],
     category: src.category || 'CODING',
@@ -516,7 +523,7 @@ export function renderNewTaskForm(tasks, tierKeys, parentTaskKey = null) {
     const s = state.manualTaskState || _manualTaskStateFields();
     const title = escapeAttr(s.title || '');
     const desc = escapeAttr(s.description || '');
-    const selPriority = String(s.priority || '');
+    const selPriority = formSprintValue(s.priority);
     const selType = s.type || 'task';
     const hasDraft = !!loadDraft(DRAFT_KEY_TASK);
     return `
@@ -605,9 +612,15 @@ export function renderNewTaskForm(tasks, tierKeys, parentTaskKey = null) {
               <div class="preview-desc" contenteditable="false" data-field="description" data-raw="${escapeAttr(pt.description)}">${renderMarkdown(pt.description)}</div>
               <div class="preview-meta">
                 <span class="status" style="--status-color:${statusColor(pt.status)}" data-status-role="${statusRoleToken(pt.status)}">${statusLabel(pt.status)}</span>
-                <span>${t('form.priorityValue', { n: pt.priority })}</span>
+                <span>${getSprintsEnabled()
+                  ? escapeAttr(t('form.sprintValue', { label: groupNoun(), sprint: pt.priority > 0 ? groupTitle(pt.priority) : t('backlog.title') }))
+                  : t('form.priorityValue', { n: pt.priority })}</span>
                 ${metaExtras}
               </div>
+              ${pt._sprintMove ? `<div class="preview-sprint-move" role="note">${escapeAttr(t('form.sprintMovedForDep', {
+                from: groupTitle(pt._sprintMove.from), to: groupTitle(pt._sprintMove.to),
+                dep: pt._sprintMove.depId, depSprint: groupTitle(pt._sprintMove.depPriority),
+              }))}</div>` : ''}
               ${(pt.tags && pt.tags.length) ? `<div class="card-tags">${pt.tags.map(tag => { const tagDesc = state.tagDescriptions.get(tag); return `<span class="tag-badge"${tagDesc ? ` title="${escapeAttr(tagDesc)}"` : ''}>${escapeAttr(tag)}</span>`; }).join('')}</div>` : ''}
             </div>
           </div>
@@ -904,7 +917,11 @@ export function renderTodoContent(allTasks, tierKeys) {
       let icon, label;
       if (aa === 'claude') { icon = CLAUDE_BADGE_SVG; label = 'Claude Code'; }
       else if (aa === 'codex') { icon = CODEX_BADGE_SVG; label = 'Codex'; }
-      else if (aa === 'pi') { icon = PI_BADGE_SVG; label = task.piModel ? shortModelName(task.piModel) : 'Pi'; }
+      else if (aa === 'pi') {
+        icon = PI_BADGE_SVG; label = task.piModel ? shortModelName(task.piModel) : 'Pi';
+        const hint = piTaskPinHint(state.objectiveProviders, task.piModel, t);
+        if (hint) label += ` — ${hint}`;
+      }
       else { icon = HUMAN_BADGE_SVG; label = 'Human'; }   // defensive: unknown agent id
       agentBadge = `<span class="agent-badge agent-badge--${escapeAttr(aa)}" title="${escapeAttr(label)}">${icon}</span>`;
     }
@@ -1484,6 +1501,14 @@ export function applyParentSprintFollow(entries) {
   return touched;
 }
 
+// (TPT660) Failure toast for the board's task writes (status confirm, delete). "Network error"
+// only when the request got no answer (isTransportError); anything the server answered gets
+// `key` with errorDetail(err) — the server's text without Electron's IPC wrapper. Same rule as
+// task-edit-modal.js's _toastWriteFailure.
+function _toastWriteFailure(err, key) {
+  showToast(t(isTransportError(err) ? 'common.networkError' : key, { msg: errorDetail(err) }), 'error');
+}
+
 // ── Status change confirmation modal ──
 // (TPT508) Owns a dialog-focus layer and an above-workspace tier: opened over the task
 // workspace (TPT466), an unlayered confirm painted on top but stayed inert.
@@ -1553,7 +1578,7 @@ export function showConfirmModal(taskId, prevStatus, newStatus, onDone) {
       }
       if (result === 'reload' && onDone) await onDone();
     } catch (err) {
-      showToast(t('common.networkError', { msg: err.message }), 'error');
+      _toastWriteFailure(err, 'board.errStatusChange');
       if (onDone) await onDone();
     }
   });
@@ -2436,7 +2461,7 @@ export function showDeleteConfirmModal(taskId, taskTitle, onDone) {
       // full loadAndRender().
       removeCardFromDom(taskId);
     } catch (err) {
-      showToast(t('common.networkError', { msg: err.message }), 'error');
+      _toastWriteFailure(err, 'board.errDelete');
     }
     if (onDone) await onDone();
   });
@@ -2672,6 +2697,10 @@ export function updateClaudeButtons() {
   // #app, which template.html owns, and this module can't call loadAndRender()/
   // pushSubtaskCrumb() — bridge event, same rationale as tiptask:task-cache-patch.
   document.dispatchEvent(new CustomEvent('tiptask:objective-tabs-sync'));
+
+  // (TPT614) The Finish button follows state.leftUncommitted, which the `task-left-uncommitted`
+  // frame, a fresh launch and a project switch all change right before calling this repaint.
+  syncAllFinishCards();
 }
 
 // ── (C1144) Active agent sessions — left nav ──
@@ -3066,10 +3095,44 @@ function _hasTerminalAgent(t) {
   return t.agentAssignee && t.agentAssignee !== 'human';
 }
 
+// Resolves to the session start's { ok, message } — see toastStartFailures() below.
 async function _startBulkTerminalTask(t, agent) {
-  await _patchBulkStartTask(t, { status: inProgressName() });
-  if (!_bulkStartTaskSession) throw new Error('Session starter unavailable');
-  await _bulkStartTaskSession(t, agent);
+  return trackQueuedStart(t, async () => {
+    await _patchBulkStartTask(t, { status: inProgressName() });
+    if (!_bulkStartTaskSession) throw new Error('Session starter unavailable');
+    return _bulkStartTaskSession(t, agent);
+  }, { agent });
+}
+
+// A refusal names a cause the user has to act on (sign in again, a teammate's task), so it
+// stays up as long as a failed save does.
+const START_ERROR_TOAST_MS = 10000;
+
+// (TPT9010) No terminal is on screen for a bulk Start or a sprint Play All (task-card.js) start,
+// so nothing else reports the server refusing one (EASSIGNEE, ECLAIM, EAUTH, ESTART). One
+// error toast per batch — every toast shares the same corner — lists the refused keys with the
+// terminal's own error text. `tasks` and `settled` line up: Promise.allSettled() over one start
+// per task, each resolving to startTerminalSession()'s { ok, message }.
+export function toastStartFailures(tasks, settled) {
+  const text = startFailureText(tasks.map((task, i) => ({ id: task.id, result: settled[i]?.value })));
+  if (text) showToast(text, 'error', { durationMs: START_ERROR_TOAST_MS });
+}
+
+// (TPT9013) Both batch starters PATCH `in_progress` before the start (the server reads the status
+// at spawn — the completion poller's baseline, the idle nudge), so a start the server refused
+// would leave the task in progress with no session. Once the batch settles, put each refused
+// task back to the status — and, with `restoreAgent` (the agent-modal branches, which PATCH
+// `agent_assignee` too), the agent assignee — of the task snapshot taken before the PATCH. Same
+// refused list toastStartFailures() reports; a timeout or dropped socket is left alone. `patch`
+// is the batch's own write: (task, body) => Promise. Best-effort — the toast already told the user.
+export async function revertRefusedStarts(tasks, settled, patch, { restoreAgent = false } = {}) {
+  const writes = refusedStartTasks(tasks, settled).map((task) => {
+    const body = {};
+    if (task.status && task.status !== inProgressName()) body.status = task.status;
+    if (restoreAgent) body.agent_assignee = task.agentAssignee || null;
+    return Object.keys(body).length ? patch(task, body) : null;
+  }).filter(Boolean);
+  await Promise.allSettled(writes);
 }
 
 async function _finishBulkStart() {
@@ -3202,10 +3265,12 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     startBtn.disabled = true;
 
     try {
-      await Promise.allSettled([
-        ...humanAssigned.map(t => _patchBulkStartTask(t, { status: inProgressName() })),
-        ...terminalAssigned.map(t => _startBulkTerminalTask(t, t.agentAssignee)),
+      const [, started] = await Promise.all([
+        Promise.allSettled(humanAssigned.map(t => _patchBulkStartTask(t, { status: inProgressName() }))),
+        Promise.allSettled(terminalAssigned.map(t => _startBulkTerminalTask(t, t.agentAssignee))),
       ]);
+      toastStartFailures(terminalAssigned, started);
+      await revertRefusedStarts(terminalAssigned, started, _patchBulkStartTask);
       await _refreshBulkSessions();
 
       if (unassigned.length > 0) {
@@ -3217,13 +3282,15 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
                 unassigned.map(t => _patchBulkStartTask(t, { agent_assignee: 'human', status: inProgressName() }))
               );
             } else {
-              await Promise.allSettled(
-                unassigned.map(async t => {
+              const startedChosen = await Promise.allSettled(
+                unassigned.map(t => trackQueuedStart(t, async () => {
                   await _patchBulkStartTask(t, { agent_assignee: choice, status: inProgressName() });
                   if (!_bulkStartTaskSession) throw new Error('Session starter unavailable');
-                  await _bulkStartTaskSession(t, choice);
-                })
+                  return _bulkStartTaskSession(t, choice);
+                }, { restoreAgent: true, agent: choice }))
               );
+              toastStartFailures(unassigned, startedChosen);
+              await revertRefusedStarts(unassigned, startedChosen, _patchBulkStartTask, { restoreAgent: true });
               await _refreshBulkSessions();
             }
           } catch (err) {
@@ -3366,7 +3433,7 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   function rebuildAgentOptions() {
     const slot = bar.querySelector('.bulk-agent-picker-slot');
     if (!slot) return;
-    const ids = ['human', ...(state.availableAgents || [])];
+    const ids = _taskStartAgentIds();
     slot.innerHTML = renderAgentPicker('bulkAgent', '', false, ids);
     const picker = slot.querySelector('.agent-picker');
     if (picker) initAgentPicker(picker, { onChange: handleBulkAgentChange });
@@ -3623,7 +3690,7 @@ export function openAgentAssignModal(taskId, current, status, onLoadAndRender) {
 // ── Bulk agent start modal (sprint play-all / bulk start: unassigned tasks) ──
 export function showBulkAgentStartModal(unassignedTasks, onConfirm, opts = {}) {
   const n = unassignedTasks.length;
-  const agents = opts.agents || ['human', ...(state.availableAgents || [])];
+  const agents = opts.agents || _taskStartAgentIds();
   const overlay = document.createElement('div');
   overlay.className = 'bulk-agent-start-overlay';
   overlay.innerHTML = `
@@ -3869,22 +3936,28 @@ function _agentPickerIcon(id) {
   return '';
 }
 
-function _configuredPiModels() {
-  const configured = (state.objectiveProviders || []).find(provider => provider.id === 'pi')?.configuredModels;
-  if (!Array.isArray(configured)) return [];
-  return [...new Set(configured.map(model => String(model || '').trim()).filter(Boolean))];
-}
-
+// One Pi option per configured row a task can start on — rows whose PI_MODELS entry sets
+// `tools: false` (objective planning only) are left out, and Pi is left out entirely when every
+// row is tool-less. The generic Pi option stays for a project whose rows are not known yet.
 function _taskAgentPickerOptions() {
-  const piModels = _configuredPiModels();
+  const providers = state.objectiveProviders;
+  const piModels = piTaskModelIds(providers);
+  const piOptions = piModels.length
+    ? piModels.map(model => ({ id: 'pi', piModel: model, label: shortModelName(model), title: model }))
+    : piOnlyToolLess(providers) ? [] : [{ id: 'pi', piModel: null, label: _AGENT_PICKER_LABELS.pi }];
   return [
     { id: 'human', label: _AGENT_PICKER_LABELS.human },
     { id: 'claude', label: _AGENT_PICKER_LABELS.claude },
     { id: 'codex', label: _AGENT_PICKER_LABELS.codex },
-    ...(piModels.length
-      ? piModels.map(model => ({ id: 'pi', piModel: model, label: shortModelName(model), title: model }))
-      : [{ id: 'pi', piModel: null, label: _AGENT_PICKER_LABELS.pi }]),
+    ...piOptions,
   ];
+}
+
+// Agent ids for the bulk agent lists (bulk-bar assignment, bulk start). A plain 'pi' starts on the
+// project's first tool-capable row, so it is dropped only when no configured row can run a task.
+function _taskStartAgentIds() {
+  const ids = ['human', ...(state.availableAgents || [])];
+  return piOnlyToolLess(state.objectiveProviders) ? ids.filter(id => id !== 'pi') : ids;
 }
 
 function _normalizeAgentPickerOption(option) {
@@ -3921,10 +3994,12 @@ export function renderAgentPicker(name, currentValue, disabled, agents, currentP
       ? { id: 'pi', piModel: currentPiModel || null, label: currentPiModel ? shortModelName(currentPiModel) : _AGENT_PICKER_LABELS.pi, icon: _agentPickerIcon('pi') }
       : allOpts[0]);
   const disabledClass = disabled ? ' agent-picker--disabled' : '';
-  const titleAttr = disabled ? ` title="${escapeAttr(t('tooltip.cannotReassign'))}"` : '';
+  const pinHint = currentValue === 'pi' ? piTaskPinHint(state.objectiveProviders, currentPiModel, t) : '';
+  const title = [disabled ? t('tooltip.cannotReassign') : '', pinHint].filter(Boolean).join('\n');
+  const titleAttr = title ? ` title="${escapeAttr(title)}"` : '';
   return `
     <div class="agent-picker${disabledClass}" data-name="${escapeAttr(name)}" data-pi-model="${escapeAttr(currentPiModel || '')}"${titleAttr}>
-      <button type="button" class="agent-picker-trigger"${disabled ? ' tabindex="-1"' : ''}>
+      <button type="button" class="agent-picker-trigger"${disabled ? ' tabindex="-1"' : ''}${titleAttr}>
         ${cur.icon}<span class="agent-picker-label">${escapeAttr(cur.label)}</span>${_CARET_SVG}
       </button>
       <ul class="agent-picker-dropdown" hidden>
@@ -4031,6 +4106,11 @@ export function initAgentPicker(pickerEl, { onChange } = {}) {
       const icon = value ? _agentPickerIcon(value) : '';
       const label = opt.querySelector('span')?.textContent || _AGENT_PICKER_LABELS[value] || t('agent.unassigned');
       trigger.innerHTML = `${icon}<span class="agent-picker-label">${escapeAttr(label)}</span>${_CARET_SVG}`;
+      const pinHint = value === 'pi' ? piTaskPinHint(state.objectiveProviders, piModel, t) : '';
+      for (const el of [pickerEl, trigger]) {
+        if (pinHint) el.setAttribute('title', pinHint);
+        else el.removeAttribute('title');
+      }
       closeDropdown();
       hiddenInput.dispatchEvent(new Event('change', { bubbles: true }));
       if (onChange) onChange(value, { piModel });
@@ -4426,6 +4506,19 @@ async function _ensureProjectTags() {
   return _projectTagsPromise;
 }
 
+// TPT623 — tags of a save the project registry doesn't have yet (case-folded), from the
+// shared tag cache. A failed registry read counts nothing as unregistered.
+export async function unregisteredProjectTags(names) {
+  if (!Array.isArray(names) || names.length === 0) return [];
+  return unregisteredTagNames(names, await _ensureProjectTags());
+}
+
+// TPT623 — drop the cached registry after a save registered new tags, so the next tag
+// typeahead / unregistered check reads them.
+export function invalidateProjectTags() {
+  _cachedProjectTags = null;
+}
+
 // Slim project task list ({id, title, status}) for the modal's dependency
 // typeahead. Reset per modal-open (unlike tags) since tasks change often.
 async function _ensureProjectTaskList() {
@@ -4444,6 +4537,15 @@ async function _ensureProjectTaskList() {
       _projectTaskListPromise = null;
     });
   return _projectTaskListPromise;
+}
+
+// (TPT642) New Task Preview's dependency floor reads the same cache for dependencies outside
+// the board's sprint-windowed, assignee-scoped list: a sync peek, and a fetch only when cold.
+export function getProjectTaskList() {
+  return _cachedProjectTaskList;
+}
+export function ensureProjectTaskList() {
+  return _ensureProjectTaskList();
 }
 
 // (TPT111) Dependency index for the modal, before/without a resolved project task list.
@@ -7139,6 +7241,7 @@ export function initSettingsModal() {
 configureTaskEditModal({
   _createMemberCombobox, _memberLabelFor, _renderMemberCombobox,
   refreshProjectMembers, _ensureProjectTags, _ensureProjectTaskList,
+  unregisteredProjectTags, invalidateProjectTags,
   _projectTaskIndex, _projectTagName, _depTitleFor, _createDepsChipInput,
   renderAgentPicker, initAgentPicker, _taskAgentPickerOptions,
   _applyAgentPickerSelection, isAgentLocked,

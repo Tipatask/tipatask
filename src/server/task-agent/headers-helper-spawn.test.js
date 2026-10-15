@@ -12,6 +12,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+// The account store defaults to USER_DATA_ROOT; keep this file's tokens in a private dir.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-hh-userdata-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
 const ClaudeAgent = require('./claude-agent');
 
 function b64url(obj) {

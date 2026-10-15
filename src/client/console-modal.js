@@ -14,9 +14,12 @@ import { forgetTaskAttention } from './attention-notifications.js';
 import { createVoiceRecorder, voiceShortcutLabel, MIC_SVG } from './audio-recorder.js';
 import { t } from './i18n.js';
 import { queueReasonText } from './queue-reason.js';
+import { forgetQueuedStart } from './queued-start-rollback.js';
+import { errorFrameText, pasteErrorText, isRefusedStart } from './terminal-frame-text.js';
 import { isInProgressName, isClosedName, isCompleteName, inProgressName, loadStatuses } from './status-registry.js';
 import { replayProgressLog, progressStatusLine } from './objective-progress-log.js';
 import { getAgentDisplayLabel } from './agent-select.js';
+import { piTaskModelIds, piOnlyToolLess } from './pi-task-models.js';
 import { clearAttention, markSessionLost, dismissLostSession, mergeSessionsSnapshot } from './attention-state.js';
 import { _isPinnedToBottom, createTerminalOutputWriter } from './terminal-output.js';
 
@@ -100,14 +103,23 @@ function _piConfiguredModels() {
   return (p && p.configuredModels) || [];
 }
 
+// The configured rows a task can start on: _piConfiguredModels() minus the rows whose
+// PI_MODELS entry sets `tools: false` (objective planning only — a task terminal refuses them).
+// Row order is kept, so the first id is what a start with no named model runs.
+function _piTaskModels() {
+  return piTaskModelIds(state.objectiveProviders);
+}
+
 // (C1279) `availableAgents` reports machine-level CLI availability, which is not enough
 // for Pi: the project must also have a model + credential configured. The provider registry
 // exposes that project-scoped answer as `selectable`; keep the configuredModels fallback for
 // older provider payloads that predate that flag. An absent provider snapshot is deliberately
-// treated as unknown/unusable until the late-hydration fetch below resolves.
+// treated as unknown/unusable until the late-hydration fetch below resolves. A project whose
+// every configured row is tool-less can still plan with Pi but cannot start a task on it.
 function _isPiProviderUsable() {
   const p = (state.objectiveProviders || []).find((x) => x.id === 'pi');
   if (!p) return false;
+  if (piOnlyToolLess(state.objectiveProviders)) return false;
   if (typeof p.selectable === 'boolean') return p.selectable;
   return Array.isArray(p.configuredModels) && p.configuredModels.length > 0;
 }
@@ -154,12 +166,14 @@ async function maybeAdvanceToInProgress(taskId, currentStatus) {
   // 'canceled') into one.
   if (isClosedName(currentStatus)) return;
   try {
-    await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+    const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: inProgressName() }),
     });
+    if (!response.ok) return;
     reload();
+    return currentStatus;
   } catch { /* ignore — same fire-and-forget discipline as before C1184 */ }
 }
 
@@ -220,8 +234,8 @@ export function openObjectiveConsole() {
   overlay.innerHTML = `
     <div class="terminal-container">
       <div class="terminal-header">
-        <span class="task-label">Debug Console</span>
-        <span class="status-dot" title="Connected"></span>
+        <span class="task-label">${escapeAttr(t('console.title'))}</span>
+        <span class="status-dot" title="${escapeAttr(t('terminal.status.connected'))}"></span>
         <div class="terminal-header-actions">
           <button class="btn-terminate-terminal">${escapeAttr(t('btn.terminate'))}</button>
           <button class="btn-close-terminal">${escapeAttr(t('btn.close'))}</button>
@@ -260,7 +274,7 @@ export function openObjectiveConsole() {
         term.write(state.chatState.clientBuffer);
       } else if (state.chatState && !state.chatState.processExited &&
                  !(state.chatState.progressLog && state.chatState.progressLog.length)) {
-        term.write('\x1b[90mwaiting for first signal…\x1b[0m\r\n');
+        term.write(`\x1b[90m${t('console.waiting')}\x1b[0m\r\n`);
       }
       if (state.chatState) {
         state.chatState.term = term;
@@ -514,8 +528,9 @@ export async function showClaudeConfirmModal(taskId, title, desc, taskStatus, op
 }
 
 function buildTaskSessionPrompt(taskId, title, desc, opts = {}) {
-  // (TPT345) Verbatim kickoff override — only caller is merge-branches-modal.js's "Resolve
-  // with agent", which hands the server-built conflict-resolution prompt to a task terminal.
+  // (TPT345) Verbatim kickoff override — merge-branches-modal.js's "Resolve with agent" hands the
+  // server-built conflict-resolution prompt to a task terminal; (TPT614) the card's Finish action
+  // (task-finish.js) does the same with the finish-prompt route's finalize kickoff.
   if (typeof opts.prompt === 'string' && opts.prompt.trim()) return opts.prompt;
   const rawDesc = String(desc || '');
   const isObjective = String(taskId || '').startsWith('obj-');
@@ -532,8 +547,17 @@ function adoptSessionStart(taskId, msg) {
   state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), startedAt: msg.startedAt });
 }
 
+// (TPT614) A fresh run even though an exited session is still retained for reattach — the Finish
+// card action's hand-off (opts.relaunch) and the lost-session Restart (opts.restartLost). The server
+// spawns anew for a connect that carries a prompt (ws-handlers.js handleConnection: an exited
+// session + prompt falls through to "Spawn new session"). Never for a live session (it reattaches
+// and the server ignores the prompt) and never on a reconnect, whose opts still carry the launch's.
+function wantsRelaunch(taskId, opts = {}) {
+  return !!(opts.relaunch || opts.restartLost) && !opts.reconnectOnly && !state.activeSessions.has(taskId);
+}
+
 function buildTaskSessionWsExtra(taskId, title, desc, opts = {}) {
-  const isResume = opts.reconnectOnly || state.activeSessions.has(taskId) || state.exitedSessions.has(taskId);
+  const isResume = opts.reconnectOnly || (!wantsRelaunch(taskId, opts) && (state.activeSessions.has(taskId) || state.exitedSessions.has(taskId)));
   const wsExtra = isResume ? {} : { prompt: buildTaskSessionPrompt(taskId, title, desc, opts) };
   const startedAt = opts.sessionStartedAt || state.sessionMeta.get(taskId)?.startedAt;
   if (isResume && Number.isFinite(startedAt) && startedAt > 0) wsExtra.startedAt = startedAt;
@@ -544,6 +568,9 @@ function buildTaskSessionWsExtra(taskId, title, desc, opts = {}) {
   return wsExtra;
 }
 
+// Starts a task session with no terminal on screen and resolves startTerminalSession()'s
+// { ok, message }. A refused start's `error` frame is the caller's to show — the bulk bar's
+// Start toasts it (toastStartFailures(), task-board.js, TPT9010).
 export function startTaskSession(taskId, title, desc, taskStatus, opts = {}) {
   const wsExtra = buildTaskSessionWsExtra(taskId, title, desc, opts);
   return startTerminalSession(taskId, wsExtra, { timeoutMs: opts.timeoutMs || 15000 }).then((result) => {
@@ -553,6 +580,7 @@ export function startTaskSession(taskId, title, desc, taskStatus, opts = {}) {
       state.activeSessions.add(taskId);
       state.exitedSessions.delete(taskId);
       clearAttention(taskId, 'opened'); // a fresh launch has nothing pending to be attentive about
+      if (wsExtra.prompt) state.leftUncommitted.delete(taskId); // (TPT613) a new run supersedes the exit-backstop flag; a reattach does not
       // (C1144) Known immediately from launch opts — no need to wait on a /api/sessions refetch
       // for the left-nav row's icon to be correct. (TPT413) The server's `config` reply names the
       // agent the session was actually created with (result.message.taskAgent) — prefer it over
@@ -619,7 +647,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   if (state.activeTerminal) {
-    if (state.activeTerminal.taskId === taskId && !opts.restartLost) {
+    if (state.activeTerminal.taskId === taskId && !(opts.restartLost || opts.relaunch)) {
       _markAttentionSeen(taskId); // (C1387) refocusing an already-open terminal counts as seen
       state.activeTerminal.refresh?.({ send: true, focus: true });
       return state.activeTerminal;
@@ -643,7 +671,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   const knownLoss = state.lostSessions.get(taskId);
-  let isResume = opts.reconnectOnly || state.activeSessions.has(taskId) || state.exitedSessions.has(taskId);
+  let isResume = opts.reconnectOnly || (!wantsRelaunch(taskId, opts) && (state.activeSessions.has(taskId) || state.exitedSessions.has(taskId)));
   // (TPT443) Read before the clear below wipes it: a watchdog-paused session shows its banner at
   // once instead of waiting for the terminal-state round-trip that confirms (or clears) it.
   const seedRunaway = state.attentionDetails.get(taskId);
@@ -660,8 +688,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // a model the project/task overrides).
   const initialAgentId = opts.agent || state.taskAgent;
   const initialAgentLabel = state.taskAgentLabel || 'Claude Code';
-  const initialModel = initialAgentId === 'pi' ? _providerDefaultModel('pi') : '';
-  const discussionSuffix = opts.discussionMode ? ' · Discussion' : '';
+  // Pi: the picked row, else the first row a task can start on — a row 0 that sets
+  // `tools: false` is never what a task runs.
+  const initialModel = initialAgentId === 'pi' ? (opts.model || _piTaskModels()[0] || _providerDefaultModel('pi')) : '';
 
   // (TPT309) Board-card hierarchy: key chip (.id-badge look) → title (.card-title look) → muted
   // agent chip. Parts are separated by the flex gap on .task-label, not by inline text, so there
@@ -669,12 +698,13 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // takes only the `agent-badge--{id}` colour modifier — never the absolutely-positioned
   // `.agent-badge` base class the board cards query.
   function renderTaskLabel(agentId, caption) {
-    if (isObjective) return 'New Objective';
+    if (isObjective) return escapeAttr(t('nav.newObjective'));
     const safeTaskId = escapeAttr(taskId);
     const safeTitle = escapeAttr(title || '');
     const dotAgent = ['claude', 'codex', 'pi'].includes(agentId) ? agentId : 'human';
+    const discussionSuffix = opts.discussionMode ? ` · ${t('terminal.discussion')}` : '';
     const safeCaption = escapeAttr(`${caption}${discussionSuffix}`);
-    return `<span class="terminal-task-key">${safeTaskId}</span><span class="terminal-task-title" title="${safeTitle}">${safeTitle}</span><span class="terminal-task-caption" title="${safeCaption}"><span class="terminal-agent-dot agent-badge--${dotAgent}" aria-hidden="true">${_agentSelectorIcon(dotAgent)}</span><span class="terminal-task-caption-text">${escapeAttr(caption)}${discussionSuffix}</span></span>`;
+    return `<span class="terminal-task-key">${safeTaskId}</span><span class="terminal-task-title" title="${safeTitle}">${safeTitle}</span><span class="terminal-task-caption" title="${safeCaption}"><span class="terminal-agent-dot agent-badge--${dotAgent}" aria-hidden="true">${_agentSelectorIcon(dotAgent)}</span><span class="terminal-task-caption-text">${safeCaption}</span></span>`;
   }
 
   // Build DOM
@@ -691,7 +721,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     <div class="terminal-container">
       <div class="terminal-header">
         <span class="task-label">${renderTaskLabel(initialAgentId, _agentCaption(initialAgentId, initialAgentLabel, initialModel))}</span>
-        <span class="status-dot" title="Connected"></span>
+        <span class="status-dot" title="${escapeAttr(t('terminal.status.connected'))}"></span>
         <div class="terminal-header-actions">
           ${isObjective ? '' : `<button class="btn-show-task" type="button">${escapeAttr(t('terminal.showTask'))}</button>`}
           <button class="terminal-voice-btn" type="button" title="${voiceBtnLabel}" aria-label="${voiceBtnLabel}">${MIC_SVG(14)}</button>
@@ -766,6 +796,14 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
 
+  // Red bracketed notices in the xterm: voice and image-paste failures.
+  function writeErrorNotice(text) {
+    term.write(`\r\n\x1b[31m[${text}]\x1b[0m\r\n`);
+  }
+  function writePasteFailure(reason) {
+    writeErrorNotice(t('terminal.imagePasteFailed', { reason }));
+  }
+
   let processRunning = true;
   let restartingLoss = !!opts.restartLost;
   let terminalPhase = 'planning';
@@ -814,7 +852,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     onFinal: text => {
       if (wsIsOpen()) ws.send(JSON.stringify({ type: 'data', data: `${text} ` }));
     },
-    onError: msg => term.write(`\r\n\x1b[31m[voice: ${msg}]\x1b[0m\r\n`),
+    onError: msg => writeErrorNotice(t('terminal.voiceError', { msg })),
   }) : null;
   if (voiceRecorder) {
     voiceBtn.addEventListener('click', () => voiceRecorder.toggle());
@@ -924,10 +962,10 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     const dlg = document.createElement('div');
     dlg.className = 'plan-ready-dialog';
     dlg.innerHTML = `
-      <div class="plan-ready-text">Agent has a plan ready. Proceed with implementation?</div>
+      <div class="plan-ready-text">${escapeAttr(t('terminal.planReady'))}</div>
       <div class="plan-ready-actions">
-        <button class="btn-plan-discard">Discard</button>
-        <button class="btn-plan-proceed">Proceed with Implementation</button>
+        <button class="btn-plan-discard">${escapeAttr(t('btn.discard'))}</button>
+        <button class="btn-plan-proceed">${escapeAttr(t('terminal.planProceed'))}</button>
       </div>`;
     overlay.querySelector('.terminal-container').appendChild(dlg);
     dlg.querySelector('.btn-plan-proceed').addEventListener('click', () => {
@@ -973,19 +1011,17 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   function showMcpAuthDialog(authState) {
     if (overlay.querySelector('[data-mcp-auth]')) return;
     const isInitial = authState === 'initial';
-    const body = isInitial
-      ? 'No API token configured — run initial setup to connect.'
-      : 'Your API token is invalid or expired — please re-authenticate.';
+    const body = t(isInitial ? 'terminal.mcpAuth.initial' : 'terminal.mcpAuth.reauth');
     const dlg = document.createElement('div');
     dlg.className = 'mcp-auth-overlay';
     dlg.dataset.mcpAuth = authState || 'reauth';
     dlg.innerHTML = `
       <div class="mcp-auth-dialog">
-        <div class="mcp-auth-title">Session not authenticated</div>
-        <div class="mcp-auth-body">${body}</div>
+        <div class="mcp-auth-title">${escapeAttr(t('terminal.mcpAuth.title'))}</div>
+        <div class="mcp-auth-body">${escapeAttr(body)}</div>
         <div class="mcp-auth-actions">
-          <button class="btn-mcp-auth-dismiss">Dismiss</button>
-          <button class="btn-mcp-auth-settings">Open Settings</button>
+          <button class="btn-mcp-auth-dismiss">${escapeAttr(t('btn.dismiss'))}</button>
+          <button class="btn-mcp-auth-settings">${escapeAttr(t('terminal.mcpAuth.openSettings'))}</button>
         </div>
       </div>`;
     termBody.appendChild(dlg);
@@ -1147,9 +1183,29 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     terminalController.ws = ws;
     if (previous && (previous.readyState === WebSocket.OPEN || previous.readyState === WebSocket.CONNECTING)) previous.close();
 
+    // Keep the advance and acceptance tied to this socket, including a refusal that
+    // arrives before the status PATCH settles. Reconnects never inherit its rollback.
+    let statusAdvance = null;
+    let startAccepted = false;
+    async function revertRefusedStart(msg) {
+      if (startAccepted || !statusAdvance || !isRefusedStart({ ok: false, message: msg })) return;
+      const advance = statusAdvance;
+      statusAdvance = null; // one restore at most, even if the server repeats the error
+      const previousStatus = await advance;
+      if (!previousStatus) return; // skipped or failed advance
+      try {
+        const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: previousStatus }),
+        });
+        if (response.ok) reload();
+      } catch { /* best-effort, like the initial advance */ }
+    }
+
     ws.onopen = () => {
       if (ws !== socket || (terminalClosing && !terminalController.detached) || terminalDisposed) return;
-      setStatus('', 'Connected');
+      setStatus('', t('terminal.status.connected'));
       lastSentSize = null; // a new socket states the size once, whatever the last one heard
       fitAndSendResize();
       ws.send(JSON.stringify({ type: 'session-status' }));
@@ -1168,6 +1224,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       // is left agent-less until that frame lands a few ms later.
       if (!isResume) {
         state.sessionMeta.set(taskId, { agent: opts.agent || state.taskAgent, label: state.taskAgentLabel, type: 'terminal', alive: true });
+        state.leftUncommitted.delete(taskId); // (TPT613) a new run supersedes the exit-backstop flag
       } else {
         const prevMeta = state.sessionMeta.get(taskId) || { type: 'terminal' };
         state.sessionMeta.set(taskId, { ...prevMeta, alive: true });
@@ -1180,7 +1237,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       // or already at the in_progress role — on a default project that is exactly
       // pending ✓, on_fire ✓, in_progress ✗, completed ✗, canceled ✗, same behavior as before.
       if (!isResume && !opts.planOnly && !opts.discussionMode) {
-        void maybeAdvanceToInProgress(taskId, taskStatus);
+        statusAdvance = maybeAdvanceToInProgress(taskId, taskStatus);
       }
     };
 
@@ -1190,6 +1247,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
 
+      if (msg.type === 'config' || msg.type === 'terminal-state') startAccepted = true;
+
       if (msg.type === 'session-queued') {
         // (TPT444) No free slot — the server parked this start and will launch it, oldest first,
         // when a running task completes. Not a live session yet, so keep it out of activeSessions.
@@ -1197,6 +1256,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         state.queueReasons.set(taskId, msg.reason || 'device-cap');
         state.queueDiagnostics.set(taskId, msg);
         state.activeSessions.delete(taskId);
+        // Recompute from every broadcast: counts, alarms and ramp timing can change
+        // while the queue position stays fixed. Only identical visible text is suppressed.
         const notice = `${t('queue.badge', { position: msg.position ?? '?' })}: ${queueReasonText(msg)}`;
         if (notice !== lastQueueNotice) term.write(`\r\n\x1b[90m${notice}\x1b[0m\r\n`);
         lastQueueNotice = notice;
@@ -1215,6 +1276,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       } else if (msg.type === 'terminal-state') {
         applyTaskAgentConfig(msg);
         adoptSessionAgent(taskId, msg); // (TPT413) spawnTerminal() rewrites session.taskAgent after pty.spawn
+        forgetQueuedStart(taskId);
         adoptSessionStart(taskId, msg);
         restartingLoss = false;
         processRunning = true;
@@ -1231,12 +1293,22 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
           terminalPlanApprovalCommandKnown = true;
         }
         terminalPhase = msg.phase || terminalPhase;
+        if (terminalPhase === 'executing') {
+          // (TPT654) A plan approved inside the agent's own TUI (Claude's ExitPlanMode dialog, a
+          // typed go-ahead to Codex/Pi) flips the server phase without a Proceed click, so a
+          // plan-ready bar still on screen is stale — and its Discard button terminates the run.
+          const staleDialog = overlay.querySelector('.plan-ready-dialog');
+          if (staleDialog) {
+            staleDialog.remove();
+            scheduleTerminalRefresh({ send: true });
+          }
+        }
         updateTaskLabel({ agent: msg.taskAgent, label: msg.taskAgentLabel || state.taskAgentLabel, model: msg.taskAgentModel });
         setStatus(undefined, terminalPhase === 'planning'
           ? (state.planApprovalCommand
-              ? `Planning — type ${state.planApprovalCommand} to continue`
-              : 'Planning — awaiting approval dialog')
-          : 'Executing');
+              ? t('terminal.status.planningCommand', { command: state.planApprovalCommand })
+              : t('terminal.status.planningDialog'))
+          : t('terminal.status.executing'));
         state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), paused: msg.paused || null });
         renderWatchdogActions(msg.paused);
         syncActiveSessionsNav();
@@ -1293,16 +1365,16 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
           setStatus('exited', runawayLine);
           term.write(`\r\n\x1b[31m--- ${runawayLine} ---\x1b[0m\r\n`);
         } else {
-          setStatus('exited', `Exited (code ${msg.code})`);
-          term.write(`\r\n\x1b[90m--- Process exited (code ${msg.code}) ---\x1b[0m\r\n`);
+          setStatus('exited', t('terminal.status.exitedCode', { code: msg.code }));
+          term.write(`\r\n\x1b[90m--- ${t('terminal.processExitedCode', { code: msg.code })} ---\x1b[0m\r\n`);
         }
         term.scrollToBottom();
         if (state.showAiStats && msg.tokens) {
-          const t = msg.tokens;
-          const costStr = t.costUsd > 0 ? ` · $${t.costUsd >= 0.01 ? t.costUsd.toFixed(2) : t.costUsd.toFixed(4)}` : '';
+          const tokens = msg.tokens;
+          const cost = tokens.costUsd > 0 ? ` · $${tokens.costUsd >= 0.01 ? tokens.costUsd.toFixed(2) : tokens.costUsd.toFixed(4)}` : '';
           const footer = document.createElement('div');
           footer.className = 'terminal-footer';
-          footer.textContent = `Tokens: ${t.input.toLocaleString()} in / ${t.output.toLocaleString()} out${costStr}`;
+          footer.textContent = t('terminal.tokens', { input: tokens.input.toLocaleString(), output: tokens.output.toLocaleString(), cost });
           overlay.querySelector('.terminal-container').appendChild(footer);
         }
         // (C1356) A process exit is exactly when the agent's task most often just went
@@ -1316,15 +1388,19 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         updateClaudeButtons();
         document.dispatchEvent(new Event('tiptask:sync-nav-statuses'));
       } else if (msg.type === 'error') {
+        void revertRefusedStart(msg);
         if (msg.code === 'ESESSION_LOST') {
           showLostSession({ reason: msg.reason, at: msg.at });
           return;
         }
-        if (restartingLoss && knownLoss) showLostSession(knownLoss, { failed: msg.message || t('terminal.sessionMissing') });
+        // (TPT9002) A coded frame renders its terminal.error.* key in the project language; an
+        // uncoded frame, or an unknown code, keeps the server's English message.
+        const errorText = errorFrameText(msg);
+        if (restartingLoss && knownLoss) showLostSession(knownLoss, { failed: errorText || t('terminal.sessionMissing') });
         processRunning = false;
         setCodexPlanReady(false);
-        setStatus('disconnected', 'Error');
-        term.write(`\r\n\x1b[31mError: ${msg.message}\x1b[0m\r\n`);
+        setStatus('disconnected', t('terminal.status.error'));
+        term.write(`\r\n\x1b[31m${t('common.error', { msg: errorText })}\x1b[0m\r\n`);
         term.scrollToBottom();
         if (!state.lostSessions.has(taskId)) clearTaskSessionState();
       } else if (msg.type === 'session-ended' && (!msg.taskId || msg.taskId === taskId)) {
@@ -1350,7 +1426,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         // the bracketed-paste path lands (C1003) — a client-side write here would
         // draw stray text over Claude's alt-screen input box.
       } else if (msg.type === 'paste-image-error') {
-        term.write(`\r\n\x1b[31m[image paste failed: ${msg.error}]\x1b[0m\r\n`);
+        writePasteFailure(pasteErrorText(msg)); // (TPT9002) terminal.pasteError.* for a coded reason
       } else if (msg.type === 'mcp-auth-failure') {
         showMcpAuthDialog(msg.authState);
       }
@@ -1362,13 +1438,13 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       // still the visible one (not detached/minimized, and not swapped out by another
       // terminal taking over state.activeTerminal).
       if (processRunning && state.activeTerminal === terminalController) {
-        setStatus('disconnected', 'Disconnected');
+        setStatus('disconnected', t('terminal.status.disconnected'));
       }
     };
 
     ws.onerror = () => {
       if (ws !== socket || terminalDisposed) return;
-      setStatus('disconnected', 'Connection error');
+      setStatus('disconnected', t('terminal.status.connectionError'));
     };
   }
 
@@ -1612,7 +1688,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     if (state.queuedSessions.has(taskId)) return;
     // OS sleep can leave readyState OPEN indefinitely. Replace the connection
     // without remounting/focusing the pane; replay owns the resize repaint nudge.
-    setStatus('disconnected', 'Disconnected');
+    setStatus('disconnected', t('terminal.status.disconnected'));
     connectWebSocket({ resume: true });
     scheduleTerminalRefresh({ send: true });
   });
@@ -1653,17 +1729,17 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       e.preventDefault();
       e.stopPropagation();
       const file = imgItem.getAsFile();
-      if (!file) { term.write('\r\n\x1b[31m[image paste failed: clipboard unreadable]\x1b[0m\r\n'); return; }
+      if (!file) { writePasteFailure(t('terminal.imagePasteReason.clipboardUnreadable')); return; }
       const reader = new FileReader();
       reader.onload = () => {
-        if (!wsIsOpen()) { term.write('\r\n\x1b[31m[image paste failed: not connected]\x1b[0m\r\n'); return; }
+        if (!wsIsOpen()) { writePasteFailure(t('terminal.imagePasteReason.notConnected')); return; }
         const data = String(reader.result).split(',')[1] || '';
-        if (!data) { term.write('\r\n\x1b[31m[image paste failed: empty data]\x1b[0m\r\n'); return; }
+        if (!data) { writePasteFailure(t('terminal.imagePasteReason.emptyData')); return; }
         // No "uploading…" cosmetic write — paste→inject is near-instant and Claude
         // Code renders its own native [Image #N] placeholder once it lands (C1003).
         ws.send(JSON.stringify({ type: 'paste-image', mimeType: file.type, data }));
       };
-      reader.onerror = () => term.write('\r\n\x1b[31m[image read failed]\x1b[0m\r\n');
+      reader.onerror = () => writeErrorNotice(t('terminal.imageReadFailed'));
       reader.readAsDataURL(file);
     };
     term.element.addEventListener('paste', pasteHandler, true);
@@ -1824,6 +1900,8 @@ export function mountTaskTerminal(host, taskId, title, desc, taskStatus, opts = 
 // so no separate "last-used Pi model" field is needed; only mark it current when the
 // project's last-used AGENT was actually pi (state.taskAgent === 'pi'), else row 0 is just
 // the configured default with no bearing on what last ran.
+// Rows that set `tools: false` are left out (_piTaskModels()), so the first button — and the
+// current marker — is the first tool-capable row, the one a start with no named model runs.
 function _buildAgentSelectorButtons() {
   const ids = [...state.availableAgents].filter((id) => id !== 'pi' || _isPiProviderUsable());
   const currentIndex = ids.indexOf(state.taskAgent);
@@ -1833,7 +1911,7 @@ function _buildAgentSelectorButtons() {
   }
   return ids.map(id => {
     if (id === 'pi') {
-      const configured = _piConfiguredModels();
+      const configured = _piTaskModels();
       const piIsCurrent = state.taskAgent === 'pi';
       if (configured.length) {
         return configured.map((model, i) => {
@@ -1871,10 +1949,10 @@ export function openAgentSelectorModal(taskId, title, desc, taskStatus, baseOpts
 
   overlay.innerHTML = `
     <div class="agent-selector-card">
-      <div class="agent-selector-title">Choose agent for this task</div>
+      <div class="agent-selector-title">${escapeAttr(t('agentSelector.title'))}</div>
       <div class="agent-selector-buttons">${_buildAgentSelectorButtons()}</div>
       <div class="agent-selector-remember">
-        <label><input type="checkbox" class="agent-selector-remember-cb"> Remember for this session</label>
+        <label><input type="checkbox" class="agent-selector-remember-cb"> ${escapeAttr(t('agentSelector.remember'))}</label>
       </div>
     </div>`;
   document.body.appendChild(overlay);

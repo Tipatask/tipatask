@@ -10,11 +10,19 @@ import { dismissNotification } from './notification-center.js';
 import { raiseAttention, clearAttention, isTerminalOpenFor, applyQueueSnapshot } from './attention-state.js';
 import { applyActivitySnapshot, syncActivityChips } from './task-activity.js';
 import { notifyTaskActivity } from './activity-notifications.js';
+import { reportStartFailure } from './start-failure-toast.js';
+
+// (TPT9014) template.html's __board__ session-ended branch reaches it via window.TipTask.attentionWs.
+export { reportStartFailure };
 
 let _ws = null;
 let _reconnectTimer = null;
 let _backoffMs = 1000;
 const BACKOFF_MAX_MS = 30000;
+// (TPT613) taskId -> exitId of the last `task-left-uncommitted` frame handled. Browser mode can
+// have this socket open beside __board__, which delivers the same frame again: a repeat re-raises
+// the ring but never notifies twice.
+const _leftUncommittedExits = new Map();
 
 // Shared with the browser board WS. Notify here, independently of card rendering,
 // and funnel all network attention-state changes through this handler. Unrelated frames
@@ -68,11 +76,56 @@ export function handleAttentionMessage(msg) {
   }
   if (msg.type === 'session-ended') {
     if (msg.taskId) {
+      // (TPT613) Same as the browser __board__ handler (template.html): the session is gone, not
+      // lost — left in activeSessions, the next /api/sessions snapshot would mark it lost.
+      state.activeSessions.delete(msg.taskId);
+      state.exitedSessions.delete(msg.taskId);
       clearAttention(msg.taskId, 'session-ended');
       forgetTaskAttention(msg.taskId);
       dismissNotification(msg.taskId); // (C1137) same reasoning as attention-cleared above
     }
     window.TipTask?.taskBoard?.updateClaudeButtons?.();
+    // (TPT9014) A queued start the server refused on drain: toast its error frame.
+    reportStartFailure(msg);
+    return true;
+  }
+  // (TPT613) Exit backstop: the task's terminal ended with the task still in progress and its
+  // required commit missing (server: terminal-session.js flagTaskLeftUncommitted()). It arrives
+  // after the session is gone or exited, so the ring is about the task: attention-state.js keeps
+  // it through session snapshots, and state.leftUncommitted outlives even the ring (TPT614's card
+  // action). A fresh exit is news even right after an idle banner for the same task or an earlier
+  // identical exit, so it clears the debounce and the notified-signature ledger first; a repeat of
+  // the same exit (second socket) only re-raises the ring.
+  if (msg.type === 'task-left-uncommitted') {
+    if (!msg.taskId) return true;
+    // (TPT664) The server retired its flag (a new run started, the task closed, or the finish
+    // route found it stale): drop ours and, when the ring is this exit's, put it out — no notice.
+    if (msg.cleared) {
+      state.leftUncommitted.delete(msg.taskId);
+      if (state.attentionDetails.get(msg.taskId)?.kind === 'uncommitted') {
+        clearAttention(msg.taskId, 'server');
+        forgetTaskAttention(msg.taskId);
+        dismissNotification(msg.taskId);
+      }
+      window.TipTask?.taskBoard?.updateClaudeButtons?.();
+      return true;
+    }
+    const blockers = (Array.isArray(msg.blockers) ? msg.blockers : []).map(b => b && b.code).filter(Boolean);
+    // (TPT664) A connect-time replay (`replay: true`) rebuilds the ring and the flag but is never
+    // news: no notification, and the ledger still learns the exitId so a later live duplicate of
+    // the same exit (browser mode, second socket) stays quiet too.
+    const fresh = !msg.replay && _leftUncommittedExits.get(msg.taskId) !== msg.exitId;
+    _leftUncommittedExits.set(msg.taskId, msg.exitId);
+    state.leftUncommitted.set(msg.taskId, { exitId: msg.exitId, blockers, status: msg.status || '', at: Date.now() });
+    if (fresh) {
+      clearDebounce(msg.taskId);
+      forgetTaskAttention(msg.taskId);
+    }
+    raiseAttention(msg.taskId, { kind: 'uncommitted', agent: msg.agent, blockers });
+    window.TipTask?.taskBoard?.updateClaudeButtons?.();
+    if (fresh) {
+      try { notifyTaskNeedsAttention(msg.taskId); } catch (err) { debugNotifyLog('notifyTaskNeedsAttention threw', msg.taskId, err); }
+    }
     return true;
   }
   // (C1565) Descendant-count watchdog alert — deliberately a fourth frame type, not folded
@@ -140,7 +193,7 @@ export function handleAttentionMessage(msg) {
 // (TPT12) `task-activity` — someone else commented on/changed a task, per-task unread
 // snapshot from task-change-poll.js. Deliberately a SIBLING to handleAttentionMessage above,
 // not folded into it: it never touches state.attentionSessions/attentionDetails, so it falls
-// outside that function's documented four-frame-type contract.
+// outside that function's contract (every frame that raises or clears the attention ring).
 //
 // Safe to call from both WS ladders (this socket, AND template.html's __board__ ladder in
 // browser mode, which runs simultaneously with this one — see the C1193 comment above) with

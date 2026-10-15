@@ -87,6 +87,40 @@ for (const ceiling of [6, 8, 12]) test(`replay ${ceiling} ordinary slots across 
   assert.equal(b.admission.snapshot().reservedBytes, ceiling * 2 * GiB);
 });
 
+test('replay ramp 6→8 ordinary slots across independent registries under quiet telemetry; a warning sample resets to 6', async t => {
+  const ordinary = { AGENT_ADMISSION_WORKLOAD_CLASS: 'ordinary' };
+  const h = harness(t, { mode: 'ramp', projectConfigs: { '/a': ordinary, '/b': ordinary } });
+  const a = h.instance(1000), b = h.instance(2000); await h.advance(0);
+  const read = () => JSON.parse(fs.readFileSync(path.join(h.directory, 'admission-state.json')));
+  const running = () => a.queue.countRunning() + b.queue.countRunning();
+  for (let n = 0; n < 10; n++) (n % 2 ? b : a).request(`R${n}`, n % 2 ? '/b' : '/a');
+  await tick();
+  assert.equal(running(), 6); // the static floor needs neither memory checks nor spacing
+  const caps = [], nextSteps = [];
+  for (let at = 5000; at <= 600000; at += 5000) {
+    await h.advance(at);
+    const snap = a.admission.snapshot();
+    assert.equal(b.admission.snapshot().cap, snap.cap); // one shared number
+    assert.equal(b.admission.snapshot().rampNextStepAt, snap.rampNextStepAt);
+    assert.ok(running() <= snap.cap);
+    if (caps.at(-1) !== snap.cap) { caps.push(snap.cap); nextSteps.push(snap.rampNextStepAt); }
+  }
+  assert.deepEqual(caps, [6, 7, 8]); // every step needs its own full window: no instance steps twice
+  assert.deepEqual(nextSteps, [300000, 600000, null]);
+  assert.equal(running(), 8);
+  assert.equal(a.queue.size() + b.queue.size(), 2);
+  assert.equal(read().pressure.rampCap, 8);
+  h.host.pressure = 'warning';
+  await h.advance(605000);
+  for (const i of [a, b]) {
+    const snap = i.admission.snapshot();
+    assert.deepEqual([snap.cap, snap.alarm, snap.rampNextStepAt], [6, 'pressure', null]);
+  }
+  assert.equal(read().pressure.rampCap, null);
+  assert.equal(running(), 8); // closing admission never terminates sessions
+  assert.equal(a.queue.snapshot('/a').queued[0].reason, 'device-cap');
+});
+
 test('twelve-slot ceiling does not promise twelve unknown unobserved launches', async t => {
   const h = harness(t, { config: { AGENT_ADMISSION_CEILING: 12 } });
   const a = h.instance(1000); await h.warm();
@@ -351,4 +385,221 @@ test('unavailable census stays unknown in successful and failed transactions', a
   a.coordinator.transaction = () => ({ ok: false, detail: 'lock-busy' });
   await a.admission.poll();
   assert.equal(a.admission.snapshot().censusPidCount, null);
+});
+
+test('an unavailable census is coordination doubt: no pressure expansion and no ramp step', async t => {
+  const h = harness(t); const a = h.instance(1000); h.census(null); await h.warm();
+  for (let n = 0; n < 7; n++) a.request(`T${n}`);
+  for (let at = 65000; at <= 150000; at += 5000) await h.advance(at);
+  assert.equal(a.started.length, 6); // shared fallback cap, never the pressure ceiling
+  assert.equal(a.queue.snapshot('/a').queued[0].reason, 'device-cap');
+  const snap = a.admission.snapshot();
+  assert.deepEqual([snap.cap, snap.fallback, snap.coordinated, snap.coordinationReason], [6, true, false, 'census-unavailable']);
+  const r = harness(t, { mode: 'ramp' }); const b = r.instance(2000); r.census(null);
+  for (let at = 0; at <= 600000; at += 5000) await r.advance(at);
+  assert.deepEqual([b.admission.snapshot().cap, b.admission.snapshot().rampNextStepAt], [6, null]);
+});
+
+test('ramp default steps the shared cap to seven after a quiet window, persists rampCap and spaces the seventh start', async t => {
+  const h = harness(t, { mode: 'ramp' }); const a = h.instance(1000);
+  for (let at = 0; at < 300000; at += 5000) await h.advance(at);
+  const read = () => JSON.parse(fs.readFileSync(path.join(h.directory, 'admission-state.json')));
+  assert.equal(a.admission.snapshot().mode, 'ramp');
+  assert.equal(a.admission.snapshot().cap, 6);
+  assert.equal(a.admission.snapshot().rampCeiling, 8);
+  assert.equal(a.admission.snapshot().rampNextStepAt, 300000); // window opened at the first normal sample
+  assert.equal(read().pressure.rampCap, null);
+  await h.advance(300000);
+  assert.equal(a.admission.snapshot().cap, 7);
+  assert.equal(a.admission.snapshot().rampCap, 7);
+  assert.equal(a.admission.snapshot().rampCeiling, 8);
+  assert.equal(a.admission.snapshot().rampNextStepAt, 600000); // the step restarted the window
+  assert.equal(read().pressure.rampCap, 7);
+  for (let n = 0; n < 8; n++) a.request(`T${n}`);
+  await tick();
+  assert.equal(a.queue.countRunning(), 6); // floor starts need no spacing; the seventh waits ten seconds
+  assert.equal(a.queue.snapshot('/a').queued[0].reason, 'spacing');
+  await h.advance(305000);
+  assert.equal(a.queue.countRunning(), 6);
+  await h.advance(310000);
+  assert.equal(a.queue.countRunning(), 7);
+  assert.equal(a.queue.snapshot('/a').queued[0].reason, 'device-cap');
+  // Queue frames carry the ramp state globally and per waiting task.
+  const frame = a.queue.snapshot('/a');
+  assert.deepEqual([frame.admission.rampCap, frame.admission.rampCeiling, frame.admission.rampNextStepAt], [7, 8, 600000]);
+  assert.deepEqual([frame.queued[0].rampCap, frame.queued[0].rampCeiling, frame.queued[0].rampNextStepAt], [7, 8, 600000]);
+  assert.equal(a.admission.snapshot().coordinationReason, null);
+  h.host.pressure = 'critical';
+  await h.advance(315000);
+  assert.equal(a.admission.snapshot().cap, 6);
+  assert.equal(a.admission.snapshot().alarm, 'pressure');
+  assert.equal(a.admission.snapshot().rampNextStepAt, null); // no step while an alarm is latched
+  assert.equal(a.queue.snapshot('/a').queued[0].rampNextStepAt, null);
+  assert.equal(read().pressure.rampCap, null);
+  assert.equal(a.queue.countRunning(), 7); // closing admission never terminates sessions
+});
+
+test('unknown-class reservations allow both ramp steps and preserve headroom diagnostics per waiting task', async t => {
+  const h = harness(t, { mode: 'ramp' }); const a = h.instance(1000);
+  // Six 4-GiB reservations exceed this proxy once the full reserve/burst/new
+  // session budget is included; the one-session ramp threshold is only 13 GiB.
+  h.host.reclaimableEstimateBytes = 30 * GiB;
+  await h.advance(0);
+  for (let n = 0; n < 7; n++) a.request(`U${n}`);
+  await tick();
+  assert.equal(a.queue.countRunning(), 6);
+  const first = a.queue.snapshot('/a');
+  assert.equal(first.admission.requiredBytes, 35 * GiB);
+  assert.deepEqual([first.queued[0].alarm, first.queued[0].requiredBytes, first.queued[0].headroomBytes],
+    [null, 35 * GiB, 30 * GiB]);
+  for (let at = 5000; at <= 300000; at += 5000) await h.advance(at);
+  assert.equal(a.admission.snapshot().rampCap, 7);
+  assert.equal(a.queue.countRunning(), 7);
+  for (let at = 305000; at <= 600000; at += 5000) await h.advance(at);
+  assert.equal(a.admission.snapshot().rampCap, 8);
+  assert.equal(a.admission.snapshot().alarm, null);
+});
+
+test('cap-blocked queue diagnostics expose headroom alarms and recovery without borrowing the global decision', async t => {
+  const h = harness(t, { mode: 'ramp', projectConfigs: { '/b': { AGENT_ADMISSION_WORKLOAD_CLASS: 'ordinary' } } });
+  const a = h.instance(1000); await h.warm();
+  for (let n = 0; n < 7; n++) a.request(`U${n}`);
+  a.request('ordinary', '/b'); await tick();
+  h.host.reclaimableEstimateBytes = 10 * GiB;
+  await h.advance(65000);
+  const frame = a.queue.snapshot();
+  assert.equal(frame.admission.alarm, 'headroom');
+  assert.deepEqual(frame.queued.map(row => [row.reason, row.alarm, row.requiredBytes, row.headroomBytes]),
+    [['device-cap', 'headroom', 35 * GiB, 10 * GiB], ['device-cap', 'headroom', 33 * GiB, 10 * GiB]]);
+  // Exercise the actual GET handler's JSON response using the live admission
+  // controller; no production server or socket is needed.
+  const { createHttpHandler, sessionQueue } = require('./ws-handlers');
+  sessionQueue.setAdmission(a.admission);
+  try {
+    let status, body;
+    await createHttpHandler(a.sessions, () => ({}))(
+      { method: 'GET', url: '/api/sessions', headers: { 'x-tipatask-project': '/a' } },
+      { writeHead(code) { status = code; }, end(value) { body = JSON.parse(value); } });
+    assert.equal(status, 200);
+    assert.deepEqual([body.admission.alarm, body.admission.requiredBytes, body.admission.headroomBytes],
+      ['headroom', 33 * GiB, 10 * GiB]);
+  } finally { sessionQueue.setAdmission(null); }
+  h.host.reclaimableEstimateBytes = 13 * GiB;
+  for (let at = 70000; at < 100000; at += 5000) {
+    await h.advance(at);
+    assert.equal(a.queue.snapshot().queued[0].alarm, 'headroom');
+  }
+  await h.advance(100000);
+  assert.equal(a.admission.snapshot().alarm, null);
+  assert.ok(a.queue.snapshot().queued.every(row => row.alarm === null));
+  a.coordinator.transaction = () => ({ ok: false, detail: 'lock-busy' });
+  a.queue.drain();
+  const failed = a.queue.snapshot();
+  assert.deepEqual([failed.admission.alarm, failed.admission.requiredBytes, failed.admission.headroomBytes],
+    [null, null, 13 * GiB]);
+  assert.ok(failed.queued.every(row => row.alarm === null && row.requiredBytes === null && row.headroomBytes === 13 * GiB));
+});
+
+test('one shared ramp cap: other instances and a late server adopt a raise, and any instance resets it for all', async t => {
+  const h = harness(t, { mode: 'ramp' }); const a = h.instance(1000), b = h.instance(2000);
+  const read = () => JSON.parse(fs.readFileSync(path.join(h.directory, 'admission-state.json')));
+  for (let at = 0; at < 300000; at += 5000) await h.advance(at);
+  for (const i of [a, b]) assert.equal(i.admission.snapshot().cap, 6);
+  h.clock.at = 300000; await a.admission.poll(); // only A sees the window close
+  assert.equal(read().pressure.rampCap, 7);
+  await b.admission.poll(); // B adopts the raise instead of stepping again on its own
+  for (const i of [a, b]) {
+    const snap = i.admission.snapshot();
+    assert.deepEqual([snap.cap, snap.rampCap, snap.rampCeiling, snap.rampNextStepAt], [7, 7, 8, 600000]);
+  }
+  assert.equal(read().pressure.rampCap, 7);
+  // A server started later never observed the window, yet admits against the same cap.
+  const c = h.instance(3000); h.clock.at = 305000; await c.admission.poll();
+  assert.equal(c.admission.snapshot().coordinationReason, null);
+  assert.deepEqual([c.admission.snapshot().cap, c.admission.snapshot().rampNextStepAt], [7, 600000]);
+  // B alone loses its census: its coordination doubt drops the shared cap for A and C too.
+  h.clock.at = 310000; h.census(null); await b.admission.poll();
+  assert.equal(b.admission.snapshot().coordinationReason, 'census-unavailable');
+  assert.equal(read().pressure.rampCap, null);
+  h.census(undefined); await a.admission.poll(); await c.admission.poll();
+  for (const i of [a, c]) {
+    const snap = i.admission.snapshot();
+    assert.equal(snap.coordinationReason, null);
+    assert.deepEqual([snap.cap, snap.rampCap], [6, 6]);
+  }
+});
+
+test('one instance census failure restarts the shared ramp window: the other instance waits a full window for its next step', async t => {
+  const h = harness(t, { mode: 'ramp' }); const a = h.instance(1000), b = h.instance(2000);
+  const read = () => JSON.parse(fs.readFileSync(path.join(h.directory, 'admission-state.json')));
+  for (let at = 0; at < 400000; at += 5000) await h.advance(at);
+  for (const i of [a, b]) assert.deepEqual([i.admission.snapshot().cap, i.admission.snapshot().rampNextStepAt], [7, 600000]);
+  // B alone loses its census at 400 s: its doubt drops the shared cap AND closes the shared window.
+  h.clock.at = 400000; h.census(null); await b.admission.poll();
+  assert.equal(b.admission.snapshot().coordinationReason, 'census-unavailable');
+  assert.deepEqual([read().pressure.rampCap, read().pressure.normalSince], [null, null]);
+  // A's own census never failed, yet the window reopens only at the next coordinated sample (405 s).
+  h.census(undefined); await h.advance(405000);
+  for (const i of [a, b]) {
+    const snap = i.admission.snapshot();
+    assert.equal(snap.coordinationReason, null);
+    assert.deepEqual([snap.cap, snap.rampCap, snap.rampNextStepAt], [6, 6, 705000]);
+  }
+  assert.equal(read().pressure.normalSince, 405000);
+  for (let at = 410000; at < 705000; at += 5000) {
+    await h.advance(at); // 600 s, the old window's end, passes without a step
+    for (const i of [a, b]) assert.equal(i.admission.snapshot().cap, 6, `no step at ${at}`);
+  }
+  await h.advance(705000);
+  for (const i of [a, b]) assert.deepEqual([i.admission.snapshot().cap, i.admission.snapshot().rampNextStepAt], [7, 1005000]);
+});
+
+test('one instance census failure restarts the shared pressure recovery window: the other instance clears its alarm and starts a full window later', async t => {
+  const h = harness(t); const a = h.instance(1000), b = h.instance(2000);
+  const read = () => JSON.parse(fs.readFileSync(path.join(h.directory, 'admission-state.json')));
+  await h.warm();
+  h.host.pressure = 'warning'; await h.advance(65000);
+  a.request('A1'); await tick();
+  assert.equal(a.queue.snapshot('/a').queued[0].reason, 'pressure');
+  h.host.pressure = 'normal';
+  for (let at = 70000; at < 95000; at += 5000) await h.advance(at);
+  assert.deepEqual([read().pressure.alarm, read().pressure.normalSince], ['pressure', 70000]); // recovery due at 100 s
+  // B alone loses its census at 95 s: its doubt closes the shared recovery window.
+  h.clock.at = 95000; h.census(null); await b.admission.poll();
+  assert.equal(b.admission.snapshot().coordinationReason, 'census-unavailable');
+  assert.deepEqual([read().pressure.alarm, read().pressure.normalSince], ['pressure', null]);
+  // A's own census never failed, yet the window reopens only at the next coordinated sample (100 s):
+  // the old window's end passes with the alarm latched and A's start still waiting.
+  h.census(undefined);
+  for (let at = 100000; at < 130000; at += 5000) {
+    await h.advance(at);
+    for (const i of [a, b]) assert.equal(i.admission.snapshot().alarm, 'pressure', `alarm at ${at}`);
+  }
+  assert.equal(read().pressure.normalSince, 100000);
+  assert.deepEqual(a.started, []);
+  await h.advance(130000);
+  for (const i of [a, b]) assert.equal(i.admission.snapshot().alarm, null);
+  assert.deepEqual(a.started, ['A1']);
+});
+
+test('admission state written before ramp loads at the static cap; a malformed rampCap fails closed', async t => {
+  const h = harness(t, { mode: 'ramp' });
+  const file = path.join(h.directory, 'admission-state.json');
+  const legacy = { version: 1, instances: {}, nextTicket: 3,
+    pressure: { alarm: null, normalSince: null, samples: [], lastStartAt: null } };
+  fs.writeFileSync(file, JSON.stringify(legacy));
+  const a = h.instance(1000); await h.advance(0);
+  const snap = a.admission.snapshot();
+  assert.equal(snap.detail, null); assert.equal(snap.mode, 'ramp');
+  assert.deepEqual([snap.cap, snap.rampCap, snap.rampCeiling], [6, 6, 8]);
+  assert.equal(JSON.parse(fs.readFileSync(file)).pressure.rampCap ?? null, null);
+  for (const rampCap of [0, -1, 1.5, 33, '7', true, {}]) {
+    fs.writeFileSync(file, JSON.stringify({ ...legacy, pressure: { ...legacy.pressure, rampCap } }));
+    assert.deepEqual(a.coordinator.transaction(() => assert.fail('must not run')),
+      { ok: false, reason: 'coordination', detail: 'state-invalid' }, JSON.stringify(rampCap));
+  }
+  await a.admission.poll();
+  const failed = a.admission.snapshot();
+  assert.equal(failed.detail, 'state-invalid');
+  assert.deepEqual([failed.rampCap, failed.rampCeiling, failed.rampNextStepAt], [null, null, null]);
 });

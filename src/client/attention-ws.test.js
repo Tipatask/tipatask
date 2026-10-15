@@ -338,3 +338,96 @@ test('session-queue-state updates the queue and refetches sessions only when a t
   assert.equal(fetched, 1); // Q1 left the queue — server started it
   globalThis.window.TipTask.fetchActiveSessions = async () => {};
 });
+
+// ── Exit backstop frame (TPT613) ──
+const leftFrame = (taskId, exitId) => ({
+  type: 'task-left-uncommitted', projectPath: '', taskId, exitId, status: 'on_fire', nudgeCount: 1, agent: 'claude',
+  blockers: [{ code: 'TASK_COMMIT_MISSING', message: `no commit starting with ${taskId}` }],
+});
+
+test('task-left-uncommitted raises the ring, records the task flag and fires exactly one notification', () => {
+  state.leftUncommitted = new Map();
+  assert.equal(handleAttentionMessage(leftFrame('U1', 'U1@1')), true);
+  assert.equal(state.attentionSessions.has('U1'), true);
+  assert.deepEqual(state.attentionDetails.get('U1'), { kind: 'uncommitted', agent: 'claude', blockers: ['TASK_COMMIT_MISSING'] });
+  assert.deepEqual({ ...state.leftUncommitted.get('U1'), at: 0 }, { exitId: 'U1@1', blockers: ['TASK_COMMIT_MISSING'], status: 'on_fire', at: 0 });
+  assert.equal(updateClaudeButtonsCount, 1);
+  assert.equal(constructorCount, 1);
+  assert.equal(lastNotification.options.body, 'Agent exited without committing or completing the task: no task commit');
+});
+
+test('task-left-uncommitted delivered twice (browser mode: both sockets) notifies once and keeps the ring', () => {
+  state.leftUncommitted = new Map();
+  handleAttentionMessage(leftFrame('U2', 'U2@1'));
+  handleAttentionMessage(leftFrame('U2', 'U2@1'));
+  assert.equal(constructorCount, 1);
+  assert.equal(state.attentionSessions.has('U2'), true);
+  // Even a repeat that lands after a session-ended (which clears the ring and the notified ledger)
+  // only re-raises the ring.
+  handleAttentionMessage({ type: 'session-ended', taskId: 'U2' });
+  assert.equal(state.attentionSessions.has('U2'), false);
+  handleAttentionMessage(leftFrame('U2', 'U2@1'));
+  assert.equal(state.attentionSessions.has('U2'), true, 're-raised');
+  assert.equal(constructorCount, 1, 'never a second banner for the same exit');
+});
+
+test('task-left-uncommitted: a new exit notifies again, even right after an attention banner for the same task', () => {
+  state.leftUncommitted = new Map();
+  handleAttentionMessage({ type: 'attention-needed', taskId: 'U3', kind: 'idle', promptText: '', agent: 'claude' });
+  assert.equal(constructorCount, 1, 'the idle banner armed the 30s debounce');
+  handleAttentionMessage(leftFrame('U3', 'U3@1'));
+  assert.equal(constructorCount, 2, 'the exit clears that debounce');
+  handleAttentionMessage(leftFrame('U3', 'U3@2')); // the next run exited the same way
+  assert.equal(constructorCount, 3, 'a new exit with identical text is still news');
+  assert.equal(state.leftUncommitted.get('U3').exitId, 'U3@2');
+});
+
+test('task-left-uncommitted replay (TPT664): rebuilds the ring and the flag, never notifies, and quiets a later live duplicate', () => {
+  state.leftUncommitted = new Map();
+  assert.equal(handleAttentionMessage({ ...leftFrame('U5', 'U5@1'), replay: true }), true);
+  assert.equal(state.attentionSessions.has('U5'), true);
+  assert.deepEqual(state.attentionDetails.get('U5'), { kind: 'uncommitted', agent: 'claude', blockers: ['TASK_COMMIT_MISSING'] });
+  assert.equal(state.leftUncommitted.get('U5').exitId, 'U5@1');
+  assert.equal(updateClaudeButtonsCount, 1);
+  assert.equal(constructorCount, 0, 'a replay is never news');
+  handleAttentionMessage(leftFrame('U5', 'U5@1')); // browser mode: the other socket's live copy of the same exit
+  assert.equal(constructorCount, 0, 'the replay taught the ledger this exitId');
+  handleAttentionMessage(leftFrame('U5', 'U5@2'));
+  assert.equal(constructorCount, 1, 'a genuinely new exit still notifies');
+});
+
+test('task-left-uncommitted cleared (TPT664): drops the flag, puts out this exit\'s ring and repaints, no notification', () => {
+  state.leftUncommitted = new Map();
+  handleAttentionMessage(leftFrame('U6', 'U6@1'));
+  assert.equal(constructorCount, 1);
+  assert.equal(handleAttentionMessage({ type: 'task-left-uncommitted', projectPath: '', taskId: 'U6', exitId: 'U6@1', blockers: [], cleared: true }), true);
+  assert.equal(state.leftUncommitted.has('U6'), false);
+  assert.equal(state.attentionSessions.has('U6'), false);
+  assert.equal(updateClaudeButtonsCount, 2);
+  assert.equal(constructorCount, 1);
+  // A ring that is NOT this exit's (a live prompt from the new run) stays up.
+  handleAttentionMessage({ type: 'attention-needed', taskId: 'U6', kind: 'toolApproval', promptText: 'Allow?', agent: 'claude' });
+  state.leftUncommitted.set('U6', { exitId: 'U6@1', blockers: [], status: 'on_fire', at: 1 });
+  handleAttentionMessage({ type: 'task-left-uncommitted', projectPath: '', taskId: 'U6', exitId: 'U6@1', blockers: [], cleared: true });
+  assert.equal(state.leftUncommitted.has('U6'), false);
+  assert.equal(state.attentionSessions.has('U6'), true, 'the new run\'s own prompt ring survives');
+});
+
+test('session-ended drops the task from the active and exited session sets, like the browser board handler', () => {
+  state.activeSessions = new Set(['U4', 'X']);
+  state.exitedSessions = new Set(['U4']);
+  try {
+    handleAttentionMessage({ type: 'session-ended', taskId: 'U4' });
+    assert.deepEqual([...state.activeSessions], ['X']);
+    assert.equal(state.exitedSessions.has('U4'), false);
+  } finally {
+    state.activeSessions = new Set();
+    state.exitedSessions = new Set();
+  }
+});
+
+test('template.html dispatches task-left-uncommitted on the browser __board__ socket', async () => {
+  const { readFileSync } = await import('node:fs');
+  const html = readFileSync(new URL('./template.html', import.meta.url), 'utf8');
+  assert.match(html, /if \(msg\.type === 'task-left-uncommitted'\) \{[\s\S]{0,400}?TipTask\.attentionWs\.handleAttentionMessage\(msg\);\s*return;\s*\}/);
+});

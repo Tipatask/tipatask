@@ -267,7 +267,7 @@ test('normal and SIMPLE_MODE terminal launches share config effort without shari
   const previousSimple = config.SIMPLE_MODE;
   const home = path.join(dir, 'user');
   fs.mkdirSync(home);
-  const preferences = 'approval_policy = "on-request"\nsandbox_mode = "workspace-write"\n[features]\nunified_exec = true\n';
+  const preferences = 'notify = ["custom-notify", "argument"]\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\n[features]\nunified_exec = true\n';
   fs.writeFileSync(path.join(home, 'config.toml'), preferences);
   process.env.CODEX_HOME = home;
   t.after(() => {
@@ -304,6 +304,7 @@ test('normal and SIMPLE_MODE terminal launches share config effort without shari
     const content = fs.readFileSync(path.join(normal.env.CODEX_HOME, 'config.toml'), 'utf8');
     const parsed = toml.parse(content);
     assert.equal(parsed.model_reasoning_effort, 'high');
+    assert.deepEqual(parsed.notify, ['custom-notify', 'argument']);
     assert.equal(parsed.approval_policy, 'on-request');
     assert.equal(parsed.sandbox_mode, 'workspace-write');
     assert.equal(parsed.features.unified_exec, true);
@@ -316,6 +317,8 @@ test('normal and SIMPLE_MODE terminal launches share config effort without shari
     assert.equal(toml.parse(fs.readFileSync(path.join(low.env.CODEX_HOME, 'config.toml'), 'utf8')).model_reasoning_effort, 'low');
     assert.equal(toml.parse(fs.readFileSync(path.join(max.env.CODEX_HOME, 'config.toml'), 'utf8')).model_reasoning_effort, 'xhigh');
     assert.equal(toml.parse(fs.readFileSync(path.join(root, '.codex/config.toml'), 'utf8')).model_reasoning_effort, undefined);
+    assert.equal(toml.parse(fs.readFileSync(path.join(root, '.codex/config.toml'), 'utf8')).notify, undefined);
+    assert.deepEqual(toml.parse(fs.readFileSync(path.join(root, '.codex/tipatask-terminal.toml'), 'utf8')).notify, ['custom-notify', 'argument']);
     const peers = await Promise.all(['TPT498', 'TPT499'].map(id => spawn({}, id)));
     for (const peer of peers) {
       assert.deepEqual(peer.env, normal.env, 'different tasks must have the same daemon environment');

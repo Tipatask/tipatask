@@ -7,10 +7,28 @@ const { createHash } = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, winExecSpec } = require('../spawn-utils');
 const { quotaError, reasonFor, coalesceQuota } = require('./quota-status');
+const { version: APP_VERSION } = require('../../../package.json');
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+// Identifies the Task App honestly; the endpoint rate-limits per OAuth token, not per client.
+const USER_AGENT = `tipatask-task-app/${APP_VERSION}`;
+// Per-credential gate on the usage endpoint, shared by every project window this server reads
+// for: a completed read is reused for MIN_INTERVAL_MS; a 429 holds off for its retry-after, or
+// DEFAULT_BACKOFF_MS when that is 0 or absent, never longer than MAX_BACKOFF_MS. Claude Code's
+// own reader applies the same 429 rule to the same token.
+const MIN_INTERVAL_MS = 60 * 1000;
+const DEFAULT_BACKOFF_MS = 5 * 60 * 1000;
+const MAX_BACKOFF_MS = 60 * 60 * 1000;
 const MAX_BYTES = 1024 * 1024;
 const WINDOWS = ['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet', 'seven_day_oauth_apps', 'seven_day_cowork'];
+
+// A cold Claude CLI start can take several seconds, so `claude auth status` gets 20s.
+// TIPATASK_QUOTA_TIMEOUT_MS (the server's own env, read per call) overrides it.
+const DEFAULT_QUOTA_TIMEOUT_MS = 20000;
+function quotaTimeoutMs(env = process.env) {
+  const ms = Number(env.TIPATASK_QUOTA_TIMEOUT_MS);
+  return Number.isFinite(ms) && ms > 0 ? Math.floor(ms) : DEFAULT_QUOTA_TIMEOUT_MS;
+}
 
 // argv via winExecSpec(): a Windows claude.cmd launcher runs through cmd.exe (Node >= 22
 // refuses a shell-less execFile of a .cmd with EINVAL); .exe and POSIX paths, including
@@ -18,7 +36,7 @@ const WINDOWS = ['five_hour', 'seven_day', 'seven_day_opus', 'seven_day_sonnet',
 function runFile(file, args, { execFileImpl = execFile, isWin, ...options } = {}) {
   return new Promise((resolve, reject) => {
     const spec = winExecSpec(file, args, isWin === undefined ? {} : { isWin });
-    execFileImpl(spec.command, spec.args, { timeout: 5000, maxBuffer: MAX_BYTES, windowsHide: true, ...spec.options, ...options }, (err, stdout) => {
+    execFileImpl(spec.command, spec.args, { timeout: quotaTimeoutMs(), maxBuffer: MAX_BYTES, windowsHide: true, ...spec.options, ...options }, (err, stdout) => {
       // `claude auth status` returns exit 1 with valid JSON when signed out.
       if (err && !(err.code === 1 && args[0] === 'auth' && stdout?.trim().startsWith('{'))) return reject(err);
       resolve(stdout);
@@ -41,12 +59,18 @@ async function readClaudeCredential(env, auth, deps = {}) {
   let text;
   if ((deps.platform || process.platform) === 'darwin') {
     const user = env.USER || os.userInfo().username;
+    const lookup = account => (deps.runFile || runFile)('/usr/bin/security',
+      ['find-generic-password', ...(account ? ['-a', account] : []), '-w', '-s', loc.service], {});
     try {
-      text = await (deps.runFile || runFile)('/usr/bin/security', ['find-generic-password', '-a', /^[a-zA-Z0-9._-]+$/.test(user) ? user : 'claude-code-user', '-w', '-s', loc.service], {});
-    } catch (err) {
-      // A missing item can use Claude's plaintext fallback. A locked/denied Keychain
-      // must not fall through to a potentially different, stale account on disk.
-      if (err.code !== 44) throw quotaError('credentials_unavailable');
+      text = await lookup(/^[a-zA-Z0-9._-]+$/.test(user) ? user : 'claude-code-user');
+    } catch {
+      // The item may be stored under another account name than this process's user:
+      // retry once without the -a filter before deciding.
+      try { text = await lookup(null); } catch (err) {
+        // A missing item can use Claude's plaintext fallback. A locked/denied Keychain
+        // must not fall through to a potentially different, stale account on disk.
+        if (err.code !== 44) throw quotaError('credentials_unavailable');
+      }
     }
   }
   if (!text) {
@@ -61,14 +85,25 @@ async function readClaudeCredential(env, auth, deps = {}) {
   } catch { throw quotaError('credentials_unavailable'); }
 }
 
+// `retry-after` as delta-seconds or an HTTP date; 0 when absent, zero, past or unparsable.
+function retryAfterMs(value, now = Date.now()) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text) return 0;
+  if (/^\d+$/.test(text)) return Number(text) * 1000;
+  const at = Date.parse(text);
+  return Number.isFinite(at) ? Math.max(0, at - now) : 0;
+}
+
 async function fetchUsage(accessToken, fetchImpl = fetch) {
   const response = await fetchImpl(USAGE_URL, {
     method: 'GET', redirect: 'error', signal: AbortSignal.timeout(10000),
-    headers: { Authorization: `Bearer ${accessToken}`, 'anthropic-beta': 'oauth-2025-04-20', Accept: 'application/json' },
+    headers: { Authorization: `Bearer ${accessToken}`, 'anthropic-beta': 'oauth-2025-04-20', Accept: 'application/json', 'User-Agent': USER_AGENT },
   });
   if (!response.ok) {
     await response.body?.cancel();
-    throw quotaError(({ 401: 'credentials_expired', 403: 'access_denied', 429: 'rate_limited' })[response.status] || 'provider_error');
+    const err = quotaError(({ 401: 'credentials_expired', 403: 'access_denied', 429: 'rate_limited' })[response.status] || 'provider_error');
+    if (response.status === 429) err.retryAfterMs = retryAfterMs(response.headers?.get('retry-after'));
+    throw err;
   }
   let size = 0;
   const chunks = [];
@@ -80,6 +115,35 @@ async function fetchUsage(accessToken, fetchImpl = fetch) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
   catch { throw quotaError('invalid_response'); }
 }
+
+function holdMs(err) {
+  if (err?.quotaReason !== 'rate_limited') return MIN_INTERVAL_MS;
+  return Math.max(MIN_INTERVAL_MS, Math.min(err.retryAfterMs > 0 ? err.retryAfterMs : DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS));
+}
+
+// Keyed by the access token's hash alone, so every project reading the same account shares one
+// gate, and a new login (a new token) never sees another account's held reply.
+const usageGate = new Map();
+function readUsageGated(accessToken, { fetch: fetchImpl, now = Date.now } = {}) {
+  const key = createHash('sha256').update(accessToken).digest('hex');
+  const at = now();
+  for (const [k, entry] of usageGate) if (entry.until <= at) usageGate.delete(k);
+  const held = usageGate.get(key);
+  if (held) return held.error ? Promise.reject(held.error) : Promise.resolve(held.data);
+  return coalesceQuota(`claude:${key}`, async () => {
+    try {
+      const data = await fetchUsage(accessToken, fetchImpl);
+      usageGate.set(key, { until: now() + MIN_INTERVAL_MS, data });
+      return data;
+    } catch (err) {
+      usageGate.set(key, { until: now() + holdMs(err), error: err });
+      throw err;
+    }
+  });
+}
+
+// Test-only: forget every held read.
+function resetUsageGate() { usageGate.clear(); }
 
 // The usage endpoint also returns a structured `limits[]` (kind session | weekly_all | weekly_scoped,
 // with the model in `scope.model`). Per-model weekly limits now appear ONLY there — the legacy
@@ -130,30 +194,64 @@ function parseClaudeUsage(data) {
   return [...legacy, ...limits.filter(w => w.id !== 'five_hour' && w.id !== 'seven_day')];
 }
 
+// The unavailable reason otherwise reaches only the sidebar row's tooltip, so it is logged with
+// the stage that failed and how long that stage ran: once per reason change per project (one
+// server reads for several project windows), cleared by a successful read. Reason and stage come
+// from fixed lists, never provider replies, error text or credentials. deps.log(line, detail)
+// replaces console.warn for tests and scripts/probe-claude-quota.js.
+const lastReason = new Map();
+function noteOutcome(projectRoot, reason, stage, ms, log = line => console.warn(line)) {
+  if (lastReason.get(projectRoot) === reason) return;
+  lastReason.set(projectRoot, reason);
+  if (reason) log(`[agent-quota] claude unavailable: ${reason} (${stage}, ${ms}ms)`, { reason, stage, ms });
+}
+
+// One-way SHA-256 of JSON parts; used as an in-memory key only, never logged or returned to clients.
+const fingerprint = parts => createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+
 async function readClaudeQuota(config, { projectRoot = config.PROJECT_ROOT, ...deps } = {}) {
-  let connectionState = 'unknown', plan = null;
+  // credentialKey names the account read, for quota-status.js's last-good-reading snapshot
+  // (TPT689). Once known it rides on every result, including usage-gate holds and failures.
+  let connectionState = 'unknown', plan = null, credentialKey = null, stage = 'setup', stageAt = Date.now();
+  const enter = name => { stage = name; stageAt = Date.now(); };
+  const unavailable = result => {
+    noteOutcome(projectRoot, result.unavailableReason, stage, Date.now() - stageAt, deps.log);
+    return credentialKey ? { ...result, credentialKey } : result;
+  };
   try {
     const env = { ...(deps.env || augmentPathEnv({ ...projectEnvExtras(projectRoot) })) };
     const nvmDir = resolveNvmBinDir(config.CLAUDE_BIN);
     if (nvmDir) env.PATH = `${nvmDir}${path.delimiter}${env.PATH}`;
+    enter('auth_status');
     const authText = await (deps.runFile || runFile)(config.CLAUDE_BIN, ['auth', 'status'], { cwd: projectRoot, env });
     let auth;
     try { auth = JSON.parse(authText); } catch { throw quotaError('invalid_response'); }
     if (typeof auth?.loggedIn !== 'boolean') throw quotaError('invalid_response');
-    if (!auth.loggedIn) return { connectionState: 'signed_out', unavailableReason: 'signed_out' };
+    if (!auth.loggedIn) return unavailable({ connectionState: 'signed_out', unavailableReason: 'signed_out' });
     connectionState = 'connected'; plan = auth.subscriptionType || null;
     const explicitOAuth = auth.authMethod === 'oauth_token' && !!env.CLAUDE_CODE_OAUTH_TOKEN;
     if ((!explicitOAuth && auth.authMethod !== 'claude.ai') || auth.apiProvider !== 'firstParty' || env.CLAUDE_CODE_CUSTOM_OAUTH_URL) {
-      return { connectionState, plan: null, unavailableReason: 'unsupported_auth' };
+      return unavailable({ connectionState, plan: null, unavailableReason: 'unsupported_auth' });
     }
+    // A stored claude.ai login is keyed by the account `auth status` names, email and org together
+    // (one org holds many seats), so the key survives token refreshes. An env token, or a login
+    // reported without both, is keyed by the token itself (taken before the expiry check below).
+    if (!env.CLAUDE_CODE_OAUTH_TOKEN && typeof auth.email === 'string' && auth.email
+      && typeof auth.orgId === 'string' && auth.orgId) credentialKey = fingerprint(['account', auth.email, auth.orgId]);
+    enter('credential');
     const credential = await readClaudeCredential(env, auth, deps);
     plan = credential.subscriptionType || plan;
+    credentialKey ||= fingerprint(['token', credential.accessToken]);
     // Do not refresh credentials or start an inference request to learn limits.
     if (Number.isFinite(credential.expiresAt) && credential.expiresAt <= Date.now()) throw quotaError('credentials_expired');
-    const key = createHash('sha256').update(JSON.stringify([projectRoot, credential.accessToken])).digest('hex');
-    const data = await coalesceQuota(`claude:${key}`, () => fetchUsage(credential.accessToken, deps.fetch));
-    return { connectionState, plan, windows: parseClaudeUsage(data) };
-  } catch (err) { return { connectionState, plan, unavailableReason: reasonFor(err) }; }
+    enter('usage_fetch');
+    const data = await readUsageGated(credential.accessToken, { fetch: deps.fetch, now: deps.now });
+    enter('usage_parse');
+    const windows = parseClaudeUsage(data);
+    noteOutcome(projectRoot, null);
+    return { connectionState, plan, windows, credentialKey };
+  } catch (err) { return unavailable({ connectionState, plan, unavailableReason: reasonFor(err) }); }
 }
 
-module.exports = { readClaudeQuota, readClaudeCredential, credentialLocation, parseClaudeUsage, fetchUsage, runFile };
+module.exports = { readClaudeQuota, readClaudeCredential, credentialLocation, parseClaudeUsage, fetchUsage, runFile, quotaTimeoutMs,
+  retryAfterMs, resetUsageGate, USER_AGENT, MIN_INTERVAL_MS, DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS };

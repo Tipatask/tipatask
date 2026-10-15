@@ -50,10 +50,14 @@ async function resolveShowMoreTarget(origin, { originWindow, projectWindows, reo
 
 // Card click target: only the alert's own project can act on it. The window owning that
 // project now (never a window since rebound to another project), else the project reopened.
-async function resolveClickTarget(origin, { originWindow, projectOf, reopen }) {
+// It is raised like Show More's target, and resolves once that raise settled; a window that
+// would not take focus is still returned, so the click lands there.
+async function resolveClickTarget(origin, { originWindow, projectOf, reopen, raise }) {
   let w = originWindow(origin);
   if (alive(w) && origin?.projectPath && projectOf(w) !== origin.projectPath) w = null;
   if (!alive(w) && origin?.projectPath) w = await reopen(origin.projectPath);
+  if (!alive(w)) return null;
+  await raise(w);
   return alive(w) ? w : null;
 }
 

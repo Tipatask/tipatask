@@ -8,7 +8,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 
 const config = require('../config');
-const { spawnPiTurn, buildPiArgs, assistantErrorOf } = require('./pi-session');
+const { spawnPiTurn, buildPiArgs, assistantErrorOf, isToolCompatError, piObjectiveToolNote, piRowHost, toolCompatMessage } = require('./pi-session');
 const { piCustomProviderId, piDefaultSessionDir } = require('../pi-custom-endpoint');
 
 const MODEL = 'openrouter/deepseek/deepseek-v4-flash-0731';
@@ -469,4 +469,268 @@ test('spawnPiTurn: no bridge leaves TIPATASK_PI_MCP_CONFIG empty even when inher
   return new Promise((resolve) => setImmediate(resolve)).then(() => {
     assert.match(run.stdin(), /^Pi objective planning: only the read tool is available/);
   });
+});
+
+// ── Tool-compat fallback (TPT633) ──
+// OpenRouter's answer when the model takes no tool definitions — verbatim from a real turn. Pi
+// reports it as stopReason:error on message_end with exit code 0, like every provider error.
+
+const TOOL_COMPAT_404 = '404: {"message":"No endpoints found that support tool use. Try disabling \\"read\\". To learn more about provider routing, visit: https://openrouter.ai/docs/guides/routing/provider-selection","code":404,"metadata":{"routing_funnel":[{"step":"Initial Endpoints","endpoint_count":1}],"failed_routing_step":"Filter by Tool Compatibility"}}';
+const TOOL_COMPAT_FAIL = { type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: TOOL_COMPAT_404 } };
+const SECOND_SESSION_EVENT = { type: 'session', version: 3, id: 'uuid-2' };
+
+// Each spawn gets its own fake proc (with a stdin capture) so a respawn can be told apart from
+// the attempt it replaces.
+function spawnSequence(t, session, deps = {}) {
+  enableTimers(t);
+  const frames = [];
+  const calls = [];
+  const procs = [];
+  spawnPiTurn(session, 'T1', (f) => frames.push(f), {
+    spawn: (command, args, opts) => {
+      const proc = makeFakeProc();
+      let stdin = '';
+      proc.stdin = { write(s) { stdin += s; }, end() {} };
+      proc.stdinText = () => stdin;
+      procs.push(proc);
+      calls.push({ command, args, opts });
+      return proc;
+    },
+    ...deps,
+  });
+  const out = (proc, ...events) => proc.stdout.emit('data', Buffer.from(events.map(e => JSON.stringify(e)).join('\n') + '\n'));
+  const ofType = (type) => frames.filter(f => f.type === type);
+  return { frames, calls, procs, out, ofType };
+}
+
+test('isToolCompatError: the OpenRouter tool-compat 404 and a local "does not support tools" match; other errors do not', () => {
+  assert.strictEqual(isToolCompatError(TOOL_COMPAT_404), true);
+  assert.strictEqual(isToolCompatError('404: {"message":"x","code":404,"metadata":{"failed_routing_step":"Filter by Tool Compatibility"}}'), true);
+  assert.strictEqual(isToolCompatError('400: registry.ollama.ai/library/llama2:latest does not support tools'), true);
+  assert.strictEqual(isToolCompatError('404: {"message":"No endpoints found for recraft-ai/recraft-v3.","code":404}'), false);
+  assert.strictEqual(isToolCompatError('401: {"message":"Missing Authentication header","code":401}'), false);
+  assert.strictEqual(isToolCompatError('request aborted'), false);
+  assert.strictEqual(isToolCompatError(null), false);
+});
+
+test('buildPiArgs: noTools emits an empty --tools allowlist and loads neither extension', () => {
+  const args = buildPiArgs({ selectedModel: MODEL, piSessionId: null }, { noTools: true, mcpBridgePath: BRIDGE.extensionPath });
+  assert.deepStrictEqual(args, ['--mode', 'json', '--provider', 'openrouter', '--model', MODEL, '--tools', '', '--no-extensions']);
+  const chat = { selectedModel: MODEL, type: 'taskChat', toolProfile: 'taskChat', taskKey: 'TPT1', piSessionId: 'uuid-9' };
+  const chatArgs = buildPiArgs(chat, { noTools: true, extensionPath: '/x/task-tools.mjs', mcpBridgePath: BRIDGE.extensionPath });
+  assert.deepStrictEqual(chatArgs.slice(chatArgs.indexOf('--tools')), ['--tools', '', '--no-extensions', '--session', 'uuid-9']);
+});
+
+test('piObjectiveToolNote: the no-tools variant says so; the two existing variants are unchanged', () => {
+  assert.match(piObjectiveToolNote(false, true), /^Pi objective planning: no tools are available in this turn/);
+  assert.strictEqual(piObjectiveToolNote(true, true), piObjectiveToolNote(false, true), 'a bridge is irrelevant without tools');
+  assert.match(piObjectiveToolNote(false), /^Pi objective planning: only the read tool is available/);
+  assert.match(piObjectiveToolNote(true), /^Pi objective planning: tools are `read` plus/);
+});
+
+test('piRowHost + toolCompatMessage: a custom row names its endpoint host, a built-in row its provider', () => {
+  assert.strictEqual(piRowHost(CUSTOM_KEYED), 'gw.example.com');
+  assert.strictEqual(piRowHost(null), 'OpenRouter');
+  assert.strictEqual(piRowHost({ model: MODEL, apiKey: 'k' }), 'OpenRouter');
+  assert.strictEqual(piRowHost({ model: 'deepseek-flash', apiKey: 'k', provider: 'deepseek' }), 'DeepSeek');
+  assert.strictEqual(
+    toolCompatMessage('openrouter/recraft-ai/recraft-v3', 'openrouter.ai'),
+    'Model "openrouter/recraft-ai/recraft-v3" at openrouter.ai does not support tool calls (the endpoint rejected the request). Choose a tool-capable model.',
+  );
+});
+
+test('spawnPiTurn: an objective turn hit by the tool-compat 404 respawns once without tools and streams proposals', async (t) => {
+  const dir = makeProjectDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const session = makeSession(dir);
+  const run = spawnSequence(t, session, { resolveMcpBridge: () => BRIDGE });
+  const [first] = run.procs;
+  assert.strictEqual(run.calls[0].args[run.calls[0].args.indexOf('-e') + 1], BRIDGE.extensionPath, 'the first attempt loads the bridge');
+
+  run.out(first, SESSION_EVENT, TOOL_COMPAT_FAIL);
+  assert.strictEqual(run.calls.length, 2, 'exactly one respawn');
+  assert.strictEqual(run.ofType('objective-error').length, 0);
+  const retry = run.calls[1];
+  assert.deepStrictEqual(retry.args.slice(-9), ['--mode', 'json', '--provider', 'openrouter', '--model', MODEL, '--tools', '', '--no-extensions']);
+  assert.ok(!retry.args.includes('-e'), 'no bridge, no extension');
+  assert.ok(!retry.args.includes('--session'), 'the failed attempt\'s session is not resumed');
+  assert.strictEqual(session.piSessionId, null);
+  assert.strictEqual(retry.opts.env.TIPATASK_PI_MCP_CONFIG, '');
+  const progress = run.ofType('objective-progress').find(f => f.stage === 'pi-no-tools-retry');
+  assert.ok(progress, 'the Debug Console learns why a second spawn happened');
+  assert.match(progress.detail, /No endpoints found that support tool use/);
+
+  // The dead first attempt is ignored from here on: no frames, no finalize.
+  const framesBefore = run.frames.length;
+  run.out(first, { type: 'turn_end', message: { role: 'assistant', stopReason: 'error', errorMessage: TOOL_COMPAT_404 } });
+  first.emit('close', 0);
+  assert.strictEqual(run.frames.length, framesBefore);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = run.procs[1];
+  assert.match(second.stdinText(), /^Pi objective planning: no tools are available in this turn/);
+  assert.strictEqual(first.stdinText(), '', 'the replaced attempt never gets the prompt');
+
+  const proposal = '```json\n{"changes":[{"type":"new","task":{"title":"A","description":"B"}}]}\n```';
+  run.out(second,
+    SECOND_SESSION_EVENT,
+    { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Plan:\n' } },
+    { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: proposal } },
+    { type: 'message_end', message: { role: 'assistant', stopReason: 'stop' } },
+    { type: 'turn_end', message: { role: 'assistant', stopReason: 'stop', usage: { input: 10, output: 5, cost: { total: 0 } } } },
+    { type: 'agent_end', messages: [] },
+  );
+  assert.strictEqual(session.piSessionId, 'uuid-2');
+  const [cards] = run.ofType('task-cards');
+  assert.ok(cards, 'the retried turn streams proposals');
+  assert.strictEqual(cards.cards.length, 1);
+  assert.strictEqual(cards.cards[0].task.title, 'A');
+  session.ws = { OPEN: 1, readyState: 1 };
+  second.emit('close', 0);
+  const [result] = run.ofType('objective-result');
+  assert.strictEqual(result.cards.length, 1);
+  assert.deepStrictEqual(result.tokens, { input: 10, output: 5, costUsd: 0 });
+  assert.strictEqual(run.ofType('objective-error').length, 0);
+  t.mock.timers.tick(config.OBJECTIVE_TURN_MAX_MS);
+  assert.strictEqual(run.ofType('objective-error').length, 0, 'the first attempt\'s timers are gone');
+});
+
+test('spawnPiTurn: the no-tools respawn restores a provider handoff the failed attempt consumed', (t) => {
+  const dir = makeProjectDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const session = {
+    ...makeSession(dir),
+    _providerSwitchPending: true,
+    messages: [
+      { role: 'user', content: 'Plan something', timestamp: 0 },
+      { role: 'assistant', content: 'Earlier answer', timestamp: 1 },
+      { role: 'user', content: 'Refine it', timestamp: 2 },
+    ],
+  };
+  const run = spawnSequence(t, session, { resolveMcpBridge: () => null });
+  run.out(run.procs[0], SESSION_EVENT, TOOL_COMPAT_FAIL);
+  assert.strictEqual(run.calls.length, 2);
+  assert.strictEqual(session._providerSwitchPending, true, 'restored, so the retry rebuilds the handoff prompt');
+  assert.strictEqual(session.piSessionId, null);
+});
+
+test('spawnPiTurn: when the no-tools retry hits the same error, one plain model-no-tools error names the model and host', (t) => {
+  const dir = makeProjectDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const session = makeSession(dir);
+  const run = spawnSequence(t, session, { resolveMcpBridge: () => null });
+  run.out(run.procs[0], SESSION_EVENT, TOOL_COMPAT_FAIL);
+  assert.strictEqual(run.calls.length, 2);
+  run.out(run.procs[1], SECOND_SESSION_EVENT, TOOL_COMPAT_FAIL);
+  run.procs[1].emit('close', 0);
+  assert.strictEqual(run.calls.length, 2, 'no third attempt');
+  const errors = run.ofType('objective-error');
+  assert.strictEqual(errors.length, 1);
+  assert.strictEqual(errors[0].reason, 'model-no-tools');
+  assert.strictEqual(errors[0].provider, 'pi');
+  assert.strictEqual(errors[0].model, MODEL);
+  assert.strictEqual(errors[0].detail, `Model "${MODEL}" at OpenRouter does not support tool calls (the endpoint rejected the request). Choose a tool-capable model.`);
+  assert.strictEqual(run.ofType('objective-result').length, 0);
+});
+
+test('spawnPiTurn: a custom row\'s model-no-tools error names the endpoint host', (t) => {
+  const dir = makeCustomProject(t, [CUSTOM_KEYED]);
+  const session = { ...makeSession(dir), selectedModel: 'gpt-4o-mini' };
+  const run = spawnSequence(t, session, { resolveMcpBridge: () => null });
+  run.out(run.procs[0], SESSION_EVENT, TOOL_COMPAT_FAIL);
+  run.out(run.procs[1], SECOND_SESSION_EVENT, TOOL_COMPAT_FAIL);
+  const [error] = run.ofType('objective-error');
+  assert.strictEqual(error.reason, 'model-no-tools');
+  assert.strictEqual(error.detail, 'Model "gpt-4o-mini" at gw.example.com does not support tool calls (the endpoint rejected the request). Choose a tool-capable model.');
+});
+
+test('spawnPiTurn: a task chat on a model without tool support fails at once with model-no-tools, no respawn', (t) => {
+  const dir = makeProjectDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const session = { ...makeSession(dir), type: 'taskChat', toolProfile: 'taskChat', taskKey: 'TPT1' };
+  const run = spawnSequence(t, session, { resolveMcpBridge: () => null });
+  assert.strictEqual(run.calls.length, 1);
+  assert.strictEqual(run.calls[0].args[run.calls[0].args.indexOf('--tools') + 1], 'read,grep,find,ls,tipatask_api');
+  run.out(run.procs[0], SESSION_EVENT, TOOL_COMPAT_FAIL);
+  assert.strictEqual(run.calls.length, 1, 'a task chat is never retried without its tools');
+  const [error] = run.ofType('objective-error');
+  assert.strictEqual(error.reason, 'model-no-tools');
+  assert.strictEqual(error.detail, `Model "${MODEL}" at OpenRouter does not support tool calls (the endpoint rejected the request). Choose a tool-capable model.`);
+});
+
+test('spawnPiTurn: an unrelated 404 keeps the generic pi-error path with no respawn', (t) => {
+  const dir = makeProjectDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const session = makeSession(dir);
+  const run = spawnSequence(t, session, { resolveMcpBridge: () => null });
+  const errorMessage = '404: {"message":"No endpoints found for recraft-ai/recraft-v3.","code":404}';
+  run.out(run.procs[0], SESSION_EVENT, { type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage } });
+  assert.strictEqual(run.calls.length, 1);
+  const [error] = run.ofType('objective-error');
+  assert.ok(error.reason.startsWith('pi-error:404'));
+  assert.strictEqual(run.ofType('objective-progress').some(f => f.stage === 'pi-no-tools-retry'), false);
+});
+
+// ── A row declared `tools: false` (TPT634) ──
+// The row says up front that its model takes no tool definitions: an objective turn runs with no
+// tools from the first attempt (nothing to retry), and a task/project chat is refused unspawned.
+
+const CUSTOM_TOOLLESS = { model: 'recraft-v3', apiKey: 'sk-or-row', provider: 'custom', baseUrl: 'https://openrouter.ai/api/v1', tools: false };
+const TOOLLESS_ARGV = ['--mode', 'json', '--provider', piCustomProviderId(CUSTOM_TOOLLESS), '--model', 'recraft-v3', '--tools', '', '--no-extensions'];
+
+test('buildPiArgs: a tools:false row gets an empty --tools allowlist and no extension, whatever is passed', (t) => {
+  const dir = makeCustomProject(t, [CUSTOM_TOOLLESS]);
+  const session = { ...makeSession(dir), selectedModel: 'recraft-v3' };
+  assert.deepStrictEqual(buildPiArgs(session), TOOLLESS_ARGV);
+  assert.deepStrictEqual(buildPiArgs(session, { mcpBridgePath: BRIDGE.extensionPath }), TOOLLESS_ARGV);
+  const chat = { ...session, type: 'taskChat', toolProfile: 'taskChat', taskKey: 'TPT1' };
+  assert.deepStrictEqual(buildPiArgs(chat, { extensionPath: '/x/task-tools.mjs', mcpBridgePath: BRIDGE.extensionPath }), TOOLLESS_ARGV);
+});
+
+test('spawnPiTurn: an objective turn on a tools:false row starts without tools or bridge and is never retried', async (t) => {
+  const dir = makeCustomProject(t, [CUSTOM_TOOLLESS]);
+  const session = { ...makeSession(dir), selectedModel: 'recraft-v3' };
+  const bridgeCalls = [];
+  const run = spawnSequence(t, session, { resolveMcpBridge: (opts) => { bridgeCalls.push(opts); return BRIDGE; } });
+  assert.strictEqual(run.calls.length, 1);
+  const { args, opts } = run.calls[0];
+  assert.deepStrictEqual(args.slice(-TOOLLESS_ARGV.length), TOOLLESS_ARGV);
+  assert.ok(!args.includes('-e'));
+  assert.deepStrictEqual(bridgeCalls, [], 'no bridge is resolved for a turn that could not call it');
+  assert.strictEqual(opts.env.TIPATASK_PI_MCP_CONFIG, '');
+  assert.strictEqual(opts.env.TIPATASK_PI_CUSTOM_API_KEY, 'sk-or-row');
+  assert.ok(fs.existsSync(path.join(dir, '.pi', 'agent', 'models.json')), 'the endpoint itself is still declared');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(run.procs[0].stdinText(), /^Pi objective planning: no tools are available in this turn/);
+
+  // Should the endpoint refuse anyway, there is nothing left to drop: one plain error, no respawn.
+  run.out(run.procs[0], SESSION_EVENT, TOOL_COMPAT_FAIL);
+  assert.strictEqual(run.calls.length, 1, 'the tool-compat retry is skipped');
+  const errors = run.ofType('objective-error');
+  assert.strictEqual(errors.length, 1);
+  assert.strictEqual(errors[0].reason, 'model-no-tools');
+  assert.strictEqual(errors[0].detail, 'Model "recraft-v3" at openrouter.ai does not support tool calls (the endpoint rejected the request). Choose a tool-capable model.');
+  assert.strictEqual(run.ofType('objective-progress').some(f => f.stage === 'pi-no-tools-retry'), false);
+});
+
+test('spawnPiTurn: a task chat on a tools:false row is refused before anything is written or spawned', (t) => {
+  const dir = makeCustomProject(t, [CUSTOM_TOOLLESS]);
+  const session = { ...makeSession(dir), selectedModel: 'recraft-v3', type: 'taskChat', toolProfile: 'taskChat', taskKey: 'TPT1' };
+  const run = spawnSequence(t, session, { resolveMcpBridge: () => BRIDGE });
+  assert.strictEqual(run.calls.length, 0, 'no Pi process');
+  const errors = run.ofType('objective-error');
+  assert.strictEqual(errors.length, 1);
+  assert.strictEqual(errors[0].reason, 'model-no-tools');
+  assert.strictEqual(errors[0].provider, 'pi');
+  assert.strictEqual(errors[0].model, 'recraft-v3');
+  assert.strictEqual(errors[0].detail, 'Model "recraft-v3" at openrouter.ai does not support tool calls (its PI_MODELS row sets tools: false). Choose a tool-capable model.');
+  assert.strictEqual(fs.existsSync(path.join(dir, '.pi')), false, 'no models.json for a refused chat');
+});
+
+test('spawnPiTurn: another row of the same project keeps its tools', (t) => {
+  const dir = makeCustomProject(t, [CUSTOM_TOOLLESS, CUSTOM_KEYLESS]);
+  const session = { ...makeSession(dir), selectedModel: 'llama3.1:8b' };
+  const run = spawnSequence(t, session, { resolveMcpBridge: () => null });
+  const { args } = run.calls[0];
+  assert.strictEqual(args[args.indexOf('--tools') + 1], 'read');
 });

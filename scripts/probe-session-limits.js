@@ -26,9 +26,11 @@ function main(args = process.argv.slice(2)) {
     const counters = Object.fromEntries(['tests', 'pass', 'fail', 'cancelled', 'skipped'].map(k =>
       [k, Number(result.stdout?.match(new RegExp(`^# ${k} (\\d+)$`, 'm'))?.[1] ?? 0)]));
     console.log(JSON.stringify({ version: 1, kind: 'synthetic-contract-replay', ok: result.status === 0,
-      stages: [6, 8, 12], ...counters, error: result.error?.code || null,
+      stages: [6, 8, 12], rampStages: [6, 7, 8], ...counters, error: result.error?.code || null,
       coverage: ['pressure warning/critical', 'rolling swap/reset', 'stale/unknown samples', 'launch races',
-        'cross-project FIFO', 'independent-process coordinator lock', 'recovery hysteresis', 'stable/brief-burst/runaway watchdog'],
+        'cross-project FIFO', 'independent-process coordinator lock', 'recovery hysteresis', 'stable/brief-burst/runaway watchdog',
+        'ramp 6→8 step with warning reset', 'shared ramp cap across instances', 'coordination doubt restarts the shared ramp window',
+        'stale process telemetry or coordination doubt restarts the shared alarm recovery window'],
       representativeLiveRuns: 0, recommendation: 'No hardware capacity or rollout claim from synthetic traces.' }, null, 2));
     process.exitCode = result.status === 0 ? 0 : 1; return;
   }

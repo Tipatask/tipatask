@@ -65,6 +65,10 @@ function makeServer(state) {
       if (req.method === 'GET' && pathname === '/api/auth/me') {
         return send(200, { user: { id: 7 } });
       }
+      // _rawCreateTask reads the project row for its task_prefix (TPT622).
+      if (req.method === 'GET' && pathname === '/api/projects/1') {
+        return send(200, { project: { id: 1, task_prefix: 'TST' } });
+      }
       if (req.method === 'GET' && pathname === '/api/projects/1/tags') {
         return send(200, { tags: [] });
       }
@@ -188,13 +192,13 @@ test('objective save with no live placeholder row creates the task carrying the 
   // Defensive fallback in overwriteRaw: id absent from the live list and not in newTaskIds.
   const state = baseState([]);
   await withFakeApiServer(makeServer(state), async (backend) => {
-    await backend.overwriteRaw(todoBody([proposalTask({ id: 'C901', ...FULL_PIN })]));
+    await backend.overwriteRaw(todoBody([proposalTask({ id: 'TST901', ...FULL_PIN })]));
 
     assert.deepStrictEqual(state.unexpected, []);
     assert.strictEqual(state.patches.length, 0);
     assert.strictEqual(state.posts.length, 1);
     const body = state.posts[0];
-    assert.strictEqual(body.task_key, 'C901');
+    assert.ok(!('task_key' in body), 'TPT9004: no client key reaches POST /tasks, even one in the project namespace — the API allocates it');
     assert.strictEqual(body.agent_assignee, 'pi');
     assert.strictEqual(body.pi_model, 'anthropic/claude-sonnet-5');
     assert.strictEqual(body.claude_model, 'opus');

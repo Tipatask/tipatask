@@ -5,6 +5,7 @@ const {
   MAX_LOG_ENTRIES, appendProgressLog, formatProgressLine, noteTurnBoundary,
   pushThinking, flushThinking, replayProgressLog, progressStatusLine, stageLogText,
 } = await import('./objective-progress-log.js');
+const { setLocale } = await import('./i18n.js');
 
 function fakeCs() {
   return {};
@@ -148,4 +149,26 @@ test('stageLogText maps stage keys to short display text', () => {
   assert.equal(stageLogText('cli-init'), 'cli-init');
   assert.equal(stageLogText('tool', 'mcp__tipatask-local__batch_grep_tags'), 'batch_grep_tags');
   assert.equal(stageLogText('tool-end', 'mcp__tipatask__get_task'), 'get_task');
+});
+
+// (TPT9007) Stage labels, the turn divider and the elapsed unit come from i18n.js console.* keys.
+test('stageLogText, the turn divider and the elapsed prefix follow the project language', () => {
+  assert.equal(stageLogText('pi-retry', null, '429\nrate limited'), 'provider retry: 429 rate limited');
+  assert.equal(stageLogText('pi-no-tools-retry'), 'tools unsupported — retrying without tools');
+  assert.equal(stageLogText('some-new-stage'), 'some-new-stage', 'an unknown stage prints its raw id');
+  setLocale('uk');
+  try {
+    assert.equal(stageLogText('spawned'), 'запущено');
+    assert.equal(stageLogText('pi-retry', null, '429'), 'повтор запиту до провайдера: 429');
+    assert.equal(stageLogText('some-new-stage'), 'some-new-stage');
+    assert.equal(stageLogText('tool', 'mcp__tipatask__get_task'), 'get_task', 'tool names stay verbatim');
+    assert.match(formatProgressLine({ kind: 'turn', turnIndex: 3 }), /═══ хід 3 ═══/);
+    assert.match(formatProgressLine({ kind: 'tool', text: 'get_task', elapsedMs: 1234 }), /\[\+1\.2с\]/);
+    assert.match(formatProgressLine({ kind: 'tool', text: 'get_task' }), /\[\+\?с\]/);
+    const cs = fakeCs();
+    noteTurnBoundary(cs);
+    appendProgressLog(cs, { kind: 'tool', text: 'get_task', toolName: 'get_task', elapsedMs: 1000 });
+    const end = appendProgressLog(cs, { kind: 'tool-end', text: 'get_task', toolName: 'get_task', elapsedMs: 3500 });
+    assert.equal(end.text, 'get_task (2.5с)');
+  } finally { setLocale('en'); }
 });

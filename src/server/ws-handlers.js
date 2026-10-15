@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { spawn: spawnChild } = require('node:child_process');
 const config = require('./config');
 const { readLastExitSince, readLostSessions, forgetLostSession } = require('./last-exit');
+const leftUncommittedRegistry = require('./left-uncommitted'); // (TPT664) exit-backstop flag registry
 const { normalizeProposals, applyRehashIntent, spawnObjectiveTurn, killObjectiveProc, escalateKill, clearRetryTimers, clearTurnDeadline, prewarmObjective, killPrewarm, teardownObjectiveSession, trackHelperProc, clearHeartbeat, prewarmObjectiveCold, killColdPrewarm, startSleepWatchdog, objectiveCacheActivity, ensureSessionStartName, computeTurnSpans } = require('./claude-session');
 const { spawnTurn, providerSessionId, clearProviderSessionId, applyModelSelection } = require('./providers/dispatch');
 const { listObjectiveProviders, listVisibleObjectiveProviders, clampSelectionToProviders, formatSelection, currentSelection, configForProject, getProviderSessionId, getProviderDefaultModel, PROVIDER_META } = require('./providers/registry');
@@ -16,7 +17,7 @@ const { providerSupportsProfile } = require('./providers/tool-profiles');
 const { findOpenDialog, resolveDialogAnswer, replayTaskChatTurn, taskFrame, changedTaskFields, buildTaskEditNote } = require('./task-chat-widgets');
 const { killProcessGroup, killWindowsChildTree, resolveAgentLimits } = require('./process-group');
 const { createSessionQueue } = require('./session-queue');
-const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, replayLiveTerminal, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary } = require('./terminal-session');
+const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, replayLiveTerminal, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary, exitRunSnapshot, flagTaskLeftUncommitted } = require('./terminal-session');
 const { buildExitResolutionComment, hasSelfAuthoredResolution, waitForFinalMessage, selectFinalMessage } = require('./exit-resolution');
 const { getTaskAgentInfo, getTaskAgentLabels, getAvailableAgents, getAvailableAgentsPeek, listTaskAgentStatuses, listTaskAgentStatusesPeek, refreshAgentDetection, resolveTaskAgentId, listAgentModels, listAllAgentModels } = require('./task-agent');
 const { isModelAllowed } = require('./task-agent/model-registry');
@@ -24,11 +25,12 @@ const { getAgentQuotaStatus, getTaskAgent } = require('./task-agent');
 const { ensureArchitectureDocsForChanges } = require('./architecture-docs');
 const { clearContext, resetTurnBuffers } = require('./context-manager');
 const { highestActiveCodingPriority } = require('./sprint-assign');
-const { maxNumbersByPrefix, resolveCodingPrefix, isValidTaskKey } = require('./task-key-format');
+const { maxNumbersByPrefix, resolveCodingPrefix, isValidTaskKey, parseTaskKey, reconcileNextNumber, SUSPECT_KEY_GAP } = require('./task-key-format');
 const { readChatDraft, writeChatDraft, deleteChatDraft, readChatState, writeChatState, deleteChatState, readChatHistory, upsertChatHistory } = require('./chat-persistence');
 const { HISTORY_PROVIDERS, isHistoryId, nativeStorageRef, historyAvailability, buildSearchData, filterHistory, publicHistoryRow } = require('./chat-history');
 const { readNativeConversation } = require('./task-agent/final-message');
-const { readProjectConfig, readVoiceSettings, buildLanguageDirective, piEntryForModel, recordLastUsedAgent, readPiEntries, buildAgentsConfigPatch, summarizeAgents, PI_PROVIDERS, piProviderEnv, piKeyEnvVars } = require('./project-config');
+const { readProjectConfig, readVoiceSettings, buildLanguageDirective, recordLastUsedAgent, readPiEntries, buildAgentsConfigPatch, summarizeAgents, PI_PROVIDERS, piProviderEnv, piKeyEnvVars } = require('./project-config');
+const { piTaskEntryForModel } = require('./pi-custom-endpoint');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolvePiLaunch, cliSpawnSpec } = require('./spawn-utils');
 const { transcribeWithAssemblyAI, ASSEMBLYAI_ERRORS, MAX_AUDIO_BYTES: ASSEMBLYAI_MAX_AUDIO_BYTES } = require('./assemblyai-batch');
 const { int16BufferToFloat32 } = require('./voice-stream/local-provider');
@@ -92,7 +94,8 @@ function _sendIfOpen(ws, payload) {
 function queuedSessionFrame(session, taskId, snapshot) {
   const row = snapshot.queued.find(entry => entry.taskId === taskId);
   return { type: 'session-queued', tabId: session.tabId, taskId,
-    position: row?.position ?? null, running: snapshot.running, cap: snapshot.cap,
+    position: row?.position ?? null, running: row?.running ?? snapshot.running, cap: row?.cap ?? snapshot.cap,
+    alarm: row?.alarm ?? null, requiredBytes: row?.requiredBytes ?? null, headroomBytes: row?.headroomBytes ?? null,
     reason: 'device-cap', ...row };
 }
 
@@ -165,6 +168,65 @@ function sessionListBucket(s) {
   if (s.alive || s._starting || s._launching) return 'active';
   if (s.pending) return null; // created, waiting for a `start` message — neither live nor exited
   return 'exited';
+}
+
+// (TPT664) Connect-time replay of the exit backstop's flags to a new __attention__ / __board__
+// subscriber, the way attention-needed is replayed above: the live frame's shape plus
+// `replay: true`, which the client treats as "raise the ring, rebuild the flag, never notify".
+// (TPT670) Given the socket's backend, it also starts the one check of the flags restored from
+// disk for this project (validateRestoredLeftUncommitted()) and returns that promise.
+function replayLeftUncommitted(ws, { backend } = {}) {
+  const projectPath = ws._projectPath || '';
+  for (const [taskId, entry] of Object.entries(leftUncommittedRegistry.list(projectPath))) {
+    ws.send(JSON.stringify({ type: 'task-left-uncommitted', projectPath, taskId, blockers: entry.blockers,
+      status: entry.status, agent: entry.agent, nudgeCount: entry.nudgeCount, exitId: entry.exitId, replay: true }));
+  }
+  return backend ? validateRestoredLeftUncommitted(projectPath, backend).catch(() => {}) : undefined;
+}
+
+// (TPT614/TPT670) The finish route's read-only judgment of one exit-backstop flag, shared with the
+// check of flags restored from disk. `code` null: actionable — `blockers` are the ones the agent's
+// own commit or merge clears. FINISH_STALE_CODES are the verdicts that retire the flag: the task is
+// closed, was committed by hand, or no longer needs a commit.
+const FINISH_STALE_CODES = new Set(['TASK_CLOSED', 'TASK_COMMITTED', 'COMMITS_OFF']);
+async function assessFinishPrompt({ backend, projectRoot, taskKey }) {
+  const task = await backend.getTask(taskKey);
+  if (!task) return { code: 'TASK_NOT_FOUND' };
+  const statusCtx = await fetchStatusContext(backend);
+  if (statusCtx.isClosed(task.status)) return { code: 'TASK_CLOSED', task };
+  const { checkTaskCommit } = require('./git-merge/completion-guard');
+  const { uncommittedBlockers } = require('./completion-nudge');
+  const check = await checkTaskCommit({ backend, projectRoot, taskId: taskKey });
+  if (!check.verified) return { code: 'VCS_UNVERIFIED', task, check };
+  const vcs = check.vcs || null;
+  const commitEnabled = !!vcs && vcs.type === 'git' && vcs.commit === true;
+  if (check.ready) return { code: commitEnabled ? 'TASK_COMMITTED' : 'COMMITS_OFF', task, check, vcs, commitEnabled };
+  // Only the blockers the agent's own commit or merge clears become instructions. A failed Git read
+  // mid-check (git_verification_failed) or a repository mid-merge leaves none, and an unknown state
+  // never turns into a commit instruction.
+  const blockers = uncommittedBlockers(check.blockers);
+  return { code: blockers.length ? null : 'GIT_STATE_UNKNOWN', task, check, vcs, commitEnabled, blockers };
+}
+
+// (TPT670) A flag restored from disk at boot was recorded by an earlier run of this server, so its
+// task may have been closed or committed while the app was down. The first __attention__ /
+// __board__ connect of the project judges each restored entry once, one at a time, with the finish
+// route's rule, and retires a stale one the same way (the `cleared` frame). Any other verdict, or a
+// read that fails, keeps the flag. `deps.websocket` is the test seam. Never throws.
+async function validateRestoredLeftUncommitted(projectPath, backend, deps = {}) {
+  const emitter = deps.websocket || websocket;
+  for (const { taskKey, exitId } of leftUncommittedRegistry.takeRestored(projectPath)) {
+    try {
+      const { code } = await assessFinishPrompt({ backend, projectRoot: projectPath || config.PROJECT_ROOT, taskKey });
+      if (!FINISH_STALE_CODES.has(code)) continue;
+      const removed = leftUncommittedRegistry.clear(projectPath, taskKey, { exitId });
+      if (!removed) continue;
+      emitter.emitTaskLeftUncommitted(projectPath, taskKey, [], { cleared: true, exitId: removed.exitId });
+      console.log(`[exit-backstop] ${taskKey}: restored flag retired (${code})`);
+    } catch (err) {
+      console.warn(`[exit-backstop] ${taskKey}: restored flag check failed: ${err.message}`);
+    }
+  }
 }
 
 // A naturally exited terminal remains in the session map with its bounded PTY buffer. Reopen
@@ -658,11 +720,15 @@ function deleteDeviceSession(taskId, backend) {
   }).catch(err => console.warn(`[device-session] release failed for ${taskId}: ${err.message}`));
 }
 
-function sessionEndedPayload(taskId, session, reason = 'terminated') {
+// (TPT9014) `error` — a start refused with no socket attached (a queued start drained after its
+// headless Play All / bulk Start socket closed): the `error` frame startFailureFrame() built, so
+// the board can toast the same text the terminal's red line would show. Absent otherwise.
+function sessionEndedPayload(taskId, session, reason = 'terminated', error = null) {
   return {
     taskId,
     tabId: session?.tabId || taskId,
     reason,
+    ...(error ? { error } : {}),
   };
 }
 
@@ -672,11 +738,11 @@ function sendSessionEnded(ws, taskId, session, reason = 'terminated') {
   }
 }
 
-function broadcastSessionEnded(taskId, session, reason = 'terminated') {
+function broadcastSessionEnded(taskId, session, reason = 'terminated', error = null) {
   // Project-scoped (C1057): the attention watcher (__attention__ branch below) and a
   // project-bound board watcher both react to session-ended, and task keys can collide
   // across two open Electron project windows.
-  websocket.broadcastToProject(session?.projectPath, 'session-ended', sessionEndedPayload(taskId, session, reason));
+  websocket.broadcastToProject(session?.projectPath, 'session-ended', sessionEndedPayload(taskId, session, reason, error));
 }
 
 // Objective/spec chat is over (finalize, kill, ws close/detach): teardownObjectiveSession() leaves
@@ -728,10 +794,11 @@ function terminateTerminalSession(session, taskId, sessionKey, sessions, reason 
   // ptyProcess.onExit is suppressed by the _terminated flag set below. Guards:
   // alive+pty = live agent only (already-exited sessions posted via onExit);
   // _terminalOutputSeen = skip never-booted sessions; fire-and-forget so the
-  // kill never blocks on the HTTP POST.
+  // kill never blocks on the HTTP POST. (TPT613) `terminateReason` tells the exit backstop
+  // why — the comment header stays 'user-terminated' for every Terminate.
   if (session && session.alive && session.pty && session._terminalOutputSeen
       && typeof session.onSessionExit === 'function') {
-    Promise.resolve(session.onSessionExit({ exitCode: null, reason: 'user-terminated', buffer: session.buffer }))
+    Promise.resolve(session.onSessionExit({ exitCode: null, reason: 'user-terminated', terminateReason: reason, buffer: session.buffer }))
       .catch(err => console.error(`[terminal] resolution comment on terminate failed for ${taskId}:`, err.message));
   }
   if (session) {
@@ -858,10 +925,24 @@ throttle.subscribe(websocket.emitObjectiveQueueState);
 // degraded to the legacy 'C' by resolveCodingPrefix() at the call site. Was hardcoded
 // 'C'/'H' scan+mint — a project with its own task_prefix got a next-id hint for a
 // prefix it no longer mints.
-function nextIdHint(tasks, activeStatuses, codingPrefix) {
+// `peekByPrefix` (TPT9004) — Map<prefix, number> from fetchNextKeyPeeks(): the API's own
+// next-key peek wins over the local max+1 whenever it is known, because the allocator is
+// the only source of keys and the local list can lag it (deleted rows) or run ahead of it
+// (keys written around it). A local number more than SUSPECT_KEY_GAP above the peek is
+// logged as suspect; the API's number is reported either way. No peek -> local, as before.
+function nextIdHint(tasks, activeStatuses, codingPrefix, peekByPrefix = null) {
   const byPrefix = maxNumbersByPrefix(tasks);
-  const nextCoding = (byPrefix.get(codingPrefix) ?? 0) + 1;
-  const nextH = (byPrefix.get('H') ?? 0) + 1;
+  const nextFor = (prefix) => {
+    const localNext = (byPrefix.get(prefix) ?? 0) + 1;
+    const peekNext = peekByPrefix && typeof peekByPrefix.get === 'function' ? peekByPrefix.get(prefix) : undefined;
+    const r = reconcileNextNumber({ prefix, localNext, peekNext });
+    if (r.suspect) {
+      console.warn(`[todo] next-id hint: local next key ${prefix}${localNext} is more than ${SUSPECT_KEY_GAP} above the API peek ${prefix}${peekNext} — keys were minted around the allocator; reporting the API's ${prefix}${r.next}`);
+    }
+    return r.next;
+  };
+  const nextCoding = nextFor(codingPrefix);
+  const nextH = nextFor('H');
   const priorities = tasks.map(t => t.priority).filter(p => typeof p === 'number');
   const maxPriority = priorities.length ? Math.max(...priorities) : 0;
   const highestActive = activeStatuses ? highestActiveCodingPriority(tasks, activeStatuses) : highestActiveCodingPriority(tasks);
@@ -869,7 +950,29 @@ function nextIdHint(tasks, activeStatuses, codingPrefix) {
   const hint = highestActive
     ? `Next priority (joins active sprint ${highestActive}): ${nextPriority}`
     : `Next priority (new step/sprint): ${nextPriority}`;
-  return `Next available task IDs (across ALL statuses): ${codingPrefix}${nextCoding}, H${nextH}. ${hint}`;
+  return `Next available task IDs (across ALL statuses, assigned by the API — never pass your own task_key): ${codingPrefix}${nextCoding}, H${nextH}. ${hint}`;
+}
+
+// TPT9004 — the API's read-only next-key peeks (GET /tasks/next-key via
+// backend.getNextTaskKey(), TPT659) for this project's CODING prefix and H, as
+// Map<prefix, number>. getNextTaskKey() fails open to null (older API, offline) and never
+// throws; a backend without the method, a null peek, or a key that does not parse leaves
+// that prefix out, so callers fall back to their local derivation. Both reads run in
+// parallel and any rejection yields an empty map — a hint or a proposal remap must never
+// fail because a peek did.
+async function fetchNextKeyPeeks(backend) {
+  const peeks = new Map();
+  if (!backend || typeof backend.getNextTaskKey !== 'function') return peeks;
+  try {
+    const keys = await Promise.all([backend.getNextTaskKey('CODING'), backend.getNextTaskKey('HUMAN')]);
+    for (const key of keys) {
+      const parsed = parseTaskKey(key);
+      if (parsed) peeks.set(parsed.prefix, Number(parsed.number));
+    }
+  } catch (err) {
+    console.warn(`[todo] next-key peek failed (${err && err.message}); using the local key derivation`);
+  }
+  return peeks;
 }
 
 // ── Helpers ──
@@ -977,6 +1080,15 @@ function getTaskSubscriptionKey(urlPath) {
   return encoded ? decodeRequestComponent(encoded) : null;
 }
 
+// TPT614 — /api/tasks/:taskKey/finish-prompt (the card's Finish action), same key-parse shape.
+function getTaskFinishPromptKey(urlPath) {
+  const prefix = '/api/tasks/';
+  const suffix = '/finish-prompt';
+  if (!urlPath.startsWith(prefix) || !urlPath.endsWith(suffix)) return null;
+  const encoded = urlPath.slice(prefix.length, -suffix.length);
+  return encoded ? decodeRequestComponent(encoded) : null;
+}
+
 function _httpError(message, statusCode) {
   const err = new Error(message);
   err.statusCode = statusCode;
@@ -1038,6 +1150,41 @@ function eauthClientMessage(err) {
   return err && (err.reasonCode === 'expired' || err.reasonCode === 'expiring') && err.message
     ? err.message
     : fallback;
+}
+
+// (TPT9002) The `error` frame a failed terminal start sends: a stable `code` (+ `params`) the
+// console modal renders in the project language (terminal.error.* in i18n.js, via
+// terminal-frame-text.js), beside the English `message` an older client prints verbatim. EAUTH
+// adds `reason` (expired/expiring) and the auth guard's `detail` ({ when, expiresAt,
+// refreshError, refreshCode?, refreshParams? }); every other failure is ESTART with the agent
+// label and the raw error text. (TPT9008) A coded ESTART — an agent detection negative or a
+// tool-less Pi row, see terminal-session.js _spawnTerminal() / pi-agent.js getSpawnSpec() — also
+// carries `reason` (the error's reasonCode) and its reasonParams (`agent`, plus `output` or
+// `model`/`host`) in `params`, for terminal.error.ESTART.<reason>[.<agent>].
+function startFailureFrame(err, session) {
+  if (err && err.code === 'EASSIGNEE') return { type: 'error', code: 'EASSIGNEE', message: 'Cannot start a task assigned to another member.' };
+  if (err && err.code === 'ECLAIM') return { type: 'error', code: 'ECLAIM', message: 'Could not assign this task to you. Task start canceled.' };
+  if (err && err.code === 'EAUTH') {
+    const reason = err.reasonCode === 'expired' || err.reasonCode === 'expiring' ? err.reasonCode : null;
+    return {
+      type: 'error',
+      code: 'EAUTH',
+      ...(reason ? { reason } : {}),
+      ...(reason && err.detail ? { params: err.detail } : {}),
+      message: eauthClientMessage(err),
+    };
+  }
+  const label = session && session.taskAgentLabel;
+  const message = err && err.message;
+  const reason = err && typeof err.reasonCode === 'string' && err.reasonCode ? err.reasonCode : null;
+  const extra = reason && err.reasonParams && typeof err.reasonParams === 'object' ? err.reasonParams : null;
+  return {
+    type: 'error',
+    code: 'ESTART',
+    ...(reason ? { reason } : {}),
+    params: { ...extra, label, message },
+    message: `Failed to start ${label}: ${message}`,
+  };
 }
 
 function sendWsJson(ws, payload) {
@@ -1196,8 +1343,11 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
           alive: false, startedAt: row.startedAt };
       }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      // (TPT664) Tasks the exit backstop flagged — the server-side source of the client's
+      // state.leftUncommitted (Finish button). No header → every project, like the loop above.
+      const leftUncommitted = leftUncommittedRegistry.list(reqPath || '');
       return res.end(JSON.stringify({ projectPath: reqPath || config.PROJECT_ROOT, sessions: active, exited, queued, lost, lostDetails, attention, attentionDetails, sessionMeta,
-        admission: sessionQueue.snapshot(reqPath || config.PROJECT_ROOT).admission }));
+        leftUncommitted, admission: sessionQueue.snapshot(reqPath || config.PROJECT_ROOT).admission }));
     }
 
     // GET /api/agent-config — agent availability snapshot for startup population
@@ -1381,6 +1531,11 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         // backend, unreachable API) falls open to 'asc', matching migration 064's column
         // default.
         sprintSortOrder: project?.sprint_sort_order === 'desc' ? 'desc' : 'asc',
+        // TPT632 — task_prefix (C1480), this project's own CODING key prefix (e.g. 'MNY').
+        // resolveCodingPrefix() reports a real derived prefix or the legacy 'C' (missing
+        // column, file backend, unreachable API) — the same degrade path the create and
+        // nextIdHint paths take. Feeds the New Task Preview's key guess (group-label.js).
+        taskPrefix: resolveCodingPrefix(project?.task_prefix),
         // TPT61 — vcs_type/vcs_*_enabled (C1213/C1215) for the Task App's own Settings ▸
         // Version Control section (TPT62). Reports the RAW stored values, unlike
         // vcs-settings.js's fetchVcsSettings()/normalizeVcsSettings() which the agent-prompt
@@ -1395,6 +1550,20 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         vcsPrEnabled: !!project?.vcs_pr_enabled,
         vcsMergeEnabled: !!project?.vcs_merge_enabled,
       }));
+    }
+
+    // TPT659 — GET /api/project/next-task-key?category=CODING|HUMAN — the key the API would
+    // allocate for the next keyless create, for the New Task Preview badge. Same-origin proxy
+    // over backend.getNextTaskKey() (read-only peek, never reserves). { taskKey: string|null }
+    // — null on any failure or a backend without the method, so the renderer keeps its own
+    // nextTaskKeyGuess(). No error branch needed: getNextTaskKey() never throws.
+    if (req.method === 'GET' && urlPath === '/api/project/next-task-key') {
+      const q = new URL(req.url, 'http://localhost').searchParams;
+      const taskKey = typeof backend.getNextTaskKey === 'function'
+        ? await backend.getNextTaskKey(q.get('category') === 'HUMAN' ? 'HUMAN' : 'CODING')
+        : null;
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store' });
+      return res.end(JSON.stringify({ taskKey: typeof taskKey === 'string' ? taskKey : null }));
     }
 
     // TPT12 — GET /api/project/notifications — the caller's per-project `notifications`
@@ -1547,7 +1716,9 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
     // list by numeric parentDbId to reconstruct a full breadcrumb ancestor chain.
     // Conditional spreads, not `?? null`: this list also feeds patchCachedBoardTasks(),
     // which merges each row into already-cached board tasks — an explicit null would
-    // wipe a real dbId there instead of just omitting the key.
+    // wipe a real dbId there instead of just omitting the key. (TPT642) Also carries
+    // priority: the New Task Preview's dependency sprint floor reads it for dependencies
+    // outside the board's assignee-scoped, sprint-windowed list.
     if (req.method === 'GET' && urlPath === '/api/project/tasks') {
       try {
         const all = await backend.getTasksUnfiltered();
@@ -1560,6 +1731,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
             dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
             ...(t.dbId != null ? { dbId: t.dbId } : {}),
             ...(t.parentDbId != null ? { parentDbId: t.parentDbId } : {}),
+            ...(t.priority != null ? { priority: t.priority } : {}),
           }));
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store' });
         return res.end(JSON.stringify({ tasks }));
@@ -2515,6 +2687,56 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       }
     }
 
+    // TPT614 — GET /api/tasks/:id/finish-prompt: the card's Finish action for a task the exit
+    // backstop flagged (terminal-session.js flagTaskLeftUncommitted()). assessFinishPrompt() re-runs
+    // the same read-only commit check the backstop used (git-merge/completion-guard.js
+    // checkTaskCommit(): live VCS settings + git reads in this process, never an agent shell); an
+    // actionable verdict answers the finalize kickoff (git-merge/handoff.js buildFinishHandoff())
+    // the client hands to openTerminal(..., { prompt }). Never writes: no status, no comment, no
+    // git. Lazy requires keep the git-merge/ tree off the boot path, like the /api/project/merge/*
+    // mount above. Must stay ahead of the generic `GET /api/tasks/:id` below, which would swallow
+    // the path. Contract: ai/architecture/tt-websocket.md § Task finish-prompt HTTP route.
+    const finishPromptKey = req.method === 'GET' ? getTaskFinishPromptKey(urlPath) : null;
+    if (finishPromptKey) {
+      const sendFinishJson = (status, body) => {
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store' });
+        return res.end(JSON.stringify(body));
+      };
+      try {
+        const projectRoot = resolveProjectRoot(req);
+        const verdict = await assessFinishPrompt({ backend, projectRoot, taskKey: finishPromptKey });
+        const { task, check, vcs } = verdict;
+        // (TPT664) A stale-flag 409 (closed, committed by hand, no commit required) also retires the
+        // server-side flag, so a reload or another window does not keep offering Finish.
+        if (FINISH_STALE_CODES.has(verdict.code)) {
+          const removed = leftUncommittedRegistry.clear(projectRoot, finishPromptKey);
+          if (removed) websocket.emitTaskLeftUncommitted(projectRoot, finishPromptKey, [], { cleared: true, exitId: removed.exitId });
+        }
+        switch (verdict.code) {
+          case 'TASK_NOT_FOUND':
+            return sendFinishJson(404, { error: 'Task not found', code: 'TASK_NOT_FOUND' });
+          case 'TASK_CLOSED':
+            return sendFinishJson(409, { error: `Task ${finishPromptKey} is already ${task.status}; nothing to finish.`, code: 'TASK_CLOSED', status: task.status });
+          case 'VCS_UNVERIFIED':
+            return sendFinishJson(409, { error: 'Version control settings could not be verified; finish is unavailable until that read succeeds.', code: 'VCS_UNVERIFIED', blockers: check.blockers || [] });
+          case 'TASK_COMMITTED':
+            return sendFinishJson(409, { error: `Task ${finishPromptKey} already has a reachable ${finishPromptKey}: commit; nothing to finish.`, code: 'TASK_COMMITTED', vcs });
+          case 'COMMITS_OFF':
+            return sendFinishJson(409, { error: `No task commit is required for this project (version control: ${vcs ? vcs.type : 'off'}); nothing to finish.`, code: 'COMMITS_OFF', vcs });
+          case 'GIT_STATE_UNKNOWN':
+            return sendFinishJson(409, { error: 'The repository state could not be read for this task; resolve it before finishing.', code: 'GIT_STATE_UNKNOWN', blockers: check.blockers || [] });
+          default:
+            break;
+        }
+        const { buildFinishHandoff } = require('./git-merge/handoff');
+        const { blockers, commitEnabled } = verdict;
+        const handoff = buildFinishHandoff({ taskKey: finishPromptKey, blockers, commitEnabled });
+        return sendFinishJson(200, { taskKey: finishPromptKey, prompt: handoff.prompt, blockers, commitEnabled, vcs, status: task.status });
+      } catch (err) {
+        return sendFinishJson(err.statusCode || 500, { error: err.message, code: 'FINISH_PROMPT_FAILED' });
+      }
+    }
+
     // GET /api/images/:projectId/:imageId — proxy image bytes from Tipatask API (browser has no JWT)
     const imgMatch = req.method === 'GET' && urlPath.match(/^\/api\/images\/(\d+)\/(\d+)$/);
     if (imgMatch) {
@@ -2836,7 +3058,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
 
-      const { status, description, title, priority, tags, order, assignee, agent_assignee, sprint_id, claude_model, codex_model, pi_model, effort, claude_design_mode, dependencies, reopen_if_closed, is_objective } = parsed;
+      const { status, description, title, priority, tags, order, assignee, agent_assignee, sprint_id, claude_model, codex_model, pi_model, effort, claude_design_mode, dependencies, reopen_if_closed, is_objective, auto_register_tags } = parsed;
 
       // Validate status against THIS project's own registry (C1184), not a hardcoded
       // literal list — a project can rename/add/remove statuses. fetchStatusContext()
@@ -2964,7 +3186,9 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         // persists in the same PATCH; postDeviceSession below keys off the request's own
         // `status` const (still undefined here), so a reopen never claims a device session.
         if (reopen_if_closed === true) await applyReopenToPatch(backend, id, updateFields, 'chat-patch');
-        const updateResult = await backend.updateTask(id, updateFields);
+        // TPT623: client-only directive from the Task App edit modal — register unknown tags
+        // with an LLM-written description instead of failing. Never a task field.
+        const updateResult = await backend.updateTask(id, updateFields, { autoRegisterTags: auto_register_tags === true });
         if (!updateResult) {
           res.writeHead(404, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ error: `Task ${id} not found` }));
@@ -3474,7 +3698,12 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         let idRemap = new Map();
         if (newChanges.length > 0) {
           const { remapCollidingIds: remap } = require('./id-remap');
-          const result = remap(newChanges.map(c => c.task), existingTasks);
+          // TPT9004: seed the per-prefix collision counters from the API's own next-key
+          // peeks (fail-open: an empty map keeps the local max+1 derivation). A remapped id
+          // only labels the proposal — the save path reserves the real key — but it must
+          // still be a number the allocator would recognize, not a local guess.
+          const peekByPrefix = await fetchNextKeyPeeks(_rb);
+          const result = remap(newChanges.map(c => c.task), existingTasks, { peekByPrefix });
           if (result.idRemap.size > 0) {
             idRemap = result.idRemap;
             // Apply remapped IDs back into the changes array
@@ -3610,9 +3839,15 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
           // to the legacy 'C' when unavailable/invalid — getProjectSettings() is cached
           // and fail-open (never throws, null on failure/offline), so this adds no new
           // failure path over the pre-C1483 hardcoded 'C'.
-          const [statusCtx, projectSettings] = await Promise.all([fetchStatusContext(b), b.getProjectSettings ? b.getProjectSettings() : null]);
+          // (TPT9004) peekByPrefix: the API's next-key peeks, fetched alongside — see
+          // fetchNextKeyPeeks()/nextIdHint(); fail-open to the local derivation.
+          const [statusCtx, projectSettings, peekByPrefix] = await Promise.all([
+            fetchStatusContext(b),
+            b.getProjectSettings ? b.getProjectSettings() : null,
+            fetchNextKeyPeeks(b),
+          ]);
           const codingPrefix = resolveCodingPrefix(projectSettings?.task_prefix);
-          const hint = nextIdHint(all, statusCtx.active, codingPrefix);
+          const hint = nextIdHint(all, statusCtx.active, codingPrefix, peekByPrefix);
           const md = `# TODO\n\n\`\`\`json\n${json}\n\`\`\`\n\n${hint}\n`;
           res.writeHead(200, { 'Content-Type': 'text/markdown', 'Cache-Control': 'no-cache, no-store' });
           return res.end(md);
@@ -3956,12 +4191,15 @@ async function launchNewTerminalSession(ctx) {
               // C1133 — saved per-task pi pin, revalidated the same way _piModelParam is
               // above: the project's PI_MODELS may have dropped this row since it was
               // saved, and spawning a stale id would run row 0's API key against the
-              // wrong model.
+              // wrong model. A pin on a row that sets `tools: false` falls back the same way
+              // (getSpawnSpec() then runs the first tool-capable row) instead of refusing.
               const _piCfgForTask = readProjectConfig(projectPath || config.PROJECT_ROOT);
-              if (piEntryForModel(_piCfgForTask, _task.piModel)) {
+              const _pinCheck = piTaskEntryForModel(_piCfgForTask, _task.piModel);
+              if (_pinCheck.entry) {
                 _taskModel = _task.piModel;
               } else {
-                console.warn(`[ws] task ${taskId}'s saved pi_model "${_task.piModel}" not in this project's PI_MODELS — falling back to default`);
+                const _why = _pinCheck.reason === 'no-tools' ? 'sets tools: false in this project\'s PI_MODELS' : 'not in this project\'s PI_MODELS';
+                console.warn(`[ws] task ${taskId}'s saved pi_model "${_task.piModel}" ${_why} — falling back to default`);
               }
             }
           }
@@ -3995,34 +4233,17 @@ async function launchNewTerminalSession(ctx) {
         if (!ws) broadcastSessionEnded(taskId, session, 'start-failed');
         return;
       }
-      if (err.code === 'EASSIGNEE') {
-        _sendIfOpen(ws, { type: 'error', code: 'EASSIGNEE', message: 'Cannot start a task assigned to another member.' });
-        try { ws && ws.close(); } catch { /* already closed */ }
-        sessions.delete(sessionKey);
-        if (!ws) broadcastSessionEnded(taskId, session, 'start-failed');
-        return;
-      }
-      if (err.code === 'ECLAIM') {
-        _sendIfOpen(ws, { type: 'error', code: 'ECLAIM', message: 'Could not assign this task to you. Task start canceled.' });
-        try { ws && ws.close(); } catch { /* already closed */ }
-        sessions.delete(sessionKey);
-        if (!ws) broadcastSessionEnded(taskId, session, 'start-failed');
-        return;
-      }
-      if (err.code === 'EAUTH') {
-        // (C1383) Pre-spawn credential check tripped — expired/invalid API_TOKEN.
-        _sendIfOpen(ws, { type: 'error', code: 'EAUTH', message: eauthClientMessage(err) });
-        try { ws && ws.close(); } catch { /* already closed */ }
-        sessions.delete(sessionKey);
-        if (!ws) broadcastSessionEnded(taskId, session, 'start-failed');
-        return;
-      }
-      _sendIfOpen(ws, { type: 'error', message: `Failed to start ${session.taskAgentLabel}: ${err.message}` });
+      // EASSIGNEE, ECLAIM, EAUTH (C1383: the pre-spawn credential check tripped — expired or
+      // invalid API_TOKEN) and ESTART all end the same way. (TPT9014) With no socket attached —
+      // a queued start drained after its headless Play All / bulk Start socket closed — the
+      // frame rides the session-ended broadcast instead, so the board can still report it.
+      const frame = startFailureFrame(err, session);
+      _sendIfOpen(ws, frame);
       try { ws && ws.close(); } catch { /* already closed */ }
       sessions.delete(sessionKey);
       if (!ws) {
         console.warn(`[terminal] Queued start of ${taskId} failed: ${err.message}`);
-        broadcastSessionEnded(taskId, session, 'start-failed');
+        broadcastSessionEnded(taskId, session, 'start-failed', frame);
       }
       return;
     }
@@ -4065,7 +4286,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
   const initialRows = Number.isFinite(rowsParam) ? Math.min(100, Math.max(10, rowsParam)) : 0;
 
   if (!taskId) {
-    ws.send(JSON.stringify({ type: 'error', message: 'Missing taskId parameter' }));
+    ws.send(JSON.stringify({ type: 'error', code: 'EBADREQUEST', message: 'Missing taskId parameter' }));
     ws.close();
     return;
   }
@@ -4105,6 +4326,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
       // with undefined on the client — _attentionLastBroadcast only ever stored {kind, promptText}.
       ws.send(JSON.stringify({ type: 'attention-needed', taskId: s.tabId, agent: s.taskAgent, ...(s._attentionLastBroadcast || {}) }));
     }
+    replayLeftUncommitted(ws, { backend }); // (TPT664; TPT670 restored-flag check)
     // (C1356) Standard `ws` isAlive liveness pattern — this socket previously had no way to
     // detect a half-open connection on either end (server pinged but never checked for a
     // pong; client had no heartbeat at all). After sleep/wake or a silent network drop,
@@ -4249,6 +4471,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
       // with undefined on the client — _attentionLastBroadcast only ever stored {kind, promptText}.
       ws.send(JSON.stringify({ type: 'attention-needed', taskId: s.tabId, agent: s.taskAgent, ...(s._attentionLastBroadcast || {}) }));
     }
+    replayLeftUncommitted(ws, { backend }); // (TPT664; TPT670 restored-flag check)
     // Send recently assigned tasks (within last 60s) to the new board watcher
     for (const tid of websocket.getRecentAssignments()) {
       ws.send(JSON.stringify({ type: 'newly-assigned', taskId: tid }));
@@ -4580,7 +4803,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
   }
 
   if (existing && (existing._starting || existing._launching) && !isAgentChatType(existing.type)) {
-    ws.send(JSON.stringify({ type: 'error', message: `Session for ${taskId} is still starting — try again in a moment.` }));
+    ws.send(JSON.stringify({ type: 'error', code: 'ESTARTING', params: { taskId }, message: `Session for ${taskId} is still starting — try again in a moment.` }));
     ws.close();
     return;
   }
@@ -4592,7 +4815,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     ws.send(JSON.stringify(lastExit
       ? { type: 'error', code: 'ESESSION_LOST', ...lastExit,
           message: `Terminal session for ${taskId} was lost when the server exited (${lastExit.reason}, ${lastExit.at}).` }
-      : { type: 'error', message: `No active terminal session for ${taskId}` }));
+      : { type: 'error', code: 'ENOSESSION', params: { taskId }, message: `No active terminal session for ${taskId}` }));
     ws.close();
     return;
   }
@@ -4630,20 +4853,24 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
   // C1122 — Pi launch-time model pick, validated against the PROJECT's own configured
   // PI_MODELS rows (never the global env-default list — those have no apiKey behind
   // them). Validated here, outside the getTask() try/catch below, so a REST hiccup can
-  // never silently drop the user's explicit choice.
+  // never silently drop the user's explicit choice. A row that sets `tools: false` cannot
+  // run a task: that pick is dropped like an unknown id, and the start falls back to the
+  // task's saved pin or the project's first tool-capable row.
   let _piModelParam = '';
   if (modelParam && (session.taskAgent || config.TASK_AGENT) === 'pi') {
     const _piCfg = readProjectConfig(projectPath || config.PROJECT_ROOT);
-    if (piEntryForModel(_piCfg, modelParam)) {
+    const _pickCheck = piTaskEntryForModel(_piCfg, modelParam);
+    if (_pickCheck.entry) {
       _piModelParam = modelParam;
     } else {
-      console.warn(`[ws] rejected pi model param "${modelParam}" — not in this project's PI_MODELS`);
+      const _why = _pickCheck.reason === 'no-tools' ? 'its PI_MODELS row sets tools: false' : 'not in this project\'s PI_MODELS';
+      console.warn(`[ws] rejected pi model param "${modelParam}" — ${_why}`);
     }
   }
   sessions.set(sessionKey, session);
   // C948: wire lifecycle callbacks before spawn — an agent that dies during boot
   // fires onExit before wireClient() below would run.
-  wireSessionLifecycle(session, taskId, backend);
+  wireSessionLifecycle(session, taskId, backend, { sessions, sessionKey });
 
   const launchCtx = { session, prompt, taskId, sessionKey, sessions, backend, projectPath, initialCols, initialRows, _piModelParam };
   if (!prompt || isAgentChatId(taskId)) {
@@ -5057,7 +5284,9 @@ function restoreTaskChatEdits(session) {
 // C948: lifecycle callbacks shared by wireClient() and the pre-spawn wiring in
 // handleConnection() — wiring must exist before spawnTerminal() so an agent that
 // dies during boot still posts its resolution comment.
-function wireSessionLifecycle(session, taskId, backend) {
+// (TPT613) `sessions`/`sessionKey` let the exit backstop see a newer run of this task; `deps` is
+// the test seam passed straight to flagTaskLeftUncommitted().
+function wireSessionLifecycle(session, taskId, backend, { sessions, sessionKey, deps } = {}) {
   if (!taskId || isAgentChatId(taskId)) return;
   // C982: stashed for the index.js completion poller — the sessions Map key is
   // sessKey(tabId||taskId, projectPath), so taskId is not recoverable from the key,
@@ -5075,7 +5304,14 @@ function wireSessionLifecycle(session, taskId, backend) {
   // PTY tail; (4) the bare header. It used to be the raw ~80-line scrollback — which, for a TUI,
   // is redraw frames and animated-title OSC payloads, not text. See tt-claude-session-terminal.md
   // § Exit resolution comment.
-  session.onSessionExit = async ({ exitCode, buffer, reason, reasonText }) => {
+  // (TPT613) A newer run of this task: a different session object under this key (Start/Restart
+  // puts it there before spawning), or this object running again. An empty key is not one —
+  // Terminate deletes it right after calling onSessionExit.
+  const isSuperseded = () => {
+    const current = sessions && sessionKey != null ? sessions.get(sessionKey) : null;
+    return (current != null && current !== session) || session.alive === true || session._starting === true;
+  };
+  session.onSessionExit = async ({ exitCode, buffer, reason, reasonText, terminateReason }) => {
     if (!backend) return;
     // Dedup: natural exit posts first; the follow-up terminate/cleanup must not re-post.
     if (session._resolutionPosted) return;
@@ -5084,6 +5320,7 @@ function wireSessionLifecycle(session, taskId, backend) {
     // replaces session._transcriptHint / _commentBaselineId with the NEW run's.
     const transcriptSession = { _transcriptHint: session._transcriptHint };
     const baselineId = session._commentBaselineId;
+    const exitRun = exitRunSnapshot(session); // (TPT613) before any await — Terminate clears alive/pty next
     const agentPostedOwnReport = async () => {
       if (typeof backend.getTaskComments !== 'function') return false;
       try {
@@ -5092,32 +5329,44 @@ function wireSessionLifecycle(session, taskId, backend) {
         return false; // unknown → fail toward posting
       }
     };
-    try {
-      if (await agentPostedOwnReport()) {
-        console.log(`[ws] ${taskId}: agent posted its own resolution comment — skipping the auto exit comment`);
-        return;
-      }
-      let finalMessage = '';
+    const postExitComment = async () => {
       try {
-        const agent = getTaskAgent(session.taskAgent);
-        // 'completed' fires from a 10s poll on the task status flip, which can precede the
-        // agent's closing message by a few seconds: wait for its turn to end (bounded).
-        const result = await waitForFinalMessage(() => agent.readFinalMessage(transcriptSession), { needTurnEnd: reason === 'completed' });
-        finalMessage = selectFinalMessage(result, reason);
+        if (await agentPostedOwnReport()) {
+          console.log(`[ws] ${taskId}: agent posted its own resolution comment — skipping the auto exit comment`);
+          return;
+        }
+        let finalMessage = '';
+        try {
+          const agent = getTaskAgent(session.taskAgent);
+          // 'completed' fires from a 10s poll on the task status flip, which can precede the
+          // agent's closing message by a few seconds: wait for its turn to end (bounded).
+          const result = await waitForFinalMessage(() => agent.readFinalMessage(transcriptSession), { needTurnEnd: reason === 'completed' });
+          finalMessage = selectFinalMessage(result, reason);
+        } catch (err) {
+          console.error(`[ws] Final-message read failed for ${taskId}:`, err.message);
+        }
+        // The agent's own report and its `completed` status can land out of order, and the wait
+        // above may have run for a while — look once more before posting a redundant comment.
+        if (reason === 'completed' && await agentPostedOwnReport()) {
+          console.log(`[ws] ${taskId}: agent posted its own resolution comment — skipping the auto exit comment`);
+          return;
+        }
+        const { content, source } = buildExitResolutionComment({ reason, reasonText, exitCode, finalMessage, buffer });
+        await backend.createTaskComment(taskId, content, 'resolution');
+        console.log(`[ws] ${taskId}: posted exit resolution comment (${source})`);
       } catch (err) {
-        console.error(`[ws] Final-message read failed for ${taskId}:`, err.message);
+        console.error(`[ws] Failed to post resolution comment for ${taskId}:`, err.message);
       }
-      // The agent's own report and its `completed` status can land out of order, and the wait
-      // above may have run for a while — look once more before posting a redundant comment.
-      if (reason === 'completed' && await agentPostedOwnReport()) {
-        console.log(`[ws] ${taskId}: agent posted its own resolution comment — skipping the auto exit comment`);
-        return;
-      }
-      const { content, source } = buildExitResolutionComment({ reason, reasonText, exitCode, finalMessage, buffer });
-      await backend.createTaskComment(taskId, content, 'resolution');
-      console.log(`[ws] ${taskId}: posted exit resolution comment (${source})`);
-    } catch (err) {
-      console.error(`[ws] Failed to post resolution comment for ${taskId}:`, err.message);
+    };
+    try {
+      await postExitComment();
+    } finally {
+      // (TPT613) Exit backstop — after the exit comment, so its own resolution comment is never
+      // read as the agent's report above, and whether or not that comment was posted.
+      await flagTaskLeftUncommitted(exitRun, {
+        backend, projectRoot: session.projectPath || config.PROJECT_ROOT,
+        reason, terminateReason, exitCode, isSuperseded, deps,
+      });
     }
   };
 }
@@ -5164,7 +5413,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
   if (!isAgentChatType(session.type)) {
     emitTerminalState(session);
   }
-  wireSessionLifecycle(session, taskId, backend);
+  wireSessionLifecycle(session, taskId, backend, { sessions, sessionKey });
   ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
@@ -5329,7 +5578,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
               if ((await getAvailableAgents(configForProject(session.projectPath))).includes(msg.agent)) {
                 session.taskAgent = msg.agent;
               } else {
-                ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Unknown agent: ${msg.agent}` }));
+                ws.send(JSON.stringify({ type: 'error', code: 'EAGENT', params: { agent: msg.agent }, tabId: session.tabId, message: `Unknown agent: ${msg.agent}` }));
                 ws.close();
                 sessions.delete(sessionKey);
                 return;
@@ -5375,25 +5624,25 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
                 return;
               }
               if (err.code === 'EASSIGNEE') {
-                ws.send(JSON.stringify({ type: 'error', code: 'EASSIGNEE', tabId: session.tabId, message: 'Cannot start a task assigned to another member.' }));
+                ws.send(JSON.stringify({ ...startFailureFrame(err, session), tabId: session.tabId }));
                 ws.close();
                 sessions.delete(sessionKey);
                 return;
               }
               if (err.code === 'ECLAIM') {
-                ws.send(JSON.stringify({ type: 'error', code: 'ECLAIM', tabId: session.tabId, message: 'Could not assign this task to you. Task start canceled.' }));
+                ws.send(JSON.stringify({ ...startFailureFrame(err, session), tabId: session.tabId }));
                 ws.close();
                 sessions.delete(sessionKey);
                 return;
               }
               if (err.code === 'EAUTH') {
                 // (C1383) Pre-spawn credential check tripped — expired/invalid API_TOKEN.
-                ws.send(JSON.stringify({ type: 'error', code: 'EAUTH', tabId: session.tabId, message: eauthClientMessage(err) }));
+                ws.send(JSON.stringify({ ...startFailureFrame(err, session), tabId: session.tabId }));
                 ws.close();
                 sessions.delete(sessionKey);
                 return;
               }
-              ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Failed to start ${session.taskAgentLabel}: ${err.message}` }));
+              ws.send(JSON.stringify({ ...startFailureFrame(err, session), tabId: session.tabId }));
               ws.close();
               sessions.delete(sessionKey);
             }
@@ -5966,7 +6215,12 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           const localPath = injectPastedImage(session, msg.mimeType, msg.data);
           sendWsJson(ws, { type: 'paste-image-done', path: localPath });
         } catch (err) {
-          sendWsJson(ws, { type: 'paste-image-error', error: err.message });
+          sendWsJson(ws, {
+            type: 'paste-image-error',
+            error: err.message,
+            ...(err.code ? { code: err.code } : {}), // (TPT9002) terminal.pasteError.* on the client
+            ...(err.params ? { params: err.params } : {}),
+          });
         }
       }
     }
@@ -6022,6 +6276,9 @@ module.exports = {
   claimUnassignedTaskOnStart,
   sessionListBucket, sessionMetaRow,
   replayExitedTerminal,
+  replayLeftUncommitted,
+  // (TPT670) Exported for unit testing — see finish-prompt-route.test.js.
+  assessFinishPrompt, validateRestoredLeftUncommitted, FINISH_STALE_CODES,
   drainSessionQueue, sessionQueue, queuedSessionFrame,
   parsePiModelList,
   queryPiModels,
@@ -6032,4 +6289,7 @@ module.exports = {
   terminateObjectiveSessions,
   // (TPT354) Exported for unit testing — see exit-resolution-lifecycle.test.js.
   wireSessionLifecycle,
+  // (TPT613) Exported for unit testing — the exit backstop's Terminate path, see
+  // exit-resolution-lifecycle.test.js.
+  terminateTerminalSession,
 };

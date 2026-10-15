@@ -112,12 +112,15 @@ test('chat.confirmCloseTabUnsaved keeps {n} and {title} placeholders in every pr
   }
 });
 
-// (TPT310) agentQuotaSidebar.updatedAt feeds the left-nav plan-usage block's "Updated HH:MM" line —
-// a translation that dropped {time} would ship a caption with no timestamp. The block's other
+// (TPT310) agentQuotaSidebar.updatedAt feeds the left-nav plan-usage block's "Updated HH:MM" line,
+// and (TPT689) agentQuotaSidebar.staleAt leads a stale bar's tooltip with the reading's time — a
+// translation that dropped {time} would ship either line with no timestamp. The block's other
 // strings are plain labels, covered by the en-subset parity check above.
-test('agentQuotaSidebar.updatedAt keeps the {time} placeholder in every locale', () => {
+test('agentQuotaSidebar.updatedAt and staleAt keep the {time} placeholder in every locale', () => {
   for (const [locale, table] of Object.entries(LOCALES)) {
-    assert.ok(table['agentQuotaSidebar.updatedAt']?.includes('{time}'), `${locale}.agentQuotaSidebar.updatedAt must contain {time}`);
+    for (const key of ['agentQuotaSidebar.updatedAt', 'agentQuotaSidebar.staleAt']) {
+      assert.ok(table[key]?.includes('{time}'), `${locale}.${key} must contain {time}`);
+    }
   }
 });
 
@@ -167,4 +170,183 @@ test('reauth.accountSwitched keeps the {email} placeholder in every locale', () 
   for (const [lang, table] of Object.entries(LOCALES)) {
     assert.match(table['reauth.accountSwitched'], /\{email\}/, `${lang} reauth.accountSwitched`);
   }
+});
+
+// (TPT614) task-finish.js's toasts name the task and the server's reason — a translation that
+// dropped {key} or {msg} would ship a toast that doesn't say which task or why it failed.
+test('card.finishNothingToDo keeps {key} and card.finishFailed keeps {msg} in every locale', () => {
+  for (const [locale, table] of Object.entries(LOCALES)) {
+    assert.ok(table['card.finishNothingToDo']?.includes('{key}'), `${locale}.card.finishNothingToDo must contain {key}`);
+    assert.ok(table['card.finishFailed']?.includes('{msg}'), `${locale}.card.finishFailed must contain {msg}`);
+  }
+});
+
+// (TPT697) openAgentSelectorModal() (console-modal.js) renders its title and Remember label from
+// these keys — both were hardcoded English before, so a Ukrainian project still showed English.
+// The parity check above can't catch a key dropped from every table at once.
+test('agentSelector.title and agentSelector.remember are translated in every locale', () => {
+  for (const key of ['agentSelector.title', 'agentSelector.remember']) {
+    for (const [locale, table] of Object.entries(LOCALES)) {
+      assert.ok(table[key]?.trim(), `${locale}.${key} must be a non-empty string`);
+    }
+    assert.notEqual(LOCALES.uk[key], LOCALES.en[key], `uk.${key} must not be the English text`);
+  }
+});
+
+// (TPT9008) The ESTART reason sub-keys: each agent's detect() codes (+ Pi's no_tool_calls), and the
+// shared detection_failed. objective-teardown-wiring.test.js checks their English against the server.
+const ESTART_REASON_KEYS = [
+  ...['claude', 'codex', 'pi'].flatMap((agent) => [`cli_not_found.${agent}`, `cli_missing.${agent}`]),
+  ...['claude', 'codex'].flatMap((agent) => [`not_logged_in.${agent}`, `login_check_failed.${agent}`]),
+  'probe_failed.pi', 'probe_failed_output.pi', 'no_tool_calls.pi', 'detection_failed',
+].map((reason) => `terminal.error.ESTART.${reason}`);
+const REFRESH_CODES = ['request_failed', 'request_failed_cause', 'request_timeout', 'rejected', 'unreadable_response',
+  'no_usable_token', 'scope_changed', 'project_scope', 'not_newer', 'missing_input', 'fetch_unavailable'];
+
+// (TPT700) console-modal.js renders the terminal's status-dot tooltips, the lines it writes into the
+// xterm, the plan-ready bar, the MCP auth dialog and the Debug Console header from these keys — all
+// hardcoded English before. The parity check above can't catch a key dropped from every table at once.
+test('terminal modal copy is translated in every locale', () => {
+  const keys = [
+    'console.title', 'btn.dismiss', 'terminal.discussion', 'terminal.planReady', 'terminal.planProceed',
+    'terminal.mcpAuth.title', 'terminal.mcpAuth.initial', 'terminal.mcpAuth.reauth', 'terminal.mcpAuth.openSettings',
+    'terminal.imageReadFailed', 'terminal.imagePasteReason.clipboardUnreadable',
+    'terminal.imagePasteReason.notConnected', 'terminal.imagePasteReason.emptyData',
+    ...['connected', 'planningCommand', 'planningDialog', 'executing', 'exited', 'exitedCode', 'error',
+      'disconnected', 'connectionError'].map((name) => `terminal.status.${name}`),
+    'terminal.processExitedCode', 'terminal.tokens', 'terminal.imagePasteFailed', 'terminal.voiceError',
+    // (TPT9002) Coded server frames, rendered by terminal-frame-text.js.
+    ...['EASSIGNEE', 'ECLAIM', 'EAUTH', 'EAUTH.expired', 'EAUTH.expiring', 'EAUTH.expiringNotRefreshed', 'ESTART',
+      'ESTARTING', 'ENOSESSION', 'EBADREQUEST', 'ESETUP', 'EAGENT'].map((code) => `terminal.error.${code}`),
+    ...['EIMAGE_NOT_RUNNING', 'EIMAGE_MISSING', 'EIMAGE_TYPE', 'EIMAGE_EMPTY', 'EIMAGE_TOO_LARGE'].map((code) => `terminal.pasteError.${code}`),
+    // (TPT9008) Agent-detection / tool-compat reasons of an ESTART frame, and token-refresh failures.
+    ...ESTART_REASON_KEYS,
+    ...REFRESH_CODES.map((code) => `terminal.error.EAUTH.refresh.${code}`),
+  ];
+  for (const key of keys) {
+    for (const [locale, table] of Object.entries(LOCALES)) {
+      assert.ok(table[key]?.trim(), `${locale}.${key} must be a non-empty string`);
+    }
+    assert.notEqual(LOCALES.uk[key], LOCALES.en[key], `uk.${key} must not be the English text`);
+  }
+});
+
+// (TPT700) A translation that dropped a placeholder would ship a planning tooltip without the
+// approval command, an exit line without the code, a token footer without its counts, or a
+// paste/voice notice without the reason.
+test('terminal modal interpolated keys keep their placeholders in every locale', () => {
+  const placeholders = {
+    'terminal.status.planningCommand': ['{command}'],
+    'terminal.status.exitedCode': ['{code}'],
+    'terminal.processExitedCode': ['{code}'],
+    'terminal.tokens': ['{input}', '{output}', '{cost}'],
+    'terminal.imagePasteFailed': ['{reason}'],
+    'terminal.voiceError': ['{msg}'],
+    // (TPT9002) Coded server frames: a dropped placeholder would hide the agent, the task key,
+    // the expiry time, the refresh error, the image type or the size cap.
+    'terminal.error.EAUTH.expired': ['{when}'],
+    'terminal.error.EAUTH.expiring': ['{when}'],
+    'terminal.error.EAUTH.expiringNotRefreshed': ['{when}', '{error}'],
+    'terminal.error.ESTART': ['{label}', '{message}'],
+    'terminal.error.ESTARTING': ['{taskId}'],
+    'terminal.error.ENOSESSION': ['{taskId}'],
+    'terminal.error.ESETUP': ['{message}'],
+    'terminal.error.EAGENT': ['{agent}'],
+    'terminal.pasteError.EIMAGE_TYPE': ['{type}'],
+    'terminal.pasteError.EIMAGE_TOO_LARGE': ['{maxMb}'],
+    // (TPT9008) Every ESTART reason names the agent; Pi's also carry the probe line or the model and
+    // its host, and a refresh failure its HTTP status or network cause.
+    ...Object.fromEntries(ESTART_REASON_KEYS.map((key) => [key, ['{label}']])),
+    'terminal.error.ESTART.probe_failed_output.pi': ['{label}', '{output}'],
+    'terminal.error.ESTART.no_tool_calls.pi': ['{label}', '{model}', '{host}'],
+    'terminal.error.EAUTH.refresh.rejected': ['{status}'],
+    'terminal.error.EAUTH.refresh.request_failed_cause': ['{cause}'],
+  };
+  for (const [key, required] of Object.entries(placeholders)) {
+    for (const [locale, table] of Object.entries(LOCALES)) {
+      for (const ph of required) assert.ok(table[key]?.includes(ph), `${locale}.${key} must contain ${ph}`);
+    }
+  }
+});
+
+// (TPT9007) The objective chat (chat-ui.js), its Debug Console lines (chat-ui.js handlers +
+// objective-progress-log.js) and the corner api-status banner (utils.js) render from these keys —
+// all hardcoded English before. The parity check above can't catch a key dropped from every table.
+test('objective chat, Debug Console and api-status banner copy is translated in every locale', () => {
+  const keys = [
+    ...['restarted', 'turnFailed', 'unknownError', 'retryAttempt', 'streamInterrupted', 'contextTrimmed',
+      'resultTokens', 'turnDivider'].map((name) => `console.${name}`),
+    ...['spawned', 'cliInit', 'modelThinking', 'working', 'piStderr', 'piRetry', 'piRetryEnd', 'piNoToolsRetry',
+      'piCompaction', 'piCompactionEnd'].map((stage) => `console.stage.${stage}`),
+    ...['tab.newObjective', 'tab.close', 'objectiveReady', 'objectiveComplete', 'objectiveReadyBody',
+      'placeholderFollowUp', 'placeholderBrief', 'historyButton', 'wordCountHint', 'olderHidden', 'originCaption',
+      'originExit', 'image.previewAlt', 'image.uploadedAlt', 'image.remove', 'image.uploadFailed', 'autoRevising',
+      'noTasksRetrying', 'retrying', 'contextTrimmed', 'connectionLostReconnecting', 'connectionLostRetry',
+      'connectionLost', 'sessionExpired'].map((name) => `chat.${name}`),
+    ...['spawned', 'cliInit', 'modelThinking', 'working', 'piRetry', 'piNoToolsRetry', 'piCompaction', 'listTasks',
+      'listSystemTags', 'getTagArchitecture', 'getTagArchitectures', 'getTask', 'batchGrepTags', 'tool',
+      'thinking'].map((name) => `chat.progress.${name}`),
+    ...['modelLabel', 'selection', 'circuitOpen', 'queueFull', 'spawn', 'spawnDetail', 'history', 'finalize',
+      'streamFailed', 'streamFailedRetried', 'streamModel', 'streamDetails', 'retryOrRefine', 'noCards', 'noCardsGot',
+      'retryOrRefineInstructions', 'selectionRetry', 'throttleRetry', 'spawnRetry', 'historyRetry', 'finalizeRetry',
+      'streamRetry'].map((name) => `chat.error.${name}`),
+    'btn.send',
+    ...['reconnected', 'reconnecting', 'offline', 'unreachable'].map((name) => `apiStatus.${name}`),
+  ];
+  for (const key of keys) {
+    for (const [locale, table] of Object.entries(LOCALES)) {
+      assert.ok(table[key]?.trim(), `${locale}.${key} must be a non-empty string`);
+    }
+    assert.notEqual(LOCALES.uk[key], LOCALES.en[key], `uk.${key} must not be the English text`);
+  }
+  // Plural stems resolved with tc(): en one/many, uk one/few/many, each keeping {n}.
+  for (const stem of ['console.turnFailedTries', 'console.resultCards', 'chat.wordCount', 'chat.loadEarlier',
+    'apiStatus.reconnectingQueued']) {
+    for (const [locale, forms] of [['en', ['one', 'many']], ['uk', ['one', 'few', 'many']]]) {
+      for (const form of forms) {
+        assert.ok(LOCALES[locale][`${stem}.${form}`]?.includes('{n}'), `${locale}.${stem}.${form} must contain {n}`);
+      }
+    }
+  }
+});
+
+// (TPT9007) A translation that dropped a placeholder would ship a Debug Console line without the
+// failure, attempt or count, an error sentence without the provider or reason, or a banner without
+// the transport error.
+test('objective chat, Debug Console and api-status banner keys keep their placeholders in every locale', () => {
+  const placeholders = {
+    'console.turnFailed': ['{msg}'],
+    'console.turnFailedTries.one': ['{reason}'],
+    'console.turnFailedTries.many': ['{reason}'],
+    'console.retryAttempt': ['{attempt}', '{reason}'],
+    'console.contextTrimmed': ['{n}'],
+    'console.resultTokens': ['{input}', '{output}'],
+    'console.turnDivider': ['{n}'],
+    'chat.objectiveReady': ['{title}'],
+    'chat.objectiveReadyBody': ['{n}'],
+    'chat.olderHidden': ['{n}'],
+    'chat.image.previewAlt': ['{name}'],
+    'chat.retrying': ['{attempt}', '{reason}'],
+    'chat.contextTrimmed': ['{n}'],
+    'chat.progress.tool': ['{name}'],
+    'chat.progress.thinking': ['{text}'],
+    'chat.error.selection': ['{reason}'],
+    'chat.error.spawn': ['{label}'],
+    'chat.error.spawnDetail': ['{label}', '{detail}'],
+    'chat.error.streamFailed': ['{label}', '{reason}'],
+    'chat.error.streamFailedRetried': ['{label}', '{n}', '{reason}'],
+    'chat.error.streamModel': ['{model}'],
+    'chat.error.streamDetails': ['{detail}'],
+    'chat.error.noCards': ['{label}'],
+    'chat.error.noCardsGot': ['{preview}'],
+    'chat.error.spawnRetry': ['{label}'],
+    'chat.error.streamRetry': ['{label}', '{reason}'],
+    'apiStatus.offline': ['{msg}'],
+  };
+  for (const [key, required] of Object.entries(placeholders)) {
+    for (const [locale, table] of Object.entries(LOCALES)) {
+      for (const ph of required) assert.ok(table[key]?.includes(ph), `${locale}.${key} must contain ${ph}`);
+    }
+  }
+  assert.ok(LOCALES.uk['console.turnFailedTries.few']?.includes('{reason}'), 'uk.console.turnFailedTries.few must contain {reason}');
 });

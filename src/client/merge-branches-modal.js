@@ -737,8 +737,13 @@ async function _resume() {
 // Opens a terminal session for the conflicting task with the server-built kickoff prompt.
 // The prompt travels in the terminal WS URL (server reads `prompt` from the query string), so
 // it is capped at MAX_DESC_LEN the same way a task description is; the full text stays in the
-// panel's copy box. A task that already has a live session can't take a URL prompt (resume
-// path) — copy it to the clipboard instead.
+// panel's copy box. A task that already has a LIVE session can't take a URL prompt (resume
+// path) — copy it to the clipboard instead. A task whose last session merely EXITED (retained
+// for replay, in state.exitedSessions) is relaunched instead: `relaunch: true` makes
+// console-modal.js's wantsRelaunch() treat it as a fresh launch so the prompt is sent and the
+// server spawns a new run (same hand-off shape as task-finish.js, TPT614) — without it the
+// terminal reattaches to the dead session and the prompt is silently dropped. relaunch is
+// ignored for a live session by design.
 async function _resolveWithAgent() {
   const owningOverlay = _overlay;
   const c = _job?.conflict;
@@ -759,7 +764,7 @@ async function _resolveWithAgent() {
     showToast(t('merge.promptCopiedResume'));
   }
   close();
-  const opts = { prompt };
+  const opts = { prompt, relaunch: true };
   const multiAgent = Array.isArray(state.availableAgents) && state.availableAgents.length > 1 && !state.sessionAgent;
   if (multiAgent && typeof openAgentSelectorModal === 'function') openAgentSelectorModal(taskKey, title, '', status, opts);
   else openTerminal(taskKey, title, '', status, opts);

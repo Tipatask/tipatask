@@ -296,7 +296,7 @@
 <script>
 // ── Import extracted modules from bundle ──
 const { constants, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, chatUI, chatTaskPreview } = window.TipTask;
-const { t } = window.TipTask.i18n;
+const { t, tc } = window.TipTask.i18n;
 // (C1259) Click-to-render perf logging — see src/client/perf-log.js.
 const { perfStart, perfEnd, perfWrap } = window.TipTask.perfLog;
 
@@ -319,7 +319,7 @@ const {
 // (C1235) Per-project group-container noun (Sprint/Batch/Bag/Jar/Group/Step). Same
 // async-trigger-point discipline as statusRegistry above — loadGroupLabel()/
 // resetGroupLabel() called alongside loadStatuses()/resetStatuses() below.
-const { groupTitle, loadGroupLabel, resetGroupLabel, getSprintsEnabled, getObjectiveGroupingEnabled, getSprintSortOrder } = window.TipTask.groupLabel;
+const { groupTitle, loadGroupLabel, resetGroupLabel, getSprintsEnabled, getObjectiveGroupingEnabled, getSprintSortOrder, nextTaskKeyGuess, fetchNextTaskKey } = window.TipTask.groupLabel;
 
 const {
   loadDraft, saveDraft, clearDraft, getObjectiveDraftKey,
@@ -340,6 +340,10 @@ const { filterTagOptions, tagDescription } = window.TipTask.tagMatch;
 // (C1547) Status-filter panel checkbox toggle math — pure, DOM-free, shared with
 // task-board.js's renderStatusFilter()/refreshFilterBarChrome() (ES import there).
 const { nextStatusSelection } = window.TipTask.statusFilterSelect;
+
+// (TPT624) Manual New Task sprint selection — raw combo value -> pinned priority, dependency
+// floor with a visible move reason. Pure, DOM-free (src/client/new-task-sprint.js).
+const { resolveManualSprintSelection, manualDependencyFloor, applyManualDependencyFloor, missingDependencyIds, dependencyFloorRows } = window.TipTask.newTaskSprint;
 
 const {
   renderCard, expandCard, collapseCard,
@@ -373,6 +377,8 @@ const {
   attachImagePaste,
   ensureProjectMembers,
   attachNewTaskFormHandlers, saveNewTaskDraft, ensureManualTaskState,
+  unregisteredProjectTags, invalidateProjectTags,
+  getProjectTaskList, ensureProjectTaskList,
 } = taskBoard;
 
 const {
@@ -1230,7 +1236,7 @@ async function fetchBoardSnapshot(context = _boardTaskCacheContext()) {
     hydrateTagDescriptions(),
     fetchBoardWindow(context.parentKey || null, context.sprintWindowExtend || 0, context.assigneeScope === 'all', !!context.fullWindow),
     hydrateSprints(),
-    context.parentKey ? _fetchTaskForHandoff(context.parentKey).catch(() => null) : Promise.resolve(null),
+    context.parentKey ? TipTask.taskFetch.fetchTaskOrNull(context.parentKey) : Promise.resolve(null),
   ]);
   // (TPT59) Breadcrumb ancestor chain — only when this task itself has a parent, so the
   // common single-level-objective case (and every root-board render) costs zero extra
@@ -1292,7 +1298,7 @@ function renderTaskLoadError(err) {
     return;
   }
   if (state.lastLoadedTaskCount > 0) {
-    showApiStatusBanner('disconnected', err.message || 'Could not load tasks');
+    showApiStatusBanner('disconnected', err.message || t('board.loadErrTitle'));
     startOfflineRetry();
     // (C1387) app.innerHTML is untouched on this branch (cards + their rings survive), but the
     // caller's own updateClaudeButtons() call never runs since loadAndRender() returns before
@@ -1333,7 +1339,7 @@ function refreshBoardSnapshotInBackground(cacheKey, previousFingerprint, context
       }
     } catch (err) {
       if (cacheKey === _boardTaskFilterHash() && state.lastLoadedTaskCount > 0) {
-        showApiStatusBanner('disconnected', err.message || 'Could not load tasks');
+        showApiStatusBanner('disconnected', err.message || t('board.loadErrTitle'));
         startOfflineRetry();
       }
     } finally {
@@ -2153,9 +2159,9 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   // Unfinalized reserve_task_keys placeholder rows ("New task", C1017) are excluded
   // from every user-facing render below — they're not real tasks yet. `tasks` itself
   // stays unfiltered — not renderNewTaskForm() (it doesn't read this param at all), but
-  // the #new-task-preview click handler further down (C1245/C1256), whose next-id guess
-  // (`C${max+1}`) must still see live reservations to avoid guessing a key someone else
-  // already has reserved.
+  // the #new-task-preview click handler further down (C1245/C1256), whose display-only
+  // next-id guess (`<project prefix>${max+1}`, TPT632) must still see live reservations so
+  // it lands past keys already booked.
   const visibleTasks = tasks.filter(t => !t.isReservation);
   // (C1259) See state.js — lets filter-bar click handlers recompute facet counts and
   // patch chrome without a full loadAndRender(). Deliberately kept UNFILTERED by objective
@@ -2977,7 +2983,9 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   const newTaskForm = document.getElementById('new-task-form');
   const newTaskPreviewBtn = newTaskForm?.querySelector('#new-task-preview');
   if (newTaskPreviewBtn) {
-    newTaskPreviewBtn.addEventListener('click', () => {
+    let previewPending = false;
+    newTaskPreviewBtn.addEventListener('click', async () => {
+      if (previewPending) return;
       const titleEl = newTaskForm.querySelector('#new-task-title');
       const descEl = newTaskForm.querySelector('#new-task-desc');
       const priorityEl = newTaskForm.querySelector('#new-task-priority');
@@ -2986,16 +2994,32 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       // (C1333) Sprints off -> task-board.js's renderNewTaskForm() omits the field
       // entirely, so priorityEl is null here by design, not a stuck-empty-combo bug.
       // Silently join the current active sprint instead of blocking the gate on it.
-      let priority;
-      if (!getSprintsEnabled()) {
-        priority = currentActiveSprintPriority();
-      } else {
-        const priorityVal = priorityEl ? priorityEl.closest('.sprint-combo').dataset.current : '';
-        if (!priorityVal) { if (priorityEl) priorityEl.focus(); return; }
-        // (C1245) includeBacklog:true on this combo can now yield the 'null' sentinel.
-        priority = priorityVal === '__new__'
-          ? Math.max(...tierKeys, 0, sprintRecordMax(state.sprints)) + 1
-          : priorityVal === 'null' ? 0 : Number(priorityVal);
+      // (TPT624) An explicit pick ('null' Backlog, '__new__', or a sprint number) is pinned so
+      // the save-time /api/resolve-sprints call keeps it instead of moving the task into the
+      // newest active sprint. Only a dependency floor may move it, and the Preview says why.
+      // rawSprint (not the resolved number) is what Back/draft restore re-show in the combo.
+      const rawSprint = priorityEl ? priorityEl.closest('.sprint-combo').dataset.current : '';
+      const selection = resolveManualSprintSelection(rawSprint, {
+        sprintsEnabled: getSprintsEnabled(),
+        tierKeys,
+        sprintMax: sprintRecordMax(state.sprints),
+        activePriority: getSprintsEnabled() ? null : currentActiveSprintPriority(),
+      });
+      if (!selection) { if (priorityEl) priorityEl.focus(); return; }
+      // (TPT642) The board's `tasks` is assignee-scoped and sprint-windowed, so a dependency
+      // on a teammate's task or one in an older sprint is absent and the floor below would
+      // skip it. Its live priority comes from the unfiltered project task list (one batched
+      // request, shared with the dependency typeahead, which has usually warmed it already).
+      // Await it only when a dependency is missing AND the cache is cold; a failed fetch
+      // caches [] and the floor falls back to the board rows — the server's 422 still guards.
+      const pendingDeps = Array.isArray(state.manualTaskState?.dependencies) ? state.manualTaskState.dependencies : [];
+      if (selection.pinned && missingDependencyIds(pendingDeps, tasks).length && !Array.isArray(getProjectTaskList())) {
+        previewPending = true;
+        try { await ensureProjectTaskList(); } catch {} finally { previewPending = false; }
+        if (state.manualTaskState?.phase === 'preview') return;
+        // A re-render replaced this form mid-fetch: replay the click on the fresh button,
+        // which now takes the synchronous path against the warm cache.
+        if (!newTaskForm.isConnected) { document.querySelector('#new-task-form #new-task-preview')?.click(); return; }
       }
 
       // (C1245) Every field the composer collects beyond title/desc/priority/type/
@@ -3014,14 +3038,16 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       const effort = s.effort || null;
       const claudeDesignMode = !!s.claudeDesignMode;
       const dependencies = Array.isArray(s.dependencies) ? s.dependencies : [];
+      const { priority, moved: sprintMove } = selection.pinned
+        ? applyManualDependencyFloor(selection.priority, manualDependencyFloor(dependencies, dependencyFloorRows(dependencies, tasks, getProjectTaskList())))
+        : { priority: selection.priority, moved: null };
 
-      // Compute next task ID — category-aware (C1245): CODING guesses C###, HUMAN
-      // guesses H###. `tasks` stays unfiltered (includes live reservations) so this
-      // never guesses a key someone else already has reserved.
-      const idPfx = category === 'HUMAN' ? 'H' : 'C';
-      const idRe = category === 'HUMAN' ? /^H\d+$/ : /^C\d+$/;
-      const usedIds = tasks.map(t => t.id).filter(id => idRe.test(id)).map(id => Number(id.slice(1)));
-      const nextId = `${idPfx}${usedIds.length ? Math.max(...usedIds) + 1 : 1}`;
+      // Next task ID for the Preview badge — category-aware (C1245): CODING guesses the
+      // project's own task_prefix (TPT632, e.g. MNY###), HUMAN guesses H###. `tasks` stays
+      // unfiltered (includes live reservations) so the guess lands past keys already
+      // booked. Display only — Confirm never sends it as the key (see below). The TPT642
+      // live dependency rows above feed only the sprint floor, never this guess.
+      const nextId = nextTaskKeyGuess(tasks, category);
 
       const currentTags = (state.manualTaskState && state.manualTaskState.tags) || [];
       const samePriority = tasks.filter(t => t.priority === priority);
@@ -3049,11 +3075,14 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
         effort,
         claudeDesignMode,
         ...(_parentTaskKey ? { parentId: _parentTaskKey } : {}),
+        // Consumed by saveTaskChange() (pinned resolve-sprints call) and the Preview card.
+        _stepPinned: selection.pinned,
+        ...(sprintMove ? { _sprintMove: sprintMove } : {}),
       };
       state.manualTaskState = {
         title,
         description: desc,
-        priority,
+        priority: getSprintsEnabled() ? rawSprint : priority,
         type: taskType,
         tags: currentTags,
         category,
@@ -3070,6 +3099,21 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
         previewTask,
       };
       loadAndRender();
+      // (TPT659) The guess above is immediate; the API's own answer (GET /tasks/next-key, the
+      // counter the save really draws from) replaces it when it arrives. Fire-and-forget:
+      // Preview never waits, and a failed/slow request simply leaves the guess. Ignored once
+      // this Preview is gone (Back, Confirm, or a re-Preview built a new previewTask). The id
+      // stays display-only either way — Confirm below drops it.
+      fetchNextTaskKey(category).then((key) => {
+        const ms = state.manualTaskState;
+        if (!key || !ms || ms.phase !== 'preview' || ms.previewTask !== previewTask) return;
+        previewTask.id = key;
+        const card = app.querySelector('.preview-card.new-task[data-task-id]');
+        if (!card) return;
+        card.dataset.taskId = key;
+        const badge = card.querySelector('.id-badge');
+        if (badge) badge.textContent = key;
+      });
     });
   }
 
@@ -3084,7 +3128,16 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
         if (titleEl) state.manualTaskState.previewTask.title = titleEl.innerText.trim();
         if (descEl) state.manualTaskState.previewTask.description = (descEl.dataset.raw || descEl.innerText).trim();
       }
-      const change = { type: 'new', task: state.manualTaskState.previewTask };
+      // (TPT624) Save a copy: saveTaskChange() strips _stepPinned from change.task, and a
+      // failed save retried from this same Preview must stay pinned to the chosen sprint.
+      // (TPT632) The copy drops the Preview's id: it is a guess from this board's partial
+      // task list, and a key inside the project's namespace would be saved as-is —
+      // overwriting a task or reservation this list can't see, or reusing a deleted key.
+      // saveTaskChange() gives the task a synthetic new-<ts>-<seq> id instead; the server
+      // drops every task_key on create anyway (api-backend.js _rawCreateTask(), TPT9004
+      // single-allocator rule), so the API allocates the real key atomically.
+      const { _sprintMove, id: _previewKeyGuess, ...previewTask } = state.manualTaskState.previewTask;
+      const change = { type: 'new', task: previewTask };
       // (C1245) Only default to the current user when the Member select was left
       // on "(none)" — an explicit pick from the New Task form's Member Assignee
       // select must survive, not get clobbered by the old unconditional self-assign.
@@ -3096,11 +3149,20 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       // global, not scoped to this tab (C1245/B2).
       change._statusEdited = true;
       change._manual = true;
+      // (TPT623) The save registers tags the project doesn't have yet (the server writes each
+      // a description with the default LLM) — say so while that runs, it takes seconds.
+      const newTagCount = (await unregisteredProjectTags(change.task.tags || [])).length;
+      const confirmLabel = newTaskConfirmBtn.textContent;
+      if (newTagCount > 0) {
+        newTaskConfirmBtn.disabled = true;
+        newTaskConfirmBtn.textContent = tc('common.registeringTags', newTagCount);
+      }
       try {
         await saveTaskChange(change);
+        if (newTagCount > 0) invalidateProjectTags();
         clearDraft(DRAFT_KEY_TASK);
         sessionStorage.removeItem(ACTIVE_NEW_TAB_KEY);
-        const priority = state.manualTaskState.previewTask.priority;
+        const priority = change.task.priority;
         state.collapsedTiers.delete(priority);
         state.expandedTiers.add(priority);
         state.manualTaskState = null;
@@ -3109,6 +3171,8 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
         await loadAndRender({ scrollToTop: true, forceFresh: true });
       } catch (err) {
         showToast(t('modal.errSave', { msg: err.message }), 'error');
+        newTaskConfirmBtn.disabled = false;
+        newTaskConfirmBtn.textContent = confirmLabel;
       }
     });
   }
@@ -3847,6 +3911,14 @@ function connectBoardWs() {
         if (card) card.classList.remove('needs-attention', 'has-active-session');
       }
       updateClaudeButtons();
+      // (TPT9014) A queued start the server refused on drain — same toast as attention-ws.js.
+      TipTask.attentionWs.reportStartFailure(msg);
+      return;
+    }
+    if (msg.type === 'task-left-uncommitted') {
+      // (TPT613) Exit backstop — shared with the Electron __attention__ channel's handler, which
+      // also de-duplicates a frame both sockets deliver (see src/client/attention-ws.js).
+      TipTask.attentionWs.handleAttentionMessage(msg);
       return;
     }
     if (msg.type === 'newly-assigned') {
@@ -3863,10 +3935,13 @@ function connectBoardWs() {
     }
 
     if (msg.type === 'api-status') {
-      _notifyApiStatus(msg.state, msg.message, msg.pendingCount || 0, msg.pendingTaskIds || []);
-      // Track pending task ids for card highlight
-      state.pendingTaskIds = new Set(msg.pendingTaskIds || []);
-      applyPendingSyncClass();
+      applyApiStatusFrame(msg);
+      return;
+    }
+    if (msg.type === 'mutations-dropped') {
+      // (TPT662) Browser-mode / forked-server transport; Electron's IPC twin is wired below
+      // next to connection.onChanged. Same handler either way.
+      onMutationsDropped(msg.entries);
       return;
     }
 
@@ -3972,16 +4047,7 @@ function connectBoardWs() {
     }
 
     if (msg.type === 'task:deleted') {
-      if (!msg.id) return;
-      // (C1259) removeCardFromDom() (task-card.js) — was a local copy of the same
-      // card+tier removal showDeleteConfirmModal() now also shares.
-      removeCardFromDom(msg.id);
-      // Clean stale selection
-      if (state.selectedCardIds.has(msg.id)) {
-        state.selectedCardIds.delete(msg.id);
-        updateBulkActionBar();
-      }
-      clearTimeout(boardRefreshTimer);
+      applyTaskDeletedEvent(msg.id);
       return;
     }
 
@@ -4017,6 +4083,53 @@ document.addEventListener('keydown', (e) => {
   void requestCloseTaskEditModal();
 });
 
+// (TPT662) An offline-queued write the reconnect replay had to give up on: notify (card +
+// toast via api-connection.js), drop its pending-sync mark, and re-read the board — the
+// optimistic row still shows the edit that never reached the API.
+function onMutationsDropped(entries) {
+  const list = Array.isArray(entries) ? entries.filter(Boolean) : [];
+  if (list.length === 0) return;
+  window.TipTask.apiConnection.handleMutationsDropped(list);
+  for (const entry of list) {
+    if (!entry.taskId) continue;
+    state.pendingTaskIds.delete(entry.taskId);
+    const card = app.querySelector(`.card[data-id="${entry.taskId}"]`);
+    if (card) card.classList.remove('pending-sync');
+  }
+  if (state.activeTab === 'board' || state.activeTab === 'list' || state.activeTab === 'todo' || state.activeTab === 'backlog') {
+    loadAndRender({ forceFresh: true });
+  }
+}
+
+// An `api-status` frame — the backend's connection state plus its offline write queue. The
+// forked server sends it over the board WS (browser mode); Electron's main-process backend,
+// which owns the queue for every IPC write, sends it as the `api-status` IPC push (TPT669).
+// `banner: false` updates only the pending-sync marks — Electron keeps `unauthorized` on its
+// reauth banner rather than the corner Offline banner.
+function applyApiStatusFrame(msg, { banner = true } = {}) {
+  if (!msg) return;
+  if (banner) _notifyApiStatus(msg.state, msg.message, msg.pendingCount || 0, msg.pendingTaskIds || []);
+  // Track pending task ids for card highlight
+  state.pendingTaskIds = new Set(msg.pendingTaskIds || []);
+  applyPendingSyncClass();
+}
+
+// A `task:deleted` event (board WS, or Electron's queue replay retiring a tmp id — TPT669).
+// Idempotent: a card already gone is a no-op.
+function applyTaskDeletedEvent(id) {
+  if (!id) return;
+  // (C1259) removeCardFromDom() (task-card.js) — was a local copy of the same
+  // card+tier removal showDeleteConfirmModal() now also shares.
+  removeCardFromDom(id);
+  state.pendingTaskIds.delete(id);
+  // Clean stale selection
+  if (state.selectedCardIds.has(id)) {
+    state.selectedCardIds.delete(id);
+    updateBulkActionBar();
+  }
+  clearTimeout(boardRefreshTimer);
+}
+
 // Lightweight DOM walk to apply/remove pending-sync class without full re-render
 function applyPendingSyncClass() {
   const cards = app.querySelectorAll('.card[data-id]');
@@ -4035,33 +4148,19 @@ onApiStatus((apiState, message, pendingCount) => {
   showApiStatusBanner(apiState, message, pendingCount);
 });
 
-// (C1389) Fetch one task through whichever transport this window uses — mirrors the
-// electronAPI-vs-fetch branch hydrateSprints() already uses above, not api-client.js
-// (that's task-board.js's own ES-module import, not reachable from this inline script).
-async function _fetchTaskForHandoff(taskKey) {
-  if (window.electronAPI?.api?.tasks?.get) {
-    return window.electronAPI.api.tasks.get(taskKey);
-  }
-  const r = await fetch(`/api/tasks/${encodeURIComponent(taskKey)}`, { headers: projectHeader() });
-  if (!r.ok) throw new Error(r.statusText || 'Failed to load task');
-  return r.json();
-}
-
 // Web, IPC, and board handoffs seed Objective chat here. Carry originTaskKey so
 // save can refine the source task. Return tabId only when a chat opened.
 async function seedObjectiveFromTask(taskKey, { warning, originTaskKey, title, description } = {}) {
   let task = title !== undefined ? { title, description } : null;
   if (!task) {
-    try {
-      task = await _fetchTaskForHandoff(taskKey);
-    } catch (err) {
-      showToast(err.message || t('handoff.loadFailed', { taskKey }), 'error');
+    // (TPT672) A task the account lost access to (403/404), a missing one, or a failed read
+    // toasts and opens no tab — labels in task-fetch.js loadTaskForAction().
+    const loaded = await TipTask.taskFetch.loadTaskForAction(taskKey, 'handoff.errLoad');
+    if (!loaded.task) {
+      showToast(loaded.message, 'error');
       return null;
     }
-    if (!task) {
-      showToast(t('handoff.taskNotFound', { taskKey }), 'error');
-      return null;
-    }
+    task = loaded.task;
   }
   const seed = buildObjectiveSeed(task, taskKey);
   const tabId = spawnObjectiveTab(seed, { title: task.title || taskKey, originTaskKey: originTaskKey || null });
@@ -4490,6 +4589,32 @@ if (window.electronAPI) {
     _maybeOpenReauth();
   }
 
+  if (window.electronAPI.api?.connection?.onMutationsDropped) {
+    // (TPT662) Main-process backend queue — see main/window-state.js.
+    window.electronAPI.api.connection.onMutationsDropped(({ entries } = {}) => onMutationsDropped(entries));
+  }
+  // (TPT669) The same main-process queue's in-flight and success signals (main/window-state.js):
+  // `api-status` drives the pending-sync pulse + corner banner, replayed writes patch the board
+  // at once instead of waiting for the next task-change poll. Electron never opens the board WS,
+  // so the forked server's own `api-status` never reaches this window; a `task:updated` it also
+  // relays over __attention__ for the same task just re-applies the same row (idempotent).
+  const _ipcOn = window.electronAPI.on;
+  if (_ipcOn?.apiStatus) {
+    _ipcOn.apiStatus((p) => {
+      const banner = p?.state === 'connected' || p?.state === 'disconnected' || p?.state === 'reconnecting';
+      applyApiStatusFrame(p, { banner });
+    });
+  }
+  if (_ipcOn?.taskUpdated) {
+    _ipcOn.taskUpdated((p) => { if (p?.task?.id) handleObjectiveTaskStateEvent({ type: 'task:updated', task: p.task }); });
+  }
+  if (_ipcOn?.taskDeleted) {
+    _ipcOn.taskDeleted((p) => applyTaskDeletedEvent(p?.id));
+  }
+  if (_ipcOn?.taskCreated) {
+    // A replayed offline create: a fresh render swaps the tmp-id card for the real one.
+    _ipcOn.taskCreated(() => handleObjectiveTaskStateEvent({ type: 'tasks-updated' }));
+  }
   if (window.electronAPI.api?.connection?.onChanged) {
     window.electronAPI.api.connection.onChanged(async ({ state }) => {
       if (state === 'unauthorized') {

@@ -10,6 +10,7 @@ const config = require('./config');
 const { fetchStatusContext } = require('./status-roles');
 const { maxNumbersByPrefix } = require('./task-key-format');
 const { codingPriorityBaseline } = require('./sprint-assign');
+const { isReservationPlaceholder } = require('./reservation-placeholder');
 
 // The forked todo-server serves multiple project windows, so GENERAL.md / CONVENTIONS.md /
 // the assembled static bundle are keyed by the resolved architecture directory rather than a
@@ -229,6 +230,7 @@ function getTaskStartupGrepBundle(tagNames, projectRoot) {
 // (buildObjectiveSystemPrompt()'s DESCRIPTION PRESERVATION rule) — list_task_id_meta's
 // active list carries no descriptions, and Pi has no MCP get_task to fetch one. Never
 // truncated: a cut description would be exactly the detail loss this exists to prevent.
+// Unfinalized reserve_task_keys placeholders are never picked — they have no real content.
 // Returns '' when the text names no active task.
 const REFERENCED_TASK_KEY_RE = /\b(?:H|[A-Z]{1,6})[0-9]+\b/g;
 const REFERENCED_TASKS_MAX = 5;
@@ -242,7 +244,7 @@ function buildReferencedTasksSection(tasks, text, activeStatuses, max = REFERENC
     if (seen.has(key)) continue;
     seen.add(key);
     const t = byId.get(key);
-    if (!t || !activeStatuses.has(t.status)) continue;
+    if (!t || isReservationPlaceholder(t) || !activeStatuses.has(t.status)) continue;
     picked.push({ id: t.id, title: t.title, status: t.status, description: t.description || '' });
     if (picked.length >= max) break;
   }
@@ -280,8 +282,16 @@ async function prefetchObjectiveWorkflow(backend, taskId, projectRoot, objective
     const maxCId = byPrefix.get('C') ?? 0;
     const maxHId = byPrefix.get('H') ?? 0;
     const maxByPrefix = Object.fromEntries(byPrefix);
+    // Unfinalized reserve_task_keys placeholders ("New task", no tags) are left out of
+    // `active` — they bloat the prompt and are not modifiable work — but stay counted in
+    // maxByPrefix above, since their keys are taken.
     const active = [];
+    let reservationsSkipped = 0;
     for (const t of tasks) {
+      if (isReservationPlaceholder(t)) {
+        reservationsSkipped++;
+        continue;
+      }
       if (statusCtx.active.has(t.status)) {
         active.push({ id: t.id, title: t.title, category: t.category, status: t.status, priority: t.priority, tags: t.tags });
       }
@@ -336,7 +346,7 @@ async function prefetchObjectiveWorkflow(backend, taskId, projectRoot, objective
     const elapsedMs = Date.now() - t0;
     const taxonomyCount = archCache.listSystemTags(projectRoot).length;
     const skippedNonTask = taxonomyCount - ttTags.length;
-    console.log(`[objective:prefetch] task=${taskId} ms=${elapsedMs} active=${active.length} taskTags=${(currentTask?.tags || []).length} ttTags=[${ttTags.join(',')}] archDocs=${archParts.length} archChars=${archCharsTotal} deferred=[${deferredTags.join(',')}] skippedNonTask=${skippedNonTask}/${taxonomyCount} projectTags=${tagsResult.ok ? tagsResult.rows.length : 'unavailable'}`);
+    console.log(`[objective:prefetch] task=${taskId} ms=${elapsedMs} active=${active.length} reservationsSkipped=${reservationsSkipped} taskTags=${(currentTask?.tags || []).length} ttTags=[${ttTags.join(',')}] archDocs=${archParts.length} archChars=${archCharsTotal} deferred=[${deferredTags.join(',')}] skippedNonTask=${skippedNonTask}/${taxonomyCount} projectTags=${tagsResult.ok ? tagsResult.rows.length : 'unavailable'}`);
     return { bundle, elapsedMs };
   } catch (err) {
     process.stderr.write(`[static-context] prefetchObjectiveWorkflow failed: ${err.message}\n`);

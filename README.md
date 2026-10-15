@@ -154,9 +154,9 @@ Short version: build each OS on that OS, and use GitHub Actions to do all three.
   ("Build installers") builds all three on native runners (`macos-latest`, `windows-latest`,
   `ubuntu-22.04`). It runs on a pushed `v*` tag, or manually from the Actions tab with
   **Run workflow**, where you can tick which of macOS, Windows and Linux to build. Each leg
-  uploads its installers as a build artifact; a tag push also attaches them to a **draft**
-  GitHub Release. The tag must match the `version` in `package.json`. See
-  [`RELEASING.md`](RELEASING.md).
+  uploads its installers as a build artifact; a tag push also attaches them, with a
+  `SHA256SUMS` file, to a **draft** GitHub Release whose body is `docs/releases/<tag>.md`.
+  The tag must match the `version` in `package.json`. See [`RELEASING.md`](RELEASING.md).
 
 More: [`ELECTRON_BUILD.md`](ELECTRON_BUILD.md) for signing and distribution,
 [`RELEASING.md`](RELEASING.md) for releases, [`CONTRIBUTING.md`](CONTRIBUTING.md) for
@@ -180,7 +180,7 @@ src/
   cli/                Setup, sign-in and task import/export command-line tools
   mcp/                Local MCP server that gives agents task and knowledge-base tools
 bin/                  mcp-node (Node version resolver) and the bundled pi launcher
-scripts/              Postinstall, bundle staging, version bump, license notices, probes
+scripts/              Postinstall, bundle staging, version bump, license notices, release notes, probes
 vendor/
   pi/                 Staged Pi Coding Agent bundle (shipped outside the asar)
   voice-models/       Local speech models, downloaded on first use (not committed)
@@ -188,7 +188,7 @@ fixtures/             Recorded terminal output used by the attention-detection p
 templates/            Files written into a project when it is opened
 assets/               App icons, splash and about pages
 build/                macOS entitlements for packaging
-docs/                 README images
+docs/                 README images; docs/releases/<tag>.md holds each release's notes
 dist/                 Client bundle (generated)
 dist-electron/        Installers from the packaging scripts (generated)
 ```

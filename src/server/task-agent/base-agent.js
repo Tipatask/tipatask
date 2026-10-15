@@ -231,9 +231,9 @@ class BaseTaskAgent {
     if (opts.compact) {
       return [
         'KB hygiene:',
-        '- ai/architecture/*.md holds standing system concepts only — what a module is for and how it works today, written for a reader who never saw this task.',
-        '- Task-specific material never goes there: investigation notes, evidence tables, dated findings, corrections of your own earlier analysis. Put those in the resolution comment instead.',
-        '- Keep a KB line only if it stays true and useful once this task is forgotten. Anything else belongs in the resolution comment.',
+        '- ai/architecture/*.md holds standing system concepts only, written for a reader who never saw this task.',
+        '- Task-specific material never goes there (investigation notes, evidence tables, dated findings, corrections of your own earlier analysis): put it in the resolution comment.',
+        '- Keep a KB line only if it stays true and useful once this task is forgotten.',
       ].join('\n');
     }
     const narrativeTarget = opts.guardedCompletion
@@ -312,6 +312,44 @@ class BaseTaskAgent {
     ].join('\n');
   }
 
+  // Follow-ups are an exception for evidenced shipped defects/risks or required manual steps.
+  // Prefer outstanding-task comments; cap new tasks at two per run. Workflow concepts, not status names,
+  // as above. opts.guardedCompletion names complete_task as the deadline (see buildKbHygieneDirective).
+  // Compact wording is echoed by Pi and serves its REST and bridge modes alike: no MCP names or questions.
+  buildFollowUpDirective(opts = {}) {
+    if (opts.compact) {
+      return [
+        'Follow-up capture:',
+        '- After implementing, before completion: Zero follow-ups is the normal result. Only capture a defect, data risk or security issue in shipped behavior, or a manual step the user must take. Never file improvements, refactors, extra tests, doc ideas, nice-to-haves or own-scope work; finish own scope. Skip trivia.',
+        '- If eligible, search not-started/urgent tasks; never duplicate. Prefer a comment (type comment: source key, finding, impact); edit steps only if wrong. Never touch in-progress/done/canceled tasks.',
+        '- At most 2 new tasks per run, each with one sentence of evidence. One concern per self-contained task: problem, files, steps, verification, registered tags, this task\'s priority unless deps push later, tildes as \\~, HUMAN only for user-only steps. List keys filed/updated in resolution and reply; otherwise report none.',
+      ].join('\n');
+    }
+    const deadline = opts.guardedCompletion ? 'before `complete_task`' : 'before the final status update';
+    return [
+      'Follow-up capture:',
+      `- After implementation and ${deadline} — never while planning, which forbids task writes — apply follow-up capture only as an exception. Zero follow-ups is the normal result.`,
+      '- Only capture a defect, data risk or security issue in shipped behavior, or a manual step the user must take. Never file improvements, refactors, extra tests, doc ideas, nice-to-haves or things already covered by this task.',
+      '- For an eligible finding, search outstanding tasks first — only tasks in the project\'s not-started and urgent statuses count: `list_tasks` filtered by each of those statuses, then `get_task` on likely matches. Never file a duplicate of an existing task.',
+      '- Prefer a comment on an existing outstanding task: `create_task_comment(task_key, content, type: "comment")` naming this task\'s key, the finding and its consequence for that task. Edit its description with `update_task` only when one of its steps is now wrong. Never touch a task that is in progress, done or canceled.',
+      '- At most 2 new tasks per run, each with one sentence of evidence. Only when no outstanding task covers an eligible finding, file one concern per task: reserve keys with `reserve_task_keys` (category HUMAN only for steps only the user can do), then fill each key with `update_task`. The description must be self-contained: problem, evidence, files, numbered steps, verification. Use registered tags (tt-* module + action + detail), registering a new tag with a real description first. Set its priority to this task\'s priority (same sprint) unless its dependencies push it later. Escape every `~` as `\\~`.',
+      '- Skip trivia nobody would act on. Never file work this task\'s own scope requires: finish it, because deferring it does not complete this task.',
+      '- List every task you filed or updated, by key, in the resolution\'s follow-ups section and in your final reply; otherwise report none.',
+    ].join('\n');
+  }
+
+  // TPT611 — closing sentence for the Claude/Codex guarded-completion mandate: the last message
+  // must carry the evidence the definition-of-done line (vcs-settings.js) gates on, beside the
+  // follow-up keys, and only after follow-up capture and complete_task. The sha clause follows
+  // the live commit flag. `completeTool` is the agent's own name for the tool.
+  static buildFinishChecklist(opts = {}, { completeTool = 'complete_task' } = {}) {
+    const vcs = (opts.vcsContext && opts.vcsContext.vcs) || opts.vcsSettings || {};
+    const sha = vcs.type === 'git' && vcs.commit === true
+      ? 'the `<TASK_KEY>:` commit sha for each repository you changed, '
+      : '';
+    return `Final-message checklist: after Follow-up capture and ${completeTool}, your last message must state ${sha}the ${completeTool} result (completed, or the blockers it listed and the on_fire fallback you applied), next to the follow-up task keys; a last message without these means the task is not finished.`;
+  }
+
   // ── Shared directive assembly ──
   // The single place every adapter's buildPrompt() gets its common directives from, so a new
   // or reordered directive is one edit here instead of three hand-synced call sites.
@@ -331,8 +369,8 @@ class BaseTaskAgent {
   // (Claude joins with blank lines inside one template, Codex/Pi splice array lines, and Pi
   // places the directives after its grep note where Codex places them before), so each
   // buildPrompt() keeps ownership of where the slots land.
-  //   directives — [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus] in that
-  //                fixed order, empties dropped, so absent optional data (no opts.vcsSettings,
+  //   directives — [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus, followUps]
+  //                in that fixed order, empties dropped, so absent optional data (no opts.vcsSettings,
   //                nothing blank in opts.tagDescriptions) emits no directive and no stray
   //                separator. resourceLimits reads opts.agentLimits and is never empty.
   //   clarify    — deliberately NOT part of `directives`: it must sit directly beside the
@@ -343,17 +381,19 @@ class BaseTaskAgent {
   // subclass override (pi-agent.js's compact/REST wording) still applies.
   // SIMPLE_MODE and Claude's Design Mode are NOT handled here — adapters return early, before
   // calling this, exactly where they always skipped the directives.
-  // kbHygiene gets guardedCompletion only when opts.vcsContext is present (the Claude/Codex
-  // resolution mandate then finishes through complete_task); without it, args stay `variant`.
+  // kbHygiene and followUps get guardedCompletion only when opts.vcsContext is present (the
+  // Claude/Codex resolution mandate then finishes through complete_task); without it, args stay `variant`.
   buildSharedPreamble(opts = {}) {
     const policy = this.getPreamblePolicy();
     const variant = policy.compact ? { compact: true } : {};
+    const completion = opts.vcsContext ? { ...variant, guardedCompletion: true } : variant;
     const vcs = this.resolveVcsDirective(opts);
     const tagDesc = this.buildTagDescriptionDirective(opts);
     const processSafety = this.buildProcessSafetyDirective(variant);
     const resourceLimits = this.buildResourceLimitsDirective(opts.agentLimits, variant);
-    const kbHygiene = this.buildKbHygieneDirective(opts.vcsContext ? { ...variant, guardedCompletion: true } : variant);
+    const kbHygiene = this.buildKbHygieneDirective(completion);
     const taskStatus = this.buildTaskStatusDirective(variant);
+    const followUps = this.buildFollowUpDirective(completion);
     const clarify = policy.clarify ? this.buildClarifyDirective(variant) : '';
     return {
       vcs,
@@ -362,7 +402,8 @@ class BaseTaskAgent {
       resourceLimits,
       kbHygiene,
       taskStatus,
-      directives: [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus].filter(Boolean),
+      followUps,
+      directives: [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus, followUps].filter(Boolean),
       clarify,
     };
   }
@@ -527,7 +568,7 @@ class BaseTaskAgent {
       return this._storeDetect(result, Date.now(), config);
     }).catch((err) => this._storeDetect({
         id: this.id, label: this.label, available: false,
-        reason: `${this.label} detection failed`,
+        reason: `${this.label} detection failed`, reasonCode: 'detection_failed',
         detail: BaseTaskAgent.buildDetectDetail(null, { error: err }),
       }, Date.now(), config)).finally(() => {
       if (this._detectInflight === probe) {
@@ -561,7 +602,7 @@ class BaseTaskAgent {
   peekDetect(config) {
     if (this._detectResult === null) {
       void this._refreshDetect(config);
-      return { id: this.id, label: this.label, available: false, reason: `${this.label} detection pending` };
+      return { id: this.id, label: this.label, available: false, reason: `${this.label} detection pending`, reasonCode: 'detection_pending' };
     }
     if (!this._detectResult.available && Date.now() - this._detectTs >= NEGATIVE_DETECT_TTL_MS) {
       void this._refreshDetect(config, { clearBin: true });
@@ -599,6 +640,24 @@ class BaseTaskAgent {
   _reprobeModelsAfterInstall(config) {
     if (!config || !config.USER_DATA_ROOT) return;
     this.getAvailableModels(config, { force: true }).catch(() => { /* keep the fallback list */ });
+  }
+
+  // (TPT9008) An `available: false` detect() result keyed by a stable `reasonCode` — a key of the
+  // agent's own DETECT_REASONS table, whose English sentence (every `{name}` filled from `params`)
+  // stays the `reason` that logs, agent-select.js and older clients show. The terminal renders the
+  // code instead (terminal.error.ESTART.<code>.<agent> in i18n.js, via the spawn gate's error and
+  // ws-handlers.js startFailureFrame()); `params` travel with it as `reasonParams`.
+  unavailableResult(reasonCode, { params, detail } = {}) {
+    const table = this.constructor.DETECT_REASONS || {};
+    const template = Object.hasOwn(table, reasonCode) ? table[reasonCode] : `${this.label} is unavailable`;
+    // split/join, not String#replace: probe output may contain `$&`-style replacement patterns.
+    const reason = Object.entries(params || {})
+      .reduce((text, [name, value]) => text.split(`{${name}}`).join(String(value)), template);
+    return {
+      id: this.id, label: this.label, available: false, reason, reasonCode,
+      ...(params ? { reasonParams: params } : {}),
+      ...(detail ? { detail } : {}),
+    };
   }
 
   // opts.spawnImpl (default child_process.spawn) and opts.isWin (default: the real platform)

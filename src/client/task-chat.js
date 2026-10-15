@@ -1659,7 +1659,9 @@ function handleFrame(msg) {
       let text;
       if (reason === 'session-gone') text = t('taskChat.error.sessionGone');
       else if (reason === 'provider-unavailable' || reason === 'turn-in-progress') text = msg.detail || t('taskChat.error.selection');
-      else text = t('taskChat.error.turn', { reason }) + (msg.detail ? ` ${msg.detail}` : '');
+      // The model takes no tool definitions (pi-session.js toolCompatMessage): the server's own sentence, alone.
+      else if (reason === 'model-no-tools') text = msg.detail || msg.message || t('taskChat.error.turn', { reason });
+      else text = t('taskChat.error.turn', { reason }) + ((msg.detail || msg.message) ? ` ${msg.detail || msg.message}` : '');
       if (reason === 'session-gone') {
         pendingAnswer = null;
         finishStreaming();

@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/tool-result-cache.js\"",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; if [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ]; then \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/tool-result-cache.js\"; elif [ -x \"$TIPATASK_TOOL_EXEC\" ] && [ -n \"$TIPATASK_TOOL_SCRIPT\" ]; then ELECTRON_RUN_AS_NODE=1 \"$TIPATASK_TOOL_EXEC\" -e 'const f=process.argv[1];try{require.resolve(f)}catch{console.error(`[hook] skipped: Task App build has no ${f}`);process.exit(0)}require(f)' \"${TIPATASK_TOOL_SCRIPT%?src?cli?task-tools.js}/scripts/tool-result-cache.js\"; else echo '[hook] skipped: no Task App runtime' >&2; fi",
             "timeout": 5
           }
         ]
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/track-file-access.js\"",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; if [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ]; then \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/track-file-access.js\"; elif [ -x \"$TIPATASK_TOOL_EXEC\" ] && [ -n \"$TIPATASK_TOOL_SCRIPT\" ]; then ELECTRON_RUN_AS_NODE=1 \"$TIPATASK_TOOL_EXEC\" -e 'const f=process.argv[1];try{require.resolve(f)}catch{console.error(`[hook] skipped: Task App build has no ${f}`);process.exit(0)}require(f)' \"${TIPATASK_TOOL_SCRIPT%?src?cli?task-tools.js}/scripts/track-file-access.js\"; else echo '[hook] skipped: no Task App runtime' >&2; fi",
             "timeout": 5
           }
         ]
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/tool-result-cache.js\"",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; if [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ]; then \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/tool-result-cache.js\"; elif [ -x \"$TIPATASK_TOOL_EXEC\" ] && [ -n \"$TIPATASK_TOOL_SCRIPT\" ]; then ELECTRON_RUN_AS_NODE=1 \"$TIPATASK_TOOL_EXEC\" -e 'const f=process.argv[1];try{require.resolve(f)}catch{console.error(`[hook] skipped: Task App build has no ${f}`);process.exit(0)}require(f)' \"${TIPATASK_TOOL_SCRIPT%?src?cli?task-tools.js}/scripts/tool-result-cache.js\"; else echo '[hook] skipped: no Task App runtime' >&2; fi",
             "timeout": 5
           }
         ]
@@ -52,7 +52,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/tool-result-cache.js\"",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; if [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ]; then \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/tool-result-cache.js\"; elif [ -x \"$TIPATASK_TOOL_EXEC\" ] && [ -n \"$TIPATASK_TOOL_SCRIPT\" ]; then ELECTRON_RUN_AS_NODE=1 \"$TIPATASK_TOOL_EXEC\" -e 'const f=process.argv[1];try{require.resolve(f)}catch{console.error(`[hook] skipped: Task App build has no ${f}`);process.exit(0)}require(f)' \"${TIPATASK_TOOL_SCRIPT%?src?cli?task-tools.js}/scripts/tool-result-cache.js\"; else echo '[hook] skipped: no Task App runtime' >&2; fi",
             "timeout": 5
           }
         ]
@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || exit 0; \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/push-kb-on-write.js\"",
+            "command": "R=\"${TIPATASK_SERVER_ROOT:-{{SERVER_ROOT}}}\"; [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ] || R=\"{{SERVER_ROOT}}\"; if [ -x \"$R/bin/{{SERVER_NODE_WRAPPER}}\" ]; then \"$R/bin/{{SERVER_NODE_WRAPPER}}\" \"$R/scripts/push-kb-on-write.js\"; elif [ -x \"$TIPATASK_TOOL_EXEC\" ] && [ -n \"$TIPATASK_TOOL_SCRIPT\" ]; then ELECTRON_RUN_AS_NODE=1 \"$TIPATASK_TOOL_EXEC\" -e 'const f=process.argv[1];try{require.resolve(f)}catch{console.error(`[hook] skipped: Task App build has no ${f}`);process.exit(0)}require(f)' \"${TIPATASK_TOOL_SCRIPT%?src?cli?task-tools.js}/scripts/push-kb-on-write.js\"; else echo '[hook] skipped: no Task App runtime' >&2; fi",
             "timeout": 60
           }
         ]

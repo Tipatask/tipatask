@@ -106,7 +106,7 @@ test('renderTaskLabel(agentId, caption) emits key / title / caption chip with an
   // Dot takes the colour modifier only — never the absolutely-positioned .agent-badge base.
   assert.match(fn[0], /terminal-agent-dot agent-badge--\$\{/);
   assert.doesNotMatch(fn[0], /class="agent-badge /);
-  assert.equal(fn[0].includes("return 'New Objective'"), true);
+  assert.equal(fn[0].includes("return escapeAttr(t('nav.newObjective'))"), true);
 });
 
 test('every renderTaskLabel call site passes the agent id', () => {

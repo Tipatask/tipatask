@@ -60,6 +60,9 @@ if (process.platform === 'win32') {
       const res = await new ClaudeAgent().detect({});
       assert.equal(res.available, false);
       assert.match(res.reason, /not logged in/i);
+      // (TPT9008) The stable code the terminal translates; the English reason is that code's sentence.
+      assert.equal(res.reasonCode, 'not_logged_in');
+      assert.equal(res.reason, ClaudeAgent.DETECT_REASONS.not_logged_in);
       assert.equal(res.detail.bin, bin);
       assert.equal(res.detail.exit, 1);
       assert.match(res.detail.output, /"loggedIn":false/);
@@ -80,6 +83,8 @@ if (process.platform === 'win32') {
       const res = await new CodexAgent().detect({});
       assert.equal(res.available, false);
       assert.match(res.reason, /not logged in/i);
+      assert.equal(res.reasonCode, 'not_logged_in');
+      assert.equal(res.reason, CodexAgent.DETECT_REASONS.not_logged_in);
       // (TPT572) Codex also names its CLI build; this stub answers `--version` with the same
       // "Not logged in" line, so no version parses.
       assert.deepEqual(res.detail, { bin, exit: 1, output: 'Not logged in', version: null });
@@ -88,6 +93,30 @@ if (process.platform === 'win32') {
       clearBinCache('codex');
     }
   });
+
+  // (TPT9008) A launcher that resolves but cannot run — here its interpreter is missing, so the
+  // login probe's spawn fails with ENOENT — is `cli_missing`, not `cli_not_found` (nothing resolved).
+  for (const [name, load] of [['claude', () => require('./claude-agent')], ['codex', () => require('./codex-agent')]]) {
+    test(`${name} detect(): a launcher whose interpreter is missing -> cli_missing with its detail`, async () => {
+      const Agent = load();
+      const bin = path.join(dir, `${name}-noexec`);
+      fs.writeFileSync(bin, '#!/nonexistent/tipatask-interpreter\necho unreachable\n', { mode: 0o755 });
+      const envKey = `${name.toUpperCase()}_BIN`;
+      process.env[envKey] = bin;
+      clearBinCache(name);
+      try {
+        const res = await new Agent().detect({});
+        assert.equal(res.available, false);
+        assert.equal(res.reasonCode, 'cli_missing');
+        assert.equal(res.reason, Agent.DETECT_REASONS.cli_missing);
+        assert.equal(res.detail.bin, bin);
+        assert.equal(res.detail.output, 'ENOENT');
+      } finally {
+        delete process.env[envKey];
+        clearBinCache(name);
+      }
+    });
+  }
 
   test('a logged-in Codex stub yields a positive whose detail is only { bin, version } — no probe output', async () => {
     const CodexAgent = require('./codex-agent');

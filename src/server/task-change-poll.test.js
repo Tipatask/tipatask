@@ -9,7 +9,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { createTaskChangePoll } = require('./task-change-poll');
+const { createTaskChangePoll, NOTIFICATIONS_EVERY_N_TICKS, FULL_RECONCILE_EVERY_N_TICKS } = require('./task-change-poll');
 
 function fakeClient({ readyState = 1, boardWatcher = false, attentionSubscriber = false, projectPath } = {}) {
   return { readyState, _boardWatcher: boardWatcher, _attentionSubscriber: attentionSubscriber, _projectPath: projectPath };
@@ -202,21 +202,20 @@ test('task-activity: runs only every Nth tick (default cadence), tasks-updated s
   let tasks = [{ id: 'C1', status: 'pending' }];
   let notifCallCount = 0;
   const poll = createTaskChangePoll({
-    wss, websocket, isSingletonUnbound: () => false, // default N=3
+    wss, websocket, isSingletonUnbound: () => false, // default N=2
     getBackendForPath: () => ({
       getTasksUnfiltered: async () => tasks,
       getNotifications: async () => { notifCallCount++; return { notifications: [], unread_count: 0, total: 0 }; },
     }),
   });
   await poll.tick(); // tick 1 — no notifications fetch yet
-  await poll.tick(); // tick 2 — still not yet
   assert.equal(notifCallCount, 0);
-  await poll.tick(); // tick 3 — fetch + first-computation broadcast (empty activity)
+  await poll.tick(); // tick 2 — fetch + first-computation broadcast (empty activity)
   assert.equal(notifCallCount, 1);
   assert.equal(websocket.calls.filter((c) => c.type === 'task-activity').length, 1);
 
   tasks = [{ id: 'C1', status: 'completed' }];
-  await poll.tick(); // tick 4 — tasks-updated fires, notifications not due again
+  await poll.tick(); // tick 3 — tasks-updated fires, notifications not due again
   assert.equal(notifCallCount, 1);
   assert.equal(websocket.calls.filter((c) => c.type === 'tasks-updated').length, 1);
 });
@@ -292,4 +291,122 @@ test('task-activity: warns (does not throw) when unread_count exceeds the return
   });
   await poll.tick();
   assert.ok(warnings.some((w) => w.includes('truncated')));
+});
+
+// ── TPT610 — change-stamp path ──
+
+function stampBackend(state) {
+  return {
+    getTaskChangeStamp: async () => {
+      state.stampCalls += 1;
+      if (state.stampError) throw state.stampError;
+      return state.stamp;
+    },
+    getTasksUnfiltered: async () => { state.listCalls += 1; return state.tasks; },
+  };
+}
+
+function stampState(extra = {}) {
+  return {
+    stamp: { count: 1, max_id: 1, max_updated_at: '2026-10-12T10:00:00.000Z' },
+    tasks: [{ id: 'C1', status: 'pending', tags: [] }],
+    stampCalls: 0, listCalls: 0, stampError: null, ...extra,
+  };
+}
+
+function stampPoll(state, websocket, opts = {}) {
+  const wss = { clients: new Set([fakeClient({ boardWatcher: true, projectPath: '/proj/a' })]) };
+  return createTaskChangePoll({
+    wss, websocket, isSingletonUnbound: () => false, warn: () => {}, log: () => {},
+    getBackendForPath: () => stampBackend(state), ...opts,
+  });
+}
+
+const updates = (websocket) => websocket.calls.filter((c) => c.type === 'tasks-updated').length;
+
+test('task-change-poll: defaults — notifications every 2nd tick, full reconcile every 10th', () => {
+  assert.equal(NOTIFICATIONS_EVERY_N_TICKS, 2);
+  assert.equal(FULL_RECONCILE_EVERY_N_TICKS, 10);
+});
+
+test('task-change-poll: a stamp change broadcasts tasks-updated once, without fetching the full list', async () => {
+  const state = stampState();
+  const websocket = fakeWebsocket();
+  const poll = stampPoll(state, websocket);
+  await poll.tick(); // baseline: stamp + list
+  assert.equal(state.listCalls, 1, 'the first tick takes a list baseline');
+  await poll.tick();
+  assert.equal(updates(websocket), 0, 'unchanged stamp — no broadcast');
+
+  state.stamp = { count: 1, max_id: 1, max_updated_at: '2026-10-12T10:00:05.000Z' };
+  await poll.tick();
+  assert.equal(updates(websocket), 1);
+  await poll.tick();
+  assert.equal(updates(websocket), 1, 'the same stamp never re-broadcasts');
+  assert.equal(state.listCalls, 1, 'non-reconcile ticks never fetch the full list');
+  assert.equal(state.stampCalls, 4);
+});
+
+test('task-change-poll: a null stamp (route missing) falls back to hashing the full list every tick', async () => {
+  const state = stampState({ stamp: null });
+  const websocket = fakeWebsocket();
+  const poll = stampPoll(state, websocket);
+  await poll.tick();
+  await poll.tick();
+  assert.equal(state.listCalls, 2);
+  assert.equal(updates(websocket), 0);
+  state.tasks = [{ id: 'C1', status: 'completed', tags: [] }];
+  await poll.tick();
+  assert.equal(updates(websocket), 1);
+});
+
+test('task-change-poll: a throwing stamp rejects the tick without falling back, and the next tick uses the stamp again', async () => {
+  const state = stampState();
+  const websocket = fakeWebsocket();
+  const warnings = [];
+  const poll = stampPoll(state, websocket, { warn: (m) => warnings.push(m) });
+  await poll.tick(); // baseline
+  const err = new Error('API unreachable: incorrect header check');
+  err.code = 'Z_DATA_ERROR';
+  err.networkError = true;
+  state.stampError = err;
+  state.tasks = [{ id: 'C1', status: 'completed', tags: [] }];
+  await poll.tick();
+  assert.equal(updates(websocket), 0);
+  assert.equal(state.listCalls, 1, 'a transport failure must not trigger the full-list fallback');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /Failed to poll tasks for project=\/proj\/a/);
+
+  state.stampError = null;
+  state.stamp = { count: 2, max_id: 2, max_updated_at: '2026-10-12T10:01:00.000Z' };
+  await poll.tick();
+  assert.equal(updates(websocket), 1);
+  assert.equal(state.listCalls, 1);
+});
+
+test('task-change-poll: the periodic full reconcile catches a change the stamp misses (tag-only edit)', async () => {
+  const state = stampState();
+  const websocket = fakeWebsocket();
+  const poll = stampPoll(state, websocket, { fullReconcileEveryNTicks: 3 });
+  await poll.tick(); // tick 1 — baseline
+  state.tasks = [{ id: 'C1', status: 'pending', tags: ['bugfix'] }]; // stamp unchanged
+  await poll.tick(); // tick 2 — stamp only, change unseen
+  assert.equal(updates(websocket), 0);
+  await poll.tick(); // tick 3 — reconcile
+  assert.equal(state.listCalls, 2);
+  assert.equal(updates(websocket), 1);
+});
+
+test('task-change-poll: stamp and list both changed on a reconcile tick broadcast only once', async () => {
+  const state = stampState();
+  const websocket = fakeWebsocket();
+  const poll = stampPoll(state, websocket, { fullReconcileEveryNTicks: 2 });
+  await poll.tick(); // tick 1 — baseline
+  state.stamp = { count: 2, max_id: 2, max_updated_at: '2026-10-12T10:02:00.000Z' };
+  state.tasks = [...state.tasks, { id: 'C2', status: 'pending', tags: [] }];
+  await poll.tick(); // tick 2 — both differ
+  assert.equal(updates(websocket), 1);
+  await poll.tick(); // tick 3 — stamp only, nothing new
+  await poll.tick(); // tick 4 — reconcile against the tick-2 list baseline, nothing new
+  assert.equal(updates(websocket), 1);
 });

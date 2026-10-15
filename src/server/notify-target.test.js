@@ -72,26 +72,62 @@ test('Show More: own window, then any open project window, then the project reop
     deps({ originWindow: () => null, projectWindows: () => [], reopen: async () => null })), null);
 });
 
-test('card click: the window owning the project now, else the project reopened', async () => {
+test('card click: the window owning the project now, else the project reopened — raised once', async () => {
   const origin = { projectPath: '/a', windowId: 1 };
   const own = fakeWindow({ project: '/a' });
   const reopened = [];
+  let raised = [];
   const deps = (over = {}) => ({ originWindow: () => own, projectOf: (w) => w.project,
-    reopen: async (dir) => { reopened.push(dir); return fakeWindow({ project: dir }); }, ...over });
+    reopen: async (dir) => { reopened.push(dir); return fakeWindow({ project: dir }); },
+    raise: async (w) => { raised.push(w); return raise(w); }, ...over });
 
   assert.equal(await resolveClickTarget(origin, deps()), own);
   assert.deepEqual(reopened, []);
+  assert.deepEqual(raised, [own], 'the verified raise Show More uses, once');
+  assert.equal(own.focusCalls, 1);
 
   // The sending window was rebound to another project: never act there, reopen the project.
+  raised = [];
   const rebound = fakeWindow({ project: '/other' });
-  assert.equal((await resolveClickTarget(origin, deps({ originWindow: () => rebound }))).project, '/a');
+  const fresh = await resolveClickTarget(origin, deps({ originWindow: () => rebound }));
+  assert.equal(fresh.project, '/a');
+  assert.deepEqual(raised, [fresh], 'the reopened window is raised, never the rebound one');
+  assert.equal(rebound.focusCalls, 0);
   // The window is gone.
-  assert.equal((await resolveClickTarget(origin, deps({ originWindow: () => null }))).project, '/a');
+  raised = [];
+  const reopenedWindow = await resolveClickTarget(origin, deps({ originWindow: () => null }));
+  assert.equal(reopenedWindow.project, '/a');
+  assert.deepEqual(raised, [reopenedWindow]);
   assert.deepEqual(reopened, ['/a', '/a']);
 
   // An alert from a window with no project keeps routing to that window while it lives.
+  raised = [];
   const unbound = fakeWindow();
   assert.equal(await resolveClickTarget({ windowId: 2 }, deps({ originWindow: () => unbound })), unbound);
+  assert.deepEqual(raised, [unbound]);
+  raised = [];
   assert.equal(await resolveClickTarget({ windowId: 2 }, deps({ originWindow: () => null })), null);
   assert.equal(await resolveClickTarget(origin, deps({ originWindow: () => null, reopen: async () => null })), null);
+  assert.deepEqual(raised, [], 'nothing to raise without a window');
+});
+
+test('card click: resolves only after the raise settled, keeps a window that would not focus', async () => {
+  const origin = { projectPath: '/a', windowId: 1 };
+  const own = fakeWindow({ project: '/a' });
+  let finish;
+  const deps = (over = {}) => ({ originWindow: () => own, projectOf: (w) => w.project, reopen: async () => null,
+    raise: () => new Promise((resolve) => { finish = resolve; }), ...over });
+
+  let resolved = null;
+  const pending = resolveClickTarget(origin, deps()).then((w) => { resolved = w; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(resolved, null, 'the click is not delivered while the window is still being raised');
+  finish(false);
+  await pending;
+  assert.equal(resolved, own, 'a window that would not take focus still receives the click');
+
+  // The window closed during the raise: nothing to deliver to.
+  const closing = fakeWindow({ project: '/a' });
+  assert.equal(await resolveClickTarget(origin, deps({ originWindow: () => closing,
+    raise: async () => { closing.destroyed = true; return false; } })), null);
 });

@@ -71,6 +71,10 @@ function makeServer(state) {
         if (state.meStatus !== 200) return send(state.meStatus, { error: 'unavailable' });
         return send(200, { user: { id: ME_ID } });
       }
+      // _rawCreateTask reads the project row for its task_prefix (TPT622).
+      if (req.method === 'GET' && pathname === '/api/projects/1') {
+        return send(200, { project: { id: 1, task_prefix: 'TST' } });
+      }
       if (req.method === 'GET' && pathname === '/api/projects/1/tags') {
         return send(200, { tags: [] });
       }

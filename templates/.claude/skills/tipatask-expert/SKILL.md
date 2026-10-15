@@ -182,3 +182,11 @@ Write it as one or two standing lines in a "Gotchas"/"Known issues" block in the
 **Line test**: would this line still be worth reading a year from now, with this task long forgotten? Yes → KB. No → resolution comment. Naming a task key, a date, or what you personally tried is itself the answer: resolution comment.
 
 **Rule of thumb**: if you had to try multiple approaches before finding the working one, the working approach (and why the others failed) is worth noting.
+
+### 4. Follow-ups captured?
+Zero follow-ups is the normal result. Only capture a defect, data risk or security issue in shipped behavior, or a manual step the user must take. Never file improvements, refactors, extra tests, doc ideas, nice-to-haves or things already covered by this task. Apply after implementation, before the completion call (never while planning, which forbids task writes).
+- **Search first, never duplicate**: for an eligible finding, only outstanding tasks count — `pending` and `on_fire` (the project's not-started and urgent statuses). `list_tasks` for each of those statuses, then `get_task` on likely matches.
+- **Prefer a comment on an existing outstanding task** → `create_task_comment(task_key, content, type: "comment")` naming this task's key, the finding and its consequence for that task. Edit its description only when one of its steps is now wrong. Never touch `in_progress`, `completed` or `canceled` tasks.
+- At most 2 new tasks per run, each with one sentence of evidence. Only when no outstanding task covers an eligible finding, file one concern per task: `reserve_task_keys` (category `HUMAN` only for steps only the user can do), then `update_task` on each reserved key. Self-contained description (problem, evidence, files, numbered steps, verification), registered tags (§ Applying Tags to a Task), this task's priority unless dependencies push it later, every `~` escaped as `\~`.
+- Skip trivia nobody would act on; never file work this task's own scope requires — finish it.
+- List every task filed or updated, by key, in the resolution's follow-ups and the final reply; otherwise report "none".

@@ -1,7 +1,8 @@
 'use strict';
 
 // Objective-chat provider/model registry (C1029).
-// Leaf module — depends only on config + project-config + task-agent detection, never
+// Leaf module — depends only on config + project-config (and pi-custom-endpoint's row-capability
+// helper, itself depending only on project-config) + task-agent detection, never
 // on claude-session.js/dispatch.js/context-manager.js, so it can be safely required
 // by all of them without creating an import cycle.
 
@@ -9,6 +10,7 @@ const config = require('../config');
 const { listTaskAgentStatusesPeek, listAgentModels, peekAgentModels } = require('../task-agent');
 const { resolveBinAsync, peekResolvedBin } = require('../spawn-utils');
 const { readProjectConfig, readPiEntries, readAvailableAgents, piConfiguredModelIds } = require('../project-config');
+const { piRowSupportsTools } = require('../pi-custom-endpoint');
 
 // (C1515) The two provider ids with a real C1504 model probe — mirrors client
 // constants.js STATIC_MODEL_LISTS. Gemini/pi have no task-agent plugin/probe (see
@@ -118,6 +120,16 @@ function configForProject(projectPath) {
   if (configuredIds.length) {
     if (!view) view = Object.create(config);
     view.PI_CONFIGURED_MODELS = configuredIds;
+  }
+
+  // PI_TOOLLESS_MODELS — the configured ids whose PI_MODELS row sets `tools: false`
+  // (pi-custom-endpoint.js piRowSupportsTools()). Such a row still runs objective planning, so it
+  // stays in PI_CONFIGURED_MODELS; only task-start and task/project-chat pickers leave it out.
+  // A legacy flat PI_MODEL pair is never tool-less, so reading the rows is enough.
+  const toolLessIds = piEntries.filter((entry) => !piRowSupportsTools(entry)).map((entry) => entry.model);
+  if (toolLessIds.length) {
+    if (!view) view = Object.create(config);
+    view.PI_TOOLLESS_MODELS = toolLessIds;
   }
 
   // (C1136) Project's own agent allowlist — .tipatask/config.json stores it as a CSV
@@ -368,6 +380,11 @@ function listObjectiveProviders(cfg, { statuses = null } = {}) {
       // project's own configured ids) — kept as a separate field since console-modal.js's
       // launch-time agent picker reads this one specifically.
       configuredModels: providerId === 'pi' ? modelIds : [],
+      // Pi-only: the subset of configuredModels whose row sets `tools: false` (ids only). The
+      // objective chat offers them (`models` is unfiltered); the task-start pickers and the
+      // task/project chat selector leave them out, since a task terminal and a task chat both
+      // refuse such a row.
+      toolLessModels: providerId === 'pi' ? (cfg.PI_TOOLLESS_MODELS || []).filter((id) => modelIds.includes(id)) : [],
     };
   });
 }

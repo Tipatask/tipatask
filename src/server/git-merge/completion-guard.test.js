@@ -5,7 +5,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const fx = require('./test-fixture');
-const { checkCompletedTaskWorktrees, warnIfCompletedWorktreeDirty, verifyTaskCompletion, completeVerifiedTask, guardCompletionTransition } = require('./completion-guard');
+const { checkCompletedTaskWorktrees, warnIfCompletedWorktreeDirty, verifyTaskCompletion, checkTaskCommit, completeVerifiedTask, guardCompletionTransition } = require('./completion-guard');
+const { runGit } = require('./git-runner');
 
 fx.applyFixtureEnvToProcess();
 
@@ -115,6 +116,35 @@ test('verifyTaskCompletion, commits on + worktrees off: needs a key-prefixed com
   const done = await completeVerifiedTask(args);
   assert.equal(done.completed, true);
   assert.deepEqual(b.calls.map(c => c[0]), ['comment', 'update']);
+});
+
+// TPT612 — the idle nudge's commit check: read-only Git, no task writes, same blockers.
+const READ_ONLY_GIT = new Set(['worktree list', 'ls-files', 'log', 'for-each-ref', 'rev-list', 'status', 'symbolic-ref', 'rev-parse', 'diff']);
+test('checkTaskCommit: read-only Git only, never posts, reports TASK_COMMIT_MISSING until a key-prefixed commit is reachable', async (t) => {
+  if (fx.skipUnless(t)) return;
+  const f = fx.buildFixture(t);
+  const b = guardBackend({ ...COMMIT_ON, vcs_worktree_enabled: 0 });
+  const ran = [];
+  const git = (args, opts) => { ran.push(args); return runGit(args, opts); };
+  const args = { backend: b, projectRoot: f.root, taskId: 'TPT1', git };
+  let check = await checkTaskCommit(args);
+  assert.equal(check.verified, true);
+  assert.equal(check.vcs.commit, true);
+  assert.deepEqual(codes(check), ['TASK_COMMIT_MISSING']);
+  assert.deepEqual(Object.keys(check).sort(), ['blockers', 'ready', 'vcs', 'verified']);
+  fx.commit(f.git, f.nested, { 'src/fix1.js': 'fix\n' }, 'TPT1: Fix the nested server');
+  check = await checkTaskCommit(args);
+  assert.equal(check.ready, true, JSON.stringify(check.blockers));
+  assert.deepEqual(check.blockers, []);
+  // Worktrees + merge on walks more of the tree; it must stay read-only too.
+  await checkTaskCommit({ ...args, backend: guardBackend({ ...COMMIT_ON, vcs_merge_enabled: 1 }) });
+  await checkTaskCommit({ ...args, backend: guardBackend() });
+  assert.ok(ran.length > 0);
+  for (const a of ran) {
+    const sub = a[0] === 'worktree' ? `worktree ${a[1]}` : a[0];
+    assert.ok(READ_ONLY_GIT.has(sub), `non-read-only git command: ${a.join(' ')}`);
+  }
+  assert.deepEqual(b.calls, [], 'never posts a comment or writes a status');
 });
 
 test('commit verification: commits off and the terminal monitor run no git; failed git reads cannot pass', async () => {

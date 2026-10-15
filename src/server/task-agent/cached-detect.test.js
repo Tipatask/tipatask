@@ -318,4 +318,34 @@ test('a detect() that throws yields a negative whose detail carries the error me
   const res = await new Throwing().cachedDetect({});
   assert.strictEqual(res.available, false);
   assert.deepStrictEqual(res.detail, { bin: null, exit: null, output: 'registry read failed' });
+  // (TPT9008) Its stable code, the one the terminal translates (terminal.error.ESTART.detection_failed).
+  assert.strictEqual(res.reasonCode, 'detection_failed');
+  assert.strictEqual(res.reason, 'Fake detection failed');
+});
+
+// (TPT9008) The informational cold peek is coded too, though no task start ever sees it.
+test('a cold peekDetect() pending placeholder carries the detection_pending code', () => {
+  const pending = new FakeAgent([AVAILABLE]).peekDetect({});
+  assert.strictEqual(pending.available, false);
+  assert.strictEqual(pending.reasonCode, 'detection_pending');
+  assert.strictEqual(pending.reason, 'Fake detection pending');
+});
+
+// (TPT9008) unavailableResult(): the agent's DETECT_REASONS sentence by code, `{name}` filled from
+// params verbatim (no String#replace patterns), params kept as reasonParams.
+test('unavailableResult() builds the coded negative from the agent table', () => {
+  class Tabled extends BaseTaskAgent {
+    static DETECT_REASONS = Object.freeze({ gone: 'Fake CLI not found', said: 'Fake said: {output} ({output})' });
+    constructor() { super('fake', 'Fake'); }
+  }
+  const agent = new Tabled();
+  assert.deepStrictEqual(agent.unavailableResult('gone'),
+    { id: 'fake', label: 'Fake', available: false, reason: 'Fake CLI not found', reasonCode: 'gone' });
+  const detail = { bin: '/x', exit: 2, output: 'boom' };
+  assert.deepStrictEqual(agent.unavailableResult('said', { params: { output: "$& $' $1" }, detail }), {
+    id: 'fake', label: 'Fake', available: false, reason: "Fake said: $& $' $1 ($& $' $1)", reasonCode: 'said',
+    reasonParams: { output: "$& $' $1" }, detail,
+  });
+  // A code the table lacks still yields a usable negative.
+  assert.strictEqual(agent.unavailableResult('nope').reason, 'Fake is unavailable');
 });

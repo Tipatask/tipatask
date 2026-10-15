@@ -7,7 +7,7 @@
 // dependency/parentId rewriting) that merely consults the predicate.
 
 const { isReservationPlaceholder } = require('./reservation-placeholder');
-const { parseTaskKey, maxNumbersByPrefix } = require('./task-key-format');
+const { parseTaskKey, maxNumbersByPrefix, reconcileNextNumber, SUSPECT_KEY_GAP } = require('./task-key-format');
 
 // ── ID collision remap ──
 // Compares incomingTasks against liveTasks. If a task in incoming has an ID
@@ -21,13 +21,37 @@ const { parseTaskKey, maxNumbersByPrefix } = require('./task-key-format');
 // C/H pair — a colliding key is remapped to its OWN prefix (TPT214 -> TPT<next>, not a
 // literal C<next>). A colliding id that isn't itself key-shaped (shouldn't happen — see
 // below) falls back to the legacy 'C' prefix rather than throwing.
-function remapCollidingIds(incomingTasks, liveTasks) {
+//
+// TPT9004: a remapped id only labels the proposal — the save path (api-backend.js
+// assignIncomingNewTaskIds()) reserves the real key through the API — but it must still be
+// a number the allocator would recognize, not a local guess. `opts.peekByPrefix`
+// (Map<prefix, number>, from GET /tasks/next-key via ws-handlers.js fetchNextKeyPeeks())
+// seeds each prefix's counter with the API's own next number when known; the local
+// max + 1 is the fallback. A local number more than SUSPECT_KEY_GAP above the peek is
+// evidence of keys written around the allocator: it is reported through `opts.log` (default
+// console.warn) and the peek-based number is used. Every candidate steps past live and
+// incoming ids, so a remapped id never names an existing row. `liveTasks` must be the
+// include_reservations=true list (getTasksUnfiltered()): reserved keys are taken too.
+function remapCollidingIds(incomingTasks, liveTasks, { peekByPrefix = null, log = console.warn } = {}) {
   const liveMap = new Map(liveTasks.map(t => [t.id, t]));
+  const taken = new Set(liveMap.keys());
+  for (const t of incomingTasks) if (t && t.id) taken.add(t.id);
 
-  const nextByPrefix = maxNumbersByPrefix(liveTasks);
+  const localMax = maxNumbersByPrefix(liveTasks);
+  const nextByPrefix = new Map();
   const nextForPrefix = (prefix) => {
-    const n = (nextByPrefix.get(prefix) ?? 0) + 1;
-    nextByPrefix.set(prefix, n);
+    if (!nextByPrefix.has(prefix)) {
+      const localNext = (localMax.get(prefix) ?? 0) + 1;
+      const peekNext = peekByPrefix && typeof peekByPrefix.get === 'function' ? peekByPrefix.get(prefix) : undefined;
+      const r = reconcileNextNumber({ prefix, localNext, peekNext, taken });
+      if (r.suspect && typeof log === 'function') {
+        log(`[id-remap] local next key ${prefix}${localNext} is more than ${SUSPECT_KEY_GAP} above the API peek ${prefix}${peekNext} — keys were minted around the allocator; using ${prefix}${r.next}`);
+      }
+      nextByPrefix.set(prefix, r.next);
+    }
+    let n = nextByPrefix.get(prefix);
+    while (taken.has(`${prefix}${n}`)) n += 1;
+    nextByPrefix.set(prefix, n + 1);
     return n;
   };
 
@@ -49,6 +73,7 @@ function remapCollidingIds(incomingTasks, liveTasks) {
     // split it (e.g. a dashed epic key some future caller lets through this path).
     const prefix = (parseTaskKey(t.id) || {}).prefix || 'C';
     const newId = `${prefix}${nextForPrefix(prefix)}`;
+    taken.add(newId);
     idRemap.set(t.id, newId);
     t.id = newId;
   }

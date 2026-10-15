@@ -36,12 +36,19 @@
     --c-danger-border: #fca5a5;
     --c-card-completed-bg: var(--c-bg-sub-nav);
     --c-card-completed-border: transparent;
-    --c-card-completed-title: var(--c-text-faint);
-    --c-card-completed-desc: var(--c-text-faint);
+    /* (TPT682) Closed cards keep their text at full opacity; the closed cue is the ground,
+       a dimmer-but-AA text colour, canceled strike-through and a flat (unelevated) card.
+       --c-text-muted misses 4.5:1 on --c-bg-sub-nav in several light palettes, so closed
+       text steps down to --c-text-secondary only. -meta colours the small muted labels. */
+    --c-card-completed-title: var(--c-text-secondary);
+    --c-card-completed-desc: var(--c-text-secondary);
+    --c-card-completed-meta: var(--c-text-secondary);
     --c-card-canceled-bg: var(--c-bg-sub-nav);
     --c-card-canceled-border: transparent;
-    --c-card-canceled-title: var(--c-text-faint);
-    --c-card-canceled-desc: var(--c-text-faint);
+    --c-card-canceled-title: var(--c-text-secondary);
+    --c-card-canceled-desc: var(--c-text-secondary);
+    --c-card-canceled-meta: var(--c-text-secondary);
+    /* (TPT682) Non-text chrome fade only (the agent badge icon) — never applied to text. */
     --c-card-canceled-opacity: 0.6;
     --c-card-completed-opacity: 0.6;
     --c-solid-text: #fff;
@@ -69,6 +76,28 @@
        reads as selected, not merely hovered. theme-default.test.js guards both ratios. */
     --left-nav-active-bg: color-mix(in srgb, var(--c-primary) 18%, var(--c-bg-card));
     --left-nav-active-fg: color-mix(in srgb, var(--c-primary) 70%, var(--c-text));
+    /* TPT652 — general-purpose accent *text* colour (active tab labels, accent letters, tinted
+       badges). Raw --c-primary is a fill colour and drops under 4.5:1 as text on every dark
+       palette's card; this re-mixes it toward --c-text the same way --left-nav-active-fg does
+       (70% light here / 30% in .theme-dark), resolved at the point of use so no per-theme rule
+       is needed. theme-default.test.js guards the ratio in every palette.
+       TPT677 — every accent `color:` in this file uses this token (icon-only chrome glyphs use
+       --c-primary-border instead, from a pinned list); raw --c-primary / --c-primary-hover never
+       paint text. theme-default.test.js fails on any new raw use. */
+    --c-primary-text: color-mix(in srgb, var(--c-primary) 70%, var(--c-text));
+    /* TPT676 — the non-text twin of --c-primary-text: focus and selected borders, focus
+       outlines, active step dots and tab underlines (WCAG 1.4.11 wants 3:1 against the
+       adjacent colour). Raw --c-primary drops to ~2.2:1 on nord's card; mixing toward
+       --c-text (85% light here / 60% in .theme-dark) clears 3:1 on the card, the sub-nav and
+       the --c-primary-lighter selected tint in every palette without touching --c-primary
+       itself, which must stay dark enough for white-on-primary fills. theme-default.test.js
+       guards the ratio. */
+    --c-primary-border: color-mix(in srgb, var(--c-primary) 85%, var(--c-text));
+    /* TPT679 — the attention orange (idle/prompting terminal rings and pulsing dots). Fixed
+       and palette-independent on purpose: it must read as the same alarm colour in every theme,
+       so no [data-theme] block or .theme-dark overrides it. Was an undefined Catppuccin
+       --c-peach whose fallback painted everywhere. */
+    --c-attention: #fab387;
   }
 
   /* C1267 — the pre-TPT220 default (violet on cool grey), kept as a first-class named
@@ -555,12 +584,15 @@
     --c-card-completed-bg: color-mix(in srgb, var(--c-bg-card) 80%, #000 20%);
     --c-card-completed-border: transparent;
     --c-card-completed-title: var(--c-text-muted);
-    --c-card-completed-desc: var(--c-text-faint);
+    --c-card-completed-desc: var(--c-text-muted);
+    --c-card-completed-meta: var(--c-text-muted);
     --c-card-completed-opacity: 0.55;
     --c-card-canceled-bg: color-mix(in srgb, var(--c-bg-card) 88%, var(--c-danger) 12%);
     --c-card-canceled-border: var(--c-danger-border);
+    /* (TPT682) --c-text-muted misses 4.5:1 on the danger-tinted ground (nord, espresso, …). */
     --c-card-canceled-title: var(--c-text-secondary);
-    --c-card-canceled-desc: var(--c-text-muted);
+    --c-card-canceled-desc: var(--c-text-secondary);
+    --c-card-canceled-meta: var(--c-text-secondary);
     --c-card-canceled-opacity: 1;
     /* TPT171 — 45% of a muted token reads too faint on a dark ground; nudge the resting thumb up. */
     --c-scroll-thumb: color-mix(in srgb, var(--c-text-muted) 60%, transparent);
@@ -569,6 +601,8 @@
        is already close to --c-text in lightness, so the light-theme ratio would overshoot into
        near-white-on-tint and 70% would undershoot back toward the too-faint primary hex. */
     --left-nav-active-fg: color-mix(in srgb, var(--c-primary) 30%, var(--c-text));
+    --c-primary-text: color-mix(in srgb, var(--c-primary) 30%, var(--c-text));
+    --c-primary-border: color-mix(in srgb, var(--c-primary) 60%, var(--c-text));
   }
 
   /* (TPT276) Per-palette dark danger. .theme-dark above is the shared fallback; each dark id
@@ -737,7 +771,7 @@
   }
 
   .left-nav-btn:focus-visible {
-    outline: 2px solid var(--c-primary);
+    outline: 2px solid var(--c-primary-border);
     outline-offset: 1px;
   }
 
@@ -830,7 +864,7 @@
   .sidebar-toggle:hover {
     background: var(--c-primary-light);
     border-color: var(--c-primary);
-    color: var(--c-primary);
+    color: var(--c-primary-border);
   }
 
   /* ── (TPT310) Agent plan usage — compact block at the bottom of the left nav ──
@@ -843,7 +877,8 @@
      the 56px rail at mobile width). Nothing fetches on hover — only startup/refresh/project switch.
      No card chrome (background/border): just the bars and the refresh button on the nav surface.
      Resting states stay distinct: pending = neutral pulsing track, known = provider-tinted track
-     (a true 0% is an empty tinted track), unavailable/failed = dashed outline. */
+     (a true 0% is an empty tinted track), stale = the same hue faded (TPT689), unavailable/failed =
+     dashed outline. */
   .agent-quota-sidebar {
     position: relative;
     flex: 0 0 auto;
@@ -910,11 +945,11 @@
   }
   .agent-quota-sidebar-refresh:hover,
   .agent-quota-sidebar-refresh:focus-visible {
-    color: var(--c-primary);
+    color: var(--c-primary-border);
     background-color: var(--left-nav-btn-state-bg);
   }
   .agent-quota-sidebar-refresh:focus-visible {
-    outline: 2px solid var(--c-primary);
+    outline: 2px solid var(--c-primary-border);
     outline-offset: 1px;
   }
   .agent-quota-sidebar-refresh[aria-disabled="true"] { cursor: progress; }
@@ -958,7 +993,7 @@
     border-radius: 1.5px;
     overflow: hidden;
     background: color-mix(in srgb, var(--c-text-muted) 24%, transparent);
-    transition: height 0.14s ease, border-radius 0.14s ease;
+    transition: height 0.14s ease, border-radius 0.14s ease, background-color 0.14s ease;
   }
   /* A loaded value gets a provider-tinted track, so a real 0% reads as an empty orange/green track
      rather than the neutral grey of the not-yet-loaded placeholder. */
@@ -972,7 +1007,7 @@
     height: 16px;
     border-radius: 3px;
   }
-  .agent-quota-sidebar-row:focus-visible .agent-quota-sidebar-bar { box-shadow: 0 0 0 1.5px var(--c-primary); }
+  .agent-quota-sidebar-row:focus-visible .agent-quota-sidebar-bar { box-shadow: 0 0 0 1.5px var(--c-primary-border); }
   /* Mouse wins over keyboard: while a row is hovered, a keyboard-focused neighbour stays thin, so two
      grown bars (16px on a 12px pitch) never overlap and cover each other's caption. */
   .agent-quota-sidebar-body:has(.agent-quota-sidebar-row:hover) .agent-quota-sidebar-row:not(:hover) .agent-quota-sidebar-bar {
@@ -992,8 +1027,27 @@
     background: var(--agent-quota-brand);
     transform-origin: left center;
     animation: agent-quota-fill 0.45s ease-out;
+    transition: opacity 0.14s ease;
   }
   @keyframes agent-quota-fill { from { transform: scaleX(0); } }
+
+  /* (TPT689) Stale: the server's last good reading, kept while fresh reads fail transiently. Same
+     geometry, fill width and provider hue as a known bar, but faded at rest (lighter track, dimmed
+     fill) so it never passes for a live value. Hover or keyboard focus restores full strength,
+     because the caption's contrast is measured against it; a focused row that another row's hover
+     shrinks back fades again. The row tooltip names the reading's time. */
+  .agent-quota-sidebar-row--stale .agent-quota-sidebar-bar--known {
+    background: color-mix(in srgb, var(--agent-quota-brand) 18%, transparent);
+  }
+  .agent-quota-sidebar-row--stale .agent-quota-sidebar-fill { opacity: 0.45; }
+  .agent-quota-sidebar-row--stale:is(:hover, :focus-visible) .agent-quota-sidebar-bar--known {
+    background: color-mix(in srgb, var(--agent-quota-brand) 32%, transparent);
+  }
+  .agent-quota-sidebar-row--stale:is(:hover, :focus-visible) .agent-quota-sidebar-fill { opacity: 1; }
+  .agent-quota-sidebar-body:has(.agent-quota-sidebar-row:hover) .agent-quota-sidebar-row--stale:not(:hover) .agent-quota-sidebar-bar--known {
+    background: color-mix(in srgb, var(--agent-quota-brand) 18%, transparent);
+  }
+  .agent-quota-sidebar-body:has(.agent-quota-sidebar-row:hover) .agent-quota-sidebar-row--stale:not(:hover) .agent-quota-sidebar-fill { opacity: 0.45; }
 
   .agent-quota-sidebar-bar--unavailable {
     box-sizing: border-box;
@@ -1063,6 +1117,7 @@
     .agent-quota-sidebar-status,
     .agent-quota-sidebar-body,
     .agent-quota-sidebar-bar,
+    .agent-quota-sidebar-fill,
     .agent-quota-sidebar-text { transition: none; }
     .agent-quota-sidebar-fill,
     .agent-quota-sidebar-row--pending .agent-quota-sidebar-bar,
@@ -1117,7 +1172,7 @@
   }
 
   .active-session-item:focus-visible {
-    outline: 2px solid var(--c-primary);
+    outline: 2px solid var(--c-primary-border);
     outline-offset: 1px;
   }
 
@@ -1164,10 +1219,10 @@
   }
 
   /* Orange attention treatment — mirrors .card.needs-attention (see above, "Attention
-     indicator for idle terminal sessions"), same --c-peach token and pulse keyframes. */
+     indicator for idle terminal sessions"), same --c-attention token and pulse keyframes. */
   .active-session-item.needs-attention {
-    border-color: var(--c-peach, #fab387);
-    background-color: rgba(250, 179, 135, 0.08);
+    border-color: var(--c-attention);
+    background-color: color-mix(in srgb, var(--c-attention) 8%, transparent);
     color: var(--c-text);
   }
   .active-session-item.needs-attention .active-session-icon::after {
@@ -1178,7 +1233,7 @@
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: var(--c-peach, #fab387);
+    background: var(--c-attention);
     animation: attention-pulse 1s ease-in-out infinite;
   }
 
@@ -1202,7 +1257,7 @@
     line-height: 1.2;
   }
   .active-session-watchdog-actions [role="button"]:hover,
-  .active-session-watchdog-actions [role="button"]:focus-visible { color: var(--c-text); border-color: var(--c-primary); }
+  .active-session-watchdog-actions [role="button"]:focus-visible { color: var(--c-text); border-color: var(--c-primary-border); }
   .active-session-watchdog-actions [data-busy] { opacity: 0.5; pointer-events: none; }
   body.left-nav-collapsed .active-session-watchdog-actions { display: none; }
 
@@ -1278,7 +1333,7 @@
   }
   .active-session-close:focus-visible {
     opacity: 1;
-    outline: 2px solid var(--c-primary);
+    outline: 2px solid var(--c-primary-border);
     outline-offset: 1px;
   }
 
@@ -1412,7 +1467,7 @@
   }
 
   .nav-tabs button:hover { color: var(--c-text); }
-  .nav-tabs button.active { color: var(--c-primary); border-bottom-color: var(--c-primary); }
+  .nav-tabs button.active { color: var(--c-primary-text); border-bottom-color: var(--c-primary-border); }
 
   /* (C1462) Objective nav tabs — real flex child (not display:contents, which would
      silently break a later [hidden] toggle and buys nothing over the bare .nav-tabs
@@ -1438,8 +1493,8 @@
     max-width: 10rem;
     border-bottom: 2px solid transparent;
   }
-  .nav-objective-tabs .nav-tab-objective-wrap.active { border-bottom-color: var(--c-primary); }
-  .nav-objective-tabs .nav-tab-objective-wrap.active button.nav-tab-objective { color: var(--c-primary); }
+  .nav-objective-tabs .nav-tab-objective-wrap.active { border-bottom-color: var(--c-primary-border); }
+  .nav-objective-tabs .nav-tab-objective-wrap.active button.nav-tab-objective { color: var(--c-primary-text); }
   /* ellipsis still needs display:block — but no line-height:48px trick: the wrapper
      above centers it now, so line-height only needs to be sane for the glyph itself.
      flex:1 1 auto + min-width:0 lets the label shrink to make room for the close button
@@ -1491,7 +1546,7 @@
   }
 
   .nav-section:hover { color: var(--c-text); background: var(--c-primary-lighter); }
-  .nav-section.active { color: var(--c-primary); background: var(--c-primary-light); }
+  .nav-section.active { color: var(--c-primary-text); background: var(--c-primary-light); }
 
   .nav-section--primary {
     background: var(--c-primary);
@@ -1577,7 +1632,7 @@
   }
 
   .mobile-menu-item:hover { color: var(--c-text); background: var(--c-primary-lighter); }
-  .mobile-menu-item.active { color: var(--c-primary); }
+  .mobile-menu-item.active { color: var(--c-primary-text); }
 
   .mobile-menu-item.sub-item {
     padding-left: 2.5rem;
@@ -1718,7 +1773,7 @@
     transition: border-color 0.15s, box-shadow 0.15s;
   }
   .search-input:focus {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 3px var(--c-primary-light);
   }
   .search-input::placeholder { color: var(--c-text-faint); }
@@ -1758,7 +1813,7 @@
     border-radius: 6px;
     border: 1.5px solid var(--c-primary);
     background: transparent;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-size: 0.78rem;
     font-weight: 600;
     cursor: pointer;
@@ -1794,7 +1849,7 @@
     height: 5px;
     transform: translateY(-50%);
     pointer-events: none;
-    background-color: var(--c-primary);
+    background-color: var(--c-primary-border); /* (TPT677) non-text glyph: 3:1 on the nav bar */
     -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1L4 4L7 1' fill='none' stroke='%23000' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
             mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1L4 4L7 1' fill='none' stroke='%23000' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
     -webkit-mask-repeat: no-repeat;
@@ -1815,7 +1870,7 @@
     border-radius: 6px;
     border: 1.5px solid var(--c-primary);
     background: transparent;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font: inherit;
     font-size: 0.78rem;
     font-weight: 600;
@@ -1874,7 +1929,7 @@
   }
   .people-filter-option:hover {
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
   .people-filter-option input[type="checkbox"],
   .people-filter-option input[type="radio"] {
@@ -1924,7 +1979,7 @@
     height: 5px;
     transform: translateY(-50%);
     pointer-events: none;
-    background-color: var(--c-primary);
+    background-color: var(--c-primary-border); /* (TPT677) non-text glyph: 3:1 on the nav bar */
     -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1L4 4L7 1' fill='none' stroke='%23000' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
             mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M1 1L4 4L7 1' fill='none' stroke='%23000' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
     -webkit-mask-repeat: no-repeat;
@@ -1944,7 +1999,7 @@
     border-radius: 6px;
     border: 1.5px solid var(--c-primary);
     background: transparent;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font: inherit;
     font-size: 0.78rem;
     font-weight: 600;
@@ -2001,7 +2056,7 @@
   }
   .status-filter-option:hover {
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
   .status-filter-option input[type="checkbox"] {
     accent-color: var(--c-primary);
@@ -2060,7 +2115,7 @@
   }
   .btn-board-refresh:hover {
     border-color: var(--c-primary);
-    color: var(--c-primary);
+    color: var(--c-primary-border);
     background: var(--c-primary-light);
   }
   .btn-board-refresh svg { display: block; width: 18px; height: 18px; }
@@ -2333,8 +2388,8 @@
 
   /* ── Attention indicator for idle terminal sessions ── */
   .card.needs-attention {
-    box-shadow: 0 0 0 2px var(--c-peach, #fab387);
-    background: rgba(250, 179, 135, 0.06);
+    box-shadow: 0 0 0 2px var(--c-attention);
+    background: color-mix(in srgb, var(--c-attention) 6%, transparent);
   }
   .card.needs-attention::before {
     content: '';
@@ -2344,11 +2399,16 @@
     width: 12px;
     height: 12px;
     border-radius: 50%;
-    background: var(--c-peach, #fab387);
+    background: var(--c-attention);
     animation: attention-pulse 1s ease-in-out infinite;
     z-index: 5;
   }
   .card.needs-attention .card-btn-group { display: none !important; }
+  /* (TPT614) A card the exit backstop flagged keeps Select + the action menu under its ring: the
+     Finish action lives there and must be reachable before the terminal is opened. Select's own
+     .finish-attention-dot takes the corner the pulse dot would occupy; the ring itself stays. */
+  .card.needs-attention.has-left-uncommitted .card-btn-group { display: flex !important; }
+  .card.needs-attention.has-left-uncommitted::before { display: none; }
   .card.needs-attention:hover .task-card-hover-controls,
   .card.needs-attention.card-expanded .task-card-hover-controls { padding-right: 0 !important; }
   .card.needs-attention.card-expanded {
@@ -2358,7 +2418,7 @@
   .card-placeholder + .card.needs-attention,
   .card.needs-attention[style*="position: fixed"] {
     background: var(--card-bg, #1e1e2e);
-    box-shadow: 0 0 0 2px var(--c-peach, #fab387), 0 8px 24px rgba(0,0,0,0.3);
+    box-shadow: 0 0 0 2px var(--c-attention), 0 8px 24px rgba(0,0,0,0.3);
   }
   @keyframes attention-pulse {
     0%, 100% { opacity: 1; transform: scale(1); }
@@ -2384,7 +2444,7 @@
   }
   /* Both indicators active: dual ring, shift green dot left */
   .card.task-new-assigned.needs-attention {
-    box-shadow: 0 0 0 2px #22c55e, 0 0 0 4px var(--c-peach, #fab387);
+    box-shadow: 0 0 0 2px #22c55e, 0 0 0 4px var(--c-attention);
   }
   .card.task-new-assigned.needs-attention::after {
     right: 26px;
@@ -2404,8 +2464,8 @@
   }
 
   /* ── Discussing lock (TPT272) — task open in a Rehash → Discuss objective tab ──
-     Children fade instead of the card itself so the hourglass stays fully opaque and the
-     dim never compounds with the completed-card opacity token. The overlay is absolute
+     Children fade instead of the card itself so the hourglass stays fully opaque. A
+     temporary inert lock, not a closed-state fade (TPT682). The overlay is absolute
      (out of flow), so locking/unlocking never shifts layout. Controls that start, edit,
      reassign or change status go inert; click-to-expand for reading still works. */
   .card.card--discussing { cursor: progress; }
@@ -2422,7 +2482,7 @@
     display: grid;
     place-items: center;
     z-index: 4;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
   .card-discuss-overlay svg {
     width: 64px;
@@ -2539,11 +2599,11 @@
     transition: color 0.15s, background 0.15s;
   }
   .btn-chain-deps:hover {
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     background: var(--c-primary-light);
   }
   .btn-chain-deps.active {
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     background: var(--c-primary-light);
   }
   .btn-chain-deps svg {
@@ -2566,7 +2626,7 @@
     transition: color 0.15s, background 0.15s;
   }
   .btn-reiterate:hover {
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     background: var(--c-primary-light);
   }
   .btn-reiterate svg {
@@ -2574,30 +2634,56 @@
     height: 14px;
   }
 
-  /* Completed cards — muted on light themes, further subdued on dark themes */
+  /* Completed cards — muted ground, dimmer text and no elevation. (TPT682) No opacity on
+     the card or any text inside it: group opacity blends every glyph under 4.5:1. Only the
+     non-text agent badge icon fades; the Start button is restyled, never faded (TPT686). */
   .card[data-status-role="complete"] {
     background: var(--c-card-completed-bg);
-    box-shadow: inset 0 0 0 1px var(--c-card-completed-border), 0 1px 3px rgba(0,0,0,0.08);
-    opacity: var(--c-card-completed-opacity, 1);
+    box-shadow: inset 0 0 0 1px var(--c-card-completed-border);
   }
   .card[data-status-role="complete"] .card-title { color: var(--c-card-completed-title); }
   .card[data-status-role="complete"] .card-desc  { color: var(--c-card-completed-desc); }
-  .card[data-status-role="complete"] .btn-claude  { opacity: 0.3; }
-  .card[data-status-role="complete"].has-active-session .btn-claude,
-  .card[data-status-role="complete"].has-active-session .btn-terminate { opacity: 1; }
+  .card[data-status-role="complete"] :is(.deps, .card-deps-label, .effort-badge, .card-due:not(.overdue)) { color: var(--c-card-completed-meta); }
+  .card[data-status-role="complete"] .agent-badge { opacity: var(--c-card-completed-opacity); }
+  /* (TPT686) The Start button stays an active control on a closed card (it re-runs the task),
+     so it keeps WCAG 1.4.11's 3:1 non-text contrast: no opacity fade (a faded --c-primary fill
+     never clears 3:1 on every closed ground). Secondary at rest — transparent fill,
+     --c-primary-border edge, --c-primary-text glyph — and the full primary fill on hover. Only
+     without a session: a card with a live/exited/queued session (.has-active-session) keeps the
+     filled/emerald/spinner button untouched, so no closed-card rule targets it. */
+  .card[data-status-role="complete"]:not(.has-active-session) .btn-claude {
+    background: transparent;
+    border-color: var(--c-primary-border);
+    color: var(--c-primary-text);
+  }
+  .card[data-status-role="complete"]:not(.has-active-session) .btn-claude:hover {
+    background: var(--c-primary);
+    border-color: var(--c-primary-border);
+    color: var(--c-on-primary);
+  }
 
-  /* Canceled cards — grayed on light themes; dark themes keep controls readable */
+  /* Canceled cards — same closed treatment plus strike-through, which is what tells a
+     canceled card from a completed one on the shared light ground (TPT682). */
   .card[data-status-role="canceled"] {
     background: var(--c-card-canceled-bg);
-    box-shadow: inset 0 0 0 1px var(--c-card-canceled-border), 0 1px 3px rgba(0,0,0,0.08);
-    opacity: var(--c-card-canceled-opacity);
+    box-shadow: inset 0 0 0 1px var(--c-card-canceled-border);
   }
   .card[data-status-role="canceled"] .card-title,
   .card[data-status-role="canceled"] .card-desc { text-decoration: line-through; color: var(--c-card-canceled-desc); }
   .card[data-status-role="canceled"] .card-title { color: var(--c-card-canceled-title); }
-  .card[data-status-role="canceled"] .btn-claude { opacity: 0.3; }
-  .card[data-status-role="canceled"].has-active-session .btn-claude,
-  .card[data-status-role="canceled"].has-active-session .btn-terminate { opacity: 1; }
+  .card[data-status-role="canceled"] :is(.deps, .card-deps-label, .effort-badge, .card-due:not(.overdue)) { color: var(--c-card-canceled-meta); }
+  .card[data-status-role="canceled"] .agent-badge { opacity: var(--c-card-canceled-opacity); }
+  /* (TPT686) Same outlined secondary Start button as the completed card above. */
+  .card[data-status-role="canceled"]:not(.has-active-session) .btn-claude {
+    background: transparent;
+    border-color: var(--c-primary-border);
+    color: var(--c-primary-text);
+  }
+  .card[data-status-role="canceled"]:not(.has-active-session) .btn-claude:hover {
+    background: var(--c-primary);
+    border-color: var(--c-primary-border);
+    color: var(--c-on-primary);
+  }
 
   .card {
     /* (TPT277/TPT279) Control sizing tokens — shared by the board's .controls-row and the
@@ -2734,6 +2820,7 @@
   }
   .card:hover .card-btn-group,
   .card.has-unmerged-worktree .card-btn-group,
+  .card.has-left-uncommitted .card-btn-group,
   .card.card-expanded .card-btn-group,
   .card.selected .card-btn-group,
   .card-btn-group:focus-within {
@@ -2754,8 +2841,12 @@
     position: relative;
     z-index: 1;
   }
-  .btn-merge-task { position: relative; }
-  .merge-attention-dot {
+  .btn-merge-task,
+  .btn-finish-task { position: relative; }
+  /* (TPT614) .finish-attention-dot: the Finish item's twin of the merge dot — same geometry, same
+     two placements (Select while collapsed, the item itself while open). */
+  .merge-attention-dot,
+  .finish-attention-dot {
     position: absolute;
     top: -4px;
     right: -4px;
@@ -2766,7 +2857,9 @@
     pointer-events: none;
   }
   .card-btn-group:hover > .btn-select-card .merge-attention-dot,
-  .card-btn-group:focus-within > .btn-select-card .merge-attention-dot { visibility: hidden; }
+  .card-btn-group:focus-within > .btn-select-card .merge-attention-dot,
+  .card-btn-group:hover > .btn-select-card .finish-attention-dot,
+  .card-btn-group:focus-within > .btn-select-card .finish-attention-dot { visibility: hidden; }
   .card-action-menu {
     position: absolute;
     top: -5px;
@@ -2822,8 +2915,10 @@
     cursor: pointer;
     transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
   }
+  /* (TPT677) Card-surface icons take --c-primary-text, not the 3:1 --c-primary-border: under this
+     hover tint a dark canceled or objective card drops the border token below 3:1. */
   .card-btn-group button:hover {
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     border-color: var(--c-primary);
     background: var(--c-primary-light);
   }
@@ -2832,7 +2927,7 @@
     height: 16px;
   }
   .card-btn-group .btn-chain-deps.active {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
   }
   /* Destructive action keeps its red hover instead of the primary accent. */
   .card-btn-group .btn-delete-task:hover {
@@ -2938,7 +3033,8 @@
     position: fixed;
     /* (C1433) above .card.chain-hl's 100 — an expanded objective card must stack over
        the ringed subtask cards behind it, not under them. Kept in sync with the inline
-       card.style.zIndex set in expandCard() (task-card.js), which wins over this rule. */
+       card.style.zIndex set in expandCard() (task-card.js), which wins over this rule.
+       (TPT635) Stays below .bulk-action-bar's 105 so the bar is never covered. */
     z-index: 101;
     /* (TPT456) Fallback until expandCard() sets the inline cap (expandedCardMaxHeight() in
        card-placement.js): never taller than the viewport minus its 10px margins. */
@@ -2999,7 +3095,7 @@
     max-width: 100%;
   }
   .card-desc.editing {
-    outline: 1.5px solid var(--c-primary);
+    outline: 1.5px solid var(--c-primary-border);
     background: var(--c-bg);
   }
 
@@ -3011,7 +3107,7 @@
 
   /* Inline-editing title */
   .card-title.editing {
-    outline: 2px solid var(--c-primary);
+    outline: 2px solid var(--c-primary-border);
     border-radius: 3px;
     padding: 2px 4px;
     white-space: normal;
@@ -3049,7 +3145,7 @@
     font-family: 'SF Mono', Monaco, Consolas, monospace;
     font-size: 0.85em;
     background: var(--c-bg-tier);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     padding: 0.1em 0.3em;
     border-radius: 3px;
   }
@@ -3338,7 +3434,7 @@
     transition: border-color 0.15s, background 0.15s;
   }
   .agent-assign-option:hover { border-color: var(--c-primary); background: var(--c-primary-lighter); }
-  .agent-assign-option--active { border-color: var(--c-primary); background: var(--c-primary-light); }
+  .agent-assign-option--active { border-color: var(--c-primary-border); background: var(--c-primary-light); }
   .agent-assign-option-icon {
     width: 28px; height: 28px; border-radius: 50%;
     display: inline-flex; align-items: center; justify-content: center;
@@ -3445,7 +3541,7 @@
   .sprint-combo-item--new {
     border-bottom: 1px solid var(--c-border);
     font-weight: 600;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
 
   /* Pill variant — per-card sprint badge */
@@ -3459,7 +3555,7 @@
     appearance: none;
     -webkit-appearance: none;
     background-color: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     background-image: url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='%23666' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
     background-repeat: no-repeat;
     background-position: right 0.35rem center;
@@ -3482,9 +3578,11 @@
     color: color-mix(in srgb, var(--status-color, #7f849c) 65%, black);
   }
 
+  /* (TPT685) --c-text-faint was 2.67–4.24:1 on --c-bg-card; --c-text-muted clears 4.5:1 in
+     every palette (min 4.65, latte). Closed cards recolour it with the -meta token below. */
   .deps {
     font-size: 0.75rem;
-    color: var(--c-text-faint);
+    color: var(--c-text-muted);
   }
 
   .deps .dep-badge {
@@ -3503,14 +3601,16 @@
     gap: 4px;
     margin-top: 4px;
   }
+  /* (TPT677) Tint layered over an opaque --c-bg-card (C1423 trick): a bare translucent tint took on
+     the card's state colour (dark canceled, objective, proposal) and dropped the text under 4.5:1. */
   .tag-badge {
     display: inline-block;
     font-size: 0.7rem;
     font-weight: 600;
     padding: 1px 8px;
     border-radius: 12px;
-    background: var(--c-primary-light);
-    color: var(--c-primary);
+    background: linear-gradient(var(--c-primary-light), var(--c-primary-light)), var(--c-bg-card);
+    color: var(--c-primary-text);
   }
 
   /* ── Due-date pill (task cards) ── */
@@ -3573,8 +3673,10 @@
     flex: 1;
     min-width: 0;
   }
+  /* (TPT681) --c-text, not --c-primary-text: on a dark canceled objective card the accent text
+     drops under 4.5:1 against the -lighter tint over the danger-mixed card ground. */
   .subtask-title:hover {
-    color: var(--c-primary);
+    color: var(--c-text);
     text-decoration: underline;
   }
   .subtask-item:has(.subtask-radio:checked) .subtask-title {
@@ -3597,7 +3699,7 @@
     cursor: text;
   }
   .tag-input-wrapper:focus-within {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 3px var(--c-primary-light);
   }
   .tag-chip {
@@ -3605,7 +3707,7 @@
     align-items: center;
     gap: 0.25rem;
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-size: 0.8rem;
     font-weight: 600;
     padding: 0.15rem 0.5rem;
@@ -3615,13 +3717,13 @@
     cursor: pointer;
     background: none;
     border: none;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-size: 0.9rem;
     line-height: 1;
     padding: 0 0.1rem;
   }
   .tag-chip-remove:hover {
-    color: var(--c-primary-hover);
+    color: var(--c-text);
   }
   .tag-input-field {
     border: none;
@@ -3656,7 +3758,7 @@
   .tag-dropdown-item:hover,
   .tag-dropdown-item.highlighted {
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
   .tag-dropdown-item {
     display: flex;
@@ -3680,7 +3782,7 @@
   .tag-create-name {
     font-size: 0.82rem;
     font-weight: 600;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
   .tag-create-desc {
     font-size: 0.8rem;
@@ -3692,7 +3794,7 @@
     outline: none;
   }
   .tag-create-desc:focus {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
   }
   .tag-create-confirm {
     align-self: flex-end;
@@ -3722,7 +3824,7 @@
     border-radius: 6px;
     border: 1.5px solid var(--c-primary);
     background: transparent;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-size: 0.78rem;
     font-weight: 600;
     cursor: pointer;
@@ -3805,8 +3907,8 @@
   }
   .tag-cloud-item.active {
     background: var(--c-primary-light);
-    border-color: var(--c-primary);
-    color: var(--c-primary);
+    border-color: var(--c-primary-border);
+    color: var(--c-primary-text);
   }
   .tag-cloud-count {
     font-weight: 400;
@@ -4210,7 +4312,7 @@
     transition: color 0.15s, background 0.15s;
   }
   .btn-split-task:hover {
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     background: var(--c-primary-light);
   }
   .btn-split-task svg {
@@ -4271,7 +4373,7 @@
     height: 28px;
     border-radius: 50%;
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -4347,7 +4449,7 @@
     height: 28px;
     border-radius: 50%;
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -4422,7 +4524,7 @@
   }
   .trello-card-url-input {
     flex: 1;
-    background: var(--c-bg-input, var(--c-bg));
+    background: var(--c-bg);
     border: 1.5px solid var(--c-border);
     border-radius: 6px;
     color: var(--c-text);
@@ -4431,7 +4533,7 @@
     padding: 6px 10px;
     outline: none;
   }
-  .trello-card-url-input:focus { border-color: var(--c-primary); }
+  .trello-card-url-input:focus { border-color: var(--c-primary-border); }
   .btn-trello-fetch {
     background: var(--c-primary);
     color: var(--c-on-primary);
@@ -4449,7 +4551,7 @@
   .trello-import-error {
     margin: 0;
     font-size: 0.82rem;
-    color: var(--c-red, #f38ba8);
+    color: var(--c-danger);
   }
   .trello-import-preview {
     max-height: 280px;
@@ -4615,7 +4717,7 @@
     font-family: inherit;
   }
   .trello-wizard-select:focus {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 3px var(--c-primary-light);
   }
   .trello-wizard-search {
@@ -4631,7 +4733,7 @@
     box-sizing: border-box;
   }
   .trello-wizard-search:focus {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 3px var(--c-primary-light);
   }
   .trello-wizard-search::placeholder { color: var(--c-text-faint); }
@@ -4654,7 +4756,7 @@
   .trello-wizard-card-item:hover { background: var(--c-primary-lighter); }
   .trello-wizard-card-item.selected {
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-weight: 600;
   }
   .trello-wizard-preview {
@@ -4726,7 +4828,7 @@
     background: var(--c-bg-card); color: var(--c-text); outline: none;
     font-family: inherit; box-sizing: border-box;
   }
-  .gmail-wizard-search:focus { border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-light); }
+  .gmail-wizard-search:focus { border-color: var(--c-primary-border); box-shadow: 0 0 0 3px var(--c-primary-light); }
   .gmail-wizard-search::placeholder { color: var(--c-text-faint); }
   .gmail-wizard-thread-list {
     max-height: 280px; overflow-y: auto;
@@ -4744,7 +4846,7 @@
     font-size: 0.88rem; font-weight: 600; color: var(--c-text);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .gmail-wizard-thread-item.selected .gmail-wizard-thread-subject { color: var(--c-primary); }
+  .gmail-wizard-thread-item.selected .gmail-wizard-thread-subject { color: var(--c-primary-text); }
   .gmail-wizard-thread-meta {
     font-size: 0.78rem; color: var(--c-text-muted); margin-top: 2px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -4802,7 +4904,7 @@
     box-shadow: 0 0 0 2px #22c55e;
   }
   .card.selected.needs-attention {
-    box-shadow: 0 0 0 2px #22c55e, 0 0 0 4px var(--c-peach, #fab387);
+    box-shadow: 0 0 0 2px #22c55e, 0 0 0 4px var(--c-attention);
   }
 
 
@@ -4829,7 +4931,10 @@
     background: var(--c-bg-card, #1e1e2e);
     border: 1px solid var(--c-border, #333);
     box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
-    z-index: 90;
+    /* (TPT635) Above every card layer — .card-overlay-backdrop 99, .card.chain-hl 100,
+       .card.card-expanded 101 (incl. expandCard()'s inline value), menu-open card 102 —
+       and below .top-nav 110, dropdowns 120+, .terminal-overlay 2000 and the 3000+ dialogs. */
+    z-index: 105;
     --bulk-divider: var(--c-border-input, #444);
   }
   .bulk-action-bar[hidden] { display: none; }
@@ -4900,7 +5005,7 @@
   .bulk-action-bar .bulk-assignee-input:focus,
   .bulk-action-bar .agent-picker-trigger:focus-visible,
   .bulk-action-bar .bulk-btn:focus-visible {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 2px var(--c-primary-light, rgba(139,92,246,0.25));
   }
   .bulk-action-bar .bulk-status-select { width: 140px; }
@@ -5274,7 +5379,7 @@
   .btn-close-terminal:focus-visible,
   .btn-terminate-terminal:focus-visible,
   .terminal-voice-btn:focus-visible {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 2px var(--c-primary-light);
   }
 
@@ -5474,7 +5579,7 @@
   }
 
   .objective-form textarea:focus {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 3px var(--c-primary-light);
   }
 
@@ -5521,7 +5626,7 @@
   .new-task-field input:focus,
   .new-task-field select:focus,
   .new-task-field textarea:focus {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 3px var(--c-primary-light);
   }
   .new-task-field textarea {
@@ -5643,7 +5748,7 @@
     transition: color 0.15s, background 0.15s;
   }
   .audio-rec-btn:hover {
-    color: var(--c-primary);
+    color: var(--c-primary-border);
     background: var(--c-primary-light);
   }
   .audio-rec-btn.is-recording {
@@ -5668,7 +5773,7 @@
     border-radius: 8px;
     background: var(--c-primary-light);
     border: 1px solid var(--c-primary);
-    color: var(--c-primary);
+    color: var(--c-primary-border);
   }
   .audio-rec-btn.voice-btn-emphasis:hover {
     background: var(--c-primary);
@@ -5698,7 +5803,7 @@
   }
   .audio-rec-btn.voice-btn-emphasis:disabled:hover {
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-border);
   }
 
   /* ── Voice recording toast (C1175) — persistent bottom-right pill, pulses for
@@ -5757,7 +5862,7 @@
     font-size: 0.82rem;
     color: var(--c-text-secondary);
   }
-  .subtask-context-note strong { color: var(--c-primary); }
+  .subtask-context-note strong { color: var(--c-primary-text); }
 
   /* ── Objective header row (label + archive button) ── */
   /* (C1257) padding matches .composer-header so the Task-form Preview phase (the one remaining
@@ -5783,7 +5888,7 @@
     border-radius: 6px;
     border: 1.5px solid var(--c-primary);
     background: transparent;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-size: 0.78rem;
     font-weight: 600;
     cursor: pointer;
@@ -5833,7 +5938,7 @@
     transition: border-color 0.15s, box-shadow 0.15s;
   }
   .recipes-search:focus {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 3px var(--c-primary-light);
   }
 
@@ -5868,7 +5973,7 @@
   .recipe-item-name {
     font-size: 0.78rem;
     font-weight: 600;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     margin-bottom: 0.25rem;
   }
 
@@ -5890,7 +5995,7 @@
     margin-bottom: 0.85rem;
     border: 1px solid var(--c-border);
     border-radius: 10px;
-    background: var(--c-bg-alt);
+    background: var(--c-bg-card);
   }
 
   .btn-chat-history-load {
@@ -6189,7 +6294,8 @@
 
   /* An error toast can carry a server message: cap its width and let it wrap. 1rem equals
      the one-line pill's half-height, so a short message still renders as the same capsule
-     and only a wrapped one becomes a rounded box. */
+     and only a wrapped one becomes a rounded box. pre-line keeps the line breaks of a
+     multi-line message (a batch start's refusals, one line per reason). */
   .tt-saving-indicator--toast.tt-toast--error {
     max-width: min(34rem, calc(100vw - 3rem));
     border-radius: 1rem;
@@ -6197,6 +6303,7 @@
   }
   .tt-toast--error .tt-saving-label {
     overflow-wrap: anywhere;
+    white-space: pre-line;
   }
   .tt-toast--error .tt-toast-icon {
     flex: none;
@@ -6294,7 +6401,7 @@
   .tt-dnp-clear {
     background: none;
     border: none;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-size: 0.75rem;
     font-weight: 600;
     cursor: pointer;
@@ -6555,10 +6662,15 @@
 
   /* (TPT257) A `new` card proposed inside a subtask (split) chat — it will be saved as a
      child of state.chatState.parentTaskKey. Same slot as the C1559 origin badge above (the
-     two never coexist: origin mode resolves to 'none' whenever parentTaskKey is set). */
+     two never coexist: origin mode resolves to 'none' whenever parentTaskKey is set).
+     (TPT681) Opaque chip ground, like .tag-badge: on the bare --c-success-bg proposal tint the
+     accent text fell under 4.5:1 in mocha and nord. */
   .preview-card .change-target--subtask {
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-weight: 600;
+    background: linear-gradient(var(--c-primary-light), var(--c-primary-light)), var(--c-bg-card);
+    border-radius: 3px;
+    padding: 0.1rem 0.4rem;
   }
 
   .preview-card.preview-card--subtask {
@@ -6576,7 +6688,7 @@
   }
 
   .preview-card:not(.card) .preview-title.editing {
-    outline: 1.5px solid var(--c-primary);
+    outline: 1.5px solid var(--c-primary-border);
     background: var(--c-bg);
     width: 100%;
   }
@@ -6592,7 +6704,7 @@
   }
 
   .preview-card:not(.card) .preview-desc.editing {
-    outline: 1.5px solid var(--c-primary);
+    outline: 1.5px solid var(--c-primary-border);
     background: var(--c-bg);
     width: 100%;
   }
@@ -6605,6 +6717,17 @@
     font-size: 0.75rem;
     color: var(--c-text-faint);
     margin-top: 0.2rem;
+  }
+
+  /* (TPT624) Manual New Task Preview: a dependency moved the selected sprint. */
+  .preview-card:not(.card) .preview-sprint-move {
+    margin-top: 0.4rem;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.75rem;
+    color: var(--c-info);
+    background: var(--c-info-bg);
+    border: 1px solid var(--c-info-border);
+    border-radius: 4px;
   }
 
   /* (TPT197/TPT279) Agent badge on a proposal card — reuses the board's renderAgentBadge() markup,
@@ -6726,7 +6849,7 @@
   }
   .preview-step-select:hover,
   .preview-step-select:focus-visible {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
   }
   .theme-dark .preview-step-select { color-scheme: dark; }
   .card.preview-card .card-preview-meta .step-label {
@@ -6851,7 +6974,7 @@
     transition: border-color 0.15s;
   }
   .settings-row select:hover { border-color: var(--c-primary); }
-  .settings-row select:focus { border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-light); }
+  .settings-row select:focus { border-color: var(--c-primary-border); box-shadow: 0 0 0 3px var(--c-primary-light); }
   /* Badge marking a setting as project-wide (vs per-user theme/agent) */
   .settings-row-note {
     font-size: 0.68rem;
@@ -6884,7 +7007,7 @@
   }
   .settings-row-btn:hover:not(:disabled) {
     border-color: var(--c-primary);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
   .settings-row-btn:disabled {
     opacity: 0.5;
@@ -6940,7 +7063,7 @@
     font-size: 0.85rem;
     outline: none;
   }
-  .settings-voice-key-input:focus { border-color: var(--c-primary); }
+  .settings-voice-key-input:focus { border-color: var(--c-primary-border); }
   .settings-row-btn-ghost {
     border-color: transparent;
     background: transparent;
@@ -7004,7 +7127,7 @@
   }
   .settings-voice-model-state[data-state="downloading"] {
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
   .settings-voice-model-state[data-state="error"],
   .settings-voice-model-state[data-state="stale"] {
@@ -7322,7 +7445,7 @@
   }
 
   .preview-card-actions .btn-accept-card:not(.active):hover {
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     border-color: var(--c-primary);
     background: var(--c-primary-light);
   }
@@ -7651,7 +7774,7 @@
     cursor: pointer;
     line-height: 1;
   }
-  .chat-tab-add:hover { background: var(--c-primary-lighter); color: var(--c-primary); }
+  .chat-tab-add:hover { background: var(--c-primary-lighter); color: var(--c-primary-text); }
   .chat-tab-add:disabled { opacity: 0.4; cursor: default; }
 
   .chat-body {
@@ -7732,7 +7855,7 @@
     font-size: 0.8rem;
     font-weight: 600;
     cursor: pointer;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
   .chat-bubble-expand-btn:hover {
     text-decoration: underline;
@@ -7956,7 +8079,7 @@
     align-items: center;
     gap: 0.5rem;
     padding: 0.5rem 0.85rem;
-    background: var(--c-bg-overlay, rgba(0,0,0,0.15));
+    background: var(--c-bg-tier);
     border-bottom: 1px solid var(--c-border);
   }
 
@@ -7965,7 +8088,7 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
 
   .spec-suggestion-label--applied { color: var(--c-success, #a6e3a1); }
@@ -7990,7 +8113,7 @@
     color: var(--c-text-secondary);
   }
 
-  .spec-diff-label--new { color: var(--c-primary); }
+  .spec-diff-label--new { color: var(--c-primary-text); }
 
   .spec-diff-title-row {
     display: flex;
@@ -8108,8 +8231,8 @@
 
   .spec-chat-input:focus {
     outline: none;
-    border-color: var(--c-primary);
-    box-shadow: 0 0 0 2px var(--c-primary-a20, rgba(137, 180, 250, 0.2));
+    border-color: var(--c-primary-border);
+    box-shadow: 0 0 0 2px var(--c-primary-light);
   }
 
   .spec-chat-send {
@@ -8134,7 +8257,7 @@
 
   .btn-spec-chat:hover {
     border-color: var(--c-primary);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
 
   /* ── end Spec Chat modal ── */
@@ -8300,7 +8423,7 @@
 
   .task-chat-icon-btn svg { width: 16px; height: 16px; }
   .task-chat-icon-btn:hover:not(:disabled) { background: var(--c-bg-sub-nav); color: var(--c-text); }
-  .task-chat-icon-btn:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 1px; }
+  .task-chat-icon-btn:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 1px; }
   .task-chat-icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .task-chat-scroll {
@@ -8482,7 +8605,7 @@
 
   button.task-chat-tool-chip[aria-expanded="true"]::after { transform: rotate(45deg); }
   button.task-chat-tool-chip:hover { border-color: var(--c-border-input); color: var(--c-text); }
-  button.task-chat-tool-chip:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 1px; }
+  button.task-chat-tool-chip:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 1px; }
 
   .task-chat-tool-dot {
     flex-shrink: 0;
@@ -8579,14 +8702,14 @@
     cursor: pointer;
   }
 
-  .task-chat-widget--task:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+  .task-chat-widget--task:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
 
   .task-chat-task-badge {
     align-self: flex-start;
     padding: 0.05rem 0.5rem;
     border-radius: 999px;
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-size: 0.68rem;
     font-weight: 700;
     letter-spacing: 0.04em;
@@ -8696,11 +8819,11 @@
 
   .task-chat-dialog-option:has(> input:checked),
   .task-chat-widget--dialog:disabled .task-chat-dialog-option:has(> input:checked):hover {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     background: var(--c-primary-light);
   }
 
-  .task-chat-dialog-option:has(> input:focus-visible) { outline: 2px solid var(--c-primary); outline-offset: 1px; }
+  .task-chat-dialog-option:has(> input:focus-visible) { outline: 2px solid var(--c-primary-border); outline-offset: 1px; }
 
   .task-chat-dialog-option > input {
     flex-shrink: 0;
@@ -8740,7 +8863,7 @@
     font-size: 0.85rem;
   }
 
-  .task-chat-dialog-other:focus { outline: none; border-color: var(--c-primary); }
+  .task-chat-dialog-other:focus { outline: none; border-color: var(--c-primary-border); }
 
   .task-chat-dialog-actions {
     display: flex;
@@ -8879,7 +9002,7 @@
   }
 
   .task-chat-composer:focus-within {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 3px var(--c-primary-light);
   }
 
@@ -8965,7 +9088,7 @@
     height: 3rem;
     border-radius: 14px;
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-border);
   }
 
   .task-chat-start-mark svg { width: 24px; height: 24px; }
@@ -9039,7 +9162,7 @@
   .task-chat-start-go:disabled { opacity: 0.45; cursor: not-allowed; }
 
   .task-chat-start-cancel:focus-visible,
-  .task-chat-start-go:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+  .task-chat-start-go:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
 
   /* History picker (TPT539): earlier chats under the start gate's actions — search, a scrolling
      list of rows, a status line; unavailable rows greyed with their reason. */
@@ -9074,7 +9197,7 @@
   }
 
   .task-chat-history-search::placeholder { color: var(--c-text-faint); }
-  .task-chat-history-search:focus { outline: none; border-color: var(--c-primary); box-shadow: 0 0 0 2px var(--c-primary-light); }
+  .task-chat-history-search:focus { outline: none; border-color: var(--c-primary-border); box-shadow: 0 0 0 2px var(--c-primary-light); }
   .task-chat-history-search[hidden],
   .task-chat-history-list[hidden],
   .task-chat-history-status[hidden],
@@ -9108,7 +9231,7 @@
   }
 
   .task-chat-history-item:hover:not([aria-disabled="true"]) { border-color: var(--c-primary); background: var(--c-primary-lighter); }
-  .task-chat-history-item:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 1px; }
+  .task-chat-history-item:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 1px; }
 
   .task-chat-history-item--unavailable {
     background: var(--c-bg-sub-nav);
@@ -9215,7 +9338,7 @@
     min-width: 0;
     text-align: right;
     font-size: 0.72rem;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -9232,7 +9355,7 @@
     border: 2px dashed var(--c-primary);
     border-radius: 12px;
     background: color-mix(in srgb, var(--c-bg-card) 82%, transparent);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     font-size: 0.95rem;
     font-weight: 600;
     pointer-events: none;
@@ -9263,7 +9386,7 @@
     overflow: hidden;
   }
   .task-chat-attach:hover { border-color: var(--c-primary); }
-  .task-chat-attach:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+  .task-chat-attach:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
 
   .task-chat-attach--image img {
     display: block;
@@ -9283,7 +9406,7 @@
     height: 1rem;
     border: 1.5px solid currentColor;
     border-radius: 2px 5px 2px 2px;
-    color: var(--c-primary);
+    color: var(--c-primary-border);
   }
   .task-chat-attach-name {
     min-width: 0;
@@ -9509,7 +9632,7 @@
   }
 
   .chat-input-area textarea:focus {
-    border-color: var(--c-primary);
+    border-color: var(--c-primary-border);
     box-shadow: 0 0 0 3px var(--c-primary-light);
   }
 
@@ -9546,7 +9669,7 @@
     border: 1px solid var(--c-border);
     border-radius: 50%;
     background: var(--c-bg-card);
-    color: var(--c-text-dim, #6c6c7a);
+    color: var(--c-text-muted);
     cursor: pointer;
     font-weight: 700;
     line-height: 1;
@@ -9708,7 +9831,7 @@
   }
   .embed-menu-trigger:hover,
   .import-menu-trigger:hover {
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     background: var(--c-primary-light);
   }
   .embed-menu-trigger:disabled {
@@ -9819,7 +9942,7 @@
     color: var(--c-text);
     font-size: 0.85rem;
   }
-  .subtask-context-banner strong { color: var(--c-primary); font-weight: 600; }
+  .subtask-context-banner strong { color: var(--c-primary-text); font-weight: 600; }
   .btn-clear-subtask-ctx {
     margin-left: auto;
     background: none;
@@ -9832,7 +9955,7 @@
     border-radius: 4px;
     flex-shrink: 0;
   }
-  .btn-clear-subtask-ctx:hover { color: var(--c-primary); background: var(--c-primary-light); }
+  .btn-clear-subtask-ctx:hover { color: var(--c-primary-text); background: var(--c-primary-light); }
 
   /* (TPT257) Subtask preview stack: the "N subtasks will be created under <key>" line sits
      directly under .subtask-context-banner (sibling of .chat-body, never inside the scroller).
@@ -9876,7 +9999,7 @@
     border-radius: 8px;
     cursor: pointer;
   }
-  .chat-discuss-card:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+  .chat-discuss-card:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
   .chat-discuss-card .card--preview {
     width: 100%;
     margin-bottom: 0;
@@ -9961,7 +10084,7 @@
   }
   .chat-console-toggle:hover {
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-border);
   }
   .chat-console-toggle svg { width: 14px; height: 14px; }
 
@@ -10060,7 +10183,7 @@
   }
   .btn-new-objective:hover {
     background: var(--c-primary-light);
-    color: var(--c-primary);
+    color: var(--c-primary-text);
   }
 
   .form-actions-row {
@@ -10119,7 +10242,7 @@
   }
   .btn-empty-secondary {
     background: transparent;
-    color: var(--c-primary);
+    color: var(--c-primary-text);
     border: 2px solid var(--c-primary);
   }
   .btn-empty-secondary:hover {
@@ -10255,7 +10378,7 @@
 .breadcrumb-ellipsis {
   background: none;
   border: none;
-  color: var(--c-primary);
+  color: var(--c-primary-text);
   font-size: 0.85rem;
   font-weight: 600;
   cursor: pointer;
@@ -10305,7 +10428,7 @@
   padding: 0;
   text-align: left;
 }
-.parent-task-pane-title:hover { color: var(--c-primary); }
+.parent-task-pane-title:hover { color: var(--c-primary-text); }
 .parent-task-pane-subtasks {
   font-size: 0.75rem;
   font-weight: 600;
@@ -10334,13 +10457,13 @@
   margin-top: 0.2rem;
   background: none;
   border: none;
-  color: var(--c-primary);
+  color: var(--c-primary-text);
   font-size: 0.75rem;
   font-weight: 600;
   cursor: pointer;
   padding: 0;
 }
-.parent-task-pane-toggle:hover { color: var(--c-primary-hover); }
+.parent-task-pane-toggle:hover { text-decoration: underline; }
 
 /* ── Subtask board drill-in button ── */
 .btn-open-subtask-board {
@@ -10360,7 +10483,7 @@
 .btn-open-subtask-board svg { width: 12px; height: 12px; flex-shrink: 0; }
 .btn-open-subtask-board:hover {
   border-color: var(--c-primary);
-  color: var(--c-primary);
+  color: var(--c-primary-text);
   background: var(--c-primary-light);
 }
 .card-expanded .btn-open-subtask-board { display: inline-flex; }
@@ -10475,7 +10598,7 @@
 }
 .backlog-hint-link:hover,
 .backlog-hint-link:focus-visible {
-  color: var(--c-primary);
+  color: var(--c-primary-text);
   background: var(--c-primary-lighter);
 }
 @media (max-width: 768px) {
@@ -10499,18 +10622,20 @@
 .todo-list { display: flex; flex-direction: column; gap: 6px; padding: 16px; max-width: 800px; margin: 0 auto; }
 .todo-empty { padding: 32px; text-align: center; color: var(--c-text-muted); }
 .todo-item { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--c-bg-card); border: 1px solid var(--c-border); border-radius: 6px; }
-.todo-item[data-status-role="complete"] { opacity: 0.65; }
+/* (TPT682) Done rows keep text at full opacity: strike-through + the AA-checked completed
+   title colour mark them; only the non-text agent badge icon fades. */
+.todo-item[data-status-role="complete"] .agent-badge { opacity: var(--c-card-completed-opacity); }
 .todo-item.agent-assigned .todo-check { opacity: 0.35; cursor: not-allowed; }
 .todo-item .agent-badge { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0; }
-.todo-item .agent-badge--claude { background: var(--c-primary-light); color: var(--c-primary); }
+.todo-item .agent-badge--claude { background: var(--c-primary-light); color: var(--c-primary-text); }
 .todo-item .agent-badge--codex  { background: var(--c-info-bg); color: var(--c-info); }
 .todo-item .agent-badge--pi     { background: #ece5fd; color: #8a63f2; }
 .todo-check { width: 15px; height: 15px; cursor: pointer; flex-shrink: 0; }
 .todo-item-id { font-size: 0.72rem; color: var(--c-text-muted); font-weight: 600; flex-shrink: 0; }
 .todo-title { flex: 1; font-size: 0.9rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.todo-title.done { text-decoration: line-through; opacity: 0.55; }
-.todo-more { font-size: 0.78rem; color: var(--c-primary); text-decoration: none; flex-shrink: 0; opacity: 0.8; }
-.todo-more:hover { opacity: 1; text-decoration: underline; }
+.todo-title.done { text-decoration: line-through; color: var(--c-card-completed-title); }
+.todo-more { font-size: 0.78rem; color: var(--c-primary-text); text-decoration: none; flex-shrink: 0; }
+.todo-more:hover { text-decoration: underline; }
 .todo-sprint-nav { display: flex; align-items: center; gap: 8px; padding: 10px 16px; max-width: 800px; margin: 0 auto 4px; }
 .todo-sprint-nav .sprint-combo { min-width: 120px; }
 .todo-sprint-prev, .todo-sprint-next {
@@ -10524,7 +10649,7 @@
   transition: border-color 0.15s, color 0.15s, opacity 0.15s;
 }
 .todo-sprint-prev:disabled, .todo-sprint-next:disabled { opacity: 0.35; cursor: default; }
-.todo-sprint-prev:hover:not(:disabled), .todo-sprint-next:hover:not(:disabled) { border-color: var(--c-primary); color: var(--c-primary); }
+.todo-sprint-prev:hover:not(:disabled), .todo-sprint-next:hover:not(:disabled) { border-color: var(--c-primary); color: var(--c-primary-text); }
 
 /* ── To-Do drawer ── */
 .todo-drawer { position: fixed; right: 0; top: 0; width: 440px; max-width: 100vw; height: 100vh; background: var(--c-bg); border-left: 2px solid var(--c-border); transform: translateX(100%); transition: transform 0.22s ease; z-index: 500; overflow-y: auto; padding: 24px 20px; box-sizing: border-box; }
@@ -10559,7 +10684,7 @@
   justify-content: center;
 }
 .agent-selector-card {
-  background: var(--c-bg-elev, var(--c-bg-card));
+  background: var(--c-bg-card);
   border: 1px solid var(--c-border);
   border-radius: 12px;
   /* C1279 — keep width inclusive of padding, with a viewport-safe gutter. */
@@ -10644,9 +10769,10 @@
    that will launch by default if the user just clicks their existing pick. Base button is
    already a filled var(--c-primary) pill, so hover-state brightness alone can't distinguish
    "current" — an outer ring (gapped by the card's own background) reads at a glance without
-   fighting the fill color in either theme. */
+   fighting the fill color in either theme. (TPT683) The ring takes --c-primary-border: raw
+   --c-primary is a fill colour and falls under 3:1 against dark cards. */
 .agent-selector-btn--current {
-  box-shadow: 0 0 0 2px var(--c-bg-elev, var(--c-bg-card)), 0 0 0 4px var(--c-primary);
+  box-shadow: 0 0 0 2px var(--c-bg-card), 0 0 0 4px var(--c-primary-border);
 }
 .agent-selector-btn--current .agent-btn-label::before {
   content: '✓ ';
@@ -10676,13 +10802,15 @@
   left: 50%;
   transform: translateX(-50%);
   z-index: 9999;
-  background: var(--c-bg-overlay, #1e1e2e);
-  color: var(--c-text-muted);
-  border: 1px solid var(--c-border);
+  /* (TPT679) Per-theme surface: was an undefined --c-bg-overlay whose Mocha #1e1e2e fallback
+     painted a dark slab with sub-AA muted text in every light palette. */
+  background: var(--c-bg-card);
+  color: var(--c-text-secondary);
+  border: 1px solid var(--c-border-input);
   border-radius: 8px;
   padding: 10px 18px;
   font-size: 0.85rem;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.18);
   pointer-events: none;
   animation: agent-notice-in 0.2s ease;
 }
@@ -10718,7 +10846,7 @@
 }
 .agent-picker-trigger:focus {
   outline: none;
-  border-color: var(--c-primary);
+  border-color: var(--c-primary-border);
   box-shadow: 0 0 0 3px var(--c-primary-light);
 }
 .agent-picker-label { flex: 1; text-align: left; }
@@ -10757,7 +10885,7 @@ img.agent-picker-icon {
   transition: background 0.1s;
 }
 .agent-picker-option:hover { background: var(--c-primary-lighter); }
-.agent-picker-option.active { background: var(--c-primary-light); color: var(--c-primary); }
+.agent-picker-option.active { background: var(--c-primary-light); color: var(--c-primary-text); }
 .agent-picker-option .agent-picker-icon { opacity: 0.85; }
 .agent-picker--disabled .agent-picker-trigger {
   opacity: 0.55;
@@ -10849,7 +10977,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .task-modal-empty-mark {
   display: inline-flex; align-items: center; justify-content: center;
   width: 44px; height: 44px; border-radius: 12px;
-  background: var(--c-primary-light); color: var(--c-primary);
+  background: var(--c-primary-light); color: var(--c-primary-border);
 }
 .task-modal-empty-mark svg { width: 22px; height: 22px; }
 .task-modal-empty-title { margin: 6px 0 0; font-size: 0.98rem; font-weight: 600; color: var(--c-text); }
@@ -10902,10 +11030,10 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .modal-top-bar button.task-modal-tab svg { width: 15px; height: 15px; flex-shrink: 0; }
 .modal-top-bar button.task-modal-tab:hover:not(.active) { color: var(--c-text); background: color-mix(in srgb, var(--c-bg-card) 60%, transparent); }
 .modal-top-bar button.task-modal-tab.active {
-  background: var(--c-bg-card); color: var(--c-primary);
+  background: var(--c-bg-card); color: var(--c-primary-text);
   box-shadow: 0 1px 2px var(--c-shadow);
 }
-.modal-top-bar button.task-modal-tab:focus-visible { box-shadow: 0 0 0 2px var(--c-primary); }
+.modal-top-bar button.task-modal-tab:focus-visible { box-shadow: 0 0 0 2px var(--c-primary-border); }
 .task-modal-tab-dot {
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--c-warning); flex-shrink: 0;
@@ -11004,8 +11132,8 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .modal-top-bar button.btn-modal-cancel,
 .modal-top-bar button.btn-modal-reset { background: transparent; box-shadow: none; color: var(--c-text-secondary); }
 .modal-top-bar button.btn-modal-cancel:hover,
-.modal-top-bar button.btn-modal-reset:hover:not([disabled]) { color: var(--c-primary); border-color: var(--c-primary); background: var(--c-primary-light); }
-.modal-top-bar button:focus-visible { outline: none; border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-light); }
+.modal-top-bar button.btn-modal-reset:hover:not([disabled]) { color: var(--c-primary-text); border-color: var(--c-primary); background: var(--c-primary-light); }
+.modal-top-bar button:focus-visible { outline: none; border-color: var(--c-primary-border); box-shadow: 0 0 0 3px var(--c-primary-light); }
 .modal-top-bar button.btn-modal-save { background: var(--c-primary); color: var(--c-on-primary); border-color: var(--c-primary); }
 .modal-top-bar button.btn-modal-save:hover { background: var(--c-primary-hover); border-color: var(--c-primary-hover); }
 .modal-top-bar button[disabled] { opacity: .4; cursor: not-allowed; }
@@ -11018,7 +11146,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   margin-bottom: 8px; transition: border-color 120ms ease;
 }
 .modal-title-input:hover:not(:focus):not([readonly]) { border-bottom-color: var(--c-border); }
-.modal-title-input:focus { outline: none; border-bottom-color: var(--c-primary); }
+.modal-title-input:focus { outline: none; border-bottom-color: var(--c-primary-border); }
 .field-locked {
   opacity: 0.5;
   pointer-events: none;
@@ -11052,7 +11180,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .modal-desc-display:hover { border-color: var(--c-primary); }
 .modal-desc-display[role="button"]:focus-visible,
 .diff-title-display[role="button"]:focus-visible {
-  outline: 2px solid var(--c-primary);
+  outline: 2px solid var(--c-primary-border);
   outline-offset: 2px;
 }
 .modal-desc-display:not([role="button"]) { cursor: default; }
@@ -11094,7 +11222,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
   color: var(--c-text-secondary); margin-bottom: 4px;
 }
-.diff-col[data-diff-side="new"] .diff-col-label { color: var(--c-primary); }
+.diff-col[data-diff-side="new"] .diff-col-label { color: var(--c-primary-text); }
 .diff-change-badge {
   font-size: 0.68rem; font-weight: 600; text-transform: none; letter-spacing: normal;
   background: var(--c-bg-tier); color: var(--c-text-secondary); border-radius: 999px;
@@ -11165,8 +11293,8 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   margin-bottom: -1px;
 }
 .modal-tab-btn.active {
-  color: var(--c-primary);
-  border-bottom-color: var(--c-primary);
+  color: var(--c-primary-text);
+  border-bottom-color: var(--c-primary-border);
 }
 .modal-tab-panel[hidden] { display: none; }
 .modal-tab-btn[hidden] { display: none; }
@@ -11297,10 +11425,10 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
 }
 .modal-context-btns button svg { width: 16px; height: 16px; flex-shrink: 0; }
-.modal-context-btns button:hover { background: var(--c-primary-light); border-color: var(--c-primary); color: var(--c-primary); }
-.modal-context-btns button:focus-visible { outline: none; border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-light); }
+.modal-context-btns button:hover { background: var(--c-primary-light); border-color: var(--c-primary); color: var(--c-primary-text); }
+.modal-context-btns button:focus-visible { outline: none; border-color: var(--c-primary-border); box-shadow: 0 0 0 3px var(--c-primary-light); }
 /* Start is the one accent action in the footer; Stop and the manage group stay neutral. */
-.modal-context-btns button[data-action="start"] { background: var(--c-primary-light); border-color: var(--c-primary); color: var(--c-primary); }
+.modal-context-btns button[data-action="start"] { background: var(--c-primary-light); border-color: var(--c-primary); color: var(--c-primary-text); }
 .modal-context-btns button[data-action="start"]:hover { background: var(--c-primary); color: var(--c-on-primary); }
 .modal-context-btns button:disabled,
 .modal-context-btns button:disabled:hover {
@@ -11316,14 +11444,14 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 }
 .modal-tag-chip {
   display: inline-flex; align-items: center; gap: 2px;
-  background: var(--c-primary-light); color: var(--c-primary);
+  background: var(--c-primary-light); color: var(--c-primary-text);
   border-radius: 12px; padding: 2px 8px; font-size: 0.78rem; font-weight: 600;
 }
 .chip-remove {
   background: none; border: none; cursor: pointer;
-  color: var(--c-primary); font-size: 0.9rem; line-height: 1; padding: 0 0 0 2px;
+  color: var(--c-primary-text); font-size: 0.9rem; line-height: 1; padding: 0 0 0 2px;
 }
-.chip-remove:hover { color: var(--c-primary-hover); }
+.chip-remove:hover { color: var(--c-text); }
 .modal-tag-input {
   border: none; outline: none; background: transparent;
   font-size: 0.85rem; font-family: inherit; color: var(--c-text);
@@ -11352,7 +11480,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .tag-typeahead-option:hover,
 .tag-typeahead-option.active {
   background: var(--c-primary-light);
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 .tag-typeahead-option small {
   color: var(--c-text-muted);
@@ -11368,7 +11496,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 }
 .modal-dep-chip {
   display: inline-flex; align-items: center; gap: 2px;
-  background: var(--c-primary-light); color: var(--c-primary);
+  background: var(--c-primary-light); color: var(--c-primary-text);
   border-radius: 12px; padding: 2px 8px; font-size: 0.78rem; font-weight: 700;
 }
 .modal-dep-input {
@@ -11400,7 +11528,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .dep-typeahead-option:hover,
 .dep-typeahead-option.active {
   background: var(--c-primary-light);
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 .dep-typeahead-option small {
   color: var(--c-text-muted);
@@ -11435,7 +11563,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .member-typeahead-option:hover,
 .member-typeahead-option.active {
   background: var(--c-primary-light);
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 .member-typeahead-empty {
   padding: 0.4rem 0.75rem;
@@ -11484,7 +11612,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   color: color-mix(in srgb, var(--status-color, #94a3b8) 55%, white);
 }
 .modal-top-bar .modal-status-select:hover:not(:disabled) { border-color: var(--c-text-muted); }
-.modal-top-bar .modal-status-select:focus-visible { outline: none; border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-light); }
+.modal-top-bar .modal-status-select:focus-visible { outline: none; border-color: var(--c-primary-border); box-shadow: 0 0 0 3px var(--c-primary-light); }
 .modal-top-bar .modal-status-select:disabled { cursor: default; opacity: 0.75; background-image: none; padding-right: 14px; }
 
 .task-edit-panel .modal-tabs { gap: 12px; margin: 0 0 10px; }
@@ -11545,7 +11673,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .task-edit-panel .modal-field-group .member-combo-input:focus,
 .task-edit-panel .modal-field-group .modal-tags:focus-within,
 .task-edit-panel .modal-field-group .modal-deps:focus-within {
-  outline: none; border-color: var(--c-primary); box-shadow: 0 0 0 3px var(--c-primary-light);
+  outline: none; border-color: var(--c-primary-border); box-shadow: 0 0 0 3px var(--c-primary-light);
 }
 
 /* Chips match the card: tags = .tag-badge, dependency keys = .id-badge. */
@@ -11555,7 +11683,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   background: var(--c-bg-tier); color: var(--c-text-secondary);
 }
 .task-edit-panel .modal-dep-chip .chip-remove { color: var(--c-text-muted); }
-.task-edit-panel .modal-dep-chip .chip-remove:hover { color: var(--c-primary); }
+.task-edit-panel .modal-dep-chip .chip-remove:hover { color: var(--c-primary-text); }
 
 @media (max-width: 720px) {
   .task-edit-overlay { padding: 10px; }
@@ -11654,7 +11782,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .new-task-form .new-task-meta-fields .member-combo-input:focus,
 .new-task-form .modal-deps:focus-within {
   outline: none;
-  border-color: var(--c-primary);
+  border-color: var(--c-primary-border);
   box-shadow: 0 0 0 3px var(--c-primary-light);
 }
 
@@ -11782,7 +11910,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   cursor: pointer;
 }
 .comment-edit-btn:hover {
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 .comment-edit-input {
   width: 100%;
@@ -11798,7 +11926,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 }
 .comment-edit-input:focus {
   outline: none;
-  border-color: var(--c-primary);
+  border-color: var(--c-primary-border);
 }
 .comment-edit-actions {
   display: flex;
@@ -11845,7 +11973,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
    not just comments despite living in this comments-block section of the file. */
 mark.mention {
   background: transparent;
-  color: var(--c-primary);
+  color: var(--c-primary-text);
   font-weight: 600;
 }
 /* claude/codex/pi — highlighted for readability, but never a real notifiable member. */
@@ -11870,7 +11998,7 @@ mark.mention--agent {
 }
 .comment-input:focus {
   outline: none;
-  border-color: var(--c-primary);
+  border-color: var(--c-primary-border);
 }
 .comment-submit {
   align-self: flex-end;
@@ -12120,8 +12248,8 @@ mark.mention--agent {
   display: inline-block;
   transition: background 0.2s;
 }
-.setup-modal-dot.is-active { background: var(--c-mauve, #cba6f7); }
-.setup-modal-dot.is-done { background: var(--c-green, #a6e3a1); }
+.setup-modal-dot.is-active { background: var(--c-primary-border); }
+.setup-modal-dot.is-done { background: var(--c-success); }
 .setup-modal-dot.is-skipped { background: var(--c-border); opacity: 0.35; }
 
 .setup-modal-preset-grid {
@@ -12138,11 +12266,11 @@ mark.mention--agent {
   transition: border-color 0.15s, background 0.15s;
 }
 .setup-modal-preset-card:hover { background: var(--c-bg-sub-nav, rgba(0,0,0,0.1)); }
-.setup-modal-preset-card.is-selected { border-color: var(--c-mauve, #cba6f7); background: rgba(203,166,247,0.08); }
+.setup-modal-preset-card.is-selected { border-color: var(--c-primary-border); background: var(--c-primary-lighter); }
 .setup-modal-preset-letter {
   font-size: 0.7rem;
   font-weight: 700;
-  color: var(--c-mauve, #cba6f7);
+  color: var(--c-primary-text);
   margin-bottom: 0.15rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -12164,7 +12292,7 @@ mark.mention--agent {
   min-height: 100px;
   resize: vertical;
   padding: 0.5rem 0.65rem;
-  background: var(--c-bg-input, var(--c-bg));
+  background: var(--c-bg);
   color: var(--c-text);
   border: 1px solid var(--c-border);
   border-radius: 6px;
@@ -12173,7 +12301,7 @@ mark.mention--agent {
   line-height: 1.4;
   outline: none;
 }
-.setup-modal-textarea:focus { border-color: var(--c-mauve, #cba6f7); }
+.setup-modal-textarea:focus { border-color: var(--c-primary-border); }
 .setup-modal-create-project-form { margin-top: 0.75rem; display: none; }
 .setup-modal-create-project-form.is-visible { display: block; }
 .setup-modal-form-label {
@@ -12188,8 +12316,8 @@ mark.mention--agent {
   font-weight: 700;
   padding: 0.1rem 0.35rem;
   border-radius: 4px;
-  background: rgba(203,166,247,0.18);
-  color: var(--c-mauve, #cba6f7);
+  background: var(--c-primary-light);
+  color: var(--c-primary-text);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   margin-left: 0.35rem;
@@ -12215,8 +12343,8 @@ mark.mention--agent {
 }
 .setup-modal-tab:hover { color: var(--c-text); }
 .setup-modal-tab.is-active {
-  color: var(--c-mauve, #cba6f7);
-  border-bottom-color: var(--c-mauve, #cba6f7);
+  color: var(--c-primary-text);
+  border-bottom-color: var(--c-primary-border);
 }
 .setup-modal-tab-panel[hidden] { display: none; }
 .setup-modal-audio-panel {
@@ -12230,7 +12358,7 @@ mark.mention--agent {
   align-items: center;
   gap: 0.4rem;
   padding: 0.45rem 0.9rem;
-  background: var(--c-bg-input, var(--c-bg));
+  background: var(--c-bg);
   border: 1px dashed var(--c-border);
   border-radius: 6px;
   font-size: 0.82rem;
@@ -12239,7 +12367,7 @@ mark.mention--agent {
   transition: border-color 0.15s, color 0.15s;
 }
 .setup-modal-audio-file-label:hover {
-  border-color: var(--c-mauve, #cba6f7);
+  border-color: var(--c-primary-border);
   color: var(--c-text);
 }
 .setup-modal-audio-file-input { display: none; }
@@ -12310,7 +12438,7 @@ mark.mention--agent {
   outline: none;
   transition: border-color 0.15s;
 }
-.setup-modal-input:focus { border-color: var(--c-mauve, #cba6f7); }
+.setup-modal-input:focus { border-color: var(--c-primary-border); }
 
 .setup-modal-btn {
   padding: 0.42rem 0.9rem;
@@ -12325,11 +12453,15 @@ mark.mention--agent {
 .setup-modal-btn:disabled { opacity: 0.4; cursor: default; }
 
 .setup-modal-btn--primary {
-  background: var(--c-mauve, #cba6f7);
-  color: #11111b;
-  border-color: var(--c-mauve, #cba6f7);
+  background: var(--c-primary);
+  color: var(--c-on-primary);
+  border-color: var(--c-primary);
 }
-.setup-modal-btn--primary:not(:disabled):hover { opacity: 0.85; }
+/* A darker fill, not opacity: fading the button would also fade its text below AA. */
+.setup-modal-btn--primary:not(:disabled):hover {
+  background: var(--c-primary-hover);
+  border-color: var(--c-primary-hover);
+}
 
 .setup-modal-btn--secondary {
   background: transparent;
@@ -12343,10 +12475,10 @@ mark.mention--agent {
   margin-top: 0.5rem;
   min-height: 1.2em;
 }
-/* TPT174 — was var(--c-red, #f38ba8): --c-red is defined in no theme, so the Mocha pastel painted
-   in every theme (≈2.1:1 on the light themes' white). --c-danger has a value per theme. */
+/* TPT174 — --c-danger has a value per theme; the old undefined Catppuccin red painted its Mocha
+   pastel in every theme (≈2.1:1 on the light themes' white). */
 .setup-modal-msg--error { color: var(--c-danger); }
-.setup-modal-msg--ok { color: var(--c-green, #a6e3a1); }
+.setup-modal-msg--ok { color: var(--c-success); }
 .setup-modal-msg--muted { color: var(--c-text-muted); }
 
 .setup-modal-spinner {
@@ -12375,7 +12507,7 @@ mark.mention--agent {
   transition: background 0.12s, border-color 0.12s;
 }
 .setup-modal-project-card:hover { background: var(--c-bg-sub-nav, rgba(0,0,0,0.1)); }
-.setup-modal-project-card.is-selected { border-color: var(--c-mauve, #cba6f7); }
+.setup-modal-project-card.is-selected { border-color: var(--c-primary-border); background: var(--c-primary-lighter); }
 
 .setup-modal-project-name {
   font-size: 0.88rem;
@@ -12441,7 +12573,7 @@ mark.mention--agent {
 }
 .import-submenu-item:hover {
   background: var(--c-primary-light);
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 .import-submenu-item.loading,
 .import-submenu-item.disabled {
@@ -12524,7 +12656,7 @@ mark.mention--agent {
   padding: 0 4px;
 }
 .settings-close:hover {
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 .settings-body {
   display: flex;
@@ -12570,10 +12702,10 @@ mark.mention--agent {
   user-select: none;
   box-sizing: border-box;
 }
-/* --c-mauve was never defined in any theme, so the Mocha lilac painted on white in the light
-   themes; --c-primary is per-theme (the light themes get a readable violet). */
+/* --c-primary / --c-primary-lighter are per-theme, like every other .setup-modal-* accent
+   (TPT652); the old undefined Catppuccin lilac painted on white in the light themes. */
 .setup-modal-agent-card.is-selected {
-  border-color: var(--c-primary);
+  border-color: var(--c-primary-border);
   background: var(--c-primary-lighter);
 }
 .setup-modal-agent-card.is-unavailable {
@@ -12617,7 +12749,7 @@ mark.mention--agent {
 .setup-modal-agent-detail .setup-modal-agent-detail-output {
   margin: 0;
   padding: 0.1rem 0.35rem;
-  background: var(--c-bg-2, rgba(0,0,0,0.12));
+  background: var(--c-bg-sub-nav);
   border-radius: 4px;
   font-family: var(--c-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-size: inherit;
@@ -12652,7 +12784,7 @@ mark.mention--agent {
   color: var(--c-text-muted);
 }
 .setup-modal-agent-card.is-selected .setup-modal-agent-default-label {
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 input.sma-cb, input.sma-radio {
   accent-color: var(--c-primary);
@@ -12660,22 +12792,8 @@ input.sma-cb, input.sma-radio {
   flex-shrink: 0;
 }
 
-/* ── Per-agent extra block — sibling under a card (C1161 Claude/Codex model <select>s).
-   The Pi model rows are top-level cards + an inline .setup-modal-agent-form (TPT172), not an
-   extra block; the field/label/hint/note rules below are shared by both. ── */
-.setup-modal-agent-extra {
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-  margin: -0.15rem 0 0.15rem 1.65rem;
-  padding: 0.55rem 0.7rem;
-  border-left: 2px solid var(--c-primary);
-  background: var(--c-bg-sub-nav, rgba(127,127,127,0.06));
-  border-radius: 0 4px 4px 0;
-}
-.setup-modal-agent-extra[hidden] {
-  display: none;
-}
+/* ── Inline agent-form fields — the label/hint/note rules below are shared by both forms that open
+   under a card: the Pi Add/Edit form (TPT172) and the Claude/Codex model form (TPT637). ── */
 .setup-modal-agent-extra-field {
   display: flex;
   flex-direction: column;
@@ -12685,12 +12803,11 @@ input.sma-cb, input.sma-radio {
   font-size: 0.72rem;
   color: var(--c-text-muted);
 }
-.setup-modal-agent-extra .setup-modal-input,
 .setup-modal-agent-form .setup-modal-input {
   padding: 0.35rem 0.5rem;
   font-size: 0.8rem;
 }
-/* Form-scoped validation line. --c-danger (per-theme) rather than the undefined --c-red, whose
+/* Form-scoped validation line. --c-danger (per-theme); the old undefined Catppuccin red's
    Mocha-pink fallback measured ≈2.1:1 on the light themes' #f8f9fa form background. */
 .setup-modal-agent-extra-hint {
   margin: 0;
@@ -12718,8 +12835,10 @@ input.sma-cb, input.sma-radio {
   overflow-y: auto;
   padding-right: 2px;
 }
-/* `<Provider> · <model>` — provider and separator never shrink, the mono model id ellipsizes. */
-.setup-modal-agent-card--pi .setup-modal-agent-name {
+/* `<Provider> · <model>` — provider and separator never shrink, the mono model id ellipsizes. A
+   Claude/Codex card with a model pick (TPT637, `--model`) uses the same row: `<Agent> · <model>`. */
+.setup-modal-agent-card--pi .setup-modal-agent-name,
+.setup-modal-agent-card--model .setup-modal-agent-name {
   display: flex;
   align-items: baseline;
   gap: 0.35rem;
@@ -12748,12 +12867,28 @@ input.sma-cb, input.sma-radio {
   color: var(--c-text-muted);
   font-style: italic;
 }
+/* "No tools" on a custom Pi row declared `tools: false`, just before its ✎/×. Its tooltip says task
+   runs and task/project chats need a tool-capable model, while objective planning still works. */
+.setup-modal-agent-badge {
+  flex-shrink: 0;
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--c-warning-border);
+  border-radius: 999px;
+  background: var(--c-warning-bg);
+  color: var(--c-warning);
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: help;
+}
 /* Unchecked Pi model row: still visible and re-checkable until Save, just quieter. */
 .setup-modal-agent-card.is-off {
   opacity: 0.6;
 }
 .sma-pi-edit,
-.sma-pi-remove {
+.sma-pi-remove,
+.sma-model-edit {
   flex-shrink: 0;
   width: 26px;
   height: 26px;
@@ -12765,9 +12900,10 @@ input.sma-cb, input.sma-radio {
   line-height: 1;
   cursor: pointer;
 }
-.sma-pi-edit:hover {
+.sma-pi-edit:hover,
+.sma-model-edit:hover {
   border-color: var(--c-primary);
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 .sma-pi-remove:hover {
   border-color: var(--c-danger);
@@ -12784,8 +12920,10 @@ input.sma-cb, input.sma-radio {
    the add-row underneath is redundant: in add mode agent-select.js already swaps it out, but in
    EDIT mode the form renders under the edited card and the add-row still follows the last Pi card,
    which left a second "+ Add model" / N/8 sitting where the native provider popup opens. The form
-   always precedes the add-row among the grid's children, so the sibling combinator is enough. */
-.setup-modal-agent-form ~ .setup-modal-agent-add-row {
+   always precedes the add-row among the grid's children, so the sibling combinator is enough. A
+   Claude/Codex model form (TPT637) also precedes it but has nothing to do with Pi rows, so it is
+   excluded — the row stays put while a Claude/Codex model is being picked. */
+.setup-modal-agent-form:not(.setup-modal-agent-form--model) ~ .setup-modal-agent-add-row {
   display: none;
 }
 .setup-modal-agent-add-row .sma-pi-add {
@@ -12796,15 +12934,15 @@ input.sma-cb, input.sma-radio {
   font-size: 0.68rem;
   color: var(--c-text-muted);
 }
-/* The inline Add/Edit form — the only place the Provider/Model/API-key inputs and the red
-   validation line exist. Same primary left-accent as the C1161 extra blocks. */
+/* The inline form under a card: the Pi Add/Edit form — the only place the Provider/Model/API-key
+   inputs and the red validation line exist — and, as `--model` (below), the Claude/Codex model form. */
 .setup-modal-agent-form {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
   padding: 0.7rem 0.85rem;
   border: 1px solid var(--c-border);
-  border-left: 2px solid var(--c-primary);
+  border-left: 2px solid var(--c-primary-border);
   border-radius: 6px;
   background: var(--c-bg-sub-nav, rgba(127,127,127,0.06));
 }
@@ -12830,7 +12968,7 @@ input.sma-cb, input.sma-radio {
   padding: 0;
   border: 0;
   background: none;
-  color: var(--c-primary);
+  color: var(--c-primary-text);
   font: inherit;
   font-size: 0.68rem;
   cursor: pointer;
@@ -12852,6 +12990,24 @@ input.sma-cb, input.sma-radio {
 /* Base URL (custom endpoint only) takes its own full-width second row under the three columns. */
 .setup-modal-agent-form-fields > .setup-modal-agent-extra-field--baseurl { grid-column: 1 / -1; }
 .setup-modal-agent-form-fields > .setup-modal-agent-extra-field[hidden] { display: none; }
+/* "Model supports tool calls" (custom endpoint only): a full-width checkbox row under Base URL. It
+   is still a .setup-modal-agent-extra-field, so the [hidden] rule above hides it off `custom`. */
+.setup-modal-agent-form-fields > .setup-modal-agent-extra-field--tools {
+  grid-column: 1 / -1;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+}
+.setup-modal-agent-extra-field--tools .setup-modal-agent-extra-label {
+  font-size: 0.78rem;
+  color: var(--c-text);
+}
+input.sma-pi-tools {
+  margin: 0;
+  accent-color: var(--c-primary);
+  cursor: pointer;
+}
 /* Below ~720px the three columns get too tight: keep Provider + Model together and give the
    API key its own full-width line. */
 @media (max-width: 720px) {
@@ -12888,7 +13044,7 @@ input.sma-cb, input.sma-radio {
 .sma-pi-suggest-option:hover,
 .sma-pi-suggest-option.active {
   background: var(--c-primary-light);
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 .setup-modal-agent-form-actions {
   display: flex;
@@ -12902,6 +13058,31 @@ input.sma-cb, input.sma-radio {
 .setup-modal-agent-form-actions .setup-modal-btn {
   padding: 0.3rem 0.75rem;
   font-size: 0.78rem;
+}
+/* TPT637 — the Claude/Codex model form: the same shell around ONE field, so the field and its
+   Cancel / Save share a single 2rem line instead of stacking, and wrap apart only when the panel is
+   too narrow. (0-2-x) specificity outranks the three-column grid and its 720px override above. */
+.setup-modal-agent-form--model {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.6rem;
+}
+.setup-modal-agent-form--model .setup-modal-agent-form-fields {
+  flex: 1 1 14rem;
+  grid-template-columns: minmax(0, 1fr);
+}
+.setup-modal-agent-form--model .setup-modal-agent-form-fields select {
+  width: 100%;
+  min-width: 0;
+  padding-right: 1.6rem;
+}
+.setup-modal-agent-form--model .setup-modal-agent-form-actions {
+  margin-left: auto;
+}
+.setup-modal-agent-form--model .setup-modal-agent-form-actions .setup-modal-btn {
+  box-sizing: border-box;
+  height: 2rem;
 }
 /* Shown under the grid when only SOME Pi models are unchecked. */
 .setup-modal-agent-unchecked-note {
@@ -12927,16 +13108,8 @@ input.sma-cb, input.sma-radio {
   justify-content: center;
 }
 
-/* ── C1161: per-agent Claude/Codex model <select> — same sibling extra-block slot as the
-   pi credentials rows above, but a single label+select row instead of stacked fields.
-   `.setup-modal-agent-extra[hidden]` (declared above) still governs visibility. ── */
-.setup-modal-agent-extra-field--select {
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-}
-.setup-modal-agent-extra select,
+/* ── Native <select>s in the inline agent forms: the Pi Provider and (TPT637) the Claude/Codex
+   Model. Both also sit in a `.setup-modal-agent-form-fields` track, which sets their height. ── */
 .setup-modal-agent-form select {
   font-size: 0.8rem;
   font-weight: 500;
@@ -12950,9 +13123,8 @@ input.sma-cb, input.sma-radio {
 }
 /* The pi Provider select sits in the form grid's fixed 9.5rem first column and also carries
    .setup-modal-input. Without this override the 160px min-width above overflows the column into
-   the Model input, and .setup-modal-agent-extra .setup-modal-input's shorter padding leaves the
+   the Model input, and .setup-modal-agent-form .setup-modal-input's shorter padding leaves the
    native arrow no room. Specificity (0-2-1) beats both. */
-.setup-modal-agent-extra .setup-modal-agent-extra-field--provider select,
 .setup-modal-agent-form .setup-modal-agent-extra-field--provider select {
   min-width: 0;
   width: 100%;
@@ -12978,7 +13150,7 @@ input.sma-cb, input.sma-radio {
 }
 .setup-modal-agent-empty-item code {
   font-family: var(--c-mono, monospace);
-  background: var(--c-bg-2, rgba(0,0,0,0.18));
+  background: var(--c-bg-sub-nav);
   padding: 0.1em 0.4em;
   border-radius: 3px;
   font-size: 0.78rem;
@@ -13027,14 +13199,12 @@ input.sma-cb, input.sma-radio {
 .theme-dark .id-badge.coding    { background: rgba(99,102,241,0.22); color: #c7d2fe; }
 .theme-dark .id-badge.human     { background: rgba(236,72,153,0.20); color: #fbcfe8; }
 
-/* Completed / canceled card backgrounds */
-.theme-dark .card[data-status-role="complete"],
-.theme-dark .card[data-status-role="canceled"] {
-  box-shadow: inset 0 0 0 1px var(--c-card-completed-border), 0 1px 3px var(--c-shadow);
+/* Completed / canceled card edges — flat like the light rules (TPT682) */
+.theme-dark .card[data-status-role="complete"] {
+  box-shadow: inset 0 0 0 1px var(--c-card-completed-border);
 }
 .theme-dark .card[data-status-role="canceled"] {
-  box-shadow: inset 0 0 0 1px var(--c-card-canceled-border), 0 1px 3px var(--c-shadow);
-  opacity: 1;
+  box-shadow: inset 0 0 0 1px var(--c-card-canceled-border);
 }
 
 /* (TPT278) Card hover-button pills: --c-bg-card matches the card itself in dark themes,
@@ -13067,7 +13237,7 @@ input.sma-cb, input.sma-radio {
 .theme-dark .card-desc .file-ref,
 .theme-dark .modal-desc-display .file-ref {
   background: var(--c-bg-tier);
-  color: var(--c-primary);
+  color: var(--c-primary-text);
 }
 
 /* ── (TPT345) Merge task branches panel — merge-branches-modal.js. Own positioning shell
@@ -13168,7 +13338,7 @@ input.sma-cb, input.sma-radio {
 .merge-step { display: flex; align-items: center; gap: 0.5rem; }
 .merge-step-icon { width: 1rem; text-align: center; color: var(--c-text-muted); }
 .merge-step-icon::before { content: '○'; }
-.merge-step[data-state="running"] .merge-step-icon::before { content: '◐'; color: var(--c-primary); display: inline-block; animation: spin 1.2s linear infinite; }
+.merge-step[data-state="running"] .merge-step-icon::before { content: '◐'; color: var(--c-primary-text); display: inline-block; animation: spin 1.2s linear infinite; }
 .merge-step[data-state="done"] .merge-step-icon::before { content: '✓'; color: var(--c-success); }
 .merge-step[data-state="failed"] .merge-step-icon::before { content: '✕'; color: var(--c-danger); }
 .merge-step[data-state="skipped"] .merge-step-icon::before { content: '–'; }
@@ -13302,7 +13472,7 @@ input.sma-cb, input.sma-radio {
 }
 .btn-restart-session:not(:disabled):hover { background: var(--c-primary-hover); border-color: var(--c-primary-hover); }
 .btn-restart-session:not(:disabled):active { transform: translateY(1px); }
-.btn-restart-session:focus-visible { outline: 2px solid var(--c-primary); outline-offset: 2px; }
+.btn-restart-session:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
 .btn-restart-session:disabled { cursor: progress; opacity: 0.8; }
 .btn-restart-session-icon { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; }
 .task-modal-pane--terminal .terminal-session-lost { padding-inline: 18px; }
@@ -13339,7 +13509,7 @@ input.sma-cb, input.sma-radio {
 .terminal-watchdog-buttons button { flex-shrink: 0; padding: 0.2rem 0.45rem; font-size: 0.75rem; }
 .terminal-watchdog-buttons .btn-resume-paused {
   border-color: var(--c-primary);
-  color: var(--c-primary);
+  color: var(--c-primary-text);
   background: var(--c-primary-lighter, var(--c-bg-card));
 }
 .terminal-watchdog-buttons .btn-resume-paused:not(:disabled):hover { background: var(--c-primary-light, var(--c-primary-lighter)); }

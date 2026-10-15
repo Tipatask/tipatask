@@ -18,6 +18,7 @@ const { fetchStatusContext } = require('../server/status-roles');
 const { isPlaceholderDescription, placeholderError } = require('./tag-description');
 const { AuthCorruptedError } = require('../server/auth-guard');
 const { isValidTaskKey, maxNumbersByPrefix } = require('../server/task-key-format');
+const { buildArchitectureReply } = require('./arch-budget');
 
 // Agents frequently pass keys with surrounding whitespace, brackets, quotes,
 // trailing punctuation, or lowercase prefixes (e.g. "c287", "[c287]", "c287.", "tpt214").
@@ -117,7 +118,7 @@ async function main() {
 
   server.tool(
     'list_task_id_meta',
-    `Returns the max task-ID number per prefix across ALL statuses (for next-ID computation — see maxByPrefix; maxCId/maxHId kept for back-compat, they're just maxByPrefix.C/.H) plus all active tasks (not completed/canceled — C1187: resolved via this project's own workflow roles, so a renamed/custom status registry is handled correctly) with summary fields. Single round-trip, <5KB response. Use for WORKFLOW step 0 instead of list_tasks with no filter. ${projectScopeNote}`,
+    `Returns the max task-ID number per prefix across ALL statuses (for next-ID computation — see maxByPrefix; maxCId/maxHId kept for back-compat, they're just maxByPrefix.C/.H) plus all active tasks (not completed/canceled — C1187: resolved via this project's own workflow roles, so a renamed/custom status registry is handled correctly) with summary fields. Unfinalized reserve_task_keys placeholders are excluded from active, though their keys still count in maxByPrefix. Single round-trip, <5KB response. Use for WORKFLOW step 0 instead of list_tasks with no filter. ${projectScopeNote}`,
     {},
     async () => {
       ensureKbSynced();
@@ -138,6 +139,10 @@ async function main() {
       const active = [];
 
       for (const t of tasks) {
+        // Unfinalized reserve_task_keys placeholders are not real tasks: their keys are
+        // already counted by maxNumbersByPrefix above (reserved keys are taken), but they
+        // must not be offered as modifiable active work.
+        if (isReservationPlaceholder(t)) continue;
         if (statusCtx.active.has(t.status)) {
           active.push({ id: t.id, projectId: t.projectId, title: t.title, category: t.category, status: t.status, priority: t.priority, tags: t.tags });
         }
@@ -401,12 +406,20 @@ async function main() {
   );
 
   // ── create_task ──
+  // TPT9004: task keys come from the API's allocator only. A create normally goes keyless
+  // (backend.createTask() -> POST /tasks -> allocateTaskKeyOnCreate()). The one accepted
+  // caller-supplied key is one THIS server process handed out through reserve_task_keys
+  // below (one Set per process = per agent session) whose placeholder row is still
+  // unfinalized; it is finalized in place by PATCH, never re-POSTed (the API answers 409).
+  // An agent's own "max + 1" or "my task key + 1" is refused — that is how a project ends
+  // up with two numberings (the TPT70x-vs-TPT900x split this closes).
+  const sessionReservedKeys = new Set();
 
   server.tool(
     'create_task',
-    `Create a new task. ${projectScopeNote}`,
+    `Create a new task. The task key is assigned by the API: OMIT task_key (preferred) and the response carries the allocated key. Pass task_key ONLY when this session obtained it from reserve_task_keys; any other key — including one computed from existing keys — is refused. ${projectScopeNote}`,
     {
-      task_key: z.string().describe('Unique task key, e.g. "C200"'),
+      task_key: z.string().optional().describe('OMIT (preferred): the API allocates the next key in this project\'s sequence. Pass a key ONLY if this session got it from reserve_task_keys; any other key is refused.'),
       title: z.string().describe('Task title'),
       description: z.string().describe('Task description'),
       category: z.enum(['CODING', 'HUMAN']).default('CODING').describe('Category'),
@@ -479,11 +492,19 @@ async function main() {
       // update_task does (line ~258) — agents pass keys with whitespace/brackets/
       // lowercase prefixes (normalizeTaskKey) and the un-normalized form would silently
       // miss the priorityMap lookup. Persist the normalized form too, matching C1053.
-      const normalizedTaskKey = normalizeTaskKey(args.task_key);
-      // C1482: task_key must be reserve_task_keys output (prefix+number) — never an
-      // agent-invented descriptive slug (e.g. "C-kb-dev-scripts", the reported bug).
-      if (!isValidTaskKey(normalizedTaskKey)) {
-        return { content: [{ type: 'text', text: `Invalid task_key ${JSON.stringify(args.task_key)} — keys must be prefix+number (reserve_task_keys output, e.g. "C214" or "TPT214"), never a descriptive slug. Call mcp__tipatask__reserve_task_keys to get a real key.` }], isError: true };
+      // TPT9004: an omitted task_key is the normal case — the API allocates it. A supplied
+      // key must be shape-valid (C1482) AND one this session got from reserve_task_keys;
+      // its placeholder row is checked right before the write below.
+      const normalizedTaskKey = args.task_key === undefined ? '' : normalizeTaskKey(args.task_key);
+      if (args.task_key !== undefined) {
+        // C1482: task_key must be reserve_task_keys output (prefix+number) — never an
+        // agent-invented descriptive slug (e.g. "C-kb-dev-scripts", the reported bug).
+        if (!isValidTaskKey(normalizedTaskKey)) {
+          return { content: [{ type: 'text', text: `Invalid task_key ${JSON.stringify(args.task_key)} — keys must be prefix+number (reserve_task_keys output, e.g. "C214" or "TPT214"), never a descriptive slug. Omit task_key to let the API allocate the next key, or call mcp__tipatask__reserve_task_keys to get a real one.` }], isError: true };
+        }
+        if (!sessionReservedKeys.has(normalizedTaskKey)) {
+          return { content: [{ type: 'text', text: `task_key ${JSON.stringify(normalizedTaskKey)} was not returned by mcp__tipatask__reserve_task_keys in this session — task keys are assigned by the API, never computed by the caller. Omit task_key to let the API allocate the next key, or call mcp__tipatask__reserve_task_keys first and pass one of its keys.` }], isError: true };
+        }
       }
       const normalizedDeps = (args.dependencies || [])
         .map(d => normalizeTaskKey(d))
@@ -496,7 +517,7 @@ async function main() {
             priority,
             dependencies: normalizedDeps,
             tasks: tasksSnapshot,
-            taskId: args.task_key,
+            taskId: normalizedTaskKey || null,
             status,
             normalizeKey: normalizeTaskKey,
             activeStatuses: statusCtx.active,
@@ -527,8 +548,7 @@ async function main() {
         console.error(`[create_task] order computation failed (${err.message}); using 0`);
       }
 
-      const task = {
-        id: args.task_key,
+      const fields = {
         title: args.title,
         description: args.description,
         category: args.category,
@@ -537,9 +557,26 @@ async function main() {
         order,
         dependencies: normalizedDeps,
         tags: args.tags,
-        assignee: null,
       };
-      const result = await backend.createTask(task);
+      let result;
+      if (normalizedTaskKey) {
+        // A reserved key: its placeholder row must still be the untouched reservation
+        // (not finalized by update_task or an earlier create_task, not deleted/purged) —
+        // then finalize it in place. No assignee in the PATCH: the reserve route stamped
+        // the creator, and clearing it would hide the task from the owner's board (same
+        // rule as api-backend.js overwriteRaw()).
+        const live = await backend.getTask(normalizedTaskKey);
+        if (!isReservationPlaceholder(live)) {
+          sessionReservedKeys.delete(normalizedTaskKey);
+          return { content: [{ type: 'text', text: `task_key ${JSON.stringify(normalizedTaskKey)} is no longer an unfinalized reservation placeholder (already finalized or deleted) — omit task_key to let the API allocate a new key, or call mcp__tipatask__reserve_task_keys again.` }], isError: true };
+        }
+        result = await backend.updateTask(normalizedTaskKey, fields);
+        sessionReservedKeys.delete(normalizedTaskKey);
+      } else {
+        // Keyless: api-backend.js's _rawCreateTask() sends no task_key and the API's
+        // allocateTaskKeyOnCreate() assigns <task_prefix>N (H<n> for HUMAN) atomically.
+        result = await backend.createTask({ ...fields, assignee: null });
+      }
       taskCache.invalidate();
       // Best-effort sprint row for a dependency-floor bump — mirrors C1053's own
       // sprint-row creation for its cascade/heal bumps. Idempotent end-to-end:
@@ -571,7 +608,7 @@ async function main() {
 
   server.tool(
     'reserve_task_keys',
-    `Atomically reserve N real, collision-proof task keys for tasks you are about to PROPOSE this turn. Creates lightweight placeholder rows server-side and returns their keys (e.g. ["C214","C215"]). Use the returned keys, IN ORDER, as the "id" values in your proposal JSON. This does NOT create the task's real content — title/description/tags are filled in only when the user Accepts/Saves. Call ONCE per category per turn after you know how many new CODING/HUMAN tasks you will propose. On a later turn, call again ONLY for additional new tasks beyond those already reserved earlier in this session; reuse previously-reserved keys for tasks you are carrying over. ${projectScopeNote}`,
+    `Atomically reserve N real, collision-proof task keys for tasks you are about to PROPOSE this turn. Creates lightweight placeholder rows server-side and returns their keys (e.g. ["C214","C215"]). Use the returned keys, IN ORDER, as the "id" values in your proposal JSON (or as create_task's task_key within this same session — the only keys it accepts). This does NOT create the task's real content — title/description/tags are filled in only when the user Accepts/Saves. Call ONCE per category per turn after you know how many new CODING/HUMAN tasks you will propose. On a later turn, call again ONLY for additional new tasks beyond those already reserved earlier in this session; reuse previously-reserved keys for tasks you are carrying over. ${projectScopeNote}`,
     {
       count: z.number().int().min(1).max(50).describe('How many NEW task keys to reserve this turn'),
       category: z.enum(['CODING', 'HUMAN']).default('CODING').describe('Category — determines the key prefix (CODING→this project\'s own task_prefix, HUMAN→H; C1481)'),
@@ -584,6 +621,8 @@ async function main() {
         return { content: [{ type: 'text', text: 'reserve_task_keys is not supported by the active backend.' }], isError: true };
       }
       const { keys } = await backend.reserveTaskKeys({ count, category, priority: priority ?? 0 });
+      // TPT9004: create_task accepts a caller-supplied task_key only from this set.
+      for (const key of keys) sessionReservedKeys.add(key);
       taskCache.invalidate();
       return {
         content: [{ type: 'text', text: JSON.stringify({ project_id: projectId, category, keys }, null, 2) }],
@@ -736,11 +775,12 @@ async function main() {
 
   server.tool(
     'get_tag_architecture',
-    'Read the full architecture documentation for a system-specific tag. Returns the content of ai/architecture/{tag_name}.md. Use before implementing anything in that module.',
+    'Read architecture documentation for a system-specific tag. Returns Markdown or a truncated section outline within a 60000-character serialized reply budget. Use section to fetch one heading body. Use before implementing anything in that module.',
     {
-      tag_name: z.string().describe('Tag name, e.g. "tt-api-auth" or "tt-task-cards"'),
+      tag_name: z.string().max(200).describe('Tag name, e.g. "tt-api-auth" or "tt-task-cards"'),
+      section: z.string().optional().describe('Exact ##/### heading text, case-insensitive; returns its body including nested subsections'),
     },
-    ({ tag_name }) => {
+    ({ tag_name, section }) => {
       ensureKbSynced();
       try {
         const t = archCacheLog ? Date.now() : 0;
@@ -760,7 +800,7 @@ async function main() {
             isError: true,
           };
         }
-        return { content: [{ type: 'text', text: content }] };
+        return buildArchitectureReply([[tag_name, content]], { single: true, section });
       } catch (err) {
         return { content: [{ type: 'text', text: `Error reading file: ${err.message}` }], isError: true };
       }
@@ -771,24 +811,22 @@ async function main() {
 
   server.tool(
     'get_tag_architectures',
-    'Read architecture docs for multiple tags in one call. Returns map { tag_name: content_or_null }. Use when loading 2+ tags — single-call replacement for repeated get_tag_architecture.',
+    'Read architecture docs in request order. Returns map { tag_name: content_or_outline_or_null } within a 60000-character serialized reply budget. Oversized docs have truncated: true, chars, sections and hint. Use section to fetch one heading body per tag.',
     {
-      tag_names: z.array(z.string()).min(1).max(50).describe('Tag names, e.g. ["tt-api-auth", "tt-task-cards"]'),
+      tag_names: z.array(z.string().max(200)).min(1).max(50).describe('Tag names, e.g. ["tt-api-auth", "tt-task-cards"]'),
+      section: z.string().optional().describe('Exact ##/### heading text, case-insensitive; missing sections return null'),
     },
-    ({ tag_names }) => {
+    ({ tag_names, section }) => {
       ensureKbSynced();
       try {
         const t = archCacheLog ? Date.now() : 0;
         const statsBefore = archCacheLog ? cache.getStats() : null;
-        const map = {};
-        for (const name of tag_names) {
-          map[name] = cache.getTagArchitecture(name);
-        }
+        const entries = tag_names.map(name => [name, cache.getTagArchitecture(name)]);
         if (archCacheLog) {
           const s = cache.getStats();
           process.stderr.write(`[mcp:arch-cache] tool=get_tag_architectures count=${tag_names.length} ms=${Date.now() - t} hits=${s.hits - statsBefore.hits} reads=${s.contentReads - statsBefore.contentReads}\n`);
         }
-        return { content: [{ type: 'text', text: JSON.stringify(map, null, 2) }] };
+        return buildArchitectureReply(entries, { section });
       } catch (err) {
         return { content: [{ type: 'text', text: `Error reading architecture files: ${err.message}` }], isError: true };
       }

@@ -138,6 +138,7 @@ if (process.platform === 'win32') {
       'case "$1" in --version) echo "codex-cli 0.160.0";; *) echo "Not logged in"; exit 1;; esac');
     assert.equal(res.available, false);
     assert.match(res.reason, /not logged in/i);
+    assert.equal(res.reasonCode, 'not_logged_in'); // (TPT9008)
     assert.deepEqual(res.detail, { bin, exit: 1, output: 'Not logged in', version: '0.160.0' });
   });
 

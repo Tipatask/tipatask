@@ -329,6 +329,20 @@ test('template.html: seedObjectiveFromTask returns the tabId (or null) on every 
   }
 });
 
+test('template.html + task-card.js: task-key reads go through task-fetch.js, never the raw IPC bridge (TPT672)', () => {
+  // A direct electronAPI.api.tasks.get() call misses api.tasks.get()'s 403-marker conversion
+  // and { _ipcError } envelope — the marker would read as a real (empty) task.
+  for (const file of ['template.html', 'task-card.js']) {
+    assert.doesNotMatch(readSource(file), /electronAPI\??\.api\??\.tasks\??\.get\b/, `${file} calls electronAPI.api.tasks.get directly`);
+  }
+  const html = readSource('template.html');
+  const seed = html.slice(html.indexOf('async function seedObjectiveFromTask('));
+  assert.match(seed.slice(0, seed.indexOf('\n}\n')), /TipTask\.taskFetch\.loadTaskForAction\(taskKey, 'handoff\.errLoad'\)/);
+  assert.match(html, /context\.parentKey \? TipTask\.taskFetch\.fetchTaskOrNull\(context\.parentKey\)/,
+    'the parent-pane read must fail soft to null through fetchTaskOrNull()');
+  assert.match(readSource('index.js'), /window\.TipTask = \{[^}]*\btaskFetch\b/, 'index.js must expose taskFetch on window.TipTask');
+});
+
 test('chat-ui.js: every fresh acceptedMask assignment goes through buildInitialAcceptedMask, not a bare all-true map', () => {
   const src = readSource('chat-ui.js');
   assert.match(

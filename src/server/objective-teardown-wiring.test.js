@@ -253,7 +253,9 @@ test('terminal reconnect reports a newer server exit only for a missing registry
   assert.deepEqual(frame, { type: 'error', code: 'ESESSION_LOST', reason: 'signal:SIGTERM', at,
     message: `Terminal session for TPT415 was lost when the server exited (signal:SIGTERM, ${at}).` });
   for (const start of [null, '', 'bad', Date.parse(at), Date.parse(at) + 1000]) {
-    assert.equal((await connect(start)).error.code, undefined);
+    // (TPT9002) The generic "no session" frame is coded too, with the key as its param.
+    assert.deepEqual((await connect(start)).error, { type: 'error', code: 'ENOSESSION', params: { taskId: 'TPT415' },
+      message: 'No active terminal session for TPT415' });
   }
   const exited = { type: 'terminal', tabId: 'TPT415', alive: false, buffer: 'retained history' };
   const retained = await connect(before, exited);
@@ -262,7 +264,135 @@ test('terminal reconnect reports a newer server exit only for a missing registry
   assert.equal(retained.frames.find(f => f.type === 'exit').code, null);
   assert.equal(exited.buffer, 'retained history');
   fs.writeFileSync(recordPath, '{');
-  assert.equal((await connect(before)).error.code, undefined);
+  assert.equal((await connect(before)).error.code, 'ENOSESSION');
+});
+
+// (TPT9002) Every terminal start failure goes out with a stable code (+ params) beside the English
+// message the console modal used to print verbatim.
+test('startFailureFrame: stable codes with params beside the English message', () => {
+  const h = harness();
+  // The frame is built inside the vm context (another realm): compare it as the client sees it.
+  const frame = (err, session) => JSON.parse(JSON.stringify(h.ctx.startFailureFrame(err, session)));
+  const session = { taskAgentLabel: 'Codex' };
+  assert.deepEqual(frame(Object.assign(new Error('TASK_ASSIGNED_TO_OTHER_MEMBER'), { code: 'EASSIGNEE' }), session),
+    { type: 'error', code: 'EASSIGNEE', message: 'Cannot start a task assigned to another member.' });
+  assert.deepEqual(frame(Object.assign(new Error('Assignee claim did not persist'), { code: 'ECLAIM' }), session),
+    { type: 'error', code: 'ECLAIM', message: 'Could not assign this task to you. Task start canceled.' });
+  assert.deepEqual(frame(new Error('Codex CLI not found'), session),
+    { type: 'error', code: 'ESTART', params: { label: 'Codex', message: 'Codex CLI not found' }, message: 'Failed to start Codex: Codex CLI not found' });
+  const { AuthCorruptedError } = require('./auth-guard');
+  assert.deepEqual(frame(new AuthCorruptedError('API rejected this account — sign in again.', { reasonCode: 'unauthorized' }), session),
+    { type: 'error', code: 'EAUTH', message: 'Authentication expired or invalid — sign in again.' });
+  const expired = new AuthCorruptedError('API token expired at 09:05 — sign in again.', { reasonCode: 'expired', detail: { when: '09:05', expiresAt: 1 } });
+  assert.deepEqual(frame(expired, session),
+    { type: 'error', code: 'EAUTH', reason: 'expired', params: { when: '09:05', expiresAt: 1 }, message: expired.message });
+  const expiring = new AuthCorruptedError('API token expires at 09:05 and could not be refreshed (offline) — sign in again.',
+    { reasonCode: 'expiring', detail: { when: '09:05', expiresAt: 1, refreshError: 'offline' } });
+  assert.deepEqual(frame(expiring, session),
+    { type: 'error', code: 'EAUTH', reason: 'expiring', params: { when: '09:05', expiresAt: 1, refreshError: 'offline' }, message: expiring.message });
+  // (TPT9008) A coded start failure adds its reason and params; label and message stay the frame's own.
+  const coded = Object.assign(new Error('Codex is not logged in'),
+    { reasonCode: 'not_logged_in', reasonParams: { agent: 'codex', label: 'spoofed', message: 'spoofed' } });
+  assert.deepEqual(frame(coded, session), {
+    type: 'error', code: 'ESTART', reason: 'not_logged_in',
+    params: { agent: 'codex', label: 'Codex', message: 'Codex is not logged in' },
+    message: 'Failed to start Codex: Codex is not logged in',
+  });
+  // A null/empty code is an uncoded failure: no reason, and its params are not forwarded.
+  assert.deepEqual(frame(Object.assign(new Error('boom'), { reasonCode: null, reasonParams: { agent: 'codex' } }), session),
+    { type: 'error', code: 'ESTART', params: { label: 'Codex', message: 'boom' }, message: 'Failed to start Codex: boom' });
+  // Missing taskId on connect.
+  const ws = fakeWs();
+  return h.exports.handleConnection(ws, { url: '/?', headers: { host: 'localhost' } }, new Map(), () => null).then(() => {
+    assert.deepEqual(ws.frames.find(f => f.type === 'error'), { type: 'error', code: 'EBADREQUEST', message: 'Missing taskId parameter' });
+  });
+});
+
+// (TPT9014) A queued start drained after its headless Play All / bulk Start socket closed has no
+// socket for the refusal: the coded frame rides the session-ended broadcast instead.
+test('a queued start refused on drain broadcasts session-ended carrying the coded error frame', async () => {
+  const h = harness();
+  const websocket = require('./websocket');
+  const realBroadcast = websocket.broadcastToProject;
+  const broadcasts = [];
+  websocket.broadcastToProject = (projectPath, type, payload) => {
+    broadcasts.push(JSON.parse(JSON.stringify({ projectPath, type, payload })));
+  };
+  try {
+    // The state the start queue hands launchNewTerminalSession(): no socket attached.
+    const session = { type: 'terminal', tabId: 'TPT1', ws: null, projectPath: '/proj/a', taskAgent: 'claude', taskAgentLabel: 'Claude' };
+    const sessionKey = h.ctx.sessKey('TPT1', '/proj/a');
+    const sessions = new Map([[sessionKey, session]]);
+    const backend = { getTask: async () => ({ id: 'TPT1', assignee: 7, tags: [] }), getCurrentUserId: async () => 3 };
+    await h.ctx.launchNewTerminalSession({ session, prompt: 'Work on task TPT1', taskId: 'TPT1', sessionKey, sessions, backend, projectPath: '/proj/a' });
+    assert.equal(sessions.has(sessionKey), false, 'the refused session leaves the map');
+    assert.deepEqual(broadcasts.filter(b => b.type === 'session-ended'), [{
+      projectPath: '/proj/a',
+      type: 'session-ended',
+      payload: { taskId: 'TPT1', tabId: 'TPT1', reason: 'start-failed',
+        error: { type: 'error', code: 'EASSIGNEE', message: 'Cannot start a task assigned to another member.' } },
+    }]);
+  } finally {
+    websocket.broadcastToProject = realBroadcast;
+  }
+});
+
+// (TPT9008) End to end for every coded start failure the server can send: the agent's real
+// detect() sentence (DETECT_REASONS via unavailableResult(), base-agent's detection_failed, Pi's
+// tool-compat refusal) → the spawn gate's error shape → startFailureFrame() → the console modal's
+// errorFrameText(). An English project must read exactly the server's message, a Ukrainian one a
+// full translation — so a sentence edited on either side without the other fails here.
+test('startFailureFrame: every coded start failure renders the server text in English and a full translation in Ukrainian', async () => {
+  const h = harness();
+  const frame = (err, session) => JSON.parse(JSON.stringify(h.ctx.startFailureFrame(err, session)));
+  const { setLocale } = await import('../client/i18n.js');
+  const { errorFrameText } = await import('../client/terminal-frame-text.js');
+  const BaseTaskAgent = require('./task-agent/base-agent');
+  const { toolCompatMessage } = require('./pi-custom-endpoint');
+  // As terminal-session.js _spawnTerminal() throws it for a detect() negative.
+  const gateError = (agent, status) => Object.assign(new Error(status.reason),
+    { reasonCode: status.reasonCode, reasonParams: { ...status.reasonParams, agent: agent.id } });
+  const cases = [];
+  for (const Agent of [require('./task-agent/claude-agent'), require('./task-agent/codex-agent'), require('./task-agent/pi-agent')]) {
+    const agent = new Agent();
+    const codes = Object.keys(Agent.DETECT_REASONS);
+    assert.ok(codes.length >= 3, `${agent.id} declares its detection reasons`);
+    for (const code of codes) {
+      const params = Agent.DETECT_REASONS[code].includes('{output}') ? { output: 'Error: Cannot find module $& x' } : undefined;
+      const status = agent.unavailableResult(code, { params });
+      assert.equal(status.reasonCode, code);
+      assert.doesNotMatch(status.reason, /\{\w+\}/, `${agent.id}.${code}: every placeholder filled`);
+      cases.push({ name: `${agent.id}.${code}`, err: gateError(agent, status), label: agent.label });
+    }
+  }
+  class Broken extends BaseTaskAgent { async detect() { throw new Error('probe exploded'); } }
+  const broken = new Broken('codex', 'Codex');
+  const failed = await broken.cachedDetect({});
+  assert.equal(failed.reasonCode, 'detection_failed');
+  cases.push({ name: 'base.detection_failed', err: gateError(broken, failed), label: broken.label });
+  const host = 'openrouter.ai';
+  cases.push({
+    name: 'pi.no_tool_calls',
+    err: Object.assign(new Error(toolCompatMessage('recraft-v3', host, { declared: true })),
+      { reasonCode: 'no_tool_calls', reasonParams: { agent: 'pi', model: 'recraft-v3', host } }),
+    label: 'Other Model',
+  });
+  try {
+    for (const { name, err, label } of cases) {
+      const sent = frame(err, { taskAgentLabel: label });
+      assert.equal(sent.reason, err.reasonCode, name);
+      setLocale('en');
+      assert.equal(errorFrameText(sent), sent.message, `${name}: English renders the server's message`);
+      setLocale('uk');
+      const uk = errorFrameText(sent);
+      assert.notEqual(uk, sent.message, `${name}: Ukrainian is translated`);
+      assert.match(uk, /^Не вдалося запустити /, name);
+      assert.doesNotMatch(uk, /\{\w+\}|terminal\.|undefined/, name);
+      assert.doesNotMatch(uk, /not found|not logged in|probe failed|detection failed|does not support/, `${name}: no English sentence left`);
+    }
+  } finally {
+    setLocale('en');
+  }
 });
 
 test('DELETE /api/objective/prewarm kills the cold spare', async () => {

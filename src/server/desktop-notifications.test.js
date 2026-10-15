@@ -5,7 +5,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createDesktopNotifications, pageHeight, PAGE_SIZE } = require('../../main/desktop-notifications');
+const { createDesktopNotifications, pageHeight, PAGE_SIZE, CLICK_HOLD_MS } = require('../../main/desktop-notifications');
 
 // Minimal project window: focus state + a webContents that records sent channels.
 let wcSeq = 100;
@@ -35,7 +35,7 @@ function nativeClass({ supported = true } = {}) {
 }
 
 function fixture({ fail = false, settingsFile = null, showMoreTarget = null, loadGate = null, projects = [],
-  native = nativeClass(), platform = 'darwin' } = {}) {
+  native = nativeClass(), platform = 'darwin', clickResult = null } = {}) {
   const windows = [];
   class BrowserWindow extends EventEmitter {
     constructor(options) { super(); this.options = options; this.webContents = new EventEmitter();
@@ -59,7 +59,7 @@ function fixture({ fail = false, settingsFile = null, showMoreTarget = null, loa
   let focused = null;
   const surface = createDesktopNotifications({ BrowserWindow, screen, ipcMain, settingsFile, Notification: native.Notification,
     focusedProjectWindow: () => focused, projectWindows: () => projects,
-    onClick: e => clicked.push(e),
+    onClick: e => { clicked.push(e); return clickResult?.(e); },
     onDismiss: (e, { keepCard } = {}) => (keepCard ? released : dismissed).push(e),
     onShowMore: e => { shownMore.push(e); return showMoreTarget; },
     onSetOnTop: on => onTopSets.push(on), platform,
@@ -209,15 +209,84 @@ test('the banner "Show" checkbox turns Show on Top off through main\'s single wr
   f.surface.dispose();
 });
 
-test('the banner never activates the app when clicked: macOS panel, Windows non-focusable', async () => {
-  for (const [platform, expected] of [['darwin', { type: 'panel', focusable: undefined }],
-    ['win32', { type: undefined, focusable: false }], ['linux', { type: undefined, focusable: undefined }]]) {
+// (TPT645) roundedCorners: false — a frameless window with rounded corners keeps a hidden
+// title-bar strip across its top, and a real click there (where Hide sits) activates the app.
+test('the banner never activates the app when clicked: macOS borderless panel, Windows non-focusable', async () => {
+  for (const [platform, expected] of [['darwin', { type: 'panel', roundedCorners: false, focusable: undefined }],
+    ['win32', { type: undefined, roundedCorners: undefined, focusable: false }],
+    ['linux', { type: undefined, roundedCorners: undefined, focusable: undefined }]]) {
     const f = fixture({ platform });
     await f.surface.show({ title: 'Title', notificationId: 'n1' }, { windowId: 1, projectPath: '/a' });
-    const { type, focusable } = f.windows[0].options;
-    assert.deepEqual({ type, focusable }, expected, platform);
+    const { type, roundedCorners, focusable } = f.windows[0].options;
+    assert.deepEqual({ type, roundedCorners, focusable }, expected, platform);
     f.surface.dispose();
   }
+});
+
+// (TPT645) A card click keeps the banner up, minus that card, until onClick has raised the
+// project window; only then does it hide for the window that now hosts the alerts.
+test('a banner card click holds the banner until onClick settles, then hides it for the raised window', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const a = projectWindow();
+  const settles = [];
+  const f = fixture({ projects: [a], clickResult: () => new Promise((resolve) => settles.push(resolve)) });
+  await show(f, 3);
+  const banner = f.windows[0];
+  const [newest, ...rest] = f.surface.snapshot();
+  f.action(newest.id, 'click');
+  assert.equal(f.clicked[0].id, newest.id);
+  assert.deepEqual(f.surface.snapshot().map((e) => e.id), rest.map((e) => e.id), 'removed before onClick runs');
+  assert.deepEqual(banner.data.entries.map((e) => e.id), rest.map((e) => e.id), 'the card leaves the banner at once');
+  assert.equal(banner.visible, true);
+  // The raise focused the project window, which hosts the alerts now; the banner stays up.
+  f.focus(a);
+  assert.equal(f.lastSurface(a).active, true);
+  assert.equal(banner.visible, true, 'held while onClick is still raising the window');
+  settles.shift()();
+  await flush();
+  assert.equal(banner.visible, false, 'hidden once the click settled');
+
+  // The last card: the banner stays up, empty, until the click settles.
+  f.focus(null);
+  f.action(rest[0].id, 'close');
+  assert.equal(banner.visible, true);
+  f.action(rest[1].id, 'click');
+  assert.equal(f.surface.snapshot().length, 0);
+  assert.equal(banner.visible, true, 'no hide before the window is raised');
+  settles.shift()();
+  await flush();
+  assert.equal(banner.visible, false);
+
+  // A click that never settles holds the banner for CLICK_HOLD_MS at most.
+  await show(f, 1);
+  f.action(f.surface.snapshot()[0].id, 'click');
+  t.mock.timers.tick(CLICK_HOLD_MS - 1);
+  assert.equal(banner.visible, true);
+  t.mock.timers.tick(1);
+  assert.equal(banner.visible, false, 'released by the cap');
+  settles.shift()();
+  await flush();
+  assert.equal(banner.visible, false, 'a late settle changes nothing');
+
+  // Hide and Show on Top off still hide at once while a click is pending.
+  await show(f, 2);
+  f.action(f.surface.snapshot()[0].id, 'click');
+  f.action(null, 'hide');
+  assert.equal(banner.visible, false, 'Hide wins over the hold');
+  settles.shift()();
+  await flush();
+  assert.equal(banner.visible, false);
+  f.surface.dispose();
+});
+
+test('a synchronous onClick releases the hold at once', async () => {
+  const f = fixture();
+  await show(f, 1);
+  f.action(f.surface.snapshot()[0].id, 'click');
+  assert.equal(f.clicked.length, 1);
+  assert.equal(f.windows[0].visible, false, 'the empty banner hides right away');
+  f.surface.dispose();
 });
 
 test('Show More focuses the newest entry window and streams the full list there', async () => {

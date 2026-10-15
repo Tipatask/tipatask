@@ -168,7 +168,9 @@ test('HTTP inventory and queue WS frames preserve diagnostics and detail-only up
   const key = `QUEUE\0${scratch}`;
   const sessions = new Map([[key, s]]);
   let diagnostic = { allowed: false, reason: 'coordination', coordinationReason: 'unregistered-server',
-    detail: null, instances: 1, censusPidCount: 2, unregisteredCount: 1, unregisteredPids: [9999] };
+    detail: null, instances: 1, censusPidCount: 2, unregisteredCount: 1, unregisteredPids: [9999],
+    running: 6, cap: 6, rampCap: 6, rampCeiling: 8, rampNextStepAt: null,
+    alarm: null, requiredBytes: 35, headroomBytes: 30 };
   const server = http.createServer(createHttpHandler(sessions, () => ({})));
   websocket.init({ clients: new Set([{ readyState: 1, _projectPath: scratch,
     send: raw => broadcasts.push(JSON.parse(raw)) }]) });
@@ -179,7 +181,9 @@ test('HTTP inventory and queue WS frames preserve diagnostics and detail-only up
     for (const next of [diagnostic, { ...diagnostic, coordinationReason: null, detail: 'lock-busy',
       instances: null, unregisteredCount: null, unregisteredPids: null },
     { ...diagnostic, coordinationReason: null, detail: 'state-invalid', instances: null,
-      unregisteredCount: null, unregisteredPids: null }]) {
+      unregisteredCount: null, unregisteredPids: null },
+    { ...diagnostic, reason: 'device-cap', coordinationReason: null, alarm: 'headroom', headroomBytes: 12 },
+    { ...diagnostic, reason: 'device-cap', coordinationReason: null, rampNextStepAt: Date.now() + 300000 }]) {
       diagnostic = next;
       sessionQueue.drain();
       const response = await getJson(server.address().port, '/api/sessions', { 'x-tipatask-project': scratch });
@@ -189,7 +193,8 @@ test('HTTP inventory and queue WS frames preserve diagnostics and detail-only up
       assert.deepEqual(response.json.queued, snapshot.queued);
       assert.deepEqual(broadcasts.at(-1).queued, snapshot.queued);
       assert.deepEqual(frames.at(-1), queuedSessionFrame(s, 'QUEUE', snapshot));
-      for (const field of ['coordinationReason', 'detail', 'instances', 'censusPidCount', 'unregisteredCount', 'unregisteredPids']) {
+      for (const field of ['coordinationReason', 'detail', 'instances', 'censusPidCount', 'unregisteredCount', 'unregisteredPids',
+        'running', 'cap', 'rampCap', 'rampCeiling', 'rampNextStepAt', 'alarm', 'requiredBytes', 'headroomBytes']) {
         assert.deepEqual(frames.at(-1)[field], diagnostic[field], field);
       }
     }

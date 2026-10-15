@@ -109,19 +109,50 @@ function assertPackagedVersions({ resources, sourceRoot, electronVersion }) {
   if (problems.length) throw new Error(`Packaged versions do not match the lockfile:\n  ${problems.join('\n  ')}`);
 }
 
+// The Claude Code settings template installed into every project. Its Node-script hook commands
+// run their scripts from this archive through the Electron runtime in packaged builds.
+const HARNESS_SETTINGS = 'templates/.claude/settings.json';
+
+// `scripts/<name>.js` paths the hook commands of a Claude settings file run, unique and sorted.
+function hookScriptsFromSettings(text) {
+  const scripts = new Set();
+  for (const groups of Object.values(JSON.parse(text).hooks || {})) {
+    for (const group of Array.isArray(groups) ? groups : []) {
+      for (const hook of group.hooks || []) {
+        for (const [, name] of String(hook.command || '').matchAll(/\/scripts\/([\w.-]+\.js)\b/g)) {
+          scripts.add(`scripts/${name}`);
+        }
+      }
+    }
+  }
+  return [...scripts].sort();
+}
+
 function assertPackagedRequires(archive) {
   const files = new Set(listPackage(archive)
     .map(file => file.replace(/\\/g, '/').replace(/^\//, '')));
+  const readFile = file => {
+    // listPackage includes directories, including empty ones. Never let a
+    // directory or checkout file satisfy an absent archive dependency.
+    if (!files.has(file) || 'files' in statFile(archive, path.normalize(file))) return null;
+    return extractPackaged(archive, file);
+  };
+  // Every script a hook command names must ship (package.json build.files) with all it requires.
+  const missing = [];
+  const settings = readFile(HARNESS_SETTINGS);
+  let hookScripts = [];
+  if (settings === null) missing.push({ from: HARNESS_SETTINGS, spec: HARNESS_SETTINGS });
+  else {
+    try { hookScripts = hookScriptsFromSettings(settings.toString('utf8')); }
+    catch (error) { throw new Error(`Unreadable ${HARNESS_SETTINGS} in ${archive}: ${error.message}`); }
+  }
+  for (const script of hookScripts) {
+    if (!files.has(script)) missing.push({ from: HARNESS_SETTINGS, spec: script });
+  }
   const entries = ['main.js', 'preload.js', 'todo-server.js',
-    ...[...files].filter(file => /^main\/.*\.js$/.test(file) && !file.endsWith('.test.js')).sort()];
-  const { missing } = collectRelativeRequires(entries, {
-    readFile(file) {
-      // listPackage includes directories, including empty ones. Never let a
-      // directory or checkout file satisfy an absent archive dependency.
-      if (!files.has(file) || 'files' in statFile(archive, path.normalize(file))) return null;
-      return extractPackaged(archive, file);
-    },
-  });
+    ...[...files].filter(file => /^main\/.*\.js$/.test(file) && !file.endsWith('.test.js')).sort(),
+    ...hookScripts.filter(script => files.has(script))];
+  missing.push(...collectRelativeRequires(entries, { readFile }).missing);
   if (missing.length) {
     throw new Error(`Unresolved packaged requires in ${archive}:\n${missing.map(({ from, spec }) => `${from}: ${spec}`).join('\n')}`);
   }
@@ -157,6 +188,8 @@ module.exports = async function afterPack(context) {
 };
 module.exports.assertNoPackagedTests = assertNoPackagedTests;
 module.exports.assertPackagedRequires = assertPackagedRequires;
+module.exports.hookScriptsFromSettings = hookScriptsFromSettings;
+module.exports.HARNESS_SETTINGS = HARNESS_SETTINGS;
 module.exports.assertPackagedVcs = assertPackagedVcs;
 module.exports.assertPackagedVersions = assertPackagedVersions;
 module.exports.PI_PACKAGE = PI_PACKAGE;

@@ -25,7 +25,19 @@ function isCodexLoggedIn(output) {
   return /\blogged in\b/i.test(output);
 }
 
+// (TPT9008) detect()'s negatives by stable code (BaseTaskAgent#unavailableResult()). Each sentence
+// is the English `reason`; the terminal shows terminal.error.ESTART.<code>.codex (i18n.js) instead,
+// whose English value must stay "Failed to start {label}: " + this sentence.
+const DETECT_REASONS = Object.freeze({
+  cli_not_found: 'Codex CLI not found. Install codex (npm i -g @openai/codex under node 22, or brew install codex), or set CODEX_BIN=/path/to/codex in .env.',
+  cli_missing: 'Codex CLI not found',
+  login_check_failed: 'Codex is not logged in (or login status check failed)',
+  not_logged_in: 'Codex is not logged in',
+});
+
 class CodexAgent extends BaseTaskAgent {
+  static DETECT_REASONS = DETECT_REASONS;
+
   getQuotaStatus(config, opts = {}) {
     return require('./codex-quota').readCodexQuota(config, opts);
   }
@@ -115,7 +127,7 @@ class CodexAgent extends BaseTaskAgent {
       // C1184: resolve the project's actual "complete" status name (role-based)
       // instead of the hardcoded literal "completed".
       opts.vcsContext
-        ? '- MANDATORY: supply ONE self-authored plain-English resolution to tipatask-local complete_task. Cover what changed and why, key files, checks, and follow-ups/caveats (none if absent). That tool posts the resolution and completion status together after verification. Never also call `create_task_comment` or `update_task` to complete the task. When it refuses, fix the blockers it lists (e.g. TASK_COMMIT_MISSING: commit first) and call it again. If a blocker cannot be cleared within this task, do not complete it: post the same report with `create_task_comment(task_key, content, type="resolution")` so it is not lost, then set the task on_fire (when available) and state the blocker. The automatic terminal-tail comment does not satisfy this requirement.'
+        ? `- MANDATORY: supply ONE self-authored plain-English resolution to tipatask-local complete_task. Cover what changed and why, key files, checks, and follow-ups/caveats (none if absent). That tool posts the resolution and completion status together after verification. Never also call \`create_task_comment\` or \`update_task\` to complete the task. When it refuses, fix the blockers it lists (e.g. TASK_COMMIT_MISSING: commit first) and call it again. If a blocker cannot be cleared within this task, do not complete it: post the same report with \`create_task_comment(task_key, content, type="resolution")\` so it is not lost, then set the task on_fire (when available) and state the blocker. The automatic terminal-tail comment does not satisfy this requirement. ${BaseTaskAgent.buildFinishChecklist(opts)}`
         : `- MANDATORY before marking this task \`${this.resolveStatusForRole('complete', opts)}\`: post ONE self-authored resolution comment via \`create_task_comment(task_key, content, type="resolution")\`. \`content\` must be a real report, written in plain English prose — do NOT use caveman style for this comment. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). Separate from and required IN ADDITION TO the auto-posted terminal-tail resolution comment (a raw log dump with no explanation, posted on session exit) — that one does not satisfy this step. Post it in the SAME tool-call batch as the final status update to \`${this.resolveStatusForRole('complete', opts)}\`.`,
       ...directives,
       `- ${grepNote}`,
@@ -259,12 +271,12 @@ class CodexAgent extends BaseTaskAgent {
     // Every result, the positive included, also names the CLI build in `detail.version`, so the
     // task-start gate log and scripts/probe-codex-kickoff.js can say which Codex took a kickoff.
     let version = null;
-    const unavailable = (reason, probe) => ({
-      id: this.id, label: this.label, available: false, reason,
+    // (TPT9008) Each negative is keyed by a DETECT_REASONS code.
+    const unavailable = (reasonCode, probe) => this.unavailableResult(reasonCode, {
       detail: { ...BaseTaskAgent.buildDetectDetail(bin, probe), version },
     });
     if (!bin) {
-      return unavailable('Codex CLI not found. Install codex (npm i -g @openai/codex under node 22, or brew install codex), or set CODEX_BIN=/path/to/codex in .env.');
+      return unavailable('cli_not_found');
     }
     // Run the login probe under the nvm-matched node so shebang-based CLIs resolve correctly.
     // prependPathEnv keeps the env at one PATH key (TPT566) — never `env.PATH = …`.
@@ -277,10 +289,10 @@ class CodexAgent extends BaseTaskAgent {
     version = CodexAgent.parseVersion(versionProbe.output);
     if (probe.error) {
       if (probe.error.code === 'ENOENT') {
-        return unavailable('Codex CLI not found', probe);
+        return unavailable('cli_missing', probe);
       }
       console.log(`[task-agent:detect] codex login probe spawn error: ${probe.error.code || probe.error.message}`);
-      return unavailable('Codex is not logged in (or login status check failed)', probe);
+      return unavailable('login_check_failed', probe);
     }
     if (isCodexLoggedIn(probe.output)) {
       // No probe output on a positive: `codex login status` can echo a masked API key.
@@ -290,7 +302,7 @@ class CodexAgent extends BaseTaskAgent {
       `[task-agent:detect] codex login probe reported not-logged-in ` +
       `(exit=${probe.status}): ${String(probe.output || '').slice(0, 200)}`
     );
-    return unavailable('Codex is not logged in', probe);
+    return unavailable('not_logged_in', probe);
   }
 }
 

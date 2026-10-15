@@ -112,3 +112,40 @@ test('selectTasksToWrite: excludes an unchanged carried-over task (the objective
   const ids = result.map(([id]) => id);
   assert.deepEqual(ids.sort(), ['C2', 'C3', 'C4']);
 });
+
+// ── TPT623: automatic registration of unknown tags ──
+
+const { buildAutoRegistrations, sanitizeAutoDescription } = require('./tag-registry-gate');
+
+test('buildAutoRegistrations keeps real descriptions and reports the rest as undescribed', () => {
+  const described = new Map([
+    ['logo-design', '  "Work on the product\'s logo mark and brand symbol."  '],
+    ['pricing', 'Auto-registered by createTask'],
+    ['empty', '   '],
+  ]);
+  const { registrations, undescribed } = buildAutoRegistrations(['logo-design', 'pricing', 'empty', 'missing'], described);
+  assert.deepEqual(registrations, [{ name: 'logo-design', description: 'Work on the product\'s logo mark and brand symbol.' }]);
+  assert.deepEqual(undescribed, ['pricing', 'empty', 'missing']);
+});
+
+test('buildAutoRegistrations never auto-registers tt-* tags', () => {
+  const { registrations, undescribed } = buildAutoRegistrations(['tt-api-foo', 'TT-Bar'], { 'tt-api-foo': 'A real description.', 'TT-Bar': 'Another one.' });
+  assert.deepEqual(registrations, []);
+  assert.deepEqual(undescribed, ['tt-api-foo', 'TT-Bar']);
+});
+
+test('buildAutoRegistrations matches model output case-insensitively and trims names', () => {
+  const { registrations } = buildAutoRegistrations([' Logo-Design '], { 'logo-design': 'Brand symbol work.' });
+  assert.deepEqual(registrations, [{ name: 'Logo-Design', description: 'Brand symbol work.' }]);
+});
+
+test('sanitizeAutoDescription collapses whitespace and caps length', () => {
+  assert.equal(sanitizeAutoDescription('a\n  b'), 'a b');
+  assert.equal(sanitizeAutoDescription(42), '');
+  assert.equal(sanitizeAutoDescription('x'.repeat(500)).length, 200);
+});
+
+test('unregisteredTagError appends an optional note', () => {
+  const err = unregisteredTagError(['a'], { projectId: 7, note: 'Automatic description failed.' });
+  assert.match(err.message, /then retry\. Automatic description failed\.$/);
+});

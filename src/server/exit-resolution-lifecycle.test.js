@@ -12,7 +12,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { wireSessionLifecycle } = require('./ws-handlers');
+const { wireSessionLifecycle, terminateTerminalSession, terminateObjectiveSessions } = require('./ws-handlers');
 const { claudeProjectDirName } = require('./task-agent/final-message');
 const { AGENT_EXIT_MARKER, isAgentLogTailComment } = require('./resolution-payload');
 
@@ -183,4 +183,113 @@ test('a posting failure is swallowed (logged), never thrown into the exit path',
   const backend = makeBackend();
   backend.createTaskComment = async () => { throw new Error('POST failed'); };
   await assert.doesNotReject(exit(makeSession(), backend, { reason: 'completed', buffer: '' }));
+});
+
+// ── Exit backstop (TPT613) ──
+// The real onSessionExit, with the backstop's live reads injected through wireSessionLifecycle's
+// `deps`. Sessions above have no type/phase, so the backstop never touches their backends.
+const BACKSTOP_ROLES = { start: 'pending', in_progress: 'in_progress', complete: 'completed', canceled: 'canceled' };
+const BACKSTOP_CHECK = {
+  verified: true, vcs: { type: 'git', worktree: false, commit: true, pr: false, merge: false }, ready: false,
+  blockers: [{ code: 'TASK_COMMIT_MISSING', message: `no commit starting with ${TASK}` }],
+};
+const BACKSTOP_HEADER = 'Agent exited without committing / completing: no task commit found';
+
+function backstopBackend(opts) {
+  const backend = makeBackend(opts);
+  backend.getTask = async (id) => ({ id, status: 'in_progress' });
+  backend.getStatuses = async () => [{ name: 'in_progress' }, { name: 'on_fire' }];
+  backend.updateTask = async (id, fields) => { backend.posted.push({ taskId: id, status: fields.status }); return { id, ...fields }; };
+  return backend;
+}
+
+function backstopDeps(frames) {
+  return {
+    fetchStatusRoles: async () => BACKSTOP_ROLES,
+    checkTaskCommit: async () => BACKSTOP_CHECK,
+    websocket: { emitTaskUpdated() {}, emitTaskLeftUncommitted: (...args) => frames.push(args) },
+  };
+}
+
+function executingSession(overrides = {}) {
+  return makeSession({ type: 'terminal', terminalPhase: 'executing', _injectDone: true, nudgeCount: 0, ...overrides });
+}
+
+// First line of each comment, or the status a write set — the order things landed in.
+const writes = (backend) => backend.posted.map(p => p.status || p.content.split('\n')[0]);
+
+// terminateTerminalSession() fires onSessionExit without awaiting it; keep its promise.
+function captureExit(session) {
+  const wired = session.onSessionExit;
+  const box = {};
+  session.onSessionExit = (args) => (box.done = wired(args));
+  return box;
+}
+
+test('exit backstop: runs after the exit comment, once per run', async () => {
+  const backend = backstopBackend();
+  const frames = [];
+  const session = executingSession();
+  wireSessionLifecycle(session, TASK, backend, { deps: backstopDeps(frames) });
+  await session.onSessionExit({ exitCode: 0, buffer: '' });
+  await session.onSessionExit({ reason: 'user-terminated', buffer: '' });
+  assert.deepEqual(writes(backend), ['Agent session ended (exit code 0)', 'on_fire', BACKSTOP_HEADER]);
+  assert.equal(frames.length, 1);
+});
+
+test('exit backstop: still runs when the agent posted its own report and the exit comment is skipped', async () => {
+  const backend = backstopBackend({ comments: [report(11)] });
+  const frames = [];
+  const session = executingSession();
+  wireSessionLifecycle(session, TASK, backend, { deps: backstopDeps(frames) });
+  await session.onSessionExit({ reason: 'user-terminated', buffer: '' });
+  assert.deepEqual(writes(backend), ['on_fire', BACKSTOP_HEADER]);
+  assert.equal(frames.length, 1);
+});
+
+test('exit backstop: a real Terminate flags the task — the key Terminate just deleted is not a newer run', async () => {
+  const backend = backstopBackend();
+  const frames = [];
+  const sessions = new Map();
+  // pid 0: killProcessGroup() refuses it, so no real process is ever signaled.
+  const session = executingSession({ alive: true, pty: { pid: 0, kill() {} }, _terminalOutputSeen: true, buffer: '', projectPath: '/projects/a' });
+  sessions.set(TASK, session);
+  wireSessionLifecycle(session, TASK, backend, { sessions, sessionKey: TASK, deps: backstopDeps(frames) });
+  const exited = captureExit(session);
+  terminateTerminalSession(session, TASK, TASK, sessions, 'terminated', { ackWs: null, backend });
+  assert.equal(sessions.has(TASK), false);
+  await exited.done;
+  assert.deepEqual(writes(backend), ['Agent session terminated by user', 'on_fire', BACKSTOP_HEADER]);
+  assert.match(backend.posted[2].content, /was terminated by the user/);
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0][0], '/projects/a');
+  assert.equal(frames[0][1], TASK);
+});
+
+test('exit backstop: an objective-tab close (a confirmed bulk stop) posts the exit comment but never flags', async () => {
+  const backend = backstopBackend();
+  const frames = [];
+  const sessions = new Map();
+  const session = executingSession({ alive: true, pty: { pid: 0, kill() {} }, _terminalOutputSeen: true, buffer: '', tabId: TASK });
+  sessions.set(TASK, session);
+  wireSessionLifecycle(session, TASK, backend, { sessions, sessionKey: TASK, deps: backstopDeps(frames) });
+  const exited = captureExit(session);
+  assert.deepEqual(terminateObjectiveSessions(new Set([TASK]), sessions, backend, ''), [TASK]);
+  await exited.done;
+  assert.deepEqual(writes(backend), ['Agent session terminated by user']);
+  assert.equal(frames.length, 0);
+});
+
+test('exit backstop: a newer run under the same key (Stop, then Start) is not flagged', async () => {
+  const backend = backstopBackend();
+  const frames = [];
+  const sessions = new Map([[TASK, null]]);
+  const session = executingSession();
+  sessions.set(TASK, session);
+  wireSessionLifecycle(session, TASK, backend, { sessions, sessionKey: TASK, deps: backstopDeps(frames) });
+  const done = session.onSessionExit({ reason: 'user-terminated', buffer: '' });
+  sessions.set(TASK, { type: 'terminal', pending: true }); // the new run's session object
+  await done;
+  assert.deepEqual(writes(backend), ['Agent session terminated by user']);
+  assert.equal(frames.length, 0);
 });

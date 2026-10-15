@@ -5,6 +5,7 @@
 // Import and call emit* helpers from any server module.
 
 const config = require('./config');
+const leftUncommitted = require('./left-uncommitted'); // (TPT664) pure, no cycle
 
 let _wss = null;
 
@@ -70,6 +71,10 @@ function emitTaskUpdated(task, opts, projectPath) {
   }
   if (projectPath) broadcastToProject(projectPath, 'task:updated', payload);
   else broadcast('task:updated', payload);
+  // (TPT664) Every server-side status write passes through here: a task that reached a closed
+  // status is no longer left uncommitted — drop the server registry entry and tell every window.
+  const removed = leftUncommitted.noteTaskUpdate(task, projectPath);
+  if (removed) emitTaskLeftUncommitted(projectPath, task.id, [], { cleared: true, exitId: removed.exitId });
 }
 
 function emitTaskDeleted(id, projectPath) {
@@ -122,8 +127,23 @@ function broadcastKbReindexResult(projectPath, payload) {
   broadcastToProject(projectPath || '', 'reindex-kb-result', { auto: true, ...payload });
 }
 
-function emitApiStatus(state, message, pendingCount = 0, pendingTaskIds = []) {
-  broadcast('api-status', { state, message: message || null, pendingCount, pendingTaskIds });
+// (TPT668) projectPath given = broadcastToProject (a per-project backend's own state);
+// omitted = unscoped broadcast (the module singleton).
+function emitApiStatus(state, message, pendingCount = 0, pendingTaskIds = [], projectPath) {
+  const payload = { state, message: message || null, pendingCount, pendingTaskIds };
+  if (projectPath) broadcastToProject(projectPath, 'api-status', payload);
+  else broadcast('api-status', payload);
+}
+
+// (TPT662) Offline-queued writes the reconnect drain could not replay (api-backend.js
+// `_drainPendingMutations()` — the API or the local tag gate rejected the entry). entries:
+// [{ op, taskId, title, code, statusCode, message }]. Unscoped like api-status unless a
+// projectPath is given; the renderer turns each entry into a notification card + toast and
+// re-reads the board, since the optimistic row still shows the lost edit.
+function emitMutationsDropped(entries, projectPath) {
+  if (!Array.isArray(entries) || entries.length === 0) return;
+  if (projectPath) broadcastToProject(projectPath, 'mutations-dropped', { entries });
+  else broadcast('mutations-dropped', { entries });
 }
 
 // (C1565) Process-group descendant-count watchdog alert. Project-scoped for the same
@@ -179,4 +199,18 @@ function emitMergeDone(projectPath, payload) { broadcastToProject(projectPath ||
 function emitMergeError(projectPath, payload) { broadcastToProject(projectPath || '', 'merge:error', { projectPath: projectPath || '', ...payload }); }
 function emitWorktreeDirtyOnComplete(projectPath, payload) { broadcastToProject(projectPath || '', 'worktree-dirty-on-complete', { projectPath: projectPath || '', ...payload }); }
 
-module.exports = { init, broadcast, broadcastToProject, emitMergeProgress, emitMergeConflict, emitMergeDone, emitMergeError, emitWorktreeDirtyOnComplete, emitTaskCreated, emitTaskUpdated, emitTaskDeleted, emitTasksFinalized, recordAssignment, getRecentAssignments, emitObjectiveQueueState, emitSessionQueueState, emitApiStatus, emitVoiceModelProgress, emitVoiceModelComplete, emitVoiceModelError, emitVoiceModelDeleted, broadcastKbReindexResult, emitSessionRunaway };
+// (TPT613) Exit backstop: a task terminal ended with its task still in the in-progress role and
+// its required commit missing (terminal-session.js flagTaskLeftUncommitted()). Project-scoped like
+// its sibling above — task keys collide across project windows. `blockers` is [{ code, message }];
+// `extra` carries { status, nudgeCount, agent, exitId } — `exitId` names this exit, so a client
+// that receives the frame on two sockets notifies once (attention-ws.js).
+function emitTaskLeftUncommitted(projectPath, taskKey, blockers, extra = {}) {
+  broadcastToProject(projectPath || '', 'task-left-uncommitted', {
+    projectPath: projectPath || '',
+    taskId: taskKey,
+    blockers: Array.isArray(blockers) ? blockers : [],
+    ...extra,
+  });
+}
+
+module.exports = { init, broadcast, broadcastToProject, emitMergeProgress, emitMergeConflict, emitMergeDone, emitMergeError, emitWorktreeDirtyOnComplete, emitTaskLeftUncommitted, emitTaskCreated, emitTaskUpdated, emitTaskDeleted, emitTasksFinalized, recordAssignment, getRecentAssignments, emitObjectiveQueueState, emitSessionQueueState, emitApiStatus, emitMutationsDropped, emitVoiceModelProgress, emitVoiceModelComplete, emitVoiceModelError, emitVoiceModelDeleted, broadcastKbReindexResult, emitSessionRunaway };

@@ -158,10 +158,18 @@ function buildNudgeMessage(turnBuffer) {
     : 'Your previous response had no fenced ```json block. Re-emit your answer as a single fenced ```json block per the OBJECTIVE MODE rules. No prose.';
 }
 
+// Diagnostic-only: make CLI file mentions inert without changing paths or e-mail
+// addresses. A fullwidth at sign cannot be interpreted as a Claude @file mention.
+// Production builders deliberately do not call this helper.
+function neutralizeAtMentions(text) {
+  return String(text ?? '').replace(/(^|[\s([{"'`])@(?=[\p{L}\p{N}_./~\\"'-])/gu, '$1＠');
+}
+
 module.exports = {
   renderMessages,
   buildRebuildPrompt,
   buildHandoffPrompt,
   buildTurnPrompt,
   buildNudgeMessage,
+  neutralizeAtMentions,
 };

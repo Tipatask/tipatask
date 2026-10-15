@@ -30,7 +30,7 @@ test('buildSharedPreamble: absent optional data emits no empty directive', () =>
     const p = agent.buildSharedPreamble({});
     assert.equal(p.vcs, '');
     assert.equal(p.tagDesc, '');
-    assert.deepEqual(p.directives, [p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus]);
+    assert.deepEqual(p.directives, [p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus, p.followUps]);
     assert.ok(p.directives.every(d => typeof d === 'string' && d.trim().length > 0));
   }
 });
@@ -40,11 +40,11 @@ test('buildSharedPreamble: called with no argument at all -> same as empty opts'
   assert.deepEqual(agent.buildSharedPreamble(), agent.buildSharedPreamble({}));
 });
 
-test('buildSharedPreamble: fixed order vcs -> tagDesc -> processSafety -> resourceLimits -> kbHygiene -> taskStatus', () => {
+test('buildSharedPreamble: fixed order vcs -> tagDesc -> processSafety -> resourceLimits -> kbHygiene -> taskStatus -> followUps', () => {
   for (const agent of [bareAgent(), new ClaudeAgent(), new CodexAgent(), new PiAgent()]) {
     const p = agent.buildSharedPreamble(ALL_OPTS);
     assert.ok(p.vcs && p.tagDesc, 'both optional directives must render for this fixture');
-    assert.deepEqual(p.directives, [p.vcs, p.tagDesc, p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus]);
+    assert.deepEqual(p.directives, [p.vcs, p.tagDesc, p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus, p.followUps]);
   }
 });
 
@@ -73,10 +73,22 @@ test('buildSharedPreamble: Claude and Codex get the full wording; Claude gets no
     assert.equal(p.resourceLimits, agent.buildResourceLimitsDirective(ALL_OPTS.agentLimits));
     assert.equal(p.kbHygiene, agent.buildKbHygieneDirective());
     assert.equal(p.taskStatus, agent.buildTaskStatusDirective());
+    assert.equal(p.followUps, agent.buildFollowUpDirective());
     assert.equal(p.vcs, buildVcsDirective(GIT_ALL_ON));
   }
   assert.equal(claude.buildSharedPreamble(ALL_OPTS).clarify, '');
   assert.equal(codex.buildSharedPreamble(ALL_OPTS).clarify, codex.buildClarifyDirective());
+});
+
+test('buildSharedPreamble: a vcsContext gives kbHygiene and followUps their guarded-completion wording', () => {
+  const agent = bareAgent();
+  const p = agent.buildSharedPreamble({ vcsContext: { verified: true } });
+  assert.equal(p.kbHygiene, agent.buildKbHygieneDirective({ guardedCompletion: true }));
+  assert.equal(p.followUps, agent.buildFollowUpDirective({ guardedCompletion: true }));
+  assert.notEqual(p.followUps, agent.buildSharedPreamble({}).followUps);
+  // Compact (Pi) wording names no completion tool, so the context changes nothing there.
+  const pi = new PiAgent();
+  assert.equal(pi.buildSharedPreamble({ vcsContext: { verified: true } }).followUps, pi.buildFollowUpDirective({ compact: true }));
 });
 
 test('buildSharedPreamble: Pi gets compact wording everywhere, subclass overrides still honored', () => {
@@ -86,6 +98,7 @@ test('buildSharedPreamble: Pi gets compact wording everywhere, subclass override
   assert.equal(p.resourceLimits, pi.buildResourceLimitsDirective(ALL_OPTS.agentLimits, { compact: true }));
   assert.equal(p.kbHygiene, pi.buildKbHygieneDirective({ compact: true }));
   assert.equal(p.taskStatus, pi.buildTaskStatusDirective({ compact: true }));
+  assert.equal(p.followUps, pi.buildFollowUpDirective({ compact: true }));
   assert.equal(p.clarify, pi.buildClarifyDirective({ compact: true }));
   // resolveVcsDirective()/buildTagDescriptionDirective() are Pi overrides — reached through `this`.
   assert.equal(p.vcs, buildVcsDirective(GIT_ALL_ON, { compact: true }));
@@ -103,11 +116,12 @@ test('buildSharedPreamble: a policy override alone switches the variant', () => 
   assert.equal(p.resourceLimits, agent.buildResourceLimitsDirective(undefined, { compact: true }));
   assert.equal(p.kbHygiene, agent.buildKbHygieneDirective({ compact: true }));
   assert.equal(p.taskStatus, agent.buildTaskStatusDirective({ compact: true }));
+  assert.equal(p.followUps, agent.buildFollowUpDirective({ compact: true }));
   assert.equal(p.clarify, '');
 });
 
 test('buildPrompt: independently specified semantic contracts reach every agent once', (t) => {
-  const { projectFixture, processSafety, resourceLimits, kbHygiene, taskStatus, tagBackfill, vcsOff } = require('./prompt-contract-assertions');
+  const { projectFixture, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, tagBackfill, vcsOff } = require('./prompt-contract-assertions');
   const opts = {
     projectPath: projectFixture(t), vcsSettings: { type: 'off' }, agentLimits: { maxSubagents: 5 },
     taskTags: ['tt-fixture'], tagDescriptions: { 'tt-fixture': '' },
@@ -118,6 +132,7 @@ test('buildPrompt: independently specified semantic contracts reach every agent 
     resourceLimits(prompt, 5);
     kbHygiene(prompt);
     taskStatus(prompt);
+    followUps(prompt);
     tagBackfill(prompt, agent.id);
     vcsOff(prompt);
     assert.ok(prompt.trim().endsWith('Do the thing'), `${agent.id}: task prompt stays last`);

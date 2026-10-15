@@ -101,3 +101,19 @@ test('emitSessionRunaway: forwards paused, resumed and memory figures, project-s
   assert.equal(a.sent[1].rssMb, 0);
   assert.equal(a.sent[1].reason, 'count');
 });
+
+test('emitTaskLeftUncommitted: project-scoped task-left-uncommitted frame with blockers and exit details (TPT613)', () => {
+  const a = fakeClient(1, '/projects/a');
+  const b = fakeClient(1, '/projects/b');
+  const unstamped = fakeClient(1, undefined);
+  websocket.init({ clients: new Set([a, b, unstamped]) });
+  const blockers = [{ code: 'TASK_COMMIT_MISSING', message: 'no commit starting with TPT1' }];
+  websocket.emitTaskLeftUncommitted('/projects/a', 'TPT1', blockers, { status: 'on_fire', nudgeCount: 2, agent: 'claude', exitId: 'TPT1@111' });
+  const frame = { type: 'task-left-uncommitted', projectPath: '/projects/a', taskId: 'TPT1', blockers,
+    status: 'on_fire', nudgeCount: 2, agent: 'claude', exitId: 'TPT1@111' };
+  assert.deepEqual(a.sent, [frame]);
+  assert.deepEqual(unstamped.sent, [frame], 'an unstamped (browser-mode) client still receives it');
+  assert.equal(b.sent.length, 0, "another project's window never sees it");
+  websocket.emitTaskLeftUncommitted(undefined, 'TPT2', null);
+  assert.deepEqual(unstamped.sent[1], { type: 'task-left-uncommitted', projectPath: '', taskId: 'TPT2', blockers: [] });
+});

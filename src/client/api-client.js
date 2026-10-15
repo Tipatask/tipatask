@@ -49,7 +49,16 @@ async function _http(method, path, body) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(path, opts);
+  let res;
+  try {
+    res = await fetch(path, opts);
+  } catch (err) {
+    // (TPT9001) fetch() rejects only when no response arrived (server down, connection
+    // refused/reset) — the one transport failure here. Same marker api-backend.js's
+    // apiRequest() puts on its own; isTransportError() below reads it.
+    err.networkError = true;
+    throw err;
+  }
   if (!res.ok) {
     let payload;
     try { payload = await res.json(); } catch { payload = null; }
@@ -60,6 +69,42 @@ async function _http(method, path, body) {
     throw err;
   }
   return res.json();
+}
+
+// (TPT9001) api:tasks.update called with { errorAsValue: true } answers a failure with
+// { _ipcError: { message, code, statusCode, networkError } } — Electron's invoke bridge would
+// keep only the message of a thrown Error (main/ipc/api-router.js). Rethrown here with the same
+// fields _http() puts on its errors, so callers see one error shape on both transports.
+function _rethrowIpcError(result) {
+  const info = result && result._ipcError;
+  if (!info) return result;
+  const err = new Error(info.message || 'Request failed');
+  if (info.code) err.code = info.code;
+  if (info.statusCode != null) err.statusCode = info.statusCode;
+  if (info.networkError) err.networkError = true;
+  throw err;
+}
+
+// (TPT9001) Statuses a reverse proxy answers with when the server behind it is down or
+// unreachable — no answer from the app itself.
+const GATEWAY_STATUSES = new Set([502, 503, 504]);
+
+// (TPT9001) True when a request got no answer from the server: fetch() rejected (_http above),
+// api-backend.js could not reach the API (`networkError`), or a gateway status. Everything
+// else — a validation rejection like the TAGS_UNREGISTERED tag gate, an auth failure, a 500 —
+// is the server answering, not the network failing.
+export function isTransportError(err) {
+  if (!err) return false;
+  if (err.networkError === true) return true;
+  return GATEWAY_STATUSES.has(Number(err.statusCode));
+}
+
+// (TPT9001) An error's message for display, without the "Error invoking remote method
+// '<channel>': Error: " wrapper Electron puts on a rejected IPC call that did not return its
+// failure as a value (another channel, or a main process older than the renderer).
+export function errorDetail(err) {
+  const raw = typeof err?.message === 'string' ? err.message : String(err ?? '');
+  return raw.replace(/^Error invoking remote method '[^']*':\s*(?:[A-Za-z]*Error:\s*)?/, '').trim() || raw;
 }
 
 // (C1197) Shared error-builder for POST /api/transcribe's two response points (multipart attempt
@@ -80,7 +125,8 @@ export const api = {
   tasks: {
     async get(id) {
       if (ipc) {
-        const task = await ipc.tasks.get(id);
+        // (TPT665) Failures as a value, like the task writes below; the 403 keeps its own marker.
+        const task = _rethrowIpcError(await ipc.tasks.get(id, { errorAsValue: true }));
         if (task?._taskAccessDenied) {
           const err = new Error('Task unavailable');
           err.statusCode = 403;
@@ -91,11 +137,11 @@ export const api = {
       return _http('GET', `/api/tasks/${encodeURIComponent(id)}`);
     },
     async update(id, patch) {
-      if (ipc) return ipc.tasks.update(id, patch);
+      if (ipc) return _rethrowIpcError(await ipc.tasks.update(id, patch, { errorAsValue: true }));
       return _http('PATCH', `/api/tasks/${encodeURIComponent(id)}`, patch);
     },
     async delete(id) {
-      if (ipc) return ipc.tasks.delete(id);
+      if (ipc) return _rethrowIpcError(await ipc.tasks.delete(id, { errorAsValue: true }));
       return _http('DELETE', `/api/tasks/${encodeURIComponent(id)}`);
     },
     async listAll() {
@@ -115,24 +161,34 @@ export const api = {
         const data = await _http('GET', `/api/tasks/${encodeURIComponent(id)}/comments`);
         return data.comments || [];
       },
+      // (TPT660) Both comment writes ask for failures as a value, like update() above.
       async create(id, content, type) {
         if (ipc) {
-          const result = await ipc.comments.create(id, content, type);
+          const result = _rethrowIpcError(await ipc.comments.create(id, content, type, { errorAsValue: true }));
           return result?.comment ?? result;
         }
         const data = await _http('POST', `/api/tasks/${encodeURIComponent(id)}/comments`, { content, type });
         return data.comment;
       },
       // TPT34 — author-only edit; a mismatched-author 403 reaches the caller as a thrown
-      // Error (both transports — see api-backend.js's updateTaskComment / _http above).
+      // Error with statusCode 403 (both transports — see api-backend.js's updateTaskComment /
+      // _http above, and the (TPT660) envelope in main/ipc/api-router.js).
       async update(id, commentId, content) {
         if (ipc) {
-          const result = await ipc.comments.update(id, commentId, content);
+          const result = _rethrowIpcError(await ipc.comments.update(id, commentId, content, { errorAsValue: true }));
           return result?.comment ?? result;
         }
         const data = await _http('PATCH', `/api/tasks/${encodeURIComponent(id)}/comments/${encodeURIComponent(commentId)}`, { content });
         return data.comment;
       },
+    },
+    // (TPT614) Finish card action: the server-built finalize kickoff for a task the exit backstop
+    // flagged. Always a direct fetch, never IPC — same reasoning as `merge` below: the server's own
+    // git reads resolve the project from the x-tipatask-project header, so no IPC twin is needed.
+    // `_http()` keeps the 409 `code` (TASK_COMMITTED / TASK_CLOSED / COMMITS_OFF /
+    // VCS_UNVERIFIED / GIT_STATE_UNKNOWN) on the thrown Error for task-finish.js.
+    async finishPrompt(id) {
+      return _http('GET', `/api/tasks/${encodeURIComponent(id)}/finish-prompt`);
     },
     events: {
       // TPT17 — Notifications tab: task-wide event log + subscription toggle
@@ -141,7 +197,7 @@ export const api = {
         return _http('GET', `/api/tasks/${encodeURIComponent(id)}/events`);
       },
       async setSubscription(id, subscribed) {
-        if (ipc) return (await ipc.events.setSubscription(id, subscribed)) || { subscribed };
+        if (ipc) return _rethrowIpcError(await ipc.events.setSubscription(id, subscribed, { errorAsValue: true })) || { subscribed };
         return _http('PUT', `/api/tasks/${encodeURIComponent(id)}/subscription`, { subscribed });
       },
     },
@@ -177,6 +233,14 @@ export const api = {
     async settings() {
       if (ipc) return ipc.project.settings();
       return _http('GET', '/api/project/settings');
+    },
+    // (TPT659) The key the API would allocate for the next keyless create of `category`
+    // (CODING|HUMAN) — { taskKey: string|null }, null whenever the server could not tell.
+    // Same IPC-first/HTTP-fallback idiom as settings() above; consumed by group-label.js's
+    // fetchNextTaskKey() for the New Task Preview badge.
+    async nextTaskKey(category) {
+      if (ipc) return ipc.project.nextTaskKey(category);
+      return _http('GET', `/api/project/next-task-key?category=${encodeURIComponent(category || 'CODING')}`);
     },
     // (C1271) Write project scalars (language/task_group_label/…/vcs_* since TPT61) —
     // PATCH /api/project, same-origin proxy → backend.updateProject(). Throws on failure

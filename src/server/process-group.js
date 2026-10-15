@@ -19,6 +19,7 @@
 
 const { execFile, spawnSync: nodeSpawnSync } = require('node:child_process');
 const os = require('node:os');
+const { terminalCopy } = require('./terminal-copy'); // (TPT9002) watchdog texts in the project language
 
 const DESCENDANT_ALERT_THRESHOLD = 50;
 // (TPT370) Warn-then-kill policy, revised after a healthy Codex session (steady ~54
@@ -551,7 +552,7 @@ function evaluateRunaway(state, sample, limits = {}) {
 // breakdown by executable name (`snapshot.commOf`, from `parsePsOutput()`'s `comm=` column),
 // most-frequent first, collapsing the long tail into a single "N other" bucket. Returns ''
 // when there's no comm data (e.g. a snapshot from a `ps` invocation that didn't request it).
-function summarizeDescendants(snapshot, pids, limit = 4) {
+function summarizeDescendants(snapshot, pids, limit = 4, locale = 'en') {
   if (!snapshot || !snapshot.commOf || !pids || !pids.size) return '';
   const counts = new Map();
   for (const pid of pids) {
@@ -563,7 +564,7 @@ function summarizeDescendants(snapshot, pids, limit = 4) {
   const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
   const top = sorted.slice(0, limit).map(([name, n]) => `${name} ×${n}`);
   const restCount = sorted.slice(limit).reduce((sum, [, n]) => sum + n, 0);
-  if (restCount > 0) top.push(`${restCount} other`);
+  if (restCount > 0) top.push(terminalCopy(locale, 'watchdog.summaryOther', { n: restCount }));
   return top.join(', ');
 }
 
@@ -571,52 +572,59 @@ function summarizeDescendants(snapshot, pids, limit = 4) {
 // (buildRunawayWarning) and the pause/kill reasons (terminal-session.js's
 // pauseRunawaySession/killRunawaySession) so the texts can never drift out of sync with the
 // actual policy constants. The memory clause is left out when there is no memory limit.
-function describeActPolicy(threshold, { growth = DESCENDANT_KILL_GROWTH, ceiling = DESCENDANT_CEILING_FACTOR * threshold, limitMb = 0, ...options } = {}) {
-  const countRule = `after ${DESCENDANT_KILL_CONSECUTIVE} consecutive checks ≥${threshold} each growing by `
-    + `≥${growth}, or immediately at ≥${ceiling}`;
-  if (!limitMb) return countRule;
+// (TPT9002) Every text builder below takes a trailing `locale` (default 'en') and reads its
+// sentences from terminal-copy.js: the sweep passes the project language for what the user
+// sees, while log lines and the exit resolution comment keep the English default.
+function describeActPolicy(threshold, { growth = DESCENDANT_KILL_GROWTH, ceiling = DESCENDANT_CEILING_FACTOR * threshold, limitMb = 0, locale = 'en', ...options } = {}) {
+  const countParams = { consecutive: DESCENDANT_KILL_CONSECUTIVE, threshold, growth, ceiling };
+  if (!limitMb) return terminalCopy(locale, 'watchdog.policy.count', countParams);
   const p = enforcementLimits({ maxTreeRssMb: limitMb, ...options });
-  return `${countRule} processes, or once RSS stays >${p.rssActionMb} MiB for ${p.rssSamples} 30-second samples `
-    + `and grows by ≥${p.rssGrowthMb} MiB in each of two intervals `
-    + `(≥${p.rssPressureGrowthMb} MiB with sustained host memory pressure)`;
+  return terminalCopy(locale, 'watchdog.policy.countMemory', {
+    ...countParams,
+    rssActionMb: p.rssActionMb,
+    rssSamples: p.rssSamples,
+    rssGrowthMb: p.rssGrowthMb,
+    rssPressureGrowthMb: p.rssPressureGrowthMb,
+  });
 }
 
-function describeRunawayReason(reason) {
-  return ({
-    'count-growth': 'sustained process-count growth',
-    'count-ceiling': 'process emergency ceiling reached',
-    'memory-growth': 'sustained high RSS and memory growth',
-    'memory-pressure': 'sustained high RSS, host memory pressure, and growth in this tree',
-    count: 'descendant warning threshold reached',
-    memory: 'RSS warning threshold reached',
-  })[reason] || 'resource watchdog intervention';
+const RUNAWAY_REASON_KEYS = new Set(['count-growth', 'count-ceiling', 'memory-growth', 'memory-pressure', 'count', 'memory']);
+
+function describeRunawayReason(reason, locale = 'en') {
+  return terminalCopy(locale, `watchdog.reason.${RUNAWAY_REASON_KEYS.has(reason) ? reason : 'default'}`);
 }
 
-function describeKillPolicy(threshold, growth = DESCENDANT_KILL_GROWTH, ceiling = DESCENDANT_KILL_CEILING, limitMb = 0) {
-  return `kill ${describeActPolicy(threshold, { growth, ceiling, limitMb })}`;
+function describeKillPolicy(threshold, growth = DESCENDANT_KILL_GROWTH, ceiling = DESCENDANT_KILL_CEILING, limitMb = 0, locale = 'en') {
+  return terminalCopy(locale, 'watchdog.killPolicy', { policy: describeActPolicy(threshold, { growth, ceiling, limitMb, locale }) });
 }
 
 // "N descendant processes" / "N descendant processes using M MB" — the tree figures every
 // watchdog text and log line names.
-function describeTree(count, rssMb) {
-  return `${count} descendant processes${rssMb > 0 ? ` using ${rssMb} MiB` : ''}`;
+function describeTree(count, rssMb, locale = 'en') {
+  return rssMb > 0
+    ? terminalCopy(locale, 'watchdog.treeRss', { count, rssMb })
+    : terminalCopy(locale, 'watchdog.tree', { count });
 }
 
 // The warn notice. `action` (resolveAgentLimits().watchdogAction) decides the closing
 // sentence, so the user reads what will actually happen next rather than a fixed threat.
-function buildRunawayWarning(count, threshold, summary, { rssMb = 0, limitMb = 0, action = 'warn', reason = 'count', activeCount, policy = {}, advisoryDescendants, advisoryTreeRssMb } = {}) {
+function buildRunawayWarning(count, threshold, summary, { rssMb = 0, limitMb = 0, action = 'warn', reason = 'count', activeCount, policy = {}, advisoryDescendants, advisoryTreeRssMb, locale = 'en' } = {}) {
+  const copy = (key, params) => terminalCopy(locale, key, params);
   const head = reason === 'memory' && limitMb > 0
-    ? `This session's process tree uses ${rssMb} MiB; RSS warning threshold ${limitMb} MiB (${count} descendant processes)`
-    : `${describeTree(count, rssMb)} under this session`;
-  const policyText = describeActPolicy(threshold, { limitMb, action, ...policy });
+    ? copy('watchdog.warn.headMemory', { rssMb, limitMb, count })
+    : copy('watchdog.warn.headCount', { tree: describeTree(count, rssMb, locale) });
+  const policyText = describeActPolicy(threshold, { limitMb, action, ...policy, locale });
   let next;
-  if (action === 'kill') next = `Automatic termination enabled (kill ${policyText}).`;
-  else if (action === 'pause') next = `The watchdog will pause it — nothing is killed and it can be resumed — ${policyText}.`;
-  else next = 'The watchdog only warns: automatic pause and termination are disabled.';
-  const load = activeCount == null ? '' : ` ${activeCount} ${activeCount === 1 ? 'session' : 'sessions'} active.`;
-  const advisory = advisoryDescendants == null ? '' : ` Advisory concurrency budgets: ${advisoryDescendants} descendants, ${advisoryTreeRssMb} MiB; these do not trigger intervention.`;
-  const base = `${head} — ${describeRunawayReason(reason)}; the session keeps running.${load}${advisory} ${next}`;
-  return summary ? `${base} Top processes: ${summary}.` : base;
+  if (action === 'kill') next = copy('watchdog.warn.nextKill', { policy: policyText });
+  else if (action === 'pause') next = copy('watchdog.warn.nextPause', { policy: policyText });
+  else next = copy('watchdog.warn.nextWarn');
+  const load = activeCount == null ? '' : copy(activeCount === 1 ? 'watchdog.warn.loadOne' : 'watchdog.warn.loadMany', { n: activeCount });
+  const advisory = advisoryDescendants == null ? '' : copy('watchdog.warn.advisory', { descendants: advisoryDescendants, rssMb: advisoryTreeRssMb });
+  let base = copy('watchdog.warn.base', { head, reason: describeRunawayReason(reason, locale) });
+  if (load) base += ` ${load}`;
+  if (advisory) base += ` ${advisory}`;
+  base += ` ${next}`;
+  return summary ? `${base} ${copy('watchdog.topProcesses', { summary })}` : base;
 }
 
 // ── Watchdog sweep body (TPT370) ──
@@ -630,7 +638,7 @@ function buildRunawayWarning(count, threshold, summary, { rssMb = 0, limitMb = 0
 // (websocket.js), `log` (default console.warn). Without `resolveLimits` the sweep is
 // warn-only. Never throws — a bad session shape is skipped, same fail-soft spirit as the
 // rest of this module.
-function sweepDescendantWatchdog(sessions, snapshot, { resolveLimits, killRunawaySession, pauseRunawaySession, emitTerminalNotice, emitSessionRunaway, host = null, sampledAt = Date.now(), log = console.warn } = {}) {
+function sweepDescendantWatchdog(sessions, snapshot, { resolveLimits, killRunawaySession, pauseRunawaySession, emitTerminalNotice, emitSessionRunaway, resolveLocale = () => 'en', host = null, sampledAt = Date.now(), log = console.warn } = {}) {
   if (!snapshot) return;
   // Snapshot the iterable so a one-shot iterator works too. Count once, before any
   // action changes a session's alive flag, across every project in the registry.
@@ -655,6 +663,11 @@ function sweepDescendantWatchdog(sessions, snapshot, { resolveLimits, killRunawa
     const action = parseWatchdogAction(limits.watchdogAction) || 'warn';
     const descendants = listDescendants(snapshot, session.ptyPid);
     const summary = summarizeDescendants(snapshot, descendants);
+    // (TPT9002) The project language for the texts the user sees (notice, buffer, prompt);
+    // `summary` and the log lines below stay English.
+    let locale = 'en';
+    try { locale = resolveLocale(session) || 'en'; } catch { locale = 'en'; }
+    const summaryLocal = locale === 'en' ? summary : summarizeDescendants(snapshot, descendants, 4, locale);
     // A missing root or any missing RSS makes memory unknown, not zero. Count still works.
     const completeRss = snapshot.parents.has(session.ptyPid) && [session.ptyPid, ...descendants].every(pid => Number.isFinite(snapshot.rssOf?.get(pid)));
     const treeRssMb = completeRss ? sumTreeRss(snapshot, session.ptyPid, descendants) / 1024 : null;
@@ -666,7 +679,12 @@ function sweepDescendantWatchdog(sessions, snapshot, { resolveLimits, killRunawa
       if (limitMb) policy.rssActionMb = Math.max(policy.rssActionMb,
         (state.resumeBase.rssMb || 0) + Math.ceil(limitMb * RESUME_RSS_GRACE_FRACTION));
     }
-    const { alert, pause, kill, count, rssMb, reason } = evaluateRunaway(state, { count: descendants.size, rssMb: treeRssMb, sampledAt, host }, limits);
+    const { alert, pause, kill, count, rssMb: exactRssMb, reason } = evaluateRunaway(state, { count: descendants.size, rssMb: treeRssMb, sampledAt, host }, limits);
+    // (TPT9009) Whole MiB from here on: every use below is a figure a person reads (log line,
+    // notice, pause/kill text, session-runaway frame) or the pause's stored figures (paused
+    // banner, then the resume base, whose raised action mark parseLimitInt() drops when
+    // fractional). evaluateRunaway() keeps the exact value for its growth and threshold math.
+    const rssMb = exactRssMb === null ? null : Math.round(exactRssMb);
     const threshold = state.threshold;
     const label = session.taskId || session.tabId;
     const figures = `${describeTree(count, rssMb)} (warn ≥${threshold}${limitMb ? `, RSS warning ${limitMb} MiB` : ''}; ${activeCount} ${activeCount === 1 ? 'session' : 'sessions'} active)`;
@@ -674,7 +692,7 @@ function sweepDescendantWatchdog(sessions, snapshot, { resolveLimits, killRunawa
     const detail = { taskId: session.tabId, pid: session.ptyPid, count, threshold, rssMb, limitMb, reason };
     if (kill) {
       log(`[watchdog] Task ${label}: ${figures} — ${describeRunawayReason(reason)}; killing process tree.${top}`);
-      const killed = killRunawaySession(session, { count, threshold, rssMb, limitMb, reason, snapshot, summary, policy });
+      const killed = killRunawaySession(session, { count, threshold, rssMb, limitMb, reason, snapshot, summary, summaryLocal, locale, policy });
       if (killed && killed.first) {
         emitSessionRunaway(session.projectPath, { ...detail, promptText: killed.text, killed: true });
       }
@@ -683,7 +701,7 @@ function sweepDescendantWatchdog(sessions, snapshot, { resolveLimits, killRunawa
     let warn = alert;
     if (pause) {
       const paused = typeof pauseRunawaySession === 'function'
-        ? pauseRunawaySession(session, { count, threshold, rssMb, limitMb, reason, snapshot, summary, policy })
+        ? pauseRunawaySession(session, { count, threshold, rssMb, limitMb, reason, snapshot, summary, summaryLocal, locale, policy })
         : null;
       if (paused) {
         if (paused.first) {
@@ -700,7 +718,7 @@ function sweepDescendantWatchdog(sessions, snapshot, { resolveLimits, killRunawa
     }
     if (!warn) continue;
     log(`[watchdog] Task ${label}: ${figures} — ${describeRunawayReason(reason)}.`);
-    const noticeText = buildRunawayWarning(count, threshold, summary, { rssMb, limitMb, action, reason: reason || 'count', activeCount, policy, advisoryDescendants: limits.advisoryDescendants, advisoryTreeRssMb: limits.advisoryTreeRssMb });
+    const noticeText = buildRunawayWarning(count, threshold, summaryLocal, { rssMb, limitMb, action, reason: reason || 'count', activeCount, policy, advisoryDescendants: limits.advisoryDescendants, advisoryTreeRssMb: limits.advisoryTreeRssMb, locale });
     emitTerminalNotice(session, noticeText);
     emitSessionRunaway(session.projectPath, { ...detail, promptText: noticeText });
   }

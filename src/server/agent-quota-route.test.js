@@ -10,6 +10,7 @@ process.env.TIPATASK_PROJECT_ROOT = root;
 process.env.TIPATASK_USER_DATA = root;
 const { createHttpHandler } = require('./ws-handlers');
 const { getTaskAgent } = require('./task-agent');
+const { clearQuotaSnapshots } = require('./task-agent/quota-status');
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 const handler = createHttpHandler(new Map(), () => { throw new Error('quota route must not access task backend'); });
@@ -86,4 +87,26 @@ test('headerless quota requests follow active project changes and capture scope 
   assert.equal(b.projectRoot, '/project-b');
   assert.equal(explicit.projectRoot, '/project-a');
   assert.deepEqual([a,b,explicit].map(v => v.agents.codex.windows[0].usagePercent), [10,90,10]);
+});
+
+test('a stale reading serves every project on the account, under the asking project, without its key (TPT689)', async t => {
+  t.after(clearQuotaSnapshots);
+  const agent = getTaskAgent('claude'), original = agent.getQuotaStatus;
+  t.after(() => { agent.getQuotaStatus = original; });
+  const credentialKey = 'f'.repeat(64);
+  let failing = false;
+  agent.getQuotaStatus = async () => (failing
+    ? { connectionState: 'connected', plan: 'max', unavailableReason: 'rate_limited', credentialKey }
+    : { connectionState: 'connected', plan: 'max', windows: [{ id: 'seven_day', usagePercent: 42, resetAt: null, windowMinutes: 10080 }], credentialKey });
+  const fresh = (await request('/api/agent-quota?agent=claude', '/project-a')).body.agents.claude;
+  assert.equal(fresh.stale, false);
+  failing = true;
+  const res = await request('/api/agent-quota?agent=claude', '/project-b');
+  const claude = res.body.agents.claude;
+  assert.equal(res.body.projectRoot, '/project-b');
+  assert.deepEqual([claude.projectRoot, claude.stale, claude.status, claude.unavailableReason], ['/project-b', true, 'available', 'rate_limited']);
+  assert.equal(claude.checkedAt, fresh.checkedAt);
+  assert.equal(claude.windows[0].usagePercent, 42);
+  assert.equal(JSON.stringify(res.body).includes(credentialKey), false);
+  assert.equal(Object.hasOwn(claude, 'credentialKey'), false);
 });

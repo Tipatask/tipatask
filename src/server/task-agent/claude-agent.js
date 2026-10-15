@@ -76,8 +76,20 @@ const DESIGN_NO_ASK_SUFFIX = 'Build it this turn: do not ask follow-up questions
 // words from you"). terminal-session.js types this one newline-free sentence after the paste.
 const KICKOFF_TYPED_LINE = 'Please carry out the task brief pasted above.';
 
+// ── Detection reasons (TPT9008) ──
+// detect()'s negatives by stable code (BaseTaskAgent#unavailableResult()). Each sentence is the
+// English `reason`; the terminal shows terminal.error.ESTART.<code>.claude (i18n.js) instead, whose
+// English value must stay "Failed to start {label}: " + this sentence (objective-teardown-wiring.test.js).
+const DETECT_REASONS = Object.freeze({
+  cli_not_found: 'Claude CLI not found. Install claude or ensure its directory is on PATH.',
+  cli_missing: 'Claude CLI not found',
+  login_check_failed: 'Claude is not logged in',
+  not_logged_in: 'Claude is not logged in',
+});
+
 class ClaudeAgent extends BaseTaskAgent {
   static KICKOFF_TYPED_LINE = KICKOFF_TYPED_LINE;
+  static DETECT_REASONS = DETECT_REASONS;
 
   getQuotaStatus(config, opts = {}) {
     return require('./claude-quota').readClaudeQuota(config, opts);
@@ -174,8 +186,8 @@ class ClaudeAgent extends BaseTaskAgent {
     // complete_task guard (commit/merge verification), never create_task_comment + remote update_task.
     // The legacy note stays for callers without a vcsContext (tests, out-of-tree callers).
     const resolutionNote = opts.vcsContext
-      ? `\n\nMANDATORY to finish this task: pass ONE self-authored resolution to \`mcp__tipatask-local__complete_task(task_key, resolution)\`. \`resolution\` must be a real report, written in plain English prose — do NOT use caveman style for it, even though the rest of this session runs in caveman mode. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). That tool verifies the task first, then posts this report as the task's resolution comment and sets \`${completeStatus}\`. Never also call \`create_task_comment\` or \`update_task\` to complete the task. When it refuses, fix the blockers it lists (e.g. TASK_COMMIT_MISSING: commit first) and call it again. If a blocker cannot be cleared within this task, do not complete it: post the same report with \`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")\` so it is not lost, then set the task \`on_fire\` (when available) and state the blocker. The auto-posted terminal-tail resolution comment (a raw log dump posted on session exit) does not replace this report.`
-      : `\n\nMANDATORY before marking this task \`${completeStatus}\`: post ONE self-authored resolution comment via \`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")\`. \`content\` must be a real report, written in plain English prose — do NOT use caveman style for this comment, even though the rest of this session runs in caveman mode. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). This is separate from and required IN ADDITION TO the auto-posted terminal-tail resolution comment (a raw log dump with no explanation, posted on session exit) — that one does not satisfy this step. Post it in the SAME tool-call batch as the final \`update_task(status="${completeStatus}")\`.`;
+      ? `\n\nMANDATORY to finish this task: pass ONE self-authored resolution to \`mcp__tipatask-local__complete_task(task_key, resolution)\`. \`resolution\` must be a real report, written in plain English prose — do NOT use caveman style for it, even though the rest of this session runs in caveman mode. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). That tool verifies the task first, then posts this report as the task's resolution comment and sets \`${completeStatus}\`. Never also call \`create_task_comment\` or \`update_task\` to complete the task. When it refuses, fix the blockers it lists (e.g. TASK_COMMIT_MISSING: commit first) and call it again. If a blocker cannot be cleared within this task, do not complete it: post the same report with \`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")\` so it is not lost, then set the task \`on_fire\` (when available) and state the blocker. The auto-posted terminal-tail resolution comment (a raw log dump posted on session exit) does not replace this report. ${BaseTaskAgent.buildFinishChecklist(opts, { completeTool: '`complete_task`' })}`
+      :`\n\nMANDATORY before marking this task \`${completeStatus}\`: post ONE self-authored resolution comment via \`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")\`. \`content\` must be a real report, written in plain English prose — do NOT use caveman style for this comment, even though the rest of this session runs in caveman mode. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). This is separate from and required IN ADDITION TO the auto-posted terminal-tail resolution comment (a raw log dump with no explanation, posted on session exit) — that one does not satisfy this step. Post it in the SAME tool-call batch as the final \`update_task(status="${completeStatus}")\`.`;
     // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status) — see
     // base-agent.js#buildSharedPreamble. Each is its own blank-line-separated block between
     // the resolution note and the task tail; absent optional ones leave no gap. The clarify
@@ -448,13 +460,13 @@ class ClaudeAgent extends BaseTaskAgent {
 
   async detect(config) {
     const bin = await resolveBinAsync('claude');
-    // Every negative carries `detail` (TPT567) — see BaseTaskAgent.buildDetectDetail().
-    const unavailable = (reason, probe) => ({
-      id: this.id, label: this.label, available: false, reason,
+    // Every negative carries `detail` (TPT567) — see BaseTaskAgent.buildDetectDetail() — and a
+    // DETECT_REASONS code (TPT9008).
+    const unavailable = (reasonCode, probe) => this.unavailableResult(reasonCode, {
       detail: BaseTaskAgent.buildDetectDetail(bin, probe),
     });
     if (!bin) {
-      return unavailable('Claude CLI not found. Install claude or ensure its directory is on PATH.');
+      return unavailable('cli_not_found');
     }
     // Run the login probe under the nvm-matched node so shebang-based CLIs resolve correctly.
     // prependPathEnv keeps the env at one PATH key (TPT566) — never `env.PATH = …`.
@@ -462,10 +474,10 @@ class ClaudeAgent extends BaseTaskAgent {
     const probe = await BaseTaskAgent.runCliProbe(bin, ['auth', 'status'], { env: probeEnv });
     if (probe.error) {
       if (probe.error.code === 'ENOENT') {
-        return unavailable('Claude CLI not found', probe);
+        return unavailable('cli_missing', probe);
       }
       console.log(`[task-agent:detect] claude auth probe spawn error: ${probe.error.code || probe.error.message}`);
-      return unavailable('Claude is not logged in', probe);
+      return unavailable('login_check_failed', probe);
     }
     const status = parseClaudeAuthStatus(probe.output);
     if (status.loggedIn) {
@@ -479,7 +491,7 @@ class ClaudeAgent extends BaseTaskAgent {
       `[task-agent:detect] claude auth probe reported not-logged-in ` +
       `(exit=${probe.status}): ${String(probe.output || '').slice(0, 200)}`
     );
-    return unavailable('Claude is not logged in', probe);
+    return unavailable('not_logged_in', probe);
   }
 }
 

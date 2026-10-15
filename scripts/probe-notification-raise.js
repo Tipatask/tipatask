@@ -67,12 +67,13 @@ if (process.argv.includes('--fullscreen-helper')) {
       projectWindows: live,
       onShowMore: (entry) => notifyTarget.resolveShowMoreTarget(entry.origin,
         { originWindow, projectWindows: live, reopen: async (dir) => openProject(dir, { slow: true }), raise }),
+      // Mirrors main.js onClick: raised inside resolveClickTarget(), the click delivered after.
       onClick: async (entry) => {
-        const w = await notifyTarget.resolveClickTarget(entry.origin,
-          { originWindow, projectOf: (target) => projects.get(target), reopen: async (dir) => openProject(dir, { slow: true }) });
+        let focused = false;
+        const w = await notifyTarget.resolveClickTarget(entry.origin, { originWindow, projectOf: (target) => projects.get(target),
+          reopen: async (dir) => openProject(dir, { slow: true }), raise: async (target) => (focused = await raise(target)) });
         if (!w) return;
-        const focused = raise(w);
-        const deliver = async () => { w.webContents.send('notify:clicked', { tag: entry.tag }); clicks.push({ tag: entry.tag, w, focused: await focused }); };
+        const deliver = () => { w.webContents.send('notify:clicked', { tag: entry.tag }); clicks.push({ tag: entry.tag, w, focused }); };
         if (w.webContents.isLoading()) w.webContents.once('did-finish-load', deliver); else deliver();
       } });
     app.on('browser-window-focus', () => surface.syncNotificationSurface());

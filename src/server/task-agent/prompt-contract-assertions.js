@@ -47,6 +47,27 @@ function taskStatus(text) {
   assert.match(text, /evidence[^\n]*resolution(?: comment)? and (?:final )?reply/);
 }
 
+function followUps(text) {
+  once(text, /Follow-up capture:/, 'follow-up capture directive delivered exactly once');
+  once(text, /Zero follow-ups is the normal result\./, 'zero follow-ups is the default exactly once');
+  once(text, /At most 2 new tasks per run, each with one sentence of evidence\./, 'new tasks are capped and evidenced exactly once');
+  assert.match(text, /Only capture a defect, data risk or security issue in shipped behavior, or a manual step the user must take\./);
+  assert.match(text, /Never file improvements, refactors, extra tests, doc ideas, nice-to-haves or (?:own-scope work|things already covered by this task)/);
+  assert.match(text, /Prefer a comment/);
+  assert.match(text, /otherwise report none/);
+  once(text, /(?:After implementation|After implementing)[^\n]*before/, 'follow-ups run after implementation and before completion exactly once');
+  once(text, /not-started(?: and |\/)urgent/, 'only not-started and urgent tasks count as outstanding exactly once');
+  once(text, /never (?:file a )?duplicate/i, 'search before filing, never duplicate exactly once');
+  once(text, /Never touch[^\n]*in[- ]progress[^\n]*done[^\n]*canceled/, 'in-progress, done and canceled tasks stay untouched exactly once');
+  once(text, /(?:filed or updated|filed\/updated)[^\n]*resolution[^\n]*reply/, 'filed or updated keys listed in resolution and reply exactly once');
+  assert.match(text, /type:? "?comment\b/, 'affected tasks get a plain comment, not a resolution');
+  assert.match(text, /self-contained/, 'filed tasks carry self-contained descriptions');
+  assert.match(text, /this task's priority/, 'filed tasks inherit this task\'s priority');
+  assert.match(text, /\\~/, 'tildes are escaped');
+  assert.match(text, /HUMAN/, 'HUMAN category is reserved for user-only steps');
+  assert.match(text, /Skip trivia/, 'trivia is skipped');
+}
+
 function tagBackfill(text, id) {
   once(text, /Blank tag description\(s\) on this task: tt-fixture/, 'blank registered tag needs backfill exactly once');
   assert.match(text, /[Ss]tudy the module/);
@@ -64,4 +85,4 @@ function vcsOff(text) {
   assert.match(text, /Never[^\n]*(?:attribution|Co-Authored-By)/);
 }
 
-module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, taskStatus, tagBackfill, vcsOff };
+module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, tagBackfill, vcsOff };

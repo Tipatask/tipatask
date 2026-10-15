@@ -73,8 +73,8 @@ test('renderCard puts Select + the action menu at the end of .card-top', () => {
   assert.match(cardJs.slice(menu, controls), /<\/div>\s*<\/div>`\}\s*<\/div>\s*\$\{preview \? previewMetaHtml/);
 });
 
-test('action menu holds Edit, Chat, Highlight Related, Rehash, Delete and conditional Merge', () => {
-  assert.match(cardJs, /<div class="card-action-menu" role="group" aria-label="\$\{escapeAttr\(translate\('card\.actionsMenu'\)\)\}">\$\{editBtn\}\$\{chatBtn\}\$\{chainBtn\}\$\{reiterateBtn\}\$\{deleteBtn\}\$\{mergeBtn\}<\/div>/);
+test('action menu holds Edit, Chat, Highlight Related, Rehash, Delete, conditional Merge and conditional Finish', () => {
+  assert.match(cardJs, /<div class="card-action-menu" role="group" aria-label="\$\{escapeAttr\(translate\('card\.actionsMenu'\)\)\}">\$\{editBtn\}\$\{chatBtn\}\$\{chainBtn\}\$\{reiterateBtn\}\$\{deleteBtn\}\$\{mergeBtn\}\$\{finishBtn\}<\/div>/);
 });
 
 // The chat button has no rule of its own: like Edit it is sized and tinted by the shared

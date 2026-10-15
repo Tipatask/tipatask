@@ -15,12 +15,14 @@ const { createWebSocketGate } = require('./ws-upgrade');
 const config = require('./config');
 const { augmentPathEnv, isAsarPath, cliSpawnSpec } = require('./spawn-utils');
 const { createBackend, createPerProjectBackend, coerceBackendType } = require('./task-backend');
+const { attachBackendBroadcasts, detachBackendBroadcasts } = require('./backend-broadcasts');
+const { createBackendEvictor, BACKEND_EVICT_SWEEP_MS } = require('./backend-eviction');
 const { createHttpHandler, handleConnection, drainSessionQueue, sessionQueue } = require('./ws-handlers');
 const websocket = require('./websocket');
 const { preloadAgentDetection, listAllAgentModels } = require('./task-agent');
 const { fetchStatusRoles } = require('./status-roles');
 const { createTaskChangePoll } = require('./task-change-poll');
-const { getAttentionPromptMatch, shouldHoldAttention, bgAgentsBusy, emitTerminalNotice, killRunawaySession, pauseRunawaySession } = require('./terminal-session'); // (C1386, C1565, TPT348, TPT357)
+const { getAttentionPromptMatch, shouldHoldAttention, bgAgentsBusy, emitTerminalNotice, noticeCopy, sessionLocale, killRunawaySession, pauseRunawaySession, maybeNudgeIdleSession } = require('./terminal-session'); // (C1386, C1565, TPT348, TPT357, TPT612, TPT9002)
 const { snapshotProcesses, sweepDescendantWatchdog, resolveAgentLimits } = require('./process-group'); // (C1565, TPT357/TPT370)
 const { installShutdownReaper } = require('./shutdown-reaper'); // (TPT295)
 const { installCrashGuard } = require('./crash-guard'); // (TPT356)
@@ -206,15 +208,48 @@ _backendInstances.set(config.PROJECT_ROOT, backend);
 
 function getBackendForPath(projectPath) {
   if (!projectPath) return backend;
-  if (_backendInstances.has(projectPath)) return _backendInstances.get(projectPath);
+  if (_backendInstances.has(projectPath)) {
+    _backendEvictor.touch(projectPath);
+    return _backendInstances.get(projectPath);
+  }
   let cfg;
   try { cfg = readProjectConfig(projectPath); } catch { cfg = null; }
   if (!cfg) return backend;
   const inst = createPerProjectBackend(cfg, projectPath);
+  // (TPT668) Before init(), so init's own first state transition reaches the project's clients.
+  attachBackendBroadcasts(inst, { websocket, projectPath });
   inst.init().catch(err => console.warn(`[backend-registry] init failed for ${projectPath}:`, err.message));
   _backendInstances.set(projectPath, inst);
+  _backendEvictor.touch(projectPath);
   return inst;
 }
+
+// (TPT673) A per-project instance is in use while any socket of that project is open, any
+// session (terminal, objective/task/project chat) belongs to it, or its merge job has not
+// finished. backend-eviction.js adds the pending-write and idle-window conditions.
+function _projectBackendInUse(projectPath) {
+  for (const client of wss.clients) {
+    if (client.readyState === 1 && client._projectPath === projectPath) return true;
+  }
+  for (const session of sessions.values()) {
+    if (session && session.projectPath === projectPath) return true;
+  }
+  const job = require('./git-merge/merge-job').getJob(projectPath);
+  if (job && (job.state === 'running' || job.state === 'conflict')) return true;
+  return false;
+}
+
+const _backendEvictor = createBackendEvictor({
+  // The module singleton (bound to config.PROJECT_ROOT) is never a candidate.
+  entries: () => [..._backendInstances].filter(([p, inst]) => inst !== backend && p !== config.PROJECT_ROOT),
+  isInUse: _projectBackendInUse,
+  evict: (projectPath, inst) => {
+    detachBackendBroadcasts(inst);
+    if (typeof inst.dispose === 'function') inst.dispose();
+    _backendInstances.delete(projectPath);
+    console.log(`[backend-registry] evicted idle backend for ${projectPath}`);
+  },
+});
 
 function getActiveBackend() {
   return backend;
@@ -363,6 +398,23 @@ process.on('message', (msg) => {
   }
 });
 
+// (TPT670) Restore the exit backstop's left-uncommitted flags an earlier run of this server saved,
+// before the server can list them (GET /api/sessions) or replay them to a connecting socket; every
+// later change is saved to the same file. A missing or corrupt file starts empty.
+const _restoredFlags = require('./left-uncommitted').load({ root: config.USER_DATA_ROOT });
+if (_restoredFlags.restored || _restoredFlags.dropped) {
+  console.log(`[exit-backstop] restored ${_restoredFlags.restored} left-uncommitted flag(s)${_restoredFlags.dropped ? `, dropped ${_restoredFlags.dropped} expired or unreadable` : ''}`);
+}
+
+// (TPT699) Restore the plan-usage sidebar's last good Claude readings an earlier run saved, so a
+// transient failure right after launch (a usage-endpoint 429 hold) serves them as stale rows
+// instead of dashes; every later change is saved to the same file. A missing or corrupt file
+// starts empty.
+const _restoredQuota = require('./task-agent/quota-status').loadQuotaSnapshots({ root: config.USER_DATA_ROOT });
+if (_restoredQuota.restored || _restoredQuota.dropped) {
+  console.log(`[agent-quota] restored ${_restoredQuota.restored} last good reading(s)${_restoredQuota.dropped ? `, dropped ${_restoredQuota.dropped} expired or unreadable` : ''}`);
+}
+
 const localAccess = createLocalAccess({
   port: config.PORT,
   secret: LOCAL_SECRET || undefined,
@@ -423,7 +475,7 @@ const wss = createWebSocketGate(server, (ws, req) => {
   Promise.resolve(handleConnection(ws, req, sessions, getActiveBackend, broadcastAttentionFor, broadcastAttentionCleared, _registryOps.getBackendForPath)).catch(err => {
     console.error('[ws] Connection handler failed:', err.message);
     try {
-      ws.send(JSON.stringify({ type: 'error', message: `Connection setup failed: ${err.message}` }));
+      ws.send(JSON.stringify({ type: 'error', code: 'ESETUP', params: { message: err.message }, message: `Connection setup failed: ${err.message}` }));
       ws.close();
     } catch {}
   });
@@ -447,6 +499,11 @@ const ATTENTION_IDLE_MS = (() => {
   const v = Number(process.env.ATTENTION_IDLE_MS);
   return Number.isFinite(v) && v >= 0 ? v : 60000;
 })();
+// (TPT610) Task-change poll interval (task-change-poll.js). Below 1s is treated as a typo.
+const TASK_POLL_MS = (() => {
+  const v = Number(process.env.TIPATASK_TASK_POLL_MS);
+  return Number.isFinite(v) && v >= 1000 ? v : 30000;
+})();
 const ATTENTION_STALE_MS = 120000; // stale-latch guard: clear a pattern match that never got a clearing chunk
 
 function terminalIdleFallbackNeeded(session, now = Date.now()) {
@@ -460,36 +517,15 @@ function terminalIdleFallbackNeeded(session, now = Date.now()) {
   return now - session.lastOutputAt > ATTENTION_IDLE_MS;
 }
 
-if (coerceBackendType(config.TASK_BACKEND) === 'api' && typeof backend.onConnectionStateChange === 'function') {
-  backend.onConnectionStateChange((state, message) => {
-    console.log(`[api-backend] state → ${state}${message ? ` (${message})` : ''}`);
-    // (C1356) A credential-less packaged-Electron singleton (see isSingletonUnbound()
-    // above) churns through connection states on its own dead init() — nothing real ever
-    // reads from it (every bound window uses its own per-project backend), so an unscoped
-    // emitApiStatus() here would bleed a bogus offline/reauth banner into every open
-    // project window.
-    if (isSingletonUnbound()) return;
-    websocket.emitApiStatus(state, message, backend.getPendingMutationCount(), backend.getPendingTaskIds());
-  });
-
-  backend.onMutationsDrained((replayedTasks, remaining) => {
-    websocket.emitApiStatus(
-      remaining > 0 ? 'reconnecting' : 'connected',
-      remaining > 0 ? `Reconnected — ${remaining} updates still queued` : null,
-      remaining,
-      backend.getPendingTaskIds(),
-    );
-    for (const t of replayedTasks) {
-      if (t._deleted) {
-        websocket.emitTaskDeleted(t.id);
-      } else if (t._replacedTmpId) {
-        websocket.emitTaskDeleted(t._replacedTmpId);
-        websocket.emitTaskCreated(t);
-      } else {
-        websocket.emitTaskUpdated(t);
-      }
-    }
-  });
+// (TPT668) Connection-state + offline-drain broadcasts — the singleton's stay unscoped;
+// each getBackendForPath() instance gets its own, project-scoped (see backend-broadcasts.js).
+// (C1356) A credential-less packaged-Electron singleton (see isSingletonUnbound() above)
+// churns through connection states on its own dead init() — nothing real ever reads from
+// it (every bound window uses its own per-project backend), so an unscoped emitApiStatus()
+// from its state listener would bleed a bogus offline/reauth banner into every open
+// project window.
+if (coerceBackendType(config.TASK_BACKEND) === 'api') {
+  attachBackendBroadcasts(backend, { websocket, skipState: isSingletonUnbound });
 }
 
 // (C1057) `detail` is { kind, promptText, agent } — optional; falls back to the session's
@@ -574,7 +610,7 @@ async function detectCompletedTerminalSessions() {
         if (!gate.allowed) {
           const reason = JSON.stringify(gate.verification.blockers);
           if (session._vcsBlockedNotice !== reason) {
-            emitTerminalNotice(session, `Completion verification blocked: ${reason}. Recheck live VCS settings and use tipatask-local complete_task after required merges and checks.`);
+            noticeCopy(session, 'notice.completion.blocked', { reason });
             session._vcsBlockedNotice = reason;
           }
           if (gate.task) websocket.emitTaskUpdated(gate.task, null, session.projectPath);
@@ -658,6 +694,10 @@ setInterval(() => {
     }
 
     if (terminalIdleFallbackNeeded(session, now)) {
+      // (TPT612) Watcher-independent: an executing task left in progress without its required
+      // commit gets a pasted commit + complete_task reminder (once per idle period, max 2).
+      maybeNudgeIdleSession(session, { backend: session.backend || backend, projectRoot: session.projectPath || config.PROJECT_ROOT })
+        .catch(err => console.error(`[nudge] ${session.taskId}:`, err.message));
       if (hasWatcher) broadcastAttentionFor(taskId, { kind: 'idle', promptText: '', agent: session.taskAgent });
     } else if (session._attentionBroadcasted && hasWatcher) {
       // (C1356) Previously also silently zeroed session._attentionBroadcasted/
@@ -704,6 +744,7 @@ if (process.platform === 'win32') {
       killRunawaySession,
       pauseRunawaySession,
       emitTerminalNotice,
+      resolveLocale: sessionLocale, // (TPT9002) watchdog texts in the project language
       emitSessionRunaway(projectPath, detail) {
         sessionValidation.watchdog(detail);
         websocket.emitSessionRunaway(projectPath, detail);
@@ -822,7 +863,7 @@ ensureCavemanPlugin()
     }
   });
 
-  // ── API backend: poll for changes every 10s, per project (C1356) ──
+  // ── API backend: completion sweep every 10s, task-change poll every TASK_POLL_MS (C1356) ──
   // coerceBackendType(), not the raw config.TASK_BACKEND literal — createBackend/
   // createPerProjectBackend already coerce a stale "file"/unset config to a real api
   // backend (C1352), so gating on the raw literal could silently disable both this poll
@@ -830,19 +871,35 @@ ensureCavemanPlugin()
   if (coerceBackendType(config.TASK_BACKEND) === 'api') {
     const taskChangePoll = createTaskChangePoll({ wss, getBackendForPath, websocket, isSingletonUnbound });
 
+    // (TPT673) Release per-project backends nobody has used for BACKEND_IDLE_EVICT_MS.
+    setInterval(() => { _backendEvictor.sweep(); }, BACKEND_EVICT_SWEEP_MS).unref();
+
+    // C982: completion detection runs regardless of connected clients — a detached
+    // agent (modal closed, process still alive) must still get its resolution
+    // comment even with no browser open. Kept at 10s: it is one getTask() per live
+    // terminal session, and its latency is the resolution comment's and queue drain's.
     setInterval(async () => {
-      // C982: completion detection runs regardless of connected clients — a detached
-      // agent (modal closed, process still alive) must still get its resolution
-      // comment even with no browser open.
       await detectCompletedTerminalSessions();
+    }, 10000);
+
+    // (TPT610) The task-change poll reads each project's cheap change stamp (see
+    // task-change-poll.js), so it runs on its own, slower interval.
+    let taskPollInFlight = false;
+    setInterval(async () => {
       // (C1057/C1282) A board or attention watcher is enough to run the poll. The Electron
       // __attention__ socket now forwards tasks-updated to the mounted Objective view, so it
       // must stay subscribed here even though it deliberately does not receive board config or
       // perform full Tasks-section rendering. task-change-poll.js's own tick() re-derives the
       // exact same watched set per project, so this is just a cheap early-out.
       if (![...wss.clients].some((c) => c._boardWatcher || c._attentionSubscriber)) return;
-      await taskChangePoll.tick();
-    }, 10000);
+      if (taskPollInFlight) return; // a slow tick never overlaps the next one
+      taskPollInFlight = true;
+      try {
+        await taskChangePoll.tick();
+      } finally {
+        taskPollInFlight = false;
+      }
+    }, TASK_POLL_MS);
   }
   })
   .catch((err) => {

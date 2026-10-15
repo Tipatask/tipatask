@@ -212,6 +212,14 @@ async function verifyTaskCompletion({ backend, projectRoot, taskId, git = runGit
   return result;
 }
 
+// Read-only commit check for the idle completion nudge (completion-nudge.js): the same live
+// settings read and Git reads complete_task runs, without the role lookup, comment or status
+// write. Never posts anything and never runs a Git write.
+async function checkTaskCommit({ backend, projectRoot, taskId, git } = {}) {
+  const { verified, vcs, ready, blockers } = await verifyTaskCompletion({ backend, projectRoot, taskId, git, requireCommit: true });
+  return { verified, vcs, ready, blockers };
+}
+
 // True when the task already carries this exact report, so a retried call (a lost tool response,
 // a status write that failed after the comment, a report already posted while completion was
 // blocked) does not post it twice. An unreadable comment list counts as no match: a duplicate
@@ -298,4 +306,4 @@ async function warnIfCompletedWorktreeDirty({ session, backend, projectRoot, tas
   }
 }
 
-module.exports = { checkCompletedTaskWorktrees, warnIfCompletedWorktreeDirty, verifyTaskCompletion, completeVerifiedTask, guardCompletionTransition };
+module.exports = { checkCompletedTaskWorktrees, warnIfCompletedWorktreeDirty, verifyTaskCompletion, checkTaskCommit, completeVerifiedTask, guardCompletionTransition };

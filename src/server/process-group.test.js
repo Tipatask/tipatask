@@ -955,6 +955,47 @@ test('sweepDescendantWatchdog: kill mode kills on sustained memory and passes th
   assert.equal(emits.at(-1).detail.killed, true);
 });
 
+// `leaderKb` on the pty leader's row and `n` descendants at 0 KB, so a test can pick a tree
+// total that is not a whole number of MiB.
+function leaderRssSnapshot(n, leaderKb) {
+  return parsePsOutput([`  10  10  1  ${leaderKb}  S  bash`,
+    ...Array.from({ length: n }, (_, i) => `  10  ${1000 + i}  10  0  S  node`)].join('\n'));
+}
+
+test('sweepDescendantWatchdog hands on whole MiB when the tree RSS is not a multiple of 1024 KB (TPT9009)', () => {
+  const fractional = /\d\.\d+ (?:MiB|МіБ)/;
+  // 1500 KB = 1.46 MiB: the count warning in either language, its log line and its frame say 1 MiB.
+  for (const [locale, head] of [['en', '54 descendant processes using 1 MiB under this session'],
+    ['uk', 'дочірніх процесів: 54, використовують 1 МіБ у цій сесії']]) {
+    const { notices, emits, deps } = makeSweepDeps();
+    const logs = [];
+    Object.assign(deps, { resolveLocale: () => locale, log: (line) => logs.push(line) });
+    sweepDescendantWatchdog(new Map([['k1', makeSweepSession()]]), leaderRssSnapshot(54, 1500), deps);
+    assert.ok(notices[0].text.includes(head), notices[0].text);
+    assert.match(logs[0], /^\[watchdog\] Task T1: 54 descendant processes using 1 MiB \(warn ≥50; 1 session active\)/);
+    assert.equal(emits[0].detail.rssMb, 1);
+    assert.doesNotMatch([notices[0].text, ...logs].join('\n'), fractional);
+  }
+  // 6384200 KB = 6234.5703125 MiB, then exactly +512 MiB a sweep: 6235 MiB in the memory warning,
+  // 7259 MiB in the pause/kill figures and log line — while evaluateRunaway(), which still gets
+  // the exact values, sees two full 512 MiB growth intervals.
+  for (const action of ['pause', 'kill']) {
+    const { notices, pauses, kills, emits, deps } = makeSweepDeps();
+    const logs = [];
+    Object.assign(deps, { resolveLimits: () => withMemory(action), log: (line) => logs.push(line) });
+    const sessions = new Map([['k1', makeSweepSession()]]);
+    for (const step of [0, 1, 2]) sweepDescendantWatchdog(sessions, leaderRssSnapshot(8, 6384200 + step * 512 * 1024), deps);
+    assert.match(notices[0].text, /uses 6235 MiB; RSS warning threshold 3072 MiB \(8 descendant processes\)/);
+    assert.equal(emits[0].detail.rssMb, 6235);
+    const acted = action === 'pause' ? pauses : kills;
+    assert.equal(acted.length, 1);
+    assert.deepEqual({ reason: acted[0].opts.reason, rssMb: acted[0].opts.rssMb }, { reason: 'memory-growth', rssMb: 7259 });
+    assert.equal(emits.at(-1).detail.rssMb, 7259);
+    assert.match(logs.at(-1), /: 8 descendant processes using 7259 MiB \(warn ≥50, RSS warning 3072 MiB; 1 session active\)/);
+    assert.doesNotMatch([...notices.map(n => n.text), ...logs].join('\n'), fractional);
+  }
+});
+
 test('sweepDescendantWatchdog resolves limits once per project per sweep and applies them per session', () => {
   const a1 = makeSweepSession({ tabId: 'A1', projectPath: '/a' });
   const a2 = makeSweepSession({ tabId: 'A2', ptyPid: 20, projectPath: '/a' });
@@ -1458,4 +1499,83 @@ test('watchdog uses one active count throughout a sweep even after killing anoth
   sweepDescendantWatchdog(sessions.entries(), parsePsOutput(rows.join('\n')), deps);
   assert.equal(kills.length, 2);
   assert.deepEqual(kills.map(k => k.opts.threshold), [50, 50]);
+});
+
+// ── (TPT9002) Project-language watchdog texts ──
+// The builders take a trailing locale; the English default is byte-identical to what they always
+// produced, so the log lines and the exit resolution comment do not change.
+
+test('watchdog text builders take a locale and keep the English default byte-identical', () => {
+  const { LOCALES: COPY } = require('./terminal-copy');
+  const { describeRunawayReason, describeTree } = require('./process-group');
+  assert.equal(describeRunawayReason('count-growth', 'uk'), COPY.uk['watchdog.reason.count-growth']);
+  assert.equal(describeRunawayReason('what', 'uk'), COPY.uk['watchdog.reason.default']);
+  assert.equal(describeRunawayReason('count-growth'), 'sustained process-count growth');
+  assert.equal(describeRunawayReason('what'), 'resource watchdog intervention');
+  assert.equal(describeTree(3, 0, 'uk'), 'дочірніх процесів: 3');
+  assert.equal(describeTree(3, 42), '3 descendant processes using 42 MiB');
+  assert.equal(describeTree(3, 0), '3 descendant processes');
+  assert.match(describeActPolicy(20, { locale: 'uk' }), /^після 2 поспіль перевірок із ≥20, кожна зі зростанням на ≥10, або одразу при ≥60$/);
+  assert.equal(describeActPolicy(20), 'after 2 consecutive checks ≥20 each growing by ≥10, or immediately at ≥60');
+  assert.match(describeActPolicy(50, { limitMb: 3072, locale: 'uk' }), /або коли RSS тримається >6144 МіБ протягом 3 30-секундних вимірів/);
+  assert.match(describeKillPolicy(50, undefined, undefined, 3072, 'uk'), /^завершення після 2 поспіль/);
+  assert.equal(describeKillPolicy(50), `kill ${describeActPolicy(50)}`);
+  const uk = buildRunawayWarning(54, 50, 'npm ×24, інших: 3', { rssMb: 900, limitMb: 3072, action: 'pause', reason: 'count', activeCount: 8, advisoryDescendants: 13, advisoryTreeRssMb: 1536, locale: 'uk' });
+  assert.match(uk, /^дочірніх процесів: 54, використовують 900 МіБ у цій сесії — досягнуто порогу попередження за кількістю дочірніх процесів; сесія продовжує працювати\. Активних сесій: 8\. Рекомендовані бюджети паралельності: 13 дочірніх процесів, 1536 МіБ; вони не спричиняють втручання\. Сторож призупинить її/);
+  assert.match(uk, / Найбільше процесів: npm ×24, інших: 3\.$/);
+  assert.doesNotMatch(uk, /\{\w+\}|descendant|session/);
+  const ukMemory = buildRunawayWarning(12, 50, '', { rssMb: 2300, limitMb: 3072, action: 'kill', reason: 'memory', activeCount: 1, locale: 'uk' });
+  assert.match(ukMemory, /^Дерево процесів цієї сесії використовує 2300 МіБ; поріг попередження RSS 3072 МіБ \(дочірніх процесів: 12\) — досягнуто порогу попередження RSS; сесія продовжує працювати\. Активних сесій: 1\. Автоматичне завершення ввімкнено \(завершення після/);
+  const en = buildRunawayWarning(54, 50, 'npm ×24', { rssMb: 900, limitMb: 3072, action: 'pause', reason: 'count', activeCount: 1, advisoryDescendants: 13, advisoryTreeRssMb: 1536 });
+  assert.equal(en, '54 descendant processes using 900 MiB under this session — descendant warning threshold reached; the session keeps running.'
+    + ' 1 session active. Advisory concurrency budgets: 13 descendants, 1536 MiB; these do not trigger intervention.'
+    + ` The watchdog will pause it — nothing is killed and it can be resumed — ${describeActPolicy(50, { limitMb: 3072, action: 'pause' })}. Top processes: npm ×24.`);
+  assert.equal(buildRunawayWarning(54, 50, '', { activeCount: 8, action: 'kill' }),
+    `54 descendant processes under this session — descendant warning threshold reached; the session keeps running. 8 sessions active. Automatic termination enabled (kill ${describeActPolicy(50)}).`);
+});
+
+// Children named so the summary has a long tail: 6 names over `n` pids → top 4 + "N other".
+function namedTreeSnapshot(n) {
+  const names = ['npm', 'node', 'sh', 'git', 'cc1', 'ld'];
+  return parsePsOutput(['  10  10  1  0  S  bash',
+    ...Array.from({ length: n }, (_, i) => `  10  ${1000 + i}  10  0  S  ${names[i % names.length]}`)].join('\n'));
+}
+
+test('sweepDescendantWatchdog: resolveLocale localizes the notice, the prompt and the summary; a throwing resolver falls back to English', () => {
+  const { LOCALES: COPY } = require('./terminal-copy');
+  for (const [resolveLocale, uk] of [[() => 'uk', true], [() => { throw new Error('boom'); }, false], [() => null, false], [undefined, false]]) {
+    const session = makeSweepSession();
+    const sessions = new Map([['k1', session]]);
+    const { notices, emits, kills, deps } = makeSweepDeps();
+    if (resolveLocale) deps.resolveLocale = resolveLocale;
+    for (const n of [52, 68, 86, 160]) sweepDescendantWatchdog(sessions, namedTreeSnapshot(n), deps);
+    assert.equal(kills.length, 0);
+    assert.equal(notices.length, 2);
+    const text = notices.at(-1).text;
+    assert.equal(emits.at(-1).detail.promptText, text, 'the OS notification carries the same text');
+    if (uk) {
+      assert.match(text, /^дочірніх процесів: 160 у цій сесії — /);
+      assert.match(text, new RegExp(` ${COPY.uk['watchdog.warn.nextWarn'].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} `));
+      assert.match(text, /Найбільше процесів: .*інших: \d+\.$/);
+      assert.doesNotMatch(text, /descendant|other|session/);
+    } else {
+      assert.match(text, /^160 descendant processes under this session — /);
+      assert.match(text, /only warns: automatic pause and termination are disabled/);
+      assert.match(text, /Top processes: .*\d+ other\.$/);
+    }
+  }
+});
+
+test('sweepDescendantWatchdog: a pause gets the locale and both summaries, so the pause text and the comment can differ in language', () => {
+  const session = makeSweepSession();
+  const sessions = new Map([['k1', session]]);
+  const { pauses, deps } = makeSweepDeps();
+  deps.resolveLimits = () => ({ warnDescendants: 50, watchdogAction: 'pause' });
+  deps.resolveLocale = () => 'uk';
+  for (const n of [54, 64, 74, 84]) sweepDescendantWatchdog(sessions, namedTreeSnapshot(n), deps);
+  assert.ok(pauses.length >= 1, 'sustained growth pauses');
+  const opts = pauses[0].opts;
+  assert.equal(opts.locale, 'uk');
+  assert.match(opts.summary, /\d+ other$/);
+  assert.match(opts.summaryLocal, /інших: \d+$/);
 });

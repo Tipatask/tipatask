@@ -22,6 +22,10 @@ const path = require('node:path');
 const http = require('node:http');
 const Module = require('node:module');
 
+// The account store defaults to USER_DATA_ROOT; keep this file's tokens in a private dir.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-wsks-userdata-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
+
 const fakeElectron = { BrowserWindow: { getAllWindows: () => [] } };
 const fakeTaskBackend = {
   // bindWindowToProject only needs backend.init() to exist and resolve — the real

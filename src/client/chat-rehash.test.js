@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import vm from 'node:vm';
 import { buildObjectivePrompt, escapeAttr, BLANK_SUBTASK_BRIEF } from './utils.js';
+import { t, tc } from './i18n.js';
 
 const source = readFileSync(new URL('./chat-ui.js', import.meta.url), 'utf8');
 const read = name => readFileSync(new URL('./' + name, import.meta.url), 'utf8');
@@ -44,7 +45,8 @@ function chat() {
       send(data) { this.sent.push(JSON.parse(data)); }
     },
     effectiveObjectiveModel: () => null,
-    OBJECTIVE_HISTORY_PAGE_MESSAGES: 20, escapeAttr, t: key => key,
+    // (TPT9007) The real i18n lookups — the composer copy (placeholder, word count) is translated now.
+    OBJECTIVE_HISTORY_PAGE_MESSAGES: 20, escapeAttr, t, tc,
     objectiveIsStreaming: () => false,
     renderComposerHeader: () => '', _buildTabBarInnerHtml: () => '',
     buildModelSelectorHtml: () => '', buildEmbedMenuHtml: () => '', DROPDOWN_CARET_SVG: '',

@@ -5,6 +5,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const os = require('node:os');
+// Tokens live only in the app-level account store under TIPATASK_USER_DATA. Give this file
+// its own, so parallel test files never race on one shared store file.
+process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-vcs-completion-data-'));
+test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
+
 const fx = require('./git-merge/test-fixture');
 const { readVcsContext, refreshSessionVcs, buildVcsContextDirective } = require('./vcs-context');
 const { verifyTaskCompletion, completeVerifiedTask, guardCompletionTransition } = require('./git-merge/completion-guard');

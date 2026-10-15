@@ -28,6 +28,8 @@ function main() {
   Object.assign(env, {
     TIPATASK_PROJECT_ROOT: scratch,
     TIPATASK_USER_DATA: scratch,
+    // test-guard.cjs records writes to this root's account store; tests may reassign TIPATASK_USER_DATA.
+    TIPATASK_TEST_SHARED_USER_DATA: scratch,
     NODE_DISABLE_COMPILE_CACHE: '1',
     TIPATASK_TEST_VIOLATIONS: path.join(scratch, 'violations.log'),
     NODE_OPTIONS: `--require=${JSON.stringify(path.join(__dirname, 'test-guard.cjs'))}`,

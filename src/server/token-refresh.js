@@ -25,6 +25,24 @@ const DEFAULT_TIMEOUT_MS = 5000;
 // joins the request already in flight.
 const _inflight = new Map();
 
+// (TPT9008) Every refresh failure carries a stable `refreshCode` (+ `refreshParams`) beside its
+// English message. auth-guard.js forwards both in its `detail`, so the EAUTH frame
+// (terminal.error.EAUTH.refresh.* in i18n.js) and the launch warning (notice.token.refreshError.*
+// in terminal-copy.js) name the failure in the project language; the English values there must
+// stay these messages (token-refresh.test.js).
+function refreshFailure(message, refreshCode, refreshParams) {
+  return Object.assign(new Error(message), { refreshCode, ...(refreshParams ? { refreshParams } : {}) });
+}
+
+// account-store.js's legacy project-scope check, tagged as a refresh failure.
+function assertRefreshProject(token, projectId) {
+  try {
+    assertTokenProject(token, projectId);
+  } catch (err) {
+    throw Object.assign(err, { refreshCode: 'project_scope' });
+  }
+}
+
 async function requestFreshToken({ baseUrl, token, projectId, fetchImpl, timeoutMs }) {
   let res;
   try {
@@ -35,19 +53,21 @@ async function requestFreshToken({ baseUrl, token, projectId, fetchImpl, timeout
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
-    const code = (err && err.cause && err.cause.code) || (err && err.name === 'TimeoutError' ? 'timeout' : '');
-    throw new Error(`token refresh request failed${code ? ` (${code})` : ''}`);
+    const cause = err && err.cause && err.cause.code;
+    if (cause) throw refreshFailure(`token refresh request failed (${cause})`, 'request_failed_cause', { cause });
+    if (err && err.name === 'TimeoutError') throw refreshFailure('token refresh request failed (timeout)', 'request_timeout');
+    throw refreshFailure('token refresh request failed', 'request_failed');
   }
-  if (!res.ok) throw new Error(`token refresh rejected (HTTP ${res.status})`);
+  if (!res.ok) throw refreshFailure(`token refresh rejected (HTTP ${res.status})`, 'rejected', { status: res.status });
   let body;
-  try { body = await res.json(); } catch { throw new Error('token refresh returned an unreadable response'); }
+  try { body = await res.json(); } catch { throw refreshFailure('token refresh returned an unreadable response', 'unreadable_response'); }
   const fresh = body && typeof body.token === 'string' ? body.token : '';
-  if (tokenExpiryMs(fresh) == null) throw new Error('token refresh returned no usable token');
-  assertTokenProject(fresh, projectId);
+  if (tokenExpiryMs(fresh) == null) throw refreshFailure('token refresh returned no usable token', 'no_usable_token');
+  assertRefreshProject(fresh, projectId);
   const before = decodeTokenPayload(token);
   const after = decodeTokenPayload(fresh);
   if (before?.id !== after?.id || (before?.project_id ?? null) !== (after?.project_id ?? null)) {
-    throw new Error('token refresh changed account or scope — sign in again');
+    throw refreshFailure('token refresh changed account or scope — sign in again', 'scope_changed');
   }
   return fresh;
 }
@@ -71,11 +91,11 @@ async function doRefresh({ projectRoot, baseUrl, token, projectId, fetchImpl, ti
 // token-free message on any failure. `fetchImpl`/`timeoutMs` exist for tests.
 function refreshProjectToken({ projectRoot, baseUrl, token, projectId, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS }) {
   if (!projectRoot || !baseUrl || !token || !projectId) {
-    return Promise.reject(new Error('token refresh needs projectRoot, baseUrl, token and projectId'));
+    return Promise.reject(refreshFailure('token refresh needs projectRoot, baseUrl, token and projectId', 'missing_input'));
   }
-  try { assertTokenProject(token, projectId); } catch (err) { return Promise.reject(err); }
+  try { assertRefreshProject(token, projectId); } catch (err) { return Promise.reject(err); }
   const impl = fetchImpl || globalThis.fetch;
-  if (typeof impl !== 'function') return Promise.reject(new Error('fetch is unavailable'));
+  if (typeof impl !== 'function') return Promise.reject(refreshFailure('fetch is unavailable', 'fetch_unavailable'));
   // Join projects of the same account token, never a new sign-in or another
   // legacy project scope on the same API server.
   const flightKey = `${normalizeBaseUrl(baseUrl)}:${createHash('sha256').update(token).digest('hex')}`;

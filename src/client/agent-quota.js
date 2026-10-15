@@ -107,6 +107,17 @@ function resetLabel(value) {
     : t('quota.resetUnknown');
 }
 
+// When a stale reading was taken: the time alone today, with a short date otherwise (the server
+// keeps a reading for up to 24h).
+function readingTime(value, now) {
+  const at = typeof value === 'string' && value ? new Date(value) : null;
+  if (!at || !Number.isFinite(at.getTime())) return '—';
+  const sameDay = at.toDateString() === new Date(now).toDateString();
+  return at.toLocaleString(getLocale(), sameDay
+    ? { hour: '2-digit', minute: '2-digit' }
+    : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
 const MINUTE_MS = 60000;
 // How often a mounted sidebar re-reads the quotas on its own (skipped while the window is hidden).
 export const REFRESH_MS = 5 * MINUTE_MS;
@@ -133,21 +144,25 @@ export function formatQuotaResetRemaining(resetAt, now = Date.now()) {
 // for the empty track and a dark-ink copy clipped to the fill, so it stays legible on both.
 // Provider/plan, reset time and recovery guidance go in the row's tooltip.
 //
-// Four states must stay visually distinct at rest: still loading (neutral pulsing placeholder,
+// Five states must stay visually distinct at rest: still loading (neutral pulsing placeholder,
 // emptyRow), a known value (`--known`: provider-tinted track, fill only when usage > 0 — so a true
-// 0% is an empty tinted track, never confused with "nothing loaded yet"), unavailable (dashed
-// outline) and a failed read (renderAgentQuotaSidebarBody's inert dashed row).
+// 0% is an empty tinted track, never confused with "nothing loaded yet"), a stale known value
+// (`--stale` row: the server's last good reading while fresh reads fail transiently, drawn faded
+// in the same hue, its tooltip led by the reading's time), unavailable (dashed outline) and a
+// failed read (renderAgentQuotaSidebarBody's inert dashed row).
 function renderRow(provider, agent, window, unavailable, hint, now) {
   const state = !window || unavailable ? 'unavailable' : quotaUsageState(window.usagePercent);
   const known = state !== 'unavailable';
+  const staleAt = known && agent?.stale === true ? t('agentQuotaSidebar.staleAt', { time: readingTime(agent.checkedAt, now) }) : '';
   const label = windowCaption(provider, window);
   const percent = known ? new Intl.NumberFormat(getLocale(), { maximumFractionDigits: 1 }).format(window.usagePercent) : '';
   const used = known ? t('quota.used', { percent }) : t('quota.unavailable');
   const width = known ? Math.min(100, window.usagePercent) : 0;
   const filled = known && width > 0;
-  const tip = [`${PROVIDER_NAMES[provider]}${agent?.plan ? ` · ${agent.plan}` : ''}`, known ? resetLabel(window.resetAt) : hint].filter(Boolean).join('\n');
+  // A stale row also says why the fresh read failed, after its reset time.
+  const tip = [staleAt, `${PROVIDER_NAMES[provider]}${agent?.plan ? ` · ${agent.plan}` : ''}`, known ? resetLabel(window.resetAt) : hint, staleAt && hint].filter(Boolean).join('\n');
   // Near-limit / exhausted are deliberately not colours — only announced to assistive tech.
-  const valueText = known && state !== 'normal' ? `${used} · ${t(`quota.state.${state}`)}` : used;
+  const valueText = [used, known && state !== 'normal' ? t(`quota.state.${state}`) : '', staleAt].filter(Boolean).join(' · ');
   const remaining = known ? formatQuotaResetRemaining(window.resetAt, now) : null;
   // The countdown span carries its reset time so the minute tick can refresh it in place.
   const countdown = remaining == null ? '' : `<span class="agent-quota-sidebar-reset" data-reset-at="${escapeAttr(window.resetAt)}"> (${escapeAttr(remaining)})</span>`;
@@ -155,7 +170,7 @@ function renderRow(provider, agent, window, unavailable, hint, now) {
   const semantics = known
     ? `role="progressbar" aria-label="${escapeAttr(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${width}" aria-valuetext="${escapeAttr(valueText)}"`
     : `role="img" aria-label="${escapeAttr(`${label}: ${used}`)}"`;
-  return `<div class="agent-quota-sidebar-row agent-quota-sidebar-row--${provider}" tabindex="0" ${semantics} title="${escapeAttr(tip)}" style="--fill:${width}%">
+  return `<div class="agent-quota-sidebar-row${staleAt ? ' agent-quota-sidebar-row--stale' : ''} agent-quota-sidebar-row--${provider}" tabindex="0" ${semantics} title="${escapeAttr(tip)}" style="--fill:${width}%">
     <div class="agent-quota-sidebar-bar${known ? ' agent-quota-sidebar-bar--known' : ' agent-quota-sidebar-bar--unavailable'}">${filled ? '<span class="agent-quota-sidebar-fill"></span>' : ''}<span class="agent-quota-sidebar-text">${text}</span>${known ? `<span class="agent-quota-sidebar-text agent-quota-sidebar-text--fill" aria-hidden="true">${text}</span>` : ''}</div>
   </div>`;
 }
@@ -167,7 +182,8 @@ function renderProvider(provider, agent, now) {
   const unavailable = !agent || agent.status === 'unavailable' || connection !== 'connected';
   const reason = REASONS.has(agent?.unavailableReason) ? agent.unavailableReason : 'quota_unavailable';
   const partial = unavailable || !windows.length || windows.some(w => quotaUsageState(w.usagePercent) === 'unavailable');
-  const hint = partial ? t(`quota.reason.${reason}`, { provider: name }) : '';
+  // A stale reading carries the transient reason its fresh read failed with.
+  const hint = partial || (agent?.stale === true && REASONS.has(agent.unavailableReason)) ? t(`quota.reason.${reason}`, { provider: name }) : '';
   const rows = (windows.length ? windows : [null]).map(window => renderRow(provider, agent, window, unavailable, hint, now)).join('');
   return `<div class="agent-quota-sidebar-group" role="group" aria-label="${name}">${rows}</div>`;
 }

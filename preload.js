@@ -153,10 +153,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     tasks: {
       list:              (opts)          => inv('api:tasks.list', opts),
       board:             (opts)          => inv('api:tasks.board', opts), // (C1259) sprint-windowed board list — { tasks, window }
-      get:               (id)            => inv('api:tasks.get', id),
+      get:               (id, opts)      => inv('api:tasks.get', { id, opts }), // (TPT665) opts.errorAsValue — failure returned as { _ipcError }
       create:            (task)          => inv('api:tasks.create', task),
-      update:            (id, patch)     => inv('api:tasks.update', { id, patch }),
-      delete:            (id)            => inv('api:tasks.delete', id),
+      update:            (id, patch, opts) => inv('api:tasks.update', { id, patch, opts }), // (TPT9001) opts.errorAsValue — failure returned as { _ipcError }, see api-router.js
+      delete:            (id, opts)      => inv('api:tasks.delete', { id, opts }), // (TPT660) opts.errorAsValue — failure returned as { _ipcError }
       saveAll:           (tasks)         => inv('api:tasks.saveAll', tasks),
       children:          (parentKey, opts) => inv('api:tasks.children', { parentKey, opts }), // (C1407) opts.unscoped — People-filter "All Tasks" mode
       overwriteRaw:      (content)       => inv('api:tasks.overwriteRaw', content),
@@ -166,12 +166,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
     comments: {
       list:   (taskKey)              => inv('api:tasks.comments.list', taskKey),
-      create: (taskKey, content, type) => inv('api:tasks.comments.create', { taskKey, content, type }),
-      update: (taskKey, commentId, content) => inv('api:tasks.comments.update', { taskKey, commentId, content }),
+      create: (taskKey, content, type, opts) => inv('api:tasks.comments.create', { taskKey, content, type, opts }), // (TPT660) opts.errorAsValue
+      update: (taskKey, commentId, content, opts) => inv('api:tasks.comments.update', { taskKey, commentId, content, opts }), // (TPT660) opts.errorAsValue
     },
     events: {
       list:            (taskKey)            => inv('api:tasks.events.list', taskKey),
-      setSubscription: (taskKey, subscribed) => inv('api:tasks.events.setSubscription', { taskKey, subscribed }),
+      setSubscription: (taskKey, subscribed, opts) => inv('api:tasks.events.setSubscription', { taskKey, subscribed, opts }), // (TPT660) opts.errorAsValue
     },
     tags: {
       list:        ()               => inv('api:tags.list'),
@@ -218,6 +218,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
         ipcRenderer.on('api:connection:changed', handler);
         return () => ipcRenderer.removeListener('api:connection:changed', handler);
       },
+      // (TPT662) { entries: [{ op, taskId, title, code, statusCode, message }], projectPath } —
+      // offline-queued IPC writes the reconnect drain could not replay (main/window-state.js).
+      onMutationsDropped: (cb) => {
+        const handler = (_, payload) => cb(payload);
+        ipcRenderer.on('api:mutations-dropped', handler);
+        return () => ipcRenderer.removeListener('api:mutations-dropped', handler);
+      },
     },
     auth: {
       reauthSave: (config) => inv('api:auth.reauth-save', { config }),
@@ -230,6 +237,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       saveAgents: (selection) => inv('api:project.saveAgents', { selection }),
       // (C1235) Project scalars from the remote API row (today: taskGroupLabel).
       settings: () => inv('api:project.settings'),
+      // (TPT659) The key the API would allocate next for a category — New Task Preview badge.
+      nextTaskKey: (category) => inv('api:project.nextTaskKey', { category }),
       // (C1271) Write project scalars (language/task_group_label) — per-window backend,
       // see api-router.js's api:project.update.
       update: (fields) => inv('api:project.update', { fields }),

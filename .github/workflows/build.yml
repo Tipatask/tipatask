@@ -2,7 +2,8 @@ name: Build installers
 
 # Release-build workflow for the Task App (Electron). Produces the same installers
 # `npm run electron:dist:*` produces on a dev machine, for all three desktop OSes at once,
-# and uploads them as run artifacts plus a draft GitHub Release.
+# and uploads them as run artifacts plus a draft GitHub Release whose body is the committed
+# docs/releases/<tag>.md (see RELEASING.md § Release notes).
 #
 # Triggers are deliberately narrow:
 #   - v* tags          -> the actual release build
@@ -289,7 +290,11 @@ jobs:
           retention-days: 14
 
   # Attaches every leg's installers to a draft GitHub Release on tag builds. Draft, never
-  # auto-published -- the maintainer writes release notes and presses publish by hand.
+  # auto-published -- the maintainer reviews and presses publish by hand. The body comes from
+  # docs/releases/<tag>.md in the tagged tree (generated at export time, reviewed and committed
+  # before tagging); a tag without that file gets a placeholder body plus a warning, never a
+  # failed job. A re-run of this job rewrites the draft body from the file, so edit the file,
+  # not the draft, until the release is published.
   release:
     name: Draft release
     needs: build
@@ -298,6 +303,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # First: actions/checkout cleans the workspace, so it must precede the artifact download.
+      # Only docs/releases is needed; no token is persisted in the checkout.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: docs/releases
+
       - uses: actions/download-artifact@v4
         with:
           pattern: TipATask-*
@@ -315,7 +327,27 @@ jobs:
           [ "$(wc -l < SHA256SUMS)" -eq "${#files[@]}" ] || { echo "::error::SHA256SUMS does not list every installer"; exit 1; }
           cat SHA256SUMS
 
+      # Release body = the committed notes minus the generator's trailing marker comment. Written
+      # under RUNNER_TEMP, never under installers/ (everything there is attached to the release).
+      - name: Prepare release notes
+        id: notes
+        env:
+          NOTES_FILE: docs/releases/${{ github.ref_name }}.md
+        run: |
+          out="$RUNNER_TEMP/release-notes.md"
+          if [ -f "$NOTES_FILE" ]; then
+            { grep -v '^<!-- tipatask-release-notes ' "$NOTES_FILE" || true; } > "$out"
+          fi
+          if [ ! -s "$out" ]; then
+            printf '%s\n' "Release notes for $GITHUB_REF_NAME were not included in this tag (expected $NOTES_FILE in the tagged tree). Write them here before publishing." > "$out"
+            echo "::warning title=Release notes missing::$NOTES_FILE is not in the tagged tree; the draft carries a placeholder body."
+          else
+            echo "::notice title=Release notes::Draft body taken from $NOTES_FILE"
+          fi
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+
       - uses: softprops/action-gh-release@v2
         with:
           draft: true
+          body_path: ${{ steps.notes.outputs.path }}
           files: installers/*

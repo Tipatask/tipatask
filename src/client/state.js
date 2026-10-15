@@ -169,6 +169,11 @@ const state = {
   // (C1057) taskId -> { kind, promptText, agent } — what the agent is actually asking,
   // surfaced in the OS notification body (attention-notifications.js#buildAttentionBody).
   attentionDetails: new Map(),
+  // (TPT613) taskId -> { exitId, blockers, status, at } — the exit backstop flagged this task: its
+  // terminal ended with the task in progress and its required commit missing (the
+  // `task-left-uncommitted` frame). Task state, not session state: survives opening the terminal,
+  // cleared only by a new run launching (startTaskSession) or the task closing (pruneClosedAttention).
+  leftUncommitted: new Map(),
 
   // Green attention (newly assigned tasks)
   newlyAssignedTasks: new Set(),

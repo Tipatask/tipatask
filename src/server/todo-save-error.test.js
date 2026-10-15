@@ -41,6 +41,17 @@ test('an unreachable API becomes 503 whatever transport code it carried', () => 
   assert.equal(out.body.code, 'API_UNREACHABLE');
 });
 
+test('a reverse-proxy gateway status is unreachable (503), not an API error (502)', () => {
+  // api-backend.js flags 502/503/504 with networkError AND keeps statusCode; the outage
+  // reading wins so the client treats it like a connection refused.
+  for (const statusCode of [502, 503, 504]) {
+    const out = classifySaveError(err(`API ${statusCode}: Service Unavailable`, { statusCode, networkError: true, retryable: true }), 'persist');
+    assert.equal(out.status, 503, String(statusCode));
+    assert.equal(out.body.code, 'API_UNREACHABLE');
+    assert.equal(out.body.error, `API ${statusCode}: Service Unavailable`);
+  }
+});
+
 test('missing credentials are an auth problem, not a server error', () => {
   const out = classifySaveError(err('API not configured for this project (missing API_TOKEN in .tipatask/config.json)', { missingCredentials: true }), 'persist');
   assert.equal(out.status, 401);
