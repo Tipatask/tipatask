@@ -221,6 +221,9 @@ const state = {
   // Card selection (reset at start of each loadAndRender call)
   selectedCardId: null,
   expandedCardMode: null, // null | 'hover' | 'pinned'
+  // (TPT9023) data-id of the board card behind .card-expanded — what a full re-render re-opens.
+  // Set by expandCard(), cleared by collapseCard(); a preview card never sets it.
+  expandedCardId: null,
   hoverScrollHandler: null,
 
   // Multi-select for bulk actions (persists across re-renders)

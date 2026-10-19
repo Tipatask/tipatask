@@ -7,7 +7,7 @@ import {
   isActiveName, isClosedName, isStartName, isInProgressName, isCompleteName, isCanceledName,
   startName, inProgressName, completeName,
 } from './status-registry.js';
-import { escapeAttr, renderMarkdown, truncateMarkdownAtParagraph, renderTagBadge, shortModelName, computeTooltipAnchor, isRectClipped, pushSubtaskCrumb, showToast, projectHeader, markTruncatedCards } from './utils.js';
+import { escapeAttr, renderMarkdown, truncateMarkdownAtParagraph, renderTagBadge, shortModelName, computeTooltipAnchor, isRectClipped, pushSubtaskCrumb, showToast, projectHeader, markTruncatedCards, skipTransitionsForFrame } from './utils.js';
 // (C1340) Aliased — renderCard()'s task-object param is itself named `t`, same
 // collision chat-task-preview.js already works around this way.
 import { t as translate } from './i18n.js';
@@ -27,7 +27,7 @@ import { collectFamilyIds } from './related-cards.js';
 import { HIDE_CLASS } from './sprint-tier-visibility.js';
 import { cardVariant, cardMaxWidthPx, estimateTextWidth, TITLE_CHAR_PX } from './card-width.js';
 import { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps } from './dependency-status.js';
-import { expandedCardMaxHeight, clampExpandedTop, resolveAnchorTop } from './card-placement.js';
+import { expandedCardMaxHeight, clampExpandedTop, resolveAnchorTop, shouldRestoreExpansion } from './card-placement.js';
 export { isDragStateStale, resolveDropTier, shouldDeferForDrag };
 export { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps };
 // (C1483) Shape check for "is this a real task key" (prefix+number or dashed epic form)
@@ -190,11 +190,46 @@ export function isDragging() { return _isDragging || _dragState !== null; }
 export function isDropInProgress() { return _dropInProgress; }
 let _dragState = null; // { sourceCard, tierCards, clone, placeholder, startX, startY, offsetX, offsetY, activated }
 
-// (C1438) True only while `taskId` is the card currently being dragged (not just while any
-// drag is active) — used to keep a WS-driven patch/regroup/remove out of the one card whose
-// DOM node the gesture holds a reference to, without deferring updates to every other card.
-export function isDragSourceId(taskId) {
-  return !!_dragState && _dragState.sourceCard.dataset.id === taskId;
+// ── Board freeze while a card is dragged (TPT9025) ──
+// From badge mousedown until the drop's final _cleanupDrag(), nothing a background event does
+// may move the board under the gesture. The per-card patch helpers (applyTaskPatch(),
+// regroupCardToSprint(), removeCardFromDom()) queue their arguments and return 'deferred';
+// board-wide repaints register through deferUntilDragEnds(). _thawBoard() replays both, in
+// arrival order, once the gesture ends. See tt-task-cards-drag-drop.md "Board freeze during
+// a drag (TPT9025)".
+const DRAG_PATCH_QUEUE_LIMIT = 200;
+// The drop's PATCHes and its post-drop render are capped: the drag listeners are already gone
+// by then, so a hung request would otherwise keep the board frozen indefinitely.
+const DROP_PHASE_TIMEOUT_MS = 10000;
+const _dragPatchQueue = []; // { kind: 'patch' | 'regroup' | 'remove', args }
+let _dragPatchOverflow = false; // queue cap hit — the thaw forces one full render instead
+const _dragDeferredRepaints = new Map(); // key → fn, one run per key at thaw
+// Set once the drop's own post-commit render has replaced #app (markDropRenderCommitted()):
+// the rest of that render's tail is the drop's repaint, not a background mutation.
+let _dropRenderCommitted = false;
+
+function _queueDragPatch(kind, args) {
+  if (_dragPatchQueue.length >= DRAG_PATCH_QUEUE_LIMIT) {
+    _dragPatchQueue.length = 0;
+    _dragPatchOverflow = true;
+  }
+  if (!_dragPatchOverflow) _dragPatchQueue.push({ kind, args });
+  return 'deferred';
+}
+
+// Board-wide repaints call this first: while a drag is live it stores `fn` under `key` (a
+// later call with the same key replaces it) and returns true, so the caller skips its own DOM
+// work now; the thaw runs every stored fn once, after the queued card patches.
+export function deferUntilDragEnds(key, fn) {
+  if (!isDragging() || _dropRenderCommitted) return false;
+  _dragDeferredRepaints.set(key, fn);
+  return true;
+}
+
+// template.html calls this right after the drop's own render (`afterDrop`) replaced #app, so
+// that render's tail (filters, session buttons, truncation, scroll restore) runs in order.
+export function markDropRenderCommitted() {
+  if (_dragState) _dropRenderCommitted = true;
 }
 
 // (C1438) isDragStateStale() / shouldDeferForDrag() live in drag-state.js (pure, no DOM
@@ -223,6 +258,7 @@ async function _patchTask(id, body, label) {
       // projectHeader() / ai/architecture/tt-task-board.md § C1391.
       headers: { 'Content-Type': 'application/json', ...projectHeader() },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(DROP_PHASE_TIMEOUT_MS), // (TPT9025) drop-only helper
     });
     if (!res.ok) console.error(`${label} PATCH failed for ${id}: ${res.status}`);
   } catch (err) {
@@ -281,13 +317,15 @@ function _startTaskSessionCore(taskId, taskTitle, taskDesc, taskStatus, { agentA
 // (C1559) Card-independent entry point for starting a task's terminal session — the
 // /start-task web-button dispatch's "regular task" and "first startable child" branches
 // (see template.html's 'start-task' IPC listener) call this, since neither has a
-// rendered DOM card to read a pinned agent/model from. Fetches the task fresh and
-// resolves agentAssignee/piModel from its own live fields instead, then shares the exact
+// rendered DOM card to read a pinned agent/model from. The edit modal may supply its
+// successfully saved snapshot; all other callers fetch the task fresh. Both share the
 // same ladder _startTaskSession() (bindCardEvents, below) uses for a card-driven Start.
-export async function startTaskById(taskId, extraOpts = {}) {
+export async function startTaskById(taskId, extraOpts = {}, savedTask = null) {
   // (TPT672) A task the account lost access to (403/404), a missing one, or a failed read
   // toasts and starts nothing — see task-fetch.js for the labels.
-  const { task, message } = await loadTaskForAction(taskId, 'card.errStartLoad');
+  const { task, message } = savedTask?.id === taskId
+    ? { task: savedTask }
+    : await loadTaskForAction(taskId, 'card.errStartLoad');
   if (!task) {
     showToast(message, 'error');
     return;
@@ -652,10 +690,23 @@ function unlockBodyScroll() {
 // existing removal, but setupCardInteractions() blanks that field on re-render without removing
 // the listener, so the teardown owns its removal too.
 let expandedPlacementTeardown = null;
+// (TPT9024) The open overlay: its card, the placeholder holding its slot, and its placement pass.
+// collapseCard() removes that placeholder wherever a move left it; syncExpandedOverlay() re-runs
+// the pass after an in-place DOM change.
+let expandedOverlay = null;
 
-export function expandCard(card, mode = 'pinned') {
+// (TPT9023) `instant` holds every transition in the card off for its first painted frame — for
+// re-opening a card a render just rebuilt, which must look as if it never closed.
+export function expandCard(card, mode = 'pinned', { instant = false } = {}) {
+  // (TPT9023) A hover timer left on a node a render has since replaced must not close the
+  // overlay that render re-opened (collapseCard() below acts on whatever card is expanded).
+  if (!card.isConnected) return;
   collapseCard();
+  const isPreviewOverlay = card.matches('.card--preview, .preview-card');
   state.expandedCardMode = mode;
+  // (TPT9023) A preview (chat proposal, Discuss card) is never re-opened onto a board card.
+  state.expandedCardId = isPreviewOverlay ? null : (card.dataset.id || null);
+  if (instant) skipTransitionsForFrame(card);
   const rect = card.getBoundingClientRect();
   const computedStyle = getComputedStyle(card);
 
@@ -705,7 +756,6 @@ export function expandCard(card, mode = 'pinned') {
   // (TPT303) A chat proposal overlay may use the whole viewport height (10px margins) so most
   // proposals open without scrolling; board cards keep 80vh. Preview overlays still scroll as a
   // whole (inline overflowY); a board card's .card-desc is its only scroller (TPT344).
-  const isPreviewOverlay = card.matches('.card--preview, .preview-card');
   if (isPreviewOverlay) card.style.overflowY = 'auto';
 
   // (TPT456) Placement is re-run whenever the card's real height can change — its own size
@@ -734,6 +784,7 @@ export function expandCard(card, mode = 'pinned') {
     card.style.top = top + 'px';
   };
   placeExpanded();
+  expandedOverlay = { card, placeholder, place: placeExpanded };
 
   state.hoverScrollHandler = placeExpanded;
   window.addEventListener('scroll', placeExpanded, { passive: true });
@@ -752,6 +803,7 @@ export function expandCard(card, mode = 'pinned') {
 
 export function collapseCard() {
   state.expandedCardMode = null;
+  state.expandedCardId = null;
   if (expandedPlacementTeardown) {
     expandedPlacementTeardown();
     expandedPlacementTeardown = null;
@@ -760,16 +812,21 @@ export function collapseCard() {
     window.removeEventListener('scroll', state.hoverScrollHandler);
     state.hoverScrollHandler = null;
   }
-  const expanded = document.querySelector('.card-expanded');
-  if (expanded) {
-    // Remove placeholder that was holding grid space and unfreeze container
-    const placeholder = expanded.previousElementSibling;
-    if (placeholder && placeholder.classList.contains('card-placeholder')) {
-      if (placeholder._frozenContainer) {
-        placeholder._frozenContainer.style.minHeight = '';
-      }
-      placeholder.remove();
+  // (TPT9024) The record finds the placeholder after a move, and the card after a patch took it
+  // off the board; adjacency covers a .card-expanded with no record.
+  const open = expandedOverlay;
+  expandedOverlay = null;
+  const expanded = open?.card || document.querySelector('.card-expanded');
+  const adjacent = expanded?.previousElementSibling;
+  const placeholder = open?.placeholder || (adjacent?.classList.contains('card-placeholder') ? adjacent : null);
+  // Remove placeholder that was holding grid space and unfreeze container
+  if (placeholder) {
+    if (placeholder._frozenContainer) {
+      placeholder._frozenContainer.style.minHeight = '';
     }
+    placeholder.remove();
+  }
+  if (expanded) {
     expanded.style.transition = 'none';
     expanded.classList.remove('card-expanded');
     expanded.style.position = '';
@@ -789,6 +846,104 @@ export function collapseCard() {
   const backdrop = document.querySelector('.card-overlay-backdrop');
   if (backdrop) backdrop.remove();
   unlockBodyScroll();
+}
+
+// (TPT9023) Last pointer position, for restoreExpandedCard()'s hit test: a node a render just
+// built has no :hover until the browser's next hover pass, and the rebuild may have moved the
+// card out from under a still pointer. Bound once from setupCardInteractions().
+let _lastPointer = null;
+let _pointerTrackingBound = false;
+function _ensurePointerTracking() {
+  if (_pointerTrackingBound) return;
+  _pointerTrackingBound = true;
+  document.addEventListener('mousemove', (e) => { _lastPointer = { x: e.clientX, y: e.clientY }; }, { capture: true, passive: true });
+  // No relatedTarget: the pointer left the window, so nothing on the page is under it.
+  document.addEventListener('mouseout', (e) => { if (!e.relatedTarget) _lastPointer = null; }, { passive: true });
+}
+
+function pointerIsOver(el) {
+  if (!_lastPointer) return false;
+  const hit = document.elementFromPoint(_lastPointer.x, _lastPointer.y);
+  return !!hit && el.contains(hit);
+}
+
+// (TPT9023) A full board render rebuilds #app under whatever overlay is open. Called right before
+// that commit: closes the overlay, so its body-level backdrop, scroll lock and placement listeners
+// never outlive the node (chat-ui.js's C1427 partial repaint does the same), and returns what
+// restoreExpandedCard() needs to re-open a board card — null for a preview or when nothing is open.
+export function takeExpandedCard(appEl) {
+  const open = appEl.querySelector('.card-expanded');
+  if (!open) return null;
+  const id = state.expandedCardId;
+  let snapshot = null;
+  if (id && open.matches(`.card[data-id="${id}"]`)) {
+    snapshot = {
+      id,
+      mode: state.expandedCardMode,
+      selected: state.selectedCardId === id,
+      descScrollTop: open.querySelector(':scope > .card-desc')?.scrollTop || 0,
+    };
+  }
+  collapseCard();
+  return snapshot;
+}
+
+// (TPT9023) Re-opens a takeExpandedCard() snapshot on the rebuilt board, in the same task as the
+// commit, so no collapsed frame is ever painted. Runs after the render's chain-highlight restore.
+export function restoreExpandedCard(appEl, snapshot) {
+  const card = appEl.querySelector(`.card[data-id="${snapshot.id}"]`);
+  // Gone or hidden: a collapsed tier keeps its cards laid out at opacity 0 (and collapses by
+  // itself once its last task closes), a filter hides them outright.
+  if (!card || card.closest('.tier.collapsed, .search-hidden')) return false;
+  expandCard(card, snapshot.mode, { instant: true });
+  if (!shouldRestoreExpansion({ mode: snapshot.mode, pointerOver: pointerIsOver(card) })) {
+    collapseCard();
+    return false;
+  }
+  if (snapshot.selected) state.selectedCardId = snapshot.id;
+  // The rings the interaction left: mouseenter rings a hover card on top of any chain highlight;
+  // a chain highlight applied after a pin supersedes the pinned card's own rings.
+  if (snapshot.mode === 'hover' ? !state.selectedCardId : !state.chainHighlightedTaskId) {
+    highlightCardAndDeps(snapshot.id);
+  }
+  const desc = card.querySelector(':scope > .card-desc');
+  if (desc) desc.scrollTop = snapshot.descScrollTop || 0;
+  return true;
+}
+
+// (TPT9024) Keeps the open overlay on its live slot after an in-place DOM pass — applyTaskPatch(),
+// regroupCardToSprint(), removeCardFromDom() and applySearchFilter() call it last. A move or a
+// removal can shift the slot without resizing the card or the body, the only things the overlay's
+// ResizeObserver watches. A card that can no longer be shown (off the board, in a folded or emptied
+// sprint, filtered out: restoreExpandedCard()'s cases) closes as a backdrop click would.
+// `moved`: the open card itself was re-parented, so a hover card stays only under the pointer.
+export function syncExpandedOverlay({ moved = false } = {}) {
+  const open = expandedOverlay;
+  if (!open) return;
+  const { card } = open;
+  if (!card.isConnected || card.closest(`.tier.collapsed, .tier.${HIDE_CLASS}, .search-hidden`)) {
+    if (state.selectedCardId && state.selectedCardId === card.dataset.id) {
+      state.selectedCardId = null;
+      clearFocusActive();
+    }
+    if (!state.selectedCardId) clearHighlights();
+    collapseCard();
+    return;
+  }
+  open.place();
+  if (moved && !shouldRestoreExpansion({ mode: state.expandedCardMode, pointerOver: pointerIsOver(card) })) {
+    collapseCard();
+  }
+}
+
+// (TPT9024) Puts the open card's placeholder back in front of it once regroupCardToSprint() has
+// re-parented the card. The source container's freeze is released and the new one gets none: the
+// placeholder already holds the slot, and a frozen min-height would beat a folded sprint's
+// max-height: 0.
+function carryExpandedPlaceholder(card, placeholder) {
+  if (placeholder._frozenContainer) placeholder._frozenContainer.style.minHeight = '';
+  placeholder._frozenContainer = null;
+  card.parentNode.insertBefore(placeholder, card);
 }
 
 // ── Dependency highlighting ──
@@ -1149,8 +1304,10 @@ function _cleanupDrag({ preserveDropState = false } = {}) {
   const { sourceCard, tierCards, currentTier, clone, placeholder } = dragState || {};
   // (C1578) Anchor on tierCards (the source .tier-cards — never removed, unlike the
   // placeholder) so re-hiding the revealed empty tiers can't jump the page under the user.
-  // A stale-state self-heal may hold detached nodes, in which case no viewport anchor exists.
-  const anchorBefore = tierCards?.isConnected ? tierCards.getBoundingClientRect().top : null;
+  // (TPT9025) Once the drop's own render has replaced it, anchor on the dropped card's fresh
+  // node instead; with neither mounted there is no viewport anchor.
+  const anchor = _dragAnchor(tierCards, sourceCard);
+  const anchorBefore = anchor ? anchor.getBoundingClientRect().top : null;
   clone?.remove();
   placeholder?.remove();
   sourceCard?.classList.remove('drag-source');
@@ -1166,16 +1323,76 @@ function _cleanupDrag({ preserveDropState = false } = {}) {
   if (preserveDropState) return;
 
   document.body.classList.remove('board-dragging');
-  if (anchorBefore !== null && tierCards.isConnected) {
-    const anchorDelta = tierCards.getBoundingClientRect().top - anchorBefore;
-    if (anchorDelta) window.scrollBy(0, anchorDelta);
-  }
-
   _isDragging = false;
   _dropInProgress = false;
   _dragState = null;
+  _dropRenderCommitted = false;
 
-  if (hadGesture) document.dispatchEvent(new CustomEvent('tiptask:drag-ended'));
+  // (TPT9025) Thaw before re-anchoring, so the same scroll correction also absorbs whatever
+  // the replayed patches move. The drag state is already clear, so nothing re-queues.
+  const needsReload = _thawBoard();
+  if (anchorBefore !== null && anchor.isConnected) {
+    const rect = anchor.getBoundingClientRect();
+    const anchorDelta = (rect.width || rect.height) ? rect.top - anchorBefore : 0;
+    if (anchorDelta) window.scrollBy(0, anchorDelta);
+  }
+
+  // `needsReload` asks template.html's listener for its single post-drag full render.
+  if (hadGesture || needsReload) {
+    document.dispatchEvent(new CustomEvent('tiptask:drag-ended', { detail: { needsReload } }));
+  }
+}
+
+// The node _cleanupDrag() holds steady in the viewport: the source .tier-cards while it is
+// mounted (cancel, or a drop whose render has not landed), else the dropped card's fresh node.
+function _dragAnchor(tierCards, sourceCard) {
+  if (tierCards?.isConnected) return tierCards;
+  const id = sourceCard?.dataset.id;
+  return id ? document.querySelector(`.card[data-id="${CSS.escape(id)}"]`) : null;
+}
+
+// (TPT9025) Applies everything the freeze held back: the queued card patches in arrival order,
+// then each deferred board repaint once. Returns whether a full render must follow — a patch
+// whose card or tier isn't mounted, a direct regroup whose caller skipped its own follow-up
+// when it saw 'deferred', a throw, or a queue overflow.
+function _thawBoard() {
+  const entries = _dragPatchQueue.splice(0);
+  const repaints = [..._dragDeferredRepaints.values()];
+  _dragDeferredRepaints.clear();
+  let needsReload = _dragPatchOverflow;
+  _dragPatchOverflow = false;
+  for (const { kind, args } of entries) {
+    try {
+      if (kind === 'patch') {
+        if (applyTaskPatch(...args) === 'reload') needsReload = true;
+      } else if (kind === 'regroup') {
+        if (_regroupAlreadyLanded(...args)) continue;
+        const result = regroupCardToSprint(...args);
+        if (regroupMovedCard(result) || regroupNeedsReload(result)) needsReload = true;
+      } else {
+        removeCardFromDom(...args);
+      }
+    } catch (err) {
+      console.error('[drag] deferred board patch failed:', err);
+      needsReload = true;
+    }
+  }
+  for (const repaint of repaints) {
+    try {
+      repaint();
+    } catch (err) {
+      console.error('[drag] deferred board repaint failed:', err);
+    }
+  }
+  return needsReload;
+}
+
+// A queued sprint move whose card already sits in its target tier (the drop's render showed
+// it there) — replaying it would only re-insert the card at the top of that tier.
+function _regroupAlreadyLanded(taskId, newPriority, isBacklog) {
+  if (isBacklog) return false;
+  const card = document.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
+  return Number(card?.closest('.tier')?.dataset.priority) === Number(newPriority);
 }
 
 function _onDragMove(e) {
@@ -1269,8 +1486,21 @@ async function _onDragEnd(e) {
     _cleanupDrag({ preserveDropState: true });
 
     if (crossSprint) {
-      const targetPriority = Number(targetTier.closest('.tier')?.dataset.priority);
+      const targetTierEl = targetTier.closest('.tier');
+      const targetPriority = Number(targetTierEl?.dataset.priority);
       const movedId = sourceCard.dataset.id;
+      // (TPT9025) Keep the in-place board right on its own, as regroupCardToSprint() does, in
+      // case the post-drop render never lands (timeout, offline): the card's priority mirror
+      // follows it — so the queued echo of this PATCH replays as a field patch, not a second
+      // regroup — the target sprint opens and shows it (a revealed empty sprint may be one the
+      // user collapsed), and an emptied source sprint hides.
+      if (Number.isFinite(targetPriority)) {
+        sourceCard.dataset.priority = targetPriority;
+        state.collapsedTiers?.delete(targetPriority);
+        state.expandedTiers?.add(targetPriority);
+      }
+      targetTierEl?.classList.remove('collapsed', HIDE_CLASS);
+      _hideIfEmptied(sourceTier, targetTier);
 
       // PATCH moved card first: new priority + order based on position in target tier —
       // the two re-rank groups below are keyed off values that assume this already landed.
@@ -1314,6 +1544,7 @@ async function _onDragEnd(e) {
         .filter(c => (Number(c.dataset.priority) || 0) === targetPriority);
       const movedIdx = siblingsInGroup.indexOf(sourceCard);
       const movedOrder = movedIdx === -1 ? 0 : siblingsInGroup.length - 1 - movedIdx;
+      sourceCard.dataset.priority = targetPriority; // (TPT9025) same reason as the cross-sprint branch
       await _patchTask(movedId, { priority: targetPriority, order: movedOrder }, 'Flat reorder');
     } else {
       // (C1438) Same-tier reorder — disjoint task keys, parallelised (was a serial loop).
@@ -1333,7 +1564,18 @@ async function _onDragEnd(e) {
     // plain loadAndRender() would repaint stale order and visually revert the drop).
     // afterDrop escapes the drag-suppression choke point in loadAndRender() itself — that
     // guard would otherwise defer this exact render, since _dropInProgress is still true.
-    if (_onLoadAndRender) await _onLoadAndRender({ forceFresh: true, afterDrop: true });
+    // (TPT9025) Every patch queued so far predates the fetch this render issues, so once it
+    // commits it already shows them — replaying them could only regress fresher data. Patches
+    // queued while it fetches still replay. Capped so a hung fetch cannot hold the freeze.
+    const supersededPatches = _dragPatchQueue.length;
+    if (_onLoadAndRender) {
+      let renderTimer = null;
+      await Promise.race([
+        _onLoadAndRender({ forceFresh: true, afterDrop: true }),
+        new Promise(resolve => { renderTimer = setTimeout(resolve, DROP_PHASE_TIMEOUT_MS); }),
+      ]).finally(() => clearTimeout(renderTimer));
+    }
+    if (_dropRenderCommitted) _dragPatchQueue.splice(0, supersededPatches);
   } catch (err) {
     // A thrown insertBefore/PATCH still reaches the same teardown as every other exit.
     console.error('[drag] drop failed:', err);
@@ -1348,6 +1590,8 @@ function _onDragKeydown(e) {
 
 // ── In-place card refresh (called after modal Save; avoids full board reload) ──
 
+// (TPT9024) Patches the node in place, never swaps it: an open overlay (.card-expanded, its
+// placeholder, backdrop and placement listeners) lives on this node and survives the patch.
 export function refreshCard(t) {
   if (!t || !t.id) return;
   const card = document.querySelector(`.card[data-id="${CSS.escape(t.id)}"]`);
@@ -1485,23 +1729,27 @@ export function refreshCard(t) {
 //               stale .tier-badge count (that recount lives only in renderBoardContent)
 //   'removed' — card was removed (Backlog / priority-0 destination — correct on board view)
 //   'reload'  — card not in DOM or target tier not rendered; caller must reload
+//   'deferred' — a card drag is live (TPT9025): queued, replayed when the drag ends; neither
+//               predicate below matches it, so the caller does nothing now
 //
 // Use regroupMovedCard()/regroupNeedsReload() below rather than comparing these literals
 // directly — keeps every call site in sync with this alphabet.
 export function regroupCardToSprint(taskId, newPriority, isBacklog) {
-  // (C1438) Re-parenting the card currently being dragged would move the exact DOM node
-  // _dragState holds a reference to out from under the gesture. Caller's 'reload' fallback
-  // is deferred by the drag-suppression choke point until the drag ends, then re-applied.
-  if (isDragSourceId(taskId)) return 'reload';
+  // (TPT9025) Re-parenting a card mid-drag reflows tiers under the gesture (and re-parenting
+  // the dragged card itself would move the node _dragState holds) — queue it for the thaw.
+  if (isDragging()) return _queueDragPatch('regroup', [taskId, newPriority, isBacklog]);
   const card = document.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
   if (!card) return 'reload'; // paginated / not yet rendered
 
   // (C1578) Capture BEFORE any mutation — this is the tier the card is leaving.
   const sourceTierCards = card.closest('.tier-cards');
+  // (TPT9024) An open card's placeholder moves with it: the overlay anchors to it.
+  const carried = expandedOverlay?.card === card ? expandedOverlay.placeholder : null;
 
   if (isBacklog) {
     card.remove();
     _hideIfEmptied(sourceTierCards, null);
+    syncExpandedOverlay(); // (TPT9024) closes this card's overlay, or re-anchors one the removal shifted
     return 'removed';
   }
 
@@ -1514,6 +1762,9 @@ export function regroupCardToSprint(taskId, newPriority, isBacklog) {
   if (state.expandedTiers) state.expandedTiers.add(p);
   const tierEl = targetTier.closest('.tier');
   if (tierEl) {
+    // (TPT9024) Unfold at once under an open card: a fading .tier-cards is a stacking context, so
+    // the overlay would fade in beneath the backdrop.
+    if (carried && tierEl.classList.contains('collapsed')) skipTransitionsForFrame(tierEl);
     tierEl.classList.remove('collapsed');
     // (C1578) The destination lookup above matches a hidden (card-less) tier just as well as
     // a visible one — without this the card gets inserted into a display:none container and
@@ -1526,14 +1777,20 @@ export function regroupCardToSprint(taskId, newPriority, isBacklog) {
   const firstCard = targetTier.querySelector('.card[data-id]');
   const sentinel = targetTier.querySelector('.tier-drop-sentinel');
   if (firstCard) {
-    targetTier.insertBefore(card, firstCard);
+    // (TPT9024) Ahead of an open first card's placeholder, never between the two.
+    const ahead = expandedOverlay?.card === firstCard && expandedOverlay.placeholder.parentNode === targetTier
+      ? expandedOverlay.placeholder : firstCard;
+    targetTier.insertBefore(card, ahead);
   } else if (sentinel) {
     targetTier.insertBefore(card, sentinel);
   } else {
     targetTier.appendChild(card);
   }
 
-  return _hideIfEmptied(sourceTierCards, targetTier) ? 'emptied' : 'moved';
+  if (carried) carryExpandedPlaceholder(card, carried);
+  const emptied = _hideIfEmptied(sourceTierCards, targetTier);
+  syncExpandedOverlay({ moved: !!carried });
+  return emptied ? 'emptied' : 'moved';
 }
 
 // (C1578) Hides the source tier in place if the move/remove left it card-less. `targetTier`
@@ -1565,12 +1822,15 @@ export function regroupNeedsReload(result) {
 // status) that used to fall back to a full loadAndRender() just to reflect one card's
 // new field values. Was two near-identical field-patch blocks (this file's refreshCard()
 // and a template.html-local copy inside the WS handler) — now one.
-// Returns 'patched' | 'moved' | 'removed' | 'reload'. 'reload' means the card isn't
-// currently in the DOM (filtered/collapsed/paginated out) or its target tier isn't
-// rendered — the caller must fall back to loadAndRender(). (C1340) Also returned when
+// Returns 'patched' | 'moved' | 'emptied' | 'removed' | 'reload' | 'deferred'. 'reload' means
+// the card isn't currently in the DOM (filtered/collapsed/paginated out) or its target tier
+// isn't rendered — the caller must fall back to loadAndRender(). (C1340) Also returned when
 // the objective/hasChildren flip below means .controls-row's button choice is stale.
+// 'deferred' (TPT9025): a card drag is live — queued, replayed when it ends; callers treat
+// it like 'patched' and schedule nothing.
 export function applyTaskPatch(t) {
   if (!t || !t.id) return 'reload';
+  if (isDragging()) return _queueDragPatch('patch', [t]);
   const card = document.querySelector(`.card[data-id="${CSS.escape(t.id)}"]`);
   if (!card) return 'reload';
 
@@ -1596,7 +1856,19 @@ export function applyTaskPatch(t) {
     if (showedSubtasks !== !!t.hasChildren) return 'reload';
   }
 
-  const currentTierEl = card.closest('[data-priority]');
+  // (TPT9034) No priority and no sprint on the payload: a partial row (the offline _pendingSync
+  // stub, api-backend.js updateTask()), not a task — rebuild rather than write its missing fields
+  // onto the card. Board, Backlog and List would reach 'reload' via regroupCardToSprint() anyway;
+  // the flat board, which never regroups, would patch.
+  if (t.priority == null && t.sprint_id === undefined && t.sprintId === undefined) return 'reload';
+
+  // (TPT9034) The sprint a card is drawn in comes from its container — a Board sprint tier or a
+  // List group — never the card's own data-priority: renderCard() stamps that on the card root, so
+  // closest('[data-priority]') matched the card itself, a backlog card read as sprint 0 and every
+  // patch to it, a status change included, removed it. Backlog-tab (.backlog-section) and
+  // Sprints-off flat-board (.tier--flat) cards sit in no sprint: patched in place unless a backlog
+  // card gains a sprint.
+  const currentTierEl = card.closest('.tier[data-priority], .list-group[data-priority]');
   const currentTierPriority = currentTierEl ? Number(currentTierEl.dataset.priority) : null;
   const currentBacklogEl = card.closest('.backlog-section');
   const nextPriority = t.priority ?? null;
@@ -1610,12 +1882,14 @@ export function applyTaskPatch(t) {
     if (regroupMovedCard(result)) {
       refreshCard(t); // field values still need updating post-move
       refreshParentSubtaskLabel(t, { prevStatus, parentDbId: t.parentDbId ?? parentDbIdHint });
+      syncExpandedOverlay(); // (TPT9024) the field patch can still shift the open card's slot
     }
     return result;
   }
 
   refreshCard(t);
   refreshParentSubtaskLabel(t, { prevStatus, parentDbId: t.parentDbId ?? parentDbIdHint });
+  syncExpandedOverlay(); // (TPT9024) e.g. a title that resized a card ahead of the open one
   return 'patched';
 }
 
@@ -1624,16 +1898,16 @@ export function applyTaskPatch(t) {
 // both used to differ only in whether they trusted this DOM patch or fell back to a
 // full loadAndRender() for the exact same effect.
 export function removeCardFromDom(taskId) {
-  // (C1438) Deleting the card currently being dragged would let _onDragEnd's
-  // `targetTier.insertBefore(sourceCard, placeholder)` resurrect a just-deleted card.
-  // Caller (task:deleted WS handler) simply drops the DOM patch; the drag's own cleanup
-  // (self-heal in _onDragMove, or the eventual re-render once the drag ends) reconciles it.
-  if (isDragSourceId(taskId)) return false;
+  // (TPT9025) Removing a card mid-drag collapses its tier under the gesture — and removing the
+  // dragged card itself would let _onDragEnd's `targetTier.insertBefore(sourceCard,
+  // placeholder)` resurrect it. Queued and replayed when the drag ends; returns 'deferred'.
+  if (isDragging()) return _queueDragPatch('remove', [taskId]);
   const card = document.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
   if (!card) return false;
   const tierCards = card.closest('.tier-cards');
   card.remove();
   _hideIfEmptied(tierCards, null); // (C1578)
+  syncExpandedOverlay(); // (TPT9024) closes this card's overlay, or re-anchors one the removal shifted
   return true;
 }
 
@@ -1675,7 +1949,9 @@ export function setupCardInteractions(appEl) {
   // Reset selection state at start of each render cycle
   state.selectedCardId = null;
   state.expandedCardMode = null;
+  state.expandedCardId = null;
   state.hoverScrollHandler = null;
+  _ensurePointerTracking();
   // (C1568) a re-render can drop the hovered button out from under a pending/shown
   // tooltip without ever firing mouseout — clear unconditionally, bind delegation once.
   hideBtnTip();
@@ -1905,7 +2181,9 @@ export function setupCardInteractions(appEl) {
         hoverCollapseTimer = null;
         clearTimeout(hoverExpandTimers.get(card));
         const timer = setTimeout(() => {
-          if (state.expandedCardMode !== 'pinned') {
+          // (TPT9023) Already open — e.g. re-opened by a board re-render under the pointer, which
+          // fires this mouseenter; expanding again would rewind its description scroll.
+          if (state.expandedCardMode !== 'pinned' && !card.classList.contains('card-expanded')) {
             expandCard(card, 'hover');
           }
         }, 250);

@@ -2,7 +2,8 @@
 
 // TPT701 — scripts/release-notes.js: release-base resolution (real git fixtures), bounded
 // evidence, prompt/output validation, the notes-file marker and the rerun rules, and the
-// generate flow with injected provider/comment deps. No model calls, no network.
+// generate flow with injected provider/comment deps, and (TPT9040) the private website Changelog
+// drafts. No model calls, no network.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -515,4 +516,303 @@ test('main generate: empty exported range writes a stub without a model call; fi
   assert.ok(prompts[0].includes('first public release'));
   assert.ok(prompts[0].includes('Runs coding agents against a task board'));
   assert.ok(!prompts[0].includes('Commits in this release'));
+});
+
+// ---------------------------------------------------------------- website Changelog drafts (TPT9040)
+
+const EN_NOTES = '## Highlights\n\n- **Faster board.** The board renders faster.\n\n## Fixes\n\n- Notifications work again.';
+const UK_NOTES = '## Головне\n\n- **Швидша дошка.** Дошка відображається швидше.\n\n## Виправлення\n\n- Сповіщення знову працюють.';
+const sha256hex = (s) => require('node:crypto').createHash('sha256').update(s, 'utf8').digest('hex');
+const readDraft = (dir, version) => JSON.parse(fs.readFileSync(path.join(dir, `v${version}.json`), 'utf8'));
+
+test('changelogBodyFromNotes drops the marker and the installer footer; isStubNotes spots the no-changes stub', () => {
+  const file = rn.renderNotesFile(EN_NOTES, 'e'.repeat(64));
+  assert.equal(rn.changelogBodyFromNotes(file), EN_NOTES);
+  assert.equal(rn.changelogBodyFromNotes(file.replace(/\n/g, '\r\n')), EN_NOTES);
+  assert.equal(rn.changelogBodyFromNotes(`${EN_NOTES}\n\n---\n\nDownloads are on the release page.\n`), EN_NOTES, 'an edited footer goes too');
+  const ruled = `${EN_NOTES}\n\n---\n\n## Known issues\n\n- One.`;
+  assert.equal(rn.changelogBodyFromNotes(ruled), ruled, 'a rule followed by a section stays');
+  assert.equal(rn.changelogBodyFromNotes('Intro line\n---\n\n- item'), 'Intro line\n---\n\n- item', 'a setext underline is not a rule');
+  assert.ok(rn.isStubNotes(rn.stubNotes('v0.9.2')));
+  assert.ok(rn.isStubNotes(rn.changelogBodyFromNotes(rn.renderNotesFile(rn.stubNotes(null), 'e'.repeat(64)))));
+  assert.ok(!rn.isStubNotes('## Maintenance\n\nThe build scripts were tidied up.'));
+});
+
+test('changelog entries derive title, excerpt and SEO fields from the notes, inside the website limits', () => {
+  const body = '## Highlights\n\n- **Ukrainian throughout.** Screens follow the project language.\n- **Finish button.** Relaunches the agent.\n- **Smarter limits.** Grows with memory.\n- **Fourth item.** Left out.\n\n## Fixes\n\n- A fix.';
+  const { body: enBody, ...en } = rn.buildChangelogEntry({ locale: 'en', version: '0.9.15', body, origin: 'release-notes' });
+  assert.equal(enBody, body);
+  assert.deepEqual(en, {
+    locale: 'en', origin: 'release-notes', title: 'Tipatask 0.9.15', excerpt: 'Ukrainian throughout. Finish button. Smarter limits.',
+    seo_title: "What's new in Tipatask 0.9.15", seo_description: 'Ukrainian throughout. Finish button. Smarter limits.',
+  });
+  assert.equal(rn.deriveExcerpt('## Fixes\n\n- `Play All` now shows **one** [message](https://example.com/x) per refusal.\n- Second.'), 'Play All now shows one message per refusal.');
+  assert.equal(rn.deriveExcerpt(rn.stubNotes('v0.9.2')), 'No changes to the application since v0.9.2; this build only moves the version number.');
+  const long = rn.deriveExcerpt(`## Improvements\n\n${'word '.repeat(200)}`);
+  assert.ok(long.length <= rn.CHANGELOG_LIMITS.excerpt && / word…$/.test(long), long.slice(-20));
+  const uk = rn.buildChangelogEntry({ locale: 'uk', version: '0.9.15', body: UK_NOTES, origin: 'machine-translation' });
+  assert.equal(uk.seo_title, 'Що нового в Tipatask 0.9.15');
+  assert.equal(uk.excerpt, 'Швидша дошка.');
+  const big = rn.buildChangelogEntry({ locale: 'en', version: '0.9.15', body: `## Highlights\n\n- **${'Long lead '.repeat(40)}** x`, origin: 'release-notes' });
+  assert.ok(big.excerpt.length <= 300 && big.seo_description.length <= 160 && big.title.length <= 200 && big.seo_title.length <= 200);
+});
+
+test('validateTranslation holds the structure and refuses leaks, English answers and renamed headings', () => {
+  const check = (text) => rn.validateTranslation(text, { sourceBody: EN_NOTES, keyPrefixes: ['TPT'] });
+  assert.ok(check(UK_NOTES).ok, check(UK_NOTES).violations.join('; '));
+  assert.equal(check(`\`\`\`markdown\n${UK_NOTES}\n\`\`\``).body, UK_NOTES);
+  const why = (text) => check(text).violations.join(' | ');
+  assert.match(why(UK_NOTES.replace('## Виправлення', '## Fixes')), /heading 2 must be "## Виправлення"/);
+  assert.match(why(UK_NOTES.replace('\n\n## Виправлення', '')), /expected 2 "## " headings, got 1/);
+  assert.match(why(`${UK_NOTES}\n- Ще один пункт.`), /expected 2 bullet points, got 3/);
+  assert.match(why(EN_NOTES.replace('## Highlights', '## Головне').replace('## Fixes', '## Виправлення')), /not translated into Ukrainian/);
+  assert.match(why(`${UK_NOTES.slice(0, -1)} (TPT12).`), /task identifier/);
+  assert.match(why(`${UK_NOTES} /Users/anton/x`), /private path/);
+  assert.match(why(`${UK_NOTES} anton@example.com`), /email address/);
+  assert.match(why(`${UK_NOTES} ghp_${'Q'.repeat(24)}`), /credential-shaped/);
+  assert.match(why(`# Заголовок\n\n${UK_NOTES}`), /an H1 heading/);
+  assert.match(why(`${UK_NOTES}\n\n${'ж'.repeat(2100)}`), /too long/);
+  assert.match(why(''), /empty answer/);
+  // A heading the map does not know may be translated freely; its slot must still be there.
+  assert.ok(rn.validateTranslation('## Подяки\n\n- Усім.', { sourceBody: '## Thanks\n\n- To everyone.' }).ok);
+});
+
+test('translateChangelog retries once with the violations, then reports rejected or failed', async () => {
+  const prompts = [];
+  const answers = [EN_NOTES, UK_NOTES];
+  let r = await rn.translateChangelog({ body: EN_NOTES, version: '0.9.15', runPrompt: async (p) => { prompts.push(p); return answers.shift(); } });
+  assert.equal(r.status, 'ok');
+  assert.equal(r.body, UK_NOTES);
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts[0].includes(`=== SOURCE START ===\n${EN_NOTES}\n=== SOURCE END ===`));
+  assert.ok(prompts[0].includes('"## Highlights" → "## Головне"'));
+  assert.match(prompts[1], /previous answer was rejected[\s\S]*not translated into Ukrainian/);
+  r = await rn.translateChangelog({ body: EN_NOTES, version: '0.9.15', runPrompt: async () => EN_NOTES });
+  assert.equal(r.status, 'rejected');
+  r = await rn.translateChangelog({ body: EN_NOTES, version: '0.9.15', runPrompt: async () => null });
+  assert.equal(r.status, 'failed');
+});
+
+test('exportChangelogDraft: en from the notes, uk translated once per notes version and retried after a failure, nothing for leaks or stubs', async (t) => {
+  const dir = path.join(scratch(t), 'drafts');
+  const notes = rn.renderNotesFile(EN_NOTES, 'e'.repeat(64));
+  const calls = [];
+  const translate = async (body, version) => { calls.push({ body, version }); return { status: 'ok', body: UK_NOTES, violations: [] }; };
+  const run = (extra = {}) => rn.exportChangelogDraft({ version: '0.9.15', notesText: notes, changelogDir: dir, translate, ...extra });
+
+  let r = await run({ dryRun: true, translate: async () => { throw new Error('must not translate'); } });
+  assert.equal(r.status, 'would-write');
+  assert.ok(!fs.existsSync(dir), 'a dry run creates nothing');
+
+  r = await run();
+  assert.equal(r.status, 'written', r.message);
+  assert.deepEqual(r.locales, ['en', 'uk']);
+  assert.equal(r.file, path.join(dir, 'v0.9.15.json'));
+  const a = readDraft(dir, '0.9.15');
+  assert.deepEqual([a.kind, a.schema, a.version, a.source.notes_file, a.source.sha256], ['tipatask-changelog-draft', 1, '0.9.15', 'docs/releases/v0.9.15.md', sha256hex(EN_NOTES)]);
+  assert.deepEqual(a.drafts.map(d => [d.locale, d.origin, d.title]), [['en', 'release-notes', 'Tipatask 0.9.15'], ['uk', 'machine-translation', 'Tipatask 0.9.15']]);
+  assert.equal(a.drafts[0].body, EN_NOTES, 'the English entry is the notes body itself');
+  assert.equal(a.drafts[1].body, UK_NOTES);
+  assert.ok(!JSON.stringify(a).includes('tipatask-release-notes') && !JSON.stringify(a).includes('attached below'), 'no marker, no installer footer');
+  assert.ok(!Object.keys(a).some(k => /publish|status/.test(k)) && a.drafts.every(d => !Object.keys(d).some(k => /publish|status/.test(k))), 'no publication state');
+  assert.deepEqual(calls, [{ body: EN_NOTES, version: '0.9.15' }]);
+  assert.deepEqual(fs.readdirSync(dir), ['v0.9.15.json'], 'no temp file left');
+
+  const before = fs.statSync(r.file).mtimeMs;
+  r = await run();
+  assert.equal(r.status, 'up-to-date');
+  assert.equal(calls.length, 1, 'unchanged notes reuse the translation');
+  assert.equal(fs.statSync(r.file).mtimeMs, before);
+
+  r = await run({ notesText: notes.replace('work again', 'work again, reliably') });
+  assert.equal(r.status, 'written');
+  assert.equal(calls.length, 2);
+  assert.ok(readDraft(dir, '0.9.15').drafts[0].body.includes('reliably'));
+
+  r = await run({ translate: async () => ({ status: 'failed', message: 'timed out', violations: [] }) });
+  assert.equal(r.status, 'written-partial');
+  assert.match(r.message, /wrote the English draft only: the Ukrainian translation failed \(timed out\)/);
+  assert.deepEqual(readDraft(dir, '0.9.15').drafts.map(d => d.locale), ['en']);
+  r = await run({ dryRun: true });
+  assert.equal(r.status, 'would-write', 'an English-only draft is never up to date');
+  r = await run({ translate: async () => ({ status: 'rejected', violations: ['expected 2 bullet points, got 1'] }) });
+  assert.equal(r.status, 'written-partial');
+  assert.match(r.message, /stays English-only: the Ukrainian translation was rejected \(expected 2 bullet points, got 1\)/);
+  r = await run();
+  assert.equal(r.status, 'written');
+  assert.deepEqual(readDraft(dir, '0.9.15').drafts.map(d => d.locale), ['en', 'uk']);
+
+  r = await rn.exportChangelogDraft({ version: '0.9.16', notesText: rn.renderNotesFile(`${EN_NOTES}\n- Closed TPT12.`, 'e'.repeat(64)), changelogDir: dir, keyPrefixes: ['TPT'], translate });
+  assert.equal(r.status, 'skipped');
+  assert.match(r.message, /task identifier/);
+  r = await rn.exportChangelogDraft({ version: '0.9.16', notesText: rn.renderNotesFile(rn.stubNotes('v0.9.15'), 'e'.repeat(64)), changelogDir: dir, translate });
+  assert.equal(r.status, 'skipped');
+  assert.match(r.message, /no-changes stub/);
+  r = await rn.exportChangelogDraft({ version: '0.9.16', notesText: '', changelogDir: dir, translate });
+  assert.equal(r.status, 'skipped');
+  assert.ok(!fs.existsSync(path.join(dir, 'v0.9.16.json')));
+  assert.equal(calls.length, 3);
+});
+
+test('main generate --changelog-dir: a draft only from usable notes; dry runs never write or call the model; a draft crash keeps the notes status', async (t) => {
+  if (fx.skipUnless(t)) return;
+  const f = buildSrc(t);
+  const stage = path.join(f.home, 'stage');
+  fs.mkdirSync(stage, { recursive: true });
+  const d = buildDest(f.git, f.home, { tag: 'v0.9.2' });
+  const paths = path.join(f.home, 'paths');
+  fs.writeFileSync(paths, exported.join('\n') + '\n');
+  const drafts = path.join(f.home, 'drafts');
+  const outLines = [];
+  const kv = () => Object.fromEntries(outLines.map(l => l.trim().split(/=(.*)/s).slice(0, 2)));
+  const prompts = [];
+  let notesReply = EN_NOTES;
+  const deps = {
+    stdout: (s) => outLines.push(s), stderr: () => {},
+    oneShot: { resolveDefaultSelection: () => ({ providerId: 'claude', model: 'm' }), stripSensitiveEnv: e => e },
+    registry: { SELECTABLE_PROVIDERS: ['claude', 'codex', 'gemini', 'pi'] },
+    fetchComments: async () => ({ status: 404, body: {} }),
+    runPrompt: async (p) => { prompts.push(p); return p.includes('=== SOURCE START ===') ? UK_NOTES : notesReply; },
+  };
+  const common = ['generate', '--src', f.src, '--ref', 'HEAD', '--dest', d.dest, '--stage', stage, '--version', '0.9.3', '--project-root', f.home,
+    '--base-status', 'resolved', '--base', f.c0, '--prev-tag', 'v0.9.2', '--paths', paths];
+  const run = async (extra = [], dep = deps) => { outLines.length = 0; assert.equal(await rn.main([...common, ...extra], dep), 0); return kv(); };
+
+  let r = await run(['--dry-run']);
+  assert.ok(!Object.keys(r).some(k => k.startsWith('changelog')), 'no flag, no changelog keys');
+  r = await run(['--dry-run', '--changelog-dir', drafts]);
+  assert.equal(r.status, 'dry-run');
+  assert.equal(r.changelog, 'would-write');
+  assert.equal(r.changelog_prev, 'skipped', 'the v0.9.2 tag carries no notes');
+  assert.equal(prompts.length, 0);
+  assert.ok(!fs.existsSync(drafts));
+
+  notesReply = null;
+  r = await run(['--changelog-dir', drafts]);
+  assert.equal(r.status, 'failed');
+  assert.equal(r.changelog, 'skipped');
+  assert.match(r.changelog_message, /no usable release notes for v0\.9\.3 in this run \(failed\)/);
+  assert.ok(!fs.existsSync(drafts), 'failed generation writes no draft');
+
+  notesReply = EN_NOTES;
+  prompts.length = 0;
+  r = await run(['--changelog-dir', drafts]);
+  assert.equal(r.status, 'generated', JSON.stringify(r));
+  assert.equal(r.changelog, 'written', r.changelog_message);
+  assert.equal(r.changelog_locales, 'en,uk');
+  assert.equal(r.changelog_file, path.join(drafts, 'v0.9.3.json'));
+  assert.equal(prompts.length, 2, 'the notes, then the translation');
+  const staged = fs.readFileSync(path.join(stage, 'docs/releases/v0.9.3.md'), 'utf8');
+  assert.equal(readDraft(drafts, '0.9.3').drafts[0].body, rn.changelogBodyFromNotes(staged));
+  assert.equal(readDraft(drafts, '0.9.3').drafts[0].body, EN_NOTES);
+
+  fs.mkdirSync(path.join(d.dest, 'docs/releases'), { recursive: true });
+  fs.writeFileSync(path.join(d.dest, 'docs/releases/v0.9.3.md'), staged);
+  fs.rmSync(path.join(stage, 'docs'), { recursive: true });
+  r = await run(['--changelog-dir', drafts]);
+  assert.equal(r.status, 'up-to-date');
+  assert.equal(r.changelog, 'up-to-date');
+  assert.equal(prompts.length, 2);
+
+  const fresh = path.join(f.home, 'fresh-drafts');
+  r = await run(['--dry-run', '--changelog-dir', fresh]);
+  assert.equal(r.status, 'up-to-date');
+  assert.equal(r.changelog, 'would-write');
+  assert.equal(prompts.length, 2);
+  assert.ok(!fs.existsSync(fresh));
+
+  fs.writeFileSync(path.join(d.dest, 'docs/releases/v0.9.3.md'), staged.replace('work again', 'work again, reliably'));
+  r = await run(['--changelog-dir', drafts]);
+  assert.equal(r.status, 'kept-edited');
+  assert.equal(r.changelog, 'written');
+  assert.equal(prompts.length, 3);
+  assert.ok(readDraft(drafts, '0.9.3').drafts[0].body.includes('reliably'));
+
+  const g = realGit();
+  r = await run(['--changelog-dir', drafts], { ...deps, git: (cwd, a, o) => { if (a[0] === 'show') throw new Error('boom'); return g(cwd, a, o); } });
+  assert.equal(r.status, 'kept-edited');
+  assert.equal(r.changelog, 'failed');
+  assert.match(r.changelog_message, /changelog draft step crashed: boom/);
+});
+
+test('main generate --changelog-dir: the previous release and a frozen version draft from their tagged notes; untagged drafts in between go', async (t) => {
+  if (fx.skipUnless(t)) return;
+  const home = scratch(t, 'rn-tags-');
+  const git = fx.makeGit(home);
+  const dest = path.join(home, 'dest');
+  fx.initRepo(git, dest, { files: { 'package.json': '{"version":"0.9.2"}\n' } });
+  fx.commit(git, dest, { 'docs/releases/v0.9.2.md': rn.renderNotesFile(EN_NOTES, 'e'.repeat(64)) }, 'Release notes v0.9.2');
+  git(dest, ['tag', '-a', 'v0.9.2', '-m', 'TipΔTask v0.9.2']);
+  fx.commit(git, dest, { 'src/a.js': '1\n' }, 'Untagged work');
+  git(dest, ['tag', '-a', 'v0.9.5', '-m', 'TipΔTask v0.9.5']);
+  const drafts = path.join(home, 'drafts');
+  fs.mkdirSync(drafts);
+  fs.writeFileSync(path.join(drafts, 'v0.9.3.json'), '{}\n');
+  fs.writeFileSync(path.join(drafts, 'v0.9.1.json'), '{}\n');
+  const outLines = [];
+  const kv = () => Object.fromEntries(outLines.map(l => l.trim().split(/=(.*)/s).slice(0, 2)));
+  const prompts = [];
+  const deps = {
+    stdout: (s) => outLines.push(s), stderr: () => {},
+    oneShot: { resolveDefaultSelection: () => ({ providerId: 'claude', model: 'm' }), stripSensitiveEnv: e => e },
+    registry: { SELECTABLE_PROVIDERS: ['claude'] },
+    runPrompt: async (p) => { prompts.push(p); return UK_NOTES; },
+  };
+  const base = ['generate', '--src', home, '--ref', 'HEAD', '--dest', dest, '--stage', path.join(home, 'stage'), '--project-root', home, '--changelog-dir', drafts];
+  const run = async (extra) => { outLines.length = 0; assert.equal(await rn.main([...base, ...extra], deps), 0); return kv(); };
+
+  let r = await run(['--version', '0.9.4', '--base-status', 'skipped-unresolved-base', '--prev-tag', 'v0.9.2', '--dry-run']);
+  assert.equal(r.status, 'skipped-unresolved-base');
+  assert.equal(r.changelog, 'skipped');
+  assert.equal(r.changelog_prev, 'would-write');
+  assert.equal(r.changelog_prev_version, '0.9.2');
+  assert.equal(r.changelog_stale, 'v0.9.3.json');
+  assert.ok(fs.existsSync(path.join(drafts, 'v0.9.3.json')), 'a dry run deletes nothing');
+  assert.equal(prompts.length, 0);
+
+  r = await run(['--version', '0.9.4', '--base-status', 'skipped-unresolved-base', '--prev-tag', 'v0.9.2']);
+  assert.equal(r.changelog_prev, 'written', r.changelog_prev_message);
+  assert.equal(readDraft(drafts, '0.9.2').drafts[0].body, EN_NOTES);
+  assert.deepEqual(fs.readdirSync(drafts).sort(), ['v0.9.1.json', 'v0.9.2.json'], 'the untagged v0.9.3 draft goes; older ones stay');
+  assert.equal(prompts.length, 1);
+
+  r = await run(['--version', '0.9.2', '--base-status', 'frozen', '--prev-tag', 'v0.9.2']);
+  assert.equal(r.status, 'frozen');
+  assert.equal(r.changelog, 'up-to-date', r.changelog_message);
+  assert.equal(r.changelog_prev, undefined, 'the frozen version is not drafted twice');
+  assert.equal(prompts.length, 1);
+
+  r = await run(['--version', '0.9.5', '--base-status', 'frozen', '--prev-tag', 'v0.9.5']);
+  assert.equal(r.changelog, 'skipped');
+  assert.match(r.changelog_message, /the v0\.9\.5 tag carries no docs\/releases\/v0\.9\.5\.md/);
+});
+
+test('changelog-draft rebuilds one draft from a notes file; a provider problem only drops the Ukrainian entry', async (t) => {
+  const dir = scratch(t);
+  const notesFile = path.join(dir, 'v0.9.5.md');
+  fs.writeFileSync(notesFile, rn.renderNotesFile(EN_NOTES, 'e'.repeat(64)));
+  const outLines = [];
+  const kv = () => Object.fromEntries(outLines.map(l => l.trim().split(/=(.*)/s).slice(0, 2)));
+  const deps = {
+    stdout: (s) => outLines.push(s), stderr: () => {},
+    oneShot: { resolveDefaultSelection: () => ({ providerId: 'claude', model: 'm' }), stripSensitiveEnv: e => e },
+    registry: { SELECTABLE_PROVIDERS: ['claude'] },
+    runPrompt: async () => UK_NOTES,
+  };
+  const drafts = path.join(dir, 'drafts');
+  assert.equal(await rn.main(['changelog-draft', '--notes', notesFile, '--version', 'v0.9.5', '--changelog-dir', drafts, '--project-root', dir], deps), 0);
+  let r = kv();
+  assert.equal(r.changelog, 'written', r.changelog_message);
+  assert.equal(readDraft(drafts, '0.9.5').drafts[1].body, UK_NOTES);
+  outLines.length = 0;
+  assert.equal(await rn.main(['changelog-draft', '--notes', path.join(dir, 'missing.md'), '--version', '0.9.5', '--changelog-dir', drafts], deps), 1);
+  assert.equal(kv().changelog, 'failed');
+  outLines.length = 0;
+  assert.equal(await rn.main(['changelog-draft', '--notes', notesFile, '--version', 'latest', '--changelog-dir', drafts], deps), 2);
+  outLines.length = 0;
+  assert.equal(await rn.main(['changelog-draft', '--notes', notesFile, '--version', '0.9.6', '--changelog-dir', drafts, '--project-root', dir, '--provider', 'nope'], { ...deps, runPrompt: undefined }), 0);
+  r = kv();
+  assert.equal(r.changelog, 'written-partial');
+  assert.match(r.changelog_message, /unknown provider "nope"/);
+  assert.deepEqual(readDraft(drafts, '0.9.6').drafts.map(x => x.locale), ['en']);
 });

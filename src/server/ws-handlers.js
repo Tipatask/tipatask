@@ -14,10 +14,10 @@ const { createSession, isAgentChatType, isAgentChatId } = require('./session-sta
 const { TASK_CHAT, isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFromChatId, buildProjectChatTitle, buildTaskChatSeed, buildTaskChatSystemPrompt } = require('./task-chat');
 const { resolvePiMcpBridge } = require('./providers/pi-task-tools');
 const { providerSupportsProfile } = require('./providers/tool-profiles');
-const { findOpenDialog, resolveDialogAnswer, replayTaskChatTurn, taskFrame, changedTaskFields, buildTaskEditNote } = require('./task-chat-widgets');
+const { findOpenDialog, resolveDialogAnswer, replayTaskChatTurn, taskFrame, changedTaskFields, buildTaskEditNote, dropTaskChatUserTurn } = require('./task-chat-widgets');
 const { killProcessGroup, killWindowsChildTree, resolveAgentLimits } = require('./process-group');
 const { createSessionQueue } = require('./session-queue');
-const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, replayLiveTerminal, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary, exitRunSnapshot, flagTaskLeftUncommitted } = require('./terminal-session');
+const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, replayLiveTerminal, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, piPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary, exitRunSnapshot, flagTaskLeftUncommitted } = require('./terminal-session');
 const { buildExitResolutionComment, hasSelfAuthoredResolution, waitForFinalMessage, selectFinalMessage } = require('./exit-resolution');
 const { getTaskAgentInfo, getTaskAgentLabels, getAvailableAgents, getAvailableAgentsPeek, listTaskAgentStatuses, listTaskAgentStatusesPeek, refreshAgentDetection, resolveTaskAgentId, listAgentModels, listAllAgentModels } = require('./task-agent');
 const { isModelAllowed } = require('./task-agent/model-registry');
@@ -789,6 +789,10 @@ function terminateTerminalSession(session, taskId, sessionKey, sessions, reason 
     clearTimeout(session._injectTimer);
     session._injectTimer = null;
   }
+  if (session?._ptyTrace) { // (TPT9048) the exit hook is suppressed by _terminated below
+    try { session._ptyTrace.write('log', `terminated: ${reason}`); session._ptyTrace.close(); } catch { /* ignore */ }
+    session._ptyTrace = null;
+  }
   // C948: user Terminate/Restart is how interactive agent sessions actually end
   // (the TUI never exits on its own) — post the resolution comment here, because
   // ptyProcess.onExit is suppressed by the _terminated flag set below. Guards:
@@ -984,6 +988,7 @@ async function fetchNextKeyPeeks(backend) {
 function maybeRefirePlanReady(session, ws) {
   if (session.terminalPhase !== 'planning') return;
   if (!codexPlanReadyIsFresh(session)) return;
+  if (!piPlanReadyIsFresh(session)) return;
   const needsExplicitPlanReady = requiresExplicitPlanReadyPattern(session);
   if (needsExplicitPlanReady) {
     if (session.agentPlanReady !== true) return;
@@ -1018,6 +1023,7 @@ function maybeRefirePlanReady(session, ws) {
   session._planIdleTimer = setTimeout(() => {
     if (session.terminalPhase === 'planning' && !session._planReadySent
         && codexPlanReadyIsFresh(session)
+        && piPlanReadyIsFresh(session)
         && (!needsExplicitPlanReady || (session.agentPlanReady === true && (session.taskAgent !== 'codex' || session.codexPlanReady === true)))
         && session.ws && session.ws.readyState === session.ws.OPEN) {
       session._planReadySent = true;
@@ -4680,7 +4686,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
 
     if (existing.pendingResult) {
       const pr = existing.pendingResult;
-      ws.send(JSON.stringify({ type: 'objective-result', tabId: existing.tabId, content: pr.content, tokens: pr.tokens, filesAddressed: pr.filesAddressed, docUpdates: pr.docUpdates, newTags: pr.newTags || [], timingMilestones: pr.timingMilestones }));
+      ws.send(JSON.stringify({ type: 'objective-result', tabId: existing.tabId, content: pr.content, tokens: pr.tokens, filesAddressed: pr.filesAddressed, docUpdates: pr.docUpdates, newTags: pr.newTags || [], cards: pr.cards, proposalResult: pr.proposalResult, objectiveSummary: pr.objectiveSummary, timingMilestones: pr.timingMilestones }));
       ws.send(JSON.stringify({ type: 'chat-ready', tabId: existing.tabId, turnIndex: pr.turnIndex }));
       ws.send(JSON.stringify({ type: 'exit', tabId: existing.tabId, code: pr.code, chatContinues: true, showAiStats: config.SHOW_AI_STATS }));
       existing.pendingResult = null;
@@ -5257,28 +5263,12 @@ async function handleTaskChatUserEdit(session, rawKey) {
 }
 
 // Hand-made task edits not yet told to the agent -> [{ task, changed, prev }], and forget them.
-// Kept on the session until the turn they ride on survives: an abort puts them back.
+// Kept on the session until the turn they ride on survives: a dropped turn puts them back.
 function takeTaskChatEdits(session) {
   const edits = session.pendingTaskEdits ? [...session.pendingTaskEdits.values()] : [];
   if (session.pendingTaskEdits) session.pendingTaskEdits.clear();
   session._drainedTaskEdits = edits.length ? edits : null;
   return edits;
-}
-
-function restoreTaskChatEdits(session) {
-  const edits = session._drainedTaskEdits;
-  session._drainedTaskEdits = null;
-  if (!edits) return;
-  if (!session.pendingTaskEdits) session.pendingTaskEdits = new Map();
-  for (const edit of edits) {
-    // A newer edit of the same task, queued while the turn ran, keeps its task but still
-    // compares against what the agent saw before the aborted turn.
-    const newer = session.pendingTaskEdits.get(edit.task.id);
-    if (!newer) { session.pendingTaskEdits.set(edit.task.id, edit); continue; }
-    const changed = changedTaskFields(edit.prev, newer.task);
-    if (changed.length) session.pendingTaskEdits.set(edit.task.id, { task: newer.task, changed, prev: edit.prev });
-    else session.pendingTaskEdits.delete(edit.task.id);
-  }
 }
 
 // C948: lifecycle callbacks shared by wireClient() and the pre-spawn wiring in
@@ -5531,9 +5521,13 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
                 const p = { ...hit.payload };
                 await prepareObjectiveProposalContext(session);
                 if (session._closed || session._aborted || (session._epoch || 0) !== epochAtReceipt) return;
-                p.cards = normalizeProposals({ changes: structuredClone(p.cards || []) }, session._startStatusName, session._proposalContext).changes;
+                if (Array.isArray(p.cards)) {
+                  const validated = normalizeProposals({ changes: structuredClone(p.cards) }, session._startStatusName, session._proposalContext);
+                  p.cards = validated.changes;
+                  p.proposalResult = validated.proposalResult.status === 'empty' ? (p.proposalResult || validated.proposalResult) : validated.proposalResult;
+                }
                 const assistantMsg = {
-                  role: 'assistant', content: p.content, cards: p.cards,
+                  role: 'assistant', content: p.content, cards: p.cards, proposalResult: p.proposalResult,
                   filesAddressed: p.filesAddressed, docUpdates: p.docUpdates,
                   objectiveSummary: p.objectiveSummary || null, // C1339
                   // C1439: was missing — the live WS frame below already sends newTags,
@@ -5548,7 +5542,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
                 ws.send(JSON.stringify({
                   type: 'objective-result', tabId: session.tabId, content: p.content, tokens: p.tokens,
                   filesAddressed: p.filesAddressed, docUpdates: p.docUpdates,
-                  newTags: p.newTags || [], objectiveSummary: p.objectiveSummary || null,
+                  newTags: p.newTags || [], objectiveSummary: p.objectiveSummary || null, proposalResult: p.proposalResult,
                   timingMilestones: p.timingMilestones, cards: p.cards,
                   fromCache: true, cachedAt: hit.cachedAt,
                 }));
@@ -6116,16 +6110,10 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       // The aborted turn's user message is dropped — except a task chat's generated seed, which
       // is the chat's context, not something the user typed and can retype.
       const _lastMsg = session.messages[session.messages.length - 1];
-      if (_lastMsg && _lastMsg.role === 'user' && !_lastMsg.seed) {
+      if (session.type === 'taskChat') {
+        dropTaskChatUserTurn(session);
+      } else if (_lastMsg && _lastMsg.role === 'user' && !_lastMsg.seed) {
         session.messages.pop();
-        // A dropped dialog answer re-opens its dialog.
-        if (_lastMsg.dialogAnswer) {
-          const _asked = session.messages[session.messages.length - 1];
-          const _dialog = _asked && Array.isArray(_asked.dialogs) && _asked.dialogs.find(d => d.id === _lastMsg.dialogAnswer.dialogId);
-          if (_dialog) delete _dialog.answer;
-        }
-        // Hand-made task edits that rode on it go back in the queue for the next turn.
-        if (_lastMsg.taskEdits) restoreTaskChatEdits(session);
       }
       resetTurnBuffers(session);
       if (session.type === 'objective') throttle.recordAbort(taskId);

@@ -34,6 +34,13 @@ test('piOnlyToolLess: true only when rows are configured and none of them can ru
   assert.equal(piOnlyToolLess(undefined), false);
 });
 
+test('Pi task choices retain full model identity and match tool flags case-insensitively', () => {
+  const kimi = 'openrouter/moonshotai/kimi-k3';
+  const custom = 'custom/Moonshot/Kimi-K3';
+  assert.deepEqual(piTaskModelIds([pi([kimi, custom, ' Provider/Image '], ['provider/IMAGE'])]), [kimi, custom]);
+  assert.equal(piOnlyToolLess([pi(['Provider/Image'], ['provider/image'])]), true);
+});
+
 test('piTaskPinHint: removed and tool-less pins name the first task-capable row', () => {
   const providers = [pi(['image', 'provider/first', 'provider/second'], ['image'])];
   for (const pin of ['removed', 'image']) {

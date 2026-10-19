@@ -1,10 +1,13 @@
 // ── Draft persistence (sessionStorage) ──
 import state from './state.js';
+import proposalResults from '../objective-proposal-result.js';
 import { DRAFT_KEY_OBJECTIVE } from './constants.js';
 import { t, tc } from './i18n.js';
 import { startName, inProgressName, completeName, canceledName, statusNames, activeNames, isLockedTargetStatus } from './status-registry.js';
 import { groupTitle, groupNewLabel } from './group-label.js';
 import { sanitizeMarkdownHtml } from './markdown-sanitize.js';
+
+const { describeProposalResult } = proposalResults;
 
 /** Returns the sessionStorage key for the objective draft, scoped to the active tab. */
 export function getObjectiveDraftKey() {
@@ -287,6 +290,21 @@ export function truncateMarkdownAtParagraph(text, maxLength) {
   for (const match of head.matchAll(/\n[ \t]*\n/g)) boundary = match.index;
   const complete = boundary > 0 ? head.slice(0, boundary).trimEnd() : head.trimEnd();
   return `${complete}\n\n… (truncated)`;
+}
+
+// ── DOM: skip transitions for one painted frame ──
+// (TPT9023) Classes re-applied to freshly rendered nodes after a forced layout (has-active-session,
+// highlight rings, a re-opened card) would otherwise transition in from the bare markup. A
+// transition only starts when its after-change style allows one, so holding `no-transition` on
+// `el` until a frame has painted shows them in their final state. The token lets a later call
+// extend the window instead of having an earlier call's second frame cut it short.
+export function skipTransitionsForFrame(el) {
+  const token = (el._skipTransitionsToken || 0) + 1;
+  el._skipTransitionsToken = token;
+  el.classList.add('no-transition');
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (el._skipTransitionsToken === token) el.classList.remove('no-transition');
+  }));
 }
 
 // ── DOM: mark truncated cards ──
@@ -728,8 +746,9 @@ function normalizeProposals(parsed) {
     );
   }
   if (parsed.changes && Array.isArray(parsed.changes)) {
+    const proposedCount = parsed.changes.length;
+    parsed.changes = parsed.changes.filter(c => c && ['new', 'modified'].includes(c.type) && c.task && typeof c.task === 'object' && !Array.isArray(c.task));
     for (const c of parsed.changes) {
-      if (!c.task) continue;
       if (c.task.description) c.task.description = c.task.description.replace(/(?<!\\)~/g, '\\~');
       // C1072: only new cards default to the start status — a modified card must never
       // carry a status nobody asked to change (Object.assign downstream would flip a
@@ -739,6 +758,7 @@ function normalizeProposals(parsed) {
     }
     parsed.changes = parsed.changes.filter(c => c.type !== 'modified'
       || !isLockedTargetStatus(state.taskStatusById.get(c.task?.id || c.task?.task_key)));
+    parsed.proposalResult = describeProposalResult(parsed, proposedCount);
   }
   return parsed;
 }

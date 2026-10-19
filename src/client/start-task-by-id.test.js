@@ -98,3 +98,12 @@ test('a readable task starts its session with the fetched title and description'
   assert.deepEqual(opened[0].slice(0, 4), ['T4', 'Real task', 'Body', 'pending']);
   assert.equal(opened[0][4].agent, 'claude');
 });
+
+test('a snapshot for another task cannot replace the requested task read', async () => {
+  opened.length = 0;
+  ipcGet = async () => ({ id: 'T5', title: 'Requested', status: 'pending', agentAssignee: 'codex' });
+  await cards.startTaskById('T5', {}, { id: 'other', agentAssignee: 'pi', piModel: 'wrong/model' });
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0][1], 'Requested');
+  assert.deepEqual(opened[0][4], { agent: 'codex' });
+});

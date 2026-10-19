@@ -16,7 +16,7 @@ import { escapeAttr, insertAtCursor, markTruncatedCards, loadDraft, saveDraft, c
 import { computeTierWindow, HIDE_CLASS } from './sprint-tier-visibility.js';
 import { isStatusRowChecked } from './status-filter-select.js';
 import { buildWsUrl, terminateTaskSession, resumePausedTaskSession } from './ws-client.js';
-import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys, hasTaskSession } from './task-card.js';
+import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys, hasTaskSession, deferUntilDragEnds, syncExpandedOverlay } from './task-card.js';
 import { buildSubtasksLabel, closedDelta, applyChildStatusDelta, countChildProgress } from './subtask-count.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { createMemberCache } from './member-cache.js';
@@ -791,8 +791,9 @@ export function renderListContent(tierKeys, tiers, sortTierFn, renderCardFn) {
         const codingTasks = sorted.filter(t => t.category === 'CODING');
         const humanTasks = sorted.filter(taskIsForHuman);
         const _tierTitleL = _tierTitleFor(p);
+        // (TPT9034) data-priority: applyTaskPatch() (task-card.js) reads the group a card sits in.
         return `
-          <div class="list-group">
+          <div class="list-group" data-priority="${p}">
             <h3 class="list-group-title">${_tierTitleL}</h3>
             <div class="list-group-columns">
               ${codingTasks.length ? `
@@ -1007,6 +1008,9 @@ export async function clearSearchQuery(rerender) {
 
 // ── Search filter ──
 export function applySearchFilter() {
+  // (TPT9025) Card/tier visibility and tier collapse never change under a card drag — this
+  // pass runs once after it instead (deferUntilDragEnds(), task-card.js).
+  if (deferUntilDragEnds('search-filter', applySearchFilter)) return;
   const needle = state.searchQuery.trim().toLowerCase();
   const resetBtn = document.getElementById('search-reset-btn');
   const humanFilter = state.humanFilterActive;
@@ -1029,9 +1033,10 @@ export function applySearchFilter() {
     } else {
       document.querySelectorAll('.tier[data-priority]').forEach(tier => {
         const p = Number(tier.dataset.priority);
-        const allDone = [...tier.querySelectorAll('.card[data-status]')].every(
-          c => isClosedName(c.dataset.status)
-        );
+        const cards = [...tier.querySelectorAll('.card[data-status]')];
+        // (TPT9025) A card-less tier is not "all done" (renderBoardContent()'s rule) —
+        // collapsing it left the empty sprint a drag reveals zero-height, so no drop landed.
+        const allDone = cards.length > 0 && cards.every(c => isClosedName(c.dataset.status));
         if (state.collapsedTiers.has(p) || (allDone && !state.expandedTiers.has(p))) {
           tier.classList.add('collapsed');
         } else {
@@ -1059,6 +1064,8 @@ export function applySearchFilter() {
     // it exactly once per render (after this function returns), covering both branches of this
     // function. This branch used to call it AGAIN, a second forced-layout pass over every
     // .card/.preview-card on every render with no active search query.
+    // (TPT9024) Last: this pass folds, hides and shows tiers — re-anchor or close an open card.
+    syncExpandedOverlay();
     return;
   }
 
@@ -1097,6 +1104,7 @@ export function applySearchFilter() {
   syncEmptyTierVisibility({ reveal: true }); // (C1578) search/tag path also un-collapses matches
   updateBacklogEmptyState();
   updateShowMoreButton();
+  syncExpandedOverlay(); // (TPT9024) same as the no-search branch above
 }
 
 // (C1502) Full-screen/blocking surfaces the client creates by appending an overlay node to
@@ -1557,10 +1565,14 @@ export function showConfirmModal(taskId, prevStatus, newStatus, onDone) {
       const result = applyTaskPatch(fresh);
       if (isClosedName(newStatus)) {
         clearAttention(taskId, 'closed');
-        const card = document.querySelector(`.card[data-id="${taskId}"]`);
-        if (card) {
+        // (TPT9025) Collapsing the tier resizes the board — under a card drag this runs after
+        // it, against the replayed card (hence the lookup by id inside).
+        const collapseClosedTier = () => {
+          const card = document.querySelector(`.card[data-id="${taskId}"]`);
+          if (!card) return;
           card.classList.remove('needs-attention');
-          const tier = card.closest('.tier');
+          // (TPT9034) Sprint tiers only: the flat board's .tier--flat has no label to unfold it.
+          const tier = card.closest('.tier[data-priority]');
           if (tier) {
             const p = Number(tier.dataset.priority);
             state.expandedTiers.delete(p);
@@ -1571,12 +1583,18 @@ export function showConfirmModal(taskId, prevStatus, newStatus, onDone) {
             if (allSiblingsDone && !tier.classList.contains('collapsed')) {
               state.collapsedTiers.add(p);
               tier.classList.add('collapsed');
+              syncExpandedOverlay(); // (TPT9024) a card still open in the folded sprint closes
             }
           }
-        }
+        };
+        if (!deferUntilDragEnds(`collapse-closed-tier:${taskId}`, collapseClosedTier)) collapseClosedTier();
         updateClaudeButtons();
       }
-      if (result === 'reload' && onDone) await onDone();
+      // (TPT9035) A status patch can move a card out of the selected facet. template.html's other
+      // applyTaskPatch() callers re-filter after it; the desktop app gets no WS echo of its own
+      // write (main/ipc/api-router.js handleTaskUpdate()), so this caller must do it itself.
+      if (result !== 'reload') applySearchFilter();
+      else if (onDone) await onDone();
     } catch (err) {
       _toastWriteFailure(err, 'board.errStatusChange');
       if (onDone) await onDone();
@@ -2503,6 +2521,13 @@ export function terminateSessionFromCard(taskId, { dismissAlerts = false } = {})
 
 // ── Update Claude button labels for active sessions ──
 export function updateClaudeButtons() {
+  // (TPT9025) The board half below reads mounted cards' statuses (C1306) and resizes cards
+  // (Stop, spinner, has-active-session) — under a card drag it waits for the thaw, while the
+  // modal, nav and Finish surfaces still sync now.
+  if (deferUntilDragEnds('session-buttons', updateClaudeButtons)) {
+    _syncSessionSurfaces();
+    return;
+  }
   // (C1306) Session/attention events can repaint this module after a card was patched in
   // place but before a full loadAndRender() rebuilds taskStatusById. The left-nav rows read
   // that map, while the buttons below read the mounted card's newer data-status. Reconcile
@@ -2519,6 +2544,15 @@ export function updateClaudeButtons() {
     if (isCompleteName(state.taskStatusById.get(taskId)) && !isCompleteName(status)) continue;
     state.taskStatusById.set(taskId, status);
   }
+
+  // (TPT9025) Sole writer of the size-changing has-active-session class: drop it from every
+  // card left without a session, including one whose session button is gone.
+  document.querySelectorAll('.card.has-active-session[data-id]').forEach(card => {
+    const id = card.dataset.id;
+    if (!state.activeSessions.has(id) && !state.exitedSessions.has(id) && !state.queuedSessions.has(id)) {
+      card.classList.remove('has-active-session');
+    }
+  });
 
   document.querySelectorAll('.btn-claude').forEach(btn => {
     const taskId = btn.dataset.taskId;
@@ -2685,6 +2719,12 @@ export function updateClaudeButtons() {
     }
   });
 
+  _syncSessionSurfaces();
+}
+
+// Session surfaces outside the board's layout: the edit modal's Start/Stop, the left-nav
+// session list, the objective nav tabs and the Finish buttons.
+function _syncSessionSurfaces() {
   syncTaskEditSessionButtons();
 
   // (C1144) Every session start/exit/terminate and attention transition funnels through

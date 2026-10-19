@@ -28,7 +28,7 @@ test('empty server card result stays authoritative instead of reviving raw propo
   };
   vm.createContext(env);
   const resultStart = chat.indexOf('      const lastMsgOR =');
-  vm.runInContext(chat.slice(resultStart, chat.indexOf("    } else if (msg.type === 'chat-history-reset')", resultStart)), env);
+  vm.runInContext('(function () {' + chat.slice(resultStart, chat.indexOf("    } else if (msg.type === 'chat-history-reset')", resultStart)) + '})();', env);
   assert.deepEqual(lastMsg._serverCards, []);
   const parseStart = chat.indexOf('          let cards;');
   vm.runInContext(chat.slice(parseStart, chat.indexOf('          const lastMsgIdx', parseStart)) + '\nglobalThis.result = cards;', env);

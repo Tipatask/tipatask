@@ -1,6 +1,6 @@
 {
   "name": "tipatask-app",
-  "version": "0.9.15",
+  "version": "0.9.16",
   "description": "TipΔTask — Electron desktop app: local task board, architecture knowledge base, and AI coding-agent orchestrator (Claude/Codex/Pi), with a CLI installer for the agent harness files.",
   "license": "Apache-2.0",
   "author": "Anton Matiienko, Apppixies",
@@ -40,6 +40,7 @@
     "probe:attention": "node scripts/probe-attention-prompts.js",
     "probe:pi-approval": "node scripts/probe-pi-approval.js",
     "probe:pi-mcp": "node scripts/probe-pi-mcp.js",
+    "probe:win-pi": "node scripts/probe-packaged-windows-pi.js",
     "probe:voice-model": "node scripts/probe-voice-model.js",
     "probe:status-roles": "node scripts/probe-status-roles.js",
     "probe:preset-seeding": "node scripts/probe-preset-seeding.js",
@@ -48,6 +49,7 @@
     "probe:agent-models": "node scripts/probe-agent-models.js",
     "probe:agent-detect": "node scripts/probe-agent-detect.js",
     "probe:claude-quota": "node scripts/probe-claude-quota.js",
+    "probe:codex-quota": "node scripts/probe-codex-quota.js",
     "probe:tag-descriptions": "node scripts/probe-tag-descriptions.js",
     "probe:kb-reindex": "node scripts/probe-kb-reindex.js",
     "probe:kb-lock": "node scripts/probe-kb-lock.js",
@@ -76,21 +78,21 @@
     "backfill-kb-descriptions": "node scripts/backfill-kb-descriptions.js",
     "electron": "node build.js && node scripts/rename-dev-electron.js && env -u ELECTRON_RUN_AS_NODE electron .",
     "electron:dev": "node build.js --electron-dev",
-    "electron:pack": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --dir",
-    "electron:ci:mac": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --mac",
-    "electron:ci:win": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --win",
-    "electron:ci:linux": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --linux",
-    "electron:dist:mac": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --mac",
-    "electron:dist:win": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --win",
-    "electron:dist:linux": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --linux",
-    "electron:dist": "node scripts/stage-pi-bundle.js && node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --mac --win --linux",
+    "electron:pack": "node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --dir",
+    "electron:ci:mac": "node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --mac",
+    "electron:ci:win": "node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --win",
+    "electron:ci:linux": "node scripts/stage-sherpa-bundle.js && node build.js && electron-builder --linux",
+    "electron:dist:mac": "node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --mac",
+    "electron:dist:win": "node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --win",
+    "electron:dist:linux": "node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --linux",
+    "electron:dist": "node scripts/stage-sherpa-bundle.js && node scripts/bump-version.js && node build.js && electron-builder --mac --win --linux",
     "bump-version": "node scripts/bump-version.js",
     "test:coverage": "c8 node scripts/run-tests.js"
   },
   "build": {
     "appId": "com.tipatask.app",
     "productName": "TipATask",
-    "npmRebuild": true,
+    "npmRebuild": false,
     "asar": true,
     "asarUnpack": [
       "node_modules/node-pty/build/Release/**",
@@ -121,6 +123,8 @@
       "NOTICE",
       "THIRD-PARTY-NOTICES.md",
       "node_modules/**/*",
+      "!node_modules/node-pty/build/**",
+      "!node_modules/node-pty/bin/**",
       "!node_modules/node-pty/prebuilds/**",
       "!node_modules/node-pty/src/**",
       "!node_modules/node-pty/deps/**",
@@ -143,6 +147,16 @@
       "output": "dist-electron"
     },
     "mac": {
+      "files": [
+        {
+          "from": "node_modules/node-pty/build/Release",
+          "to": "node_modules/node-pty/build/Release",
+          "filter": [
+            "*.node",
+            "spawn-helper"
+          ]
+        }
+      ],
       "target": {
         "target": "dmg",
         "arch": [
@@ -164,7 +178,23 @@
     },
     "win": {
       "target": "nsis",
-      "icon": "assets/icon.ico"
+      "icon": "assets/icon.ico",
+      "files": [
+        {
+          "from": "node_modules/node-pty/prebuilds/win32-${arch}",
+          "to": "node_modules/node-pty/build/Release",
+          "filter": [
+            "*.node",
+            "*.dll",
+            "*.exe",
+            "conpty/*.dll",
+            "conpty/*.exe"
+          ]
+        }
+      ],
+      "asarUnpack": [
+        "node_modules/node-pty/prebuilds/win32-${arch}/**"
+      ]
     },
     "nsis": {
       "oneClick": false,
@@ -175,6 +205,16 @@
       "include": "build/installer.nsh"
     },
     "linux": {
+      "files": [
+        {
+          "from": "node_modules/node-pty/build/Release",
+          "to": "node_modules/node-pty/build/Release",
+          "filter": [
+            "*.node",
+            "spawn-helper"
+          ]
+        }
+      ],
       "target": [
         "AppImage",
         "deb",
@@ -184,6 +224,7 @@
       "category": "Development",
       "maintainer": "Tipatask <reply@tipatask.com>"
     },
+    "beforePack": "scripts/before-pack.js",
     "afterPack": "scripts/check-packaged-tests.js"
   },
   "dependencies": {

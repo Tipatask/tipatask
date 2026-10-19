@@ -6,7 +6,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
-const { createPackage, uncache } = require('@electron/asar');
+const { createPackage, createPackageWithOptions, uncache } = require('@electron/asar');
+const { WINDOWS_PTY_BINARIES, WINDOWS_PTY_SCRIPTS } = require('../../scripts/windows-pty');
 const { FileMatcher } = require('app-builder-lib/out/fileMatcher');
 const afterPack = require('../../scripts/check-packaged-tests');
 const { discoverTests } = require('../../scripts/run-tests');
@@ -73,7 +74,9 @@ test('runner isolates inherited credentials and discovers nested tests from any 
       assert.equal(process.env[key], undefined, key);
     }
     assert.equal(process.env.NODE_DISABLE_COMPILE_CACHE, '1');
-    assert.deepEqual(require('node:fs').readdirSync(process.env.TIPATASK_PROJECT_ROOT), []);
+    const path = require('node:path');
+    assert.equal(path.dirname(process.env.CLAUDE_CONFIG_DIR), process.env.TIPATASK_PROJECT_ROOT);
+    assert.deepEqual(require('node:fs').readdirSync(process.env.TIPATASK_PROJECT_ROOT), [path.basename(process.env.CLAUDE_CONFIG_DIR)]);
   `);
   const result = fixture.run(inherited);
   assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -84,6 +87,27 @@ test('runner fails when discovery is empty', t => {
   const result = runnerFixture(t).run();
   assert.equal(result.status, 1);
   assert.match(result.stderr, /No unit tests discovered/);
+});
+
+test('runner gives Claude config writers separate worker profiles inherited by their children', t => {
+  const fixture = runnerFixture(t);
+  const profiles = [path.join(fixture.dir, 'profile-one.json'), path.join(fixture.dir, 'profile-two.json')];
+  const worker = output => `
+    const { spawnSync } = require('node:child_process');
+    const result = spawnSync(process.execPath, ['-e', 'process.stdout.write(process.env.CLAUDE_CONFIG_DIR)'], { encoding: 'utf8' });
+    require('node:assert/strict').equal(result.stdout, process.env.CLAUDE_CONFIG_DIR);
+    require('node:fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify(process.env.CLAUDE_CONFIG_DIR));
+  `;
+  fixture.write(worker(profiles[0]));
+  fs.writeFileSync(path.join(fixture.dir, 'src', 'other.test.cjs'), worker(profiles[1]));
+  const result = fixture.run({ CLAUDE_CONFIG_DIR: fixture.dir });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const [one, two] = profiles.map(file => JSON.parse(fs.readFileSync(file, 'utf8')));
+  assert.notEqual(one, two);
+  for (const profile of [one, two]) {
+    assert.notEqual(profile, fixture.dir);
+    assert.equal(fs.existsSync(profile), false, 'runner cleans temporary Claude profiles');
+  }
 });
 
 test('runner propagates assertion failures and cleans temporary state', t => {
@@ -217,6 +241,23 @@ function packagedFixture(t) {
     if (name === afterPack.PI_PACKAGE) continue;
     writeJson(path.join(source, 'node_modules', name, 'package.json'), { name, version: lockVersion(name) });
   }
+  const ptyRoot = path.join(source, 'node_modules', 'node-pty');
+  const pe = Buffer.alloc(512);
+  pe.write('MZ');
+  pe.writeUInt32LE(128, 0x3c);
+  pe.write('PE\0\0', 128);
+  pe.writeUInt16LE(0x8664, 132);
+  pe.writeUInt16LE(0x20b, 152);
+  for (const binary of WINDOWS_PTY_BINARIES) {
+    const file = path.join(ptyRoot, 'build', 'Release', binary);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, pe);
+  }
+  for (const script of WINDOWS_PTY_SCRIPTS) {
+    const file = path.join(ptyRoot, 'lib', script);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '// node-pty runtime fixture');
+  }
   for (const platform of afterPack.SHERPA_PLATFORMS) {
     writeJson(path.join(resources, 'app.asar.unpacked', 'node_modules', `sherpa-onnx-${platform}`, 'package.json'),
       { name: `sherpa-onnx-${platform}`, version: lockVersion('sherpa-onnx-node') });
@@ -228,7 +269,7 @@ function packagedFixture(t) {
   // @electron/asar caches each archive's header by path, so a rebuilt archive must be dropped from it.
   const repack = async () => {
     const archive = path.join(resources, 'app.asar');
-    await createPackage(source, archive);
+    await createPackageWithOptions(source, archive, { unpack: '**/node-pty/**' });
     uncache(archive);
   };
   const electronVersion = require('electron/package.json').version;
@@ -249,6 +290,62 @@ test('release hook accepts a runtime-only archive and rejects leaked test files'
   await createPackage(f.source, path.join(badResources, 'app.asar'));
   await assert.rejects(afterPack({ appOutDir: f.dir, electronPlatformName: 'darwin',
     packager: { appInfo: { productFilename: 'Bad' } } }), /leak\.test\.js/);
+});
+
+test('Windows release hook requires a shipped Node executable larger than 1 MiB and its license', async t => {
+  const f = packagedFixture(t);
+  await f.repack();
+  const context = { appOutDir: f.dir, electronPlatformName: 'win32', arch: 'x64',
+    packager: { info: { framework: { version: f.electronVersion } } } };
+  const runtime = path.join(f.piModules, 'tipatask-node');
+  const node = path.join(runtime, 'node.exe');
+  const license = path.join(runtime, 'LICENSE');
+  const rejects = async (file, pattern) => assert.rejects(afterPack(context), error => {
+    assert.match(error.message, /Windows Pi runtime is incomplete/);
+    assert.ok(error.message.includes(file));
+    assert.match(error.message, pattern);
+    assert.match(error.message, /stage-pi-bundle\.js/);
+    assert.match(error.message, /build\.extraResources/);
+    return true;
+  });
+  await rejects(node, /ENOENT/);
+  fs.mkdirSync(runtime);
+  fs.writeFileSync(node, Buffer.alloc(1024 * 1024 + 1));
+  fs.writeFileSync(license, 'Node.js license');
+  await afterPack(context);
+
+  fs.rmSync(node);
+  await rejects(node, /ENOENT/);
+  fs.mkdirSync(node);
+  await rejects(node, /not a regular file/);
+  fs.rmdirSync(node);
+  for (const size of [0, 1024, 1024 * 1024]) {
+    fs.writeFileSync(node, Buffer.alloc(size));
+    await rejects(node, /must be larger than 1 MiB/);
+  }
+  fs.writeFileSync(node, Buffer.alloc(1024 * 1024 + 1));
+  fs.rmSync(license);
+  await rejects(license, /ENOENT/);
+  fs.mkdirSync(license);
+  await rejects(license, /not a regular file/);
+  fs.rmdirSync(license);
+  fs.writeFileSync(license, 'Node.js license');
+  await afterPack(context);
+});
+
+test('Windows release hook rejects missing ConPTY and a substituted host module in actual output', async t => {
+  const f = packagedFixture(t);
+  await f.repack();
+  const runtime = path.join(f.piModules, 'tipatask-node');
+  fs.mkdirSync(runtime);
+  fs.writeFileSync(path.join(runtime, 'node.exe'), Buffer.alloc(1024 * 1024 + 1));
+  fs.writeFileSync(path.join(runtime, 'LICENSE'), 'Node.js license');
+  const context = { appOutDir: f.dir, electronPlatformName: 'win32', arch: 'x64', packager: {} };
+  const native = path.join(f.resources, 'app.asar.unpacked/node_modules/node-pty/build/Release/conpty.node');
+  fs.writeFileSync(native, Buffer.from('cffaedfe', 'hex'));
+  await assert.rejects(afterPack(context), /conpty\.node: expected PE32\+ x64/);
+  fs.unlinkSync(native);
+  await assert.rejects(afterPack(context), /conpty\.node: ENOENT/);
 });
 
 test('packaged require guard checks archive entry points and all main modules recursively', async t => {

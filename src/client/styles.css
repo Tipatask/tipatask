@@ -2085,6 +2085,15 @@
      target for the duration of a card drag — see body.board-dragging below. */
   .tier.tier--empty { display: none; }
   body.board-dragging .tier.tier--empty { display: flex; }
+  /* (TPT9025) A sprint the user collapsed before it emptied still pops up as a drop target —
+     a zero-height .tier-cards is ignored by resolveDropTier(). No transition: the reveal must
+     not animate the board after _startDrag() has anchored the scroll position. */
+  body.board-dragging .tier.tier--empty.collapsed .tier-cards {
+    max-height: none;
+    padding: 0.75rem 1rem;
+    opacity: 1;
+    transition: none;
+  }
 
   .board-no-sprint-tasks {
     padding: 2rem 1rem;
@@ -3025,6 +3034,16 @@
     background: rgba(0,0,0,0.15);
     backdrop-filter: blur(2px);
     -webkit-backdrop-filter: blur(2px);
+  }
+
+  /* (TPT9023) skipTransitionsForFrame() (utils.js) holds this for one painted frame: on #app after
+     an in-place board re-render, and on a card expandCard(card, mode, { instant: true }) re-opens,
+     so what the render re-applies (session controls, rings, the overlay) doesn't animate back in. */
+  .no-transition,
+  .no-transition *,
+  .no-transition *::before,
+  .no-transition *::after {
+    transition: none !important;
   }
 
   /* ── Expanded card overlay positioning ── */
@@ -8864,6 +8883,14 @@
   }
 
   .task-chat-dialog-other:focus { outline: none; border-color: var(--c-primary-border); }
+
+  /* An answered free-text Other: the whole answer, wrapped, in place of the one-line input. */
+  .task-chat-dialog-other-answer {
+    margin-top: 0.25rem;
+    font-size: 0.85rem;
+    color: var(--c-text);
+    overflow-wrap: anywhere;
+  }
 
   .task-chat-dialog-actions {
     display: flex;

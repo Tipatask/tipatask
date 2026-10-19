@@ -202,7 +202,8 @@ jobs:
             exit 1
           fi
 
-      # Chain: stage-pi-bundle -> stage-sherpa-bundle -> build.js -> electron-builder --<os>.
+      # Chain: stage-sherpa-bundle -> build.js -> electron-builder --<os>.
+      # before-pack.js stages Pi and selects node-pty natives for each target OS/CPU.
       # `--publish never` is appended (npm passes args after `--` on to electron-builder).
       # electron-builder infers a GitHub publish provider from the git remote on a tag build;
       # there is no build.publish config and no GH_TOKEN in this job's env so it cannot actually
@@ -234,6 +235,9 @@ jobs:
             [ -n "${!v}" ] && set_count=$((set_count + 1))
           done
           extra=()
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            extra+=(--x64 --arm64)
+          fi
           if [ "$set_count" -eq 5 ]; then
             echo "::notice title=macOS signing::Developer ID signing + notarization enabled."
             extra=(-c.mac.identity="$APPLE_TEAM_ID" -c.mac.notarize=true -c.forceCodeSigning=true)
@@ -246,6 +250,26 @@ jobs:
             exit 1
           fi
           npm run ${{ matrix.script }} -- --publish never "${extra[@]}"
+
+      - name: Verify Windows Pi runtime shipped
+        if: runner.os == 'Windows'
+        run: |
+          node_path="dist-electron/win-unpacked/resources/pi/node_modules/tipatask-node/node.exe"
+          if [ ! -f "$node_path" ]; then
+            echo "::error title=Missing Windows Pi runtime::$node_path was not packaged. Check scripts/stage-pi-bundle.js and build.extraResources before releasing."
+            exit 1
+          fi
+
+      - name: Verify packaged Windows task terminal runtime
+        if: runner.os == 'Windows'
+        run: node scripts/probe-packaged-windows-pty.js dist-electron/win-unpacked
+
+      # (TPT9047) The staged Pi runtime verification inside the packaged app: bundled console Node,
+      # one-file import, full cli.js import — each timed against its own deadline — plus a forced
+      # timeout that must leave no node.exe behind. A cold runner is the realistic first start.
+      - name: Verify packaged Windows Pi runtime
+        if: runner.os == 'Windows'
+        run: node scripts/probe-packaged-windows-pi.js dist-electron/win-unpacked
 
       # Only when the build signed: mount each dmg and check the app inside is Developer ID
       # signed, notarized and stapled. An ad-hoc/unsigned artifact fails this step.

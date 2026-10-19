@@ -53,6 +53,8 @@ if (sharedRoot) {
 // node --test runs each file in its own worker (argv[1]); helpers it spawns inherit the name.
 if (sharedRoots.size && process.env.NODE_TEST_CONTEXT && !process.env.TIPATASK_TEST_FILE) {
   process.env.TIPATASK_TEST_FILE = process.argv[1];
+  // Each worker owns its Claude user config; Node children inherit that same profile.
+  process.env.CLAUDE_CONFIG_DIR = fs.mkdtempSync(path.join(sharedRoot, 'claude-'));
 }
 
 function isSharedStore(target) {

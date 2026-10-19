@@ -5,7 +5,8 @@ const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { execFile, execFileSync } = require('node:child_process');
-const { killProcessGroup } = require('./process-group');
+const { pathToFileURL } = require('node:url');
+const { killProcessGroup, killWindowsChildTree } = require('./process-group');
 
 const IS_WIN = process.platform === 'win32';
 
@@ -244,6 +245,8 @@ if (_nodeBinDirHasNode) {
 const _binCache = {};
 const _binInflight = new Map();
 const _binGeneration = new Map();
+const _piLaunchChecks = new Map();
+const _piLaunchChoices = new Map();
 function peekResolvedBin(name) { return _binCache[name]; }
 
 const _firstLine = (lines) => (lines.find(l => l.trim()) || '').trim();
@@ -737,6 +740,10 @@ function resolveBin(name) {
  * @param {string} [name]
  */
 function clearBinCache(name) {
+  if (!name || name === 'pi') {
+    _piLaunchChecks.clear();
+    _piLaunchChoices.clear();
+  }
   if (name === undefined) {
     for (const key of new Set([...Object.keys(_binCache), ..._binInflight.keys()])) clearBinCache(key);
     // Forced re-detection also re-reads the registry Path dirs (win32) and rebuilds the
@@ -759,21 +766,236 @@ function isAsarPath(p) {
   return typeof p === 'string' && /\.asar([\\/]|$)/.test(p);
 }
 
+function packagedPiLaunch() {
+  if (!process.resourcesPath) return null;
+  const cli = path.join(process.resourcesPath, 'pi', 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js');
+  if (!_exists(cli)) return null;
+  // The Windows app executable is a GUI program. A successful piped --version
+  // check does not establish that its interactive stdin/stdout work in ConPTY.
+  // All packaged Windows Pi launches use a console Node runtime instead.
+  if (IS_WIN) return {
+    command: path.join(process.resourcesPath, 'pi', 'node_modules', 'tipatask-node', 'node.exe'),
+    argsPrefix: [cli], env: { ELECTRON_RUN_AS_NODE: '' },
+  };
+  return { command: process.execPath, argsPrefix: [cli], env: { ELECTRON_RUN_AS_NODE: '1' } };
+}
+
+function piFileFingerprint(file) {
+  try { const stat = fs.statSync(file); return `${file}:${stat.size}:${stat.mtimeMs}`; }
+  catch { return file; }
+}
+
+function piLaunchKey(launch) {
+  const node = path.join(process.resourcesPath, 'pi', 'node_modules', 'tipatask-node', 'node.exe');
+  const key = [launch.command, ...launch.argsPrefix, node].map(piFileFingerprint).join('|');
+  const choice = _piLaunchChoices.get(key);
+  // A system Node can be upgraded independently of the app and its staged CLI.
+  if (choice && choice.fingerprint !== piFileFingerprint(choice.launch.command)) {
+    _piLaunchChoices.delete(key);
+    _piLaunchChecks.delete(key);
+  }
+  return key;
+}
+
+// (TPT9047) Windows Pi runtime verification runs in stages, each with its own deadline, so a
+// failure names the layer that broke and a healthy-but-cold install is never mistaken for a dead
+// runtime. Measured on a 4-vCPU Windows 11 ARM64 VM with Defender real-time protection on:
+//   runtime  `node.exe --version`                                 ~35 ms
+//   import   one ESM file (dist/config.js) printing Pi's VERSION  ~0.4 s cold, ~0.1 s warm
+//   cli      `cli.js --version` — Pi imports its whole dist tree (~19k files) before it prints:
+//            ~0.7 s warm, ~17 s on a cold file cache (first run after install or reboot, every
+//            file read and scanned once); an x64 build under ARM emulation is slower still.
+// One 5 s budget used to cover all three, so a cold start overran it on every runtime and the
+// bundled and the system Node failed alike with a message that blamed the runtimes.
+const PI_STAGE_TIMEOUT_MS = Object.freeze({ runtime: 5000, import: 15000, cli: 60000 });
+const PI_STAGES = Object.freeze(['runtime', 'import', 'cli']);
+
+// Full argv of one stage. `--version` is appended only where it means Node's or Pi's version:
+// after `-e` it would make Node print its own version and skip the import.
+function piStageArgs(stage, cli) {
+  if (stage === 'runtime') return ['--version'];
+  if (stage === 'import') {
+    const config = pathToFileURL(path.join(path.dirname(cli), 'config.js')).href;
+    return ['--input-type=module', '-e', `import(${JSON.stringify(config)}).then(m => process.stdout.write(String(m.VERSION)))`];
+  }
+  return [cli, '--version'];
+}
+
+// Run one probe with a bound on output and lifetime. On the deadline the captured child tree is
+// taken (Windows: taskkill /T) and `killed` records whether that succeeded; `elapsedMs` is wall
+// time from spawn to settle, so a timeout and a slow success are both measured.
+function probePackagedPi(launch, args) {
+  const timeoutMs = launch.timeoutMs;
+  return new Promise(resolve => {
+    let child;
+    let settled = false;
+    const started = Date.now();
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(backstop);
+      resolve({ ...result, elapsedMs: Date.now() - started });
+    };
+    const stop = () => {
+      if (IS_WIN) return killWindowsChildTree(child);
+      if (child?.pid && !killProcessGroup(child.pid, 'SIGKILL')) {
+        try { child.kill('SIGKILL'); } catch { return false; }
+      }
+      return true;
+    };
+    const backstop = setTimeout(() => {
+      const killed = stop();
+      finish({ error: Object.assign(new Error('Pi runtime probe timed out'), { code: 'ETIMEDOUT' }), status: null, output: '', stdout: '', killed });
+    }, timeoutMs);
+    try {
+      child = execFile(launch.command, args, {
+        env: augmentPathEnv({ PI_SKIP_VERSION_CHECK: '1', ...launch.env }),
+        encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024, windowsHide: true,
+      }, (error, stdout, stderr) => {
+        finish({ error, status: error ? (Number.isInteger(error.code) ? error.code : null) : 0,
+          output: [stdout, stderr].filter(Boolean).join('\n').trim(), stdout: String(stdout || '').trim() });
+      });
+    } catch (error) {
+      finish({ error, status: null, output: '', stdout: '' });
+    }
+  });
+}
+
+// Search every node.exe, not only resolveBin('node')'s first hit: a stale system install
+// must not hide a compatible registry/nvm-windows runtime. Never accept npm shell shims.
+function systemPiNodes() {
+  const dirs = augmentedPath().split(PATH_SEP);
+  const nvmRoot = process.env.NVM_HOME || path.join(os.homedir(), 'AppData', 'Roaming', 'nvm');
+  try {
+    dirs.push(...fs.readdirSync(nvmRoot).filter(v => /^v?\d/.test(v)).sort().reverse()
+      .map(v => path.join(nvmRoot, v)));
+  } catch { /* nvm-windows not present */ }
+  const seen = new Set();
+  return dirs.filter(Boolean).map(dir => path.join(dir.replace(/^"(.*)"$/, '$1'), 'node.exe'))
+    .filter(file => {
+      const key = file.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      try { return fs.statSync(file).isFile(); } catch { return false; }
+    });
+}
+
+function piNodeMeetsEngine(version, engine) {
+  // The app declares a >=X.Y.Z floor. Reject unknown ranges/versions rather than running
+  // Pi under a runtime whose compatibility we could not establish.
+  const min = /^>=\s*(\d+)\.(\d+)\.(\d+)$/.exec(engine || '');
+  const current = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version || '');
+  if (!min || !current) return false;
+  for (let i = 1; i <= 3; i++) {
+    if (+current[i] !== +min[i]) return +current[i] > +min[i];
+  }
+  return true;
+}
+
+// One line per attempted runtime for an error message or a log: the stage that ended the
+// attempt, how long it took against its deadline, and what it printed (or why it failed).
+function describePiRuntimeCheck(check) {
+  const where = check.stage ? ` ${check.stage} stage ${check.elapsedMs ?? '?'}ms/${check.timeoutMs}ms` : '';
+  return `${check.runtime} (${check.command})${where}: ${check.output || 'empty output'}`;
+}
+
+// Verify the packaged Windows launch: the bundled console Node first, then every compatible
+// system Node, each through the runtime → import → cli stages above. The verified launch carries
+// `runtimeChecks` (one entry per attempted runtime with its `stages`) and `piVersion` (the exact
+// version `cli.js --version` printed), so the agent's detect() can trust it without re-importing
+// Pi. A failure throws `EPI_RUNTIME` with the same `runtimeChecks`, the failing attempt's summary
+// (`stage`, `elapsedMs`, `timeoutMs`) and a message that lists every attempt.
+async function verifyPackagedPiLaunch(launch) {
+  const key = piLaunchKey(launch);
+  if (_piLaunchChecks.has(key)) return _piLaunchChecks.get(key);
+  const pending = (async () => {
+    const cli = launch.argsPrefix[0];
+    const manifest = JSON.parse(fs.readFileSync(path.join(path.dirname(cli), '..', 'package.json'), 'utf8'));
+    const node = path.join(process.resourcesPath, 'pi', 'node_modules', 'tipatask-node', 'node.exe');
+    const engine = require('../../package.json').engines.node;
+    const checks = [];
+    let lastCandidate, lastProbe;
+    const skip = (candidate, output) => {
+      checks.push({ runtime: candidate.runtime, command: candidate.command, stage: null, timeoutMs: null,
+        elapsedMs: null, exit: null, output, stages: [] });
+    };
+    const verify = async candidate => {
+      lastCandidate = candidate;
+      const entry = { runtime: candidate.runtime, command: candidate.command, stages: [] };
+      checks.push(entry);
+      for (const stage of PI_STAGES) {
+        const timeoutMs = PI_STAGE_TIMEOUT_MS[stage];
+        const probe = lastProbe = await probePackagedPi({ ...candidate, timeoutMs }, piStageArgs(stage, cli));
+        let failure = null;
+        if (probe.error) failure = probe.output || probe.error.code || probe.error.message;
+        else if (stage === 'runtime' && !piNodeMeetsEngine(probe.stdout, engine)) {
+          failure = `Node ${probe.stdout || 'empty version'} does not satisfy ${engine}`;
+        } else if (stage !== 'runtime' && probe.stdout !== manifest.version) {
+          failure = probe.output ? `expected Pi ${manifest.version}, got ${probe.output}` : 'empty output';
+        }
+        const record = { stage, ok: !failure, timeoutMs, elapsedMs: probe.elapsedMs, exit: probe.status,
+          output: String(failure ?? probe.stdout).slice(0, 200), ...(probe.killed === undefined ? {} : { killed: probe.killed }) };
+        entry.stages.push(record);
+        Object.assign(entry, record);
+        if (stage === 'runtime' && !failure) entry.nodeVersion = probe.stdout;
+        if (failure) return null;
+      }
+      const verified = { ...candidate, runtimeChecks: checks, piVersion: manifest.version, verifiedAt: Date.now() };
+      if (_piLaunchChecks.get(key) === pending) {
+        _piLaunchChoices.set(key, { launch: verified, fingerprint: piFileFingerprint(candidate.command) });
+      }
+      return verified;
+    };
+    const bundled = { command: node, argsPrefix: [cli], env: { ELECTRON_RUN_AS_NODE: '' }, runtime: 'bundled-node' };
+    if (_exists(node)) {
+      const verified = await verify(bundled);
+      if (verified) return verified;
+    } else {
+      skip(bundled, 'bundled node.exe is missing');
+    }
+    const nodes = systemPiNodes();
+    if (!nodes.length) {
+      skip({ runtime: 'system-node', command: 'node.exe' }, `system node.exe not found (requires ${engine})`);
+    }
+    for (const command of nodes) {
+      const verified = await verify({ command, argsPrefix: [cli], env: { ELECTRON_RUN_AS_NODE: '' }, runtime: 'system-node' });
+      if (verified) return verified;
+    }
+    const why = checks.map(describePiRuntimeCheck).join('; ');
+    const failed = checks.findLast(check => check.stage) || checks.at(-1) || {};
+    throw Object.assign(new Error(`Pi runtime verification failed (expected Pi ${manifest.version}; ${why})`), {
+      code: 'EPI_RUNTIME', launch: lastCandidate,
+      stage: failed.stage || null, elapsedMs: failed.elapsedMs ?? null, timeoutMs: failed.timeoutMs ?? null,
+      runtime: failed.runtime || null, stageOutput: failed.output || '',
+      probe: { ...lastProbe, output: `Expected Pi ${manifest.version}; ${why}` },
+      runtimeChecks: checks,
+    });
+  })();
+  _piLaunchChecks.set(key, pending);
+  try { return await pending; }
+  catch (error) {
+    if (_piLaunchChecks.get(key) === pending) _piLaunchChecks.delete(key);
+    error.launch ||= launch;
+    throw error;
+  }
+}
+
 // (C1112) How to launch Pi, beyond what a single resolveBin() path string can express. The
 // packaged-Electron case needs a two-part command (`process.execPath <cliPath>`, not a plain
 // executable), so this returns { command, argsPrefix, env } — callers do
 // spawn(launch.command, [...launch.argsPrefix, ...args], { env: { ...env, ...launch.env } }).
 //
 // Order: PI_BIN env override > bundled checkout (bin/pi via resolveBundledBin) > packaged
-// extraResources copy > system-wide install (login shell / PROBE_DIRS / nvm). The first two
+// extraResources copy (Windows: bundled Node > compatible system Node)
+// > system-wide Pi install (login shell / PROBE_DIRS / nvm). The first two
 // mirror resolveBin('pi') exactly; the packaged branch only ever matches when resolveBundledBin
 // returned null because __dirname is inside app.asar (see resolveBundledBin's asar guard) —
 // electron-builder's extraResources ships the Pi package as plain files at
 // process.resourcesPath/pi/node_modules (staged by scripts/stage-pi-bundle.js), outside the
 // asar and therefore spawnable, but on a runtime with no `node` next to process.execPath
-// (packaged Electron never has one) — so it's launched via the Electron binary itself running
-// as plain Node (ELECTRON_RUN_AS_NODE=1), the same trick used for the in-asar MCP entry point
-// in codex-mcp-config.js / project-config.js.
+// (packaged Electron never has one). POSIX uses Electron run-as-node, the same mechanism as
+// the in-asar MCP entry point. Windows instead ships a console Node executable under
+// tipatask-node, with a verified compatible system Node as its fallback.
 function resolvePiLaunch(serverRoot = SERVER_ROOT_DIR) {
   const envOverride = process.env.PI_BIN;
   if (envOverride) {
@@ -784,14 +1006,8 @@ function resolvePiLaunch(serverRoot = SERVER_ROOT_DIR) {
   const bundled = resolveBundledBin('pi', serverRoot);
   if (bundled) return { command: bundled, argsPrefix: [], env: {} };
 
-  if (process.resourcesPath) {
-    const packagedCli = path.join(
-      process.resourcesPath, 'pi', 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js'
-    );
-    if (_exists(packagedCli)) {
-      return { command: process.execPath, argsPrefix: [packagedCli], env: { ELECTRON_RUN_AS_NODE: '1' } };
-    }
-  }
+  const packaged = packagedPiLaunch();
+  if (packaged) return (IS_WIN && _piLaunchChoices.get(piLaunchKey(packaged))?.launch) || packaged;
 
   // Fall back to a system-wide install. resolveBin('pi') re-runs Strategy 0/0.5 too, but both
   // are memoized in _binCache, so that's free.
@@ -807,12 +1023,8 @@ async function resolvePiLaunchAsync(serverRoot = SERVER_ROOT_DIR) {
   }
   const bundled = resolveBundledBin('pi', serverRoot);
   if (bundled) return { command: bundled, argsPrefix: [], env: {} };
-  if (process.resourcesPath) {
-    const packagedCli = path.join(process.resourcesPath, 'pi', 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js');
-    if (_exists(packagedCli)) {
-      return { command: process.execPath, argsPrefix: [packagedCli], env: { ELECTRON_RUN_AS_NODE: '1' } };
-    }
-  }
+  const packaged = packagedPiLaunch();
+  if (packaged) return IS_WIN ? verifyPackagedPiLaunch(packaged) : packaged;
   const fallback = await resolveBinAsync('pi');
   return fallback ? { command: fallback, argsPrefix: [], env: {} } : null;
 }
@@ -987,6 +1199,7 @@ module.exports = {
   projectEnvExtras, resolveNvmBinDir, captureLoginShellPath, resolveSpawnModel,
   resolveAttentionTerminalBell, isAsarPath, resolveSpawnServerRoot, resolveBundledBin,
   resolvePiLaunch, resolvePiLaunchAsync, PROBE_DIRS,
+  PI_STAGE_TIMEOUT_MS, PI_STAGES, piStageArgs, describePiRuntimeCheck, probePackagedPi,
   // Windows launcher/registry resolution (TPT558) — pure helpers, exported for tests
   WIN_LAUNCHER_EXTS, winLauncherExts, selectWindowsLauncher, parseRegQueryPath,
   expandWindowsEnv, readWindowsRegistryPathDirs, _findExecutable,

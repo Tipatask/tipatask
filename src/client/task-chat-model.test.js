@@ -184,13 +184,44 @@ test('dialogState: a window notice after the reply keeps it open; a later turn s
   assert.equal(m.dialogState({ messages: [], message: null, dialog }), 'skipped');
 });
 
-test('localAnswer + answerSummary: the picks as the server stores them and as the user reads them', () => {
-  const answer = m.localAnswer(MULTI, { dialogId: 'dlg-2', selected: [0, 2], other: 'plus a note' });
-  assert.deepEqual(answer, { selected: ['Current sprint', 'Later'], indexes: [0, 2], other: 'plus a note' });
-  assert.equal(m.answerSummary(answer), 'Current sprint; Later; Other: plus a note');
-  assert.equal(m.answerSummary(m.localAnswer(SINGLE, { selected: [1] })), 'Backlog');
-  assert.equal(m.answerSummary({ selected: [], other: 'Next month' }), 'Next month');
-  assert.equal(m.answerSummary(null), '');
+test('dialogState: answering one dialog of a reply skips the others, even with no later turn', () => {
+  // The answer turn is not in the transcript: when its reply fails or comes back empty, the
+  // asking reply is the latest turn again, and the answer itself says the chat moved on.
+  const first = { ...SINGLE };
+  const second = { ...MULTI };
+  const reply = { role: 'assistant', content: 'Two questions.', dialogs: [first, second] };
+  const messages = [{ role: 'user', content: 'Plan it' }, reply, { role: 'system', content: 'Turn failed' }];
+  const state = dialog => m.dialogState({ messages, message: reply, dialog, connected: true, running: false });
+  assert.equal(state(second), 'open');
+  first.answer = { selected: ['Backlog'], indexes: [1], other: '' };
+  assert.equal(state(first), 'answered');
+  assert.equal(state(second), 'skipped');
+  delete first.answer; // an aborted answer turn re-opens its dialog, and the others with it
+  assert.equal(state(first), 'open');
+  assert.equal(state(second), 'open');
+});
+
+test('isDialogAnswerTurn: only the user turn the server records for a dialog answer', () => {
+  assert.equal(m.isDialogAnswerTurn({ role: 'user', content: 'Answer to "Q": Backlog', dialogAnswer: { dialogId: 'dlg-1', selected: ['Backlog'] } }), true);
+  assert.equal(m.isDialogAnswerTurn({ role: 'user', content: 'Backlog' }), false, 'a typed message is a turn of its own');
+  assert.equal(m.isDialogAnswerTurn({ role: 'user', content: 'x', dialogAnswer: {} }), false, 'no dialog id, no answer');
+  assert.equal(m.isDialogAnswerTurn({ role: 'assistant', content: 'x', dialogAnswer: { dialogId: 'dlg-1' } }), false);
+  assert.equal(m.isDialogAnswerTurn(null), false);
+});
+
+test('answeredDialog: the dialog of a reply the user answered', () => {
+  const answered = { ...MULTI, answer: { selected: ['Later'], indexes: [2], other: '' } };
+  assert.equal(m.answeredDialog({ role: 'assistant', dialogs: [{ ...SINGLE }, answered] }), answered);
+  assert.equal(m.answeredDialog({ role: 'assistant', dialogs: [{ ...SINGLE }] }), null);
+  assert.equal(m.answeredDialog({ role: 'assistant', content: 'No widgets.' }), null);
+  assert.equal(m.answeredDialog({ role: 'user', dialogs: [answered] }), null);
+  assert.equal(m.answeredDialog(null), null);
+});
+
+test('localAnswer: the picks as the server stores them', () => {
+  assert.deepEqual(m.localAnswer(MULTI, { dialogId: 'dlg-2', selected: [0, 2], other: 'plus a note' }),
+    { selected: ['Current sprint', 'Later'], indexes: [0, 2], other: 'plus a note' });
+  assert.deepEqual(m.localAnswer(SINGLE, { selected: [1] }), { selected: ['Backlog'], indexes: [1], other: '' });
 });
 
 const tr = key => `[${key}]`;
@@ -221,6 +252,8 @@ test('dialogWidgetHtml: radios for single choice, a free-text Other row and a di
   const submit = el.querySelector('.task-chat-dialog-submit');
   assert.ok(submit.hasAttribute('disabled'));
   assert.equal(submit.hasAttribute('hidden'), false);
+  assert.equal(el.querySelector('.task-chat-dialog-other').hasAttribute('hidden'), false);
+  assert.ok(el.querySelector('.task-chat-dialog-other-answer').hasAttribute('hidden'), 'no answer to show yet');
 });
 
 test('dialogWidgetHtml: checkboxes for multi choice; an answered dialog is locked with its picks', (t) => {
@@ -232,9 +265,18 @@ test('dialogWidgetHtml: checkboxes for multi choice; an answered dialog is locke
   assert.ok(toggles.every(i => i.type === 'checkbox'));
   assert.deepEqual(toggles.filter(i => i.hasAttribute('checked')).map(i => i.value), ['1', 'other']);
   assert.equal(el.querySelector('.task-chat-dialog-other').getAttribute('value'), 'plus "this"');
+  // The dialog is the answer's only rendering: the free text in full, not a one-line input.
+  assert.ok(el.querySelector('.task-chat-dialog-other').hasAttribute('hidden'));
+  const freeText = el.querySelector('.task-chat-dialog-other-answer');
+  assert.equal(freeText.hasAttribute('hidden'), false);
+  assert.equal(freeText.textContent, 'plus "this"');
   assert.equal(el.querySelector('.task-chat-dialog-state').textContent, '[taskChat.dialog.answered]');
   assert.ok(el.querySelector('.task-chat-dialog-submit').hasAttribute('hidden'));
   assert.equal(el.querySelector('.task-chat-dialog-hint').textContent, '[taskChat.dialog.hintMulti]');
+
+  const picked = parse(t, m.dialogWidgetHtml({ ...SINGLE, answer: { selected: ['Backlog'], indexes: [1], other: '' } }, { t: tr, name: 'grp-3' }));
+  assert.equal(picked.querySelector('.task-chat-dialog-other').hasAttribute('hidden'), false);
+  assert.ok(picked.querySelector('.task-chat-dialog-other-answer').hasAttribute('hidden'), 'an option answer has no free text to show');
 });
 
 test('dialogWidgetHtml: escapes agent-supplied text', () => {
@@ -329,19 +371,23 @@ test('stripTaskEditNote: removes exactly the block the server puts in front of a
   assert.equal(m.stripTaskEditNote(undefined), '');
 });
 
-test('visibleHistory: a dialog answer shows its picks and a user turn loses its task_edits block', () => {
+test('visibleHistory: a dialog answer turn is left out; a typed user turn stays and loses its task_edits block', () => {
   const note = buildTaskEditNote([{ task: { id: 'TPT5', title: 'T' }, changed: ['title'] }]);
+  const asked = { id: 'dlg-1', answer: { selected: ['Backlog'], indexes: [1], other: 'soon' } };
   const history = m.visibleHistory([
     { role: 'user', content: 'seed', seed: true },
-    { role: 'assistant', content: 'Which?', dialogs: [{ id: 'dlg-1' }] },
+    { role: 'assistant', content: 'Which?', dialogs: [asked] },
     { role: 'user', content: `${note}\n\nAnswer to "Which?": Backlog; Other: soon`, dialogAnswer: { dialogId: 'dlg-1', selected: ['Backlog'], indexes: [1], other: 'soon' }, taskEdits: [{ taskKey: 'TPT5', changed: ['title'] }] },
     { role: 'assistant', content: 'Ok.' },
     { role: 'user', content: `${note}\n\nAnd rename it.` },
   ]);
-  assert.equal(history[1].content, 'Backlog; Other: soon');
-  assert.deepEqual(history[1].dialogAnswer, { dialogId: 'dlg-1' });
-  assert.equal(history[3].content, 'And rename it.');
-  assert.equal('dialogAnswer' in history[3], false);
+  assert.deepEqual(history.map(h => [h.role, h.content]), [
+    ['assistant', 'Which?'],
+    ['assistant', 'Ok.'],
+    ['user', 'And rename it.'],
+  ], 'the answer shows only as the dialog it answered');
+  assert.deepEqual(history[0].dialogs, [asked], 'which keeps the server\'s answer');
+  assert.ok(history.every(h => !('dialogAnswer' in h)));
 });
 
 test('every taskChat.* string the widget markup uses exists in both locales', () => {

@@ -17,6 +17,7 @@
 
 const en = {
   // ── terminal-session.js notices ──
+  'notice.starting': 'Starting {label}…',
   'notice.approval.stalledRetrying': '{label} approval looks stalled (no real activity yet) — retrying once.',
   'notice.approval.stalledAfterRetry': '{label} approval still looks stalled after a retry (no real activity — the model may keep returning an empty or malformed reply). Check the model configured for this project.',
   'notice.plan.alreadyApproved': 'Plan is already approved.',
@@ -47,6 +48,8 @@ const en = {
   'notice.submit.notReachedRepaste': 'The task prompt did not reach the composer — pasting it again.',
   'notice.submit.typedPressEnter': 'The task prompt is typed but was not submitted — press Enter to start it.',
   'notice.submit.typedRetryEnter': 'The task prompt was typed but not submitted — pressing Enter again.',
+  'notice.submit.waitingForStartup': 'The task prompt is queued behind the agent\'s startup — waiting for it to be accepted.',
+  'notice.inject.composerStarting': 'The agent is still starting — the task prompt will be sent once its input box is ready.',
   'notice.inject.mcpAutoApproved': 'Auto-approved project MCP servers.',
   'notice.inject.firstRunWaiting': 'Claude Code first-run setup is waiting for your input. Answer the prompts above — the task prompt will be sent automatically once setup finishes.',
   'notice.inject.firstRunStillWaiting': 'Still waiting on Claude Code first-run setup.',
@@ -93,6 +96,7 @@ const en = {
 };
 
 const uk = {
+  'notice.starting': 'Запускаємо {label}…',
   'notice.approval.stalledRetrying': 'Схвалення в {label} виглядає завислим (реальної активності ще немає) — повторна спроба.',
   'notice.approval.stalledAfterRetry': 'Схвалення в {label} і після повторної спроби виглядає завислим (реальної активності немає — модель може повертати порожню або некоректну відповідь). Перевірте модель, налаштовану для цього проєкту.',
   'notice.plan.alreadyApproved': 'План уже схвалено.',
@@ -122,6 +126,8 @@ const uk = {
   'notice.submit.notReachedRepaste': 'Промпт задачі не потрапив у поле вводу — вставляємо його ще раз.',
   'notice.submit.typedPressEnter': 'Промпт задачі набрано, але не надіслано — натисніть Enter, щоб почати.',
   'notice.submit.typedRetryEnter': 'Промпт задачі набрано, але не надіслано — натискаємо Enter ще раз.',
+  'notice.submit.waitingForStartup': 'Промпт задачі в черзі, поки агент запускається — чекаємо, доки його буде прийнято.',
+  'notice.inject.composerStarting': 'Агент ще запускається — промпт задачі буде надіслано, щойно поле вводу буде готове.',
   'notice.inject.mcpAutoApproved': 'MCP-сервери проєкту схвалено автоматично.',
   'notice.inject.firstRunWaiting': 'Початкове налаштування Claude Code чекає на ваш ввід. Дайте відповіді на запити вище — промпт задачі буде надіслано автоматично після завершення налаштування.',
   'notice.inject.firstRunStillWaiting': 'Досі очікуємо завершення початкового налаштування Claude Code.',

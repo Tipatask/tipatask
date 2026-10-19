@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { expandedCardMaxHeight, clampExpandedTop, resolveAnchorTop, OVERLAY_MARGIN } from './card-placement.js';
+import { expandedCardMaxHeight, clampExpandedTop, resolveAnchorTop, shouldRestoreExpansion, OVERLAY_MARGIN } from './card-placement.js';
 
 // (TPT456) The expanded card overlay must stay inside the viewport, wherever its card rests.
 const vh = 900;
@@ -61,4 +61,23 @@ test('board cards cap at 80vh, chat previews at the viewport minus margins', () 
   assert.equal(expandedCardMaxHeight({ viewportHeight: 1000, isPreview: true }), 980);
   // A tiny viewport never gets a cap taller than what fits between the margins.
   assert.equal(expandedCardMaxHeight({ viewportHeight: 60 }), 40);
+});
+
+// (TPT9023) A board re-render re-opens a pinned card always, a hover card only under the pointer.
+test('a pinned card is re-opened whether or not the pointer is on it', () => {
+  assert.equal(shouldRestoreExpansion({ mode: 'pinned', pointerOver: false }), true);
+  assert.equal(shouldRestoreExpansion({ mode: 'pinned', pointerOver: true }), true);
+  assert.equal(shouldRestoreExpansion({ mode: 'pinned' }), true);
+});
+
+test('a hover card is re-opened only while the pointer is over it', () => {
+  assert.equal(shouldRestoreExpansion({ mode: 'hover', pointerOver: true }), true);
+  assert.equal(shouldRestoreExpansion({ mode: 'hover', pointerOver: false }), false);
+  assert.equal(shouldRestoreExpansion({ mode: 'hover' }), false);
+});
+
+test('nothing is re-opened without an expansion mode', () => {
+  assert.equal(shouldRestoreExpansion({ mode: null, pointerOver: true }), false);
+  assert.equal(shouldRestoreExpansion({ mode: undefined }), false);
+  assert.equal(shouldRestoreExpansion({ mode: 'peek', pointerOver: true }), false);
 });

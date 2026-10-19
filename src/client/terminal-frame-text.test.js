@@ -69,6 +69,9 @@ for (const lang of ['en', 'uk']) {
       sub(table['terminal.error.ESTART.probe_failed_output.pi'], { label: 'Other Model', output: 'Error: boom' }));
     assert.equal(errorFrameText(frame('no_tool_calls', { label: 'Other Model', agent: 'pi', model: 'recraft-v3', host: 'openrouter.ai' })),
       sub(table['terminal.error.ESTART.no_tool_calls.pi'], { label: 'Other Model', model: 'recraft-v3', host: 'openrouter.ai' }));
+    // (TPT9047) The staged Windows runtime verification names its stage and timing.
+    const staged = { label: 'Other Model', stage: 'cli', elapsedMs: 60000, timeoutMs: 60000, runtime: 'bundled-node', output: 'ETIMEDOUT' };
+    assert.equal(errorFrameText(frame('runtime_failed', { ...staged, agent: 'pi' })), sub(table['terminal.error.ESTART.runtime_failed.pi'], staged));
     // The shared sub-key serves every agent.
     assert.equal(errorFrameText(frame('detection_failed', { label: 'Codex', agent: 'codex' })),
       sub(table['terminal.error.ESTART.detection_failed'], { label: 'Codex' }));

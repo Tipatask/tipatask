@@ -13,6 +13,7 @@ const { normalizeQuota, quotaError, coalesceQuota, staleQuota, clearQuotaSnapsho
 const { readClaudeQuota, credentialLocation, readClaudeCredential, parseClaudeUsage, runFile, quotaTimeoutMs,
   retryAfterMs, resetUsageGate, USER_AGENT, MIN_INTERVAL_MS, DEFAULT_BACKOFF_MS, MAX_BACKOFF_MS } = require('./claude-quota');
 const { readCodexQuota, openQuotaRpc } = require('./codex-quota');
+const { runProbe: runCodexQuotaProbe } = require('../../../scripts/probe-codex-quota');
 const { getAgentQuotaStatus } = require('./index');
 
 const cfg = { PROJECT_ROOT: '/project-a', CLAUDE_BIN: '/cli/claude', CODEX_BIN: '/cli/codex' };
@@ -623,7 +624,7 @@ test('(TPT699) a failed save never throws, keeps the reading in memory and warns
 function codexDeps({ account = { type: 'chatgpt', planType: 'pro', email: 'a@example.test' }, data, error } = {}) {
   const calls = [], scopes = [];
   let closed = 0;
-  return { calls, scopes, get closed() { return closed; }, env: { CODEX_HOME: '/wrong-project', ANTHROPIC_API_KEY: 'wrong-provider' },
+  return { calls, scopes, get closed() { return closed; }, log: () => {}, env: { CODEX_HOME: '/wrong-project', ANTHROPIC_API_KEY: 'wrong-provider' },
     openRpc(bin, env, root) {
       scopes.push({ bin, home: env.CODEX_HOME, root });
       return { initialized() { calls.push('initialized'); }, close() { closed++; }, async request(method) {
@@ -670,6 +671,54 @@ test('Codex signed out, unsupported auth, provider errors and exhausted secondar
   assert.equal((await readCodexQuota(cfg, codexDeps({ data: {} }))).unavailableReason, 'invalid_response');
 });
 
+test('Codex failures name every stage and log only classified reasons and timings', async () => {
+  const secretError = new Error('Bearer stage-secret a@example.test');
+  const stages = ['setup', 'spawn', 'initialize', 'account_read', 'rate_limits', 'parse'];
+  for (const [index, stage] of stages.entries()) {
+    const logs = [], observed = [];
+    const deps = codexDeps(stage === 'parse' ? { data: {} } : {});
+    const open = deps.openRpc;
+    deps.openRpc = (...args) => {
+      if (stage === 'spawn') throw secretError;
+      const rpc = open(...args), request = rpc.request;
+      rpc.request = method => {
+        if (method === { initialize: 'initialize', account_read: 'account/read', rate_limits: 'account/rateLimits/read' }[stage]) throw secretError;
+        return request(method);
+      };
+      return rpc;
+    };
+    const config = stage === 'setup' ? { ...cfg, get CODEX_BIN() { throw secretError; } } : cfg;
+    const result = await readCodexQuota(config, { ...deps, projectRoot: `/codex-stage-${stage}`,
+      log: (text, detail) => logs.push({ text, detail }), onStage: detail => observed.push(detail) });
+    assert.equal(result.unavailableReason, stage === 'parse' ? 'invalid_response' : 'provider_error');
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0].detail.stage, stage);
+    assert.match(logs[0].text, /^\[agent-quota\] codex unavailable: [a-z_]+ \([a-z_]+, \d+ms\)$/);
+    assert.deepEqual(observed.map(s => s.stage), stages.slice(0, index + 1));
+    assert.ok(observed.every(s => Number.isFinite(s.ms) && s.ms >= 0));
+    assert.equal(JSON.stringify({ result, logs, observed }).includes('stage-secret'), false);
+  }
+});
+
+test('Codex logs early unavailable returns, changes in failing stage, and failures after recovery', async () => {
+  const logs = [], projectRoot = '/codex-outcome-log';
+  const read = overrides => readCodexQuota(cfg, { ...codexDeps(overrides), projectRoot, log: (text, detail) => logs.push(detail) });
+  await read({ account: null });
+  await read({ account: null });
+  await read({ account: { type: 'apiKey' } });
+  await read({ error: quotaError('invalid_response') });
+  await read({ data: {} });
+  const unknown = await read({ data: { rateLimits: { primary: { usedPercent: null } } } });
+  assert.equal(unknown.unavailableReason, 'quota_unavailable');
+  await read();
+  await read({ account: null });
+  assert.deepEqual(logs.map(({ reason, stage }) => [reason, stage]), [
+    ['signed_out', 'account_read'], ['unsupported_auth', 'account_read'],
+    ['invalid_response', 'rate_limits'], ['invalid_response', 'parse'],
+    ['quota_unavailable', 'parse'], ['signed_out', 'account_read'],
+  ]);
+});
+
 test('registry never falls back to Claude for unsupported provider IDs', async () => {
   for (const id of ['pi', 'gemini', '__proto__', 'constructor', '']) {
     const result = await getAgentQuotaStatus(id, cfg);
@@ -695,11 +744,12 @@ test('coalescing shares simultaneous credential reads only; new credentials/proj
   assert.equal(reads, 4);
 });
 
-function fakeChild(reply) {
+function fakeChild(reply, { spawnEvent = true } = {}) {
   const child = new EventEmitter();
   child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.kills = [];
   child.kill = signal => { child.kills.push(signal); queueMicrotask(() => child.emit('exit', 0)); };
   child.stdin = new Writable({ write(chunk, encoding, done) { reply(JSON.parse(chunk.toString()), child); done(); } });
+  if (spawnEvent) queueMicrotask(() => child.emit('spawn'));
   return child;
 }
 
@@ -709,7 +759,7 @@ test('Codex RPC handles split frames, ignores notifications, and cleans up its c
     c.stdout.write('{"method":"account/updated","params":{}}\n');
     c.stdout.write(line.slice(0, 12)); c.stdout.write(line.slice(12));
   });
-  const rpc = openQuotaRpc('/codex', {}, '/project', { spawnImpl: () => child });
+  const rpc = openQuotaRpc('/codex', {}, '/project', { spawnImpl: () => child, isWin: false });
   assert.deepEqual(await rpc.request('account/read'), { account: null });
   rpc.close();
   assert.deepEqual(child.kills, ['SIGTERM']);
@@ -723,7 +773,7 @@ test('Codex RPC bounds stalled and malformed providers and discards secret error
       if (mode === 'rpc-error') c.stdout.write(JSON.stringify({ id: msg.id, error: { code: -32000, message: 'secret' } }) + '\n');
       if (mode === 'expired') c.stdout.write(JSON.stringify({ id: msg.id, error: { code: -32000, message: '401 Unauthorized Bearer secret' } }) + '\n');
     });
-    const rpc = openQuotaRpc('/codex', {}, '/project', { spawnImpl: () => child, timeoutMs: 20 });
+    const rpc = openQuotaRpc('/codex', {}, '/project', { spawnImpl: () => child, timeoutMs: 20, isWin: false });
     await assert.rejects(rpc.request('account/read'), error => {
       assert.equal(error.quotaReason, { timeout: 'timeout', 'bad-json': 'invalid_response', 'null-json': 'invalid_response', 'rpc-error': 'provider_error', expired: 'credentials_expired' }[mode]);
       assert.equal(error.message.includes('secret'), false); return true;
@@ -740,7 +790,7 @@ test('Codex RPC handles spawn failure, early exit and oversized output without a
       if (mode === 'early-exit') queueMicrotask(() => c.emit('exit', 1));
       if (mode === 'oversized') c.stdout.write('x'.repeat(1024 * 1024 + 1));
     });
-    const rpc = openQuotaRpc('/codex', {}, '/project', { spawnImpl: () => child });
+    const rpc = openQuotaRpc('/codex', {}, '/project', { spawnImpl: () => child, isWin: false });
     await assert.rejects(rpc.request('initialize'), error => {
       assert.equal(mode === 'spawn-error' ? error.code : error.quotaReason,
         { 'spawn-error': 'ENOENT', 'early-exit': 'provider_error', oversized: 'invalid_response' }[mode]);
@@ -753,6 +803,108 @@ test('Codex RPC handles spawn failure, early exit and oversized output without a
 // npm's codex.cmd / claude.cmd: Node >= 22 refuses a shell-less spawn of a .cmd (EINVAL), so both
 // quota readers build their argv through winExecSpec(). isWin forces the win32 branch on any host.
 const WIN_SPACED_NPM = 'C:\\Users\\Anton M\\AppData\\Roaming\\npm';
+
+test('Codex quota (win32): piped .cmd RPC with split CRLF replies returns windows and kills the tree', async () => {
+  const calls = [], methods = [], killed = [], stages = [];
+  const bin = `${WIN_SPACED_NPM}\\codex.cmd`;
+  let child;
+  const raw = await readCodexQuota({ ...cfg, CODEX_BIN: bin }, {
+    projectRoot: 'C:\\project', isWin: true, env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    onStage: detail => stages.push(detail.stage),
+    spawnImpl(command, args, options) {
+      calls.push({ command, args, options });
+      child = fakeChild((msg, c) => {
+        methods.push(msg.method);
+        if (msg.method === 'initialized') return;
+        const result = msg.method === 'account/read' ? { account: { type: 'chatgpt', planType: 'plus' } }
+          : msg.method === 'account/rateLimits/read' ? { rateLimits: {
+            primary: { usedPercent: 23, windowDurationMins: 300 }, secondary: { usedPercent: 47, windowDurationMins: 10080 },
+          } } : {};
+        c.stderr.write('Bearer windows-secret');
+        c.stdout.write('\r\n{"method":"account/updated","params":{}}\r\n');
+        const line = JSON.stringify({ id: msg.id, result }) + '\r\n';
+        c.stdout.write(line.slice(0, -1)); c.stdout.write(line.slice(-1));
+      });
+      child.pid = 9030;
+      return child;
+    },
+    killTree(pid) { killed.push(pid); return true; },
+  });
+  const result = normalizeQuota('codex', 'C:\\project', raw);
+  assert.equal(result.connectionState, 'connected');
+  assert.equal(result.status, 'available');
+  assert.deepEqual(result.windows.map(w => w.usagePercent), [23, 47]);
+  assert.deepEqual(methods, ['initialize', 'initialized', 'account/read', 'account/rateLimits/read']);
+  assert.deepEqual(stages, ['setup', 'spawn', 'initialize', 'account_read', 'rate_limits', 'parse']);
+  assert.equal(calls[0].command, 'C:\\Windows\\System32\\cmd.exe');
+  assert.deepEqual(calls[0].options.stdio, ['pipe', 'pipe', 'pipe']);
+  assert.equal(calls[0].options.shell, undefined);
+  assert.equal(calls[0].options.windowsVerbatimArguments, true);
+  assert.equal(child.stdin.destroyed, true);
+  assert.deepEqual(killed, [9030]);
+  assert.deepEqual(child.kills, []);
+});
+
+test('Codex Windows timeout and asynchronous spawn failure log the right stage and kill the tree once', async () => {
+  for (const mode of ['spawn', 'initialize']) {
+    const logs = [], killed = [];
+    let child;
+    const result = await readCodexQuota(cfg, {
+      env: {}, isWin: true, timeoutMs: 20, projectRoot: `/codex-win-${mode}`,
+      log: (text, detail) => logs.push(detail),
+      spawnImpl() {
+        child = fakeChild(() => {}, { spawnEvent: mode !== 'spawn' });
+        child.pid = 9031;
+        if (mode === 'spawn') {
+          // A failed spawn emits error, never spawn.
+          queueMicrotask(() => child.emit('error', Object.assign(new Error('Bearer spawn-secret'), { code: 'ENOENT' })));
+        }
+        return child;
+      },
+      killTree(pid) { killed.push(pid); return true; },
+    });
+    assert.equal(result.unavailableReason, mode === 'spawn' ? 'cli_missing' : 'timeout');
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0].stage, mode);
+    assert.deepEqual(killed, [9031]);
+    assert.deepEqual(child.kills, []);
+  }
+});
+
+test('Codex quota probe prints launch details and all stage timings without leaking RPC or environment secrets', async () => {
+  for (const failure of [false, true]) {
+    const lines = [], methods = [];
+    let spawns = 0;
+    const result = await runCodexQuotaProbe({ ...cfg, PROJECT_ROOT: `/codex-probe-${failure}` }, {
+      output: line => lines.push(line), env: { API_TOKEN: 'env-secret' }, isWin: false,
+      spawnImpl() {
+        spawns++;
+        return fakeChild((msg, child) => {
+          methods.push(msg.method);
+          if (msg.method === 'initialized') return;
+          if (failure && msg.method === 'account/rateLimits/read') {
+            child.stdout.write(JSON.stringify({ id: msg.id, error: { code: -32000, message: '401 Bearer rpc-secret' } }) + '\n');
+            return;
+          }
+          const response = msg.method === 'account/read' ? { account: { type: 'chatgpt', email: 'private@example.test' } }
+            : msg.method === 'account/rateLimits/read' ? { rateLimits: { primary: { usedPercent: 12 } } } : {};
+          child.stdout.write(JSON.stringify({ id: msg.id, result: response }) + '\n');
+        });
+      },
+    });
+    const text = lines.join('\n');
+    assert.equal(spawns, 1);
+    assert.deepEqual(methods, ['initialize', 'initialized', 'account/read', 'account/rateLimits/read']);
+    assert.match(text, /CODEX_BIN: \/cli\/codex/);
+    assert.match(text, /exec spec: .*"args":\["app-server"\]/);
+    for (const stage of ['setup', 'spawn', 'initialize', 'account_read', 'rate_limits']) assert.match(text, new RegExp(`^${stage}: \\d+ms$`, 'm'));
+    assert.match(text, failure ? /parse: not reached/ : /parse: \d+ms/);
+    assert.match(text, /connectionState: connected/);
+    assert.equal(result.unavailableReason, failure ? 'credentials_expired' : null);
+    assert.match(text, failure ? /failing stage: rate_limits/ : /failing stage: \(none\)/);
+    assert.doesNotMatch(text, /env-secret|rpc-secret|private@example\.test/);
+  }
+});
 
 function captureRpcSpawn(calls) {
   return (command, args, options) => {

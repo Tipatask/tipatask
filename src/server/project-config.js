@@ -749,6 +749,45 @@ function _ensureGitignoreLine(dir, line) {
   }
 }
 
+// Record folder trust in Claude's user config before opening a project. Never
+// replace malformed user state; failure leaves the CLI's normal trust dialog available.
+function writeProjectClaudeTrust(projectRoot) {
+  let tmp;
+  try {
+    const configPath = process.env.CLAUDE_CONFIG_DIR
+      ? path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json')
+      : path.join(require('node:os').homedir(), '.claude.json');
+    const absProjectRoot = path.resolve(projectRoot);
+    const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    let settings = {};
+    let mode = 0o600;
+    try {
+      settings = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      mode = fs.statSync(configPath).mode & 0o777;
+    } catch (err) { if (err.code !== 'ENOENT') throw err; }
+    if (!isObject(settings)
+      || (settings.projects !== undefined && !isObject(settings.projects))) {
+      throw new Error('Invalid Claude user configuration');
+    }
+    const entry = settings.projects?.[absProjectRoot];
+    if (entry !== undefined && !isObject(entry)) throw new Error('Invalid Claude project configuration');
+    if (entry?.hasTrustDialogAccepted === true) return true;
+    settings.projects = settings.projects || {};
+    settings.projects[absProjectRoot] = { ...entry, hasTrustDialogAccepted: true };
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    tmp = configPath + '.tmp.' + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n', { encoding: 'utf8', mode });
+    fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, configPath);
+    return true;
+  } catch {
+    console.warn('[project-config] Claude folder trust pre-acceptance failed; check user configuration format and file access.');
+    return false;
+  } finally {
+    if (tmp) { try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ } }
+  }
+}
+
 // Pre-approve the two managed MCP servers without caching credentials. Preserve
 // third-party settings; malformed settings are left intact for user repair.
 function writeProjectClaudeMcpApproval(projectRoot) {
@@ -823,6 +862,7 @@ function writeProjectClaudeMcpApproval(projectRoot) {
 function writeProjectMcpConfig(projectRoot, serverRoot) {
   const absProjectRoot = path.resolve(projectRoot);
   const absServerRoot = path.resolve(serverRoot);
+  writeProjectClaudeTrust(absProjectRoot);
   // Same rule as config.js USER_DATA_ROOT: TIPATASK_USER_DATA, else the server root. Handed
   // to the stdio server so a `claude` launched from a plain shell still finds the account store.
   const userDataRoot = require('./account-store').userDataRoot({ serverRoot: absServerRoot });
@@ -952,6 +992,7 @@ module.exports = {
   readVoiceSettings,
   writeProjectConfig,
   writeProjectMcpConfig,
+  writeProjectClaudeTrust,
   writeProjectClaudeMcpApproval,
   writeProjectSkillsConfig,
   migrateFromLegacy,

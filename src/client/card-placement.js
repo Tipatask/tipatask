@@ -26,3 +26,9 @@ export function clampExpandedTop({ anchorTop, height, viewportHeight, margin = O
   const visibleHeight = Math.min(height, Math.max(0, viewportHeight - 2 * margin));
   return Math.max(margin, Math.min(anchorTop, viewportHeight - visibleHeight - margin));
 }
+
+// (TPT9023) Whether a full board re-render keeps the card that was expanded when it committed:
+// a pinned card always, a hover card only while the pointer is over its re-opened overlay.
+export function shouldRestoreExpansion({ mode, pointerOver = false }) {
+  return mode === 'pinned' || (mode === 'hover' && !!pointerOver);
+}

@@ -358,7 +358,10 @@ test('startFailureFrame: every coded start failure renders the server text in En
     const codes = Object.keys(Agent.DETECT_REASONS);
     assert.ok(codes.length >= 3, `${agent.id} declares its detection reasons`);
     for (const code of codes) {
-      const params = Agent.DETECT_REASONS[code].includes('{output}') ? { output: 'Error: Cannot find module $& x' } : undefined;
+      // Every placeholder the sentence declares gets a sample value (output may carry `      const params = Agent.DETECT_REASONS[code].includes('{output}') ? { output: 'Error: Cannot find module $& x' } : undefined;`).
+      const samples = { output: 'Error: Cannot find module $& x', stage: 'cli', elapsedMs: 60000, timeoutMs: 60000, runtime: 'bundled-node' };
+      const names = [...Agent.DETECT_REASONS[code].matchAll(/\{(\w+)\}/g)].map(m => m[1]);
+      const params = names.length ? Object.fromEntries(names.map(n => [n, samples[n] ?? `sample-${n}`])) : undefined;
       const status = agent.unavailableResult(code, { params });
       assert.equal(status.reasonCode, code);
       assert.doesNotMatch(status.reason, /\{\w+\}/, `${agent.id}.${code}: every placeholder filled`);

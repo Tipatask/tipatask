@@ -154,8 +154,12 @@ function focusWindow(w, { steal = false } = {}) {
 
 let desktopNotifications = null;
 
+// The last project window's close was already confirmed as a quit by
+// requestConfirmedWindowClose(), or came from a deliberately unguarded path (project:close,
+// project:remove). A second, parentless quit dialog here would leave a windowless app whose
+// server keeps port 4455 if cancelled — so quit without one.
 function quitIfOnlyNotificationWindowRemains() {
-  if (process.platform !== 'darwin' && BrowserWindow.getAllWindows().every((w) => desktopNotifications?.owns(w))) app.quit();
+  if (process.platform !== 'darwin' && BrowserWindow.getAllWindows().every((w) => desktopNotifications?.owns(w))) quitWithoutConfirmation();
 }
 
 // Prefer window that owns origin's project NOW; fall back to window that sent the IPC. Null if
@@ -290,6 +294,9 @@ const DEFAULT_API_BASE_URL = 'https://web.tipatask.com';
 // or a Cancel-free confirmWindowClose pass) calls w.close(). A window can only be
 // closed once, so no explicit cleanup needed.
 const _closeConfirmed = new WeakSet();
+// Windows whose close (or close-as-quit) confirmation dialog is open right now, so repeated
+// X / Ctrl+W presses never stack a second dialog. Cleared when the dialog settles.
+const _closePrompting = new WeakSet();
 
 // Access must be checked before binding a backend (which starts task/KB requests).
 const ensureProjectAccess = createProjectAccessGate({
@@ -411,11 +418,15 @@ function rememberRecentProject(projectPath) {
   if (app.isReady()) createMenu();
 }
 
-async function confirmAndQuit() {
+// `parent` (a live BrowserWindow) makes the dialog modal to the window being closed — the
+// close-as-quit path below. `quitOnError` fails open for that path: a broken dialog must
+// never trap a window shut (C1429).
+async function confirmAndQuit(parent = null, { quitOnError = false } = {}) {
   if (_confirmingQuit || _quitConfirmed) return;
   _confirmingQuit = true;
   try {
-    const { response } = await dialog.showMessageBox(null, {
+    const owner = parent && !parent.isDestroyed() ? parent : null;
+    const { response } = await dialog.showMessageBox(owner, {
       type: 'question',
       buttons: mt('confirm.quitButtons'),
       defaultId: 0,
@@ -432,6 +443,7 @@ async function confirmAndQuit() {
     }
   } catch (e) {
     console.warn('[quit] confirmation failed', e?.message || e);
+    if (quitOnError) quitWithoutConfirmation();
   } finally {
     if (!_quitConfirmed) _confirmingQuit = false;
   }
@@ -487,15 +499,39 @@ async function confirmWindowClose(w) {
 // gap in the original C1429 guard (only createProjectWindow had it).
 function attachCloseGuard(w) {
   w.on('close', (e) => {
-    if (_closeConfirmed.has(w) || _quitConfirmed || _confirmingQuit) return;
+    if (_closeConfirmed.has(w) || _quitConfirmed) return;
     e.preventDefault();
-    void (async () => {
-      if (!(await confirmWindowClose(w))) return;
-      if (w.isDestroyed()) return;
-      _closeConfirmed.add(w);
-      w.close();
-    })();
+    void requestConfirmedWindowClose(w);
   });
+}
+
+// On Windows/Linux, closing the last project window quits the app (window-all-closed), so
+// that close IS the quit and must be confirmed as one. The notification banner never counts.
+function closingWindowQuitsApp(w) {
+  if (process.platform === 'darwin') return false;
+  return openProjectWindows().every((other) => other === w);
+}
+
+// Single gate in front of a window's destruction: the window stays open (renderer, sessions
+// and all) until the user confirms, and Cancel/Esc leaves everything as it was. One dialog per
+// window at a time; while the app-wide quit dialog is open a close is held, not let through.
+async function requestConfirmedWindowClose(w) {
+  if (_closePrompting.has(w) || _confirmingQuit) return;
+  _closePrompting.add(w);
+  try {
+    if (closingWindowQuitsApp(w)) {
+      // Quit → _quitConfirmed + app.quit(), which closes this window through the guard's
+      // allow path and ends at will-quit's server tree kill. Cancel → nothing happens.
+      await confirmAndQuit(w, { quitOnError: true });
+      return;
+    }
+    if (!(await confirmWindowClose(w))) return;
+    if (w.isDestroyed()) return;
+    _closeConfirmed.add(w);
+    w.close();
+  } finally {
+    _closePrompting.delete(w);
+  }
 }
 
 // ── Startup workspace validation ──────────────────────────────────────────────
@@ -1987,7 +2023,7 @@ function createMenu() {
         { role: 'hideOthers' },
         { role: 'unhide' },
         { type: 'separator' },
-        { label: mt('menu.quit'), accelerator: 'CmdOrCtrl+Q', click: confirmAndQuit },
+        { label: mt('menu.quit'), accelerator: 'CmdOrCtrl+Q', click: () => confirmAndQuit() },
       ],
     }] : []),
     {
@@ -2053,7 +2089,7 @@ function createMenu() {
           click: (mi, window) => { if (window && !window.isDestroyed()) window.webContents.send('force-reauth'); },
         },
         { type: 'separator' },
-        { label: mt('menu.quit'), accelerator: 'CmdOrCtrl+Q', click: confirmAndQuit },
+        { label: mt('menu.quit'), accelerator: 'CmdOrCtrl+Q', click: () => confirmAndQuit() },
       ],
     },
     {
@@ -2631,31 +2667,37 @@ app.whenReady()
   });
 
 let _quitting = false;
-app.on('before-quit', (event) => {
+// Runs twice on a confirmed quit: the first pass defers the quit for the open-projects sync
+// and does the one-time teardown; the re-issued app.quit() lands in the second pass, which
+// lets the quit proceed.
+function onBeforeQuit(event) {
   if (!_quitConfirmed) {
     event.preventDefault();
     confirmAndQuit();
     return;
   }
+  if (_quitting) return;
+  _quitting = true;
+  event.preventDefault();
   desktopNotifications?.dispose();
   saveWindowSession();
-  if (!_quitting) {
-    _quitting = true;
-    event.preventDefault();
-    const timeout = new Promise(r => setTimeout(r, 1500));
-    Promise.race([_syncOpenProjectsNow(), timeout])
-      .catch(() => {})
-      .finally(() => app.quit());
-  }
-});
+  const timeout = new Promise(r => setTimeout(r, 1500));
+  Promise.race([_syncOpenProjectsNow(), timeout])
+    .catch(() => {})
+    .finally(() => app.quit());
+}
+app.on('before-quit', onBeforeQuit);
 
-app.on('window-all-closed', () => {
+function onWindowAllClosed() {
   // C1006: during startup the splash may be the only window; closing it (safety
   // timeout, or Cmd+W on the frameless splash — Electron's default menu is live
   // until createMenu() runs late in startup) must not be read as "app is done".
   if (!_initialWindowsCreated) return;
-  if (process.platform !== 'darwin') app.quit();
-});
+  // No second dialog: the last window's close was confirmed as a quit already, or was a
+  // deliberately unguarded close — see quitIfOnlyNotificationWindowRemains().
+  if (process.platform !== 'darwin') quitWithoutConfirmation();
+}
+app.on('window-all-closed', onWindowAllClosed);
 
 app.on('activate', () => {
   // C1006: Dock click during startup → raise the splash, don't spawn a window
@@ -2677,13 +2719,16 @@ app.on('activate', () => {
 // Windows: child.kill() below only terminates the server process itself, orphaning its
 // agent CLIs and the ELECTRON_RUN_AS_NODE MCP servers they spawn — TipATask.exe processes
 // that keep the install directory locked and make the next NSIS upgrade fail. Kill the
-// whole tree synchronously while the parent-pid chain is still intact.
-app.on('will-quit', () => {
-  if (process.platform !== 'win32') return;
+// whole tree synchronously while the parent-pid chain is still intact. will-quit is reached
+// only once before-quit let the quit through, i.e. after confirmation, so this is the single
+// owner of the server/agent tree kill — a cancelled close or quit never gets here.
+function onWillQuit() {
+  if (process.platform !== 'win32' || serverStopping) return;
   if (!serverChild || serverChild.exitCode !== null || serverChild.signalCode !== null) return;
   serverStopping = true;
   killWindowsProcessTree(serverChild.pid);
-});
+}
+app.on('will-quit', onWillQuit);
 
 app.on('quit', () => {
   serverStopping = true;

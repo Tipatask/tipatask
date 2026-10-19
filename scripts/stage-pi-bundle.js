@@ -100,7 +100,8 @@ function pruneForeignOptional(vendorDir, lock, platform, arch, log = console) {
   return removed;
 }
 
-function ensurePiInstalled({ serverRoot = SERVER_ROOT, platform = process.platform, arch = process.arch, spawn = spawnSync, log = console } = {}) {
+function ensurePiInstalled({ serverRoot = SERVER_ROOT, platform = process.platform, arch = process.arch,
+  hostPlatform = process.platform, spawn = spawnSync, log = console } = {}) {
   const vendorDir = path.join(serverRoot, 'vendor', 'pi');
   const modulesDir = path.join(vendorDir, 'node_modules');
   const stampPath = path.join(modulesDir, STAMP_NAME);
@@ -126,11 +127,12 @@ function ensurePiInstalled({ serverRoot = SERVER_ROOT, platform = process.platfo
   // against Electron's ABI (it ships plain JS/ESM, not native modules) — unlike the top-level
   // `npm install` in this package, whose postinstall (electron-rebuild for node-pty) IS wanted.
   const result = spawn(
-    platform === 'win32' ? 'npm.cmd' : 'npm',
+    hostPlatform === 'win32' ? 'npm.cmd' : 'npm',
     // shell:true on Windows is required (Node >=20.12 refuses to spawn a .cmd shim without it,
     // spawnSync EINVAL), and it joins args unquoted, so quote the path that may hold spaces.
-    ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', platform === 'win32' ? `"${vendorDir}"` : vendorDir],
-    { stdio: 'inherit', cwd: serverRoot, shell: platform === 'win32' }
+    ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', `--os=${platform}`, `--cpu=${arch}`,
+      '--prefix', hostPlatform === 'win32' ? `"${vendorDir}"` : vendorDir],
+    { stdio: 'inherit', cwd: serverRoot, shell: hostPlatform === 'win32' }
   );
   if (result.error || result.status !== 0) throw new Error(`npm ci failed${result.error ? `: ${result.error.message}` : ` (exit ${result.status})`}`);
   pruneForeignOptional(vendorDir, lock, platform, arch, log);
@@ -162,6 +164,85 @@ function stagePatchedWs(sourceDir = ROOT_WS_DIR, targetDir = PI_WS_DIR) {
   console.log(`[stage-pi-bundle] staged ws@${sourceVersion} into Pi bundle`);
 }
 
+// Windows builds run under the repository's pinned standalone Node. Ship that exact
+// executable as Pi's fallback when Electron cannot honor ELECTRON_RUN_AS_NODE. Keep the
+// distribution's full LICENSE beside it (including Node's bundled dependency notices).
+// No runtime download or developer-machine PATH lookup happens in the installed app.
+function stageWindowsNode({ serverRoot = SERVER_ROOT, platform = process.platform,
+  execPath = process.execPath, version = process.version, electron = process.versions.electron,
+  spawn = spawnSync, log = console } = {}) {
+  if (platform !== 'win32') return;
+  const pinned = fs.readFileSync(path.join(serverRoot, '.nvmrc'), 'utf8').trim().replace(/^v/, '');
+  if (electron || path.basename(execPath).toLowerCase() !== 'node.exe' || version.replace(/^v/, '') !== pinned) {
+    throw new Error(`Windows Pi bundle must be staged with standalone Node ${pinned}`);
+  }
+  const license = ['LICENSE', 'LICENSE.txt'].map(name => path.join(path.dirname(execPath), name))
+    .find(file => fs.existsSync(file) && fs.statSync(file).size > 0);
+  if (!license) throw new Error('Node distribution LICENSE missing beside node.exe');
+  const dest = path.join(serverRoot, 'vendor', 'pi', 'node_modules', 'tipatask-node');
+  fs.mkdirSync(dest, { recursive: true });
+  const stagedNode = path.join(dest, 'node.exe');
+  fs.copyFileSync(execPath, stagedNode);
+  fs.copyFileSync(license, path.join(dest, 'LICENSE'));
+  const result = spawn(stagedNode, ['--version'], { encoding: 'utf8', timeout: 10000, windowsHide: true });
+  const actual = result.stdout?.trim();
+  if (result.error || result.status !== 0 || actual !== `v${pinned}`) {
+    throw new Error(`Staged Windows Pi runtime ${stagedNode} failed verification: expected v${pinned}, `
+      + `received ${actual || 'no version'} (${result.error?.message || result.signal || `exit ${result.status}`}). `
+      + `Reinstall standalone Node ${pinned} and rerun scripts/stage-pi-bundle.js.`);
+  }
+  log.log(`[stage-pi-bundle] staged standalone Node ${pinned} and its LICENSE for Windows`);
+}
+
+// Cross-builds cannot execute a Windows binary. Use the official pinned distribution,
+// validate its release checksum and PE architecture, then verify the copied bytes too.
+async function downloadWindowsNode(pinned, arch) {
+  const { downloadNodeJsBinary, fetchNodeJsChecksum } = require('app-builder-lib/out/frameworks/LibUiFramework');
+  const { Platform } = require('app-builder-lib/out/core');
+  const execPath = await downloadNodeJsBinary(pinned, Platform.WINDOWS, arch);
+  const sha256 = await fetchNodeJsChecksum(pinned, `win-${arch === 'ia32' ? 'x86' : arch}/node.exe`);
+  return { execPath, sha256 };
+}
+
+function assertWindowsNode(file, arch, sha256) {
+  const machines = { ia32: 0x014c, x64: 0x8664, arm64: 0xaa64 };
+  const bytes = fs.readFileSync(file);
+  const pe = bytes.length >= 64 ? bytes.readUInt32LE(0x3c) : -1;
+  if (bytes.length <= 1024 * 1024 || bytes.toString('ascii', 0, 2) !== 'MZ'
+      || pe < 0 || pe + 6 > bytes.length || bytes.toString('ascii', pe, pe + 4) !== 'PE\0\0'
+      || bytes.readUInt16LE(pe + 4) !== machines[arch]) {
+    throw new Error(`Windows Pi runtime ${file} is not a valid ${arch} Node executable`);
+  }
+  if (!/^[a-f0-9]{64}$/.test(sha256 || '') || crypto.createHash('sha256').update(bytes).digest('hex') !== sha256) {
+    throw new Error(`Windows Pi runtime checksum mismatch: ${file}`);
+  }
+}
+
+async function stageTargetWindowsNode({ serverRoot = SERVER_ROOT, platform = process.platform,
+  arch = process.arch, hostPlatform = process.platform, hostArch = process.arch,
+  download = downloadWindowsNode, log = console, ...options } = {}) {
+  if (platform !== 'win32') return;
+  if (!['ia32', 'x64', 'arm64'].includes(arch)) throw new Error(`Unsupported Windows Pi runtime architecture: ${arch}`);
+  if (hostPlatform === 'win32' && hostArch === arch) {
+    stageWindowsNode({ ...options, serverRoot, platform, log });
+    return;
+  }
+  const pinned = fs.readFileSync(path.join(serverRoot, '.nvmrc'), 'utf8').trim().replace(/^v/, '');
+  if (!/^\d+\.\d+\.\d+$/.test(pinned)) throw new Error('Windows Pi runtime requires an exact Node version in .nvmrc');
+  const { execPath, sha256 } = await download(pinned, arch);
+  assertWindowsNode(execPath, arch, sha256);
+  const license = path.join(path.dirname(execPath), 'LICENSE');
+  if (!fs.statSync(license).isFile() || fs.statSync(license).size === 0) {
+    throw new Error(`Node distribution LICENSE missing or empty: ${license}`);
+  }
+  const dest = path.join(serverRoot, 'vendor', 'pi', 'node_modules', 'tipatask-node');
+  fs.mkdirSync(dest, { recursive: true });
+  fs.copyFileSync(execPath, path.join(dest, 'node.exe'));
+  fs.copyFileSync(license, path.join(dest, 'LICENSE'));
+  assertWindowsNode(path.join(dest, 'node.exe'), arch, sha256);
+  log.log(`[stage-pi-bundle] staged checksum-verified standalone Node ${pinned} for win32/${arch} and its LICENSE`);
+}
+
 // (C1531) Runs unconditionally, even when ensurePiInstalled() found nothing to do — order
 // matters: install first (so the freshly-installed tree exists to regenerate notices from),
 // license/notice writes second (so npm can never prune them on a subsequent install).
@@ -180,6 +261,9 @@ function stageNotices({ serverRoot = SERVER_ROOT, spawn = spawnSync, log = conso
   );
   if (genResult.error || genResult.status !== 0) throw new Error('gen-third-party-notices.js failed');
   fs.copyFileSync(noticesSrc, noticesDest);
+  if (fs.existsSync(path.join(vendorDir, 'node_modules', 'tipatask-node', 'node.exe'))) {
+    fs.appendFileSync(noticesDest, '\n## Standalone Node.js runtime\n\nThe Windows Pi bundle includes Node.js. Its complete license and dependency notices are in `tipatask-node/LICENSE` beside `tipatask-node/node.exe`.\n');
+  }
   log.log(`[stage-pi-bundle] wrote ${path.relative(serverRoot, noticesDest)}`);
 }
 
@@ -189,7 +273,22 @@ function stagePiBundle(options = {}) {
   // Only a Pi tree that actually ships its own nested ws needs the patched copy.
   const piWsDir = path.join(serverRoot, 'vendor', 'pi', PI_WS_REL);
   if (fs.existsSync(piWsDir)) stagePatchedWs(path.join(serverRoot, 'node_modules', 'ws'), piWsDir);
+  stageWindowsNode(options);
   stageNotices(options);
+}
+
+// electron-builder supplies the target here; process.platform describes only the build host.
+// Its default sequential packaging keeps the shared vendor tree scoped to the current target.
+async function beforePack(context, options = {}) {
+  const arch = typeof context.arch === 'string' ? context.arch : require('builder-util').Arch[context.arch];
+  const serverRoot = context.packager.projectDir;
+  const target = { ...options, serverRoot, platform: context.electronPlatformName, arch };
+  ensurePiInstalled(target);
+  const piWsDir = path.join(serverRoot, 'vendor', 'pi', PI_WS_REL);
+  if (fs.existsSync(piWsDir)) stagePatchedWs(path.join(serverRoot, 'node_modules', 'ws'), piWsDir);
+  if (target.platform === 'win32') await stageTargetWindowsNode(target);
+  else fs.rmSync(path.join(serverRoot, 'vendor', 'pi', 'node_modules', 'tipatask-node'), { recursive: true, force: true });
+  stageNotices(target);
 }
 
 if (require.main === module) {
@@ -202,4 +301,5 @@ if (require.main === module) {
   }
 }
 
-module.exports = { readExpectedState, validateTree, pruneForeignOptional, ensurePiInstalled, stagePatchedWs, stageNotices, stagePiBundle };
+module.exports = { readExpectedState, validateTree, pruneForeignOptional, ensurePiInstalled, stagePatchedWs,
+  stageWindowsNode, stageTargetWindowsNode, stageNotices, stagePiBundle, beforePack };

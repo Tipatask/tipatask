@@ -2,7 +2,7 @@
 'use strict';
 
 // (TPT567) Read-only diagnostic for agent CLI detection. When the Edit Agents card says
-// "not found" / "not logged in", this prints WHY, layer by layer, for claude and codex:
+// "not found" / "not logged in", this prints WHY, layer by layer, for claude, codex and pi:
 //
 //   1. every resolveBin() strategy's own answer (env override, bundled, where / login shell,
 //      PROBE_DIRS, registry Path, nvm, nvm-windows) — resolveBin() short-circuits on the first
@@ -21,6 +21,7 @@
 //   npm run probe:agent-detect
 //   npm run probe:agent-detect -- --agent claude
 //   npm run probe:agent-detect -- --agent codex
+//   npm run probe:agent-detect -- --agent pi
 
 require('./check-node-version');
 const os = require('node:os');
@@ -35,14 +36,14 @@ const { getTaskAgent } = require('../src/server/task-agent');
 const config = require('../src/server/config');
 
 const IS_WIN = process.platform === 'win32';
-const PROBE_ARGS = { claude: ['auth', 'status'], codex: ['login', 'status'] };
+const PROBE_ARGS = { claude: ['auth', 'status'], codex: ['login', 'status'], pi: ['--version'] };
 
 function parseArgs(argv) {
-  const opts = { agents: ['claude', 'codex'] };
+  const opts = { agents: ['claude', 'codex', 'pi'] };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--agent') {
       const id = argv[++i];
-      if (!PROBE_ARGS[id]) { console.error(`unknown agent "${id}" — use claude or codex`); process.exit(2); }
+      if (!Object.hasOwn(PROBE_ARGS, id)) { console.error(`unknown agent "${id}" — use claude, codex or pi`); process.exit(2); }
       opts.agents = [id];
     }
   }
@@ -52,6 +53,25 @@ function parseArgs(argv) {
 const fmt = (v) => (v === null || v === undefined || v === '' ? '(none)' : typeof v === 'string' ? v : util.inspect(v, { depth: 4, breakLength: 120 }));
 const line = (label, value) => console.log(`  ${label.padEnd(26)} ${fmt(value)}`);
 const header = (title) => console.log(`\n=== ${title} ===`);
+
+// (TPT9047) One block per attempted runtime, one line per verification stage (runtime → import →
+// cli, each with its own deadline), so a cold-cache cli import that overran its limit reads
+// differently from a runtime that never started.
+function printRuntimeChecks(checks = []) {
+  for (const [index, check] of checks.entries()) {
+    line(`runtime ${index + 1}`, check.runtime);
+    line('  executable', check.command);
+    if (check.nodeVersion) line('  Node version', check.nodeVersion);
+    if (!check.stages || !check.stages.length) {
+      line('  skipped', check.output || '(no reason)');
+      continue;
+    }
+    for (const stage of check.stages) {
+      const kill = stage.killed === undefined ? '' : stage.killed ? ' — child tree killed' : ' — child tree kill FAILED';
+      line(`  stage ${stage.stage}`, `${stage.ok ? 'ok' : 'FAILED'} ${stage.elapsedMs ?? '?'}ms (limit ${stage.timeoutMs}ms): ${stage.output || '(empty)'}${kill}`);
+    }
+  }
+}
 
 function execLines(command, args) {
   return new Promise((resolve) => {
@@ -155,15 +175,16 @@ async function printStrategies(name) {
   return async || sync;
 }
 
-async function printProbe(name, bin) {
-  header(`${name}: login probe`);
+async function printProbe(name, launch) {
+  header(`${name}: ${name === 'pi' ? 'version' : 'login'} probe`);
+  const bin = launch?.command;
   if (!bin) { console.log('  (no launcher resolved — probe skipped)'); return; }
   let real = bin;
   try { real = fs.realpathSync(bin); } catch { /* keep as-is */ }
   line('launcher', bin);
   if (real !== bin) line('realpath', real);
   try { line('size', `${fs.statSync(real).size} bytes`); } catch { /* unreadable */ }
-  const args = PROBE_ARGS[name];
+  const args = [...(launch.argsPrefix || []), ...PROBE_ARGS[name]];
   let spec;
   try {
     spec = su.winExecSpec(bin, args);
@@ -177,7 +198,9 @@ async function printProbe(name, bin) {
   const nvmDir = su.resolveNvmBinDir(bin);
   line('nvm bin dir prepended', nvmDir || '(none)');
   // Exactly detect()'s env: augmented PATH as one key, nvm dir (if any) in front.
-  const env = su.prependPathEnv(su.augmentPathEnv({}), nvmDir);
+  const env = su.prependPathEnv(su.augmentPathEnv(name === 'pi'
+    ? { PI_SKIP_VERSION_CHECK: '1', ...launch.env } : {}), nvmDir);
+  if (name === 'pi') line('env ELECTRON_RUN_AS_NODE', env.ELECTRON_RUN_AS_NODE || '(unset)');
   line('env PATH key(s)', Object.keys(env).filter(k => /^path$/i.test(k)).join(', '));
   const t0 = Date.now();
   const probe = await BaseTaskAgent.runCliProbe(bin, args, { env });
@@ -191,26 +214,45 @@ async function printProbe(name, bin) {
 
 async function printDetect(name) {
   header(`${name}: detect() verdict`);
-  su.clearBinCache(name);
+  if (name !== 'pi') su.clearBinCache(name);
   const result = await getTaskAgent(name).detect(config);
   line('available', result.available);
   line('reason', result.reason);
   line('detail', result.detail);
 }
 
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
+async function main(argv = process.argv.slice(2)) {
+  const opts = parseArgs(argv);
   const t0 = Date.now();
   printEnvironment();
   for (const name of opts.agents) {
     const bin = await printStrategies(name);
-    await printProbe(name, bin);
+    let launch = bin ? { command: bin, argsPrefix: [], env: {} } : null;
+    if (name === 'pi') {
+      header('pi: launch resolution (packaged CLI/runtime included)');
+      line('→ resolvePiLaunch()', su.resolvePiLaunch());
+      try {
+        launch = await su.resolvePiLaunchAsync();
+        line('→ resolvePiLaunchAsync()', launch);
+        if (launch?.piVersion) line('verified Pi', `${launch.piVersion} (detect() reuses this; no second cli.js import)`);
+        printRuntimeChecks(launch?.runtimeChecks);
+      } catch (error) {
+        launch = null;
+        line('launch error', error.message);
+        printRuntimeChecks(error.runtimeChecks);
+      }
+    }
+    await printProbe(name, launch);
     await printDetect(name);
   }
   console.log(`\nelapsed=${Date.now() - t0}ms`);
 }
 
-main().catch((err) => {
-  console.error('[probe-agent-detect] failed:', err);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('[probe-agent-detect] failed:', err);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { main, printRuntimeChecks };

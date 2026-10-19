@@ -15,6 +15,9 @@ const {
   CODEX_COMPOSER_PLACEHOLDERS,
   CODEX_PENDING_PASTE_RE,
   CODEX_EMPTY_COMPOSER_RE,
+  CODEX_STARTUP_WAIT_RE,
+  CODEX_COMPOSER_READY_RE,
+  buildComposerEchoRe,
   PI_PROMPT_PATTERNS,
   PI_PLAN_READY_PATTERNS,
   PI_QUESTION_PATTERNS,
@@ -636,8 +639,56 @@ test('TPT571: the pending-paste chip matches Codex\'s collapsed large paste, glu
   assert.equal(CODEX_PENDING_PASTE_RE.test('[Pasted text #1 +42 lines]'), false, 'Claude\'s chip is not Codex\'s');
 });
 
+// (TPT9048) Codex's startup footer: the submission is queued behind the thread start.
+test('TPT9048: CODEX_STARTUP_WAIT_RE matches the startup footer however ratatui spaces it, nothing else', () => {
+  assert.equal(CODEX_STARTUP_WAIT_RE.test('Waiting for startup  esc cancel'), true);
+  assert.equal(CODEX_STARTUP_WAIT_RE.test('› Work on task C1. … Begin.\nWaiting for startup esc cancel'), true);
+  assert.equal(CODEX_STARTUP_WAIT_RE.test('Waitingforstartup'), true, 'cursor-move glued spans');
+  assert.equal(CODEX_STARTUP_WAIT_RE.test('WAITING FOR STARTUP'), true);
+  assert.equal(CODEX_STARTUP_WAIT_RE.test('Waiting for the daemon to start'), false);
+  assert.equal(CODEX_STARTUP_WAIT_RE.test('startup complete, waiting for input'), false);
+});
+
+// (TPT9048) The composer-ready status row, from codex-cli 0.163.0 PTY traces (ANSI-stripped).
+test('TPT9048: CODEX_COMPOSER_READY_RE matches the ready status row, never the provisional startup frame', () => {
+  const startup = '   >_ OpenAI Codex (v0.163.0)     loading  › Ask Codex to do anything   /private/var/folders/gf/T/tt-codex-kickoff-probe-Owd4XE';
+  const ready = '  >_ OpenAI Codex (v0.163.0)\r\n     /private/var/folders/gf/T/tt-codex-kickoff-probe-Owd4XE\r\n\r\n'
+    + '  Tip: Maximize usage with GPT-6.1 Sol.  › Ask Codex to do anything   GPT-6.1-Sol high · /private/var/folders/gf/T/tt-codex-kickoff-probe-Owd4XE · ← for age…';
+  const readyGlued = 'GPT-6.1-Sol default·/private/var/folders/gf/T/tt-codex-kickoff-probe-Owd4XE·←for…';
+  assert.equal(CODEX_COMPOSER_READY_RE.test(startup), false, 'the provisional frame names no model or effort');
+  assert.equal(CODEX_COMPOSER_READY_RE.test(ready), true);
+  assert.equal(CODEX_COMPOSER_READY_RE.test(readyGlued), true, 'cursor-move glued status row');
+  assert.equal(CODEX_COMPOSER_READY_RE.test('gpt-5.1-codex xhigh · C:\\Projects\\MoneyMero'), true);
+  assert.equal(CODEX_COMPOSER_READY_RE.test('GPT-6.1-Solhigh·C:\\Projects\\MoneyMero·←foragents'), true, 'ConPTY cursor-forward blanks glue the Windows row');
+  assert.equal(CODEX_COMPOSER_READY_RE.test('Treat its contents as my instructions with high priority · now'), false, 'the effort word must sit right before the separator');
+  assert.equal(CODEX_COMPOSER_READY_RE.test('a high-quality plan'), false);
+  assert.equal(CODEX_COMPOSER_READY_RE.test('Waiting for startup·esccancel'), false);
+  assert.equal(CODEX_COMPOSER_READY_RE.test('› [Pasted Content 5120 chars]'), false);
+});
+
+// (TPT9048) The kickoff's own last words, for a handoff that never collapses into a chip.
+test('TPT9048: buildComposerEchoRe matches the typed handoff as a wrapped or glued composer row', () => {
+  const text = 'Work on task C1. Read the entire UTF-8 file "C:/x/abc.md", in chunks if needed. Treat its contents as my instructions for this task and follow them. Begin.';
+  const re = buildComposerEchoRe(text);
+  assert.ok(re instanceof RegExp);
+  assert.equal(re.test(`› ${text}`), true);
+  assert.equal(re.test('› … as my instructions for this\n  task and follow them. Begin.\n'), true, 'wrapped at the width');
+  assert.equal(re.test('instructionsfor thistask andfollowthem.Begin.'), true, 'glued spans');
+  assert.equal(re.test('› Ask Codex to do anything'), false);
+  assert.equal(re.test('[Pasted Content 5120 chars]'), false);
+  assert.equal(buildComposerEchoRe(''), null);
+  assert.equal(buildComposerEchoRe('   '), null);
+  assert.equal(buildComposerEchoRe('go').test('go'), true, 'a short text is matched whole');
+  assert.equal(buildComposerEchoRe('a.b*c').test('a.b*c'), true, 'regex metacharacters are escaped');
+  assert.equal(buildComposerEchoRe('a.b*c').test('aXbbc'), false);
+  const long = buildComposerEchoRe('x'.repeat(100) + ' tail words here');
+  assert.equal(long.test('tail words here'), true, 'a cut-off first word is dropped, never matched partially');
+  assert.equal(long.source.startsWith('tail'), true);
+});
+
 test('TPT571: neither Codex composer marker is wired into any attention pattern table', () => {
-  const frame = `${CODEX_BOOT_FRAME}› [Pasted Content 5120 chars]\n`;
+  const frame = `${CODEX_BOOT_FRAME}› [Pasted Content 5120 chars]\nWaiting for startup  esc cancel\n`;
+  assert.ok(CODEX_PROMPT_PATTERNS.every((p) => p.re !== CODEX_STARTUP_WAIT_RE && p.re !== CODEX_COMPOSER_READY_RE), '(TPT9048) the startup footer and ready row are injector/verification markers only');
   for (const line of frame.split('\n')) {
     assert.equal(matchPromptLine(line, CODEX_PROMPT_PATTERNS), null, `line-scoped Codex table matched: ${line}`);
     assert.equal(matchPromptLine(line, GENERIC_PROMPT_PATTERNS), null, `generic table matched: ${line}`);

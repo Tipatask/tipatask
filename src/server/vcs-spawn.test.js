@@ -46,7 +46,7 @@ test('actual terminal launch passes fresh project settings through the real Code
     session.taskAgent = 'codex';
     session.backend = backend;
     await spawnTerminal(session, 'Work on task TPT1: scratch', 'TPT1', [], { backend });
-    const prompt = spec.initialPrompt;
+    const prompt = spec.kickoffFile ? fs.readFileSync(spec.kickoffFile, 'utf8') : spec.initialPrompt;
     assert.ok(captured.args.every((a) => !a.includes('Work on task')), 'kickoff must not be a positional argv entry');
     assert.equal(captured.options.cwd, root);
     assert.equal(prompt.includes('`git merge task/'), !!merge);

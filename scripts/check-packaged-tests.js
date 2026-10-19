@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { listPackage, extractFile, statFile } = require('@electron/asar');
 const { collectRelativeRequires } = require('../src/server/require-graph');
+const { assertWindowsPtyBinaries, WINDOWS_PTY_BINARIES, WINDOWS_PTY_SCRIPTS } = require('./windows-pty');
 
 // @electron/asar splits the requested path on path.sep, so a forward-slash path is "not found"
 // on Windows for anything below the archive root. Normalize before every lookup.
@@ -60,6 +61,50 @@ function packagedPackageJson(resources, name) {
 function readJsonFile(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return null; }
+}
+
+function assertPackagedWindowsNode(resources) {
+  const runtimeDir = path.join(resources, 'pi', 'node_modules', 'tipatask-node');
+  const problems = [];
+  for (const name of ['node.exe', 'LICENSE']) {
+    const file = path.join(runtimeDir, name);
+    let stat;
+    try { stat = fs.statSync(file); }
+    catch (error) {
+      problems.push(`${file}: cannot read file (${error.code || error.message})`);
+      continue;
+    }
+    if (!stat.isFile()) problems.push(`${file}: not a regular file`);
+    else if (name === 'node.exe' && stat.size <= 1024 * 1024) {
+      problems.push(`${file}: ${stat.size} bytes; must be larger than 1 MiB (1048576 bytes)`);
+    }
+  }
+  if (problems.length) {
+    throw new Error(`Windows Pi runtime is incomplete:\n  ${problems.join('\n  ')}\n`
+      + 'Run scripts/stage-pi-bundle.js with the standalone Node version pinned in .nvmrc, '
+      + 'and ensure build.extraResources copies vendor/pi/node_modules to pi/node_modules before packaging again.');
+  }
+}
+
+function assertPackagedWindowsPty(resources, arch) {
+  const root = path.join(resources, 'app.asar.unpacked', 'node_modules', 'node-pty');
+  assertWindowsPtyBinaries(path.join(root, 'build', 'Release'), arch);
+  const archive = path.join(resources, 'app.asar');
+  for (const script of WINDOWS_PTY_SCRIPTS) {
+    const file = `node_modules/node-pty/lib/${script}`;
+    const stat = statFile(archive, path.normalize(file));
+    if (!stat.unpacked || !fs.statSync(path.join(root, 'lib', script)).isFile()) {
+      throw new Error(`Windows node-pty runtime script must be unpacked: ${file}`);
+    }
+  }
+  // Every native must also have an unpacked archive entry: files sitting beside
+  // app.asar alone cannot satisfy a require through app.asar's virtual filesystem.
+  for (const binary of WINDOWS_PTY_BINARIES) {
+    const file = `node_modules/node-pty/build/Release/${binary}`;
+    if (!statFile(archive, path.normalize(file)).unpacked) {
+      throw new Error(`Windows node-pty runtime binary must be unpacked: ${file}`);
+    }
+  }
 }
 
 // Fails the packaging step, before signing and installer creation, when what is inside the package
@@ -177,6 +222,11 @@ module.exports = async function afterPack(context) {
     ? path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, 'Contents', 'Resources')
     : path.join(context.appOutDir, 'resources');
   const projectDir = context.packager?.projectDir || path.resolve(__dirname, '..');
+  if (context.electronPlatformName === 'win32') {
+    assertPackagedWindowsNode(resources);
+    const arch = typeof context.arch === 'string' ? context.arch : require('builder-util').Arch[context.arch];
+    assertPackagedWindowsPty(resources, arch);
+  }
   assertNoPackagedTests(path.join(resources, 'app.asar'));
   assertPackagedRequires(path.join(resources, 'app.asar'));
   assertPackagedVcs(path.join(resources, 'app.asar'), projectDir);
@@ -194,3 +244,4 @@ module.exports.assertPackagedVcs = assertPackagedVcs;
 module.exports.assertPackagedVersions = assertPackagedVersions;
 module.exports.PI_PACKAGE = PI_PACKAGE;
 module.exports.SHERPA_PLATFORMS = SHERPA_PLATFORMS;
+module.exports.assertPackagedWindowsPty = assertPackagedWindowsPty;

@@ -189,10 +189,15 @@ const CLAUDE_FIRST_RUN_PATTERNS = [
   { re: /\bManaged settings require approval\b/i, kind: 'firstRun' },
   { re: /\bYes, I trust these settings\b/i, kind: 'firstRun' },
   { re: /\bNo, exit Claude Code\b/i, kind: 'firstRun' },
-];
+].map(({ re, ...pattern }) => ({
+  ...pattern,
+  // ConPTY/Ink can position each word with cursor escapes instead of spaces.
+  // The raw injection tail strips those escapes; keep trust gated in that form too.
+  re: new RegExp(re.source.replace(/ /g, '\\s*'), re.flags),
+}));
 
-// (C1219) Consulted ONLY inside terminal-session.js's onInjectSilence() 'firstRun' defer branch
-// — proof of an actually-ready REPL, not just silence, before injecting the task prompt. C1120's
+// Proof of an actually-ready REPL, not just silence, before releasing the per-spawn
+// first-run gate in terminal-session.js's output and injection-silence handlers. C1120's
 // dismiss-detection (lineDialogLeftScreen/dialogGateCleared) clears the gate the moment a
 // screen's line-scoped state goes inactive, but an option-less intermediate wait between two
 // onboarding steps (e.g. "opening browser for login…") also looks inactive — pure silence would
@@ -201,8 +206,8 @@ const CLAUDE_FIRST_RUN_PATTERNS = [
 // `--permission-mode plan` (claude-agent.js), which renders a "plan mode on" indicator once the
 // REPL is truly up.
 const CLAUDE_REPL_READY_PATTERNS = [
-  /\?\s*for shortcuts\b/i,
-  /\bplan mode on\b/i,
+  /\?\s*for\s*shortcuts\b/i,
+  /\bplan\s*mode\s*on\b/i,
 ];
 function isClaudeReplReady(tail) {
   return typeof tail === 'string' && CLAUDE_REPL_READY_PATTERNS.some((re) => re.test(tail));
@@ -244,7 +249,7 @@ const CODEX_COMPOSER_PLACEHOLDERS = [
 // output can glue them. Literal confirmed in the codex-cli 0.160.0 binary (`[Pasted Content `).
 // A CLI that stops collapsing pastes simply never matches, which disables the re-send (the Enter
 // is then sent exactly once, as before). Re-verify after CLI upgrades.
-const CODEX_PENDING_PASTE_RE = /\[Pasted\s*Content\s+[\d,]+\s*chars?\s*\]/i;
+const CODEX_PENDING_PASTE_RE = /\[Pasted\s*Content\s*[\d,]+\s*chars?\s*\]/i;
 
 // Empty idle composer: a prompt-marker row carrying nothing but one of the placeholders above.
 // Seen as the LAST thing drawn after the kickoff paste + Enter, with the PTY silent, it means the
@@ -256,6 +261,43 @@ const CODEX_EMPTY_COMPOSER_RE = new RegExp(
   `^\\s*[›❯>]\\s*(?:${CODEX_COMPOSER_PLACEHOLDERS.map((t) => t.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')).join('|')})\\s*$`,
   'im',
 );
+
+// (TPT9048) Codex's startup footer. The TUI paints its composer before the thread is started;
+// an Enter typed then queues the submission and the footer reads "Waiting for startup  esc
+// cancel" until the TUI replays it. While this is on screen a re-sent Enter is pointless and any
+// other key cancels the queued submission, so submit verification only waits. Rendered from two
+// separate spans in the codex-cli 0.163.0 binary ("Waiting for " + "startup"), hence `\s*`.
+// Submit-verification only — never in a pattern table (HARD RULE above).
+const CODEX_STARTUP_WAIT_RE = /Waiting\s*for\s*startup/i;
+
+// (TPT9048) Codex's composer is ready for a real submission. Before the thread is started the TUI
+// paints a provisional frame — header `>_ OpenAI Codex (vX)     loading  › Ask Codex to do
+// anything   <cwd>` with `loading` where the model goes — and a submission typed into it is at
+// best queued (CODEX_STARTUP_WAIT_RE). Once `thread/start` resolves, the status row under the
+// composer reads `<model> <effort>·<cwd>·…` (`GPT-6.1-Sol default·/path`, `GPT-6.1-Sol high ·
+// /path`); that effort word followed by the `·` separator never appears in the provisional frame.
+// No word boundary before the effort word: ConPTY re-emits the row with cursor-forward moves for
+// its blank runs, so the ANSI-stripped Windows stream reads `GPT-6.1-Solhigh·C:\Projects…`.
+// Captured from codex-cli 0.163.0 PTY traces (macOS cold and warm starts, the installed Windows
+// app). Submit-side gate only (the injector's awaitReady), bounded by
+// CodexAgent#getComposerReadyMaxMs(); never in a pattern table (HARD RULE above).
+const CODEX_COMPOSER_READY_RE = /(?:default|minimal|low|medium|high|xhigh)\s*·/i;
+
+// (TPT9048) The kickoff text still sitting in the composer after the submit Enter. Windows
+// Codex sends a short single-line file handoff that never collapses into the chip above, so the
+// only visible proof of a lost Enter is the handoff's own last words on the composer row. Built
+// per spawn from the tail of what was typed (paste + typed suffix): words joined by `\s*` so a
+// row wrapped at the terminal width or painted by cursor moves still matches. null for empty text.
+function buildComposerEchoRe(text, { tailChars = 48 } = {}) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!flat) return null;
+  let tail = flat.slice(-tailChars);
+  // Never start on a partial word: a cut word cannot be found on screen as typed.
+  if (flat.length > tailChars && !/^\s/.test(tail)) tail = tail.replace(/^\S*\s*/, '');
+  const words = tail.split(' ').filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  if (!words.length) return null;
+  return new RegExp(words.join('\\s*'), 'i');
+}
 
 // Before first injection, Claude's AskUserQuestion menu must defer pending paste.
 // Match stable menu chrome in the raw tail without line anchors; keep it out of
@@ -392,6 +434,9 @@ module.exports = {
   CODEX_COMPOSER_PLACEHOLDERS,
   CODEX_PENDING_PASTE_RE,
   CODEX_EMPTY_COMPOSER_RE,
+  CODEX_STARTUP_WAIT_RE,
+  CODEX_COMPOSER_READY_RE,
+  buildComposerEchoRe,
   CODEX_PROMPT_PATTERNS,
   CODEX_PLAN_READY_PATTERNS,
   CODEX_QUESTION_PATTERNS,

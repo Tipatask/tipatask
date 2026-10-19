@@ -357,6 +357,22 @@ function resolveDialogAnswer(dialog, { selected, other } = {}) {
   };
 }
 
+// Roll back a turn the agent will not keep. The generated seed is context, not a user
+// submission. Returning the dropped message lets error frames report an actual rollback.
+function dropTaskChatUserTurn(session) {
+  const last = session.messages.at(-1);
+  if (!last || last.role !== 'user' || last.seed) return null;
+  session.messages.pop();
+  if (last.dialogAnswer) {
+    const asked = session.messages.at(-1);
+    const dialog = asked && Array.isArray(asked.dialogs)
+      && asked.dialogs.find(d => d.id === last.dialogAnswer.dialogId);
+    if (dialog) delete dialog.answer;
+  }
+  if (last.taskEdits) restoreTaskChatEdits(session);
+  return last;
+}
+
 // ── User edits ────────────────────────────────────────────────────────────────
 
 // The agent never sees a task the user edits by hand (the edit goes to the API from the task
@@ -381,6 +397,22 @@ function changedTaskFields(prev, next) {
   if (!next || typeof next !== 'object') return [];
   if (!prev || typeof prev !== 'object') return TASK_EDIT_FIELDS.filter(field => next[field] != null);
   return TASK_EDIT_FIELDS.filter(field => comparableField(prev, field) !== comparableField(next, field));
+}
+
+function restoreTaskChatEdits(session) {
+  const edits = session._drainedTaskEdits;
+  session._drainedTaskEdits = null;
+  if (!edits) return;
+  if (!session.pendingTaskEdits) session.pendingTaskEdits = new Map();
+  for (const edit of edits) {
+    // A newer edit queued during the dropped turn keeps its task, compared against
+    // what the agent saw before that turn.
+    const newer = session.pendingTaskEdits.get(edit.task.id);
+    if (!newer) { session.pendingTaskEdits.set(edit.task.id, edit); continue; }
+    const changed = changedTaskFields(edit.prev, newer.task);
+    if (changed.length) session.pendingTaskEdits.set(edit.task.id, { task: newer.task, changed, prev: edit.prev });
+    else session.pendingTaskEdits.delete(edit.task.id);
+  }
 }
 
 function editedTaskView(task) {
@@ -421,4 +453,5 @@ module.exports = {
   replayTaskChatTurn,
   findOpenDialog,
   resolveDialogAnswer,
+  dropTaskChatUserTurn,
 };

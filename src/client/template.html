@@ -328,7 +328,7 @@ const {
   buildObjectivePrompt, showSaveToast, showToast, showApiStatusBanner,
   showReauthBanner, hideReauthBanner, showSetupRequiredBanner, hideSetupRequiredBanner,
   renderSprintCombobox, initSprintCombobox, sprintRecordMax,
-  isSubmitShortcut, loadErrorGuidance, projectHeader,
+  isSubmitShortcut, loadErrorGuidance, projectHeader, skipTransitionsForFrame,
 } = utils;
 
 const { buildWsUrl, wsSend, onApiStatus, _notifyApiStatus } = wsClient;
@@ -346,10 +346,10 @@ const { nextStatusSelection } = window.TipTask.statusFilterSelect;
 const { resolveManualSprintSelection, manualDependencyFloor, applyManualDependencyFloor, missingDependencyIds, dependencyFloorRows } = window.TipTask.newTaskSprint;
 
 const {
-  renderCard, expandCard, collapseCard,
-  highlightCardAndDeps, clearHighlights, clearChainHighlights,
+  renderCard, collapseCard, takeExpandedCard, restoreExpandedCard,
+  clearHighlights, clearChainHighlights,
   applyChainHighlight, applyObjectiveHighlight, applyRelatedHighlight, setupCardInteractions, registerCardCallbacks,
-  isDragging, isDropInProgress, shouldDeferForDrag, applyTaskPatch, removeCardFromDom, applyDiscussLock,
+  isDragging, isDropInProgress, shouldDeferForDrag, markDropRenderCommitted, applyTaskPatch, removeCardFromDom, applyDiscussLock,
 } = taskCard;
 
 const {
@@ -1359,27 +1359,9 @@ function openBoardTaskEditModal(taskId, trigger, workspace = {}) {
     trigger,
     initialPane: workspace.initialPane,
     terminalLaunch: workspace.terminalLaunch,
-    onStart: (task) => {
-      // (C1316) Every branch returns its launcher's result so the modal's Start handler
-      // can await it — the launchers are synchronous today, so this is a no-op for now,
-      // but it makes the contract awaitable without another pass through every branch.
-      const { id, title, description: desc, status, agentAssignee } = task;
-      const hasSession = state.activeSessions.has(id) || state.exitedSessions.has(id);
-      const pinnedAgent = (agentAssignee === 'claude' || agentAssignee === 'codex') ? agentAssignee : null;
-      if (isClosedName(status) && !hasSession) {
-        return showClaudeConfirmModal(id, title, desc, status, { agent: pinnedAgent });
-      } else if (hasSession) {
-        return openTerminal(id, title, desc, status);
-      } else if (pinnedAgent) {
-        return openTerminal(id, title, desc, status, { agent: pinnedAgent });
-      } else if (state.availableAgents.length > 1 && state.sessionAgent === null) {
-        return openAgentSelectorModal(id, title, desc, status);
-      } else if (state.sessionAgent) {
-        return openTerminal(id, title, desc, status, { agent: state.sessionAgent });
-      } else {
-        return openTerminal(id, title, desc, status);
-      }
-    },
+    // The modal calls onStart only after saving successfully (or with a clean draft).
+    // Use that snapshot so the shared launcher preserves its agent and full Pi model id.
+    onStart: (task) => window.TipTask.taskCard.startTaskById(task.id, {}, task),
     onLoadAndRender: (opts) => loadAndRender(opts),
   });
 }
@@ -1688,7 +1670,9 @@ function handleObjectiveTaskStateEvent(msg) {
     // DIFFERENT drill-down still serves an instant cache hit instead of a cold refetch.
     // (C1329) state.taskStatusById/taskTitleById and syncActiveSessionsNav() are already
     // handled by the prologue above — it runs for every non-Objective tab, this one included.
-    invalidateLoadAndRender();
+    // (TPT9025) Not during a drop: the render in flight is the drop's own, and this patch is
+    // queued to replay after it — dropping it would only cost the drop its repaint.
+    if (!isDropInProgress()) invalidateLoadAndRender();
     // (TPT58) This event carries the full updated row, so merge it into every cached
     // drill-down snapshot in place rather than invalidateBoardTaskCache()'s whole-Map wipe —
     // that wipe was firing on nearly every task event while a subtask session ran, so an
@@ -1698,9 +1682,10 @@ function handleObjectiveTaskStateEvent(msg) {
     if (msg.isNewlyAssigned) applyNewlyAssigned(taskId);
     const pendingCard = app.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
     if (pendingCard) pendingCard.classList.remove('pending-sync');
+    // (TPT9025) 'deferred' (a card drag is live) takes the patched branch: nothing is scheduled,
+    // the patch replays when the drag ends and applySearchFilter() defers itself until then.
     if (applyTaskPatch(task) === 'reload') {
       clearTimeout(boardRefreshTimer);
-      state.pendingRestoreContext = { scrollY: window.scrollY, cardId: state.selectedCardId, cardMode: state.expandedCardMode };
       boardRefreshTimer = setTimeout(() => {
         if (isTasksSectionTab()) loadAndRender({ forceFresh: true }).catch(() => {});
       }, 0);
@@ -1712,12 +1697,14 @@ function handleObjectiveTaskStateEvent(msg) {
   }
 
   if (msg?.type === 'tasks-updated') {
-    invalidateLoadAndRender();
+    if (!isDropInProgress()) invalidateLoadAndRender(); // (TPT9025) keep the drop's own render
     // (TPT58) Payload-less — no single row to merge, so soft-stale instead of wiping; the
     // forceFresh render below still refetches the CURRENT drill-down key immediately.
     staleBoardTaskCache();
     clearTimeout(boardRefreshTimer);
-    state.pendingRestoreContext = { scrollY: window.scrollY, cardId: state.selectedCardId, cardMode: state.expandedCardMode };
+    // (TPT9023) No pendingRestoreContext from a background refresh: the render keeps the scroll and
+    // the open card from its own commit-time snapshot, and an event-time context would overwrite
+    // the one an open terminal saved for its close.
     boardRefreshTimer = setTimeout(() => {
       if (isTasksSectionTab()) loadAndRender({ forceFresh: true }).catch(() => {});
     }, 0);
@@ -1747,13 +1734,39 @@ document.addEventListener('tiptask:voice-field-recording', (e) => {
 // gesture holds direct references to DOM nodes (task-card.js's _dragState) that a full render
 // would detach mid-gesture. `tiptask:drag-ended` fires once per gesture (drop committed,
 // Escape-cancelled, or self-healed after a detached-DOM check) — see the guard this pairs
-// with, just below hasLiveFieldRecording() in _loadAndRenderImpl.
-document.addEventListener('tiptask:drag-ended', () => {
-  if (!_deferredRenderOptions) return;
-  const opts = _deferredRenderOptions;
+// with, _deferRenderForDrag().
+// (TPT9025) The one post-drag render: it also takes the browser board socket's
+// _pendingBoardRefresh and the thaw's `needsReload` (a replayed patch whose card or tier isn't
+// mounted), so a gesture ends with at most one forceFresh rebuild.
+document.addEventListener('tiptask:drag-ended', (e) => {
+  const needsReload = !!e.detail?.needsReload;
+  if (!_deferredRenderOptions && !_pendingBoardRefresh && !needsReload) return;
+  const scrollToTop = _deferredRenderOptions?.scrollToTop;
   _deferredRenderOptions = null;
-  loadAndRender(opts);
+  _pendingBoardRefresh = false;
+  if (needsReload) staleBoardTaskCache(); // what a tiptask:reload would do
+  loadAndRender({ forceFresh: true, scrollToTop });
 });
+
+// (C1438) A drag gesture or its drop is in flight — see tt-task-cards-drag-drop.md "Root cause:
+// drag vs. board re-render". Every full board render passes this check twice: in
+// loadAndRender(), before the generation bump, and again right before its #app commit
+// (TPT9025 — a render that entered before the gesture began can reach its commit mid-drag).
+// That covers every trigger that wipes #app: the board-WS handlers, the attention-ws bridge,
+// refreshBoardSnapshotInBackground(), tiptask:reload, the offline retry. `afterDrop` is the
+// drop's own post-commit render (task-card.js _onDragEnd) escaping this exact guard; the
+// Objective-pane refreshes never touch the board and pass too.
+function _deferRenderForDrag(options) {
+  if (state.activeTab === 'objective' && (options.objectiveTaskUpdate || options.objectiveTasksUpdated)) return false;
+  if (!shouldDeferForDrag({ afterDrop: !!options.afterDrop, dragging: isDragging(), dropInProgress: isDropInProgress() })) {
+    return false;
+  }
+  _deferredRenderOptions = {
+    forceFresh: true,
+    scrollToTop: (_deferredRenderOptions && _deferredRenderOptions.scrollToTop) || options.scrollToTop || undefined,
+  };
+  return true;
+}
 
 // (C1154) Last top-level view a completed render committed. Used to detect a *transition*
 // into the Objective view — see the dismiss hook in loadAndRender().
@@ -2018,6 +2031,9 @@ async function loadAndRender(options = {}) {
   // (C1327) A stale state.activeTab pointing at a hidden view would render a view with no tab
   // to leave by. Fall back to the board. Removed automatically when HIDDEN_VIEW_TABS is emptied.
   if (isHiddenViewTab(state.activeTab)) state.activeTab = 'board';
+  // (TPT9025) Before the generation bump: a render the drag guard defers must not first
+  // invalidate the one already in flight — during a drop, that is the drop's own render.
+  if (_deferRenderForDrag(options)) return;
   const renderGeneration = invalidateLoadAndRender();
   const _handle = perfStart('load-and-render', { tab: state.activeTab, cacheable: _canUseBoardTaskCache(), forceFresh: !!options.forceFresh, snapshot: !!options.snapshot, objectiveTaskRefresh: !!(options.objectiveTaskUpdate || options.objectiveTasksUpdated) });
   try {
@@ -2064,27 +2080,16 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     };
     return;
   }
-  // (C1438) A drag gesture or its drop is in flight — see tt-task-cards-drag-drop.md "Root
-  // cause: drag vs. board re-render". This is the one choke point every render passes
-  // through, so it covers every trigger that used to wipe #app mid-drag: the board-WS
-  // handlers, the attention-ws bridge (Electron — the path with no drag awareness at all
-  // before this), refreshBoardSnapshotInBackground(), tiptask:reload, and the offline retry.
-  // `afterDrop` is the drop's own post-commit render (task-card.js _onDragEnd) escaping this
-  // exact guard — without it the drop could never repaint its own result.
-  if (shouldDeferForDrag({ afterDrop: !!options.afterDrop, dragging: isDragging(), dropInProgress: isDropInProgress() })) {
-    _deferredRenderOptions = {
-      forceFresh: true,
-      scrollToTop: (_deferredRenderOptions && _deferredRenderOptions.scrollToTop) || options.scrollToTop || undefined,
-    };
-    return;
-  }
+  // (C1438) The drag guard itself runs in loadAndRender() and again before the #app commit
+  // below — see _deferRenderForDrag(). (TPT9025) The drop's own render remembers the deferral
+  // pending when it started, so its commit can supersede that one.
+  const deferredBeforeDropRender = options.afterDrop ? _deferredRenderOptions : null;
   // (C1187) TTL'd fire-and-forget refresh — never awaited, so a teammate's status rename
   // in the web app surfaces on the next repaint without adding a round-trip to every
   // render (this runs on every WS frame / poll tick).
   refreshStatusesIfStale();
   // Preserve card edits before re-render
   captureCardEdits();
-  const startScrollY = window.scrollY;
   if (state.activeTab !== 'todo') closeTodoDrawer();
 
   const canUseTaskCache = _canUseBoardTaskCache();
@@ -2334,8 +2339,20 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   if (!isCurrentLoadAndRender(renderGeneration) || boardRenderState.revision !== (state._boardRenderRevision || 0)) {
     return;
   }
+  // (TPT9025) Commit-time drag check: this render may have entered before the gesture began
+  // and awaited its fetch through it — re-defer rather than detach the dragged card.
+  if (_deferRenderForDrag(options)) return;
 
   const { isStreaming, isReady } = getObjectiveNavState();
+
+  // (TPT9023) Read at the commit, not at render start — the fetch above can outlast a scroll or a
+  // card opening. wantTop marks navigation (explicit scrollToTop or the one-shot pendingScrollTop);
+  // everything else is an in-place refresh that keeps the page where it is (scroll policy below).
+  const wantTop = options.scrollToTop || state.pendingScrollTop;
+  state.pendingScrollTop = false; // always consume one-shot flag (prevent leakage to later renders)
+  const restoreScrollY = window.scrollY;
+  // Closes the open overlay before its node goes; restoreExpandedCard() below re-opens it in place.
+  const expandedBefore = takeExpandedCard(app);
 
   app.innerHTML = `
     <nav class="top-nav${isNewSection ? ' top-nav--bare' : ''}">
@@ -2404,6 +2421,22 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     <div class="content-area" style="--chat-tab-count:${state.tabsState.length}">
       ${isEmptyBoard ? renderEmptyBoardContent() : tabContent}
     </div>`;
+
+  // (TPT9025) The drop's own render just replaced #app: the tail below is the drop's repaint
+  // (filters, session buttons, truncation, scroll restore) and runs inline, and a render
+  // deferred before this one started is superseded by its fresher fetch.
+  if (options.afterDrop) {
+    markDropRenderCommitted();
+    if (_deferredRenderOptions && _deferredRenderOptions === deferredBeforeDropRender && !_deferredRenderOptions.scrollToTop) {
+      _deferredRenderOptions = null;
+    }
+  }
+
+  // (TPT9023) An in-place refresh repaints the same board: what the tail below re-applies to the
+  // fresh nodes after its first forced layout (has-active-session controls, chain rings and blur,
+  // the re-opened card) lands in its final state instead of animating in and shifting the page.
+  // Tasks tabs only — the Objective pane's proposal cards wait on transitionend to leave.
+  if (isTasksSection && !wantTop) skipTransitionsForFrame(app);
 
   // (C1256) Spans everything from the innerHTML wipe through listener rewiring/scroll
   // restore — the ~1000-line tail of this function. Answers C1256 sub-item (2) ("skip
@@ -3647,38 +3680,33 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   });
   updateBulkActionBar();
 
-  // Scroll policy — evaluated in priority order:
-  //   1. Terminal overlay open → leave pendingRestoreContext intact, do nothing.
-  //   2. Returning from terminal → restore to pre-open scroll + re-expand pinned card.
+  // Scroll policy — evaluated in priority order (wantTop and restoreScrollY are read at the commit):
+  //   1. Terminal overlay open → leave pendingRestoreContext intact, keep the scroll.
+  //   2. Returning from terminal → keep the scroll + re-open the pinned card it was launched from.
   //   3. Explicit navigation (options.scrollToTop or one-shot state.pendingScrollTop) → top.
   //   4. Default: preserve scroll across in-place data refreshes (status confirms, WS updates, etc.)
+  //      and re-open the card that was expanded at the commit (TPT9023).
   //
   // DEFAULT IS PRESERVE. Scroll-to-top only happens on genuine navigation. This prevents
   // trailing debounced re-renders and status-confirm renders from jumping to top.
-  const wantTop = options.scrollToTop || state.pendingScrollTop;
-  state.pendingScrollTop = false; // always consume one-shot flag (prevent leakage to later renders)
-
+  let reopen = null;
   if (state.activeTerminal) {
     // overlay open — leave state.pendingRestoreContext intact for when the terminal closes
+    if (!wantTop) window.scrollTo(0, restoreScrollY);
   } else if (state.pendingRestoreContext) {
     const ctx = state.pendingRestoreContext;
     state.pendingRestoreContext = null;
-    window.scrollTo(0, startScrollY);
-    if (ctx.cardId && ctx.cardMode === 'pinned') {
-      const cardToRestore = app.querySelector(`.card[data-id="${ctx.cardId}"]`);
-      if (cardToRestore) {
-        state.selectedCardId = ctx.cardId;
-        highlightCardAndDeps(ctx.cardId);
-        expandCard(cardToRestore, 'pinned');
-        const focusBtn = cardToRestore.querySelector('.btn-focus-card');
-        if (focusBtn) focusBtn.classList.add('active');
-      }
-    }
+    window.scrollTo(0, restoreScrollY);
+    // A card pinned while the terminal-close render fetched is newer than the launching one.
+    reopen = (ctx.cardId && ctx.cardMode === 'pinned' && expandedBefore?.mode !== 'pinned')
+      ? { id: ctx.cardId, mode: 'pinned', selected: true }
+      : expandedBefore;
   } else if (wantTop) {
     window.scrollTo(0, 0);
   } else {
     // Default: preserve scroll position across data-refresh re-renders.
-    window.scrollTo(0, startScrollY);
+    window.scrollTo(0, restoreScrollY);
+    reopen = expandedBefore;
   }
 
   // Restore chain highlights after re-render
@@ -3691,6 +3719,11 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     else if (savedMode === 'related') applyRelatedHighlight(savedId);
     else applyChainHighlight(savedId);
   }
+
+  // (TPT9023) Re-open the card in this same task, so no collapsed frame paints. After the chain
+  // restore: restoreExpandedCard() layers the card's own rings over or under it as the
+  // interaction did.
+  if (reopen) restoreExpandedCard(app, reopen);
 
   // Board loaded successfully — dismiss any offline/reconnecting banner + stop Electron retry loop
   if (document.getElementById('api-status-banner')) showApiStatusBanner('connected');
@@ -3782,15 +3815,8 @@ let boardReconnectTimer = null;
 // fires when there was actually a gap to heal.
 let _boardWsHasConnectedOnce = false;
 let boardRefreshTimer = null;
+// Flushed by the single tiptask:drag-ended listener (TPT9025, next to _deferredRenderOptions).
 let _pendingBoardRefresh = false;
-
-// Flush deferred re-render after drag ends
-document.addEventListener('tiptask:drag-ended', () => {
-  if (_pendingBoardRefresh) {
-    _pendingBoardRefresh = false;
-    loadAndRender();
-  }
-});
 
 document.addEventListener('tiptask:desc-edit-done', () => {
   if (_pendingBoardRefresh) {
@@ -3908,7 +3934,9 @@ function connectBoardWs() {
         TipTask.attentionNotifications.forgetTaskAttention(msg.taskId);
         TipTask.notificationCenter.dismissNotification(msg.taskId); // (C1137) prompt resolved
         const card = app.querySelector(`.card[data-id="${CSS.escape(msg.taskId)}"]`);
-        if (card) card.classList.remove('needs-attention', 'has-active-session');
+        // (TPT9025) has-active-session belongs to updateClaudeButtons() just below, which
+        // holds that size change back while a card drag is live.
+        if (card) card.classList.remove('needs-attention');
       }
       updateClaudeButtons();
       // (TPT9014) A queued start the server refused on drain — same toast as attention-ws.js.
@@ -3966,13 +3994,7 @@ function connectBoardWs() {
       }
       boardRefreshTimer = setTimeout(() => {
         if (state.activeTab !== 'board' && state.activeTab !== 'list' && state.activeTab !== 'todo' && state.activeTab !== 'backlog') return;
-
-        state.pendingRestoreContext = {
-          scrollY: window.scrollY,
-          cardId: state.selectedCardId,
-          cardMode: state.expandedCardMode,
-        };
-
+        // (TPT9023) No pendingRestoreContext — see handleObjectiveTaskStateEvent()'s tasks-updated branch.
         loadAndRender({ forceFresh: true });
       }, state.activeTerminal ? 0 : 1000);
       return;
@@ -4031,7 +4053,6 @@ function connectBoardWs() {
         // (see § Board task cache) already re-syncs it the moment the user returns to a
         // Tasks-section tab, so nothing is lost by skipping this while on Create.
         if (isTasksSectionTab()) {
-          state.pendingRestoreContext = { scrollY: window.scrollY, cardId: state.selectedCardId, cardMode: state.expandedCardMode };
           boardRefreshTimer = setTimeout(() => loadAndRender({ forceFresh: true }), 300);
         }
         return;
@@ -4059,7 +4080,6 @@ function connectBoardWs() {
       }
       boardRefreshTimer = setTimeout(() => {
         if (state.activeTab !== 'board' && state.activeTab !== 'list' && state.activeTab !== 'todo' && state.activeTab !== 'backlog') return;
-        state.pendingRestoreContext = { scrollY: window.scrollY, cardId: state.selectedCardId, cardMode: state.expandedCardMode };
         loadAndRender({ forceFresh: true });
       }, 300);
     }

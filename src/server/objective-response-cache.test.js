@@ -119,6 +119,15 @@ test('cached reply filters locked targets without changing the cached payload', 
   assert.deepEqual(objectiveResponseCache.get(key).payload.cards.map(c => c.task.id), tasks.map(t => t.id));
 });
 
+test('empty cached replies retain their explanation through result and history', async () => {
+  const { handlers, frames, session, tasks } = wire();
+  const proposalResult = { status: 'empty', reason: 'Already covered by TPT9036 and TPT9037.' };
+  objectiveResponseCache.set(expectedKey({ tasks }), { content: 'cached empty answer', cards: [], proposalResult });
+  await handlers.message(startMsg());
+  assert.deepEqual(frames.find(f => f.type === 'objective-result').proposalResult, proposalResult);
+  assert.deepEqual(session.messages.at(-1).proposalResult, proposalResult);
+});
+
 test('lookup key is scoped to the session project root, falling back to config.PROJECT_ROOT', async () => {
   const a = wire({ session: { projectPath: '/project-a' } });
   await a.handlers.message(startMsg());

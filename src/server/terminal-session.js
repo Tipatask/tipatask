@@ -22,7 +22,7 @@ const { refreshProjectToken } = require('./token-refresh');
 const { getApiCredentials } = require('./api-credentials');
 const { getTaskAgent } = require('./task-agent');
 const BaseTaskAgent = require('./task-agent/base-agent');
-const { buildLegacyPatternTable, sanitizePromptText, isClaudeReplReady, matchClaudeBgAgentsLine, CODEX_COMPOSER_PLACEHOLDERS } = require('./task-agent/prompt-detect');
+const { buildLegacyPatternTable, sanitizePromptText, isClaudeReplReady, matchClaudeBgAgentsLine, CODEX_COMPOSER_PLACEHOLDERS, CODEX_EMPTY_COMPOSER_RE } = require('./task-agent/prompt-detect');
 const { reflowChunk, carveReflowLines, resetReflow } = require('./screen-reflow');
 const { matchClaudePlanOutcomeLine, trackTypedLine, classifyTypedSubmission } = require('./plan-approval-detect'); // (TPT654)
 const { maxCommentId, isTerminalTailExitComment } = require('./exit-resolution');
@@ -30,6 +30,7 @@ const { syncOnSessionStart, isSyncAsYouGoEnabled } = require('../cli/knowledge-s
 const archCache = require('../mcp/architecture-cache');
 const { getTagsForTask } = require('./tag-cache');
 const { resolveAttachmentDir } = require('./attachment-paths');
+const { openPtyTrace } = require('./pty-trace'); // (TPT9048) TIPATASK_PTY_TRACE kickoff diagnostics
 const {
   killProcessGroup,
   killProcessTree,
@@ -161,6 +162,10 @@ const SUBMIT_POLL_MS = 1000;     // re-check cadence while the marker is visible
 const SUBMIT_WATCH_MS = 15000;   // stop watching this long after the last Enter
 const SUBMIT_MARKER_TRAILING_MAX = 500;  // an unsent paste is the LAST thing drawn: only footer/hint text may follow its marker in the tail
 const MAX_SUBMIT_RETRIES = 2;
+// (TPT9048) How long a kickoff may sit queued behind the agent's own startup (the TUI's
+// "Waiting for startup" footer, Codex) before verification stops watching. Startup is bounded by
+// the MCP servers' startup_timeout_sec (60 s) on a cold Windows machine, plus the model catalog.
+const SUBMIT_STARTUP_WAIT_MAX_MS = 120000;
 // (TPT571) Lost-paste fallback, Codex. A kickoff paste the TUI never took leaves the composer EMPTY
 // (agent.getEmptyComposerRe() — the bare placeholder row), so re-sending the Enter would submit
 // nothing. That state — the empty composer as the last thing drawn, PTY silent, no dialog, the
@@ -179,6 +184,28 @@ function unsentPasteVisible(re, tail) {
   let last = -1;
   for (const m of tail.matchAll(g)) last = m.index;
   return last >= 0 && tail.length - last <= SUBMIT_MARKER_TRAILING_MAX;
+}
+
+// (TPT9048) The kickoff text (agent.getKickoffEchoRe()) is still sitting UNSENT in the composer:
+// its last occurrence is near the end of the tail, nothing that proves a running turn follows it
+// (a `Working (` / `esc to interrupt` / activity row, see codexTurnMarker()), and no empty
+// composer placeholder row follows it either (that pairing is the echoed transcript row of a turn
+// that DID go in, with the composer repainted empty below it). Wider trailing budget than the
+// chip's: the whole handoff row plus the footer sits after the match.
+const KICKOFF_ECHO_TRAILING_MAX = 900;
+function kickoffEchoStranded(re, tail) {
+  if (!re || typeof tail !== 'string' || !tail) return false;
+  const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
+  let last = -1;
+  let end = -1;
+  for (const m of tail.matchAll(g)) { last = m.index; end = m.index + m[0].length; }
+  if (last < 0 || tail.length - last > KICKOFF_ECHO_TRAILING_MAX) return false;
+  const after = tail.slice(end);
+  for (const line of after.split(/\r\n|[\r\n]/)) {
+    if (codexTurnMarker(line) === 'work' && !/^\s*[›❯>]/.test(line)) return false; // a turn is running
+    if (CODEX_EMPTY_COMPOSER_RE.test(line)) return false;                           // echo row + empty composer
+  }
+  return true;
 }
 
 // Pure predicate for the awaitPreludeRun release decision — exported for unit testing
@@ -224,6 +251,17 @@ function codexTextPlanReady(text) {
 
 function codexPlanReadyIsFresh(session) {
   return session.taskAgent !== 'codex' || session._codexPlan?.ready === true;
+}
+
+function piPlanReadyIsFresh(session) {
+  if (session.taskAgent !== 'pi' || !session._transcriptHint) return true;
+  // Pi echoes the full kickoff and task attachments. A painted sentinel alone
+  // cannot distinguish those user/tool messages from a completed assistant plan.
+  try {
+    const message = getTaskAgent('pi').readFinalMessage(session);
+    return message?.turnEnded === true && typeof message.text === 'string'
+      && /^\s*Plan ready[.!]?\s*$/i.test(message.text.trim().split(/\r?\n/).at(-1));
+  } catch { return false; }
 }
 
 function invalidateCodexPlan(session) {
@@ -454,6 +492,9 @@ function feedAttentionChunk(session, agent, rawChunk, cleanChunk, now = Date.now
   // feedCodexPlan below) — scanning the legacy+row union would double-count and scramble order.
   if (agent.id === 'claude') trackBgAgents(session, rowChunk == null ? legacyLines : rowLines, now);
   let hit = agent.matchPromptLines(lines);
+  // A live Pi session confirms its candidate from the native transcript in the
+  // quiet-window callback below. Do not raise attention from the echoed prompt.
+  if (agent.id === 'pi' && session._transcriptHint && hit?.kind === 'planReady') return hit;
   // (TPT654) The answered ExitPlanMode dialog collapses to a transcript row (or the mode footer
   // changes after a shift+tab) — a plan approved inside Claude's own TUI. Same stream-order row
   // set as trackBgAgents() above; acts only on a planning session past its kickoff.
@@ -756,12 +797,14 @@ function pausedSummary(session) {
   return { at: p.at, reason: p.reason, count: p.count, threshold: p.threshold, rssMb: p.rssMb || 0, limitMb: p.limitMb || 0 };
 }
 
-function emitTerminalNotice(session, text) {
+function emitTerminalNotice(session, text, { retain = false } = {}) {
+  const data = `\r\n\x1b[90m[Task App] ${text}\x1b[0m\r\n`;
+  if (retain) session.buffer = (session.buffer || '') + data;
   if (session.ws && session.ws.readyState === session.ws.OPEN) {
     session.ws.send(JSON.stringify({
       type: 'data',
       tabId: session.tabId,
-      data: `\r\n\x1b[90m[Task App] ${text}\x1b[0m\r\n`,
+      data,
     }));
   }
 }
@@ -799,8 +842,8 @@ function sessionCopy(session, key, params) {
 
 // Keyed twins of emitTerminalNotice()/emitTerminalWarning(): `key` names a terminal-copy.js
 // entry, rendered in the session's project language.
-function noticeCopy(session, key, params) {
-  emitTerminalNotice(session, sessionCopy(session, key, params));
+function noticeCopy(session, key, params, options) {
+  emitTerminalNotice(session, sessionCopy(session, key, params), options);
 }
 
 function warningCopy(session, key, params) {
@@ -1230,10 +1273,12 @@ function trackClaudePlanOutcome(session, lines) {
 // silence, bracketed-paste the text, wait again, type `typedLine` when the agent refuses a
 // paste-only message (Claude, TPT445), wait again, then Enter. Every step re-checks the session,
 // so a Stop/Restart in between turns the rest into a no-op.
-function pasteAndSubmit(session, agent, text, typedLine = '') {
+function pasteAndSubmit(session, agent, text, typedLine = '', { verify = null } = {}) {
   const quietMs = agent.getPasteSilenceMs();
   const live = () => session.alive && session.pty && !session._terminated;
   const later = (fn, ms) => { const timer = setTimeout(fn, ms); if (timer.unref) timer.unref(); };
+  const plain = typeof agent.wrapsBracketedPaste === 'function' && agent.wrapsBracketedPaste() === false;
+  const frame = (body) => (plain ? body : `\x1b[200~${body}\x1b[201~`);
   // After a write, wait at least one silence window before checking: the echo of the write has
   // not arrived yet, so lastOutputAt alone would read as already quiet.
   const waitQuiet = (cb, afterWrite) => {
@@ -1246,14 +1291,62 @@ function pasteAndSubmit(session, agent, text, typedLine = '') {
     if (afterWrite) later(check, quietMs);
     else check();
   };
-  const steps = [() => session.pty.write(`\x1b[200~${text}\x1b[201~`)];
+  const steps = [() => session.pty.write(frame(text))];
   if (typedLine) steps.push(() => session.pty.write(typedLine));
   steps.push(() => session.pty.write('\r'));
   const run = (i) => {
-    if (i >= steps.length) return;
+    if (i >= steps.length) {
+      if (verify) verifyPastedSubmission(session, agent, verify);
+      return;
+    }
     waitQuiet(() => { steps[i](); run(i + 1); }, i > 0);
   };
   run(0);
+}
+
+// (TPT9048) Bounded submit verification for pasteAndSubmit() callers (Windows Codex plan
+// approval, idle nudges): the same stranded-text / startup-queued reading as the kickoff
+// injector's checkSubmitted(), without its chip and empty-composer states. `echoRe` is the
+// submission's own last words (prompt-detect.js buildComposerEchoRe()). Never Enters into a
+// dialog, never while the TUI reports the submission queued behind startup, and stops once a
+// turn is running or the retry budget is spent. Timers are unref'd and every step re-checks
+// liveness, so a Stop/Restart turns the rest into a no-op.
+function verifyPastedSubmission(session, agent, { echoRe, label = 'submission' }) {
+  if (!echoRe) return;
+  const live = () => session.alive && session.pty && !session._terminated;
+  const later = (fn, ms) => { const timer = setTimeout(fn, ms); if (timer.unref) timer.unref(); };
+  let retries = 0;
+  let startupWaitSeenAt = 0;
+  let startupWaitClearedAt = 0;
+  let watchUntil = Date.now() + SUBMIT_WATCH_MS;
+  const check = () => {
+    if (!live()) return;
+    const tail = session._attentionTail || '';
+    const now = Date.now();
+    if (unsentPasteVisible(agent.getStartupWaitRe(), tail)) {
+      if (!startupWaitSeenAt) startupWaitSeenAt = now;
+      watchUntil = Math.max(watchUntil, startupWaitSeenAt + SUBMIT_STARTUP_WAIT_MAX_MS);
+      if (now < watchUntil) later(check, SUBMIT_POLL_MS);
+      return;
+    }
+    if (!kickoffEchoStranded(echoRe, tail)) return;             // accepted (or buried)
+    if (now >= watchUntil) return;
+    if (now - (session.lastOutputAt || 0) < SUBMIT_QUIET_MS) { later(check, SUBMIT_POLL_MS); return; }
+    if (startupWaitSeenAt && !startupWaitClearedAt) { startupWaitClearedAt = now; later(check, SUBMIT_QUIET_MS); return; }
+    const dlg = getAttentionPromptMatch(tail, session.taskAgent, session);
+    if (dlg && isInjectGateKind(dlg.kind)) { later(check, SUBMIT_POLL_MS); return; }
+    if (retries >= MAX_SUBMIT_RETRIES) {
+      console.log(`[terminal:${agent.id}] ${label} for task ${session.taskId} still unsent after ${retries} Enter retries; tail=${JSON.stringify(tail.slice(-160))}`);
+      return;
+    }
+    retries++;
+    console.log(`[terminal:${agent.id}] ${label} for task ${session.taskId} still on the composer row (PTY silent ${now - (session.lastOutputAt || 0)}ms) — re-sending Enter ${retries}/${MAX_SUBMIT_RETRIES}`);
+    if (session._ptyTrace) session._ptyTrace.write('log', `${label}: re-sending Enter ${retries}/${MAX_SUBMIT_RETRIES}`);
+    session.pty.write('\r');
+    watchUntil = Date.now() + SUBMIT_WATCH_MS;
+    later(check, SUBMIT_VERIFY_MS);
+  };
+  later(check, SUBMIT_VERIFY_MS);
 }
 
 // Called by index.js's 1s sweep while terminalIdleFallbackNeeded() holds — watcher-independent.
@@ -1439,6 +1532,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   // spawn call sites before spawnTerminal() — they already have the task row fetched, so
   // the guard no longer pays a second, uncached GET /tasks/:key per start.
   const agent = getTaskAgent(session.taskAgent || config.TASK_AGENT);
+  noticeCopy(session, 'notice.starting', { label: agent.label }, { retain: true });
   let status = await agent.cachedDetect(config);
   if (!status.available) {
     // Never fail a task start on a cached negative — one fresh probe (~500ms)
@@ -1570,6 +1664,20 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     killSpawnedPty(ptyProcess);
     throw terminalStartCanceledError();
   }
+  // (TPT9048) Optional PTY I/O trace — one wrap of pty.write() covers every input site (the
+  // injector, submit verification, pasteAndSubmit(), approvePlan(), handleTerminalInput(), the
+  // MCP-trust auto-answer); onData() below records the raw output. Off unless TIPATASK_PTY_TRACE is set.
+  const ptyTrace = openPtyTrace({
+    agentId: agent.id, taskId, spawnedAt, spec,
+    cols: opts.initialCols || 120, rows: opts.initialRows || 40,
+    userDataRoot: config.USER_DATA_ROOT,
+  });
+  if (ptyTrace) {
+    const rawWrite = ptyProcess.write.bind(ptyProcess);
+    ptyProcess.write = (data) => { ptyTrace.write('in', data); return rawWrite(data); };
+    console.log(`[terminal:${agent.id}] PTY trace for task ${taskId}: ${ptyTrace.file}`);
+  }
+  session._ptyTrace = ptyTrace;
 
   // C1218 — auto-reindex, fired strictly AFTER the PTY is alive (never before pty.spawn,
   // never awaited) so a stale-descriptions Opus run can never add latency to task launch.
@@ -1698,11 +1806,18 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   let injectPhaseStartAt = 0;
   let injectRetries = 0;
   let mcpTrustNoticeShown = false;
+  let firstRunPending = false;
   let mcpTrustAnswered = false;  // guards firing the auto-answer keystroke more than once per session (C1047)
   let firstRunNoticeShown = false;  // (C1219) guards the first, softer onboarding-wait notice
   let askQuestionNoticeShown = false;  // (C1272) guards the first "a question is waiting" notice
   let preludeSubmittedAt = 0;  // (C1260) dedicated clock for awaitPreludeRun's min/quiet/max wait — kept SEPARATE from injectPhaseStartAt, which the onData force-check below mutates for other reasons
   let preludeLongNoticeShown = false;  // (C1260) guards the ~5min "still running" notice
+  let composerStartingNoticeShown = false;  // (TPT9048) guards the composer-ready wait notice
+  // (TPT9048) The composer-ready marker is latched the moment any chunk paints it: the ready
+  // status row is painted once, and ConPTY's later blank-row repaints push it out of the
+  // 1024-byte tail long before the paste check runs.
+  const composerReadyRe = typeof agent.getComposerReadyRe === 'function' ? agent.getComposerReadyRe() : null;
+  let composerReadySeen = false;
 
   const clearInjectTimer = () => {
     if (session._injectTimer) { clearTimeout(session._injectTimer); session._injectTimer = null; }
@@ -1711,6 +1826,12 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     clearInjectTimer();
     session._injectTimer = setTimeout(onInjectSilence, delayMs);
   };
+  // (TPT9048) Injector diagnostics go to the server log AND the optional PTY trace, so a
+  // packaged Windows app (no console) still leaves evidence of what the kickoff did.
+  const logInject = (msg) => {
+    console.log(`[terminal:${agent.id}] ${msg}`);
+    if (session._ptyTrace) session._ptyTrace.write('log', msg);
+  };
   // (TPT364) See SUBMIT_VERIFY_MS. Everything here is guarded on the session still being live, so a
   // timer that outlives a Stop/Restart is a no-op (terminateTerminalSession() nulls pty/alive).
   let submitRetries = 0;
@@ -1718,6 +1839,17 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   let pasteRetries = 0;        // (TPT571) lost-paste re-paste budget — see MAX_PASTE_RETRIES
   let pasteChipSeen = false;   // (TPT571) the agent's unsent-paste chip echoed after the paste: it landed
   let bufferLenAtEnter = 0;    // (TPT571) session.buffer length when the kickoff Enter went out
+  // (TPT9048) The kickoff's own last words on the composer row (Windows Codex file handoff — no
+  // chip ever appears), and the TUI's "queued behind startup" footer. See kickoffEchoStranded().
+  const kickoffEchoRe = typeof agent.getKickoffEchoRe === 'function' ? agent.getKickoffEchoRe(spec) : null;
+  let startupWaitSeenAt = 0;     // first time the startup footer was seen after the Enter
+  let startupWaitClearedAt = 0;  // first poll that no longer saw it — one quiet window before any Enter
+  // (TPT9048) Composer writes: a bracketed-paste frame unless the agent says the console never
+  // delivers paste events to it (Codex on Windows), in which case the text goes in plain.
+  const wrapPaste = typeof agent.wrapsBracketedPaste === 'function' && agent.wrapsBracketedPaste() === false
+    ? (text) => text
+    : (text) => `\x1b[200~${text}\x1b[201~`;
+  const writePaste = (text) => session.pty.write(wrapPaste(text));
   const armSubmitCheck = (delayMs) => {
     clearTimeout(session._submitCheckTimer);
     session._submitCheckTimer = setTimeout(checkSubmitted, delayMs);
@@ -1730,14 +1862,50 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     const chipVisible = unsentPasteVisible(agent.getUnsentPasteRe(), tail);
     // (TPT571) Lost paste: the EMPTY composer is the last thing drawn (never the chip), see
     // MAX_PASTE_RETRIES. Only an agent exposing getEmptyComposerRe() (Codex) can reach this.
-    const composerEmpty = !chipVisible && !pasteChipSeen
+    // (TPT9048) A typed handoff that is still visible anywhere in the tail reached the composer
+    // (the chip-less Windows twin of pasteChipSeen) — never re-paste on top of it.
+    const echoVisible = !!(kickoffEchoRe && kickoffEchoRe.test(tail));
+    const composerEmpty = !chipVisible && !pasteChipSeen && !echoVisible
       && unsentPasteVisible(agent.getEmptyComposerRe(), tail)
       && (session.buffer || '').length - bufferLenAtEnter <= EMPTY_COMPOSER_MAX_BYTES;
-    if (!chipVisible && !composerEmpty) return;  // marker gone (or buried): the prompt went in
+    // (TPT9048) Queued behind the TUI's startup: never Enter (pointless) and never anything else
+    // (a key cancels the queue) — only wait, well past the ordinary watch window.
+    const startupWait = unsentPasteVisible(agent.getStartupWaitRe(), tail);
+    // (TPT9048) The kickoff text itself, stranded on the composer row with no running turn after it.
+    const echoStranded = !chipVisible && !composerEmpty && kickoffEchoStranded(kickoffEchoRe, tail);
     const now = Date.now();
-    if (now >= submitWatchUntil) return;
+    if (startupWait) {
+      if (!startupWaitSeenAt) {
+        startupWaitSeenAt = now;
+        logInject(`Submit verification: kickoff for task ${taskId} is queued behind the agent's startup — holding`);
+        noticeCopy(session, 'notice.submit.waitingForStartup');
+      }
+      submitWatchUntil = Math.max(submitWatchUntil, startupWaitSeenAt + SUBMIT_STARTUP_WAIT_MAX_MS);
+      if (now >= submitWatchUntil) {
+        logInject(`Submit verification: kickoff for task ${taskId} still queued behind startup after ${SUBMIT_STARTUP_WAIT_MAX_MS}ms — giving up`);
+        return;
+      }
+      armSubmitCheck(SUBMIT_POLL_MS);
+      return;
+    }
+    if (!chipVisible && !composerEmpty && !echoStranded) {
+      // marker gone (or buried): the prompt went in
+      logInject(`Submit verification: kickoff for task ${taskId} shows no unsent marker — accepted`);
+      return;
+    }
+    if (now >= submitWatchUntil) {
+      logInject(`Submit verification: kickoff for task ${taskId} still unsent when the watch window closed — no more retries`);
+      return;
+    }
     if (now - (session.lastOutputAt || 0) < SUBMIT_QUIET_MS) {
       armSubmitCheck(SUBMIT_POLL_MS);                       // still animating: a turn is (about to be) running
+      return;
+    }
+    if (startupWaitSeenAt && !startupWaitClearedAt) {
+      // (TPT9048) The footer just went away: the TUI replays the queued submission itself. Give
+      // that one full quiet window before judging the composer again.
+      startupWaitClearedAt = now;
+      armSubmitCheck(SUBMIT_QUIET_MS);
       return;
     }
     const dlg = getAttentionPromptMatch(tail, session.taskAgent, session);
@@ -1751,7 +1919,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
         return;
       }
       pasteRetries++;
-      console.log(`[terminal:${agent.id}] Submit verification: kickoff for task ${taskId} never reached the composer `
+      logInject(`Submit verification: kickoff for task ${taskId} never reached the composer `
         + `(PTY silent ${now - (session.lastOutputAt || 0)}ms, ${(session.buffer || '').length - bufferLenAtEnter} bytes since the Enter) `
         + `— pasting it again ${pasteRetries}/${MAX_PASTE_RETRIES}; tail=${JSON.stringify(tail.slice(-160))}`);
       noticeCopy(session, 'notice.submit.notReachedRepaste');
@@ -1762,9 +1930,16 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       session._injectDone = false;
       injectPhase = 'awaitPasteAck';
       typedLineSent = false;
-      session.pty.write(`\x1b[200~${initialPrompt}\x1b[201~`);
+      writePaste(initialPrompt);
       injectPhaseStartAt = now;
       armInjectTimer(agent.getPasteSilenceMs());
+      return;
+    }
+    // (TPT9048) Authoritative duplicate guard before any re-sent Enter: the agent's native
+    // transcript for this spawn already carries the kickoff -> it was accepted, whatever the
+    // screen says (a stale echo row, a repaint in flight).
+    if (echoStranded && typeof agent.kickoffAccepted === 'function' && agent.kickoffAccepted(session)) {
+      logInject(`Submit verification: kickoff for task ${taskId} is in the agent's transcript — accepted`);
       return;
     }
     if (submitRetries >= MAX_SUBMIT_RETRIES) {
@@ -1774,8 +1949,8 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     submitRetries++;
     // Server-log the state too: why the first Enter was lost is not known, and this line is the
     // evidence a future diagnosis needs (how long the PTY was silent, what the tail looked like).
-    console.log(`[terminal:${agent.id}] Submit verification: kickoff for task ${taskId} still unsent after the Enter `
-      + `(PTY silent ${now - (session.lastOutputAt || 0)}ms) — re-sending Enter ${submitRetries}/${MAX_SUBMIT_RETRIES}; `
+    logInject(`Submit verification: kickoff for task ${taskId} still unsent after the Enter `
+      + `(${echoStranded ? 'typed text on the composer row' : 'paste chip'}, PTY silent ${now - (session.lastOutputAt || 0)}ms) — re-sending Enter ${submitRetries}/${MAX_SUBMIT_RETRIES}; `
       + `tail=${JSON.stringify(tail.slice(-160))}`);
     noticeCopy(session, 'notice.submit.typedRetryEnter');
     session.pty.write('\r');
@@ -1834,7 +2009,9 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     // before the shared mcpTrust/toolApproval defer block so 'firstRun' never falls through that
     // branch's cap-then-paste fallback — see the constant's own doc comment for why 'firstRun'
     // must never fall through to a blind paste at all.
-    if (dlg && dlg.kind === 'firstRun' && !isClaudeReplReady(session._attentionTail)) {
+    if (dlg && dlg.kind === 'firstRun') firstRunPending = true;
+    if (firstRunPending && isClaudeReplReady(session._attentionTail)) firstRunPending = false;
+    if (firstRunPending) {
       if (!firstRunNoticeShown) {
         firstRunNoticeShown = true;
         noticeCopy(session, 'notice.inject.firstRunWaiting');
@@ -1910,15 +2087,34 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       const elapsed = Date.now() - injectFirstOutputAt;
       const floor = agent.getInteractiveReadyMs();
       if (elapsed < floor) { armInjectTimer(floor - elapsed); return; }
+      // (TPT9048) Composer-ready marker (Codex on Windows): the TUI paints its composer long
+      // before the thread is started, and a kickoff typed into that provisional composer is
+      // queued behind startup at best. Defer, refreshing injectPhaseStartAt so the onData
+      // ceiling cannot force the paste; past getComposerReadyMaxMs() paste anyway and let submit
+      // verification deal with it.
+      if (composerReadyRe && !composerReadySeen && !composerReadyRe.test(session._attentionTail || '')) {
+        if (elapsed < agent.getComposerReadyMaxMs()) {
+          if (!composerStartingNoticeShown) {
+            composerStartingNoticeShown = true;
+            logInject(`awaitReady: composer for task ${taskId} is still starting — holding the kickoff`);
+            noticeCopy(session, 'notice.inject.composerStarting');
+          }
+          injectPhaseStartAt = Date.now();
+          armInjectTimer(INJECT_DIALOG_RETRY_MS);
+          return;
+        }
+        logInject(`awaitReady: composer-ready marker for task ${taskId} not seen within ${agent.getComposerReadyMaxMs()}ms — pasting anyway`);
+      }
       // (C1260) design mode: paste the /design prelude alone first, never fused with the
       // task prompt — a slash command fused into a multi-line paste never runs as a
       // command. No prelude -> unchanged original behavior.
       if (preludePrompt) {
-        session.pty.write(`\x1b[200~${preludePrompt}\x1b[201~`);
+        writePaste(preludePrompt);
         injectPhase = 'awaitPreludeAck';
       } else {
-        session.pty.write(`\x1b[200~${initialPrompt}\x1b[201~`);
+        writePaste(initialPrompt);
         injectPhase = 'awaitPasteAck';
+        logInject(`awaitReady: kickoff for task ${taskId} pasted after ${elapsed}ms (${initialPrompt.length} chars${kickoffTypedLine ? ', typed suffix follows' : ''})`);
       }
       injectPhaseStartAt = Date.now();
       // Verify the paste landed: the TUI echoes it; once that render settles the paste
@@ -1951,7 +2147,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       const gated = !!(dlg && isInjectGateKind(dlg.kind));
       const replReady = isClaudeReplReady(session._attentionTail);
       const release = () => {
-        session.pty.write(`\x1b[200~${initialPrompt}\x1b[201~`);
+        writePaste(initialPrompt);
         injectPhase = 'awaitPasteAck';
         injectPhaseStartAt = now;
         armInjectTimer(agent.getPasteSilenceMs());
@@ -1989,6 +2185,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       if (kickoffTypedLine && !typedLineSent) {
         typedLineSent = true;
         session.pty.write(kickoffTypedLine);
+        logInject(`awaitPasteAck: typed suffix for task ${taskId} written`);
         injectPhaseStartAt = Date.now();
         armInjectTimer(agent.getPasteSilenceMs());
         return;
@@ -1996,11 +2193,13 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       injectDone = true;
       injectPhase = 'done';
       session.pty.write('\r');
+      logInject(`awaitPasteAck: kickoff Enter for task ${taskId} written`);
       // (TPT364) Confirm the Enter actually submitted the paste — see SUBMIT_VERIFY_MS.
       // (TPT571) Also watches for the empty-composer lost-paste state, see MAX_PASTE_RETRIES.
+      // (TPT9048) And for the stranded typed handoff / startup-queued states.
       submitWatchUntil = Date.now() + SUBMIT_WATCH_MS;
       bufferLenAtEnter = (session.buffer || '').length;
-      if (agent.getUnsentPasteRe() || agent.getEmptyComposerRe()) armSubmitCheck(SUBMIT_VERIFY_MS);
+      if (agent.getUnsentPasteRe() || agent.getEmptyComposerRe() || kickoffEchoRe || agent.getStartupWaitRe()) armSubmitCheck(SUBMIT_VERIFY_MS);
     }
   }
 
@@ -2012,6 +2211,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   }
 
   ptyProcess.onData((data) => {
+    if (ptyTrace) ptyTrace.write('out', data);
     session.lastOutputAt = Date.now();
     session._terminalOutputSeen = true;
     // (C1060) Strip OSC (terminal title, OSC 9;4 progress, OSC 8 hyperlinks, OSC 52 clipboard)
@@ -2034,10 +2234,15 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       session._attentionTail = '';
     }
     session._attentionTail = ((session._attentionTail || '') + cleanChunk).slice(-ATTENTION_WINDOW_BYTES);
+    if (!injectDone && composerReadyRe && !composerReadySeen && composerReadyRe.test(session._attentionTail)) {
+      composerReadySeen = true; // (TPT9048) see the latch's declaration
+    }
     // Tail-scoped match: feeds ONLY onInjectSilence()'s paste-injection gate (above) and the
     // plan-ready state machine below. The real-time attention signal is computed separately,
     // line-scoped, by feedAttentionChunk() — see its comment for why the two are kept apart.
     let attentionMatch = getAttentionPromptMatch(session._attentionTail, session.taskAgent, session);
+    if (!injectDone && attentionMatch?.kind === 'firstRun') firstRunPending = true;
+    if (firstRunPending && isClaudeReplReady(session._attentionTail)) firstRunPending = false;
     // (C1386) Hoisted above feedAttentionChunk() so its step 4 can consult shouldHoldAttention()
     // against the SAME tail kind the C1120 block below reasons about — was previously computed
     // only after feedAttentionChunk() ran.
@@ -2074,7 +2279,9 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     if (!injectDone) {
       // (TPT571) The paste chip echoing while the paste settles proves it reached the composer —
       // the lost-paste fallback in checkSubmitted() must then never fire for this attempt.
-      if (injectPhase === 'awaitPasteAck' && unsentPasteVisible(agent.getUnsentPasteRe(), session._attentionTail)) {
+      if (injectPhase === 'awaitPasteAck'
+          && (unsentPasteVisible(agent.getUnsentPasteRe(), session._attentionTail)
+              || (kickoffEchoRe && kickoffEchoRe.test(session._attentionTail || '')))) { // (TPT9048) typed handoff echoed
         pasteChipSeen = true;
       }
       const now = Date.now();
@@ -2123,7 +2330,8 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       const elapsed = Date.now() - session._planFirstArmedAt;
       const delay = Math.max(0, Math.min(2000, 10000 - elapsed));
       session._planIdleTimer = setTimeout(() => {
-        if (session.terminalPhase === 'planning' && !session._planReadySent
+        if (session.alive && session.terminalPhase === 'planning' && !session._planReadySent
+            && piPlanReadyIsFresh(session)
             && session.ws && session.ws.readyState === session.ws.OPEN) {
           session._planReadySent = true;
           if (!session._attentionState) {
@@ -2149,6 +2357,8 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     if (session._approvalWatchdogTimer) { clearTimeout(session._approvalWatchdogTimer); session._approvalWatchdogTimer = null; }
     if (session._tokenExpiryWatch) { session._tokenExpiryWatch.cancel(); session._tokenExpiryWatch = null; } // (TPT349)
     console.log(`[terminal:${agent.id}] Process exited for task ${taskId} (code ${exitCode})`);
+    if (ptyTrace) { ptyTrace.write('log', `exit code ${exitCode}`); ptyTrace.close(); }
+    if (session._ptyTrace === ptyTrace) session._ptyTrace = null;
     if (session._terminated) return;
     session.alive = false;
     session.exitCode = exitCode;
@@ -2190,6 +2400,12 @@ function handleTerminalInput(session, data) {
     session._attentionTail = '';
     session._attentionLineCarry = '';
     session._attentionRowCarry = '';
+  }
+  // (TPT9048) A user Enter takes over the kickoff: the automatic submit retry must not follow it
+  // with another Enter into whatever the user is now doing.
+  if (/[\r\n]/.test(data) && session._submitCheckTimer) {
+    clearTimeout(session._submitCheckTimer);
+    session._submitCheckTimer = null;
   }
   if (!session._userInteracted) session._userInteracted = true;
 
@@ -2380,6 +2596,10 @@ module.exports = {
   MAX_PASTE_RETRIES,
   EMPTY_COMPOSER_MAX_BYTES,
   unsentPasteVisible,
+  kickoffEchoStranded,          // (TPT9048)
+  KICKOFF_ECHO_TRAILING_MAX,    // (TPT9048)
+  SUBMIT_STARTUP_WAIT_MAX_MS,   // (TPT9048)
+  verifyPastedSubmission,       // (TPT9048)
   emitTerminalState,
   emitTerminalNotice,
   emitTerminalWarning,
@@ -2406,6 +2626,7 @@ module.exports = {
   forceResumeRepaint,
   getAttentionPromptMatch,
   codexPlanReadyIsFresh,
+  piPlanReadyIsFresh,
   CODEX_PLAN_QUIET_MS,
   getMcpTrustAutoAnswer,
   carveAttentionLines,

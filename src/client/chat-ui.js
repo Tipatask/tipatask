@@ -197,6 +197,11 @@ function objectiveErrorMessage(reason, attempts, detail, label, model) {
 function objectiveRetryBannerText(cs, previewRaw) {
   const reason = cs && cs._lastErrorReason;
   const label = providerLabelFor(cs, cs && cs._lastErrorProvider);
+  const result = [...(cs?.messages || [])].reverse().find(m => m.role === 'assistant')?.proposalResult;
+  if (!reason && result?.status === 'rejected') return t('chat.result.rejected') + ' ' + t('chat.error.retryOrRefineInstructions');
+  if (!reason && cs?.lastParseError) {
+    return t(cs.lastParseError.rawLength ? 'chat.error.unreadableCards' : 'chat.error.emptyOutput') + ' ' + t('chat.error.retryOrRefineInstructions');
+  }
   if (!reason) {
     return [
       t('chat.error.noCards', { label }),
@@ -1263,6 +1268,7 @@ export function saveChatState() {
         // reloading a chat with unsaved cards lost its tag registrations.
         newTags: m.newTags || [],
         objectiveSummary: m.objectiveSummary || null,
+        proposalResult: m.proposalResult || null,
         discarded: m.discarded || false,
         streaming: false,
         timestamp: m.timestamp,
@@ -1899,6 +1905,13 @@ function captureFocusedComposerForRerender() {
   return { ...captureObjectiveViewState(), messagesScrollTop: null, tabId: state.activeTabId };
 }
 
+function objectiveProposalNotice(msg) {
+  if (msg.streaming || msg.cards?.length) return '';
+  const result = msg.proposalResult;
+  if (!result || !['empty', 'rejected'].includes(result.status)) return '';
+  return [t(`chat.result.${result.status}`), result.reason].filter(Boolean).join('\n');
+}
+
 // ── Render objective tab content (returns HTML string) ──
 export function renderObjectiveContent(options = {}) {
   if (state.chatState) syncChatHistoryMeta(state.chatState);
@@ -1940,6 +1953,8 @@ export function renderObjectiveContent(options = {}) {
       if (displayText) {
         body += `<div class="chat-stream-text">${escapeAttr(displayText)}</div>`;
       }
+      const proposalNotice = objectiveProposalNotice(msg);
+      if (proposalNotice) body += `<div class="chat-stream-text">${escapeAttr(proposalNotice)}</div>`;
       // Typing indicator — stays inside the clamped body so it never gets stranded below a
       // clip that hasn't measured yet; harmless since streaming bubbles render expanded.
       if (msg.streaming) {
@@ -2902,6 +2917,9 @@ export function connectObjectiveWS(taskId, prompt, opts) {
         if (msg.filesAddressed) lastMsgOR.filesAddressed = msg.filesAddressed;
         if (msg.docUpdates) lastMsgOR.docUpdates = msg.docUpdates;
         if (msg.timingMilestones) lastMsgOR.timingMilestones = msg.timingMilestones;
+        if (lastMsgOR._exitHandled) return;
+        if (msg.proposalResult) lastMsgOR.proposalResult = msg.proposalResult;
+        else if (Array.isArray(msg.cards)) lastMsgOR.proposalResult = { status: msg.cards.length ? 'cards' : 'empty', reason: '' };
         if (Array.isArray(msg.cards)) {
           lastMsgOR._serverCards = msg.cards;
           lastMsgOR.streaming = false;
@@ -2959,6 +2977,8 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       const rawContent = cs.cleanContent || stripAnsi(cs.clientBuffer);
       const lastMsg = cs.messages[cs.messages.length - 1];
       if (lastMsg && lastMsg.role === 'assistant') {
+        if (lastMsg._exitHandled) return;
+        lastMsg._exitHandled = true;
         lastMsg.streaming = false;
         try {
           let cards;
@@ -2972,6 +2992,7 @@ export function connectObjectiveWS(taskId, prompt, opts) {
           } else {
             const proposals = parseObjectiveResult(rawContent);
             cards = proposals.changes;
+            lastMsg.proposalResult = proposals.proposalResult;
             lastMsg.filesAddressed = proposals.files_addressed || [];
             lastMsg.docUpdates = proposals.doc_updates || [];
             lastMsg.newTags = Array.isArray(proposals.new_tags) ? proposals.new_tags : [];
@@ -2984,11 +3005,15 @@ export function connectObjectiveWS(taskId, prompt, opts) {
           const confirmedIds = _getConfirmedTaskIds(cs, lastMsgIdx);
           const filtered = cards.filter(c => !confirmedIds.has(c.task.id));
           filtered.forEach(c => { if (!c.task.tags) c.task.tags = []; });
+          const sameCards = JSON.stringify(lastMsg.cards) === JSON.stringify(filtered);
           lastMsg.cards = filtered;
           // (TPT15) origin-linked chat: a stray "modified" card outside the objective's
           // own subtree starts unchecked (opt-in), not just accepted by default.
-          lastMsg.acceptedMask = buildInitialAcceptedMask(cs, filtered);
-          lastMsg.confirmedMask = filtered.map(() => false);
+          if (!sameCards) {
+            lastMsg.acceptedMask = buildInitialAcceptedMask(cs, filtered);
+            lastMsg.confirmedMask = filtered.map(() => false);
+          }
+          cs.lastParseError = null;
           notifyObjectiveCardsReady(lastMsg, cards.length, wsTabId);
           // Accumulate for feedback context
           cs.allChanges = cs.allChanges.concat(filtered);
@@ -3028,22 +3053,16 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       const lastAssistant = [...cs.messages].reverse().find(m => m.role === 'assistant');
       const hasCards = lastAssistant && lastAssistant.cards && lastAssistant.cards.length > 0;
 
-      // Deferred efficiency analysis (claude-session.js:1136) may emit a `cards-update`
-      // frame on slow turns — suppress retry banner until that arrives.
-      const tm = lastAssistant && lastAssistant.timingMilestones;
-      const totalTurnMs = (tm && tm.turnStart != null && tm.turnEnd != null)
-        ? (tm.turnEnd - tm.turnStart) : 0;
-      const SLOW_TURN_MS = 60000;
-      if (!hasCards && msg.code === 0 && totalTurnMs > SLOW_TURN_MS) {
-        cs.pendingCardsUpdate = true;
-      }
-
-      if ((msg.code !== 0 || !cs.cleanContent || !hasCards) && !cs.pendingCardsUpdate) {
-        cs.retryable = true;
-      }
+      // Efficiency hints are supplemental; they cannot turn a missing proposal
+      // result into success. Never infer a pending update from elapsed time.
+      cs.pendingCardsUpdate = false;
+      const outcome = lastAssistant?.proposalResult?.status;
+      const validBatch = ['empty', 'cards'].includes(outcome);
+      cs.retryable = msg.code !== 0 || (!hasCards && !validBatch);
 
       // Auto-retry once silently when code=0, content present, but no cards
-      if (msg.code === 0 && cs.cleanContent && !hasCards && !cs.pendingCardsUpdate && cs.autoRetryCount < 1) {
+      if (msg.code === 0 && cs.cleanContent && !hasCards && !outcome && !cs._lastErrorReason
+        && !cs.messages.some(m => m.cards?.length) && cs.autoRetryCount < 1) {
         cs.autoRetryCount++;
         cs.messages.push({ role: 'system', content: t('chat.noTasksRetrying'), cards: [], acceptedMask: [], confirmedMask: [], discarded: false, streaming: false, timestamp: Date.now() });
         repaint();
@@ -3194,10 +3213,15 @@ export function connectObjectiveWS(taskId, prompt, opts) {
         const lastAssistantIdx = cs.messages.lastIndexOf(lastAssistant);
         const confirmedIds = _getConfirmedTaskIds(cs, lastAssistantIdx);
         const filtered = msg.cards.filter(c => !confirmedIds.has(c.task.id));
+        filtered.forEach(c => { if (!c.task.tags) c.task.tags = []; });
+        const sameCards = JSON.stringify(lastAssistant.cards) === JSON.stringify(filtered);
         lastAssistant.cards = filtered;
+        if (msg.proposalResult) lastAssistant.proposalResult = msg.proposalResult;
         // (TPT15) see buildInitialAcceptedMask() call above — same out-of-subtree guard.
-        lastAssistant.acceptedMask = buildInitialAcceptedMask(cs, filtered);
-        lastAssistant.confirmedMask = filtered.map(() => false);
+        if (!sameCards) {
+          lastAssistant.acceptedMask = buildInitialAcceptedMask(cs, filtered);
+          lastAssistant.confirmedMask = filtered.map(() => false);
+        }
         lastAssistant.filesAddressed = msg.filesAddressed || [];
         lastAssistant.docUpdates = msg.docUpdates || [];
         // C1439: the server already sends newTags/objectiveSummary on this frame
@@ -3333,10 +3357,14 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       const confirmedIds = _getConfirmedTaskIds(cs, targetIdx);
       const filtered = (msg.cards || []).filter(c => !confirmedIds.has(c.task && c.task.id));
       filtered.forEach(c => { if (c.task && !c.task.tags) c.task.tags = []; });
+      const sameCards = JSON.stringify(targetMsg.cards) === JSON.stringify(filtered);
       targetMsg.cards = filtered;
+      if (msg.proposalResult) targetMsg.proposalResult = msg.proposalResult;
       // (TPT15) see buildInitialAcceptedMask() call above — same out-of-subtree guard.
-      targetMsg.acceptedMask = buildInitialAcceptedMask(cs, filtered);
-      targetMsg.confirmedMask = filtered.map(() => false);
+      if (!sameCards) {
+        targetMsg.acceptedMask = buildInitialAcceptedMask(cs, filtered);
+        targetMsg.confirmedMask = filtered.map(() => false);
+      }
       cs.pendingCardsUpdate = false;
       if (filtered.length > 0) {
         cs.retryable = false;

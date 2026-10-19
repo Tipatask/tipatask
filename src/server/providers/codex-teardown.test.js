@@ -7,6 +7,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
 const { createRequire } = require('node:module');
@@ -14,7 +15,7 @@ const { EventEmitter } = require('node:events');
 
 const throttle = require('../objective-throttle');
 
-function harness(t) {
+function harness(t, { realEnv = false } = {}) {
   // The spawned turn arms a 10-minute deadline + a ticker; mocked so they can't hold the process.
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const spawned = [];
@@ -41,6 +42,7 @@ function harness(t) {
     '../task-agent/attachments': { localizeAttachments: async ({ prompt }) => { await localizeGate; return { prompt }; } },
     '../context-manager': { shouldTrimContext: () => false, trimContext: () => false },
   };
+  if (realEnv) delete mocks['../codex-env'];
   const module = { exports: {} };
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
     module, exports: module.exports,
@@ -118,6 +120,53 @@ for (const resumed of [false, true]) {
     } else {
       assert.equal(args[args.indexOf('-s') + 1], 'read-only');
       assert.match(h.spawned[0].stdinText, /plan it/);
+    }
+  });
+}
+
+for (const code of ['EPERM', 'EINVAL']) {
+  test(`Codex task and fresh/resumed chat reach launch with copied auth after ${code}`, async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-codex-auth-launch-'));
+    const projectRoot = path.join(root, 'project');
+    const globalHome = path.join(root, 'user-codex');
+    const previous = process.env.CODEX_HOME;
+    t.after(() => {
+      if (previous === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previous;
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+    fs.mkdirSync(projectRoot);
+    fs.mkdirSync(globalHome);
+    fs.writeFileSync(path.join(globalHome, 'config.toml'), '');
+    const auth = '{"token":"synthetic-codex-auth"}';
+    fs.writeFileSync(path.join(globalHome, 'auth.json'), auth);
+    process.env.CODEX_HOME = globalHome;
+    const symlink = fs.symlinkSync;
+    t.mock.method(fs, 'symlinkSync', (source, target, ...args) => {
+      if (path.basename(target) === 'auth.json') throw Object.assign(new Error('auth symlink denied'), { code });
+      return symlink(source, target, ...args);
+    });
+
+    const CodexAgent = require('../task-agent/codex-agent');
+    const spec = await new CodexAgent().getSpawnSpec({ CODEX_BIN: 'codex', PROJECT_ROOT: projectRoot, USER_DATA_ROOT: root },
+      'Work on task AUTH-PROBE.', '', { projectPath: projectRoot });
+    const terminalAuth = path.join(spec.env.CODEX_HOME, 'auth.json');
+    assert.equal(fs.lstatSync(terminalAuth).isFile(), true);
+    assert.equal(fs.readFileSync(terminalAuth, 'utf8'), auth);
+
+    const h = harness(t, { realEnv: true });
+    Object.assign(h.session, { type: 'taskChat', toolProfile: 'taskChat', projectPath: projectRoot });
+    for (const resumed of [false, true]) {
+      h.session.codexSessionId = resumed ? 'fixture-thread' : null;
+      h.codex.spawnCodexTurn(h.session, `taskChat:auth-${code}-${resumed}`);
+      h.releaseLocalize();
+      await settle(); await settle();
+      assert.equal(h.spawned.length, resumed ? 2 : 1, 'chat reaches process spawn without an auth error');
+      const { options } = h.spawned.at(-1).spawnArgs;
+      const chatAuth = path.join(options.env.CODEX_HOME, 'auth.json');
+      assert.equal(fs.lstatSync(chatAuth).isFile(), true);
+      assert.equal(fs.readFileSync(chatAuth, 'utf8'), auth);
+      assert.equal(h.session._spawning, false);
     }
   });
 }

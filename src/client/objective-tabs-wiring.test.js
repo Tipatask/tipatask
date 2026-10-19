@@ -105,7 +105,10 @@ test("template.html: onProjectChanged clears state.objectiveTabs", () => {
 test('task-board.js: updateClaudeButtons() dispatches tiptask:objective-tabs-sync', () => {
   const src = readSource('task-board.js');
   const body = extractFunctionBody(src, 'updateClaudeButtons');
-  assert.match(body, /tiptask:objective-tabs-sync/,
+  // (TPT9025) The tail lives in _syncSessionSurfaces(), which updateClaudeButtons() also runs
+  // while a card drag holds its board half back.
+  assert.equal((body.match(/_syncSessionSurfaces\(\);/g) || []).length, 2);
+  assert.match(extractFunctionBody(src, '_syncSessionSurfaces'), /tiptask:objective-tabs-sync/,
     "updateClaudeButtons()'s tail must dispatch tiptask:objective-tabs-sync — without it, " +
     "a local session start (openTerminal()'s ws.onopen, startTaskSession()) never repaints " +
     "the objective nav tabs since neither calls loadAndRender()");

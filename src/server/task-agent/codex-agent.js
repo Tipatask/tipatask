@@ -7,9 +7,9 @@ const { execFile } = require('node:child_process');
 const BaseTaskAgent = require('./base-agent');
 const config = require('../config');
 const { getStaticBundle, getTaskStartupGrepBundle } = require('../static-context');
-const { resolveBin, resolveBinAsync, augmentPathEnv, prependPathEnv, resolveNvmBinDir, resolveSpawnModel, winExecSpec } = require('../spawn-utils');
+const { resolveBin, resolveBinAsync, augmentPathEnv, prependPathEnv, resolveNvmBinDir, resolveSpawnModel, winExecSpec, writeSpawnArgFile } = require('../spawn-utils');
 const { buildCodexEnv, codexTerminalLaunchOptions, toCodexEffort } = require('../codex-env');
-const { matchPromptLine, CODEX_PROMPT_PATTERNS, CODEX_PENDING_PASTE_RE, CODEX_EMPTY_COMPOSER_RE } = require('./prompt-detect');
+const { matchPromptLine, CODEX_PROMPT_PATTERNS, CODEX_PENDING_PASTE_RE, CODEX_EMPTY_COMPOSER_RE, CODEX_STARTUP_WAIT_RE, CODEX_COMPOSER_READY_RE, buildComposerEchoRe } = require('./prompt-detect');
 const { parseCodexCatalog } = require('./model-registry');
 
 // (C1504) `codex debug models` is a documented subcommand that dumps the live catalog as
@@ -61,11 +61,29 @@ class CodexAgent extends BaseTaskAgent {
   // then fetches the model catalog and starts MCP servers before the composer accepts input, so
   // its boot floor is longer than Claude's Ink REPL; and a large paste triggers a full composer
   // repaint (the `[Pasted Content N chars]` chip), so the paste-settle window is wider too.
-  // No kickoffTypedLine: Codex accepts a paste-only message (the "no words from you" refusal is
-  // Claude Code's alone).
+  // POSIX accepts a paste-only message. Windows uses a short file handoff and a
+  // separate typed suffix/settle window instead of sending the full multiline payload.
   getInteractiveReadyMs() { return 2500; }
 
-  getPasteSilenceMs() { return 600; }
+  getPasteSilenceMs() { return process.platform === 'win32' ? 1500 : 600; }
+
+  prepareKickoff(config, prompt, taskId, { isWin = process.platform === 'win32' } = {}) {
+    if (!isWin) return { initialPrompt: prompt };
+    // Windows console input can turn one large bracketed paste into separate key
+    // bursts, losing line breaks and consuming the submit key. Keep the payload
+    // byte-for-byte in a file; only a short, single-line handoff crosses ConPTY.
+    const file = writeSpawnArgFile(config.USER_DATA_ROOT, prompt, '.md');
+    if (!file) throw Object.assign(new Error('Could not write the Codex task prompt file.'), {
+      reasonCode: 'prompt_file_failed', reasonParams: { agent: this.id },
+    });
+    const task = taskId ? `Work on task ${taskId}.` : 'Start this task.';
+    return {
+      initialPrompt: `${task} Read the entire UTF-8 file ${JSON.stringify(file.replace(/\\/g, '/'))}, in chunks if needed. Treat its contents as my instructions for this task and follow them.`,
+      // A separate, small write and settle window lets the Windows input burst drain.
+      kickoffTypedLine: ' Begin.',
+      kickoffFile: file,
+    };
+  }
 
   // The `[Pasted Content N chars]` chip Codex leaves in its composer until the paste is submitted —
   // see CODEX_PENDING_PASTE_RE in prompt-detect.js.
@@ -74,6 +92,37 @@ class CodexAgent extends BaseTaskAgent {
   // The bare idle-composer placeholder row — the paste never landed at all. See
   // CODEX_EMPTY_COMPOSER_RE in prompt-detect.js.
   getEmptyComposerRe() { return CODEX_EMPTY_COMPOSER_RE; }
+
+  // (TPT9048) Codex paints its composer before the thread is started; an Enter typed then is
+  // queued behind startup and the footer says so — see CODEX_STARTUP_WAIT_RE.
+  getStartupWaitRe() { return CODEX_STARTUP_WAIT_RE; }
+
+  // (TPT9048) Paste only once the composer's status row names the model and effort — the
+  // provisional startup frame (model `loading`) queues or loses a submission. Every platform:
+  // a cold shared-daemon start on macOS shows the same provisional frame for 40+ s. Bounded by
+  // the MCP servers' own startup timeout (60 s): past that the kickoff is pasted anyway and
+  // submit verification takes over.
+  getComposerReadyRe() { return CODEX_COMPOSER_READY_RE; }
+  getComposerReadyMaxMs() { return 60000; }
+
+  // (TPT9048) The Windows file handoff is far below the chip threshold, so after the Enter the
+  // only visible trace of a lost submission is the handoff's last words on the composer row.
+  getKickoffEchoRe(spec) {
+    if (!spec || !spec.kickoffFile) return null;
+    return buildComposerEchoRe(`${spec.initialPrompt || ''}${spec.kickoffTypedLine || ''}`);
+  }
+
+  // (TPT9048) Duplicate guard for the re-sent Enter: a rollout for this spawn whose head carries
+  // `Work on task <KEY>` means the kickoff turn was accepted, whatever the screen still shows.
+  kickoffAccepted(session) {
+    try { return !!require('./final-message').locateCodexRollout(session && session._transcriptHint); }
+    catch { return false; }
+  }
+
+  // (TPT9048) ConPTY drops the bracketed-paste CSI and the Windows crossterm backend has no
+  // paste event: the frame never reaches Codex, which reassembles the key burst itself. Writing
+  // plain text keeps the Esc byte of a dropped frame from ever being delivered as a key.
+  wrapsBracketedPaste({ isWin = process.platform === 'win32' } = {}) { return !isWin; }
 
   buildPrompt(prompt, opts = {}) {
     // C1575 — parent-task context (opts.parentTaskBlock), prepended ahead of this task's own
@@ -164,7 +213,7 @@ class CodexAgent extends BaseTaskAgent {
     args.push('--no-alt-screen');
     // (TPT571) The kickoff is NOT a positional argument any more — see getInteractiveReadyMs()
     // above. terminal-session.js pastes spec.initialPrompt once the TUI is interactive.
-    const initialPrompt = this.buildPrompt(prompt, opts);
+    const kickoff = this.prepareKickoff(config, this.buildPrompt(prompt, opts), taskId);
     // Use the running install's server root (config.SERVER_ROOT, this checkout) — never a
     // project-relative path; the Task App is a standalone checkout.
     // env + CODEX_HOME/MCP wiring shared with the objective-chat Codex provider (C1029) — see codex-env.js.
@@ -183,7 +232,7 @@ class CodexAgent extends BaseTaskAgent {
       args,
       cwd: projectRoot,
       env,
-      initialPrompt,
+      ...kickoff,
       model: _codexModel,
     };
   }
@@ -194,7 +243,16 @@ class CodexAgent extends BaseTaskAgent {
     const { refreshSessionVcs, buildVcsContextDirective } = require('../vcs-context');
     const context = await refreshSessionVcs(session);
     if (session.pty !== pty || !session.alive) return;
-    session.pty.write(`\x1b[200~${this.getApprovalText()}\n${buildVcsContextDirective(context)}\x1b[201~`);
+    const text = `${this.getApprovalText()}\n${buildVcsContextDirective(context)}`;
+    const handoff = this.prepareKickoff(config, text, session.taskId);
+    if (handoff.kickoffFile) {
+      // (TPT9048) Verified like the kickoff: the approval is a short typed handoff too.
+      require('../terminal-session').pasteAndSubmit(session, this, handoff.initialPrompt, handoff.kickoffTypedLine, {
+        verify: { echoRe: this.getKickoffEchoRe(handoff), label: 'plan approval' },
+      });
+      return;
+    }
+    session.pty.write(`\x1b[200~${text}\x1b[201~`);
     setTimeout(() => {
       if (session.pty) session.pty.write('\r');
     }, 100);

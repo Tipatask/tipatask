@@ -96,7 +96,7 @@ if (process.platform === 'win32') {
 
   // (TPT9008) A launcher that resolves but cannot run — here its interpreter is missing, so the
   // login probe's spawn fails with ENOENT — is `cli_missing`, not `cli_not_found` (nothing resolved).
-  for (const [name, load] of [['claude', () => require('./claude-agent')], ['codex', () => require('./codex-agent')]]) {
+  for (const [name, load] of [['claude', () => require('./claude-agent')], ['codex', () => require('./codex-agent')], ['pi', () => require('./pi-agent')]]) {
     test(`${name} detect(): a launcher whose interpreter is missing -> cli_missing with its detail`, async () => {
       const Agent = load();
       const bin = path.join(dir, `${name}-noexec`);
@@ -117,6 +117,22 @@ if (process.platform === 'win32') {
       }
     });
   }
+
+  test('Pi diagnostic script prints launch, raw version failure, and detection detail', () => {
+    const { execFileSync } = require('node:child_process');
+    const bin = stub('pi-failed', 'echo "Pi startup failed"; exit 7');
+    const output = execFileSync(process.execPath, [path.resolve(__dirname, '../../../scripts/probe-agent-detect.js'), '--agent', 'pi'], {
+      encoding: 'utf8', timeout: 30000,
+      env: { ...process.env, PI_BIN: bin, TIPATASK_PROJECT_ROOT: dir, TIPATASK_USER_DATA: dir },
+    });
+    assert.match(output, /pi: launch resolution/);
+    assert.match(output, /resolvePiLaunchAsync\(\)/);
+    assert.match(output, /pi: version probe/);
+    assert.match(output, /probe exit status\s+7/);
+    assert.match(output, /Pi startup failed/);
+    assert.match(output, /available\s+false/);
+    assert.match(output, /detail\s+\{\s*bin:[\s\S]*?pi-failed[\s\S]*?exit: 7/);
+  });
 
   test('a logged-in Codex stub yields a positive whose detail is only { bin, version } — no probe output', async () => {
     const CodexAgent = require('./codex-agent');

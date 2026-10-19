@@ -1045,10 +1045,7 @@ function prepareCodexTerminalHome({ projectRoot, codexHome, effort, env = {} }) 
   const auth = path.join(codexHome, 'auth.json');
   const snapshotAuth = path.join(home, 'auth.json');
   if (fs.existsSync(auth)) {
-    try { fs.symlinkSync(auth, snapshotAuth); }
-    catch (err) {
-      if (err.code !== 'EEXIST' || fs.realpathSync(snapshotAuth) !== fs.realpathSync(auth)) throw err;
-    }
+    ensureCodexAuthLink(auth, snapshotAuth);
   }
   const cache = path.join(codexHome, 'models_cache.json');
   if (fs.existsSync(cache) && !fs.existsSync(path.join(home, 'models_cache.json'))) {
@@ -1081,48 +1078,49 @@ function updateGlobalCodexMcpApprovalConfig({ targetPath, projectRoot, mcpServer
   fs.writeFileSync(targetPath, out.endsWith('\n') ? out : `${out}\n`, 'utf8');
 }
 
-function ensureProjectAuthLink(paths) {
-  if (!fs.existsSync(paths.globalAuthPath)) {
-    return { ok: false, reason: 'global-auth-missing' };
-  }
-
-  let needsLink = false;
+// File symlinks require extra privileges on Windows. Regular files are managed
+// copies: refresh on newer source metadata or changed contents, including token
+// rotations that preserve the source timestamp.
+function ensureCodexAuthLink(source, target) {
+  let stat;
   try {
-    const stat = fs.lstatSync(paths.projectAuthPath);
+    stat = fs.lstatSync(target);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  if (stat) {
     if (stat.isSymbolicLink()) {
-      const target = fs.readlinkSync(paths.projectAuthPath);
-      if (target === paths.globalAuthPath && fs.existsSync(paths.projectAuthPath)) {
+      if (fs.readlinkSync(target) === source && fs.existsSync(target)) {
         // Correct symlink pointing at a live target — nothing to do.
         return { ok: true, reason: 'already-linked' };
       }
       // Wrong target or dangling symlink — recreate.
-      fs.rmSync(paths.projectAuthPath, { force: true });
-      needsLink = true;
-    } else {
-      // Regular file: keep only when it parses as a JSON object (genuine standalone auth).
-      // A materialized symlink (e.g. the path-string "/Users/.../.codex/auth.json" written
-      // as plain text by git-checkout / rsync) is NOT valid JSON → replace with symlink.
-      try {
-        const raw = fs.readFileSync(paths.projectAuthPath, 'utf8');
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return { ok: true, reason: 'project-auth-exists' };
-        }
-      } catch { /* not valid JSON — fall through to recreate */ }
-      fs.rmSync(paths.projectAuthPath, { force: true });
-      needsLink = true;
+      fs.rmSync(target, { force: true });
+    } else if (stat.isFile()) {
+      if (fs.statSync(source).mtimeMs > stat.mtimeMs
+        || !fs.readFileSync(source).equals(fs.readFileSync(target))) {
+        fs.copyFileSync(source, target);
+      }
+      return { ok: true, reason: 'copied' };
     }
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
-    needsLink = true;
   }
 
-  if (needsLink) {
-    fs.mkdirSync(paths.projectCodexDir, { recursive: true });
-    fs.symlinkSync(paths.globalAuthPath, paths.projectAuthPath);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  try {
+    fs.symlinkSync(source, target);
     return { ok: true, reason: 'linked' };
+  } catch (err) {
+    if (err.code !== 'EPERM' && err.code !== 'EINVAL') throw err;
+    fs.copyFileSync(source, target);
+    return { ok: true, reason: 'copied' };
   }
-  return { ok: true, reason: 'linked' };
+}
+
+function ensureProjectAuthLink(paths) {
+  if (!fs.existsSync(paths.globalAuthPath)) {
+    return { ok: false, reason: 'global-auth-missing' };
+  }
+  return ensureCodexAuthLink(paths.globalAuthPath, paths.projectAuthPath);
 }
 
 function ensureProjectCodexHome({ projectRoot, mcpServerPath, nodePath, browserTools } = {}) {
@@ -1156,7 +1154,7 @@ function ensureProjectCodexHome({ projectRoot, mcpServerPath, nodePath, browserT
 
 // ── Project-level Codex config writer ──────────────────────────────────────────
 // Writes {projectRoot}/.codex/config.toml with the tipatask MCP entry and repairs
-// the project-local auth.json symlink. Mirror of writeProjectMcpConfig / writeProjectSkillsConfig
+// the project-local auth.json link or copy. Mirror of writeProjectMcpConfig / writeProjectSkillsConfig
 // in project-config.js — call alongside those functions at every setup entry point
 // (Open Project, Create Project, Re-authenticate, reconfigureWindowBackend).
 //
@@ -1176,6 +1174,7 @@ function writeProjectCodexConfig(projectRoot, serverRoot) {
 }
 
 module.exports = {
+  ensureCodexAuthLink,  // (TPT9048) scripts/probe-codex-kickoff.js seeds its scratch Codex home with it
   TIPATASK_MCP_NAME,
   TIPATASK_MCP_LOCAL_NAME,
   DEFAULT_MCP_SERVER_PATH,

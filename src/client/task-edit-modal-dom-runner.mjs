@@ -1,6 +1,6 @@
 // Runs the real client modules in a DOM process isolated from node:test globals.
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -48,6 +48,7 @@ try {
   const bundled = await build({
     stdin: {
       contents: `export * as board from './src/client/task-board.js';
+        export * as cards from './src/client/task-card.js';
         export * as editor from './src/client/task-edit-modal.js';
         export { default as state } from './src/client/state.js';
         export { api } from './src/client/api-client.js';`,
@@ -60,7 +61,7 @@ try {
     loader: { '.css': 'empty' },
   });
   writeFileSync(bundlePath, bundled.outputFiles[0].contents);
-  const { board, state, api } = await import(pathToFileURL(bundlePath).href);
+  const { board, cards, state, api } = await import(pathToFileURL(bundlePath).href);
   const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   const modal = () => document.getElementById('task-edit-modal');
   const task = (id, overrides = {}) => ({
@@ -446,6 +447,98 @@ try {
   assert.equal(modal().querySelector('.modal-actions-run [data-action="stop"]'), null);
   board.closeTaskEditModal(true);
   console.log('TPT568_START_SYNC_PASS');
+
+  // Exercise the page shell's real opener, the modal's save gate, and the shared launcher.
+  const template = readFileSync(new URL('./template.html', import.meta.url), 'utf8');
+  const opener = template.slice(template.indexOf('function openBoardTaskEditModal('));
+  const openBoardModal = new Function('openTaskEditModal', 'window', 'loadAndRender',
+    `${opener.slice(0, opener.indexOf('\n}\n') + 3)}; return openBoardTaskEditModal;`
+  )(board.openTaskEditModal, window, () => {});
+  const launches = [], selections = [], confirmations = [];
+  cards.registerCardCallbacks({
+    onOpenTerminal: (...args) => launches.push(args),
+    onOpenAgentSelectorModal: (...args) => selections.push(args),
+    onShowClaudeConfirmModal: (...args) => confirmations.push(args),
+  });
+  window.TipTask = { taskCard: cards };
+  state.availableAgents = ['claude', 'codex', 'pi'];
+  state.sessionAgent = 'codex'; // A saved Pi choice takes precedence over a remembered agent.
+  const kimi = 'openrouter/moonshotai/kimi-k3';
+  state.objectiveProviders = [{ id: 'pi', configuredModels: ['image/model', kimi], toolLessModels: ['image/model'] }];
+  const piChoice = () => modal().querySelector(`.agent-picker-option[data-value="pi"][data-pi-model="${kimi}"]`);
+  const updateBeforePi = api.tasks.update;
+  let releasePiSave;
+  api.tasks.update = async (id, patch) => {
+    writes.push({ id, patch });
+    await new Promise(resolve => { releasePiSave = resolve; });
+    return {};
+  };
+  await openBoardModal('TPT1');
+  await tick();
+  piChoice().click();
+  startBtn().click();
+  await tick();
+  assert.deepEqual(writes.at(-1), { id: 'TPT1', patch: { agent_assignee: 'pi', pi_model: kimi } });
+  assert.equal(launches.length, 0, 'Start waits for the selection save');
+  releasePiSave();
+  await tick();
+  assert.equal(modal().hidden, true);
+  assert.equal(launches.length, 1);
+  assert.deepEqual(launches.at(-1)[4], { agent: 'pi', model: kimi });
+  assert.equal(selections.length, 0, 'saved Pi selection bypasses the agent picker');
+  // api.tasks.get still returns the old task: launch must use the successful save snapshot.
+  assert.equal(tasks.get('TPT1').agentAssignee, null);
+
+  api.tasks.update = async () => { throw new Error('Pi selection rejected'); };
+  await openBoardModal('TPT1');
+  await tick();
+  piChoice().click();
+  startBtn().click();
+  await tick();
+  assert.equal(launches.length, 1, 'failed selection save starts no terminal');
+  assert.equal(selections.length, 0, 'failed save opens no picker');
+  assert.equal(modal().hidden, false, 'failed save keeps draft open');
+  assert.equal(modal().querySelector('.btn-modal-save').disabled, false);
+  board.closeTaskEditModal(true);
+  api.tasks.update = updateBeforePi;
+
+  const savedTask = tasks.get('TPT1');
+  tasks.set('TPT1', { ...savedTask, agentAssignee: 'pi', piModel: kimi });
+  const writesBeforeClean = writes.length;
+  await openBoardModal('TPT1');
+  await tick();
+  startBtn().click();
+  await tick();
+  assert.equal(writes.length, writesBeforeClean, 'a previously saved Pi choice needs no PATCH');
+  assert.deepEqual(launches.at(-1)[4], { agent: 'pi', model: kimi });
+  assert.equal(selections.length, 0);
+
+  tasks.set('TPT1', { ...savedTask, agentAssignee: 'pi', piModel: 'previous/model' });
+  await openBoardModal('TPT1');
+  await tick();
+  piChoice().click();
+  startBtn().click();
+  await tick();
+  assert.deepEqual(writes.at(-1), { id: 'TPT1', patch: { pi_model: kimi } });
+  assert.deepEqual(launches.at(-1)[4], { agent: 'pi', model: kimi }, 'changing only the Pi model also uses the saved choice');
+
+  tasks.set('TPT1', { ...savedTask, status: 'completed', agentAssignee: 'pi', piModel: kimi });
+  await openBoardModal('TPT1');
+  await tick();
+  startBtn().click();
+  await tick();
+  assert.equal(confirmations.length, 1);
+  assert.deepEqual(confirmations[0][4], { agent: 'pi', model: kimi });
+
+  tasks.set('TPT1', savedTask);
+  state.sessionAgent = null;
+  await openBoardModal('TPT1');
+  await tick();
+  startBtn().click();
+  await tick();
+  assert.equal(selections.length, 1, 'an unassigned task still asks for an agent');
+  delete window.TipTask;
+  console.log('TPT9042_PI_START_PASS');
 
   // (TPT9001) A save the server rejects says "Save failed"; only a request that got no answer
   // says "Network error". Real _http() PATCH path, real tag-gate message.

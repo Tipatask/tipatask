@@ -111,14 +111,30 @@ export function lastTurnMessage(messages) {
   return (Array.isArray(messages) ? messages : []).findLast(m => m && m.role !== 'system') || null;
 }
 
+// The user turn the server records for a dialog answer: `Answer to "<question>": <labels>`,
+// carrying `dialogAnswer`. It is never part of the transcript — the answered dialog, locked
+// with its picks, is the answer's only rendering.
+export function isDialogAnswerTurn(message) {
+  return !!(message && message.role === 'user' && message.dialogAnswer && message.dialogAnswer.dialogId);
+}
+
+// The dialog of `message` the user answered, or null. With no answer turn in the transcript,
+// a reply whose dialog is answered is where the conversation moved on from — and the dialog an
+// dropped answer turn opens again, whether aborted or failed.
+export function answeredDialog(message) {
+  if (!message || message.role !== 'assistant' || !Array.isArray(message.dialogs)) return null;
+  return message.dialogs.find(d => d && d.answer) || null;
+}
+
 // A dialog widget's state. The server takes an answer only for an unanswered dialog on the
 // chat's latest turn, with no turn running — the widget is `open` under exactly those
 // conditions and the socket up; `waiting` while that turn runs or the socket is down (a
 // reattach restores history before its `config` frame says it is connected); `skipped` once
-// the conversation moved on; `answered` once `dialog.answer` is set.
+// the conversation moved on (a later turn, or an answer to another dialog of the same reply);
+// `answered` once `dialog.answer` is set.
 export function dialogState({ messages, message, dialog, connected, running } = {}) {
   if (dialog && dialog.answer) return 'answered';
-  if (!message || message !== lastTurnMessage(messages)) return 'skipped';
+  if (!message || message !== lastTurnMessage(messages) || answeredDialog(message)) return 'skipped';
   return connected && !running && !message.streaming ? 'open' : 'waiting';
 }
 
@@ -133,20 +149,11 @@ export function localAnswer(dialog, submission) {
   };
 }
 
-// An answer as the user's own line in the transcript: the picked labels, then the free text.
-export function answerSummary(answer) {
-  if (!answer) return '';
-  const labels = (Array.isArray(answer.selected) ? answer.selected : []).filter(Boolean).map(String);
-  const parts = [...labels];
-  const free = typeof answer.other === 'string' ? answer.other.trim() : '';
-  if (free) parts.push(labels.length ? `Other: ${free}` : free);
-  return parts.join('; ');
-}
-
 // Markup of one dialog: the question, an option per row (radio for single choice, checkbox for
 // multi), a free-text "Other" row and the submit button. `name` must be unique per rendered
 // widget — dialog ids are content hashes, so the same question asked twice shares an id.
-// An answered dialog renders locked with its picks; the window toggles the open/closed state.
+// An answered dialog renders locked with its picks, a free-text answer in full in place of the
+// one-line input; the window toggles the open/closed state.
 export function dialogWidgetHtml(dialog, { t, name } = {}) {
   if (!dialog || !Array.isArray(dialog.options)) return '';
   const tr = typeof t === 'function' ? t : key => key;
@@ -172,7 +179,8 @@ export function dialogWidgetHtml(dialog, { t, name } = {}) {
     + '<label class="task-chat-dialog-option task-chat-dialog-option--other">'
     + `<input type="${type}" name="${group}" value="other" aria-label="${otherLabel}"${freeText ? ' checked' : ''}>`
     + `<span class="task-chat-dialog-text"><span class="task-chat-dialog-label">${otherLabel}</span>`
-    + `<input type="text" class="task-chat-dialog-other" maxlength="2000" autocomplete="off" placeholder="${esc(tr('taskChat.dialog.otherPlaceholder'))}" aria-label="${esc(tr('taskChat.dialog.otherPlaceholder'))}" value="${esc(freeText)}">`
+    + `<input type="text" class="task-chat-dialog-other" maxlength="2000" autocomplete="off" placeholder="${esc(tr('taskChat.dialog.otherPlaceholder'))}" aria-label="${esc(tr('taskChat.dialog.otherPlaceholder'))}" value="${esc(freeText)}"${freeText ? ' hidden' : ''}>`
+    + `<span class="task-chat-dialog-other-answer"${freeText ? '' : ' hidden'}>${esc(freeText)}</span>`
     + '</span></label></div>'
     + '<div class="task-chat-dialog-actions">'
     + `<span class="task-chat-dialog-state">${answer ? esc(tr('taskChat.dialog.answered')) : ''}</span>`
@@ -304,22 +312,19 @@ export function stripTaskEditNote(text) {
 
 // Server history -> transcript entries. The generated first message (`seed: true`: task JSON,
 // comments, opening ask) is context for the agent, not part of the conversation; so is the
-// `task_edits` block a user turn may open with.
+// `task_edits` block a user turn may open with. A dialog answer turn (isDialogAnswerTurn()) is
+// left out: the answered dialog on the reply before it shows the picks.
 //
 // A chat resumed from history (TPT539) holds the earlier conversation read back from the
 // provider's session (`restored: true`, shown as ordinary turns) and then the hidden resume
 // marker, which becomes the resumed-session indicator in its place.
 export function visibleHistory(serverMessages) {
   return (Array.isArray(serverMessages) ? serverMessages : [])
-    .filter(m => m && (m.resumed || (!m.seed && (m.role === 'user' || m.role === 'assistant'))))
+    .filter(m => m && (m.resumed || (!m.seed && !isDialogAnswerTurn(m) && (m.role === 'user' || m.role === 'assistant'))))
     .map(m => m.resumed ? resumedIndicator(m) : ({
       ...(m.restored ? { restored: true } : {}),
       role: m.role,
-      // A dialog answer shows as the picks themselves, not the server's `Answer to "…": …` line.
-      content: m.role === 'user' && m.dialogAnswer
-        ? (answerSummary(m.dialogAnswer) || stripTaskEditNote(m.content))
-        : stripTaskEditNote(m.content),
-      ...(m.role === 'user' && m.dialogAnswer ? { dialogAnswer: { dialogId: m.dialogAnswer.dialogId } } : {}),
+      content: stripTaskEditNote(m.content),
       dialogs: Array.isArray(m.dialogs) ? m.dialogs.slice() : [],
       tools: Array.isArray(m.tools) ? m.tools.slice() : [],
       taskEvents: Array.isArray(m.taskEvents) ? m.taskEvents.slice() : [],

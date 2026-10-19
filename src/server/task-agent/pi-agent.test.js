@@ -1,6 +1,6 @@
 'use strict';
 
-const { test } = require('node:test');
+const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -12,9 +12,26 @@ const PiAgent = require('./pi-agent');
 // config object — FAKE_CONFIG below intentionally carries no PI_BIN. Tests compare spec.command
 // against a live resolvePiLaunch() call so they pass regardless of whether the bundled
 // dependency is installed on the machine running them.
-const { resolvePiLaunch } = require('../spawn-utils');
+const { resolvePiLaunch, clearBinCache } = require('../spawn-utils');
 const { piCustomProviderId, piDefaultSessionDir } = require('../pi-custom-endpoint');
 const { matchPromptLine, PI_PROMPT_PATTERNS, GENERIC_PROMPT_PATTERNS, buildLegacyPatternTable } = require('./prompt-detect');
+
+// The Windows launch/quoting matrix is exercised by pi-launch-windows.test.js. Keep these
+// model/prompt tests independent of whether this host installed Pi via a batch wrapper.
+const originalPiBin = process.env.PI_BIN;
+before(() => {
+  if (process.platform === 'win32') { process.env.PI_BIN = process.execPath; clearBinCache('pi'); }
+});
+after(() => {
+  if (originalPiBin === undefined) delete process.env.PI_BIN;
+  else process.env.PI_BIN = originalPiBin;
+  clearBinCache('pi');
+});
+
+function kickoffText(spec) {
+  const arg = spec.args.at(-1);
+  return process.platform === 'win32' ? fs.readFileSync(arg.slice(1), 'utf8') : arg;
+}
 
 function makeProjectDir(cfg) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-pi-agent-'));
@@ -48,7 +65,7 @@ test('PiAgent.getSpawnSpec: uses OpenRouter interactive args and project env', a
     assert.deepStrictEqual(argsAfterPrefix.slice(0, 5), ['--provider', 'openrouter', '--model', 'openrouter/test-model', '--approve']);
     assert.strictEqual(spec.model, 'openrouter/test-model'); // (C1118) resolved model, for the terminal header caption
     assert.ok(!spec.args.includes('--mcp-config'), 'Pi has no MCP config flag');
-    assert.ok(spec.args.at(-1).includes('Work on task C1.'));
+    assert.ok(kickoffText(spec).includes('Work on task C1.'));
     assert.strictEqual(spec.env.TIPATASK_PROJECT_ROOT, dir);
     assert.strictEqual(spec.env.OPENROUTER_API_KEY, 'sk-or-test');
     assert.strictEqual(spec.env.PI_SKIP_VERSION_CHECK, '1');
@@ -1045,8 +1062,8 @@ test('PiAgent.getSpawnSpec: loads the MCP bridge with -e and its derived config,
     const cfgPath = spec.env.TIPATASK_PI_MCP_CONFIG;
     assert.match(path.basename(cfgPath), /^[0-9a-f]{12}\.pi\.json$/);
     assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(cfgPath, 'utf8')).mcpServers), ['tipatask', 'tipatask-local']);
-    assert.match(spec.args.at(-1), /tipatask-local__complete_task/);
-    assert.doesNotMatch(spec.args.at(-1), /TIPATASK_TOOL_SCRIPT/);
+    assert.match(kickoffText(spec), /tipatask-local__complete_task/);
+    assert.doesNotMatch(kickoffText(spec), /TIPATASK_TOOL_SCRIPT/);
     assert.ok(lines.some((l) => l.includes(`mcp-bridge=${staged}`)), JSON.stringify(lines));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -1110,8 +1127,8 @@ test('PiAgent.getSpawnSpec: .mcp.json without an API target fails closed to the 
     const spec = await new PiAgent().getSpawnSpec({ ...FAKE_CONFIG, SIMPLE_MODE: false, USER_DATA_ROOT: userData }, 'Work on task C1.', 'C1', { projectPath: dir });
     assert.ok(!spec.args.includes('-e'));
     assert.equal(spec.env.TIPATASK_PI_MCP_CONFIG, '');
-    assert.match(spec.args.at(-1), /tt complete "\$TIPATASK_TASK_ID"/);
-    assert.doesNotMatch(spec.args.at(-1), /tipatask-local__complete_task/);
+    assert.match(kickoffText(spec), /tt complete "\$TIPATASK_TASK_ID"/);
+    assert.doesNotMatch(kickoffText(spec), /tipatask-local__complete_task/);
     assert.ok(lines.some((l) => l.includes('mcp-bridge=off')), JSON.stringify(lines));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -1154,7 +1171,7 @@ test('PiAgent.getSpawnSpec: no .mcp.json means no bridge, REST fallback prompt a
     const spec = await new PiAgent().getSpawnSpec({ ...FAKE_CONFIG, SIMPLE_MODE: false, USER_DATA_ROOT: userData }, 'Work on task C1.', 'C1', { projectPath: dir });
     assert.ok(!spec.args.includes('-e'));
     assert.equal(spec.env.TIPATASK_PI_MCP_CONFIG, '');
-    assert.match(spec.args.at(-1), /tt complete "\$TIPATASK_TASK_ID"/);
+    assert.match(kickoffText(spec), /tt complete "\$TIPATASK_TASK_ID"/);
     assert.ok(lines.some((l) => l.includes('mcp-bridge=off')), JSON.stringify(lines));
     assert.equal(fs.existsSync(path.join(userData, 'pi-ext')), false, 'nothing staged without a config');
   } finally {

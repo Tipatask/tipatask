@@ -40,7 +40,9 @@ test('applySearchFilter() calls syncEmptyTierVisibility() at least twice, once b
   // The no-needle branch is the WS task:updated resync tail — its early `return;` must come
   // AFTER the first syncEmptyTierVisibility() call, or an emptied-by-move tier never hides.
   const firstCallIdx = calls[0].index;
-  const noNeedleReturnIdx = body.indexOf('return;');
+  // (TPT9025) Searched from the no-needle branch itself — the drag-freeze guard on the first
+  // line returns early too.
+  const noNeedleReturnIdx = body.indexOf('return;', body.indexOf('if (!needle) {'));
   assert.ok(noNeedleReturnIdx !== -1, 'no-needle branch must have an early return');
   assert.ok(firstCallIdx < noNeedleReturnIdx,
     'syncEmptyTierVisibility() must run before the no-needle branch\'s early return — this is ' +
@@ -141,7 +143,7 @@ test('regroupCardToSprint() un-hides the destination tier before inserting the c
 
 test('regroupCardToSprint() alphabet includes emptied, and both predicates cover it correctly', () => {
   const src = readSource('task-card.js');
-  assert.match(src, /return _hideIfEmptied\(sourceTierCards, targetTier\) \? 'emptied' : 'moved';/);
+  assert.match(src, /const emptied = _hideIfEmptied\(sourceTierCards, targetTier\);[\s\S]*?return emptied \? 'emptied' : 'moved';/);
   const movedPred = extractFunctionBody(src, 'regroupMovedCard');
   assert.match(movedPred, /result === 'moved' \|\| result === 'emptied'/);
   const reloadPred = extractFunctionBody(src, 'regroupNeedsReload');

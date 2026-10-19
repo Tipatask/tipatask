@@ -10,6 +10,7 @@ const { resolveBin, resolveBinAsync, augmentPathEnv, prependPathEnv, projectEnvE
 const { matchPromptLine, CLAUDE_PROMPT_PATTERNS, CLAUDE_PENDING_PASTE_RE } = require('./prompt-detect');
 const { buildClaudeModelList } = require('./model-registry');
 const { buildHeadersHelperCommand, writeSpawnMcpConfig } = require('../mcp-spawn-config');
+const { writeProjectClaudeTrust } = require('../project-config');
 
 // ── Model probe (C1504) ──
 // No CLI path exists for this at all: `claude --help` has no `models` subcommand, `--model`
@@ -227,6 +228,7 @@ class ClaudeAgent extends BaseTaskAgent {
       console.warn('[claude-agent] opts.projectPath is falsy in a packaged Electron build — falling back to config.PROJECT_ROOT (bundle path). Check WS session projectPath resolution.');
     }
     const projectRoot = opts.projectPath || config.PROJECT_ROOT;
+    writeProjectClaudeTrust(projectRoot);
     const env = augmentPathEnv({ TERM: 'xterm-256color', ...projectEnvExtras(opts.projectPath) });
     if (taskId) {
       env.TIPATASK_TASK_ID = taskId;

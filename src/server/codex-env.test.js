@@ -286,7 +286,7 @@ test('normal and SIMPLE_MODE terminal launches share config effort without shari
       API_BASE_URL: 'https://terminal-launch.test', API_PROJECT_ID: simple ? '32' : '31',
       API_TOKEN: simple ? 'simple-token' : 'normal-token', CODEX_MODEL: 'project-model', MCP_BROWSER_TOOLS: [],
     }));
-    const cfg = { CODEX_BIN: 'codex', PROJECT_ROOT: '/wrong-root' };
+    const cfg = { CODEX_BIN: 'codex', PROJECT_ROOT: '/wrong-root', USER_DATA_ROOT: dir };
     const prompt = 'Work on task TPT497.';
     const spawn = (opts, taskId = 'TPT497') => agent.getSpawnSpec(cfg, `Work on task ${taskId}.`, taskId, { projectPath: root, ...opts });
     const [normal, low, max] = await Promise.all([
@@ -330,10 +330,11 @@ test('normal and SIMPLE_MODE terminal launches share config effort without shari
     assert.deepEqual(again.args, normal.args);
     assert.match(again.initialPrompt, /Work on task TPT500\./);
     assert.equal(fs.readFileSync(path.join(normal.env.CODEX_HOME, 'config.toml'), 'utf8'), content);
-    if (simple) assert.equal(normal.initialPrompt, prompt);
+    const fullPrompt = normal.kickoffFile ? fs.readFileSync(normal.kickoffFile, 'utf8') : normal.initialPrompt;
+    if (simple) assert.equal(fullPrompt, prompt);
     else {
-      assert.match(normal.initialPrompt, /Do not implement, edit files, or run mutating commands until the user approves the plan/);
-      assert.match(normal.initialPrompt, /Plan ready\./);
+      assert.match(fullPrompt, /Do not implement, edit files, or run mutating commands until the user approves the plan/);
+      assert.match(fullPrompt, /Plan ready\./);
     }
   }
 });

@@ -18,6 +18,7 @@ const {
   replayTaskChatTurn,
   findOpenDialog,
   resolveDialogAnswer,
+  dropTaskChatUserTurn,
   TASK_EDITS_RE,
   changedTaskFields,
   buildTaskEditNote,
@@ -32,6 +33,54 @@ function chat(extra = {}) {
 }
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
+
+test('dropping an answer turn reopens only its dialog and allows another answer', () => {
+  const [dialog] = parseAskUserBlocks(BLOCK);
+  const other = { ...dialog, id: 'dlg-other', answer: { selected: ['Backlog'] } };
+  const resolved = resolveDialogAnswer(dialog, { selected: [0] });
+  dialog.answer = resolved.answer;
+  const asked = { role: 'assistant', dialogs: [other, dialog] };
+  const answer = { role: 'user', content: resolved.content, dialogAnswer: { dialogId: dialog.id } };
+  const { session } = chat({ messages: [asked, answer] });
+  assert.equal(dropTaskChatUserTurn(session), answer);
+  assert.equal(session.messages.at(-1), asked);
+  assert.equal(dialog.answer, undefined);
+  assert.ok(other.answer, 'unrelated dialog remains answered');
+  assert.equal(findOpenDialog(session.messages, dialog.id).dialog, dialog);
+  assert.equal(resolveDialogAnswer(dialog, { selected: [1] }).content, 'Answer to "Which sprint?": Backlog');
+  assert.equal(dropTaskChatUserTurn(session), null, 'no user turn left to drop');
+});
+
+test('dropping a typed turn preserves the seed and tolerates a missing dialog', () => {
+  const seed = { role: 'user', content: 'context', seed: true };
+  const typed = { role: 'user', content: 'Try again' };
+  const { session } = chat({ messages: [seed, typed] });
+  assert.equal(dropTaskChatUserTurn(session), typed);
+  assert.equal(dropTaskChatUserTurn(session), null);
+  assert.deepEqual(session.messages, [seed]);
+  session.messages.push({ role: 'user', dialogAnswer: { dialogId: 'missing' } });
+  assert.ok(dropTaskChatUserTurn(session));
+  session.messages = [];
+  assert.equal(dropTaskChatUserTurn(session), null);
+});
+
+for (const newerTitle of ['Latest title', 'Original title']) {
+  test(`dropping a turn restores edits against their original baseline (${newerTitle})`, () => {
+    const prev = { id: 'TPT1', title: 'Original title', status: 'pending' };
+    const drained = { task: { ...prev, title: 'First edit' }, changed: ['title'], prev };
+    const queued = { task: { ...prev, title: newerTitle }, changed: ['title'], prev: drained.task };
+    const otherEdit = { task: { id: 'TPT2', title: 'Another task' }, changed: ['title'], prev: null };
+    const { session } = chat({
+      messages: [{ role: 'user', content: 'Check edits', taskEdits: [{ taskKey: 'TPT1' }, { taskKey: 'TPT2' }] }],
+      _drainedTaskEdits: [drained, otherEdit], pendingTaskEdits: new Map([['TPT1', queued]]),
+    });
+    dropTaskChatUserTurn(session);
+    assert.equal(session._drainedTaskEdits, null);
+    assert.equal(session.pendingTaskEdits.get('TPT2'), otherEdit);
+    if (newerTitle === prev.title) assert.equal(session.pendingTaskEdits.has('TPT1'), false, 'reverted edit needs no note');
+    else assert.deepEqual(session.pendingTaskEdits.get('TPT1'), { task: queued.task, changed: ['title'], prev });
+  });
+}
 
 test('an ask_user block becomes a dialog with normalized options and a stable id', () => {
   const [dialog] = parseAskUserBlocks(`Pick one.\n\n${BLOCK}`);

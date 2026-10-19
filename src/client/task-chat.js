@@ -21,9 +21,9 @@ import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu } fr
 import {
   taskChatProviders, pickSelection, buildModelOptionsHtml, stripAskUserFence,
   visibleHistory, upsertById, shortToolName, hasWidgets, collapseTaskEvents,
-  dialogSubmission, localAnswer, answerSummary, dialogWidgetHtml, toolChipHtml,
+  dialogSubmission, localAnswer, dialogWidgetHtml, toolChipHtml,
   userMessageHtml, stripPendingImageRefs,
-  dialogState, lastTurnMessage,
+  dialogState, lastTurnMessage, isDialogAnswerTurn, answeredDialog,
   resumedIndicator, providerName, historyQuery, historyRowHtml, historyFocusIndex,
 } from './task-chat-model.js';
 
@@ -50,7 +50,7 @@ let ws = null;
 let chat = null;            // { kind: 'task'|'project', key, sessionId, title } — the open chat
 let openSeq = 0;            // bumped per open request; a slower project-config read loses to a newer one
 let root = null;            // .task-chat-modal
-let messages = [];          // [{ role, content, streaming?, error?, retry?, dialogAnswer?, dialogs, tools, taskEvents, el }]
+let messages = [];          // [{ role, content, streaming?, error?, retry?, dialogs, tools, taskEvents, el }]
 let providers = [];
 let selection = '';         // "provider:model" sent with the next turn
 let running = false;        // a turn is in progress on the server
@@ -77,7 +77,7 @@ let keyHandler = null;
 let providersHandler = null;
 let reloadHandler = null;
 let renderedLocale = '';     // locale the window's labels were last written in
-let pendingAnswer = null;   // { dialog, userMsg } — an answer sent, no frame of its turn back yet
+let pendingAnswer = null;   // { dialog } — an answer sent, no frame of its turn back yet
 let widgetSeq = 0;
 const widgetSig = new WeakMap(); // widget element -> signature of the record it was built from
 let embedded = null;        // { host, onOpenTask, onClosed } while mounted in a workspace pane
@@ -934,6 +934,8 @@ function paintAssistant(m) {
 }
 
 function pushMessage(m) {
+  // A dialog answer is shown by its dialog alone, never as a turn of its own.
+  if (isDialogAnswerTurn(m)) return null;
   const entry = { dialogs: [], tools: [], taskEvents: [], ...m };
   messages.push(entry);
   const list = listEl();
@@ -1175,21 +1177,28 @@ function applyDialogState(el, m, dialog) {
   el.disabled = state !== 'open';
   const submit = el.querySelector('.task-chat-dialog-submit');
   const caption = el.querySelector('.task-chat-dialog-state');
+  const other = el.querySelector('.task-chat-dialog-other');
+  const otherAnswer = el.querySelector('.task-chat-dialog-other-answer');
+  const free = state === 'answered' ? (dialog.answer.other || '') : '';
   if (state === 'answered') {
     const picked = new Set(Array.isArray(dialog.answer.indexes) ? dialog.answer.indexes : []);
-    const free = dialog.answer.other || '';
     for (const input of el.querySelectorAll('.task-chat-dialog-options input:not(.task-chat-dialog-other)')) {
       input.checked = input.value === 'other' ? !!free : picked.has(Number(input.value));
     }
-    el.querySelector('.task-chat-dialog-other').value = free;
+    other.value = free;
   }
+  // The dialog is the answer's only rendering: a free-text answer shows in full, wrapped, where
+  // the one-line input was. A dialog that opens again gets the input back with that text in it.
+  otherAnswer.textContent = free;
+  otherAnswer.hidden = !free;
+  other.hidden = !!free;
   caption.textContent = state === 'answered' ? t('taskChat.dialog.answered') : (state === 'skipped' ? t('taskChat.dialog.skipped') : '');
   submit.hidden = state === 'answered' || state === 'skipped';
   submit.disabled = state !== 'open' || !readDialog(el, dialog);
 }
 
 // The agent's question as a form: one option per row (radio or checkbox), a free-text Other,
-// and Submit. Answering locks it and becomes the next user turn.
+// and Submit. Answering locks it with the picks — the answer's only rendering in the transcript.
 function renderDialogWidget(m, dialog) {
   const el = fromHtml(dialogWidgetHtml(dialog, { t, name: `task-chat-dlg-${++widgetSeq}` }));
   if (!el) return null;
@@ -1221,11 +1230,13 @@ function submitDialog(el, m, dialog) {
   const submission = readDialog(el, dialog);
   if (!submission) return;
   wsSend(ws, WS_SEND_TYPES.TASK_CHAT_ANSWER, { ...submission, model: selection || undefined });
-  // The server stores the same answer and starts the turn; show both right away.
+  // The server stores the same answer and starts the turn; show both right away. The dialog,
+  // locked with the picks, stands for the answer: no user turn of its own under it.
   dialog.answer = localAnswer(dialog, submission);
-  const userMsg = pushMessage({ role: 'user', content: answerSummary(dialog.answer), dialogAnswer: { dialogId: dialog.id } });
+  applyDialogState(el, m, dialog);
   pushMessage({ role: 'assistant', content: '', streaming: true });
-  pendingAnswer = { dialog, userMsg };
+  scrollToBottom(true);
+  pendingAnswer = { dialog };
   setRunning(true);
 }
 
@@ -1245,10 +1256,9 @@ function revertPendingAnswer() {
   const pending = pendingAnswer;
   pendingAnswer = null;
   if (!pending) return false;
+  delete pending.dialog.answer;
   const partial = streamingMessage();
   if (partial) removeMessage(partial);
-  delete pending.dialog.answer;
-  removeMessage(pending.userMsg);
   return true;
 }
 
@@ -1469,6 +1479,23 @@ function turnFailed(text) {
   pushNotice(text, { error: true, retry: established ? null : startFresh });
 }
 
+// The server removed the turn: discard its partial reply and return its submission.
+function restoreDroppedTurn() {
+  pendingAnswer = null;
+  const partial = streamingMessage();
+  if (partial) removeMessage(partial);
+  const last = lastTurnMessage(messages);
+  if (last && last.role === 'user') {
+    removeMessage(last);
+    const input = root.querySelector('.task-chat-input');
+    if (!input.value.trim()) { input.value = last.content; rememberDraft(); growInput(); }
+  } else {
+    // Dialog answers have no user bubble; the dialog keeps the picks to resend.
+    const dialog = answeredDialog(last);
+    if (dialog) delete dialog.answer;
+  }
+}
+
 // Frames that can only come from a turn that started — the answer that began it was accepted.
 const TURN_FRAMES = new Set([
   WS_RECV_TYPES.DATA, 'objective-progress', 'objective-thinking', 'objective-retry',
@@ -1569,23 +1596,7 @@ function handleFrame(msg) {
       break;
 
     case WS_RECV_TYPES.GENERATION_ABORTED: {
-      pendingAnswer = null;
-      const partial = streamingMessage();
-      if (partial) removeMessage(partial);
-      // The server drops the user message that started the aborted turn; hand its text back.
-      const last = lastTurnMessage(messages);
-      if (last && last.role === 'user') {
-        removeMessage(last);
-        if (last.dialogAnswer) {
-          // It was a dialog answer: nothing to retype — the dialog itself opens again.
-          const asked = lastTurnMessage(messages);
-          const dialog = asked && (asked.dialogs || []).find(d => d.id === last.dialogAnswer.dialogId);
-          if (dialog) delete dialog.answer;
-        } else {
-          const input = root.querySelector('.task-chat-input');
-          if (!input.value.trim()) { input.value = last.content; rememberDraft(); growInput(); }
-        }
-      }
+      restoreDroppedTurn();
       setRunning(false);
       break;
     }
@@ -1644,6 +1655,7 @@ function handleFrame(msg) {
     }
 
     case 'objective-error': {
+      if (msg.droppedUserTurn === true) restoreDroppedTurn();
       const reason = msg.reason || 'error';
       if (reason === 'history-unavailable') {
         pendingAnswer = null;

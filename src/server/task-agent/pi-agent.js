@@ -4,7 +4,7 @@ const path = require('node:path');
 const BaseTaskAgent = require('./base-agent');
 const runtimeConfig = require('../config');
 const { getStaticBundle, getTaskStartupGrepBundle } = require('../static-context');
-const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolveSpawnModel, resolvePiLaunch, resolvePiLaunchAsync } = require('../spawn-utils');
+const { augmentPathEnv, prependPathEnv, projectEnvExtras, resolveNvmBinDir, resolveSpawnModel, resolvePiLaunchAsync, cliSpawnSpec, writeSpawnArgFile } = require('../spawn-utils');
 const { readProjectConfig, piDefaultEntry, piEntryForModel, piKeyEnvVars } = require('../project-config');
 const { preparePiCustomEndpoint, piRowSupportsTools, piRowHost, toolCompatMessage, piTaskDefaultEntry } = require('../pi-custom-endpoint');
 const { matchPromptLine, PI_PROMPT_PATTERNS } = require('./prompt-detect');
@@ -113,6 +113,9 @@ const DETECT_REASONS = Object.freeze({
   cli_missing: 'Pi CLI not found',
   probe_failed: 'Pi CLI probe failed',
   probe_failed_output: 'Pi CLI probe failed: {output}',
+  // (TPT9047) The packaged Windows runtime verification (spawn-utils.js verifyPackagedPiLaunch())
+  // failed; `stage` names the layer (runtime / import / cli), the times are the failing attempt's.
+  runtime_failed: 'Pi runtime check failed at the {stage} stage after {elapsedMs} ms (limit {timeoutMs} ms, {runtime}): {output}',
 });
 
 class PiAgent extends BaseTaskAgent {
@@ -275,7 +278,7 @@ class PiAgent extends BaseTaskAgent {
     // (C1112) launch is null only when Pi is unresolvable by any strategy (no bundle, no
     // PI_BIN, no system install) — fall back to the bare name so the spawn fails with a clear
     // ENOENT the caller already surfaces, instead of throwing here.
-    const launch = resolvePiLaunch() || { command: 'pi', argsPrefix: [], env: {} };
+    const launch = await resolvePiLaunchAsync() || { command: 'pi', argsPrefix: [], env: {} };
     const env = augmentPathEnv({
       TERM: 'xterm-256color',
       PI_SKIP_VERSION_CHECK: '1',
@@ -283,7 +286,7 @@ class PiAgent extends BaseTaskAgent {
       ...launch.env,
     });
     const nvmBinDir = resolveNvmBinDir(launch.command);
-    if (nvmBinDir) env.PATH = `${nvmBinDir}${path.delimiter}${env.PATH}`;
+    prependPathEnv(env, nvmBinDir);
     if (taskId) {
       env.TIPATASK_TASK_ID = taskId;
       env.TIPATASK_TRACK_DIR = path.join(config.USER_DATA_ROOT, '.file-tracks');
@@ -354,14 +357,28 @@ class PiAgent extends BaseTaskAgent {
     // would have to name every bridged tool, which is only known once the servers answer.
     // Headless chat turns do pass one (tool-profiles.js piToolAllowlist) — they want a fence.
     if (bridge) args.push('-e', bridge.extensionPath);
+    // Pi accepts a filename for --append-system-prompt and @file for the kickoff.
+    // Keep Windows argv below CreateProcess's limit and out of cmd.exe's text parser,
+    // including for the checkout's custom bin/pi.cmd (which is not an npm shim).
+    const promptArg = text => {
+      if (process.platform !== 'win32') return text;
+      const file = writeSpawnArgFile(config.USER_DATA_ROOT, text, '.md');
+      if (!file) throw new Error('Could not write Pi prompt file');
+      return file;
+    };
     if (!config.SIMPLE_MODE) {
-      args.push('--append-system-prompt', this._buildAppendSystemPrompt(opts));
+      args.push('--append-system-prompt', promptArg(this._buildAppendSystemPrompt(opts)));
     }
-    args.push(this.buildPrompt(prompt, opts));
+    const kickoff = promptArg(this.buildPrompt(prompt, opts));
+    args.push(process.platform === 'win32' ? `@${kickoff}` : kickoff);
+    const spec = cliSpawnSpec(launch.command, [...launch.argsPrefix, ...args], { env });
+    console.log(`[terminal:pi] launch=${JSON.stringify({ command: spec.command, launcher: launch.command,
+      cli: spec.command !== launch.command && !/cmd\.exe$/i.test(spec.command) ? spec.args[0] : launch.argsPrefix[0],
+      runtimeChecks: launch.runtimeChecks })}`);
 
     return {
-      command: launch.command,
-      args: [...launch.argsPrefix, ...args],
+      command: spec.command,
+      args: spec.args,
       cwd: projectRoot,
       env,
       model: piModel,
@@ -458,21 +475,44 @@ class PiAgent extends BaseTaskAgent {
   async detect(config) {
     // (C1112) launch is null only when Pi is unresolvable by any strategy — bundled dependency
     // (checkout), extraResources copy (packaged Electron), PI_BIN override, or system PATH.
-    const launch = await resolvePiLaunchAsync();
-    if (!launch) return this.unavailableResult('cli_not_found');
+    let launch;
+    try { launch = await resolvePiLaunchAsync(); }
+    catch (error) {
+      const detail = BaseTaskAgent.buildDetectDetail(error.launch?.command, error.probe || { error });
+      // (TPT9047) A staged Windows verification failure names its stage and timing; the full
+      // per-runtime list stays in `detail.output` (agent-select.js, probe-agent-detect.js).
+      if (error.code === 'EPI_RUNTIME' && error.stage) {
+        return this.unavailableResult('runtime_failed', {
+          params: { stage: error.stage, elapsedMs: error.elapsedMs ?? '?', timeoutMs: error.timeoutMs ?? '?',
+            runtime: error.runtime || 'runtime', output: error.stageOutput || error.probe?.error?.code || 'no output' },
+          detail,
+        });
+      }
+      return this.unavailableResult('probe_failed_output', { params: { output: error.message }, detail });
+    }
+    const unavailable = (code, probe, params) => this.unavailableResult(code, {
+      params, detail: BaseTaskAgent.buildDetectDetail(launch?.command, probe),
+    });
+    if (!launch) return unavailable('cli_not_found');
+    // (TPT9047) A packaged Windows launch verified by resolvePiLaunchAsync() already ran
+    // `cli.js --version` (a full import of Pi's dist tree, seconds on a cold cache) and carries the
+    // version it printed — a second probe here would only repeat that cost on every start.
+    if (launch.piVersion) {
+      return { id: this.id, label: this.label, available: true, detail: { bin: launch.command, version: launch.piVersion } };
+    }
     const nvmBinDir = resolveNvmBinDir(launch.command);
     const probeEnv = augmentPathEnv({ PI_SKIP_VERSION_CHECK: '1', ...launch.env });
-    if (nvmBinDir) probeEnv.PATH = `${nvmBinDir}${path.delimiter}${probeEnv.PATH}`;
+    prependPathEnv(probeEnv, nvmBinDir);
     const probe = await BaseTaskAgent.runCliProbe(launch.command, [...launch.argsPrefix, '--version'], { env: probeEnv });
     if (probe.error) {
-      return this.unavailableResult(probe.error.code === 'ENOENT' ? 'cli_missing' : 'probe_failed');
+      return unavailable(probe.error.code === 'ENOENT' ? 'cli_missing' : 'probe_failed', probe);
     }
     if (probe.status === 0) {
       return { id: this.id, label: this.label, available: true };
     }
     return probe.output
-      ? this.unavailableResult('probe_failed_output', { params: { output: probe.output.split('\n')[0] } })
-      : this.unavailableResult('probe_failed');
+      ? unavailable('probe_failed_output', probe, { output: probe.output.split('\n')[0] })
+      : unavailable('probe_failed', probe);
   }
 }
 

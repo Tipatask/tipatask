@@ -66,6 +66,73 @@ function harness(t, overrides = {}) {
 }
 
 const { SEPARATOR } = require('./objective-prompt-dump');
+const { parseAskUserBlocks, resolveDialogAnswer, findOpenDialog } = require('./task-chat-widgets');
+
+for (const kind of ['task', 'project']) {
+  for (const failure of ['cli-error', 'retries-exhausted']) {
+    test(`Claude ${kind} chat ${failure} drops an answer, restores edits and accepts a replacement`, async t => {
+      const h = harness(t, { OBJECTIVE_MAX_RETRIES: 1 });
+      const session = h.session;
+      const chatId = kind === 'task' ? 'taskChat:TPT1' : 'projectChat:2:testchat';
+      session.type = 'taskChat';
+      session.taskKey = kind === 'task' ? 'TPT1' : null;
+      session.chatProjectId = kind === 'project' ? '2' : null;
+      session.claudeSessionId = 'native-chat';
+      const seed = { role: 'user', content: 'seed context', seed: true };
+      const [dialog] = parseAskUserBlocks('```ask_user\n{"question":"Which sprint?","options":["Current","Backlog"]}\n```');
+      const asked = { role: 'assistant', content: 'Pick.', dialogs: [dialog] };
+      const resolved = resolveDialogAnswer(dialog, { selected: [0] });
+      dialog.answer = resolved.answer;
+      const edit = { task: { id: 'TPT1', title: 'Updated' }, changed: ['title'], prev: null };
+      session._drainedTaskEdits = [edit];
+      session.pendingTaskEdits = new Map();
+      session.messages = [seed, asked, { role: 'user', content: resolved.content,
+        dialogAnswer: { dialogId: dialog.id }, taskEdits: [{ taskKey: 'TPT1' }] }];
+      h.claude.spawnObjectiveTurn(session, chatId);
+      await h.settled();
+      assert.ok(h.processes[0].stdinText.includes(resolved.content), 'answer reached the attempted turn');
+      if (failure === 'cli-error') {
+        h.out({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'Network unavailable' });
+      } else {
+        t.mock.timers.tick(60000);
+        t.mock.timers.tick(250);
+        await h.settled();
+        assert.equal(h.errors().length, 0, 'a retry keeps the answer until retries run out');
+        assert.ok(dialog.answer);
+        t.mock.timers.tick(60000);
+      }
+      assert.equal(h.errors().length, 1);
+      assert.equal(h.errors()[0].droppedUserTurn, true);
+      assert.equal(h.errors()[0].provider, 'claude');
+      assert.deepEqual(session.messages, [seed, asked]);
+      assert.equal(dialog.answer, undefined);
+      assert.equal(session.pendingTaskEdits.get('TPT1'), edit);
+      assert.equal(session._drainedTaskEdits, null);
+      for (const proc of h.processes) proc.emit('close', 1);
+      assert.equal(h.errors().length, 1, 'late process close cannot roll back twice');
+
+      const open = findOpenDialog(session.messages, dialog.id);
+      assert.equal(open.error, undefined, 'the server permits another answer');
+      const replacement = resolveDialogAnswer(open.dialog, { selected: [1] });
+      dialog.answer = replacement.answer;
+      session.messages.push({ role: 'user', content: replacement.content, dialogAnswer: { dialogId: dialog.id } });
+      h.claude.spawnObjectiveTurn(session, chatId);
+      await h.settled();
+      assert.ok(h.processes.at(-1).stdinText.includes('Answer to "Which sprint?": Backlog'), 'replacement reaches the agent');
+    });
+  }
+}
+
+test('Claude first-turn failure keeps the task-chat seed without claiming a dropped user turn', async t => {
+  const h = harness(t);
+  h.session.type = 'taskChat';
+  h.session.messages[0].seed = true;
+  h.claude.spawnObjectiveTurn(h.session, 'taskChat:TPT1');
+  await h.settled();
+  h.out({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'Network unavailable' });
+  assert.equal(h.session.messages.length, 1);
+  assert.equal(h.errors()[0].droppedUserTurn, undefined);
+});
 
 test('every turn logs [objective:prompt-size] and dumps objective-prompt.md holding the exact stdin text', async t => {
   const h = harness(t);

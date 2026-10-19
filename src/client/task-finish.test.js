@@ -165,7 +165,10 @@ test('renderCard / refreshCard / setup wire the Finish item next to Merge and fo
   assert.match(cardJs, /\$\{manualMerge \? MERGE_DOT : ''\}\$\{leftUncommitted \? FINISH_DOT : ''\}<\/button>`/);
   assert.match(slice(cardJs, 'export function refreshCard(t)', '\n}'), /syncTaskFinishCard\(card\)/);
   assert.match(cardJs, /initializeTaskMerge\(appEl\);\n\s*initializeTaskFinish\(appEl\);/);
-  assert.match(slice(board, 'export function updateClaudeButtons()', '\n}\n'), /syncAllFinishCards\(\);/);
+  // (TPT9025) updateClaudeButtons() ends in _syncSessionSurfaces(), which also runs while a card
+  // drag holds the board half back.
+  assert.match(slice(board, 'export function updateClaudeButtons()', '\n}\n'), /_syncSessionSurfaces\(\);$/);
+  assert.match(slice(board, 'function _syncSessionSurfaces()', '\n}\n'), /syncAllFinishCards\(\);/);
 });
 
 test('relaunch: the Start ladder skips the reattach branch, console-modal sends the prompt past an exited session, the workspace replaces the mounted pane', () => {

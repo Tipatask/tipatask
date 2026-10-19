@@ -5,6 +5,7 @@ const fs = require('node:fs/promises');
 const crypto = require('node:crypto');
 const { spawn: cpSpawn } = require('node:child_process');
 const config = require('./config');
+const { describeProposalResult } = require('../objective-proposal-result');
 const { augmentPathEnv, projectEnvExtras: sharedProjectEnvExtras, cliSpawnSpec, writeSpawnArgFile } = require('./spawn-utils');
 const { killWindowsChildTree } = require('./process-group');
 
@@ -191,8 +192,9 @@ function normalizeProposals(parsed, startName = 'pending', context) {
   }
   // Normalize task fields: accept task_key as id, ensure id/title/description exist
   if (parsed.changes && Array.isArray(parsed.changes)) {
+    const proposedCount = parsed.changes.length;
+    parsed.changes = parsed.changes.filter(c => c && ['new', 'modified'].includes(c.type) && c.task && typeof c.task === 'object' && !Array.isArray(c.task));
     for (const c of parsed.changes) {
-      if (!c.task) continue;
       if (!c.task.id && c.task.task_key) c.task.id = c.task.task_key;
       if (c.type === 'new') {
         if (!c.task.title) c.task.title = '';
@@ -216,6 +218,7 @@ function normalizeProposals(parsed, startName = 'pending', context) {
         return false;
       });
     }
+    parsed.proposalResult = describeProposalResult(parsed, proposedCount);
   }
   return parsed;
 }
@@ -229,6 +232,7 @@ function tryEmitTaskCards(session) {
       const parsed = normalizeProposals(JSON.parse(blocks[i][1]), sessionStartName(session), session.type === 'objective' ? (session._proposalContext || { tasks: null }) : undefined);
       if (parsed.changes && Array.isArray(parsed.changes)) {
         const cards = parsed.changes;
+        const proposalResult = parsed.proposalResult;
         const filesAddressed = parsed.files_addressed || [];
         const docUpdates = parsed.doc_updates || [];
         const newTags = Array.isArray(parsed.new_tags) ? parsed.new_tags : [];
@@ -239,18 +243,19 @@ function tryEmitTaskCards(session) {
         if (cardsJson !== session._lastEmittedCardsJson) {
           session._lastEmittedCardsJson = cardsJson;
           if (session.ws && session.ws.readyState === session.ws.OPEN) {
-            session.ws.send(JSON.stringify({ type: 'task-cards', tabId: session.tabId, cards, filesAddressed, docUpdates, newTags, objectiveSummary }));
+            session.ws.send(JSON.stringify({ type: 'task-cards', tabId: session.tabId, cards, filesAddressed, docUpdates, newTags, objectiveSummary, proposalResult }));
           }
-          const lastAssistant = [...session.messages].reverse().find(m => m.role === 'assistant');
-          if (lastAssistant) {
+          const lastAssistant = session.messages[session.messages.length - 1];
+          if (lastAssistant?.role === 'assistant') {
             lastAssistant.cards = cards;
+            lastAssistant.proposalResult = proposalResult;
             lastAssistant.filesAddressed = filesAddressed;
             lastAssistant.docUpdates = docUpdates;
             lastAssistant.newTags = newTags;
             lastAssistant.objectiveSummary = objectiveSummary;
           }
         }
-        return { cards, filesAddressed, docUpdates, newTags, objectiveSummary };
+        return { cards, filesAddressed, docUpdates, newTags, objectiveSummary, proposalResult };
       }
     } catch { /* JSON incomplete or malformed — ignore, will retry */ }
   }
@@ -778,10 +783,13 @@ function emitObjectiveError(session, taskId, reason, attempts, extra) {
     session.abortController.abort();
     session.abortController = new AbortController();
   }
-  // Keep the original prompt on a stall: the existing Retry action restarts
-  // from messages[0]. Follow-up prompts can still be resubmitted.
-  if (session.messages.length > (reason === 'stream-stalled' ? 1 : 0) && session.messages[session.messages.length - 1].role === 'user') {
+  let droppedUserTurn = false;
+  // Keep the original objective prompt on a stall: Retry restarts from messages[0].
+  if (session.type === 'taskChat') {
+    droppedUserTurn = !!taskChatWidgets.dropTaskChatUserTurn(session);
+  } else if (session.messages.length > (reason === 'stream-stalled' ? 1 : 0) && session.messages[session.messages.length - 1].role === 'user') {
     session.messages.pop();
+    droppedUserTurn = true;
   }
   session.turnBuffer = '';
   session.turnRawSse = '';
@@ -794,7 +802,7 @@ function emitObjectiveError(session, taskId, reason, attempts, extra) {
     // background tab). Literal 'claude', not session.providerType: dispatch.js routes specChat
     // to spawnObjectiveTurn regardless of providerType, and this file only runs the claude bin.
     // Siblings that must stay in sync: gemini-session.js, pi-session.js, codex-session.js.
-    session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId, reason, attempts, provider: 'claude', ...(extra || {}) }));
+    session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId, reason, attempts, provider: 'claude', ...(extra || {}), ...(droppedUserTurn ? { droppedUserTurn: true } : {}) }));
   }
 }
 
@@ -1797,6 +1805,7 @@ async function finalizeCloseTurn(session, code, taskId, resultPath) {
     const extracted = tryEmitTaskCards(session);
     if (extracted) {
       assistantMsg.cards = extracted.cards;
+      assistantMsg.proposalResult = extracted.proposalResult;
       assistantMsg.filesAddressed = extracted.filesAddressed;
       assistantMsg.docUpdates = extracted.docUpdates;
       assistantMsg.newTags = extracted.newTags || [];
@@ -1835,6 +1844,7 @@ async function finalizeCloseTurn(session, code, taskId, resultPath) {
         filesAddressed: assistantMsg.filesAddressed,
         docUpdates: assistantMsg.docUpdates,
         cards: assistantMsg.cards,
+        proposalResult: assistantMsg.proposalResult,
         newTags: assistantMsg.newTags || [],
         objectiveSummary: assistantMsg.objectiveSummary || null, // C1339
         timingMilestones: config.OBJECTIVE_TIMING_ENABLED ? session.timingMilestones : undefined,
@@ -1861,6 +1871,7 @@ async function finalizeCloseTurn(session, code, taskId, resultPath) {
     filesAddressed: assistantMsg.filesAddressed,
     docUpdates: assistantMsg.docUpdates,
     cards: assistantMsg.cards,
+    proposalResult: assistantMsg.proposalResult,
     newTags: assistantMsg.newTags || [],
     objectiveSummary: assistantMsg.objectiveSummary || null, // C1339
     timingMilestones: timingPayload,
@@ -1869,7 +1880,7 @@ async function finalizeCloseTurn(session, code, taskId, resultPath) {
   };
   if (typeof session.onNativeSession === 'function') session.onNativeSession(); // turn done: refresh the chat-history entry
   if (session.ws && session.ws.readyState === session.ws.OPEN) {
-    session.ws.send(JSON.stringify({ type: 'objective-result', tabId: session.tabId, content: cleaned, tokens: session.turnTokens, filesAddressed: assistantMsg.filesAddressed, docUpdates: assistantMsg.docUpdates, newTags: assistantMsg.newTags || [], objectiveSummary: assistantMsg.objectiveSummary || null, timingMilestones: timingPayload, cards: assistantMsg.cards }));
+    session.ws.send(JSON.stringify({ type: 'objective-result', tabId: session.tabId, content: cleaned, tokens: session.turnTokens, filesAddressed: assistantMsg.filesAddressed, docUpdates: assistantMsg.docUpdates, newTags: assistantMsg.newTags || [], objectiveSummary: assistantMsg.objectiveSummary || null, timingMilestones: timingPayload, cards: assistantMsg.cards, proposalResult: assistantMsg.proposalResult }));
     session.ws.send(JSON.stringify({ type: 'chat-ready', tabId: session.tabId, turnIndex }));
     session.ws.send(JSON.stringify({ type: 'exit', tabId: session.tabId, code: code ?? 0, chatContinues: true, showAiStats: config.SHOW_AI_STATS }));
     if (config.OBJECTIVE_TIMING_ENABLED) {
@@ -1902,9 +1913,13 @@ async function finalizeCloseTurn(session, code, taskId, resultPath) {
         session.timingMilestones.efficiency_async_ms = efficiencyMs;
         if (!hintCards.length) return;
         assistantMsg.cards = [...(assistantMsg.cards || []), ...hintCards];
-        if (session.pendingResult) session.pendingResult.cards = assistantMsg.cards;
+        assistantMsg.proposalResult = { status: 'cards', reason: '' };
+        if (session.pendingResult) {
+          session.pendingResult.cards = assistantMsg.cards;
+          session.pendingResult.proposalResult = assistantMsg.proposalResult;
+        }
         if (!session._aborted && session.ws && session.ws.readyState === session.ws.OPEN) {
-          session.ws.send(JSON.stringify({ type: 'cards-update', tabId: session.tabId, turnIndex, cards: assistantMsg.cards }));
+          session.ws.send(JSON.stringify({ type: 'cards-update', tabId: session.tabId, turnIndex, cards: assistantMsg.cards, proposalResult: assistantMsg.proposalResult }));
           console.log(`[objective] Efficiency cards-update sent for task ${taskId} (${hintCards.length} hint cards, took ${efficiencyMs}ms)`);
         }
       })

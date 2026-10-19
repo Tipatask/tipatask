@@ -32,6 +32,156 @@ const {
 
 const toml = require('toml');
 
+function authFixture(t) {
+  const root = makeTempDir();
+  const projectRoot = path.join(root, 'project');
+  const globalHome = path.join(root, 'user-codex');
+  fs.mkdirSync(projectRoot);
+  fs.mkdirSync(globalHome);
+  const source = path.join(globalHome, 'auth.json');
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = globalHome;
+  t.after(() => {
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return { projectRoot, source, prepare: () => ensureProjectCodexHome({ projectRoot, browserTools: [] }) };
+}
+
+function denyAuthSymlinks(t, code) {
+  const symlink = fs.symlinkSync;
+  return t.mock.method(fs, 'symlinkSync', (source, target, ...args) => {
+    if (path.basename(target) === 'auth.json') throw Object.assign(new Error('auth symlink denied'), { code });
+    return symlink(source, target, ...args);
+  });
+}
+
+for (const code of ['EPERM', 'EINVAL']) {
+  test(`project auth falls back to a copy on ${code} and refreshes newer or different credentials`, t => {
+    const { source, prepare } = authFixture(t);
+    fs.writeFileSync(source, '{"token":"initial"}');
+    fs.utimesSync(source, 1, 1);
+    denyAuthSymlinks(t, code);
+    const copy = t.mock.method(fs, 'copyFileSync');
+
+    const result = prepare();
+    const target = result.projectAuthPath;
+    assert.deepEqual(result.auth, { ok: true, reason: 'copied' });
+    assert.equal(fs.lstatSync(target).isFile(), true);
+    assert.equal(fs.readFileSync(target, 'utf8'), fs.readFileSync(source, 'utf8'));
+    assert.equal(copy.mock.callCount(), 1);
+    assert.deepEqual(prepare().auth, { ok: true, reason: 'copied' });
+    assert.equal(copy.mock.callCount(), 1, 'unchanged copies are not rewritten');
+
+    for (const delta of [0, -10000]) {
+      const timestamp = new Date(fs.statSync(target).mtimeMs + delta);
+      fs.writeFileSync(source, JSON.stringify({ token: `rotated-${delta}` }));
+      fs.utimesSync(source, timestamp, timestamp);
+      const before = copy.mock.callCount();
+      prepare();
+      assert.equal(copy.mock.callCount(), before + 1, 'changed contents refresh even without a newer timestamp');
+      assert.equal(fs.readFileSync(target, 'utf8'), fs.readFileSync(source, 'utf8'));
+    }
+
+    const newer = new Date(fs.statSync(target).mtimeMs + 10000);
+    fs.utimesSync(source, newer, newer);
+    const before = copy.mock.callCount();
+    prepare();
+    assert.equal(copy.mock.callCount(), before + 1, 'newer global auth refreshes even with equal contents');
+  });
+
+  test(`terminal auth falls back on ${code} and refreshes a reused snapshot`, t => {
+    const { projectRoot, source, prepare } = authFixture(t);
+    fs.writeFileSync(source, '{"token":"initial"}');
+    denyAuthSymlinks(t, code);
+    const { projectCodexDir } = prepare();
+    const select = () => prepareCodexTerminalHome({ projectRoot, codexHome: projectCodexDir, effort: 'high' });
+    const home = select();
+    const target = path.join(home, 'auth.json');
+    assert.equal(fs.lstatSync(target).isFile(), true);
+    assert.equal(fs.readFileSync(target, 'utf8'), fs.readFileSync(source, 'utf8'));
+    const copy = t.mock.method(fs, 'copyFileSync');
+    assert.equal(select(), home);
+    assert.equal(copy.mock.callCount(), 0, 'unchanged snapshot copies are not rewritten');
+
+    fs.writeFileSync(source, '{"token":"rotated"}');
+    prepare();
+    assert.equal(select(), home);
+    assert.equal(fs.readFileSync(target, 'utf8'), '{"token":"rotated"}');
+    assert.equal(copy.mock.callCount(), 2, 'global rotation reaches both project and terminal copies');
+  });
+}
+
+test('existing regular project auth is treated as a managed copy, including a materialized link', t => {
+  const { source, projectRoot, prepare } = authFixture(t);
+  fs.writeFileSync(source, '{"token":"global"}');
+  const target = path.join(projectRoot, '.codex', 'auth.json');
+  fs.mkdirSync(path.dirname(target));
+  const link = denyAuthSymlinks(t, 'EPERM');
+  for (const previous of ['{"token":"stale"}', source]) {
+    fs.writeFileSync(target, previous);
+    assert.deepEqual(prepare().auth, { ok: true, reason: 'copied' });
+    assert.equal(fs.readFileSync(target, 'utf8'), '{"token":"global"}');
+  }
+  assert.equal(link.mock.callCount(), 0, 'existing regular files do not need another symlink attempt');
+});
+
+test('missing global auth leaves project auth intact and creates no terminal auth', t => {
+  const { projectRoot, prepare } = authFixture(t);
+  const result = prepare();
+  assert.deepEqual(result.auth, { ok: false, reason: 'global-auth-missing' });
+  const home = prepareCodexTerminalHome({ projectRoot, codexHome: result.projectCodexDir, effort: 'high' });
+  assert.equal(fs.existsSync(path.join(home, 'auth.json')), false);
+  fs.writeFileSync(result.projectAuthPath, '{"token":"local"}');
+  assert.deepEqual(prepare().auth, { ok: false, reason: 'global-auth-missing' });
+  assert.equal(fs.readFileSync(result.projectAuthPath, 'utf8'), '{"token":"local"}');
+});
+
+test('working auth symlinks remain linked and wrong or dangling links are repaired', t => {
+  const { source, projectRoot, prepare } = authFixture(t);
+  fs.writeFileSync(source, '{}');
+  const result = prepare();
+  if (result.auth.reason === 'copied') {
+    t.skip('File symlinks are unavailable without privileges on this host');
+    return;
+  }
+  assert.deepEqual(result.auth, { ok: true, reason: 'linked' });
+  assert.deepEqual(prepare().auth, { ok: true, reason: 'already-linked' });
+  const select = () => prepareCodexTerminalHome({ projectRoot, codexHome: result.projectCodexDir, effort: 'high' });
+  const snapshotAuth = path.join(select(), 'auth.json');
+  const other = path.join(path.dirname(source), 'other.json');
+  fs.writeFileSync(other, '{"token":"other"}');
+  for (const target of [result.projectAuthPath, snapshotAuth]) {
+    for (const wrong of [other, path.join(path.dirname(source), 'missing.json')]) {
+      fs.unlinkSync(target);
+      fs.symlinkSync(wrong, target);
+      prepare();
+      select();
+      assert.equal(fs.realpathSync(target), fs.realpathSync(source));
+    }
+  }
+  assert.deepEqual(prepare().auth, { ok: true, reason: 'already-linked' });
+});
+
+test('auth fallback propagates unrelated symlink and copy failures', t => {
+  const { projectRoot, source, prepare } = authFixture(t);
+  fs.writeFileSync(source, '{}');
+  const link = denyAuthSymlinks(t, 'EIO');
+  assert.throws(prepare, { code: 'EIO' });
+  const home = path.join(projectRoot, '.codex');
+  fs.writeFileSync(path.join(home, 'auth.json'), '{}');
+  const select = () => prepareCodexTerminalHome({ projectRoot, codexHome: home, effort: 'high' });
+  assert.throws(select, { code: 'EIO' });
+  link.mock.restore();
+  denyAuthSymlinks(t, 'EPERM');
+  t.mock.method(fs, 'copyFileSync', () => { throw Object.assign(new Error('auth copy denied'), { code: 'EACCES' }); });
+  fs.unlinkSync(path.join(home, 'auth.json'));
+  assert.throws(prepare, { code: 'EACCES' });
+  fs.writeFileSync(path.join(home, 'auth.json'), '{}');
+  assert.throws(select, { code: 'EACCES' });
+});
+
 test('native terminal homes preserve MCP policies, user settings and shared auth/history across effort choices', t => {
   const root = makeTempDir();
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -55,7 +205,7 @@ test('native terminal homes preserve MCP policies, user settings and shared auth
     assert.deepEqual(cfg.mcp_servers, toml.parse(original).mcp_servers);
     assert.equal(cfg.sqlite_home, home);
     assert.deepEqual(cfg.project_root_markers, ['.codex']);
-    assert.equal(fs.realpathSync(path.join(selected, 'auth.json')), fs.realpathSync(path.join(home, 'auth.json')));
+    assert.equal(fs.readFileSync(path.join(selected, 'auth.json'), 'utf8'), fs.readFileSync(path.join(home, 'auth.json'), 'utf8'));
     assert.equal(fs.realpathSync(path.join(selected, 'sessions')), fs.realpathSync(path.join(home, 'sessions')));
     assert.equal(fs.realpathSync(path.join(selected, 'packages')), fs.realpathSync(path.join(home, 'packages')));
     assert.doesNotMatch(content, /test-secret/);

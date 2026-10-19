@@ -425,6 +425,34 @@ class BaseTaskAgent {
   // (default) = no such row is known for this agent, so a lost paste is never retried.
   getEmptyComposerRe() { return null; }
 
+  // (TPT9048) Pattern for the TUI's "a submission is queued behind startup" footer. While it is
+  // visible after the kickoff Enter, submit verification waits instead of re-sending Enter (the
+  // TUI replays the queued submission itself; another key would cancel it). null = no such state.
+  getStartupWaitRe() { return null; }
+
+  // (TPT9048) Pattern matched against the rolling tail before the kickoff is pasted: the agent's
+  // composer only accepts a real submission once this is on screen. null = paste after the boot
+  // floor + silence alone (every agent today except Codex on Windows). Bounded by
+  // getComposerReadyMaxMs(): past that the paste goes out regardless and verification covers it.
+  getComposerReadyRe() { return null; }
+  getComposerReadyMaxMs() { return 0; }
+
+  // (TPT9048) Pattern for the kickoff text itself still sitting in the composer after the submit
+  // Enter, for agents whose kickoff never collapses into an unsent-paste chip (the Windows Codex
+  // file handoff). Built per spawn from the spawn spec; null = no such marker for this spawn.
+  getKickoffEchoRe(_spec) { return null; }
+
+  // (TPT9048) True when the agent's native transcript for this spawn already holds the kickoff
+  // turn — consulted before a re-sent Enter so a stale echo row can never cause a second turn.
+  // Default: unknown, so verification relies on the screen alone.
+  kickoffAccepted(_session) { return false; }
+
+  // (TPT9048) Whether composer writes are wrapped in a bracketed-paste frame (ESC[200~ … ESC[201~).
+  // false for a console that never delivers paste events to the TUI (Codex on Windows: ConPTY
+  // drops the unknown CSI and crossterm's Windows backend has no paste event), where the frame
+  // is dead weight at best and a stray Esc at worst.
+  wrapsBracketedPaste() { return true; }
+
   // Writes a locally-saved clipboard image's path into the PTY so the agent attaches it
   // (C809/C1003/C1051). Default: bare absolute path inside a bracketed-paste frame — no `@`,
   // no quotes, no trailing newline, left on the input line (not auto-submitted). Confirmed

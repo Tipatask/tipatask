@@ -417,11 +417,13 @@ test('a dialog frame draws a locked form mid-turn that opens when the turn ends'
   assert.equal(h.$('.task-chat-widget--dialog'), dialog, 'the same element — picks made so far survive');
 });
 
-test('picking an option and submitting sends task-chat-answer, locks the dialog and becomes the next user turn', (t) => {
+test('picking an option and submitting sends task-chat-answer and locks the dialog with the pick — no user bubble under it', (t) => {
   const h = harness(t);
   h.start();
   askDialog(h);
   h.feed({ type: 'chat-ready' });
+  const users = () => h.$$('.task-chat-msg--user').length;
+  const before = users();
   const dialog = h.$('.task-chat-widget--dialog');
   const radios = h.$$('.task-chat-dialog-options input[type="radio"]');
   radios[1].checked = true;
@@ -435,13 +437,19 @@ test('picking an option and submitting sends task-chat-answer, locks the dialog 
   assert.equal(dialog.disabled, true);
   assert.equal(submit.hidden, true);
   assert.equal(h.$('.task-chat-dialog-state').textContent, 'taskChat.dialog.answered');
-  const bubbles = h.$$('.task-chat-msg--user .task-chat-body').map(el => el.textContent);
-  assert.equal(bubbles.at(-1), 'Backlog', 'the pick is the next user turn');
-  assert.ok(h.$('.task-chat-msg--streaming'), 'and the reply to it is on its way');
+  assert.deepEqual(h.$$('.task-chat-dialog-options input').filter(i => i.checked).map(i => i.value), ['1']);
+  assert.equal(users(), before, 'the dialog is the answer — no user turn repeats it');
+  const reply = dialog.closest('.task-chat-msg').nextElementSibling;
+  assert.ok(reply.classList.contains('task-chat-msg--streaming'), 'the reply follows the dialog directly');
   assert.equal(h.$('.task-chat-send').hidden, true);
 
   click(submit);
   assert.equal(h.sent.length, 1, 'a locked dialog sends nothing more');
+
+  h.feed({ type: 'data', data: 'Moved to the backlog.' });
+  h.feed({ type: 'chat-ready' });
+  assert.equal(users(), before, 'nor once the reply is in');
+  assert.equal(dialog.dataset.state, 'answered');
 });
 
 test('the free-text Other answers a single-choice dialog on its own; a multi-choice dialog combines picks', (t) => {
@@ -449,13 +457,21 @@ test('the free-text Other answers a single-choice dialog on its own; a multi-cho
   h.start();
   askDialog(h);
   h.feed({ type: 'chat-ready' });
+  const users = () => h.$$('.task-chat-msg--user').length;
+  const before = users();
+  // Typed or dictated: either way the field gets input events.
   const other = h.$('.task-chat-dialog-other');
-  other.value = 'The sprint after next';
+  const long = 'The sprint after next, once the API half has landed and the board work is split out';
+  other.value = long;
   other.dispatchEvent(new h.doc.defaultView.Event('input', { bubbles: true }));
   assert.equal(h.$('.task-chat-dialog-options input[value="other"]').checked, true, 'typing selects Other');
   click(h.$('.task-chat-dialog-submit'));
-  assert.deepEqual(h.sent, [{ type: 'task-chat-answer', dialogId: 'dlg-1', selected: [], other: 'The sprint after next', model: undefined }]);
-  assert.equal(h.$$('.task-chat-msg--user .task-chat-body').at(-1).textContent, 'The sprint after next');
+  assert.deepEqual(h.sent, [{ type: 'task-chat-answer', dialogId: 'dlg-1', selected: [], other: long, model: undefined }]);
+  assert.equal(users(), before, 'no user bubble repeats the free text');
+  const freeText = h.$('.task-chat-dialog-other-answer');
+  assert.equal(freeText.hidden, false);
+  assert.equal(freeText.textContent, long, 'the dialog shows the whole answer');
+  assert.equal(other.hidden, true, 'in place of the one-line input');
 
   h.feed({ type: 'data', data: 'And which?' });
   h.feed({ type: 'task-chat-dialog', taskKey: 'TPT1', dialog: { ...DIALOG, id: 'dlg-2', multi: true } });
@@ -468,7 +484,9 @@ test('the free-text Other answers a single-choice dialog on its own; a multi-cho
   for (const box of boxes.slice(0, 2)) { box.checked = true; change(box); }
   click(second.querySelector('.task-chat-dialog-submit'));
   assert.deepEqual(h.sent, [{ type: 'task-chat-answer', dialogId: 'dlg-2', selected: [0, 1], model: undefined }]);
-  assert.equal(h.$$('.task-chat-msg--user .task-chat-body').at(-1).textContent, 'Current sprint; Backlog');
+  assert.equal(second.dataset.state, 'answered');
+  assert.deepEqual(boxes.map(box => box.checked), [true, true, false]);
+  assert.equal(users(), before);
 });
 
 test('an answer the server refuses is taken back and the dialog opens again', (t) => {
@@ -482,11 +500,12 @@ test('an answer the server refuses is taken back and the dialog opens again', (t
   const users = () => h.$$('.task-chat-msg--user').length;
   const before = users();
   click(h.$('.task-chat-dialog-submit'));
-  assert.equal(users(), before + 1);
+  assert.equal(users(), before, 'the answer is the locked dialog, not a user turn');
+  assert.equal(h.$('.task-chat-widget--dialog').dataset.state, 'answered');
 
   h.feed({ type: 'error', message: 'That dialog is already answered.' });
-  assert.equal(users(), before, 'the optimistic user turn is gone');
-  assert.equal(h.$('.task-chat-msg--streaming'), null);
+  assert.equal(users(), before);
+  assert.equal(h.$('.task-chat-msg--streaming'), null, 'the optimistic reply is gone');
   const dialog = h.$('.task-chat-widget--dialog');
   assert.equal(dialog.dataset.state, 'open');
   assert.equal(h.$('.task-chat-dialog-submit').disabled, false, 'the pick is still there to resend');
@@ -499,6 +518,8 @@ test('stopping the answer turn re-opens the dialog and does not put the answer i
   h.start();
   askDialog(h);
   h.feed({ type: 'chat-ready' });
+  const users = () => h.$$('.task-chat-msg--user').length;
+  const before = users();
   const radios = h.$$('.task-chat-dialog-options input[type="radio"]');
   radios[0].checked = true;
   change(radios[0]);
@@ -507,8 +528,115 @@ test('stopping the answer turn re-opens the dialog and does not put the answer i
   h.feed({ type: 'generation-aborted' });
   assert.equal(h.$('.task-chat-widget--dialog').dataset.state, 'open');
   assert.equal(h.$('.task-chat-input').value, '');
-  assert.equal(h.$$('.task-chat-msg--user .task-chat-body').some(el => el.textContent === 'Current sprint'), false);
+  assert.equal(h.$('.task-chat-msg--streaming'), null);
+  assert.equal(users(), before, 'no stray bubble, and the typed turn before it is kept');
+  assert.equal(h.$('.task-chat-dialog-submit').disabled, false, 'the pick is still there to resend');
 });
+
+for (const ending of ['generation-aborted', 'objective-error']) {
+  test(`${ending} on a dropped answer after a reattach reopens its dialog without a bubble`, (t) => {
+    const h = harness(t);
+    h.env.open('TPT1');
+    h.feed({
+      type: 'chat-history-reset',
+      running: true,
+      messages: [
+        { role: 'user', content: 'seed', seed: true },
+        { role: 'assistant', content: 'Pick.', dialogs: [{ ...DIALOG, answer: { selected: [], indexes: [], other: 'Next week' } }], tools: [], taskEvents: [] },
+        { role: 'user', content: 'Answer to "Where should it go?": Next week', dialogAnswer: { dialogId: 'dlg-1', selected: [], indexes: [], other: 'Next week' } },
+      ],
+    });
+    h.feed({ type: 'config', objectiveProviders: [] });
+    const dialog = h.$('.task-chat-widget--dialog');
+    assert.equal(h.$$('.task-chat-msg--user').length, 0, 'the answer turn is not drawn');
+    assert.equal(dialog.dataset.state, 'answered');
+    assert.equal(h.$('.task-chat-dialog-other-answer').textContent, 'Next week');
+    assert.ok(h.$('.task-chat-msg--streaming'), 'the running reply to it');
+
+    h.feed({ type: ending, droppedUserTurn: true, reason: 'cli-error:error_during_execution' });
+    assert.equal(dialog.dataset.state, 'open');
+    assert.equal(h.$$('.task-chat-msg--user').length, 0);
+    assert.equal(h.$('.task-chat-msg--streaming'), null);
+    assert.equal(h.$('.task-chat-input').value, '', 'nothing to retype');
+    const other = h.$('.task-chat-dialog-other');
+    assert.equal(other.hidden, false, 'the free text is back in its input');
+    assert.equal(other.value, 'Next week');
+    assert.equal(h.$('.task-chat-dialog-other-answer').hidden, true);
+  });
+}
+
+for (const kind of ['task', 'project']) {
+  test(`a flagged failure in ${kind} chat reopens an accepted answer and can resend it`, async t => {
+    const h = harness(t);
+    if (kind === 'task') h.start();
+    else {
+      h.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '2' } }) });
+      await h.env.openProjectChat();
+      h.feed({ type: 'config', objectiveProviders: [] });
+      await new Promise(resolve => setImmediate(resolve));
+      click(h.$('.task-chat-start-go'));
+      h.feed({ type: 'chat-ready' });
+      h.sent.length = 0;
+    }
+    askDialog(h);
+    h.feed({ type: 'chat-ready' });
+    const users = h.$$('.task-chat-msg--user').length;
+    const radio = h.$('.task-chat-dialog-options input[type="radio"]');
+    radio.checked = true;
+    change(radio);
+    click(h.$('.task-chat-dialog-submit'));
+    h.feed({ type: 'objective-progress', stage: 'spawned' });
+    h.feed({ type: 'data', data: 'Partial reply that failed' });
+    h.feed({ type: 'objective-error', provider: 'claude', reason: 'stream-idle-timeout', droppedUserTurn: true });
+    assert.equal(h.$('.task-chat-widget--dialog').dataset.state, 'open');
+    assert.equal(h.$('.task-chat-msg--streaming'), null);
+    assert.equal(h.$$('.task-chat-msg--user').length, users, 'answer has no bubble; preceding typed turn stays');
+    assert.equal(h.$('.task-chat-input').value, '');
+    assert.equal(h.$('.task-chat-dialog-submit').disabled, false);
+    assert.match(h.$('.task-chat-msg--error').textContent, /stream-idle-timeout/);
+    assert.equal(h.$('.task-chat-messages').textContent.includes('Partial reply that failed'), false);
+    h.sent.length = 0;
+    click(h.$('.task-chat-dialog-submit'));
+    assert.deepEqual(h.sent, [{ type: 'task-chat-answer', dialogId: 'dlg-1', selected: [0], model: undefined }]);
+    assert.equal(h.$('.task-chat-widget--dialog').dataset.state, 'answered');
+  });
+}
+
+for (const provider of ['codex', 'pi']) {
+  test(`an unflagged ${provider} failure keeps the accepted dialog answer`, t => {
+    const h = harness(t);
+    h.start();
+    askDialog(h);
+    h.feed({ type: 'chat-ready' });
+    const radio = h.$('.task-chat-dialog-options input[type="radio"]');
+    radio.checked = true;
+    change(radio);
+    click(h.$('.task-chat-dialog-submit'));
+    h.feed({ type: 'objective-progress', stage: 'spawned' });
+    h.feed({ type: 'objective-error', provider, reason: 'Network unavailable' });
+    assert.equal(h.$('.task-chat-widget--dialog').dataset.state, 'answered');
+    assert.equal(h.$('.task-chat-input').value, '');
+    assert.equal(h.$$('.task-chat-msg--user').length, 1, 'only the preceding typed message is shown');
+    assert.match(h.$('.task-chat-msg--error').textContent, /Network unavailable/);
+  });
+}
+
+for (const draft of ['', 'New draft']) {
+  test(`a flagged typed-turn failure restores its composer text without overwriting draft (${draft})`, t => {
+    const storage = new Map();
+    const h = harness(t, { draftStorage: storage });
+    h.start();
+    h.turn('Please check this');
+    h.feed({ type: 'data', data: 'Partial reply' });
+    if (draft) typeDraft(h, draft);
+    h.feed({ type: 'objective-error', reason: 'cli-error:error_during_execution', droppedUserTurn: true });
+    assert.equal(h.$('.task-chat-input').value, draft || 'Please check this');
+    assert.ok([...storage.values()].includes(draft || 'Please check this'));
+    assert.equal(h.$$('.task-chat-msg--user').length, 0);
+    assert.equal(h.$('.task-chat-msg--streaming'), null);
+    assert.match(h.$('.task-chat-msg--error').textContent, /cli-error:error_during_execution/);
+  });
+}
 
 test('typing a message instead leaves the dialog behind as not answered', (t) => {
   const h = harness(t);
@@ -521,9 +649,10 @@ test('typing a message instead leaves the dialog behind as not answered', (t) =>
   assert.equal(dialog.disabled, true);
   assert.equal(h.$('.task-chat-dialog-state').textContent, 'taskChat.dialog.skipped');
   assert.equal(h.$('.task-chat-dialog-submit').hidden, true);
+  assert.equal(h.$$('.task-chat-msg--user .task-chat-body').at(-1).textContent, 'Never mind, do something else', 'a typed message stays a user turn');
 });
 
-test('restored history shows an answered dialog locked with its pick, and the answer as a user turn', (t) => {
+test('restored history shows an answered dialog locked with its pick, and no user turn for the answer', (t) => {
   const h = harness(t);
   h.env.open('TPT1');
   h.feed({
@@ -541,7 +670,12 @@ test('restored history shows an answered dialog locked with its pick, and the an
   const dialog = h.$('.task-chat-widget--dialog');
   assert.equal(dialog.dataset.state, 'answered');
   assert.deepEqual(h.$$('.task-chat-dialog-options input').filter(i => i.checked).map(i => i.value), ['1']);
-  assert.equal(h.$('.task-chat-msg--user .task-chat-body').textContent, 'Backlog');
+  assert.equal(h.$$('.task-chat-msg--user').length, 0);
+  const reply = dialog.closest('.task-chat-msg').nextElementSibling;
+  assert.equal(reply.querySelector('.task-chat-body').textContent, 'Done.', 'the reply follows the dialog directly');
+  assert.equal(h.env.pushMessage({ role: 'user', content: 'Answer to "Where should it go?": Backlog', dialogAnswer: { dialogId: 'dlg-1' } }), null,
+    'nor is one ever appended live');
+  assert.equal(h.$$('.task-chat-msg--user').length, 0);
 });
 
 test('(TPT475) a reattached project chat opens its pending dialog once config arrives after the history', async (t) => {

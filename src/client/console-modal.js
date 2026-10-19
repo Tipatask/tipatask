@@ -1564,7 +1564,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     clearAttention(taskId, 'session-ended');
     state.sessionMeta.delete(taskId); // (C1144)
     const card = document.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
-    if (card) card.classList.remove('needs-attention', 'has-active-session');
+    // (TPT9025) has-active-session belongs to updateClaudeButtons() below, which holds that
+    // size change back while a card drag is live.
+    if (card) card.classList.remove('needs-attention');
     updateClaudeButtons();
   }
 

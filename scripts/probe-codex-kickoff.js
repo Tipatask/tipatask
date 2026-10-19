@@ -25,11 +25,23 @@
 // home (a copy of the real config.toml plus a link to the real auth.json) — the real Codex home is
 // never written. The MCP handshake and the attachment lookup reach the API the project points at,
 // read-only. No server is started and port 4455 is never touched. Hence the explicit --yes.
-// POSIX only: Codex and its shared-mode daemon are stopped by process group.
+// POSIX stops Codex and its shared-mode daemon by process group; Windows (TPT9048) by
+// `taskkill /T /F` on the PTY leader and on the daemon records' pids.
 //
-// Usage: npm run probe:codex-kickoff -- --yes [--keep]
+// --file-kickoff exercises Windows' short file handoff (implied on Windows, where production
+// takes that path anyway). A pass then also requires the rollout to contain the original task
+// text read from that file, and exactly ONE user turn with the kickoff — a re-sent Enter that
+// produced a second turn fails the run.
+// --approve-handoff-read answers Codex's command-approval dialog for reading the handoff file
+// once (`y`), the way a user does on a Windows host whose Codex sandbox is disabled: there every
+// command, including `Get-Content` of the prompt file, asks for approval before it runs.
+// --trace writes the PTY I/O trace (TIPATASK_PTY_TRACE, src/server/pty-trace.js) into the
+// scratch dir and keeps it; --no-bracket / --boot-floor-ms <n> / --manual-enter-after <ms> are
+// diagnosis knobs for the Windows input path (see TPT9048).
+// Usage: npm run probe:codex-kickoff -- --yes [--keep] [--file-kickoff] [--trace] [--no-bracket]
+//        [--boot-floor-ms N] [--manual-enter-after MS]
 // Exit codes: 0 = kickoff delivered · 1 = a check failed, or cleanup left a process running ·
-//             2 = refused to run (no --yes, no project/account, Windows) · 3 = Codex unavailable or never started.
+//             2 = refused to run (no --yes, no project/account) · 3 = Codex unavailable or never started.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -41,7 +53,7 @@ const TASK_KEY = 'PROBE-1';
 const KICKOFF = `Work on task ${TASK_KEY}: Kickoff delivery probe. An automated check of how Codex receives a `
   + 'pasted task prompt, not a real task: do not read files, run commands or call tools. Reply with the single word READY.';
 const SILENCE_MS = 20_000;   // this long without PTY output = Codex sits idle (a running turn animates)
-const TIMEOUT_MS = 180_000;  // ceiling when neither signal ever settles
+const TIMEOUT_MS = process.platform === 'win32' ? 240_000 : 180_000;  // ceiling when neither signal ever settles (Windows: cold MCP starts)
 const POLL_MS = 500;
 const KILL_GRACE_MS = 1500;
 const TAIL_LINES = 40;
@@ -51,7 +63,17 @@ const COLD_START_RE = /app server did not become ready/i;
 const SECRET_KEY_RE = /(?:_API_KEY|TOKEN|SECRET|PASSWORD)$/;
 
 function parseArgs(argv) {
-  return { yes: argv.includes('--yes'), keep: argv.includes('--keep') };
+  const value = (flag) => { const i = argv.indexOf(flag); return i >= 0 && argv[i + 1] ? Number(argv[i + 1]) : null; };
+  return {
+    yes: argv.includes('--yes'),
+    keep: argv.includes('--keep'),
+    fileKickoff: argv.includes('--file-kickoff') || process.platform === 'win32',
+    trace: argv.includes('--trace'),
+    noBracket: argv.includes('--no-bracket'),
+    bootFloorMs: value('--boot-floor-ms'),
+    manualEnterAfterMs: value('--manual-enter-after'),
+    approveHandoffRead: argv.includes('--approve-handoff-read'),
+  };
 }
 
 function findProjectRoot(start) {
@@ -97,8 +119,12 @@ function seedCodexUserHome(dir, real) {
   const target = path.join(dir, 'config.toml');
   if (fs.existsSync(real.globalConfigPath)) fs.copyFileSync(real.globalConfigPath, target);
   else fs.writeFileSync(target, '');
-  fs.chmodSync(target, 0o600);
-  if (fs.existsSync(real.globalAuthPath)) fs.symlinkSync(real.globalAuthPath, path.join(dir, 'auth.json'));
+  try { fs.chmodSync(target, 0o600); } catch { /* NTFS has no mode bits */ }
+  // Symlink where allowed, a managed copy where not (unprivileged Windows users) — the same
+  // rule a project home follows (codex-mcp-config.js ensureCodexAuthLink()).
+  if (fs.existsSync(real.globalAuthPath)) {
+    require('../src/codex-mcp-config').ensureCodexAuthLink(real.globalAuthPath, path.join(dir, 'auth.json'));
+  }
 }
 
 // A shared-mode launch starts a detached app-server daemon under the native home; codex-env.js
@@ -116,11 +142,49 @@ function readDaemonPid(codexHome) {
 // the pid-based teardown missed. Reported, never signaled.
 function scratchProcesses(scratch) {
   try {
+    if (process.platform === 'win32') {
+      const script = 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }';
+      return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', windowsHide: true, timeout: 20_000 })
+        .split(/\r?\n/).filter((line) => line.toLowerCase().includes(scratch.toLowerCase())).map((line) => line.trim());
+    }
     return execFileSync('/bin/ps', ['-Aww', '-o', 'pid=,command='], { encoding: 'utf8' })
       .split('\n').filter((line) => line.includes(scratch)).map((line) => line.trim());
   } catch {
     return [];
   }
+}
+
+// (TPT9048) How many user turns in the rollout carry the kickoff line. Codex records a submitted
+// prompt as an `event_msg`/`user_message` row (and mirrors it as a `response_item` user message);
+// count the event rows, falling back to the mirrored items for a build that writes only those.
+function countKickoffTurns(rollout) {
+  let events = 0;
+  let items = 0;
+  let lines;
+  try { lines = fs.readFileSync(rollout, 'utf8').split('\n'); } catch { return 0; }
+  const marker = `Work on task ${TASK_KEY}`;
+  for (const line of lines) {
+    if (!line.includes(marker)) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    const payload = row && row.payload ? row.payload : row;
+    if (!payload || typeof payload !== 'object') continue;
+    if (row.type === 'event_msg' && payload.type === 'user_message') events++;
+    else if (row.type === 'response_item' && payload.role === 'user') items++;
+  }
+  return events || items;
+}
+
+// (TPT9048) Both daemon records a shared-mode start can leave under a Codex home.
+function daemonPids(codexHome) {
+  const pids = [];
+  for (const name of ['daemon.pid', 'daemon-updater.pid']) {
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(codexHome, 'app-server-daemon', name), 'utf8'));
+      if (Number.isInteger(record.pid) && record.pid > 1) pids.push(record.pid);
+    } catch { /* no such record */ }
+  }
+  return pids;
 }
 
 // spawnTerminal() reports to the session's socket. Only its own `[Task App]` notices are printed —
@@ -141,10 +205,6 @@ function noticeRecorder(onNotice) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  if (process.platform === 'win32') {
-    console.error('probe-codex-kickoff is POSIX-only: it stops Codex and its daemon by process group.');
-    process.exit(2);
-  }
   const sourceRoot = findProjectRoot(process.env.TIPATASK_PROJECT_ROOT || process.cwd());
   if (!sourceRoot) {
     console.error('No .tipatask/config.json found above the current directory.');
@@ -194,6 +254,9 @@ async function main() {
     TIPATASK_NO_BANNER: '1',
     CODEX_HOME: codexUserHome,
   });
+  // (TPT9048) The PTY I/O trace lands beside the scratch project and survives --keep.
+  if (opts.trace) process.env.TIPATASK_PTY_TRACE = path.join(scratch, 'pty-trace');
+  else delete process.env.TIPATASK_PTY_TRACE;
   seedCodexUserHome(codexUserHome, require('../src/codex-mcp-config').getCodexPaths(sourceRoot, { env: realEnv }));
   require('../src/server/account-store').writeAccountToken(creds.baseUrl, creds.token, { userDataRoot: userData });
 
@@ -204,7 +267,7 @@ async function main() {
   const { spawnTerminal, unsentPasteVisible, SUBMIT_MARKER_TRAILING_MAX } = require('../src/server/terminal-session');
   const { CODEX_COMPOSER_PLACEHOLDERS } = require('../src/server/task-agent/prompt-detect');
   const { locateCodexRollout } = require('../src/server/task-agent/final-message');
-  const { snapshotProcesses, listDescendants, killProcessTree } = require('../src/server/process-group');
+  const { snapshotProcesses, listDescendants, killProcessTree, killWindowsProcessTree } = require('../src/server/process-group');
 
   const ptyPids = [];
   let codexHome = null;
@@ -212,8 +275,15 @@ async function main() {
   // Idempotent: the normal path and Ctrl+C share one teardown.
   const runCleanup = () => (cleanup = cleanup || (async () => {
     const report = { daemonPid: codexHome ? readDaemonPid(codexHome) : null, survivors: [], leftover: [] };
-    const roots = [...ptyPids, report.daemonPid].filter((pid) => Number.isInteger(pid) && pid > 1);
-    if (roots.length > 0) {
+    const roots = [...ptyPids, report.daemonPid, ...(codexHome ? daemonPids(codexHome) : [])]
+      .filter((pid, i, all) => Number.isInteger(pid) && pid > 1 && all.indexOf(pid) === i);
+    if (roots.length > 0 && process.platform === 'win32') {
+      // (TPT9048) No process groups on Windows: `taskkill /T /F` each root's tree, then report
+      // what is still alive. killWindowsProcessTree() never throws.
+      for (const root of roots) killWindowsProcessTree(root);
+      await sleep(KILL_GRACE_MS);
+      report.survivors = roots.filter(isAlive);
+    } else if (roots.length > 0) {
       const snapshot = await snapshotProcesses();
       const tracked = new Set(roots);
       for (const root of roots) for (const pid of listDescendants(snapshot, root)) tracked.add(pid);
@@ -230,17 +300,32 @@ async function main() {
     }
     report.leftover = scratchProcesses(scratch);
     if (opts.keep) console.log(`Scratch dir kept: ${scratch}`);
-    else fs.rmSync(scratch, { recursive: true, force: true });
+    else {
+      // (TPT9048) The trace is the evidence a failed run is for: move it out before the scratch goes.
+      const traceDir = path.join(scratch, 'pty-trace');
+      if (opts.trace && fs.existsSync(traceDir)) {
+        const kept = path.join(os.tmpdir(), `tt-codex-kickoff-trace-${Date.now()}`);
+        try { fs.cpSync(traceDir, kept, { recursive: true }); console.log(`PTY trace kept: ${kept}`); } catch { /* best effort */ }
+      }
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
     return report;
   })());
   process.once('SIGINT', () => { runCleanup().finally(() => process.exit(130)); });
 
-  const checks = { composer: false, rollout: false };
+  const checks = { composer: false, rollout: false, singleTurn: true };
   const notes = [];
   let version = 'unknown';
 
   async function run() {
     const agent = getTaskAgent('codex');
+    if (opts.fileKickoff) {
+      const prepare = agent.prepareKickoff.bind(agent);
+      agent.prepareKickoff = (cfg, prompt, taskId) => prepare(cfg, prompt, taskId, { isWin: true });
+    }
+    // (TPT9048) Diagnosis knobs for the Windows input path — production values unless set.
+    if (opts.noBracket) agent.wrapsBracketedPaste = () => false;
+    if (opts.bootFloorMs != null) agent.getInteractiveReadyMs = () => opts.bootFloorMs;
     const status = await agent.cachedDetect(config, true);
     version = (status.detail && status.detail.version) || 'unknown';
     console.log(`Scratch project: ${projectRoot}`);
@@ -267,6 +352,12 @@ async function main() {
     let spec = null;
     const getSpawnSpec = agent.getSpawnSpec.bind(agent);
     agent.getSpawnSpec = async (...args) => (spec = await getSpawnSpec(...args));
+    const receivedKickoff = rollout => {
+      if (!rollout) return false;
+      if (!opts.fileKickoff) return true;
+      try { return fs.readFileSync(rollout, 'utf8').includes(KICKOFF); }
+      catch { return false; }
+    };
 
     // One task start through the production path, watched until it settles.
     async function launch() {
@@ -280,6 +371,20 @@ async function main() {
         codexHome = (spec && spec.env && spec.env.CODEX_HOME) || codexHome;
       }
       const spawnedAt = session._transcriptHint.spawnedAt;
+      // (TPT9048) The injector may hold the kickoff while Codex's provisional startup frame is on
+      // screen (CodexAgent#getComposerReadyRe()); an empty, silent composer is expected until the
+      // kickoff has actually been written. Watch the PTY input for it.
+      let kickoffWrittenAt = 0;
+      if (session.pty && typeof session.pty.write === 'function') {
+        const rawWrite = session.pty.write.bind(session.pty);
+        session.pty.write = (data) => {
+          if (!kickoffWrittenAt && typeof data === 'string' && data.includes(`Work on task ${TASK_KEY}`)) {
+            kickoffWrittenAt = Date.now();
+            console.log(`kickoff written ${((kickoffWrittenAt - spawnedAt) / 1000).toFixed(1)}s after spawn`);
+          }
+          return rawWrite(data);
+        };
+      }
       if (ptyPids.length === 1) {
         console.log(`argv:            ${spec.command} ${spec.args.join(' ')}`);
         console.log(`CODEX_HOME:      ${codexHome}`);
@@ -287,26 +392,46 @@ async function main() {
       }
       // Silence alone is no verdict: Codex can sit silent on `Waiting for startup` with the paste
       // queued. Only an empty composer that stays the last frame through SILENCE_MS ends the wait early.
-      const emptyComposerSilent = () => Date.now() - session.lastOutputAt >= SILENCE_MS
+      const emptyComposerSilent = () => kickoffWrittenAt > 0 && Date.now() - session.lastOutputAt >= SILENCE_MS
         && emptyComposerLast(session._attentionTail || '');
       let rollout = null;
       let rolloutAt = 0;
       let stop = '';
+      let manualEnterSent = false;
+      let handoffReadApproved = false;
       for (;;) {
         await sleep(POLL_MS);
+        // (TPT9048) The handoff file read waits for command approval where Codex has no sandbox
+        // (Windows, sandbox disabled): answer it once, as the user would, when the dialog names the file.
+        if (opts.approveHandoffRead && !handoffReadApproved && session.pty && spec && spec.kickoffFile
+            && Date.now() - session.lastOutputAt >= 1500) {
+          const tail = session._attentionTail || '';
+          const fileName = path.basename(spec.kickoffFile);
+          if (/Would you like to run the following command\?/i.test(tail) && tail.includes(fileName) && /Yes, proceed/i.test(tail)) {
+            handoffReadApproved = true;
+            console.log(`approving the handoff file read ${((Date.now() - spawnedAt) / 1000).toFixed(1)}s after spawn (--approve-handoff-read)`);
+            session.pty.write('y');
+          }
+        }
+        // (TPT9048) Diagnosis: a second, hand-timed Enter to see whether the TUI accepts one at all.
+        if (opts.manualEnterAfterMs != null && !manualEnterSent && session.pty && Date.now() - spawnedAt >= opts.manualEnterAfterMs) {
+          manualEnterSent = true;
+          console.log(`manual Enter written ${((Date.now() - spawnedAt) / 1000).toFixed(1)}s after spawn (--manual-enter-after)`);
+          session.pty.write('\r');
+        }
         rollout = locateCodexRollout(session._transcriptHint);
-        if (rollout) { rolloutAt = Date.now(); stop = 'rollout found'; break; }
+        if (receivedKickoff(rollout)) { rolloutAt = Date.now(); stop = opts.fileKickoff ? 'full kickoff read from file' : 'rollout found'; break; }
         if (!session.alive) { stop = `codex exited (code ${session.exitCode})`; break; }
         if (emptyComposerSilent()) { stop = `empty composer, PTY silent for ${SILENCE_MS / 1000}s`; break; }
         if (Date.now() - spawnedAt >= TIMEOUT_MS) { stop = `no verdict after ${TIMEOUT_MS / 1000}s`; break; }
       }
       if (!rollout) {
         rollout = locateCodexRollout(session._transcriptHint);
-        if (rollout) rolloutAt = Date.now();
+        if (receivedKickoff(rollout)) rolloutAt = Date.now();
       }
       console.log(`\nStopped: ${stop} — ${((Date.now() - spawnedAt) / 1000).toFixed(1)}s after spawn, `
         + `${session.buffer.length} bytes of PTY output`);
-      return { session, spawnedAt, rollout, rolloutAt, emptyComposer: emptyComposerSilent() };
+      return { session, spawnedAt, rollout, rolloutAt, emptyComposer: emptyComposerSilent(), handoffReadApproved };
     }
 
     let result;
@@ -328,8 +453,14 @@ async function main() {
     const { session, spawnedAt, rollout, rolloutAt, emptyComposer } = result;
     const tail = session._attentionTail || '';
     checks.composer = !emptyComposer;
-    checks.rollout = !!rollout;
-    if (rollout) notes.push(`${path.basename(rollout)} has the kickoff ${((rolloutAt - spawnedAt) / 1000).toFixed(1)}s after spawn`);
+    checks.rollout = receivedKickoff(rollout);
+    if (result.handoffReadApproved) notes.push('the handoff file read was approved by the probe (--approve-handoff-read)');
+    // (TPT9048) A re-sent Enter must never have produced a second kickoff turn.
+    const turns = rollout ? countKickoffTurns(rollout) : 0;
+    checks.singleTurn = !rollout || turns === 1;
+    if (rollout) notes.push(`${turns} user turn(s) carry the kickoff line${turns === 1 ? '' : ' — expected exactly one'}`);
+    if (checks.rollout) notes.push(`${path.basename(rollout)} has the ${opts.fileKickoff ? 'full file' : 'pasted'} kickoff ${((rolloutAt - spawnedAt) / 1000).toFixed(1)}s after spawn`);
+    if (opts.fileKickoff && rollout && !checks.rollout) notes.push('the short handoff was submitted but the full task file was not read');
     if (emptyComposer) {
       notes.push('the empty composer is the last frame — the kickoff never reached it');
       // The same screen through production's marker: no match means checkSubmitted()'s lost-paste
@@ -344,7 +475,8 @@ async function main() {
       console.log(`--- last ${TAIL_LINES} lines of PTY output (ANSI-stripped) ---`);
       console.log(tail.split(/\r?\n/).slice(-TAIL_LINES).map((line) => `  ${line}`).join('\n'));
     }
-    return checks.composer && checks.rollout ? 0 : 1;
+    if (session._ptyTrace || process.env.TIPATASK_PTY_TRACE) notes.push(`PTY trace: ${process.env.TIPATASK_PTY_TRACE}`);
+    return checks.composer && checks.rollout && checks.singleTurn ? 0 : 1;
   }
 
   let code;
@@ -367,7 +499,7 @@ async function main() {
   }
 
   console.log('\ncomposer-ok  rollout-ok  notes');
-  console.log([String(checks.composer).padEnd(11), String(checks.rollout).padEnd(10), notes.join('; ')].join('  '));
+  console.log([String(checks.composer).padEnd(11), String(checks.rollout).padEnd(10), String(checks.singleTurn).padEnd(11), notes.join('; ')].join('  '));
   console.log(code === 0
     ? `\nPASS — Codex ${version} took the pasted kickoff.`
     : `\nFAIL (exit ${code}) — Codex ${version}`);

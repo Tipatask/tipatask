@@ -121,6 +121,7 @@ function extractCards(session, emit) {
       const parsed = normalizeProposals(JSON.parse(blocks[i][1]), session._startStatusName, session._proposalContext || { tasks: null });
       if (parsed && parsed.changes && Array.isArray(parsed.changes)) {
         const cards = parsed.changes;
+        const proposalResult = parsed.proposalResult;
         const filesAddressed = parsed.files_addressed || [];
         const docUpdates = parsed.doc_updates || [];
         const newTags = Array.isArray(parsed.new_tags) ? parsed.new_tags : [];
@@ -130,17 +131,18 @@ function extractCards(session, emit) {
         const cardsJson = JSON.stringify(cards);
         if (cardsJson !== session._lastEmittedCardsJson) {
           session._lastEmittedCardsJson = cardsJson;
-          emit({ type: 'task-cards', cards, filesAddressed, docUpdates, newTags, objectiveSummary });
-          const lastAssistant = [...session.messages].reverse().find(m => m.role === 'assistant');
-          if (lastAssistant) {
+          emit({ type: 'task-cards', cards, filesAddressed, docUpdates, newTags, objectiveSummary, proposalResult });
+          const lastAssistant = session.messages[session.messages.length - 1];
+          if (lastAssistant?.role === 'assistant') {
             lastAssistant.cards = cards;
+            lastAssistant.proposalResult = proposalResult;
             lastAssistant.filesAddressed = filesAddressed;
             lastAssistant.docUpdates = docUpdates;
             lastAssistant.newTags = newTags;
             lastAssistant.objectiveSummary = objectiveSummary;
           }
         }
-        return { cards, filesAddressed, docUpdates, newTags, objectiveSummary };
+        return { cards, filesAddressed, docUpdates, newTags, objectiveSummary, proposalResult };
       }
     } catch { /* partial JSON in mid-stream — retry on next chunk */ }
   }
@@ -286,6 +288,7 @@ function finalizePiTurn(session, taskId, code, emit, stats) {
     role: 'assistant',
     content: session.turnBuffer,
     cards: cardResult ? cardResult.cards : null,
+    proposalResult: cardResult?.proposalResult || null,
     filesAddressed: cardResult ? cardResult.filesAddressed : [],
     docUpdates: cardResult ? cardResult.docUpdates : [],
     newTags: cardResult ? cardResult.newTags : [],
@@ -309,6 +312,7 @@ function finalizePiTurn(session, taskId, code, emit, stats) {
     filesAddressed: assistantMsg.filesAddressed,
     docUpdates: assistantMsg.docUpdates,
     cards: assistantMsg.cards,
+    proposalResult: assistantMsg.proposalResult,
     newTags: assistantMsg.newTags || [],
     objectiveSummary: assistantMsg.objectiveSummary || null, // C1339
     timingMilestones: {},

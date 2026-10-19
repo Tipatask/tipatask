@@ -8,6 +8,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { createRequire } = require('node:module');
 const { EventEmitter } = require('node:events');
+const { resolveDialogAnswer } = require('./task-chat-widgets');
 
 // Task-chat widget frames through each provider's real turn loop (Claude, Codex, Pi): a fake CLI
 // process writes that provider's own stream events and the test reads what reaches the client.
@@ -115,7 +116,7 @@ test('claude: ask_user text and tool_use events become dialog and tool frames, d
   assert.equal(frames.filter(f => f.type === 'chat-ready').length, 1);
 });
 
-test('codex: mcp_tool_call items and the agent message become tool and dialog frames', async (t) => {
+test('codex: tool and dialog frames survive, and a failed answer turn stays answered', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const spawned = [];
   const codex = loadInVm('providers/codex-session.js', {
@@ -155,9 +156,26 @@ test('codex: mcp_tool_call items and the agent message become tool and dialog fr
   const reply = session.messages.at(-1);
   assert.equal(reply.dialogs.length, 1);
   assert.deepEqual(reply.tools.map(tool => tool.status), ['done', 'error']);
+
+  const dialog = reply.dialogs[0];
+  const resolved = resolveDialogAnswer(dialog, { selected: [0] });
+  dialog.answer = resolved.answer;
+  const answer = { role: 'user', content: resolved.content, dialogAnswer: { dialogId: dialog.id } };
+  session.messages.push(answer);
+  codex.spawnCodexTurn(session, 'taskChat:TPT1');
+  await settle();
+  const failed = spawned.at(-1);
+  failed.killed = true;
+  failed.stdout.emit('data', line({ type: 'turn.failed', error: { message: 'Network unavailable' } }));
+  const error = frames.find(f => f.type === 'objective-error');
+  assert.equal(error.provider, 'codex');
+  assert.equal(error.droppedUserTurn, undefined);
+  assert.equal(session.messages.at(-1), answer);
+  assert.equal(dialog.answer, resolved.answer);
+  failed.emit('close', 1);
 });
 
-test('pi: tipatask_api tool executions and text deltas become tool and dialog frames', async (t) => {
+test('pi: tool and dialog frames survive, and a failed answer turn stays answered', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   t.after(() => t.mock.timers.reset());
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-chat-streams-'));
@@ -196,4 +214,20 @@ test('pi: tipatask_api tool executions and text deltas become tool and dialog fr
   assert.equal(reply.role, 'assistant');
   assert.equal(reply.dialogs.length, 1);
   assert.equal(reply.tools.length, 2);
+
+  const dialog = reply.dialogs[0];
+  const resolved = resolveDialogAnswer(dialog, { selected: [0] });
+  dialog.answer = resolved.answer;
+  const answer = { role: 'user', content: resolved.content, dialogAnswer: { dialogId: dialog.id } };
+  session.messages.push(answer);
+  const failed = fakeProc(0);
+  failed.killed = true;
+  spawnPiTurn(session, 'taskChat:TPT1', frame => frames.push(frame), { spawn: () => failed });
+  failed.stdout.emit('data', line({ type: 'error', message: 'Network unavailable' }));
+  const error = frames.find(f => f.type === 'objective-error');
+  assert.equal(error.provider, 'pi');
+  assert.equal(error.droppedUserTurn, undefined);
+  assert.equal(session.messages.at(-1), answer);
+  assert.equal(dialog.answer, resolved.answer);
+  failed.emit('close', 1);
 });

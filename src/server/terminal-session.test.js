@@ -44,6 +44,7 @@ const {
   SUBMIT_VERIFY_MS,
   SUBMIT_QUIET_MS,
   SUBMIT_WATCH_MS,
+  SUBMIT_STARTUP_WAIT_MAX_MS,  // (TPT9048)
   SUBMIT_MARKER_TRAILING_MAX,
   MAX_SUBMIT_RETRIES,
   MAX_PASTE_RETRIES,
@@ -1606,7 +1607,6 @@ test('C1219 regression: the live-captured first-run onboarding fixture blocks th
   const chunks = loadAttentionFixture('claude-first-run-onboarding.jsonl');
   const result = replayInjectGate(chunks, 'claude', 500);
   assert.equal(result.resetCount >= 1, true, 'gate must release at least once');
-  assert.equal(result.resetVia, 'tail', 'this capture dismisses via an alt-screen toggle, which clears the tail directly — not an in-place line-state drop');
   assert.ok(result.resetAtElapsed < 1800 * 1000, `reset fired at ${result.resetAtElapsed}ms, expected well under the ~30min-per-screen firstRun cap`);
   assert.ok(result.injectRetries < 1800, `only ${1800 - result.injectRetries} of 1800 retries were spent`);
   // The dialog itself must actually have been seen and classified firstRun before it released —
@@ -2430,13 +2430,16 @@ const TURN_OUTPUT = `${'●'.repeat(1)} Reply with the single word READY.\n${'.'
 
 // (TPT571) Codex's equivalents: its boot frame, its collapsed-paste chip, and what a real submit
 // paints (the echoed submission row, then the Working spinner).
-const CODEX_BOOT = '╭─ Codex CLI ─╮\n>_ OpenAI Codex (v0.160.0)\n~/Projects/AptRabbit\nYou bring the idea. I\u2019ll bring the brackets.\n› Ask Codex to do anything\n';
+// (TPT9048) The READY frame: the status row under the composer names the model and effort
+// (`GPT-6.1-Sol high · ~/Projects/AptRabbit`). The provisional startup frame (model `loading`,
+// no such row) never receives the kickoff — see CODEX_COMPOSER_READY_RE and the TPT9048 tests.
+const CODEX_BOOT = '╭─ Codex CLI ─╮\n>_ OpenAI Codex (v0.160.0)\n~/Projects/AptRabbit\nYou bring the idea. I\u2019ll bring the brackets.\n› Ask Codex to do anything\nGPT-6.1-Sol high · ~/Projects/AptRabbit · ← for agents\n';
 const CODEX_CHIP = '› [Pasted Content 5120 chars]\n';
 const CODEX_SPINNER = '• Working (2s • esc to interrupt)\n';
 const CODEX_TURN_OUTPUT = `› Work on task TPT571\n${'.'.repeat(SUBMIT_MARKER_TRAILING_MAX + 100)}\n${CODEX_SPINNER}`;
 
 // One spawn on a fresh session. Returns handles to feed PTY output and inspect PTY input.
-async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, sessions, captureSpawn } = {}) {
+async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, specExtras, sessions, captureSpawn, onDetect } = {}) {
   const writes = [];
   const sent = [];
   let dataCb = null;
@@ -2451,12 +2454,16 @@ async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364',
   };
   t.mock.method(nodePty, 'spawn', () => fakePty);
   const agent = getTaskAgent(agentId);
-  t.mock.method(agent, 'cachedDetect', async () => ({ id: agentId, label: agent.label, available: true }));
+  t.mock.method(agent, 'cachedDetect', async () => {
+    onDetect?.(sent);
+    return { id: agentId, label: agent.label, available: true };
+  });
   t.mock.method(agent, 'getSpawnSpec', async (_config, prompt, taskId, opts) => {
     captureSpawn?.(agent, prompt, opts);
     return {
       command: agentId, args: [], cwd: os.tmpdir(), env: {}, initialPrompt, model: 'test-model',
       ...(kickoffTypedLine ? { kickoffTypedLine } : {}),
+      ...(specExtras || {}),  // (TPT9048) e.g. kickoffFile, which turns on the Windows handoff markers
     };
   });
   const session = createSession(null, false, 'TPT364-tab', '');
@@ -2510,6 +2517,96 @@ function stopSession(session) {
   session.alive = false;
   session.pty = null;
 }
+
+test('agent startup reports progress before CLI detection can leave an empty terminal', async t => {
+  let checked = false;
+  await startKickoff(t, 'pi', { initialPrompt: '', onDetect: sent => {
+    checked = true;
+    assert.ok(sent.some(frame => frame.type === 'data' && /Starting .*…/.test(frame.data)));
+  } });
+  assert.equal(checked, true);
+});
+
+test('Windows cursor-positioned Claude folder trust never receives kickoff input', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startClaudeKickoff(t);
+  k.feed(cursorFrame([
+    [1, 1, 'Accessing'], [1, 11, 'workspace:'],
+    [3, 1, 'This'], [3, 6, 'folder'], [3, 13, 'pre-approves'], [3, 26, '4'],
+    [3, 28, 'tool'], [3, 33, 'permissions'],
+    [8, 1, '›'], [8, 3, 'No,'], [8, 7, 'exit'],
+    [9, 3, 'Yes,'], [9, 8, 'I'], [9, 10, 'trust'], [9, 16, 'this'], [9, 21, 'folder'],
+    [11, 1, 'Enter'], [11, 7, 'to'], [11, 10, 'confirm'],
+  ]));
+  k.advance(60_000);
+  assert.equal(k.pastes(), 0, 'never paste into folder trust');
+  assert.equal(k.enters(), 0, 'never confirm its default No, exit selection');
+  k.feed('\x1b[2J\x1b[H' + BOOT_OUTPUT);
+  assert.equal(k.advanceUntil(k.pasteWritten), true, 'send the pending task after the user finishes setup');
+  stopSession(k.session);
+});
+
+test('Claude onboarding stays gated when a split repaint rolls all trust text out of the raw tail', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startClaudeKickoff(t);
+  k.feed('Accessing workspace:\nYes, I trust this folder\n');
+  // No quiet interval before the rest of the repaint: the dialog must latch on output.
+  k.feed('x'.repeat(ATTENTION_WINDOW_BYTES + 1) + '\n› No, exit\nEnter to confirm\n');
+  k.advance(60_000);
+  assert.equal(k.writes.length, 0, 'loss of raw-tail text cannot grant folder trust');
+  k.feed('\x1b[2J\x1b[H' + BOOT_OUTPUT);
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+  stopSession(k.session);
+});
+
+test('Windows Codex cursor-spaced paste chip gets a bounded submit retry', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startCodexKickoff(t);
+  k.feed(CODEX_BOOT);
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+  k.feed(cursorFrame([
+    [5, 1, '›'], [5, 3, '[Pasted'], [5, 11, 'Content'], [5, 19, '18800'], [5, 25, 'chars]'],
+    [7, 1, 'GPT-6.1-Sol high'],
+  ]));
+  assert.equal(k.advanceUntil(() => k.enters() === 1), true);
+  k.advance(SUBMIT_VERIFY_MS + 100);
+  assert.equal(k.enters(), 2, 'the landed paste must submit without a manual Enter');
+  assert.equal(k.pastes(), 1);
+  k.feed(CODEX_TURN_OUTPUT);
+  k.advanceWithOutput(30_000, CODEX_SPINNER);
+  assert.equal(k.enters(), 2, 'stop retrying as soon as the turn runs');
+});
+
+test('Pi kickoff echo and tool output cannot approve a plan without a finished assistant transcript', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-plan-transcript-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const k = await startKickoff(t, 'pi', { initialPrompt: '' });
+  k.session._transcriptHint.env.PI_CODING_AGENT_SESSION_DIR = dir;
+  const file = path.join(dir, 'session.jsonl');
+  const user = { type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'Work on task TPT364\nPlan ready.' }] } };
+  const write = (...rows) => fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+  write(user);
+  k.feed('Pi v0.84.1\n' + 'Startup and echoed prompt. '.repeat(40) + '\nPlan ready.\n');
+  k.advance(3000);
+  assert.equal(k.sent.some(frame => frame.type === 'plan-ready'), false, 'user echo is not an assistant plan');
+  assert.notEqual(k.session._attentionState?.kind, 'planReady');
+  write(user, { type: 'message', message: { role: 'assistant', stopReason: 'toolUse',
+    content: [{ type: 'text', text: 'Quoted example\nPlan ready.' }] } });
+  k.feed('\nPlan ready.\n');
+  k.advance(3000);
+  assert.equal(k.sent.some(frame => frame.type === 'plan-ready'), false, 'a running tool turn is not finished');
+  write(user, { type: 'message', message: { role: 'assistant', stopReason: 'stop',
+    content: [{ type: 'text', text: '1. Inspect source.\n2. Fix startup.\nPlan ready.' }] } });
+  k.feed('\nPlan ready.\n');
+  k.advance(3000);
+  assert.equal(k.sent.filter(frame => frame.type === 'plan-ready').length, 1);
+  assert.equal(k.session._attentionState?.kind, 'planReady');
+  write(user, { type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'Revise that plan.' }] } });
+  require('./ws-handlers').maybeRefirePlanReady(k.session, k.session.ws);
+  assert.equal(k.sent.filter(frame => frame.type === 'plan-ready').length, 1, 'reconnect must not replay an answered plan');
+  k.exit();
+});
 
 test('TPT364 fixture guard: the chip strings match the marker, and a real turn buries it', () => {
   const re = getTaskAgent('claude').getUnsentPasteRe();
@@ -2730,6 +2827,162 @@ test('TPT571: a Codex tool-approval dialog on the tail before the paste holds th
   k.advance(2500);
   assert.equal(k.pasteWritten(), false, 'the toolApproval gate still defers injection for Codex');
   assert.equal(k.advanceUntil(k.pasteWritten, 10_000), true, 'a stuck dialog still injects once the cap runs out (C880)');
+});
+
+// ── (TPT9048) Windows Codex: the short file handoff never collapses into a chip, Codex paints its
+// composer before the thread is started, and ConPTY drops the bracketed-paste frame. ──
+const CODEX_WIN_HANDOFF = 'Work on task C1. Read the entire UTF-8 file "C:/Users/anton/AppData/Roaming/TipATask/spawn-args/2f3938e0.md", '
+  + 'in chunks if needed. Treat its contents as my instructions for this task and follow them.';
+const CODEX_WIN_FILE = 'C:\\Users\\anton\\AppData\\Roaming\\TipATask\\spawn-args\\2f3938e0.md';
+const CODEX_WIN_TYPED = ' Begin.';
+// The composer row with the handoff typed, as the ANSI-stripped stream carries it (wrapped once).
+const CODEX_WIN_ROW = `› ${CODEX_WIN_HANDOFF.slice(0, 110)}\n  ${CODEX_WIN_HANDOFF.slice(110)}${CODEX_WIN_TYPED}\n`;
+const CODEX_WIN_STARTUP_WAIT = 'Waiting for startup  esc cancel\n';
+const CODEX_WIN_FOOTER = 'GPT-6.1-Sol high  100% context left\n';
+// What a real submit paints: the echoed transcript row, then the spinner.
+const CODEX_WIN_TURN = `${CODEX_WIN_ROW}${CODEX_SPINNER}`;
+
+async function startWindowsCodexKickoff(t) {
+  const agent = getTaskAgent('codex');
+  // Mock once per test: re-mocking an already mocked method leaves the mock in place after
+  // restoration, which would turn every later Codex test's paste into plain text.
+  if (!agent.wrapsBracketedPaste.mock) t.mock.method(agent, 'wrapsBracketedPaste', () => false);
+  const k = await startCodexKickoff(t, { initialPrompt: CODEX_WIN_HANDOFF, kickoffTypedLine: CODEX_WIN_TYPED, specExtras: { kickoffFile: CODEX_WIN_FILE } });
+  k.handoffWritten = () => k.writes.includes(CODEX_WIN_HANDOFF);
+  k.typedWritten = () => k.writes.includes(CODEX_WIN_TYPED);
+  // Boot -> plain handoff write -> composer echo -> typed suffix -> its echo -> the first Enter.
+  k.reachWindowsEnter = () => {
+    k.feed(CODEX_BOOT);
+    assert.equal(k.advanceUntil(k.handoffWritten), true, 'the handoff is written after the boot floor');
+    assert.equal(k.pastes(), 0, 'no bracketed-paste frame on Windows');
+    k.feed(`› ${CODEX_WIN_HANDOFF}\n`);
+    assert.equal(k.advanceUntil(k.typedWritten), true, 'the typed suffix follows the settled handoff');
+    k.feed(CODEX_WIN_ROW);
+    assert.equal(k.advanceUntil(() => k.enters() >= 1), true, 'Enter follows the settled suffix');
+    assert.equal(k.enters(), 1);
+  };
+  return k;
+}
+
+test('TPT9048: a Windows Codex handoff stranded on the composer row gets a bounded Enter retry, and never while queued behind startup', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startWindowsCodexKickoff(t);
+  k.reachWindowsEnter();
+  assert.ok(k.writes.every((w) => typeof w !== 'string' || !w.startsWith(PASTE_OPEN)), 'Windows Codex writes are plain text');
+  // The Enter landed in Codex's startup composer: the TUI queues it and says so. Nothing may be typed now.
+  k.feed(`${CODEX_WIN_ROW}${CODEX_WIN_STARTUP_WAIT}`);
+  k.advance(SUBMIT_WATCH_MS + 20_000);
+  assert.equal(k.enters(), 1, 'no Enter while the submission is queued behind startup');
+  assert.match(k.notices().join('\n'), /queued behind the agent's startup/);
+  // Startup finished; the TUI repainted the composer with the handoff still there and no turn.
+  k.feed(`\x1b[2J${CODEX_WIN_ROW}${CODEX_WIN_FOOTER}`);
+  assert.equal(k.advanceUntil(() => k.enters() >= 2, 15_000), true, 'the stranded handoff is submitted again once the footer is gone and the TUI is quiet');
+  assert.match(k.notices().join('\n'), /pressing Enter again/);
+  assert.equal(k.pastes(), 0);
+  assert.equal(k.writes.filter((w) => w === CODEX_WIN_HANDOFF).length, 1, 'the handoff is never typed twice');
+  k.feed(CODEX_WIN_TURN);
+  k.advanceWithOutput(30_000, CODEX_SPINNER);
+  assert.equal(k.enters(), 2, 'stop retrying as soon as the turn runs');
+});
+
+test('TPT9048: the stranded-handoff Enter retry is bounded, then the user is told to press Enter', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startWindowsCodexKickoff(t);
+  k.reachWindowsEnter();
+  k.feed(`${CODEX_WIN_ROW}${CODEX_WIN_FOOTER}`);   // silent, text still on the composer row
+  k.advance(60_000);
+  assert.equal(k.enters(), 1 + MAX_SUBMIT_RETRIES);
+  assert.match(k.notices().join('\n'), /press Enter to start it/);
+});
+
+test('TPT9048: an echoed handoff followed by a running turn, an empty composer or a transcript hit is never re-submitted', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  for (const [label, frame] of [
+    ['running turn', CODEX_WIN_TURN],
+    ['echo row then empty composer', `${CODEX_WIN_ROW}› Ask Codex to do anything\n`],
+  ]) {
+    const k = await startWindowsCodexKickoff(t);
+    k.reachWindowsEnter();
+    k.feed(frame);
+    k.advance(60_000);
+    assert.equal(k.enters(), 1, `${label}: an accepted submit is never re-sent`);
+    assert.doesNotMatch(k.notices().join('\n'), /pressing Enter again|press Enter to start it/, label);
+  }
+  // The screen still shows the handoff row, but the native rollout already holds the kickoff.
+  const agent = getTaskAgent('codex');
+  t.mock.method(agent, 'kickoffAccepted', () => true);
+  const k = await startWindowsCodexKickoff(t);
+  k.reachWindowsEnter();
+  k.feed(`${CODEX_WIN_ROW}${CODEX_WIN_FOOTER}`);
+  k.advance(60_000);
+  assert.equal(k.enters(), 1, 'the transcript is the authority: no duplicate turn');
+});
+
+test('TPT9048: a dialog on the tail holds the stranded-handoff Enter back', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startWindowsCodexKickoff(t);
+  k.reachWindowsEnter();
+  k.feed(`${CODEX_WIN_ROW}bash -lc 'ls' needs your approval.\n`);
+  k.advance(SUBMIT_WATCH_MS + 5000);
+  assert.equal(k.enters(), 1, 'never Enter into a tool-approval dialog');
+});
+
+test('TPT9048: a startup hold outlives the ordinary watch window but not SUBMIT_STARTUP_WAIT_MAX_MS', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startWindowsCodexKickoff(t);
+  k.reachWindowsEnter();
+  k.feed(`${CODEX_WIN_ROW}${CODEX_WIN_STARTUP_WAIT}`);
+  k.advance(SUBMIT_WATCH_MS * 3);              // far past the ordinary 15 s window
+  k.feed(`\x1b[2J${CODEX_WIN_ROW}${CODEX_WIN_FOOTER}`);
+  assert.equal(k.advanceUntil(() => k.enters() >= 2, 15_000), true, 'still verified after a long startup');
+  const k2 = await startWindowsCodexKickoff(t);
+  k2.reachWindowsEnter();
+  k2.feed(`${CODEX_WIN_ROW}${CODEX_WIN_STARTUP_WAIT}`);
+  k2.advance(SUBMIT_STARTUP_WAIT_MAX_MS + 5000);
+  k2.feed(`\x1b[2J${CODEX_WIN_ROW}${CODEX_WIN_FOOTER}`);
+  k2.advance(30_000);
+  assert.equal(k2.enters(), 1, 'a hold past the ceiling is given up, not retried');
+});
+
+test('TPT9048: a manual Enter from the user cancels the automatic submit retry', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const k = await startWindowsCodexKickoff(t);
+  k.reachWindowsEnter();
+  k.feed(`${CODEX_WIN_ROW}${CODEX_WIN_FOOTER}`);
+  handleTerminalInput(k.session, '\r');
+  assert.equal(k.enters(), 2, 'the user\'s own Enter went through');
+  k.advance(60_000);
+  assert.equal(k.enters(), 2, 'no automatic Enter follows the user\'s');
+  assert.doesNotMatch(k.notices().join('\n'), /pressing Enter again/);
+});
+
+test('TPT9048: the composer-ready marker holds the Codex kickoff back, bounded by getComposerReadyMaxMs()', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const agent = getTaskAgent('codex');
+  // The real marker is the status row (CODEX_COMPOSER_READY_RE, covered in prompt-detect.test.js);
+  // a synthetic one isolates the injector's gate from the fixture's own status row.
+  t.mock.method(agent, 'getComposerReadyRe', () => /COMPOSER_READY_MARKER/);
+  t.mock.method(agent, 'getComposerReadyMaxMs', () => 90_000);
+  const k = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT9048' });
+  k.feed(CODEX_BOOT);
+  k.advance(20_000);
+  assert.equal(k.pasteWritten(), false, 'a composer without its ready marker gets no kickoff');
+  assert.match(k.notices().join('\n'), /still starting/);
+  k.feed('COMPOSER_READY_MARKER\n');
+  assert.equal(k.advanceUntil(k.pasteWritten, 3000), true, 'the kickoff follows the marker promptly');
+  const k2 = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT9048' });
+  k2.feed(CODEX_BOOT);
+  k2.advance(89_000);
+  assert.equal(k2.pasteWritten(), false);
+  assert.equal(k2.advanceUntil(k2.pasteWritten, 5000), true, 'past the ceiling the kickoff is pasted anyway');
+  // The marker is painted once; ConPTY's blank-row repaints then push it out of the 1024-byte
+  // tail before the paste check runs. The latch must remember it.
+  const k3 = await startCodexKickoff(t, { initialPrompt: 'Work on task TPT9048' });
+  k3.feed(CODEX_BOOT);
+  k3.feed('COMPOSER_READY_MARKER\n');
+  k3.feed(`${' '.repeat(120)}\r\n`.repeat(20));           // > ATTENTION_WINDOW_BYTES of blank rows
+  assert.doesNotMatch(k3.session._attentionTail, /COMPOSER_READY_MARKER/, 'the marker has left the tail');
+  assert.equal(k3.advanceUntil(k3.pasteWritten, agent.getInteractiveReadyMs() + 3000), true, 'a marker seen earlier still releases the kickoff');
 });
 
 test('TPT571: a "Plan ready." row painted before the kickoff Enter never flips codexPlanReady', async (t) => {
