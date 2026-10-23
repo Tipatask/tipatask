@@ -22,8 +22,9 @@ export function piTaskModelIds(providers) {
   const pi = piEntry(providers);
   if (!pi) return [];
   const toolLess = new Set(idList(pi.toolLessModels).map(id => id.toLowerCase()));
+  const images = new Set(idList(pi.imageModels).map(id => id.toLowerCase()));
   // Match capability flags like the server, while retaining each full configured id.
-  return idList(pi.configuredModels).filter((id) => !toolLess.has(id.toLowerCase()));
+  return idList(pi.configuredModels).filter((id) => images.has(id.toLowerCase()) || !toolLess.has(id.toLowerCase()));
 }
 
 // True only when the project has configured Pi rows and none of them can run a task: Pi can plan

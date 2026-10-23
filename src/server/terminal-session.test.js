@@ -62,6 +62,10 @@ const { reflowChunk } = require('./screen-reflow');
 const { createSession } = require('./session-state');
 const { buildExitResolutionComment } = require('./exit-resolution');
 const nodePty = require('node-pty');
+const legacyPermissionBackend = {
+  getTask: async id => ({ id, agentPermissionMode: null }),
+  getEffectiveProjectSettings: async () => ({ settings: { agent_permission_mode: null } }),
+};
 
 // 1x1 transparent PNG — enough to pass saveBase64Image's MIME/size checks.
 const TINY_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
@@ -2400,7 +2404,7 @@ test('spawnTerminal: an unavailable agent fails the start with its detection cod
   const detect = t.mock.method(agent, 'cachedDetect', async () => negative);
   const session = createSession(null, false, 'TPT9008-tab', '');
   session.taskAgent = 'claude';
-  await assert.rejects(spawnTerminal(session, 'Work on task TPT9008', 'TPT9008', [], { sessions: new Map() }), {
+  await assert.rejects(spawnTerminal(session, 'Work on task TPT9008', 'TPT9008', [], { sessions: new Map(), backend: legacyPermissionBackend }), {
     message: 'Claude CLI not found. Install claude or ensure its directory is on PATH.',
     reasonCode: 'cli_not_found',
     reasonParams: { agent: 'claude' },
@@ -2409,7 +2413,7 @@ test('spawnTerminal: an unavailable agent fails the start with its detection cod
   assert.equal(ptySpawn.mock.callCount(), 0);
   // An uncoded negative (an older or third-party detect()) still fails the start, without a code.
   detect.mock.mockImplementation(async () => ({ id: 'claude', label: agent.label, available: false, reason: 'gone' }));
-  await assert.rejects(spawnTerminal(session, 'Work on task TPT9008', 'TPT9008', [], { sessions: new Map() }),
+  await assert.rejects(spawnTerminal(session, 'Work on task TPT9008', 'TPT9008', [], { sessions: new Map(), backend: legacyPermissionBackend }),
     { message: 'gone', reasonCode: null, reasonParams: { agent: 'claude' } });
 });
 
@@ -2439,7 +2443,7 @@ const CODEX_SPINNER = '• Working (2s • esc to interrupt)\n';
 const CODEX_TURN_OUTPUT = `› Work on task TPT571\n${'.'.repeat(SUBMIT_MARKER_TRAILING_MAX + 100)}\n${CODEX_SPINNER}`;
 
 // One spawn on a fresh session. Returns handles to feed PTY output and inspect PTY input.
-async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, specExtras, sessions, captureSpawn, onDetect } = {}) {
+async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, specExtras, sessions, captureSpawn, onDetect, designMode = false, backend = legacyPermissionBackend, task } = {}) {
   const writes = [];
   const sent = [];
   let dataCb = null;
@@ -2456,7 +2460,7 @@ async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364',
   const agent = getTaskAgent(agentId);
   t.mock.method(agent, 'cachedDetect', async () => {
     onDetect?.(sent);
-    return { id: agentId, label: agent.label, available: true };
+    return { id: agentId, label: agent.label, available: true, detail: { version: { claude: '2.1.306', codex: '0.163.0', pi: '0.84.1' }[agentId] } };
   });
   t.mock.method(agent, 'getSpawnSpec', async (_config, prompt, taskId, opts) => {
     captureSpawn?.(agent, prompt, opts);
@@ -2469,7 +2473,7 @@ async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364',
   const session = createSession(null, false, 'TPT364-tab', '');
   session.taskAgent = agentId;
   session.ws = { OPEN: 1, readyState: 1, send: (m) => sent.push(JSON.parse(m)) };
-  await spawnTerminal(session, 'raw prompt', 'TPT364', [], { sessions });
+  await spawnTerminal(session, 'raw prompt', 'TPT364', [], { sessions, backend, task, designMode });
   assert.equal(session.alive, true, 'the fake spawn must have gone live');
   assert.equal(typeof dataCb, 'function', 'onData handler must be registered');
   const k = {
@@ -2511,12 +2515,91 @@ const startCodexKickoff = (t, opts) => startKickoff(t, 'codex', opts);
 // The teardown terminateTerminalSession() (ws-handlers.js) performs on Stop/Restart. It does NOT
 // touch the submit-check timer — that one relies on its own liveness guards.
 function stopSession(session) {
+  session._permissionGate?.close();
   clearTimeout(session._injectTimer);
   session._injectTimer = null;
   session._terminated = true;
   session.alive = false;
   session.pty = null;
 }
+
+test('explicit Bypass starts executing, publishes the frozen inherited mode, and a later start re-reads it', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let mode = 'bypass';
+  const backend = { ...legacyPermissionBackend,
+    getEffectiveProjectSettings: async () => ({ settings: { agent_permission_mode: mode } }),
+  };
+  const first = await startKickoff(t, 'codex', { backend });
+  t.after(() => stopSession(first.session));
+  assert.equal(first.session.terminalPhase, 'executing');
+  assert.equal(first.session.permissionPolicy.mode, 'bypass');
+  assert.ok(first.sent.some(m => m.type === 'terminal-state' && m.permissionMode === 'bypass' && m.permissionSource === 'project'));
+  mode = 'plan';
+  assert.equal(first.session.permissionPolicy.mode, 'bypass');
+  stopSession(first.session);
+  const next = await startKickoff(t, 'codex', { backend });
+  t.after(() => stopSession(next.session));
+  assert.equal(next.session.permissionPolicy.mode, 'plan');
+  assert.equal(next.session.terminalPhase, 'planning');
+  next.session.agentPlanReady = true;
+  approvePlan(next.session);
+  assert.equal(markPlanApprovedInTui(next.session, 'typed'), false);
+  assert.equal(next.session.terminalPhase, 'executing');
+  assert.equal(next.session.permissionPolicy.enforced, false);
+});
+
+test('explicit Plan accepts in-TUI approval and keeps legacy Claude readiness', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const k = await startClaudeKickoff(t, { task: { agentPermissionMode: 'plan' } });
+  t.after(() => stopSession(k.session));
+  assert.equal(k.session.permissionPolicy.enforced, false);
+  assert.equal(k.session._permissionGate, null);
+  assert.equal(markPlanApprovedInTui(k.session, 'dialog'), true);
+  assert.equal(k.session.terminalPhase, 'executing');
+  assert.doesNotMatch(k.notices().join(''), /Choose an execution mode|read-only/);
+});
+
+for (const mode of ['plan', 'auto', 'bypass']) test(`Design Mode starts with ${mode} policy`, async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const k = await startClaudeKickoff(t, {
+    task: { agentPermissionMode: mode }, designMode: true,
+    initialPrompt: '/design Make a task board',
+    captureSpawn: (_agent, _prompt, opts) => {
+      assert.equal(opts.designMode, true);
+      assert.equal(opts.permissionPolicy.mode, mode);
+    },
+  });
+  t.after(() => stopSession(k.session));
+  assert.equal(k.session._permissionGate, null);
+  k.reachFirstEnter();
+  assert.ok(k.writes.some(text => text.includes('/design Make a task board')));
+  assert.equal(k.session.terminalPhase, mode === 'plan' ? 'planning' : 'executing');
+});
+
+for (const mode of ['plan', 'auto', 'bypass']) test(`Claude ${mode} pastes kickoff without a hook handshake`, async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const k = await startClaudeKickoff(t, {
+    task: { agentPermissionMode: mode },
+    captureSpawn: (_agent, _prompt, opts) => assert.equal(opts.permissionGate, null),
+  });
+  t.after(() => stopSession(k.session));
+  assert.equal(k.session._permissionGate, null);
+  k.reachFirstEnter();
+  assert.equal(k.session.alive, true);
+  assert.ok(k.sent.filter(m => m.type === 'terminal-state').every(m => m.permissionRequest === null));
+});
+
+test('Pi Auto withholds kickoff until the native startup handshake', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const k = await startKickoff(t, 'pi', { task: { agentPermissionMode: 'auto' } });
+  t.after(() => stopSession(k.session));
+  assert.equal(k.session.terminalPhase, 'executing');
+  k.feed(BOOT_OUTPUT);
+  k.advance(5000);
+  assert.equal(k.pastes(), 0);
+  k.session._permissionGate.ready = true;
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+});
 
 test('agent startup reports progress before CLI detection can leave an empty terminal', async t => {
   let checked = false;
@@ -3512,6 +3595,43 @@ const CLAUDE_REJECTED_CHUNK = "\x1b[H\x1b[2K\x1b[3;2H⏺ User rejected Claude's 
 function feedClaude(session, chunks) {
   session._tuiClock = session._tuiClock || Date.now();
   for (const raw of chunks) { session._tuiClock += 10000; feedRaw(session, getTaskAgent('claude'), raw, session._tuiClock); }
+}
+
+for (const enforced of [false, true]) {
+  for (const path of ['Proceed', '/approve-plan', 'native dialog']) {
+    test(`explicit Plan (${enforced ? 'older enforced snapshot' : 'native policy'}): ${path} continues the same Claude run`, t => {
+      t.mock.timers.enable({ apis: ['setTimeout'] });
+      const agent = getTaskAgent('claude');
+      const policy = Object.freeze({ ...agent.buildPermissionPolicy({ mode: 'plan', source: 'task' }), enforced });
+      const writes = [];
+      const pty = { write: data => writes.push(data) };
+      const { session, messages } = tuiSession('claude', { permissionPolicy: policy, pty });
+
+      if (path === 'native dialog') {
+        feedClaude(session, [CLAUDE_PLAN_DIALOG_CHUNK]);
+        assert.equal(session.terminalPhase, 'planning', 'the question itself is not approval');
+        handleTerminalInput(session, '1\r');
+        assert.equal(session.terminalPhase, 'planning', 'wait for the native approval outcome');
+        feedClaude(session, [CLAUDE_APPROVED_CHUNK]);
+        assert.deepEqual(writes, ['1\r'], 'native approval needs no injected approval text');
+        assert.equal(session._planApprovedInTui, 'dialog');
+      } else {
+        if (path === 'Proceed') approvePlan(session);
+        else handleTerminalInput(session, '/approve-plan\r');
+        assert.deepEqual(writes, ['\x1b[Z'], 'leave native plan mode first');
+        t.mock.timers.tick(120);
+        assert.deepEqual(writes, ['\x1b[Z', 'Plan approved. Implement the approved plan now.']);
+        t.mock.timers.tick(100);
+        assert.deepEqual(writes, ['\x1b[Z', agent.getApprovalText(session), '\r']);
+        feedClaude(session, [CLAUDE_APPROVED_CHUNK]);
+      }
+      assert.equal(session.terminalPhase, 'executing');
+      assert.equal(session.pty, pty, 'approval must reuse the running terminal');
+      assert.equal(session.permissionPolicy, policy, 'approval must not resolve or replace the run policy');
+      assert.equal(messages.filter(m => m.type === 'terminal-state' && m.phase === 'executing').length, 1);
+      assert.equal(exitRunSnapshot(session).executing, true, 'completion guards apply after approval');
+    });
+  }
 }
 
 test('TPT654 step 1: a Claude dialog left unanswered keeps planning — no nudge, no exit backstop (the pre-fix life of every in-TUI approval)', async () => {

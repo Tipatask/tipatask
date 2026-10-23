@@ -45,6 +45,10 @@ import { formSprintValue } from './new-task-sprint.js';
 import { VCS_TYPES, VCS_GIT_FLAGS, buildVcsPatchBody } from './vcs-form.js';
 import { shouldTypeToFilter } from './type-to-filter.js';
 import { piTaskModelIds, piOnlyToolLess, piTaskPinHint } from './pi-task-models.js';
+import { projectPermissionMode, setProjectPermissionMode } from './group-label.js';
+import { buildProjectModeOptions, effectivePermissionMode, permissionModeIcon, permissionModeTip, isAgentPermissionMode } from './permission-mode.js';
+import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
+import { syncAllPermissionButtons } from './task-permission-mode.js';
 import {
   configureTaskEditModal, openTaskEditModal, closeTaskEditModal,
   requestCloseTaskEditModal, openTaskEditModalFromTerminal,
@@ -2528,20 +2532,14 @@ export function updateClaudeButtons() {
     _syncSessionSurfaces();
     return;
   }
-  // (C1306) Session/attention events can repaint this module after a card was patched in
-  // place but before a full loadAndRender() rebuilds taskStatusById. The left-nav rows read
-  // that map, while the buttons below read the mounted card's newer data-status. Reconcile
-  // the two sources first so a completed session gets its done styling without requiring the
-  // user to open the task (which incidentally forced a full board refresh).
-  // (C1329) Never let this downgrade a server-confirmed completion: a mounted card can be
-  // stale (rendered from a cache-hit snapshot, or ahead of an in-flight WS echo) while
-  // taskStatusById already holds a completion the server sent directly — see
-  // syncNavStatusesFromServer()/the task:updated handlers in template.html.
+  // Task events and authoritative reads own the status map. A mounted card may be
+  // stale in either direction (completion or reopening); use it only as an initial
+  // fallback, never to overwrite a known status while repainting session controls.
   for (const taskId of state.activeSessions) {
     const card = document.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
     const status = card?.dataset.status;
     if (!status) continue;
-    if (isCompleteName(state.taskStatusById.get(taskId)) && !isCompleteName(status)) continue;
+    if (state.taskStatusById.has(taskId)) continue;
     state.taskStatusById.set(taskId, status);
   }
 
@@ -2795,9 +2793,10 @@ export function renderActiveSessionsList(sessions, collapsed) {
     // current fetch — subtask drill-in / assignee scoping) so the tooltip never dangles a
     // trailing "KEY — " with nothing after it.
     const base = s.title ? t('nav.sessionTooltip', { key: s.taskId, title: s.title }) : String(s.taskId);
-    const tip = escapeAttr(s.lost ? t('nav.sessionLost', { label: base })
+    const sessionTip = s.lost ? t('nav.sessionLost', { label: base })
       : s.paused ? t('nav.sessionPaused', { label: base })
-        : s.needsAttention ? t('nav.sessionNeedsAttention', { label: base }) : base);
+        : s.needsAttention ? t('nav.sessionNeedsAttention', { label: base }) : base;
+    const tip = escapeAttr(s.permissionTip ? `${sessionTip}\n${s.permissionTip}` : sessionTip);
     // (C1152) Close control — nested <span role="button"> since .active-session-item is
     // itself a <button> (nested <button> invalid HTML). Mirrors .chat-tab-close (chat-ui.js),
     // plus keyboard support that precedent lacks.
@@ -2811,6 +2810,7 @@ export function renderActiveSessionsList(sessions, collapsed) {
     // .active-session-tooltip, see ensureSessionTooltips()) instead of a native `title`, which
     // has a ~1s delay and is reset by every rail repaint.
     return `<button type="button" class="${cls}" data-task-id="${key}" data-tooltip="${tip}" aria-label="${tip}">`
+      + (s.permissionIcon ? `<span class="active-session-permission" title="${escapeAttr(s.permissionTip)}">${s.permissionIcon}</span>` : '')
       + `<span class="active-session-icon">${_sessionAgentIcon(s.agent)}${done ? SESSION_DONE_BADGE : ''}</span>`
       + `<span class="active-session-key">${key}</span>`
       + `<span class="active-session-title">${title}</span>`
@@ -2967,6 +2967,7 @@ export function syncActiveSessionsNav() {
   // Chat) and through a workspace swap, where the old xterm is released a frame before the next
   // one mounts — following state.activeTerminal alone dropped the row and repainted it back.
   const openId = getOpenWorkspaceTaskId() || state.activeTerminal?.taskId || null;
+  const projectDefault = projectPermissionMode();
   const rows = [...new Set([...state.activeSessions, ...state.lostSessions.keys()])]
     // /api/sessions does not filter by session type — keep objective/spec-chat sessions
     // (and their 'obj-'-prefixed synthetic ids) out of what is meant to be a terminal list.
@@ -2982,6 +2983,8 @@ export function syncActiveSessionsNav() {
       agent: state.sessionMeta.get(id)?.agent || state.taskAgent,
       title: state.taskTitleById.get(id) || '',
       status: state.taskStatusById.get(id) || '', // (C1152) drives .session-completed styling
+      permissionIcon: permissionModeIcon(effectivePermissionMode({ agentPermissionMode: state.taskPermissionModeById.get(id) }, projectDefault).mode),
+      permissionTip: permissionModeTip({ agentPermissionMode: state.taskPermissionModeById.get(id) }, projectDefault, t),
       isOpen: id === openId,
       needsAttention: state.attentionSessions.has(id) && !state.lostSessions.has(id),
       paused: state.sessionMeta.get(id)?.paused || null,
@@ -5587,6 +5590,8 @@ export async function applyProjectLanguage() {
 // Read project language from project config (Electron: IPC; browser: HTTP GET).
 async function readProjectLanguage() {
   try {
+    const settings = await api.project.settings();
+    if (settings?.language) return settings.language;
     if (window.electronAPI?.api) {
       const ctx = await window.electronAPI.api.project.config();
       return (ctx && ctx.config && ctx.config.language) || 'en';
@@ -5601,12 +5606,8 @@ async function readProjectLanguage() {
   return 'en';
 }
 
-// Persist language to project config without triggering a backend rebind.
-// Unlike theme (per-user layout), language is a project-wide setting: after the
-// local config write it PATCHes the Tipatask API project (via api.project.update() —
-// C1271, same backend-method write path the Group Tasks Into select below uses) so the
-// DB value stays authoritative for every member.
-// On API failure the config write is rolled back to `prev` and the select reset.
+// Persist through the API's creator/personal contract. Local config is used only
+// when no API project is configured; a rejected save leaves stored values intact.
 async function writeProjectLanguage(val, prev) {
   const lang = val || 'en';
   const writeConfig = (v) => {
@@ -5620,16 +5621,14 @@ async function writeProjectLanguage(val, prev) {
     });
   };
   try {
-    await writeConfig(lang);
-    await api.project.update({ language: lang });
+    const saved = await api.project.update({ language: lang });
+    if (!saved) await writeConfig(lang);
     // Persisted everywhere — switch the UI locale and re-render the board live.
     setLocale(lang);
     try { await window.electronAPI?.setAppLocale?.(lang); } catch { /* non-fatal, see applyProjectLanguage() */ }
     document.dispatchEvent(new Event('tiptask:reload'));
   } catch (err) {
     console.error('[settings] Failed to save project language:', err.message);
-    // Roll back so config file and API DB stay consistent.
-    try { await writeConfig(prev || 'en'); } catch { /* ignore */ }
     const sel = document.getElementById('settings-language-select');
     if (sel) sel.value = prev || 'en';
     showToast(t('settings.errUpdateLanguage', { msg: err.message }), 'error');
@@ -6353,6 +6352,43 @@ function _populateSettingsObjectiveGroupingRow() {
   if (toggle) toggle.checked = getObjectiveGroupingEnabled();
 }
 
+let _settingsPermissionControl = null;
+
+function _populateSettingsPermissionModeRow() {
+  const host = document.getElementById('settings-permission-mode-row');
+  if (!host) return;
+  const restoreFocus = host.contains(document.activeElement);
+  _settingsPermissionControl?.destroy();
+  const options = buildProjectModeOptions(projectPermissionMode(), t);
+  const hint = options.find(row => row.selected)?.hint || '';
+  host.innerHTML = `
+    <label class="permission-mode-label" for="settings-agent-permission-mode">${escapeAttr(t('settings.workflow.agentPermissions'))}</label>
+    ${renderPermissionModeSelect({ name: 'settings-agent-permission-mode', options, t })}
+    <p class="settings-row-hint">${escapeAttr(hint)}</p>
+    <p class="settings-row-hint">${escapeAttr(t('permissionMode.projectNote'))}</p>`;
+  _settingsPermissionControl = bindPermissionModeSelect(host, async value => {
+    if (!isAgentPermissionMode(value)) return;
+    const control = _settingsPermissionControl;
+    const prev = projectPermissionMode() || '';
+    control.disabled = true;
+    try {
+      await api.project.update({ agent_permission_mode: value });
+      setProjectPermissionMode(value);
+      syncAllPermissionButtons();
+      syncActiveSessionsNav();
+      // Rebuild to retire the initial Not set placeholder and refresh the mode hint.
+      if (_settingsPermissionControl === control) _populateSettingsPermissionModeRow();
+      showToast(t('permissionMode.projectSaved'), 'success');
+    } catch (err) {
+      control.value = prev;
+      showToast(t('permissionMode.failed', { msg: err.message }), 'error');
+    } finally {
+      control.disabled = false;
+    }
+  });
+  if (restoreFocus) host.querySelector('button')?.focus();
+}
+
 async function _populateSettingsWorkflowTab() {
   const tabBtn = document.getElementById('settings-workflow-tab-btn');
   const list = document.getElementById('settings-workflow-list');
@@ -6382,6 +6418,9 @@ async function _populateSettingsWorkflowTab() {
   _populateSettingsSprintsRow();
   // (C1558) No ordering dependency on the two rows above — independent setting.
   _populateSettingsObjectiveGroupingRow();
+  _populateSettingsPermissionModeRow();
+  syncAllPermissionButtons();
+  syncActiveSessionsNav();
 
   try {
     _workflowStatuses = await api.statuses.list();
@@ -6985,8 +7024,8 @@ async function _populateSettingsNotificationsRows() {
         : status.lastError === 'not-registered' ? notRegisteredHint
         : (blocked ? t('settings.notifHintBlocked') : '');
     }
-    hintEl.hidden = !blocked;
     if (status.delivery === 'desktop' && status.lastError && hintTextEl) hintTextEl.textContent = t('settings.notifHintDesktopFailed');
+    hintEl.hidden = !blocked || !hintTextEl?.textContent;
     // (C1355) Repair button only makes sense when there's an actual duplicate-claimant conflict
     // to fix — for every other blocked reason (unsigned, seal-broken, denied, unsupported) it
     // would just fail with nothing to repair.
@@ -7002,13 +7041,13 @@ async function _populateSettingsNotificationsRows() {
   const styleHint = document.getElementById('settings-notifications-style-hint');
   if (styleHint) {
     const isMac = window.electronAPI?.platform === 'darwin' && status.delivery !== 'desktop';
-    styleHint.hidden = !isMac;
-    if (isMac) {
-      const textEl = document.getElementById('settings-notifications-style-text');
-      const btnEl = document.getElementById('settings-notifications-style-btn');
-      if (textEl) textEl.textContent = t('settings.notifHintStyleMac');
-      if (btnEl) btnEl.textContent = t('settings.notifOpenSystemSettings');
-    }
+    const textEl = document.getElementById('settings-notifications-style-text');
+    const btnEl = document.getElementById('settings-notifications-style-btn');
+    // Never show the balloon without its message — a missing string would leave it blank.
+    const text = isMac ? t('settings.notifHintStyleMac') : '';
+    if (textEl) textEl.textContent = text;
+    if (btnEl) btnEl.textContent = isMac ? t('settings.notifOpenSystemSettings') : '';
+    styleHint.hidden = !text || !textEl;
   }
 }
 

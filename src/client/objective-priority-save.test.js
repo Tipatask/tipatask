@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
-import { attachOriginalSpecPayload } from './objective-spec-payload.js';
+import { attachOriginalSpecPayload, getOriginalSpec } from './objective-spec-payload.js';
+import { missingSourceRefsBlock } from '../server/spec-comment.js';
 import { attachNewTagsPayload } from './objective-new-tags.js';
 import { resolveOriginPlan, attachSplitOriginPayload } from './objective-origin-task.js';
 import { shouldCreateObjectiveParent } from './objective-parent-task.js';
@@ -36,7 +37,7 @@ for (const provider of ['claude', 'codex', 'gemini', 'pi']) {
       const context = {
         console, Date, Set, Map,
         state: { chatState: { providerType: provider, messages: [{ role: 'user', content: 'Improve product search' }] } },
-        attachOriginalSpecPayload, attachNewTagsPayload, resolveOriginPlan, attachSplitOriginPayload,
+        attachOriginalSpecPayload, getOriginalSpec, missingSourceRefsBlock, getLocale: () => 'en', attachNewTagsPayload, resolveOriginPlan, attachSplitOriginPayload,
         shouldCreateObjectiveParent, buildUsedIds, upsertTaskEntry,
         getObjectiveGroupingEnabled: () => false,
         projectHeader: () => ({}), isStartName: status => status === 'pending', startName: () => 'pending',
@@ -73,7 +74,7 @@ async function saveSingleCard(backend) {
   const context = {
     console: { ...console, error() {}, warn() {} }, Date, Set, Map,
     state: { chatState: { providerType: 'claude', messages: [{ role: 'user', content: 'Improve product search' }] } },
-    attachOriginalSpecPayload, attachNewTagsPayload, resolveOriginPlan, attachSplitOriginPayload,
+    attachOriginalSpecPayload, getOriginalSpec, missingSourceRefsBlock, getLocale: () => 'en', attachNewTagsPayload, resolveOriginPlan, attachSplitOriginPayload,
     shouldCreateObjectiveParent, buildUsedIds, upsertTaskEntry,
     getObjectiveGroupingEnabled: () => false,
     projectHeader: () => ({}), isStartName: status => status === 'pending', startName: () => 'pending',

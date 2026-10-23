@@ -1,5 +1,7 @@
 'use strict';
 
+const { isImageModel, normalizeImageDefaults } = require('../pi-image-settings');
+
 const path = require('node:path');
 const fs = require('node:fs');
 
@@ -166,7 +168,7 @@ function sanitizePiModels(value, max = PI_MAX_MODELS) {
   const rows = raw
     ? raw.map((e) => (typeof e === 'string'
         ? { model: e, apiKey: '' }
-        : { model: String(e?.model ?? ''), apiKey: String(e?.apiKey ?? ''), provider: e?.provider, baseUrl: e?.baseUrl, api: e?.api, tools: e?.tools }))
+        : { model: String(e?.model ?? ''), apiKey: String(e?.apiKey ?? ''), provider: e?.provider, baseUrl: e?.baseUrl, api: e?.api, tools: e?.tools, purpose: e?.purpose, imageDefaults: e?.imageDefaults }))
     : [{ model: String(value?.piModel ?? ''), apiKey: String(value?.piApiKey ?? '') }];
 
   const seen = new Set();
@@ -175,6 +177,7 @@ function sanitizePiModels(value, max = PI_MAX_MODELS) {
     const model = r.model.trim();
     const apiKey = r.apiKey.trim();
     const provider = normalizePiProvider(r.provider);
+    if (isImageModel(r) && provider !== PI_DEFAULT_PROVIDER) continue;
     if (!model) continue;
     if (!apiKey && PI_PROVIDERS[provider].keyRequired) continue;
     let baseUrl = '';
@@ -193,7 +196,8 @@ function sanitizePiModels(value, max = PI_MAX_MODELS) {
         ...(r.tools === false ? { tools: false } : {}),
       });
     } else {
-      out.push(provider === PI_DEFAULT_PROVIDER ? { model, apiKey } : { model, apiKey, provider });
+      out.push({ model, apiKey, ...(provider !== PI_DEFAULT_PROVIDER ? { provider } : {}),
+        ...(isImageModel(r) ? { purpose: 'image', imageDefaults: normalizeImageDefaults(r) } : {}) });
     }
     if (out.length >= max) break;
   }
@@ -245,12 +249,13 @@ function rendererPiModels(cfg) {
   if (!rows.length && cfg?.PI_MODEL) {
     rows.push({ model: cfg.PI_MODEL, apiKey: cfg.OPENROUTER_API_KEY || '' });
   }
-  return rows.map(({ model, apiKey, provider, baseUrl, api, tools }) => ({
+  return rows.map(({ model, apiKey, provider, baseUrl, api, tools, purpose, imageDefaults }) => ({
     model,
     ...(provider ? { provider } : {}),
     ...(baseUrl ? { baseUrl } : {}),
     ...(api ? { api } : {}),
     ...(tools === false ? { tools: false } : {}),
+    ...(purpose === 'image' ? { purpose, imageDefaults } : {}),
     hasApiKey: !!apiKey,
     apiKeyAction: apiKey ? 'preserve' : 'clear',
     credentialRef: { model, provider: provider || PI_DEFAULT_PROVIDER },
@@ -258,6 +263,7 @@ function rendererPiModels(cfg) {
 }
 
 function rendererProjectConfig(cfg = {}) {
+  cfg = { ...cfg, ...require('./project-settings-cache').displayPreferences(cfg) };
   const safe = {};
   for (const key of [
     'TASK_BACKEND', 'API_BASE_URL', 'API_PROJECT_ID', 'projectName', 'DEVICE_ID',
@@ -549,8 +555,7 @@ const LANGUAGE_NAMES = { en: 'English', uk: 'Ukrainian' };
 // "plain human-readable English" description style rule.
 function buildLanguageDirective(projectRoot, opts = {}) {
   if (!projectRoot) return '';
-  const cfg = readProjectConfig(projectRoot) || {};
-  const lang = cfg.language || 'en';
+  const lang = readProjectLanguage(projectRoot);
   if (lang === 'en') return '';
   const name = LANGUAGE_NAMES[lang] || lang;
   let directive = `Communicate with the user in ${name}. All responses, questions, and status messages must be in ${name}.`;
@@ -558,6 +563,11 @@ function buildLanguageDirective(projectRoot, opts = {}) {
     directive += ` Task titles and descriptions in the JSON output must also be written in ${name} — this overrides any instruction to write descriptions in English.`;
   }
   return directive;
+}
+
+// Synchronous prompt/menu/terminal reads use the current account's API mirror.
+function readProjectLanguage(projectRoot) {
+  return require('./project-settings-cache').displayPreferences(readProjectConfig(projectRoot) || {}).language;
 }
 
 // The signed-in account's token lives in the app-level account store (account-store.js),
@@ -749,39 +759,60 @@ function _ensureGitignoreLine(dir, line) {
   }
 }
 
-// Record folder trust in Claude's user config before opening a project. Never
+// Record folder trust and an explicitly selected Bypass acknowledgement. Never
 // replace malformed user state; failure leaves the CLI's normal trust dialog available.
-function writeProjectClaudeTrust(projectRoot) {
+function writeProjectClaudeTrust(projectRoot, permissionMode = null) {
   let tmp;
   try {
+    const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    const read = file => {
+      let settings = {};
+      let mode = 0o600;
+      try {
+        settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+        mode = fs.statSync(file).mode & 0o777;
+      } catch (err) { if (err.code !== 'ENOENT') throw err; }
+      if (!isObject(settings)) throw new Error('Invalid Claude user configuration');
+      return { file, settings, mode };
+    };
+    const write = ({ file, settings, mode }) => {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      tmp = file + '.tmp.' + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n', { encoding: 'utf8', mode });
+      fs.chmodSync(tmp, mode);
+      fs.renameSync(tmp, file);
+      tmp = null;
+    };
     const configPath = process.env.CLAUDE_CONFIG_DIR
       ? path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json')
       : path.join(require('node:os').homedir(), '.claude.json');
     const absProjectRoot = path.resolve(projectRoot);
-    const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-    let settings = {};
-    let mode = 0o600;
-    try {
-      settings = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      mode = fs.statSync(configPath).mode & 0o777;
-    } catch (err) { if (err.code !== 'ENOENT') throw err; }
-    if (!isObject(settings)
-      || (settings.projects !== undefined && !isObject(settings.projects))) {
+    const userConfig = read(configPath);
+    const { settings } = userConfig;
+    if (settings.projects !== undefined && !isObject(settings.projects)) {
       throw new Error('Invalid Claude user configuration');
     }
     const entry = settings.projects?.[absProjectRoot];
     if (entry !== undefined && !isObject(entry)) throw new Error('Invalid Claude project configuration');
-    if (entry?.hasTrustDialogAccepted === true) return true;
-    settings.projects = settings.projects || {};
-    settings.projects[absProjectRoot] = { ...entry, hasTrustDialogAccepted: true };
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    tmp = configPath + '.tmp.' + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n', { encoding: 'utf8', mode });
-    fs.chmodSync(tmp, mode);
-    fs.renameSync(tmp, configPath);
+    const acceptBypass = permissionMode === 'bypass';
+    // Current CLIs read the acknowledgement from user settings; older CLIs read
+    // .claude.json. Read both before writing so malformed settings stay intact.
+    const userSettings = acceptBypass ? read(path.join(process.env.CLAUDE_CONFIG_DIR
+      || path.join(require('node:os').homedir(), '.claude'), 'settings.json')) : null;
+    if (entry?.hasTrustDialogAccepted !== true
+      || (acceptBypass && settings.bypassPermissionsModeAccepted !== true)) {
+      settings.projects = settings.projects || {};
+      settings.projects[absProjectRoot] = { ...entry, hasTrustDialogAccepted: true };
+      if (acceptBypass) settings.bypassPermissionsModeAccepted = true;
+      write(userConfig);
+    }
+    if (userSettings && userSettings.settings.skipDangerousModePermissionPrompt !== true) {
+      userSettings.settings.skipDangerousModePermissionPrompt = true;
+      write(userSettings);
+    }
     return true;
   } catch {
-    console.warn('[project-config] Claude folder trust pre-acceptance failed; check user configuration format and file access.');
+    console.warn('[project-config] Claude trust/permission pre-acceptance failed; check user configuration format and file access.');
     return false;
   } finally {
     if (tmp) { try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ } }
@@ -1002,6 +1033,7 @@ module.exports = {
   readProjectMeta,
   writeProjectMeta,
   buildLanguageDirective,
+  readProjectLanguage,
   LANGUAGE_NAMES,
   PI_MAX_MODELS,
   PI_PROVIDERS,

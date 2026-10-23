@@ -18,10 +18,12 @@ import { attachAudioRecorder } from './audio-recorder.js';
 import { clearAttention, mergeSessionsSnapshot } from './attention-state.js';
 import { syncActivityChips, activityIds, markActivityRead, unmarkActivityRead } from './task-activity.js';
 import { taskHasNullSprint } from './board-count-domain.js';
-import { groupNoun, groupTitle, getSprintsEnabled } from './group-label.js';
+import { groupNoun, groupTitle, getSprintsEnabled, projectPermissionMode } from './group-label.js';
 import { perfStart, perfEnd } from './perf-log.js';
 import { tagDescription, filterTagOptions } from './tag-match.js';
 import { showActionConfirm } from './action-confirm.js';
+import { buildTaskModeOptions, normalizePermissionMode } from './permission-mode.js';
+import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
 import { activateDialogFocus } from './dialog-focus.js';
 
 let commands;
@@ -907,7 +909,8 @@ async function _openTaskEditModalImpl(taskId, callbacks = {}) {
   const modalRoot = document.getElementById('task-edit-modal');
   _modalDialogFocus = activateDialogFocus({
     root: modalRoot,
-    initialFocus: () => (_modalState?.pane === 'edit' && !_isModalReadOnly(_modalState?.draft) && modalRoot.querySelector('.modal-title-input:not([hidden]):not(:disabled)'))
+    initialFocus: () => (callbacks.focusField && modalRoot.querySelector(`#${CSS.escape(callbacks.focusField)}:not(:disabled)`))
+      || (_modalState?.pane === 'edit' && !_isModalReadOnly(_modalState?.draft) && modalRoot.querySelector('.modal-title-input:not([hidden]):not(:disabled)'))
       || modalRoot.querySelector('.task-modal-tab.active')
       || modalRoot.querySelector('.modal-task-id'),
     returnFocus: () => {
@@ -1063,6 +1066,7 @@ export function closeTaskEditModal(force = false, { keepRail = false } = {}) {
   // (TPT466) Detach the terminal and chat before the DOM goes: their server-side session and
   // chat keep running, only this window's xterm and socket are released.
   _disposePanes();
+  _modalState._permissionModeSelect?.destroy();
   document.body.classList.remove('task-modal-rail');
   const el = document.getElementById('task-edit-modal');
   if (el) { el.hidden = true; el.innerHTML = ''; delete el.dataset.taskId; delete el.dataset.pane; }
@@ -1197,6 +1201,7 @@ export function _agentModelControlHtml(assignee, draft, projectConfig, { hidden 
 function _renderTaskEditModal() {
   const modal = document.getElementById('task-edit-modal');
   if (!modal) return;
+  _modalState._permissionModeSelect?.destroy();
   const { draft } = _modalState;
   const tierKeys = state.tierKeys || [];
   const dirty = _isModalDirty();
@@ -1333,6 +1338,7 @@ function _renderTaskEditModal() {
               <div class="modal-field-group-title">${t('modal.groupAgent')}</div>
             <div class="modal-field-row"><label>${t('field.agent')}</label>${agentPickerHtml}</div>
             ${_agentModelControlHtml(assignee, draft, projectConfig, { hideBrowserTools: isPreviewTask, disabled: agentLocked })}
+            ${!isPreviewTask ? `<div class="modal-field-row"><label for="modal-permission-mode">${t('field.permissionMode')}</label>${renderPermissionModeSelect({ name: 'modal-permission-mode', options: buildTaskModeOptions(draft.agentPermissionMode !== undefined ? draft.agentPermissionMode : draft.agent_permission_mode, projectPermissionMode(), t), t })}</div>` : ''}
             </section>
             <section class="modal-field-group modal-field-group--wide" data-group="links">
             <div class="modal-field-row"><label>${t('field.tags')}</label>
@@ -1769,6 +1775,15 @@ function _attachModalHandlers(modal) {
   const sprintCombo = modal.querySelector('.sprint-combo[data-id="modal-sprint-combo"]');
 
   const upd = () => _modalUpdateButtonStates(saveBtn, resetBtn);
+  const permissionSelect = modal.querySelector('[data-permission-mode-select]');
+  if (permissionSelect) {
+    _modalState._permissionModeSelect = bindPermissionModeSelect(permissionSelect, value => {
+      _modalState.draft.agentPermissionMode = value || null;
+      upd();
+    });
+    // Permission changes configure the next run, including while a session is active.
+    _modalState._permissionModeSelect.disabled = _isModalReadOnly(_modalState.draft);
+  }
   const commitAgentChoice = (value, { piModel } = {}) => {
     commands._applyAgentPickerSelection(_modalState.draft, value, { piModel });
     _applyModalAgentModelVisibility(
@@ -2112,6 +2127,9 @@ function _attachModalHandlers(modal) {
     if ((draft.claudeModel || null) !== (original.claudeModel || null)) patch.claude_model = draft.claudeModel || null;
     if ((draft.codexModel  || null) !== (original.codexModel  || null)) patch.codex_model  = draft.codexModel  || null;
     if ((draft.piModel     || null) !== (original.piModel     || null)) patch.pi_model     = draft.piModel     || null;
+    const permissionMode = normalizePermissionMode(draft.agentPermissionMode !== undefined ? draft.agentPermissionMode : draft.agent_permission_mode);
+    const originalPermissionMode = normalizePermissionMode(original.agentPermissionMode !== undefined ? original.agentPermissionMode : original.agent_permission_mode);
+    if (permissionMode !== originalPermissionMode) patch.agent_permission_mode = permissionMode;
     if ((draft.effort      || null) !== (original.effort      || null)) patch.effort       = draft.effort      || null;
     // C1207: `!!` on BOTH sides, not the `|| null` shape used for the model fields above.
     // `false || null` is `null`, and `null !== false` would fire a spurious PATCH on every
@@ -2956,12 +2974,13 @@ export function getOpenWorkspaceTaskId() {
 // One entry point for "show this task's workspace on that pane" — the terminal and chat
 // launchers route here (console-modal.js openTerminal, task-chat.js open). An open workspace
 // on the same task just switches pane; another task's goes through the dirty-close confirm.
-export async function openTaskWorkspace(taskId, { pane = 'edit', terminal = null, trigger } = {}) {
+export async function openTaskWorkspace(taskId, { pane = 'edit', terminal = null, trigger, focusField } = {}) {
   if (!taskId) return;
   const target = _PANES.includes(pane) ? pane : 'edit';
   if (_modalState && _modalState.taskId === taskId && _modalState.tabs) {
     if (terminal) _modalState.pendingTerminal = terminal;
     _switchPane(target);
+    if (focusField) document.getElementById(focusField)?.focus();
     return;
   }
   // (TPT479) Only ask about an unsaved draft here — the open workspace stays on screen until
@@ -2971,7 +2990,7 @@ export async function openTaskWorkspace(taskId, { pane = 'edit', terminal = null
   // (TPT485) The rail stays live during that fetch (the board loader starts at its edge,
   // styles.css), so a second rail click can overtake this one: the latest open wins.
   if (_modalState && !(await _confirmDiscardIfDirty())) return;
-  const opts = { initialPane: target, terminalLaunch: terminal, trigger };
+  const opts = { initialPane: target, terminalLaunch: terminal, trigger, focusField };
   if (_taskWorkspaceOpener) return _taskWorkspaceOpener(taskId, opts);
   return openTaskEditModal(taskId, opts);
 }

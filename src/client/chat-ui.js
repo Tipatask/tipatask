@@ -1601,6 +1601,90 @@ export function captureCardEdits() {
   });
 }
 
+// ── Transcript scroll (TPT9086) ──
+// A new message (the user's send, a streamed assistant reply, proposal cards, an error bubble)
+// always scrolls #chat-messages to its end. A repaint that brings nothing new keeps the reader's
+// place. scrollChatToEnd() is the only code that pins the transcript to its end.
+let _chatScrollToEndToken = 0;
+
+// Instant even though .chat-messages has scroll-behavior: smooth. An animated scroll stops short
+// when the transcript keeps growing under it, and a restore would animate a fresh node from 0.
+function setTranscriptScrollTop(el, top) {
+  if (typeof el.scrollTo === 'function') el.scrollTo({ top, behavior: 'instant' });
+  else el.scrollTop = top;
+}
+
+// Resolves one frame after the transcript's last pending image has loaded or failed.
+function transcriptLaidOut(el) {
+  const images = Array.from(el.querySelectorAll('img')).filter(img => !img.complete);
+  return Promise.all(images.map(img => new Promise(resolve => {
+    img.addEventListener('load', resolve, { once: true });
+    img.addEventListener('error', resolve, { once: true });
+  }))).then(() => new Promise(resolve => requestAnimationFrame(resolve)));
+}
+
+// Pins #chat-messages to its last line in the next frame, once the render that asked for it has
+// laid out, then again after its images and proposal cards finish laying out. Calls in one frame
+// coalesce, and a tab switch in between never moves the other chat's transcript. The second pass
+// is skipped when a newer call superseded it, the node was re-rendered, or the reader scrolled up
+// in the meantime.
+export function scrollChatToEnd() {
+  if (typeof document === 'undefined' || typeof requestAnimationFrame !== 'function') return;
+  const token = ++_chatScrollToEndToken;
+  const chatTabId = String(state.chatState?.taskId || '');
+  requestAnimationFrame(() => {
+    const el = document.getElementById('chat-messages');
+    if (!el || token !== _chatScrollToEndToken || (el.dataset.activeTab || '') !== chatTabId) return;
+    setTranscriptScrollTop(el, el.scrollHeight);
+    const pinnedTop = el.scrollTop;
+    transcriptLaidOut(el).then(() => {
+      if (token !== _chatScrollToEndToken || !el.isConnected || el.scrollTop < pinnedTop - 1) return;
+      setTranscriptScrollTop(el, el.scrollHeight);
+    });
+  });
+}
+
+// What the transcript shows: its message count, its last message (which one, whether it is still
+// streaming, how many proposal cards it carries) and the first loaded history message.
+// renderObjectiveContent() stamps it on #chat-messages, so a saved view describes what the reader
+// actually saw rather than state that has moved on since.
+function transcriptStamp(cs) {
+  const messages = (cs && cs.messages) || [];
+  const last = messages[messages.length - 1];
+  return {
+    count: messages.length,
+    last: last ? `${bubbleKey(last)}:${last.streaming ? 'streaming' : 'done'}:${(last.cards || []).length}` : '',
+    windowStart: (cs && cs.historyWindowStart) || 1,
+  };
+}
+
+function transcriptStampAttrs(cs) {
+  const stamp = transcriptStamp(cs);
+  return `data-msg-count="${stamp.count}" data-last-msg="${escapeAttr(stamp.last)}" data-window-start="${stamp.windowStart}"`;
+}
+
+// True when a repaint must end at the bottom instead of restoring `view`'s saved place: the
+// message count changed, or the last message is a different one (an error bubble replacing the
+// empty typing bubble keeps the count), or that reply finished or got its proposal cards. A reader
+// who was at the end stays there, so cards that grow while hydrating never leave the view short.
+// "Load earlier messages" adds messages above the reader, so it keeps the place.
+function transcriptEndsAfterRepaint(view, cs) {
+  const now = transcriptStamp(cs);
+  if (now.last !== view.lastMessage) return true;
+  if (now.windowStart < view.windowStart) return false;
+  return now.count !== view.messageCount || view.messagesAtEnd === true;
+}
+
+// A view with no saved place (the transcript was not on screen) ends at the bottom too.
+function restoreTranscriptScroll(messages, view) {
+  if (!state.chatState) return; // the empty composer layout has no transcript
+  if (Number.isFinite(view.messagesScrollTop) && !transcriptEndsAfterRepaint(view, state.chatState)) {
+    setTranscriptScrollTop(messages, view.messagesScrollTop);
+  } else {
+    scrollChatToEnd();
+  }
+}
+
 // ── Lightweight DOM patch during streaming ──
 export function updateStreamingBubble() {
   const msgContainer = document.getElementById('chat-messages');
@@ -1626,8 +1710,8 @@ export function updateStreamingBubble() {
     textEl.textContent = stripped;
   }
 
-  // Auto-scroll to bottom so newest streaming content stays visible
-  msgContainer.scrollTop = msgContainer.scrollHeight;
+  // (TPT9086) Each streamed chunk keeps the newest text in view.
+  scrollChatToEnd();
 }
 
 // ── Mutate progress chip without a full reload ──
@@ -1646,6 +1730,7 @@ function updateProgressChip() {
     chip.className = 'chat-progress-stage';
     const bubble = lastBubble.querySelector('.chat-bubble--assistant');
     if (bubble) bubble.appendChild(chip);
+    scrollChatToEnd(); // (TPT9086) the new progress line grows the streaming reply
   }
   chip.textContent = label;
 }
@@ -1861,7 +1946,19 @@ function captureObjectiveViewState() {
       selectionDirection: input.selectionDirection,
       focused: document.activeElement === input,
     } : null,
-    messagesScrollTop: messages ? messages.scrollTop : null,
+    ...captureTranscriptView(messages),
+  };
+}
+
+// (TPT9086) The reader's place in the transcript, with the stamp of what it was showing.
+function captureTranscriptView(messages) {
+  if (!messages) return { messagesScrollTop: null };
+  return {
+    messagesScrollTop: messages.scrollTop,
+    messagesAtEnd: messages.scrollHeight - messages.scrollTop - messages.clientHeight <= 2,
+    messageCount: Number(messages.dataset.msgCount),
+    lastMessage: messages.dataset.lastMsg || '',
+    windowStart: Number(messages.dataset.windowStart) || 1,
   };
 }
 
@@ -1884,17 +1981,18 @@ function restoreObjectiveViewState(viewState) {
       try { input.setSelectionRange(start, end, composer.selectionDirection || 'none'); } catch {}
     }
   }
+  // (TPT9086) The saved place survives only a repaint that brought nothing new. A view without
+  // one (TPT525's composer-only restore) leaves the transcript alone.
   const messages = document.getElementById('chat-messages');
-  if (messages && Number.isFinite(viewState.messagesScrollTop)) {
-    messages.scrollTop = viewState.messagesScrollTop;
-  }
+  if (messages && Number.isFinite(viewState.messagesScrollTop)) restoreTranscriptScroll(messages, viewState);
 }
 
 // (TPT525) Focus guard for a full render (template.html's #app.innerHTML rewrite), which has no
 // viewState of its own. Captures the live composer only while it is focused AND still belongs to
 // the tab about to be rendered (#chat-input's data-tab-id === state.activeTabId) — when the
 // removed tab was the active one, the active tab changed and nothing is carried over. Message
-// scroll is left to the full render's own scroll handling. Consumed once by attachChatHandlers().
+// scroll is restored separately (_pendingTranscriptRestore below). Consumed once by
+// attachChatHandlers().
 let _pendingComposerRestore = null;
 
 function captureFocusedComposerForRerender() {
@@ -1903,6 +2001,20 @@ function captureFocusedComposerForRerender() {
   if (!input || !input.isConnected || document.activeElement !== input) return null;
   if ((input.dataset.tabId || '') !== String(state.activeTabId ?? '')) return null;
   return { ...captureObjectiveViewState(), messagesScrollTop: null, tabId: state.activeTabId };
+}
+
+// (TPT9086) The full render's transcript counterpart: the live #chat-messages view when it shows
+// the chat about to be rendered (data-active-tab), else a view with no saved place, which ends
+// at the bottom (first paint, opening the Objective tab, a tab not shown before). Null when there
+// is no chat. Consumed once by attachChatHandlers(), after syncBubbleClamps().
+let _pendingTranscriptRestore = null;
+
+function captureTranscriptForRerender() {
+  if (!state.chatState || typeof document === 'undefined') return null;
+  const messages = document.getElementById('chat-messages');
+  const sameChat = messages && messages.isConnected
+    && (messages.dataset.activeTab || '') === String(state.chatState.taskId || '');
+  return sameChat ? captureTranscriptView(messages) : { messagesScrollTop: null };
 }
 
 function objectiveProposalNotice(msg) {
@@ -1918,6 +2030,7 @@ export function renderObjectiveContent(options = {}) {
   // (TPT525) An explicit viewState (refreshObjectiveContent()/renderActiveTab()) is restored by
   // its caller; only a viewState-less full render arms the one-shot restore.
   _pendingComposerRestore = options.viewState ? null : captureFocusedComposerForRerender();
+  _pendingTranscriptRestore = options.viewState ? null : captureTranscriptForRerender(); // (TPT9086)
   const composerView = options.viewState || _pendingComposerRestore;
   const layoutClass = state.chatState ? 'objective-chat--active' : 'objective-chat--empty';
 
@@ -2070,7 +2183,7 @@ export function renderObjectiveContent(options = {}) {
       ${originBannerHtml}
       ${discussPreviewHtml}
       <div class="chat-body">
-      <div class="chat-messages" id="chat-messages" data-active-tab="${escapeAttr(state.chatState && state.chatState.taskId ? String(state.chatState.taskId) : '')}">
+      <div class="chat-messages" id="chat-messages" data-active-tab="${escapeAttr(state.chatState && state.chatState.taskId ? String(state.chatState.taskId) : '')}" ${transcriptStampAttrs(state.chatState)}>
         ${historyBannerHtml}
         ${messagesHtml}
       </div>
@@ -2602,13 +2715,6 @@ export function attachChatHandlers() {
     });
   }
 
-  // Scroll to bottom after reload() when flagged
-  if (state.chatState && state.chatState.shouldScrollToBottom) {
-    state.chatState.shouldScrollToBottom = false;
-    const msgContainer = document.getElementById('chat-messages');
-    if (msgContainer) msgContainer.scrollTop = msgContainer.scrollHeight;
-  }
-
   // (C1390) Bubble expand/collapse — delegated on #chat-messages, which is fully rebuilt on
   // every render, so this listener never stacks across renders like the other handlers here.
   // Toggling is DOM-only (no reload()), so scroll position / streaming state are untouched.
@@ -2629,6 +2735,16 @@ export function attachChatHandlers() {
     });
   }
   syncBubbleClamps();
+
+  // (TPT9086) A full render rebuilt #chat-messages at the top: end at the bottom when a message
+  // landed or no place was saved, else return to the reader's place. After syncBubbleClamps(), so
+  // unhiding Show more buttons cannot move a restored place.
+  if (_pendingTranscriptRestore) {
+    const view = _pendingTranscriptRestore;
+    _pendingTranscriptRestore = null;
+    const messages = document.getElementById('chat-messages');
+    if (messages) restoreTranscriptScroll(messages, view);
+  }
 }
 
 // ── Start a new chat session ──
@@ -2699,7 +2815,6 @@ export function startChat(prompt, userText, systemPrompt, clientTiming) {
 
   syncChatHistoryMeta(state.chatState);
   state.activeTab = 'objective';
-  state.chatState.shouldScrollToBottom = true;
   syncObjectiveChatLayout();
   reload();
 
@@ -3145,7 +3260,6 @@ export function connectObjectiveWS(taskId, prompt, opts) {
         discarded: false, streaming: false, timestamp: Date.now(),
       });
       cs.pendingCardsUpdate = false;
-      cs.shouldScrollToBottom = true;
       if (tab) tab.status = 'streaming';
       if (isActiveTab) { updateStreamingBubble(); reload(); } else renderTabBarOnly();
     } else if (msg.type === 'objective-error') {
@@ -3477,7 +3591,6 @@ export async function sendChatMessage(userText) {
 
   clearDraft(getObjectiveDraftKey());
   syncChatHistoryMeta(state.chatState);
-  state.chatState.shouldScrollToBottom = true;
   reload();
   saveChatDraft();
 

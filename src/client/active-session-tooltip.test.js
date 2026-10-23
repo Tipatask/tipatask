@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import vm from 'node:vm';
+import { seedStatuses, resetStatuses, isCompleteName } from './status-registry.js';
 
 // (TPT414) Left-nav session row tooltip: full title travels as data-tooltip and is rendered by a
 // body-appended tooltip (a ::after inside the overflow-clipped rail would be cut off). CSS and the
@@ -9,6 +11,30 @@ const css = readFileSync(new URL('./styles.css', import.meta.url), 'utf8');
 const boardJs = readFileSync(new URL('./task-board.js', import.meta.url), 'utf8');
 
 const renderFn = boardJs.match(/export function renderActiveSessionsList[\s\S]*?\n\}\n/)?.[0] || '';
+
+test('a retained session gains its completed class and check badge from the configured complete-role status', () => {
+  seedStatuses([
+    { name: 'working', is_in_progress: true },
+    { name: 'shipped', is_workflow_complete: true },
+  ]);
+  try {
+    const context = vm.createContext({
+      isCompleteName, escapeAttr: value => String(value), t: key => key,
+      _sessionAgentIcon: () => '<svg></svg>', SESSION_DONE_BADGE: '<span class="session-done-badge">✓</span>',
+    });
+    vm.runInContext(renderFn.replace('export ', ''), context);
+    const statuses = new Map([['TPT9070', 'working']]);
+    const render = () => context.renderActiveSessionsList([{ taskId: 'TPT9070', status: statuses.get('TPT9070') }], false);
+    assert.doesNotMatch(render(), /session-completed|session-done-badge/);
+    statuses.set('TPT9070', 'shipped');
+    assert.match(render(), /session-completed/);
+    assert.match(render(), /session-done-badge/);
+    statuses.set('TPT9070', 'working');
+    assert.doesNotMatch(render(), /session-completed|session-done-badge/);
+  } finally {
+    resetStatuses();
+  }
+});
 
 test('row emits data-tooltip + aria-label with the full (untruncated) tip text', () => {
   assert.ok(renderFn, 'renderActiveSessionsList not found');

@@ -10,6 +10,7 @@ import vm from 'node:vm';
 const read = name => readFileSync(new URL('./' + name, import.meta.url), 'utf8');
 import { MERGE_DOT, mergeButtonHtml } from './task-merge.js';
 import { FINISH_DOT, finishButtonHtml } from './task-finish.js';
+import { permissionButtonHtml } from './task-permission-mode.js';
 
 function extract(text, name) {
   const start = text.indexOf(`function ${name}(`);
@@ -34,6 +35,7 @@ function cardEnv(overrides = {}) {
     getSprintsEnabled: () => true, renderSprintBadgeLabel: () => 'Sprint 341', buildSubtasksLabel: () => '0/1',
     formatDueDate: () => '', _WAND_SVG: '<svg/>', _CHAT_SVG: '<svg/>', _SUBTASKS_SVG: '<svg/>',
     isTaskDiscussing: () => false, lockIntentOf: () => null, discussOverlayHtml: () => '<div class="card-discuss-overlay"></div>',
+    permissionButtonHtml, // (TPT9063) the real renderer: board cards carry the permission-mode button
     Date, JSON, Set, Map, String, Number,
     ...overrides,
   };
@@ -94,7 +96,7 @@ test('renderCard(preview) keeps what a card shows and drops every control and bo
     'data-id=', 'data-db-id=', 'data-parent-db-id=', 'data-deps=', 'data-tags=', 'data-task-id=',
     'card-action-menu', 'card-btn-group', 'btn-chain-deps', 'btn-reiterate', 'btn-task-chat', 'btn-delete-task', 'btn-select-card',
     'task-card-hover-controls', 'card-status-select', 'card-start-btn', 'subtask-list', 'subtask-radio',
-    'activity-chip', 'needs-attention', ' selected', 'pending-sync', 'card-ctl',
+    'activity-chip', 'needs-attention', ' selected', 'pending-sync', 'card-ctl', 'card-permission-btn',
   ]) assert.ok(!html.includes(banned), `preview card must not contain "${banned}"`);
 });
 
@@ -117,6 +119,7 @@ test('renderCard() without preview is unchanged: full board card with lookup att
     // (TPT278) every header control carries the shared sizing class
     'class="card-status-select card-ctl"',
     'class="card-start-btn btn-claude card-ctl"', 'class="btn-open-subtask-board card-ctl"',
+    'class="card-permission-btn card-ctl" data-task-id="TPT179"', // (TPT9063)
   ]) assert.ok(html.includes(wanted), `board card must still contain "${wanted}"`);
   assert.ok(!html.includes('data-preview-task'));
   assert.ok(!html.includes('card--preview'));

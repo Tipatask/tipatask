@@ -81,13 +81,15 @@ function buildPiMcpToolMap() {
 // tasks). Forces Pi to ground its questions in what already exists instead of assuming a blank
 // project, and explicitly overrides the "write the plan immediately" instruction above for
 // THIS task only: questions come before the plan, not after.
-function piDiscoveryMandateLines(bridge = false) {
+function piDiscoveryMandateLines(bridge = false, planning = true) {
   return [
     `- This is a discovery task: before asking anything, read what already exists — ai/architecture/GENERAL.md (## Source Documents, ## Existing Code), any root README/docs, any manifest file — so your questions fit the real project.`,
     bridge
       ? `- Then read the other tasks in this project (tipatask__list_tasks) and their comment history (tipatask__list_task_resolutions) so you never re-ask something a sibling task already recorded.`
       : `- Then read the other tasks in this project and their comments (the GET /tasks and GET /tasks/<key>/comments curls above) so you never re-ask something a sibling task already recorded.`,
-    `- Only then ask the user with the Clarifying questions mechanism above, batch by batch until the task's own question list is answered — this overrides the earlier instruction to write the plan immediately: for THIS task, the plan comes after the answers. If the user says "you decide", record it as an explicit Assumption line in the deliverable.`,
+    planning
+      ? `- Only then ask the user with the Clarifying questions mechanism above, batch by batch until the task's own question list is answered — this overrides the earlier instruction to write the plan immediately: for THIS task, the plan comes after the answers. If the user says "you decide", record it as an explicit Assumption line in the deliverable.`
+      : `- Honor the task's explicit request to consult the user using the Clarifying questions mechanism above. Read available context first; if the user says "you decide", choose and briefly record the assumption, then continue within this run's permission policy.`,
   ];
 }
 
@@ -174,7 +176,7 @@ class PiAgent extends BaseTaskAgent {
     // (C1575) SIMPLE_MODE is a bare debug path with no surrounding framing to budget the
     // parent block against — thread it through uncapped, same discipline SIMPLE_MODE gives
     // every other opt in this method.
-    if (runtimeConfig.SIMPLE_MODE) return BaseTaskAgent.prependParentTask(promptWithComments, opts);
+    if (runtimeConfig.SIMPLE_MODE && !opts.permissionPolicy?.enforced && opts.permissionPolicy?.mode !== 'plan') return BaseTaskAgent.prependParentTask(promptWithComments, opts);
 
     const ttTags = (opts.taskTags || []).filter(t => t.startsWith('tt-'));
     const cachedTags = (opts.cachedTags || []).filter(t => t.startsWith('tt-') && !ttTags.includes(t));
@@ -231,6 +233,7 @@ class PiAgent extends BaseTaskAgent {
     const lines = [
       'Use the Tipatask workflow for this repository.',
       ...intro,
+      ...(opts.permissionPolicy?.enforced && !opts.permissionPolicy.planning ? [this.permissionPrompt(opts)] : [
       'Start in planning mode enforced by Task App. First study the task, relevant source code, configuration files, and architecture docs. Do not implement, edit files, or run mutating commands until the user approves the plan.',
       // (C1116) The instruction below is deliberately kept as ONE unbroken sentence with no
       // literal newline — Pi's TUI echoes this prompt verbatim in its first frames, and the
@@ -240,6 +243,7 @@ class PiAgent extends BaseTaskAgent {
       // fixed. Keep it embedded mid-sentence so only Pi's REAL final line (which Pi renders
       // as a bare "Plan ready." with nothing else on it, per this instruction) can match.
       'Write the plan immediately in normal output, then as the very last line of the response, by itself with nothing else on that line, write exactly the words Plan ready. — do this only after the plan is fully written, then wait for Task App approval before mutating files.',
+      ]),
       clarify,
       'Project context:',
       '- General architecture and tag taxonomy are pre-loaded in the system prompt.',
@@ -248,7 +252,7 @@ class PiAgent extends BaseTaskAgent {
       ...taskOps,
       `- ${grepNote}`,
       ...directives,
-      ...(opts.discovery ? piDiscoveryMandateLines(bridge) : []),
+      ...(opts.discovery ? piDiscoveryMandateLines(bridge, !opts.permissionPolicy?.enforced || opts.permissionPolicy.planning) : []),
       '',
     ];
     // (C1575) Fit the parent-task block against the REAL assembled framing + task text
@@ -357,6 +361,14 @@ class PiAgent extends BaseTaskAgent {
     // would have to name every bridged tool, which is only known once the servers answer.
     // Headless chat turns do pass one (tool-profiles.js piToolAllowlist) — they want a fence.
     if (bridge) args.push('-e', bridge.extensionPath);
+    const permissionGate = opts.permissionPolicy?.planning || opts.permissionPolicy?.mode === 'plan'
+      ? null : opts.permissionGate;
+    if (permissionGate) {
+      args.push('--no-extensions');
+      env.TIPATASK_PERMISSION_URL = permissionGate.url;
+      env.TIPATASK_PERMISSION_TOKEN = permissionGate.token;
+      args.push('-e', require('../providers/pi-task-tools').stagePermissionGate(config.USER_DATA_ROOT));
+    }
     // Pi accepts a filename for --append-system-prompt and @file for the kickoff.
     // Keep Windows argv below CreateProcess's limit and out of cmd.exe's text parser,
     // including for the checkout's custom bin/pi.cmd (which is not an npm shim).
@@ -369,8 +381,10 @@ class PiAgent extends BaseTaskAgent {
     if (!config.SIMPLE_MODE) {
       args.push('--append-system-prompt', promptArg(this._buildAppendSystemPrompt(opts)));
     }
-    const kickoff = promptArg(this.buildPrompt(prompt, opts));
-    args.push(process.platform === 'win32' ? `@${kickoff}` : kickoff);
+    if (!permissionGate) {
+      const kickoff = promptArg(this.buildPrompt(prompt, opts));
+      args.push(process.platform === 'win32' ? `@${kickoff}` : kickoff);
+    }
     const spec = cliSpawnSpec(launch.command, [...launch.argsPrefix, ...args], { env });
     console.log(`[terminal:pi] launch=${JSON.stringify({ command: spec.command, launcher: launch.command,
       cli: spec.command !== launch.command && !/cmd\.exe$/i.test(spec.command) ? spec.args[0] : launch.argsPrefix[0],
@@ -382,6 +396,7 @@ class PiAgent extends BaseTaskAgent {
       cwd: projectRoot,
       env,
       model: piModel,
+      ...(permissionGate ? { initialPrompt: this.buildPrompt(prompt, opts) } : {}),
     };
   }
 
@@ -426,7 +441,7 @@ class PiAgent extends BaseTaskAgent {
   }
 
   approvePlan(session) {
-    this._submitApproval(session, this.getApprovalText());
+    this._submitApproval(session, this.getApprovalText(session));
   }
 
   // (TPT354) See BaseTaskAgent#readFinalMessage. Pi's per-cwd session dir (or a custom-endpoint
@@ -439,7 +454,8 @@ class PiAgent extends BaseTaskAgent {
   // Substantive one-liner instead of a bare "go" — a terse instruction is what let a Kimi
   // K3 turn come back as nothing but a leaked chat-template separator token (`<|sep|>`, see
   // tt-pi-session.md § Plan approval PTY protocol) with no tool activity at all.
-  getApprovalText() {
+  getApprovalText(opts = {}) {
+    if (opts.permissionPolicy?.enforced) return super.getApprovalText(opts);
     return 'Plan approved. Implement the approved plan now — do not re-plan and do not request approval again. '
       + 'If this task requires clarifying questions from the user, ask them now with the numbered-list mechanism from the system prompt. '
       + 'Follow the Tipatask workflow already given in the system prompt, including posting the resolution comment before marking the task complete.';
@@ -466,6 +482,7 @@ class PiAgent extends BaseTaskAgent {
     session._piApprovalRetried = true;
     this._submitApproval(
       session,
+      session.permissionPolicy?.enforced ? this.getApprovalText(session) :
       'Your previous reply had no usable content. Plan approved — implement it now: use your '
       + 'tools (read, edit, write, bash) to make the actual code changes the plan calls for. '
       + 'Do not just acknowledge this message.'
@@ -508,7 +525,7 @@ class PiAgent extends BaseTaskAgent {
       return unavailable(probe.error.code === 'ENOENT' ? 'cli_missing' : 'probe_failed', probe);
     }
     if (probe.status === 0) {
-      return { id: this.id, label: this.label, available: true };
+      return { id: this.id, label: this.label, available: true, detail: { bin: launch.command, version: probe.output.trim() } };
     }
     return probe.output
       ? unavailable('probe_failed_output', probe, { output: probe.output.split('\n')[0] })

@@ -55,3 +55,7 @@ test('Task Edit module imports without initializing board, cards, chat, or termi
     /\/(task-board|task-card|chat-ui|console-modal)\.js$/.test(path));
   assert.deepEqual(forbidden, []);
 });
+
+test('Permission edits save overrides and inheritance, reopen, reset and refresh card shields (TPT9071)', () => {
+  assert.match(runDomRunner().stdout, /TPT9071_PERMISSION_MODE_PASS/);
+});

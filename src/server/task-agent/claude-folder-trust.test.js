@@ -74,6 +74,78 @@ test('already accepted folder trust leaves file bytes and modification time unch
   assert.equal(fs.statSync(configPath).mtimeMs, mtime);
 });
 
+test('Bypass acknowledgement updates an already trusted project once and preserves user state', t => {
+  const { projectRoot, configDir, configPath } = fixture(t);
+  const settingsPath = path.join(configDir, 'settings.json');
+  const userSettings = { permissions: { deny: ['Bash(rm *)'] }, hooks: {}, skipDangerousModePermissionPrompt: false };
+  put(settingsPath, JSON.stringify(userSettings));
+  fs.chmodSync(settingsPath, 0o640);
+  const original = { theme: 'dark', bypassPermissionsModeAccepted: false,
+    projects: { [projectRoot]: { hasTrustDialogAccepted: true, allowedTools: ['Read'] } } };
+  put(configPath, JSON.stringify(original));
+  fs.chmodSync(configPath, 0o640);
+  assert.equal(writeProjectClaudeTrust(projectRoot, 'bypass'), true);
+  assert.deepEqual(read(configPath), { ...original, bypassPermissionsModeAccepted: true });
+  assert.deepEqual(read(settingsPath), { ...userSettings, skipDangerousModePermissionPrompt: true });
+  if (process.platform !== 'win32') assert.equal(fs.statSync(configPath).mode & 0o777, 0o640);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(settingsPath).mode & 0o777, 0o640);
+  const content = fs.readFileSync(configPath, 'utf8');
+  const settingsContent = fs.readFileSync(settingsPath, 'utf8');
+  fs.utimesSync(configPath, 1234567890, 1234567890);
+  fs.utimesSync(settingsPath, 1234567890, 1234567890);
+  for (const mode of ['bypass', 'plan', 'auto', null]) {
+    assert.equal(writeProjectClaudeTrust(projectRoot, mode), true);
+    assert.equal(fs.readFileSync(configPath, 'utf8'), content);
+    assert.equal(fs.statSync(configPath).mtimeMs, 1234567890000);
+    assert.equal(fs.readFileSync(settingsPath, 'utf8'), settingsContent);
+    assert.equal(fs.statSync(settingsPath).mtimeMs, 1234567890000);
+  }
+});
+
+test('only Bypass accepts the acknowledgement in the default Claude user config', t => {
+  const { root, projectRoot } = fixture(t);
+  t.mock.method(os, 'homedir', () => root);
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const configPath = path.join(root, '.claude.json');
+  const settingsPath = path.join(root, '.claude/settings.json');
+  for (const mode of [null, 'plan', 'auto']) {
+    assert.equal(writeProjectClaudeTrust(projectRoot, mode), true);
+    assert.equal(read(configPath).bypassPermissionsModeAccepted, undefined);
+    assert.equal(fs.existsSync(settingsPath), false);
+  }
+  assert.equal(writeProjectClaudeTrust(projectRoot, 'bypass'), true);
+  assert.equal(read(configPath).bypassPermissionsModeAccepted, true);
+  assert.equal(read(settingsPath).skipDangerousModePermissionPrompt, true);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(settingsPath).mode & 0o777, 0o600);
+});
+
+test('Bypass repairs a missing current acknowledgement even when legacy acknowledgements exist', t => {
+  const { projectRoot, configDir, configPath } = fixture(t);
+  const original = JSON.stringify({ bypassPermissionsModeAccepted: true,
+    projects: { [projectRoot]: { hasTrustDialogAccepted: true } } });
+  put(configPath, original);
+  assert.equal(writeProjectClaudeTrust(projectRoot, 'bypass'), true);
+  assert.equal(fs.readFileSync(configPath, 'utf8'), original);
+  assert.equal(read(path.join(configDir, 'settings.json')).skipDangerousModePermissionPrompt, true);
+});
+
+test('Bypass preserves malformed current settings and does not partially update legacy config', t => {
+  const { projectRoot, configDir, configPath } = fixture(t);
+  const settingsPath = path.join(configDir, 'settings.json');
+  put(configPath, '{}');
+  t.mock.method(console, 'warn', () => {});
+  for (const content of ['{invalid', 'null', '[]']) {
+    put(settingsPath, content);
+    assert.equal(writeProjectClaudeTrust(projectRoot, 'bypass'), false);
+    assert.equal(fs.readFileSync(settingsPath, 'utf8'), content);
+    assert.equal(fs.readFileSync(configPath, 'utf8'), '{}');
+    assert.deepEqual(fs.readdirSync(configDir).sort(), ['.claude.json', 'settings.json']);
+  }
+  // Non-Bypass launches never need to read or alter the bypass settings file.
+  assert.equal(writeProjectClaudeTrust(projectRoot, 'auto'), true);
+  assert.equal(fs.readFileSync(settingsPath, 'utf8'), '[]');
+});
+
 test('malformed folder trust config is preserved and reported without exposing its content', t => {
   const { projectRoot, configDir, configPath } = fixture(t);
   const warnings = t.mock.method(console, 'warn', () => {});
@@ -81,7 +153,7 @@ test('malformed folder trust config is preserved and reported without exposing i
     JSON.stringify({ projects: { [projectRoot]: null } })];
   for (const content of cases) {
     put(configPath, content);
-    assert.equal(writeProjectClaudeTrust(projectRoot), false);
+    assert.equal(writeProjectClaudeTrust(projectRoot, 'bypass'), false);
     assert.equal(fs.readFileSync(configPath, 'utf8'), content);
     assert.deepEqual(fs.readdirSync(configDir), ['.claude.json']);
   }
@@ -99,7 +171,7 @@ test('failed atomic trust replacement keeps original config and removes its temp
     return rename(from, to);
   });
   t.mock.method(console, 'warn', () => {});
-  assert.equal(writeProjectClaudeTrust(projectRoot), false);
+  assert.equal(writeProjectClaudeTrust(projectRoot, 'bypass'), false);
   assert.equal(fs.readFileSync(configPath, 'utf8'), content);
   assert.deepEqual(fs.readdirSync(configDir), ['.claude.json']);
 });
@@ -123,6 +195,30 @@ async function spawnSpec(t, projectRoot, opts = {}) {
     CLAUDE_BIN: 'claude', SIMPLE_MODE: true, PROJECT_ROOT: projectRoot, USER_DATA_ROOT: path.dirname(projectRoot),
   }, 'Review this task.', null, opts);
 }
+
+test('Claude spawn uses native permissions, keeps the bell, and never installs the hook gate', async t => {
+  const { projectRoot, configPath } = fixture(t);
+  const agent = new ClaudeAgent();
+  for (const [mode, expected] of [[null, 'plan'], ['plan', 'plan'], ['auto', 'acceptEdits'], ['bypass', 'bypassPermissions']]) {
+    const spec = await spawnSpec(t, projectRoot, {
+      permissionPolicy: agent.buildPermissionPolicy({ mode }),
+      // A stale caller must not re-install hooks on a native-permission launch.
+      permissionGate: { url: 'http://127.0.0.1:1/approval', token: 'test-only' },
+    });
+    assert.equal(spec.args[spec.args.indexOf('--permission-mode') + 1], expected);
+    assert.deepEqual(JSON.parse(spec.args[spec.args.indexOf('--settings') + 1]), { preferredNotifChannel: 'terminal_bell' });
+    assert.doesNotMatch(JSON.stringify(spec), /PreToolUse|SessionStart|127\.0\.0\.1:1/);
+    if (mode === 'plan') {
+      assert.match(spec.initialPrompt, /standalone line reading Plan ready\./);
+      assert.match(spec.initialPrompt, /Wait for user approval, then implement the approved plan in this same session\.$/);
+    }
+    assert.equal(read(configPath).bypassPermissionsModeAccepted, mode === 'bypass' ? true : undefined);
+  }
+  fs.mkdirSync(path.join(projectRoot, '.tipatask'), { recursive: true });
+  put(path.join(projectRoot, '.tipatask/config.json'), JSON.stringify({ ATTENTION_TERMINAL_BELL: false }));
+  const quiet = await spawnSpec(t, projectRoot, { permissionPolicy: agent.buildPermissionPolicy({ mode: 'auto' }) });
+  assert.equal(quiet.args.includes('--settings'), false);
+});
 
 test('Claude spawn accepts the bound project without a project-open refresh and preserves accepted entries', async t => {
   const { root, projectRoot, configPath } = fixture(t);

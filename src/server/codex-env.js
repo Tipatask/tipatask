@@ -11,7 +11,47 @@ const toml = require('toml');
 const { createHash, randomUUID } = require('node:crypto');
 const config = require('./config');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir } = require('./spawn-utils');
-const { ensureProjectCodexHome, prepareCodexTerminalHome } = require('../codex-mcp-config');
+const { ensureProjectCodexHome, prepareCodexTerminalHome, tomlValue } = require('../codex-mcp-config');
+const { permissionError } = require('./permission-policy');
+
+function codexPermissionOverrides(policy, parsed) {
+  // Planning is a prompt gate; execution continues with native user approvals.
+  if (policy?.mode === 'plan') return { approval_policy: 'on-request', approvals_reviewer: 'user' };
+  if (!policy?.enforced) return {};
+  if (parsed.default_permissions) throw permissionError('unsupported', {
+    mode: policy.mode, agent: 'codex', supportReason: 'codexProfiles',
+  });
+  const auto = policy.mode === 'auto';
+  const result = {
+    sandbox_mode: auto ? 'workspace-write' : 'danger-full-access',
+    approval_policy: auto ? 'on-request' : 'never',
+    approvals_reviewer: auto ? 'auto_review' : 'user',
+    'features.guardian_approval': auto,
+    'sandbox_workspace_write.network_access': false,
+    'sandbox_workspace_write.writable_roots': [],
+  };
+  for (const id of new Set(['_default', ...Object.keys(parsed.apps || {})])) {
+    const prefix = `apps.${JSON.stringify(id)}`;
+    result[`${prefix}.default_tools_approval_mode`] = auto ? 'prompt' : 'approve';
+    result[`${prefix}.approvals_reviewer`] = auto ? 'auto_review' : 'user';
+    for (const tool of Object.keys(parsed.apps?.[id]?.tools || {})) {
+      result[`${prefix}.tools.${JSON.stringify(tool)}.approval_mode`] = auto ? 'prompt' : 'approve';
+    }
+  }
+  for (const [plugin, config] of Object.entries(parsed.plugins || {})) {
+    for (const id of Object.keys(config.mcp_servers || {})) {
+      result[`plugins.${JSON.stringify(plugin)}.mcp_servers.${JSON.stringify(id)}.default_tools_approval_mode`] = auto ? 'prompt' : 'approve';
+    }
+  }
+  for (const [id, server] of Object.entries(parsed.mcp_servers || {})) {
+    const prefix = `mcp_servers.${JSON.stringify(id)}`;
+    result[`${prefix}.default_tools_approval_mode`] = auto ? 'prompt' : 'approve';
+    for (const tool of Object.keys(server.tools || {})) {
+      result[`${prefix}.tools.${JSON.stringify(tool)}.approval_mode`] = auto ? 'prompt' : 'approve';
+    }
+  }
+  return result;
+}
 
 const CODEX_REASONING_EFFORT = 'high';
 const DAEMON_RECORD = 'tipatask-daemon.json';
@@ -125,11 +165,24 @@ function codexEffortArgs(level = CODEX_REASONING_EFFORT) {
   return ['-c', `model_reasoning_effort="${level}"`];
 }
 
-// Interactive Codex must receive configuration through native files, never -c,
-// --profile, --enable, --disable or --search. Separate immutable native homes
-// allow matching consoles to share a daemon without racing task effort writes.
-function codexTerminalLaunchOptions(projectRoot, codexHome, level = CODEX_REASONING_EFFORT, env = null) {
-  const home = prepareCodexTerminalHome({ projectRoot, codexHome, effort: level, env: env || {} });
+// Legacy interactive consoles share immutable native homes without CLI overrides.
+// Enforced permission modes use embedded sessions and authoritative CLI overrides.
+function codexTerminalLaunchOptions(projectRoot, codexHome, level = CODEX_REASONING_EFFORT, env = null, policy = null) {
+  const base = toml.parse(fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8'));
+  const overrides = codexPermissionOverrides(policy, base);
+  const home = prepareCodexTerminalHome({ projectRoot, codexHome, effort: level, env: env || {}, overrides });
+  if (policy?.enforced && policy.mode !== 'plan') {
+    // An explicit embedded launch gives these overrides precedence over project-layer
+    // config. Legacy shared-daemon launches retain their zero-override contract.
+    const args = ['--no-daemon'];
+    const effective = toml.parse(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'));
+    // Codex CLI dotted keys do not parse quoted TOML identifiers. Override each
+    // whole affected table using the same serializer as scoped chat MCP configs.
+    for (const key of new Set(Object.keys(overrides).map(key => key.split('.')[0]))) {
+      args.push('-c', `${key}=${tomlValue(effective[key])}`);
+    }
+    return { args, mode: 'embedded', reason: `permission-${policy.mode}`, codexHome: home };
+  }
   const terminalEnv = env && { ...env, CODEX_HOME: home };
   const parsed = toml.parse(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'));
   const reason = terminalEnv && terminalDaemonFallback(home, terminalEnv, parsed);
@@ -190,4 +243,4 @@ function buildCodexEnv({ projectRoot, taskId, term = 'dumb' } = {}) {
   return { env };
 }
 
-module.exports = { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, terminalDaemonFallback, toCodexEffort };
+module.exports = { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, terminalDaemonFallback, toCodexEffort, codexPermissionOverrides };

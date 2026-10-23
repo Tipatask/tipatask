@@ -491,7 +491,7 @@ test('Pi detection still probes an unverified launch (POSIX bundle, PI_BIN, syst
   const h = agentHarness(t, { launch: { command: '/usr/local/bin/pi', argsPrefix: [], env: {} }, probe: { error: null, status: 0, output: '0.84.1' } });
   const result = await h.agent.detect({});
   assert.equal(result.available, true);
-  assert.equal(result.detail, undefined);
+  assert.deepEqual(plain(result.detail), { bin: '/usr/local/bin/pi', version: '0.84.1' });
 });
 
 test('Pi detection turns a staged Windows verification failure into the localized runtime_failed reason', async t => {

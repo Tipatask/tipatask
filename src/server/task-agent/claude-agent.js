@@ -161,7 +161,7 @@ class ClaudeAgent extends BaseTaskAgent {
     }
 
     // SIMPLE_MODE: skip all KB/cache preamble, return bare task prompt
-    if (config.SIMPLE_MODE) return promptWithComments;
+    if (config.SIMPLE_MODE && !opts.permissionPolicy?.enforced) return promptWithComments;
 
     const ttTags = (opts.taskTags || []).filter(t => t.startsWith('tt-'));
     const cachedTags = (opts.cachedTags || []).filter(t => t.startsWith('tt-') && !ttTags.includes(t));
@@ -192,10 +192,10 @@ class ClaudeAgent extends BaseTaskAgent {
     // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status) — see
     // base-agent.js#buildSharedPreamble. Each is its own blank-line-separated block between
     // the resolution note and the task tail; absent optional ones leave no gap. The clarify
-    // slot is unused here by policy (getPreamblePolicy() above).
-    const { directives } = this.buildSharedPreamble(opts);
-    const directiveBlocks = directives.map(d => `\n\n${d}`).join('');
-    return `/tipatask-expert\n${cavemanLine}\n\n⚠️ Architecture KB: NEVER write to \`ai/ARCHITECTURE.md\` (deprecated legacy path, will not be loaded by any agent). Always use \`ai/architecture/GENERAL.md\` for stack/env/commands and \`ai/architecture/tt-*.md\` for module docs.\n\nBefore starting:\n1. General architecture and tag taxonomy are pre-loaded in the system prompt (STATIC CONTEXT section) — no need to Read \`ai/architecture/GENERAL.md\` or call \`list_system_tags\`.\n2. ${tagNote}\n\nDuring exploration: when a STANDING fact is missing from KB (undocumented endpoint, file not in KB Files table, schema change, behavioral nuance) — update \`ai/architecture/tt-*.md\` immediately with that fact alone. What you find out about THIS task does not go there — see KB hygiene below.\n\n${grepNote}\n\nAfter any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task to reflect added/removed/changed endpoints, DB schema, env vars, file structure, or module behavior. Do this before marking task complete — never \`ai/ARCHITECTURE.md\`.\n\nBefore marking complete: if new module touched has no tt-* tag — call list_system_tags to verify, create tag via MCP or POST /api/tags, create ai/architecture/tt-*.md stub, add tag to task.${resolutionNote}${directiveBlocks}\n\n${promptWithComments}`;
+    // slot carries mode-specific communication; Claude retains native questions.
+    const { directives, clarify } = this.buildSharedPreamble(opts);
+    const directiveBlocks = [clarify, ...directives].filter(Boolean).map(d => `\n\n${d}`).join('');
+    return `${this.permissionPrompt(opts) ? this.permissionPrompt(opts) + '\n\n' : ''}/tipatask-expert\n${cavemanLine}\n\n⚠️ Architecture KB: NEVER write to \`ai/ARCHITECTURE.md\` (deprecated legacy path, will not be loaded by any agent). Always use \`ai/architecture/GENERAL.md\` for stack/env/commands and \`ai/architecture/tt-*.md\` for module docs.\n\nBefore starting:\n1. General architecture and tag taxonomy are pre-loaded in the system prompt (STATIC CONTEXT section) — no need to Read \`ai/architecture/GENERAL.md\` or call \`list_system_tags\`.\n2. ${tagNote}\n\nDuring exploration: when a STANDING fact is missing from KB (undocumented endpoint, file not in KB Files table, schema change, behavioral nuance) — update \`ai/architecture/tt-*.md\` immediately with that fact alone. What you find out about THIS task does not go there — see KB hygiene below.\n\n${grepNote}\n\nAfter any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task to reflect added/removed/changed endpoints, DB schema, env vars, file structure, or module behavior. Do this before marking task complete — never \`ai/ARCHITECTURE.md\`.\n\nBefore marking complete: if new module touched has no tt-* tag — call list_system_tags to verify, create tag via MCP or POST /api/tags, create ai/architecture/tt-*.md stub, add tag to task.${resolutionNote}${directiveBlocks}\n\n${promptWithComments}`;
   }
 
   getInteractiveReadyMs() { return 1500; }
@@ -228,7 +228,8 @@ class ClaudeAgent extends BaseTaskAgent {
       console.warn('[claude-agent] opts.projectPath is falsy in a packaged Electron build — falling back to config.PROJECT_ROOT (bundle path). Check WS session projectPath resolution.');
     }
     const projectRoot = opts.projectPath || config.PROJECT_ROOT;
-    writeProjectClaudeTrust(projectRoot);
+    const mode = opts.permissionPolicy?.mode;
+    writeProjectClaudeTrust(projectRoot, mode);
     const env = augmentPathEnv({ TERM: 'xterm-256color', ...projectEnvExtras(opts.projectPath) });
     if (taskId) {
       env.TIPATASK_TASK_ID = taskId;
@@ -241,7 +242,8 @@ class ClaudeAgent extends BaseTaskAgent {
     // TPT286 — per-task effort (null = CLI's own default, spawn left untouched).
     const effort = this.resolveEffort(opts.task);
     console.log(`[claude-agent] model=${model} (task=${opts.model || '-'}) effort=${effort || '-'}`);
-    const args = ['--model', model, '--permission-mode', 'plan'];
+    const nativeMode = mode === 'bypass' ? 'bypassPermissions' : mode === 'auto' ? 'acceptEdits' : 'plan';
+    const args = ['--model', model, '--permission-mode', nativeMode];
     // (TPT354) Pin the session uuid so the exit-comment builder can find this run's transcript
     // (final-message.js) instead of guessing among the project's sessions. terminal-session.js
     // mints it per spawn and stores it on session._transcriptHint; absent for any caller that
@@ -278,13 +280,19 @@ class ClaudeAgent extends BaseTaskAgent {
     // per-project with { "ATTENTION_TERMINAL_BELL": false } in .tipatask/config.json if a
     // future CLI version changes that merge behavior.
     if (resolveAttentionTerminalBell(projectRoot)) {
-      args.push('--settings', JSON.stringify({ preferredNotifChannel: 'terminal_bell' }));
+      const i = args.indexOf('--settings');
+      if (i >= 0) args[i + 1] = JSON.stringify({ ...JSON.parse(args[i + 1]), preferredNotifChannel: 'terminal_bell' });
+      else args.push('--settings', JSON.stringify({ preferredNotifChannel: 'terminal_bell' }));
     }
     if (!config.SIMPLE_MODE) {
       args.push('--exclude-dynamic-system-prompt-sections');
       args.push('--append-system-prompt', this._buildAppendSystemPrompt(opts));
     }
-    const initialPrompt = this.buildPrompt(prompt, opts);
+    // Keep the plan sentinel in the final kickoff instructions, including SIMPLE_MODE.
+    // Design Mode must retain its single-line /design submission.
+    const initialPrompt = this.buildPrompt(prompt, opts) + (mode === 'plan' && !opts.designMode
+      ? '\nPresent the plan, then end with a standalone line reading Plan ready. Wait for user approval, then implement the approved plan in this same session.'
+      : '');
     // (C1260, now dead for Claude as of C1272) preludePrompt was `/design` split into its own
     // submission — see buildPrompt()'s design-mode doc comment for why that shipped a worse
     // bug and was replaced with a single-submission `/design <brief>`. ClaudeAgent no longer
@@ -395,7 +403,7 @@ class ClaudeAgent extends BaseTaskAgent {
     session.pty.write('\x1b[Z');
     setTimeout(() => {
       if (session.pty) {
-        session.pty.write(this.getApprovalText());
+        session.pty.write(this.getApprovalText(session));
       }
     }, 120);
     setTimeout(() => {
@@ -458,6 +466,15 @@ class ClaudeAgent extends BaseTaskAgent {
       stream.on('end', () => { clearTimeout(timer); resolve(rows.join('\n')); });
       stream.on('error', (err) => { clearTimeout(timer); reject(err); });
     });
+  }
+
+  async getPermissionVersion(status) {
+    if (status.detail?.version) return status.detail.version;
+    const bin = await resolveBinAsync('claude');
+    if (!bin) return '';
+    const env = prependPathEnv(augmentPathEnv({}), resolveNvmBinDir(bin));
+    const probe = await BaseTaskAgent.runCliProbe(bin, ['--version'], { env });
+    return !probe.error && probe.status === 0 ? probe.output : '';
   }
 
   async detect(config) {

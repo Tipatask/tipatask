@@ -11,6 +11,7 @@ const { withProjectLock } = require('./project-mutex');
 const { isReservationPlaceholder } = require('./reservation-placeholder');
 const { isTaskKeyLike } = require('./task-key-format');
 const { readProjectConfig } = require('./project-config');
+const { PROJECT_SETTING_FIELDS, settingsResult, readSettingsCache, writeSettingsCache } = require('./project-settings-cache');
 const { buildSpecCommentBody, stripSpecCommentHeader } = require('./spec-comment');
 const { readOriginSpecSnapshot, postOriginSpecComment } = require('./origin-spec-capture');
 const { applyReopenToPatch } = require('./reopen-closed-task');
@@ -145,6 +146,34 @@ let _statusesEntry = null; // { rows, at }
 
 // ── Project settings cache (C1215) — same invalidation discipline as _statusesEntry ──
 let _projectSettingsEntry = null; // { row, at, fallback }
+let _effectiveSettingsEntry = null; // API { settings, source, is_creator }
+let _settingsGeneration = 0;
+let _settingsSaveQueue = Promise.resolve();
+
+function _invalidateSettings() {
+  _settingsGeneration++;
+  _projectSettingsEntry = null;
+  _effectiveSettingsEntry = null;
+}
+
+function _settingsRequestContext(includeWrites = true) {
+  const credentials = getCredentials(); // observe account/target changes before cache hits
+  const generation = _settingsGeneration;
+  const userGeneration = _userIdGeneration;
+  return () => {
+    const current = getCredentials();
+    if ((includeWrites && generation !== _settingsGeneration) || userGeneration !== _userIdGeneration || current.baseUrl !== credentials.baseUrl
+      || String(current.projectId) !== String(credentials.projectId) || current.token !== credentials.token) {
+      throw Object.assign(new Error('Project settings context changed; reload settings'), { contextChanged: true });
+    }
+  };
+}
+
+function _rememberSettings(data) {
+  _effectiveSettingsEntry = { data, at: Date.now() };
+  try { writeSettingsCache(readProjectConfig(_projectRoot), data); }
+  catch { console.warn('[api-backend] Could not save local project settings cache'); }
+}
 
 // Bumped by every _cacheInvalidate(). A list request captures it when it starts and may
 // only install its result (or clear the in-flight slot) while it is unchanged — a response
@@ -174,7 +203,7 @@ function _resetUserContext(reason) {
   _userIdGeneration++;
   _cacheInvalidate();
   _statusesEntry = null;
-  _projectSettingsEntry = null;
+  _invalidateSettings();
   console.log(`[api-backend] User context reset (${reason})`);
 }
 
@@ -448,8 +477,15 @@ async function _completeFirstConnect(taskCount) {
     console.warn('[api-backend] local recipes dir unavailable (non-fatal):', e.message);
   }
   await _fetchCurrentUserId();
+  // Setup, restart and reconnect all hydrate the same account-scoped preferences.
+  await _initializeSettings();
   _firstConnectDone = true;
   console.log(`[api-backend] Connected — ${taskCount} tasks in project`);
+}
+
+async function _initializeSettings() {
+  try { await require('../cli/setup').initializeProjectSettings({ projectRoot: _projectRoot, backend }); }
+  catch { console.warn('[api-backend] Effective project settings unavailable; using account-scoped display defaults'); }
 }
 
 async function _probeConnection() {
@@ -485,7 +521,7 @@ async function _probeConnection() {
         }
         // Before the drain, so replayed creates stamp the assignee from the resolved user id.
         await _completeFirstConnect(((res.data && res.data.tasks) || []).length);
-      }
+      } else await _initializeSettings();
       _cacheInvalidate();
       await _drainPendingMutations();
       // If drain re-armed reconnect (partial failure), don't call _markConnected yet
@@ -821,6 +857,7 @@ function fromApi(t) {
     // TPT284/TPT285: per-task reasoning effort ('low'|'medium'|'high'|'max'), null = inherit
     // the agent default. Same key in snake_case and camelCase.
     effort: t.effort ?? null,
+    agentPermissionMode: t.agent_permission_mode ?? null,
     // C1207: a real boolean, not a tri-state override. Column is TINYINT(1) NOT NULL
     // DEFAULT 0 and mysql2 hands it back as 0/1 (api/src/db.js sets no typeCast), so
     // coerce here — same discipline as isReservation below. Never let `null` through:
@@ -869,6 +906,10 @@ function toApi(t) {
   // TPT285: same conditional-omit rule — an omitted `effort` resolves to NULL (inherit) in the
   // API's POST/PUT readers (normalizeEffort(undefined) -> null).
   if (t.effort) out.effort = t.effort;
+  // Omission preserves an existing override; explicit null clears it. Never copy
+  // the project default into tasks: inheritance is resolved only when a run starts.
+  const permissionMode = t.agentPermissionMode !== undefined ? t.agentPermissionMode : t.agent_permission_mode;
+  if (permissionMode !== undefined) out.agent_permission_mode = permissionMode;
   // C1207: same conditional-omit shape as the model fields above, different reason —
   // for a boolean, omitting *is* "false": the API's POST/PUT readers do
   // `toBoolInt(t.claude_design_mode)` → 0, identical to the column default.
@@ -1022,11 +1063,14 @@ async function assignIncomingNewTaskIds(backend, incomingNewTasks, liveTasks) {
 // task actually needs a PATCH, or can be skipped — avoids re-sending every task in
 // the project on every save now that persistence is targeted-PATCH, not bulk-PUT.
 const DIFF_FIELDS = ['title', 'description', 'category', 'status', 'priority', 'order',
-  'dependencies', 'tags', 'assignee', 'agentAssignee', 'claudeModel', 'codexModel', 'piModel', 'effort', 'claudeDesignMode', 'due_date', 'parentDbId', 'isObjective'];
+  'dependencies', 'tags', 'assignee', 'agentAssignee', 'claudeModel', 'codexModel', 'piModel', 'effort', 'agentPermissionMode', 'claudeDesignMode', 'due_date', 'parentDbId', 'isObjective'];
 function tasksDiffer(incoming, live) {
   if (!live) return true;
+  const permissionMode = incoming.agentPermissionMode !== undefined ? incoming.agentPermissionMode : incoming.agent_permission_mode;
   for (const f of DIFF_FIELDS) {
-    const a = incoming[f];
+    // Older editors/proposals omit this field; omission is not a reset to inherit.
+    if (f === 'agentPermissionMode' && permissionMode === undefined) continue;
+    const a = f === 'agentPermissionMode' ? permissionMode : incoming[f];
     const b = live[f];
     if (Array.isArray(a) || Array.isArray(b)) {
       if (JSON.stringify(a || []) !== JSON.stringify(b || [])) return true;
@@ -1103,6 +1147,8 @@ async function _rawUpdateTask(id, fields, opts = {}) {
   if (piModel !== undefined) body.pi_model = piModel;
   // TPT285: single key in both casings; '' clears to null (API normalizeEffort does the same).
   if (fields.effort !== undefined) body.effort = fields.effort || null;
+  const permissionMode = fields.agentPermissionMode !== undefined ? fields.agentPermissionMode : fields.agent_permission_mode;
+  if (permissionMode !== undefined) body.agent_permission_mode = permissionMode;
   // C1207. The snake_case fallback is MANDATORY, not defensive: main/ipc/api-router.js
   // forwards the renderer's snake_case patch verbatim, and in the desktop app that IPC
   // route — not ws-handlers.js's HTTP PATCH — is the primary path for api.tasks.update().
@@ -1561,31 +1607,87 @@ const backend = {
     }
   },
 
-  // C1215 — this project's row (used for vcs_type/vcs_worktree_enabled/
-  // vcs_commit_enabled/vcs_pr_enabled — see vcs-settings.js). `apiRequest`'s urlPath is
-  // always prefixed with `/api/projects/${projectId}` (see apiRequest() above), so an
-  // EMPTY urlPath hits exactly `GET /api/projects/:id` — the project-detail endpoint,
-  // response shape `{ project, is_owner }`. Same cache/fallback shape as getStatuses()
-  // above: a fetch failure never throws — falls back to the last good cached row, else
-  // null (vcs-settings.js's normalizeVcsSettings(null) degrades to VCS_OFF, so a
-  // hiccup here can never block a task spawn). opts.refresh bypasses the cache.
-  async getProjectSettings(opts = {}) {
-    if (!opts.strict && !opts.refresh && _projectSettingsEntry) {
-      const ttl = _projectSettingsEntry.fallback ? PROJECT_SETTINGS_FALLBACK_TTL_MS : PROJECT_SETTINGS_CACHE_TTL_MS;
-      if ((Date.now() - _projectSettingsEntry.at) < ttl) return _projectSettingsEntry.row;
-    }
+  // The API owns creator attribution and initializes each member's snapshot once.
+  // Settings writes never enter the task mutation queue or retry under another account.
+  async getEffectiveProjectSettings(opts = {}) {
+    let assertCurrent;
     try {
+      assertCurrent = _settingsRequestContext();
+      if (!opts.strict && !opts.refresh && _effectiveSettingsEntry
+        && Date.now() - _effectiveSettingsEntry.at < PROJECT_SETTINGS_CACHE_TTL_MS) return _effectiveSettingsEntry.data;
+      const data = settingsResult(await apiRequest('GET', '/settings'));
+      assertCurrent();
+      if (!data) throw new Error('Effective project settings unavailable');
+      _rememberSettings(data);
+      return data;
+    } catch (err) {
+      if (opts.strict || err.contextChanged) throw err;
+      // Only a transport outage permits offline UI values; never authorize from them.
+      if (!err.networkError || !assertCurrent) return null;
+      try { assertCurrent(); } catch { return null; }
+      return _effectiveSettingsEntry?.data || readSettingsCache(readProjectConfig(_projectRoot));
+    }
+  },
+
+  async saveEffectiveProjectSettings(fields) {
+    if (!fields || typeof fields !== 'object' || Array.isArray(fields)
+      || !Object.keys(fields).length || Object.keys(fields).some(field => !PROJECT_SETTING_FIELDS.includes(field))) {
+      throw new Error('Unknown or empty project settings patch');
+    }
+    // Serialize partial edits. A later response must not restore an earlier form's
+    // full snapshot, and a waiting edit must stay bound to its original account.
+    const assertIdentity = _settingsRequestContext(false);
+    const previous = _settingsSaveQueue;
+    let release;
+    _settingsSaveQueue = new Promise(resolve => { release = resolve; });
+    await previous;
+    try {
+      assertIdentity();
+      _invalidateSettings();
+      const assertCurrent = _settingsRequestContext();
+      const data = settingsResult(await apiRequest('PATCH', '/settings', fields));
+      assertCurrent();
+      if (!data) throw new Error('Effective project settings save returned no settings');
+      _invalidateSettings();
+      _rememberSettings(data);
+      return data;
+    } catch (err) {
+      throw unwrapStatusesApiError(err);
+    } finally {
+      release();
+    }
+  },
+
+  // Compatibility row for metadata consumers (task_prefix, name, reindex timestamp,
+  // capabilities) and runtime preference consumers. Preferences always use /settings.
+  async getProjectSettings(opts = {}) {
+    let assertCurrent;
+    try {
+      assertCurrent = _settingsRequestContext();
+      if (!opts.strict && !opts.refresh && _projectSettingsEntry) {
+        const ttl = _projectSettingsEntry.fallback ? PROJECT_SETTINGS_FALLBACK_TTL_MS : PROJECT_SETTINGS_CACHE_TTL_MS;
+        if (Date.now() - _projectSettingsEntry.at < ttl) return _projectSettingsEntry.row;
+      }
       const data = await apiRequest('GET', '');
-      const row = (data && data.project) || null;
+      assertCurrent();
+      let row = (data && data.project) || null;
       if (opts.strict && !row) throw new Error('Project settings unavailable');
+      if (row) {
+        const effective = await this.getEffectiveProjectSettings(opts);
+        assertCurrent();
+        // Never fall back to unscoped preferences from an older project endpoint.
+        row = Object.fromEntries(Object.entries(row).filter(([field]) => !PROJECT_SETTING_FIELDS.includes(field)));
+        Object.assign(row, effective?.settings);
+      }
       _projectSettingsEntry = { row, at: Date.now(), fallback: !row };
       return row;
     } catch (err) {
-      // Permissions must never be authorized from a stale cache after a failed read.
-      // UI callers retain their existing last-known-good fallback.
       if (opts.strict) throw err;
-      // Stale-but-real beats a null fallback.
+      try { if (!assertCurrent) return null; assertCurrent(); } catch { return null; }
+      if (!err.networkError) return null;
       if (_projectSettingsEntry && !_projectSettingsEntry.fallback) return _projectSettingsEntry.row;
+      const cached = readSettingsCache(readProjectConfig(_projectRoot));
+      if (cached) return cached.settings;
       _projectSettingsEntry = { row: null, at: Date.now(), fallback: true };
       return null;
     }
@@ -1607,23 +1709,18 @@ const backend = {
     }
   },
 
-  // C1271 — PATCH this project's row (language, task_group_label, color_scheme,
-  // sprints_enabled, kb_sync_as_you_go, use_objective_grouping, sprint_sort_order, and —
-  // since TPT61 — vcs_type/vcs_worktree_enabled/vcs_commit_enabled/vcs_pr_enabled, C1213/
-  // C1215). Empty urlPath resolves to PATCH /api/projects/:id (see apiRequest() above),
-  // response shape { project }. Unlike getProjectSettings() this is a write and must NOT
-  // fail open — the caller (Settings modal) rolls its control back to the previous value on
-  // throw. Drops _projectSettingsEntry so the next getProjectSettings() re-reads the fresh
-  // row instead of serving up to 30s of stale cache — same discipline the statuses CRUD
-  // below uses for _statusesEntry. unwrapStatusesApiError() is generic despite its name
-  // (just unwraps `{ error }` API bodies) — reused here rather than duplicated. This same
-  // method is what TPT61's "updateProjectSettings(patch)" ask maps onto — no separate
-  // method was added, the field allowlist in ws-handlers.js's PATCH /api/project is the
-  // real gate (the API's buildVcsPatch() owns the git-only-flag cross-check).
+  // Keep the existing settings editor response shape. Metadata edits retain the
+  // API's own permission gate; preference-only writes use the effective contract.
   async updateProject(fields) {
+    if (fields && Object.keys(fields).every(field => PROJECT_SETTING_FIELDS.includes(field))) {
+      const data = await this.saveEffectiveProjectSettings(fields);
+      return data.settings;
+    }
+    const assertCurrent = _settingsRequestContext();
     try {
       const data = await apiRequest('PATCH', '', fields);
-      _projectSettingsEntry = null;
+      assertCurrent();
+      _invalidateSettings();
       return (data && data.project) || null;
     } catch (err) {
       throw unwrapStatusesApiError(err);
@@ -1833,6 +1930,7 @@ const backend = {
       }
     }
     _enqueueMutation('update', [id, fields, opts], id);
+    const permissionMode = fields.agentPermissionMode !== undefined ? fields.agentPermissionMode : fields.agent_permission_mode;
     // Optimistic: mutate cached row in both unfiltered and scoped caches
     let _found = null;
     _eachListCache(cache => {
@@ -1848,6 +1946,7 @@ const backend = {
         if (fields.codexModel !== undefined) row.codexModel = fields.codexModel;
         if (fields.piModel !== undefined) row.piModel = fields.piModel;
         if (fields.effort !== undefined) row.effort = fields.effort || null;
+        if (permissionMode !== undefined) row.agentPermissionMode = permissionMode;
         if (fields.claudeDesignMode !== undefined) row.claudeDesignMode = !!fields.claudeDesignMode;
         if (fields.isObjective !== undefined) row.isObjective = !!fields.isObjective;
         if (fields.order !== undefined) row.order = fields.order;
@@ -1857,7 +1956,7 @@ const backend = {
       }
     });
     if (_found) return _found;
-    return { id, ...fields, _pendingSync: true };
+    return { id, ...fields, ...(permissionMode !== undefined ? { agentPermissionMode: permissionMode } : {}), _pendingSync: true };
   },
 
   async addTokenUsage(taskKey, tokens) {
@@ -2206,13 +2305,11 @@ const backend = {
     }
     _cacheInvalidate();
     if (originalSpec && newTaskIds.length > 0) {
-      // C1159: header the stored spec comment as reference-only — the executor agent
-      // reads this comment first (spec sorts ahead of others, see base-agent.js
-      // formatTaskCommentsBlock) and was eagerly implementing sibling tasks' scope
-      // out of the raw objective text. Per-project language, same as agent prompts
-      // (buildLanguageDirective).
+      // Spec comments sort first at kickoff. A sole task owns the full objective;
+      // multiple tasks use it as reference and keep their own description's scope.
+      // Per-project language, same as agent prompts (buildLanguageDirective).
       const lang = (readProjectConfig(_projectRoot) || {}).language || 'en';
-      const specBody = buildSpecCommentBody(originalSpec, lang);
+      const specBody = buildSpecCommentBody(originalSpec, lang, { soleTask: newTaskIds.length === 1 });
       await Promise.all(newTaskIds.map(async id => {
         try {
           let existing = null;
@@ -2502,7 +2599,7 @@ const backend = {
     _reconnectAttempt = 0;
     _cacheInvalidate();
     _statusesEntry = null;
-    _projectSettingsEntry = null;
+    _invalidateSettings();
     _stateListeners.clear();
     _drainListeners.clear();
   },

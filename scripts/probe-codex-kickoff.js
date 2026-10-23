@@ -365,7 +365,10 @@ async function main() {
       session.taskAgent = 'codex';
       session.projectPath = projectRoot;
       try {
-        await spawnTerminal(session, KICKOFF, TASK_KEY, [], { sessions: [], initialCols: 120, initialRows: 40 });
+        await spawnTerminal(session, KICKOFF, TASK_KEY, [], { sessions: [], initialCols: 120, initialRows: 40,
+          task: { id: TASK_KEY, agentPermissionMode: null },
+          backend: { getEffectiveProjectSettings: async () => ({ settings: { agent_permission_mode: null } }) },
+        });
       } finally {
         if (session.ptyPid) ptyPids.push(session.ptyPid);
         codexHome = (spec && spec.env && spec.env.CODEX_HOME) || codexHome;

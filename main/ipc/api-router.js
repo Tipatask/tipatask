@@ -112,6 +112,7 @@ function registerApiHandlers() {
         id: t.id,
         title: t.title,
         status: t.status,
+        ...(t.agentPermissionMode !== undefined ? { agentPermissionMode: t.agentPermissionMode } : {}),
         dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
         ...(t.dbId != null ? { dbId: t.dbId } : {}),
         ...(t.parentDbId != null ? { parentDbId: t.parentDbId } : {}),
@@ -343,6 +344,7 @@ function registerApiHandlers() {
     const project = backend && typeof backend.getProjectSettings === 'function' ? await backend.getProjectSettings() : null;
     return {
       taskGroupLabel: project?.task_group_label || 'Batches',
+      language: project?.language || null,
       colorScheme: project?.color_scheme || 'default',
       // C1332 — sprints_enabled, kept identical to ws-handlers.js's GET /api/project/settings.
       sprintsEnabled: project?.sprints_enabled === undefined || project?.sprints_enabled === null
@@ -366,6 +368,10 @@ function registerApiHandlers() {
       vcsCommitEnabled: !!project?.vcs_commit_enabled,
       vcsPrEnabled: !!project?.vcs_pr_enabled,
       vcsMergeEnabled: !!project?.vcs_merge_enabled,
+      // TPT9063 — agent_permission_mode, kept identical to ws-handlers.js's GET
+      // /api/project/settings (one of the five canonical modes, else null = "Not set").
+      agentPermissionMode: ['plan', 'always_ask', 'accept_edits', 'auto', 'bypass'].includes(project?.agent_permission_mode)
+        ? project.agent_permission_mode : null,
     };
   });
 
@@ -542,6 +548,19 @@ function registerApiHandlers() {
     if (!st.projectPath) return { ok: false, error: 'no project' };
     const existing = readProjectConfig(st.projectPath) || st.config || {};
     const merged = mergeRendererProjectConfig(existing, partial);
+    if (merged.API_BASE_URL && merged.API_PROJECT_ID) {
+      const preferences = {};
+      if (!['API_BASE_URL', 'API_PROJECT_ID'].some(key => Object.hasOwn(partial, key))) {
+        if (Object.hasOwn(partial, 'language')) preferences.language = partial.language;
+        if (Object.hasOwn(partial, 'theme')) preferences.color_scheme = partial.theme || 'default';
+      }
+      if (Object.keys(preferences).length) {
+        if (!st.backend) throw new Error('No project loaded');
+        await st.backend.updateProject(preferences);
+      }
+      delete merged.language;
+      delete merged.theme;
+    }
     writeProjectConfig(st.projectPath, merged);
     st.config = merged;
     // (C1202) This IS the packaged app's voice-settings save path (Settings > Voice writes

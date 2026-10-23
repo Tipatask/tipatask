@@ -165,7 +165,7 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `zod@4.6.5` | MIT | Copyright (c) 2025 Colin McDonnell |
 | `zod-to-json-schema@3.25.2` | ISC | Copyright (c) 2020, Stefan Terdell |
 
-### Pi Coding Agent bundle (135 packages)
+### Pi Coding Agent bundle (136 packages)
 
 | Package | License | Copyright |
 |---|---|---|
@@ -205,7 +205,8 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `@earendil-works/pi-tui@0.84.1` | MIT | Mario Zechner |
 | `@google/genai@1.52.0` | Apache-2.0 | — |
 | `@mariozechner/clipboard@0.3.9` | MIT | — |
-| `@mariozechner/clipboard-win32-arm64-msvc@0.3.9` | MIT | — |
+| `@mariozechner/clipboard-darwin-arm64@0.3.9` | MIT | — |
+| `@mariozechner/clipboard-darwin-universal@0.3.9` | MIT | — |
 | `@mistralai/mistralai@2.2.6` | Apache-2.0 | Copyright 2024 Mistral AI |
 | `@nodable/entities@2.1.0` | MIT | Amit Gupta (https://solothought.com) |
 | `@opentelemetry/api@1.9.0` | Apache-2.0 | OpenTelemetry Authors |

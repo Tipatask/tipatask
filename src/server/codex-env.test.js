@@ -32,6 +32,34 @@ function checkDaemon(home, env) {
   return { args: reason ? ['--no-daemon'] : [], mode: reason ? 'embedded' : 'shared', reason };
 }
 
+test('Plan uses native approvals and unfenced shared launches, including older enforced snapshots', t => {
+  const root = makeTempDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, '.codex');
+  fs.mkdirSync(home);
+  const original = '[mcp_servers.custom]\ncommand="custom-mcp"\n';
+  fs.writeFileSync(path.join(home, 'config.toml'), original);
+  for (const enforced of [false, true]) {
+    const policy = { mode: 'plan', planning: true, enforced };
+    const launch = codexTerminalLaunchOptions(root, home, 'high', {}, policy);
+    assert.equal(launch.mode, 'shared');
+    assert.deepEqual(launch.args, []);
+    const parsed = toml.parse(fs.readFileSync(path.join(launch.codexHome, 'config.toml'), 'utf8'));
+    assert.equal(parsed.approval_policy, 'on-request');
+    assert.equal(parsed.approvals_reviewer, 'user');
+    assert.equal(parsed.sandbox_mode, undefined);
+    assert.deepEqual({ ...parsed.mcp_servers.custom }, { command: 'custom-mcp' });
+    assert.equal(parsed.features, undefined);
+    // A changed environment cannot reuse the pending daemon, but needs no policy flags.
+    fs.writeFileSync(path.join(launch.codexHome, 'tipatask-daemon.json'), '{}');
+    const fallback = codexTerminalLaunchOptions(root, home, 'high', {}, policy);
+    assert.equal(fallback.mode, 'embedded');
+    assert.deepEqual(fallback.args, ['--no-daemon']);
+    fs.unlinkSync(path.join(launch.codexHome, 'tipatask-daemon.json'));
+  }
+  assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), original);
+});
+
 test('codexEffortArgs pins the Codex config override to high', () => {
   assert.equal(CODEX_REASONING_EFFORT, 'high');
   assert.deepEqual(codexEffortArgs(), ['-c', 'model_reasoning_effort="high"']);

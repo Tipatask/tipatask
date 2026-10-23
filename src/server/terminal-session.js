@@ -5,6 +5,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { beginSessionMemory, endSessionMemory } = require('./session-memory');
 const { refreshSessionVcs } = require('./vcs-context');
+const { resolvePermissionMode, assertPermissionSupport, permissionError } = require('./permission-policy');
+const { createPermissionGate } = require('./permission-gate');
 let pty;
 try {
   pty = require('node-pty');
@@ -775,6 +777,10 @@ function emitTerminalState(session) {
       tabId: session.tabId,
       startedAt: session.startedAt,
       phase: session.terminalPhase,
+      permissionMode: session.permissionPolicy?.mode ?? null,
+      permissionSource: session.permissionPolicy?.source ?? null,
+      permissionRequest: session._permissionGate?.snapshot() || null,
+      ...(session._imageState ? { imageTask: session._imageState } : {}),
       taskAgent: session.taskAgent,
       taskAgentLabel: session.taskAgentLabel,
       taskAgentModel: session.taskAgentModel || '', // (C1118) resolved model for the header caption
@@ -822,15 +828,14 @@ function emitTerminalWarning(session, text) {
 }
 
 // (TPT9002) The project's UI language, for the text this file writes into the PTY stream. Read
-// live from .tipatask/config.json (mtime-cached by readProjectConfig()), so a Settings change
+// live from the account-scoped settings mirror, so a Settings change
 // applies to the next notice without a restart; anything unreadable → 'en'. The same lookup
 // serves the watchdog sweep (index.js passes it as `resolveLocale`).
 function sessionLocale(session) {
   const root = (session && session.projectPath) || config.PROJECT_ROOT;
   if (!root) return 'en';
   try {
-    const cfg = require('./project-config').readProjectConfig(root);
-    return normalizeLocale(cfg && cfg.language);
+    return normalizeLocale(require('./project-config').readProjectLanguage(root));
   } catch {
     return 'en';
   }
@@ -1521,18 +1526,47 @@ async function spawnTerminal(session, prompt, taskId, taskTags = [], opts = {}) 
   }
   try {
     return await _spawnTerminal(session, prompt, taskId, taskTags, opts);
+  } catch (err) {
+    session._permissionGate?.close();
+    session._permissionGate = null;
+    throw err;
   } finally {
     session._starting = false;
   }
 }
 
 async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {}) {
+  const permissionAgent = getTaskAgent(session.taskAgent || config.TASK_AGENT);
+  noticeCopy(session, 'notice.starting', { label: permissionAgent.label }, { retain: true });
+  const resolved = await resolvePermissionMode({ backend: opts.backend, task: opts.task, taskId, planOnly: session.planOnly || session.discussionMode });
+  throwIfTerminated(session);
+  // Includes communication rules: all prompts/continuations consume this frozen
+  // snapshot. Only a fresh spawn (including relaunch) resolves preferences again.
+  session.permissionPolicy = permissionAgent.buildPermissionPolicy(resolved);
+  session._permissionGate?.close();
+  session._permissionGate = null;
+  if (session.taskAgent === 'pi' && opts.task) {
+    const projectRoot = session.projectPath || config.PROJECT_ROOT;
+    const images = require('./image-task');
+    const entry = images.resolveImageEntry(projectRoot, opts.model, opts.task);
+    if (entry) {
+      if (session.permissionPolicy.enforced) throw permissionError('unsupported', { mode: resolved.mode, agent: 'pi', supportReason: 'images' });
+      if (session.planOnly || session.discussionMode) {
+        const { imageTaskCopy } = require('../image-task-copy.mjs');
+        throw Object.assign(new Error(imageTaskCopy(sessionLocale(session), 'imageTask.error.textOnly')), { reasonCode: 'image_textOnly', reasonParams: { agent: 'pi' } });
+      }
+      await assertCredentialsUsable(opts.backend, { projectRoot });
+      throwIfTerminated(session);
+      await images.startImageTask(session, { task: opts.task, entry, backend: opts.backend, projectRoot, userDataRoot: config.USER_DATA_ROOT });
+      emitTerminalState(session);
+      return;
+    }
+  }
   // C1408 — the start-time assignee guard/auto-claim used to live inline here. Moved to
   // ws-handlers.js's assertTaskStartable()/claimUnassignedTaskOnStart(), called by both
   // spawn call sites before spawnTerminal() — they already have the task row fetched, so
   // the guard no longer pays a second, uncached GET /tasks/:key per start.
   const agent = getTaskAgent(session.taskAgent || config.TASK_AGENT);
-  noticeCopy(session, 'notice.starting', { label: agent.label }, { retain: true });
   let status = await agent.cachedDetect(config);
   if (!status.available) {
     // Never fail a task start on a cached negative — one fresh probe (~500ms)
@@ -1543,10 +1577,12 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   }
   // (TPT572) Name the CLI build behind this start whenever detection reports one (Codex: the parsed
   // `codex --version`), so a CLI upgrade that changes prompt intake is visible in the server log.
-  const cliVersion = status.detail && status.detail.version;
+  const cliVersion = status.available && session.permissionPolicy.enforced
+    ? await agent.getPermissionVersion(status) : status.detail?.version;
+  if (status.available) assertPermissionSupport(session.permissionPolicy, cliVersion);
   if (cliVersion) {
     console.log(`[terminal:${agent.id}] start gate for task ${taskId}: ${agent.label} CLI ${cliVersion}`
-      + `${status.detail.bin ? ` (${status.detail.bin})` : ''} — `
+      + `${status.detail?.bin ? ` (${status.detail.bin})` : ''} — `
       + `${status.available ? 'available' : `unavailable: ${status.reason || 'no reason'}`}`);
   }
   if (!status.available) {
@@ -1650,7 +1686,13 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   const agentLimits = scaleAgentLimitsForConcurrency(
     resolveAgentLimits(session.projectPath || config.PROJECT_ROOT), activeCount,
   );
-  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode, task: opts.task || null, agentSessionId });
+  if (session.permissionPolicy.enforced && agent.id === 'pi' && resolved.mode !== 'bypass') {
+    session._permissionGate = await createPermissionGate(session, {
+      root: session.projectPath || config.PROJECT_ROOT, changed: () => emitTerminalState(session),
+      attentionText: terminalCopy(sessionLocale(session), 'notice.permission.approval'),
+    });
+  }
+  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate });
   throwIfTerminated(session);
   const spawnedAt = Date.now(); // (TPT354) lower bound for locating this run's transcript file
   const ptyProcess = pty.spawn(spec.command, spec.args, {
@@ -1715,7 +1757,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   session.rows = opts.initialRows || 40;
   session.alive = true;
   session.pending = false;
-  session.terminalPhase = 'planning';
+  session.terminalPhase = session.permissionPolicy.planning ? 'planning' : 'executing';
   session.lastOutputAt = Date.now();
   session._terminalOutputSeen = false;
   session._attentionBroadcasted = false;
@@ -1958,6 +2000,15 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     armSubmitCheck(SUBMIT_VERIFY_MS);
   }
   function onInjectSilence() {
+    if (session._permissionGate && !session._permissionGate.ready) {
+      if (Date.now() - spawnedAt > 30000) {
+        clearInjectTimer();
+        noticeCopy(session, 'notice.permission.unavailable');
+        session._permissionGate.close();
+        killSpawnedPty(ptyProcess);
+      } else armInjectTimer(250);
+      return;
+    }
     session._injectTimer = null;
     if (injectDone || !session.alive || !session.pty) return;
     const dlg = getAttentionPromptMatch(session._attentionTail, session.taskAgent, session);
@@ -2204,9 +2255,9 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   }
 
   emitTerminalState(session);
-  if (session.planApprovalCommand) {
+  if (session.terminalPhase === 'planning' && session.planApprovalCommand) {
     noticeCopy(session, 'notice.planning.command', { command: session.planApprovalCommand });
-  } else {
+  } else if (session.terminalPhase === 'planning') {
     noticeCopy(session, 'notice.planning.dialog');
   }
 
@@ -2350,6 +2401,8 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   });
 
   ptyProcess.onExit(({ exitCode }) => {
+    session._permissionGate?.close();
+    session._permissionGate = null;
     endSessionMemory(session, 'exited');
     clearInjectTimer();
     clearTimeout(session._submitCheckTimer); // (TPT364)
@@ -2619,6 +2672,7 @@ module.exports = {
   exitReasonFields,
   handleTerminalInput,
   spawnTerminal,
+  resolvePermissionMode,
   fetchTaskCommentsContext,
   fetchParentTaskBlock,
   approvePlan,

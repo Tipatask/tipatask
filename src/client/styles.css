@@ -38,11 +38,17 @@
     --c-card-completed-border: transparent;
     /* (TPT682) Closed cards keep their text at full opacity; the closed cue is the ground,
        a dimmer-but-AA text colour, canceled strike-through and a flat (unelevated) card.
-       --c-text-muted misses 4.5:1 on --c-bg-sub-nav in several light palettes, so closed
+       (TPT9060) A completed card paints every glyph in one grey: its own closed ground moved
+       0.455 OKLCH lightness darker (0.44 lighter in .theme-dark). A fixed lightness step from
+       the ground gives about the same contrast in every palette, so the grey sits just above
+       4.5:1 — on the plain ground and under the objective tint — with no per-theme value.
+       -edge is the hairline outline its chips get instead of a fill. */
+    --c-card-completed-text: oklch(from var(--c-card-completed-bg) calc(l - 0.455) c h);
+    --c-card-completed-edge: color-mix(in srgb, var(--c-card-completed-text) 45%, transparent);
+    /* Done To-Do rows sit on --c-bg-card, not the closed card ground, and keep their own colour. */
+    --c-todo-done-title: var(--c-text-secondary);
+    /* --c-text-muted misses 4.5:1 on --c-bg-sub-nav in several light palettes, so canceled
        text steps down to --c-text-secondary only. -meta colours the small muted labels. */
-    --c-card-completed-title: var(--c-text-secondary);
-    --c-card-completed-desc: var(--c-text-secondary);
-    --c-card-completed-meta: var(--c-text-secondary);
     --c-card-canceled-bg: var(--c-bg-sub-nav);
     --c-card-canceled-border: transparent;
     --c-card-canceled-title: var(--c-text-secondary);
@@ -583,9 +589,9 @@
     --c-danger-border: rgba(243, 139, 168, 0.45);
     --c-card-completed-bg: color-mix(in srgb, var(--c-bg-card) 80%, #000 20%);
     --c-card-completed-border: transparent;
-    --c-card-completed-title: var(--c-text-muted);
-    --c-card-completed-desc: var(--c-text-muted);
-    --c-card-completed-meta: var(--c-text-muted);
+    /* (TPT9060) See :root — the dark closed ground moved up instead of down. */
+    --c-card-completed-text: oklch(from var(--c-card-completed-bg) calc(l + 0.44) c h);
+    --c-todo-done-title: var(--c-text-muted);
     --c-card-completed-opacity: 0.55;
     --c-card-canceled-bg: color-mix(in srgb, var(--c-bg-card) 88%, var(--c-danger) 12%);
     --c-card-canceled-border: var(--c-danger-border);
@@ -1197,6 +1203,9 @@
     width: 16px;
     height: 16px;
   }
+
+  .active-session-permission { display: inline-flex; flex-shrink: 0; }
+  .active-session-permission > svg { width: 16px; height: 16px; }
 
   /* (C1503) max-width caps key so long one can't push .active-session-close past
      .active-session-item's overflow:hidden edge — margin-left:auto → 0 on overflowed flex
@@ -2645,14 +2654,13 @@
 
   /* Completed cards — muted ground, dimmer text and no elevation. (TPT682) No opacity on
      the card or any text inside it: group opacity blends every glyph under 4.5:1. Only the
-     non-text agent badge icon fades; the Start button is restyled, never faded (TPT686). */
+     non-text agent badge icon fades; the Start button is restyled, never faded (TPT686).
+     (TPT9060) The text colours live in the "Completed card text" block after the dark-theme
+     overrides near the end of this file — they have to come after those rules. */
   .card[data-status-role="complete"] {
     background: var(--c-card-completed-bg);
     box-shadow: inset 0 0 0 1px var(--c-card-completed-border);
   }
-  .card[data-status-role="complete"] .card-title { color: var(--c-card-completed-title); }
-  .card[data-status-role="complete"] .card-desc  { color: var(--c-card-completed-desc); }
-  .card[data-status-role="complete"] :is(.deps, .card-deps-label, .effort-badge, .card-due:not(.overdue)) { color: var(--c-card-completed-meta); }
   .card[data-status-role="complete"] .agent-badge { opacity: var(--c-card-completed-opacity); }
   /* (TPT686) The Start button stays an active control on a closed card (it re-runs the task),
      so it keeps WCAG 1.4.11's 3:1 non-text contrast: no opacity fade (a faded --c-primary fill
@@ -3296,6 +3304,27 @@
   .card-start-btn.deps-blocked,
   .btn-claude.deps-blocked { opacity: 0.38; cursor: not-allowed; pointer-events: none; }
 
+  /* (TPT9063) Permission-mode icon button in .controls-row (task-permission-mode.js): sized by
+     the shared .card-ctl rule above, squared here (0,2,0 — placed later, so it wins padding/
+     display). An explicit task override tints the glyph with the AA accent text token and rings
+     with --c-primary-border, never raw --c-primary. */
+  .task-card-hover-controls .card-permission-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--card-ctrl-h);
+    padding-inline: 0;
+    border: 1px solid var(--c-border);
+    background: var(--c-bg-card);
+    color: var(--c-text-secondary);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .task-card-hover-controls .card-permission-btn svg { width: 15px; height: 15px; }
+  .task-card-hover-controls .card-permission-btn:hover { background: var(--c-bg-sub-nav); color: var(--c-text); }
+  .task-card-hover-controls .card-permission-btn:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 1px; }
+  .task-card-hover-controls .card-permission-btn--override { border-color: var(--c-primary-border); color: var(--c-primary-text); }
+
   /* Status select dropdown styled as pill */
   .status-select,
   .card-status-select {
@@ -3463,6 +3492,86 @@
   .agent-assign-option-icon--claude { background: #d97757; }
   .agent-assign-option-icon--codex  { background: #10a37f; }
   .agent-assign-option-icon--human  { background: var(--c-primary); color: var(--c-on-primary); }
+
+  /* ── Permission-mode dialog (TPT9063, task-permission-mode.js) — same band/shape as
+     .agent-assign-overlay/-modal: centred card, two labelled selects, a hint under each. ── */
+  .permission-mode-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 3000;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .permission-mode-dialog {
+    background: var(--c-bg-card); color: var(--c-text);
+    border: 1px solid var(--c-border); border-radius: 12px;
+    box-sizing: border-box; width: min(440px, calc(100% - 32px));
+    padding: 20px 24px; box-shadow: 0 8px 32px rgba(0,0,0,0.22);
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .permission-mode-head { display: flex; align-items: center; gap: 8px; }
+  .permission-mode-title { margin: 0; flex: 1; font-size: 1rem; font-weight: 600; color: var(--c-text); }
+  .permission-mode-section { display: flex; flex-direction: column; gap: 6px; }
+  .permission-mode-label { font-size: 0.8rem; font-weight: 600; color: var(--c-text-secondary); }
+  select.permission-mode-select, .permission-mode-select-trigger {
+    width: 100%; padding: 7px 10px;
+    border: 1px solid var(--c-border-input); border-radius: 8px;
+    background-color: var(--c-bg-card); color: var(--c-text);
+    font: inherit; font-size: 0.9rem;
+  }
+  select.permission-mode-select:focus-visible, .permission-mode-select-trigger:focus-visible {
+    outline: 2px solid var(--c-primary-border); outline-offset: 1px;
+  }
+  select.permission-mode-select:disabled, .permission-mode-select-trigger:disabled { cursor: progress; }
+  .theme-dark .permission-mode-select { color-scheme: dark; }
+  /* Shared icon listbox. Native selects keep their existing rules until callers migrate. */
+  div.permission-mode-select { position: relative; width: 100%; min-width: 0; }
+  .permission-mode-select-trigger {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    text-align: left; cursor: pointer;
+  }
+  .permission-mode-select-trigger:hover:not(:disabled) { border-color: var(--c-primary-border); }
+  .permission-mode-select-value { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .permission-mode-select-label { overflow-wrap: anywhere; }
+  .permission-mode-select-chevron { flex-shrink: 0; color: var(--c-text-secondary); }
+  .permission-mode-select-menu {
+    position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 20;
+    max-height: min(360px, 50vh); overflow-y: auto; overscroll-behavior: contain;
+    padding: 4px; border: 1px solid var(--c-border-input); border-radius: 8px;
+    background: var(--c-bg-card); color: var(--c-text);
+    box-shadow: 0 6px 20px var(--c-shadow);
+  }
+  .permission-mode-select-menu[hidden] { display: none; }
+  /* (TPT9084) The open menu sits at the end of <body> (bindPermissionModeSelect() moves it there)
+     so a scrolling host — the Task Edit modal's .modal-scroll-body under its pinned
+     .modal-context-btns, the Settings panel — never clips it: fixed, placed from the trigger's
+     viewport rect by inline top/bottom/left/width with max-height = the free viewport room, on
+     the tier of the other body-portaled modal dropdowns (3200, above .task-edit-overlay). */
+  .permission-mode-select-menu[data-portaled="1"] { position: fixed; right: auto; box-sizing: border-box; z-index: 3200; }
+  /* Opened from Settings' Workflow tab while Settings sits over the workspace (3250): above that
+     panel, below the dialogs Settings opens itself (.agents-modal 3300, action confirms 3400). */
+  #settings-modal.settings-modal--over-modal ~ .permission-mode-select-menu[data-portaled="1"] { z-index: 3260; }
+  .permission-mode-select-option {
+    padding: 8px; border-radius: 5px; cursor: pointer; font-size: 0.9rem;
+  }
+  .permission-mode-select-option[aria-selected="true"] { background: var(--c-primary-lighter); }
+  .permission-mode-select-option:hover:not([aria-disabled="true"]) { background: var(--c-primary-light); }
+  .permission-mode-select-option:focus-visible {
+    outline: 2px solid var(--c-primary-border); outline-offset: -2px;
+    background: var(--c-primary-light);
+  }
+  .permission-mode-select-option[aria-disabled="true"] { color: var(--c-text-muted); cursor: default; }
+  .permission-mode-select-option-hint {
+    display: block; margin: 3px 0 0 26px; color: var(--c-text-muted);
+    font-size: 0.78rem; line-height: 1.35; overflow-wrap: anywhere;
+  }
+  .permission-mode-icon { width: 18px; height: 18px; flex-shrink: 0; vertical-align: middle; }
+  .permission-mode-icon--inherited { color: var(--c-text-muted); }
+  .permission-mode-icon--plan { color: var(--c-info); }
+  .permission-mode-icon--always_ask { color: var(--c-warning); }
+  .permission-mode-icon--accept_edits { color: var(--c-success); }
+  .permission-mode-icon--auto { color: var(--c-primary-text); }
+  .permission-mode-icon--bypass { color: var(--c-danger); }
+  .permission-mode-hint, .permission-mode-note { margin: 0; font-size: 0.78rem; line-height: 1.35; color: var(--c-text-muted); }
 
   /* ── Bulk agent start modal (sprint play-all: unassigned tasks) ── */
   .bulk-agent-start-overlay {
@@ -7213,6 +7322,11 @@
   #settings-notifications-style-btn {
     flex-shrink: 0;
   }
+  /* The ID rule's display:flex outranks the UA [hidden] rule, so a hidden hint row would still
+     paint as an empty warning balloon with a blank button. Re-assert display:none for every
+     hint row, ID-scoped for the one that sets its own display. */
+  .settings-row-hint[hidden],
+  #settings-notifications-style-hint[hidden] { display: none; }
 
   /* ── Workflow tab (C1182) — status table + chips ── */
   /* C1270 — 4.5rem×4 stage columns (288px) left no room for the chip inside this modal's
@@ -10649,8 +10763,8 @@
 .todo-list { display: flex; flex-direction: column; gap: 6px; padding: 16px; max-width: 800px; margin: 0 auto; }
 .todo-empty { padding: 32px; text-align: center; color: var(--c-text-muted); }
 .todo-item { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--c-bg-card); border: 1px solid var(--c-border); border-radius: 6px; }
-/* (TPT682) Done rows keep text at full opacity: strike-through + the AA-checked completed
-   title colour mark them; only the non-text agent badge icon fades. */
+/* (TPT682) Done rows keep text at full opacity: strike-through + the AA-checked
+   --c-todo-done-title colour mark them; only the non-text agent badge icon fades. */
 .todo-item[data-status-role="complete"] .agent-badge { opacity: var(--c-card-completed-opacity); }
 .todo-item.agent-assigned .todo-check { opacity: 0.35; cursor: not-allowed; }
 .todo-item .agent-badge { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0; }
@@ -10660,7 +10774,7 @@
 .todo-check { width: 15px; height: 15px; cursor: pointer; flex-shrink: 0; }
 .todo-item-id { font-size: 0.72rem; color: var(--c-text-muted); font-weight: 600; flex-shrink: 0; }
 .todo-title { flex: 1; font-size: 0.9rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.todo-title.done { text-decoration: line-through; color: var(--c-card-completed-title); }
+.todo-title.done { text-decoration: line-through; color: var(--c-todo-done-title); }
 .todo-more { font-size: 0.78rem; color: var(--c-primary-text); text-decoration: none; flex-shrink: 0; }
 .todo-more:hover { text-decoration: underline; }
 .todo-sprint-nav { display: flex; align-items: center; gap: 8px; padding: 10px 16px; max-width: 800px; margin: 0 auto 4px; }
@@ -13015,7 +13129,9 @@ input.sma-cb, input.sma-radio {
   border-width: 1px;
 }
 /* Base URL (custom endpoint only) takes its own full-width second row under the three columns. */
-.setup-modal-agent-form-fields > .setup-modal-agent-extra-field--baseurl { grid-column: 1 / -1; }
+.setup-modal-agent-form-fields > .setup-modal-agent-extra-field--baseurl,
+.setup-modal-agent-form-fields > .setup-modal-agent-extra-field--purpose,
+.setup-modal-agent-form-fields > .setup-modal-agent-extra-field--folder { grid-column: 1 / -1; }
 .setup-modal-agent-form-fields > .setup-modal-agent-extra-field[hidden] { display: none; }
 /* "Model supports tool calls" (custom endpoint only): a full-width checkbox row under Base URL. It
    is still a .setup-modal-agent-extra-field, so the [hidden] rule above hides it off `custom`. */
@@ -13265,6 +13381,42 @@ input.sma-pi-tools {
 .theme-dark .modal-desc-display .file-ref {
   background: var(--c-bg-tier);
   color: var(--c-primary-text);
+}
+
+/* ── (TPT9060) Completed card text — every glyph in one muted grey ──
+   A card in the configured completion role (data-status-role="complete", stamped by
+   renderCard()/refreshCard() from statusRoleToken(), never a literal status name) paints its
+   title, its description and everything Markdown renders inside it (links keep their
+   underline), the key chip, tags, the meta labels, the due/effort/dependency chips, inline
+   subtask titles and the token stats line in --c-card-completed-text. Chips drop their fills
+   and accent hues for a hairline --c-card-completed-edge outline, so every glyph sits on the
+   closed ground that grey is measured against. Live signals and controls keep their own
+   colours: the status select, Start/Subtasks buttons, the action menu, the unread-activity
+   chip and the member avatar. No :hover rule restyles any of it, so the card stays muted on
+   hover and when expanded.
+   This block must stay after the component and .theme-dark colour rules: some of them share
+   its specificity (.theme-dark .id-badge.coding, .theme-dark .card-desc .file-ref) and a tie
+   goes to the later rule. theme-default.test.js guards the contrast band and the cascade. */
+.card[data-status-role="complete"] :is(.card-title, .card-desc, .card-desc *, .card-preview-meta,
+  .id-badge, .tag-badge, .deps, .dep-badge, .card-deps-label, .card-due, .effort-badge, .ai-stats) {
+  color: var(--c-card-completed-text);
+}
+/* (0,4,0), like `.subtask-item:has(.subtask-radio:checked) .subtask-title` that it has to beat;
+   the checked row keeps its strike-through. */
+.card[data-status-role="complete"] .subtask-item .subtask-title { color: var(--c-card-completed-text); }
+.card[data-status-role="complete"] :is(.id-badge, .tag-badge, .dep-badge, .card-due, .effort-badge,
+  .card-desc code, .card-desc .file-ref) {
+  background: transparent;
+}
+/* The due date stretches across the card, so it goes bare instead: an outlined full-width bar
+   would read as an input field. */
+.card[data-status-role="complete"] :is(.id-badge, .tag-badge, .dep-badge, .card-desc code, .card-desc .file-ref) {
+  box-shadow: inset 0 0 0 1px var(--c-card-completed-edge);
+}
+.card[data-status-role="complete"] .effort-badge { border-color: var(--c-card-completed-edge); }
+.card[data-status-role="complete"] .card-desc .trello-appendix {
+  background: transparent;
+  border-left-color: var(--c-card-completed-edge);
 }
 
 /* ── (TPT345) Merge task branches panel — merge-branches-modal.js. Own positioning shell
@@ -13540,3 +13692,38 @@ input.sma-pi-tools {
   background: var(--c-primary-lighter, var(--c-bg-card));
 }
 .terminal-watchdog-buttons .btn-resume-paused:not(:disabled):hover { background: var(--c-primary-light, var(--c-primary-lighter)); }
+
+.image-task-results {
+  flex-shrink: 0;
+  max-height: 300px;
+  overflow: auto;
+  padding: 12px 16px;
+  background: var(--c-bg-card);
+  color: var(--c-text);
+  border-bottom: 1px solid var(--c-border);
+}
+.image-task-results > p { margin: 0 0 8px; }
+.image-task-action {
+  display: inline-flex;
+  margin: 4px 8px 0 0;
+  padding: 6px 10px;
+  border: 1px solid var(--c-border-input);
+  border-radius: 6px;
+  background: var(--c-bg-sub-nav);
+  color: var(--c-text);
+  font: inherit;
+  cursor: pointer;
+}
+.image-task-action:disabled { opacity: 0.5; cursor: default; }
+.image-task-action:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
+.image-task-files { display: flex; gap: 12px; flex-wrap: wrap; }
+.image-task-files figure { margin: 0; max-width: 260px; }
+.image-task-files img { max-height: 150px; max-width: 100%; object-fit: contain; border-radius: 6px; }
+.image-task-files figcaption { overflow-wrap: anywhere; font-size: 12px; user-select: text; }
+.image-task-files a { color: var(--c-primary-text); font-size: 12px; }
+
+/* Per-run policy and one-action approvals in task terminals. */
+.terminal-permission-mode { font-size: 12px; color: var(--c-text-muted); }
+.terminal-permission-request { padding: 12px 16px; border-top: 1px solid var(--c-border); background: var(--c-bg-card); color: var(--c-text); flex-shrink: 0; }
+.terminal-permission-request pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; margin: 8px 0; }
+.terminal-permission-request button { margin-right: 8px; }

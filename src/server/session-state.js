@@ -66,6 +66,8 @@ function createSession(ws, pending, tabId, projectPath) {
     taskAgentLabel: taskAgent.label,
     taskAgentModel: '',       // (C1118) resolved --model value from the last spawnTerminal(), for the terminal header caption
     terminalPhase: 'planning',
+    permissionPolicy: null, // Frozen launch snapshot; settings edits apply only to a new run.
+    _permissionGate: null,
     planApprovalCommand: taskAgent.approvalCommand,
     _userInteracted: false,
     _localCommandBuffer: '',

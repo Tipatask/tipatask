@@ -7,7 +7,29 @@
 // never capture translated strings in module-level constants (they would freeze
 // at import time, before the project locale is known).
 
+import * as imageTaskStrings from '../image-task-copy.mjs';
+
 const en = {
+  "terminal.error.EPERMISSION.unavailable": "Could not read current permission settings. Task start canceled.",
+  "terminal.error.EPERMISSION.invalid": "Invalid permission mode. Task start canceled.",
+  "terminal.error.EPERMISSION.unsupported": "Permission mode {mode} is not supported by {agent}: {detail}",
+  "terminal.permission.run": "Run: {mode}",
+  "terminal.permission.inherited": "Inherited from the project at start. Changes apply on the next run.",
+  "terminal.permission.fixed": "Fixed for this run. Changes apply on the next run.",
+  "terminal.permission.title": "Approval required",
+  "terminal.permission.allow": "Allow once",
+  "terminal.permission.deny": "Deny",
+  "terminal.permission.support.codexGate": "this CLI cannot require approval for every tool action; choose Plan, Auto, or Bypass",
+  "terminal.permission.support.codexVersion": "Codex 0.163.0 or newer is required",
+  "terminal.permission.support.codexProfiles": "named Codex permission profiles conflict with task sandbox policies; remove default_permissions before starting",
+  "terminal.permission.support.windows": "a verified Windows read-only sandbox is required",
+  "terminal.permission.support.claudeVersion": "Claude Code 2.1.295 or newer is required for blocking permission hooks",
+  "terminal.permission.support.piVersion": "Pi 0.84.1 or newer is required for blocking tool events",
+  "terminal.permission.support.provider": "no permission adapter is registered",
+  "terminal.permission.support.images": "image tasks use a separate generation approval flow",
+  "terminal.permission.support.design": "turn off Design Mode to use an enforced task permission policy",
+
+  ...imageTaskStrings.en,
   // Project access dialog, shared with the native/renderer translation table.
   "projectAccess.title": "Cannot open project",
   "projectAccess.denied": "This project is not available to the current account.",
@@ -1265,6 +1287,7 @@ const en = {
   // Group Tasks Into select (C1271) — project-wide noun for board group containers, at
   // the top of this tab. See group-label.js's groupPluralFor() for the option labels.
   'settings.workflow.groupLabel': 'Group tasks into',
+  'settings.workflow.agentPermissions': 'Agent permissions',
   'settings.workflow.groupLabelNote': 'project-wide',
   'settings.workflow.groupLabelSaved': 'Tasks now grouped into {label}',
   'settings.workflow.groupLabelFailed': 'Failed to update group label: {msg}',
@@ -1562,9 +1585,52 @@ const en = {
   'filter.unassigned': 'Unassigned',
   'filter.peopleSelected.one': '{n} person',
   'filter.peopleSelected.many': '{n} people',
+
+  // ── Agent permission mode (TPT9063): card button tip + dialog, project default ──
+  'field.permissionMode': 'Permission mode',
+  'permissionMode.plan': 'Plan mode',
+  'permissionMode.auto': 'Auto mode',
+  'permissionMode.bypass': 'Bypass',
+  'permissionMode.projectDefault': 'Project Default',
+  'permissionMode.projectDefaultWith': 'Project Default ({mode})',
+  'permissionMode.notSet': 'Not set',
+  'permissionMode.hint.plan': 'The agent plans first, then implements after you approve.',
+  'permissionMode.hint.auto': 'The agent judges each action and asks only when unsure.',
+  'permissionMode.hint.bypass': 'No approval prompts; the task runs unattended.',
+  'permissionMode.hint.inherited': 'Inherits the project default: {mode} — {hint}',
+  'permissionMode.hint.notSet': 'Until a mode is chosen, agents keep their current behaviour.',
+  'permissionMode.title': 'Permission mode — {key}',
+  'permissionMode.taskLabel': 'This task',
+  'permissionMode.projectLabel': 'Project default',
+  'permissionMode.projectNote': 'Project-wide: applies to tasks without an override when they start.',
+  'permissionMode.tip': 'Permission mode: {mode}',
+  'permissionMode.taskSaved': 'Permission mode saved for {key}',
+  'permissionMode.projectSaved': 'Project default permission mode saved',
+  'permissionMode.failed': 'Could not save permission mode: {msg}',
+  'permissionMode.errLoad': 'Could not load task {id}: {msg}',
 };
 
 const uk = {
+  "terminal.error.EPERMISSION.unavailable": "Не вдалося прочитати поточні налаштування дозволів. Запуск задачі скасовано.",
+  "terminal.error.EPERMISSION.invalid": "Неприпустимий режим дозволів. Запуск задачі скасовано.",
+  "terminal.error.EPERMISSION.unsupported": "Режим дозволів {mode} не підтримується агентом {agent}: {detail}",
+  "terminal.permission.run": "Запуск: {mode}",
+  "terminal.permission.inherited": "Успадковано від проєкту під час запуску. Зміни діють з наступного запуску.",
+  "terminal.permission.fixed": "Зафіксовано для цього запуску. Зміни діють з наступного запуску.",
+  "terminal.permission.title": "Потрібен дозвіл",
+  "terminal.permission.allow": "Дозволити один раз",
+  "terminal.permission.deny": "Відхилити",
+  "terminal.permission.support.codexGate": "цей CLI не може вимагати підтвердження кожної дії інструмента; виберіть режим планування, автоматичний режим або режим без підтверджень",
+  "terminal.permission.support.codexVersion": "потрібен Codex 0.163.0 або новіший",
+  "terminal.permission.support.codexProfiles": "іменовані профілі дозволів Codex конфліктують із політикою пісочниці задачі; видаліть default_permissions перед запуском",
+  "terminal.permission.support.windows": "потрібна перевірена пісочниця Windows лише для читання",
+  "terminal.permission.support.claudeVersion": "для блокування дій потрібен Claude Code 2.1.295 або новіший",
+  "terminal.permission.support.piVersion": "для блокування дій інструментів потрібен Pi 0.84.1 або новіший",
+  "terminal.permission.support.provider": "адаптер дозволів не зареєстровано",
+  "terminal.permission.support.images": "задачі зображень мають окреме підтвердження генерації",
+  "terminal.permission.support.design": "вимкніть режим дизайну, щоб застосувати політику дозволів задачі",
+
+  ...imageTaskStrings.uk,
   // Project access dialog, shared with the native/renderer translation table.
   "projectAccess.title": "Не вдалося відкрити проєкт",
   "projectAccess.denied": "Цей проєкт недоступний для поточного акаунта.",
@@ -2695,6 +2761,7 @@ const uk = {
   'settings.workflow.countTitle': 'Задачі з цим статусом',
   'settings.workflow.colorLabel': 'Колір для {name}',
   'settings.workflow.groupLabel': 'Групувати задачі в',
+  'settings.workflow.agentPermissions': 'Дозволи агента',
   'settings.workflow.groupLabelNote': 'для всього проєкту',
   'settings.workflow.groupLabelSaved': 'Задачі тепер згруповано в: {label}',
   'settings.workflow.groupLabelFailed': 'Не вдалося оновити тип групування: {msg}',
@@ -2979,6 +3046,29 @@ const uk = {
   'filter.peopleSelected.one': '{n} людина',
   'filter.peopleSelected.few': '{n} людини',
   'filter.peopleSelected.many': '{n} людей',
+
+  // ── Agent permission mode (TPT9063) ──
+  'field.permissionMode': 'Режим дозволів',
+  'permissionMode.plan': 'Режим планування',
+  'permissionMode.auto': 'Автоматичний режим',
+  'permissionMode.bypass': 'Без підтверджень',
+  'permissionMode.projectDefault': 'Типовий для проєкту',
+  'permissionMode.projectDefaultWith': 'Типовий для проєкту ({mode})',
+  'permissionMode.notSet': 'Не задано',
+  'permissionMode.hint.plan': 'Агент спочатку планує, а після вашого підтвердження виконує задачу.',
+  'permissionMode.hint.auto': 'Агент оцінює кожну дію і питає лише тоді, коли не впевнений.',
+  'permissionMode.hint.bypass': 'Жодних запитів на підтвердження; задача виконується без нагляду.',
+  'permissionMode.hint.inherited': 'Успадковує типовий режим проєкту: {mode} — {hint}',
+  'permissionMode.hint.notSet': 'Доки режим не обрано, агенти зберігають поточну поведінку.',
+  'permissionMode.title': 'Режим дозволів — {key}',
+  'permissionMode.taskLabel': 'Ця задача',
+  'permissionMode.projectLabel': 'Типовий для проєкту',
+  'permissionMode.projectNote': 'Для всього проєкту: застосовується під час запуску до задач без власного налаштування.',
+  'permissionMode.tip': 'Режим дозволів: {mode}',
+  'permissionMode.taskSaved': 'Режим дозволів для {key} збережено',
+  'permissionMode.projectSaved': 'Типовий режим дозволів проєкту збережено',
+  'permissionMode.failed': 'Не вдалося зберегти режим дозволів: {msg}',
+  'permissionMode.errLoad': 'Не вдалося завантажити задачу {id}: {msg}',
 };
 
 export const LOCALES = { en, uk };

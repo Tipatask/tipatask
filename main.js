@@ -141,6 +141,9 @@ const { claimProject, ownerOf, releaseProject, claimSetup, setupFor, releaseSetu
 function focusWindow(w, { steal = false } = {}) {
   if (!w || w.isDestroyed()) return false;
   if (steal && process.platform === 'darwin') {
+    // (TPT9056) A hidden app (Cmd+H) keeps its windows off screen whatever is ordered front,
+    // and a native notification click can arrive in that state: unhide first.
+    try { if (app.isHidden()) app.show(); } catch { /* non-fatal */ }
     try { app.focus({ steal: true }); } catch { /* non-fatal */ }
   }
   if (w.isMinimized()) w.restore();
@@ -180,8 +183,25 @@ function openProjectWindows() {
 
 // Notification actions must end with the window in front of the user, so the raise is
 // verified and repeated (main/notify-target.js) instead of trusting one focusWindow() call.
-function raiseNotifyWindow(w) {
-  return notifyTarget.raiseWindow(w, { focus: (target) => focusWindow(target, { steal: true }) });
+// (TPT9056) On macOS "in front" means key, on screen and the app active: a window on another
+// Space takes key focus without ever coming into view (the banner panel sits on every Space, so
+// activation finds a Tipatask window on the user's current one and never switches), so the
+// deps confirm all three and add two fallbacks — a LaunchServices open of this bundle when the
+// app did not activate, and a pull to the user's current Space when the window stays off
+// screen. The controller hides the banner for the raise (desktop-notifications.js clicksPending)
+// so the native Space switch gets its chance first. One log line per raise.
+const notifyRaiseDeps = notifyTarget.createRaiseDeps({ app, platform: process.platform, exec: execFile, execPath: process.execPath });
+function focusNotificationTarget(w) {
+  const started = Date.now();
+  return notifyTarget.raiseWindow(w, {
+    focus: (target) => focusWindow(target, { steal: true }),
+    ...notifyRaiseDeps,
+    trace: ({ stage, ok, stages }) => {
+      const state = w.isDestroyed() ? 'window gone'
+        : `active=${process.platform === 'darwin' ? app.isActive() : 'n/a'} key=${w.isFocused()} onScreen=${notifyTarget.onScreen(w)}`;
+      (ok ? console.log : console.warn)(`[notify] raise ${ok ? 'ok' : 'failed'} via ${stage} (${stages.join(' > ')}, ${Date.now() - started} ms): ${state}`);
+    },
+  });
 }
 
 // (C1141/C1318) codesign --verify result for the running .app — see src/server/
@@ -1129,19 +1149,20 @@ function registerIpcHandlers() {
       originWindow: resolveNotifyTarget,
       projectWindows: () => openProjectWindows().filter((w) => projectDirs.get(w.webContents.id)),
       reopen: (projectPath) => createProjectWindow(projectPath),
-      raise: raiseNotifyWindow,
+      raise: focusNotificationTarget,
     }).catch(() => null),
     // A card belongs to its project: the window owning that project now, else the project
-    // reopened. It gets the same verified raise as Show More, and `notify:clicked` only after
-    // that raise settled (or on did-finish-load for a window still loading), so the task opens
-    // in a window that is in front. The controller keeps the banner up until this resolves.
+    // reopened. It gets the same verified raise as Show More (focusNotificationTarget()), and
+    // `notify:clicked` only after that raise settled (or on did-finish-load for a window still
+    // loading), so the task opens in a window that is in front. The controller defers the
+    // banner's surface decision until this resolves.
     onClick: async (entry) => {
       try {
         const w = await notifyTarget.resolveClickTarget(entry.origin, {
           originWindow: resolveNotifyTarget,
           projectOf: (target) => projectDirs.get(target.webContents.id) || null,
           reopen: (projectPath) => createProjectWindow(projectPath),
-          raise: raiseNotifyWindow,
+          raise: focusNotificationTarget,
         });
         if (!w) return;
         const send = () => {
@@ -1345,6 +1366,8 @@ function registerIpcHandlers() {
         // otherwise be silently dropped every time this open-existing flow re-runs.
         ...(existingCfg.LAST_AGENT ? { LAST_AGENT: existingCfg.LAST_AGENT } : {}),
       });
+
+      await require('./src/cli/setup').initializeProjectSettings({ projectRoot: projectPath });
 
       // 6. First-adoption guard: write project.json + KB templates only when absent.
       //    project.json must exist BEFORE adoptProjectIntoWindow so getDisplayName returns
@@ -1577,6 +1600,17 @@ function registerIpcHandlers() {
       const { authenticate } = require('./src/cli/auth');
       const { token, user } = await authenticate(apiBaseUrl, { chooseAccount: true });
       const saved = saveAccountForServer(apiBaseUrl, { token, userId: user?.id, email: user?.email });
+      for (const [wcId, dir] of projectDirs) {
+        if (!dir) continue;
+        const cfg = readProjectConfig(dir);
+        if (normalizeBaseUrl(cfg?.API_BASE_URL) !== saved.apiBaseUrl) continue;
+        const backend = getWindowState(wcId).backend;
+        backend?.resetUserContext?.('account switch');
+        try { await require('./src/cli/setup').initializeProjectSettings({ projectRoot: dir, backend }); }
+        catch { /* membership may differ; the renderer will show the new account's access error */ }
+        const win = BrowserWindow.getAllWindows().find(w => w.webContents.id === wcId);
+        if (win && !win.isDestroyed()) win.webContents.send('project:changed', dir, cfg.projectName, true);
+      }
       if (app.isReady()) createMenu();
       reconcileRecentProjectsWithAccounts();
       // (TPT556) Unbound window (no project dir): bring Get Started back once the account is
@@ -1693,6 +1727,8 @@ function registerIpcHandlers() {
         projectName: apiProject.name,
         ...(piModels.length ? { PI_MODELS: piModels } : {}),
       });
+
+      await require('./src/cli/setup').initializeProjectSettings({ projectRoot: projectPath });
 
       // 8. Write .tipatask/project.json for window title + cross-device sync
       writeProjectMeta(projectPath, { name: apiProject.name, apiProjectId: projectId, updatedAt: new Date().toISOString() });
@@ -2405,6 +2441,9 @@ async function createProjectWindow(projectDir, { deferShow = false } = {}) {
     },
   });
   attachExternalLinkPolicy(w);
+  // (TPT9056) Feeds the on-screen check notification raises confirm against (show/hide follow
+  // occlusion on macOS) — see main/notify-target.js trackOnScreen().
+  notifyTarget.trackOnScreen(w);
   // Main process is the sole title authority; block renderer document.title from overriding.
   // (TPT556) BrowserWindow-level listener — see createSetupWindow for why not webContents.
   w.on('page-title-updated', (e) => e.preventDefault());
@@ -2746,8 +2785,7 @@ app.on('browser-window-focus', (_event, w) => {
     if (!w || w.isDestroyed() || w === splashWindow) return;
     const dir = projectDirs.get(w.webContents.id) || null;
     if (!dir) return;
-    const cfg = readProjectConfig(dir);
-    const lang = cfg?.language || 'en';
+    const lang = require('./src/server/project-config').readProjectLanguage(dir);
     if (getMenuLocale() === (LOCALES[lang] ? lang : 'en')) return;
     setMenuLocale(lang);
     if (app.isReady()) createMenu();

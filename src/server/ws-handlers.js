@@ -247,6 +247,7 @@ function replayExitedTerminal(ws, session) {
 function sessionMetaRow(s) {
   return { agent: s.taskAgent || null, label: s.taskAgentLabel || '', type: s.type || 'terminal', alive: !!s.alive,
     paused: pausedSummary(s),
+    ...(s.permissionPolicy ? { permissionMode: s.permissionPolicy.mode, permissionSource: s.permissionPolicy.source } : {}),
     ...(s.startedAt ? { startedAt: s.startedAt } : {}),
     // (TPT469) A project chat is listed in the left menu once it has a title — its first user
     // message. Untitled ones are drafts the next Start Chat reuses.
@@ -806,6 +807,9 @@ function terminateTerminalSession(session, taskId, sessionKey, sessions, reason 
       .catch(err => console.error(`[terminal] resolution comment on terminate failed for ${taskId}:`, err.message));
   }
   if (session) {
+    session._permissionGate?.close();
+    session._permissionGate = null;
+    session._imageAbort?.();
     session._terminated = true;
     attachedWs = session.ws;
     const ptyProcess = session.pty;
@@ -1168,6 +1172,7 @@ function eauthClientMessage(err) {
 // carries `reason` (the error's reasonCode) and its reasonParams (`agent`, plus `output` or
 // `model`/`host`) in `params`, for terminal.error.ESTART.<reason>[.<agent>].
 function startFailureFrame(err, session) {
+  if (err?.code === 'EPERMISSION') return { type: 'error', code: err.code, reason: err.reason, params: err.params, message: err.message };
   if (err && err.code === 'EASSIGNEE') return { type: 'error', code: 'EASSIGNEE', message: 'Cannot start a task assigned to another member.' };
   if (err && err.code === 'ECLAIM') return { type: 'error', code: 'ECLAIM', message: 'Could not assign this task to you. Task start canceled.' };
   if (err && err.code === 'EAUTH') {
@@ -1285,6 +1290,22 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       return getActiveBackend();
     }
     const backend = resolveBackend(req);
+
+    if (req.method === 'GET' && urlPath === '/api/image-task/result') {
+      try {
+        const query = new URL(req.url, 'http://localhost').searchParams;
+        const projectRoot = resolveProjectRoot(req);
+        const store = require('./image-task').storeFor(config.USER_DATA_ROOT, projectRoot, query.get('task'), backend);
+        const saved = await store.read();
+        const index = Number(query.get('index'));
+        const file = Number.isInteger(index) && index >= 0 ? saved?.files?.[index] : null;
+        if (!file || saved.runId !== query.get('run')) throw new Error('Not found');
+        const bytes = await store.bytes(saved, file);
+        res.writeHead(200, { 'Content-Type': file.mime, 'Content-Length': bytes.length, 'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'; sandbox", 'Content-Disposition': `inline; filename="${file.filename}"` });
+        return res.end(bytes);
+      } catch { res.writeHead(404); return res.end('Not found'); }
+    }
     if (process.env.TIPATASK_PROJECT_DEBUG === '1') {
       console.log(`[proj:http] ${req.method} ${urlPath} hdr=${req.headers['x-tipatask-project'] || '<none>'}`);
     }
@@ -1307,8 +1328,11 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
     // empty array: model ids remain free text in the consumer, so catalog discovery is an aid,
     // never a gate that can block configuring a provider Pi knows but cannot currently list.
     if (req.method === 'GET' && urlPath === '/api/pi/models') {
-      const provider = new URL(req.url, 'http://localhost').searchParams.get('provider');
-      const models = await listPiModels(provider, resolveProjectRoot(req));
+      const query = new URL(req.url, 'http://localhost').searchParams;
+      const provider = query.get('provider');
+      const models = query.get('purpose') === 'image'
+        ? (provider === 'openrouter' ? await require('./pi-image-provider').listImageModels() : [])
+        : await listPiModels(provider, resolveProjectRoot(req));
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       return res.end(JSON.stringify(models));
     }
@@ -1516,6 +1540,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store' });
       return res.end(JSON.stringify({
         taskGroupLabel: project?.task_group_label || 'Batches',
+        language: project?.language || null,
         colorScheme: project?.color_scheme || 'default',
         // C1332 — sprints_enabled (C1330 migration/PATCH). Same fail-open contract as the
         // two fields above: null/undefined project or column (file backend, unreachable
@@ -1555,6 +1580,14 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         vcsCommitEnabled: !!project?.vcs_commit_enabled,
         vcsPrEnabled: !!project?.vcs_pr_enabled,
         vcsMergeEnabled: !!project?.vcs_merge_enabled,
+        // TPT9063 — agent_permission_mode (TPT9062 project preference). Raw stored value when
+        // it is one of the five canonical modes, else null — "Not set" is the legacy behaviour
+        // kept, not a sixth mode. Hand-mirrors api/src/lib/agent-permission-mode.js's
+        // AGENT_PERMISSION_MODES (same "this server can't require() the API package's lib"
+        // convention as PATCH /api/project below). Feeds the card's permission-mode button and
+        // dialog (task-permission-mode.js) through group-label.js's settings bundle.
+        agentPermissionMode: ['plan', 'always_ask', 'accept_edits', 'auto', 'bypass'].includes(project?.agent_permission_mode)
+          ? project.agent_permission_mode : null,
       }));
     }
 
@@ -1734,6 +1767,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
             id: t.id,
             title: t.title,
             status: t.status,
+            ...(t.agentPermissionMode !== undefined ? { agentPermissionMode: t.agentPermissionMode } : {}),
             dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
             ...(t.dbId != null ? { dbId: t.dbId } : {}),
             ...(t.parentDbId != null ? { parentDbId: t.parentDbId } : {}),
@@ -1816,6 +1850,18 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         }
         const existing = readProjectConfig(projectRoot) || {};
         const merged = mergeRendererProjectConfig(existing, parsed, { allowApiToken: true });
+        if (merged.API_BASE_URL && merged.API_PROJECT_ID) {
+          // Re-auth payloads may contain the old account's displayed preferences.
+          // Only an explicit preference edit on the unchanged target is a save.
+          if (!['API_BASE_URL', 'API_PROJECT_ID', 'API_TOKEN'].some(key => Object.hasOwn(parsed, key))) {
+            const preferences = {};
+            if (Object.hasOwn(parsed, 'language')) preferences.language = parsed.language;
+            if (Object.hasOwn(parsed, 'theme')) preferences.color_scheme = parsed.theme || 'default';
+            if (Object.keys(preferences).length) await backend.updateProject(preferences);
+          }
+          delete merged.language;
+          delete merged.theme;
+        }
         writeProjectConfig(projectRoot, merged);
         // Trigger a reconnect probe so SSE clients receive 'connected' after token refresh
         const b = resolveBackend(req);
@@ -2004,6 +2050,21 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
           return res.end(JSON.stringify({ error: `${field} must be a boolean` }));
         }
         patch[field] = parsed[field];
+      }
+      if (parsed.agent_permission_mode !== undefined) {
+        // TPT9063 — hand-mirrors api/src/lib/agent-permission-mode.js's AGENT_PERMISSION_MODES
+        // (same "this server can't require() the API package's lib" reasoning as
+        // task_group_label/color_scheme above). null clears the project default ("Not set" —
+        // legacy behaviour, not a sixth mode). backend.updateProject() routes the field to the
+        // preference-only saveEffectiveProjectSettings() patch (TPT9062), so a default change
+        // never touches task overrides or running sessions. '' is NOT normalized to null
+        // (unlike vcs_type): the client never sends it, so it is a bug, not a choice.
+        const AGENT_PERMISSION_MODES = ['plan', 'always_ask', 'accept_edits', 'auto', 'bypass'];
+        if (parsed.agent_permission_mode !== null && !AGENT_PERMISSION_MODES.includes(parsed.agent_permission_mode)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: `agent_permission_mode must be one of: ${AGENT_PERMISSION_MODES.join(', ')}, or null` }));
+        }
+        patch.agent_permission_mode = parsed.agent_permission_mode;
       }
       if (Object.keys(patch).length === 0) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -3064,7 +3125,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
 
-      const { status, description, title, priority, tags, order, assignee, agent_assignee, sprint_id, claude_model, codex_model, pi_model, effort, claude_design_mode, dependencies, reopen_if_closed, is_objective, auto_register_tags } = parsed;
+      const { status, description, title, priority, tags, order, assignee, agent_assignee, sprint_id, claude_model, codex_model, pi_model, effort, agent_permission_mode, claude_design_mode, dependencies, reopen_if_closed, is_objective, auto_register_tags } = parsed;
 
       // Validate status against THIS project's own registry (C1184), not a hardcoded
       // literal list — a project can rename/add/remove statuses. fetchStatusContext()
@@ -3155,6 +3216,15 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'effort must be a string or null' }));
       }
 
+      // TPT9063: per-task permission-mode override — shape check only, like effort; the API owns
+      // the enum (normalizeAgentPermissionMode → 400 on an unknown mode). null clears the
+      // override back to Project Default, resolved when the task starts. Config-only: nothing at
+      // session start reads it yet (TPT9064).
+      if (agent_permission_mode !== undefined && agent_permission_mode !== null && typeof agent_permission_mode !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'agent_permission_mode must be a string or null' }));
+      }
+
       // C1207: real boolean, not a tri-state model override — null is accepted and
       // means "off" (the column has no third state).
       if (claude_design_mode !== undefined && claude_design_mode !== null && typeof claude_design_mode !== 'boolean') {
@@ -3178,13 +3248,15 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'is_objective must be a boolean' }));
       }
 
-      if (status === undefined && description === undefined && title === undefined && priority === undefined && sprint_id === undefined && tags === undefined && order === undefined && assignee === undefined && agent_assignee === undefined && claude_model === undefined && codex_model === undefined && pi_model === undefined && effort === undefined && claude_design_mode === undefined && dependencies === undefined && is_objective === undefined) {
+      if (status === undefined && description === undefined && title === undefined && priority === undefined && sprint_id === undefined && tags === undefined && order === undefined && assignee === undefined && agent_assignee === undefined && claude_model === undefined && codex_model === undefined && pi_model === undefined && effort === undefined && agent_permission_mode === undefined && claude_design_mode === undefined && dependencies === undefined && is_objective === undefined) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Must provide status, description, title, priority, sprint_id, tags, order, assignee, agent_assignee, dependencies, is_objective, and/or claude_model/codex_model/pi_model/effort/claude_design_mode' }));
+        return res.end(JSON.stringify({ error: 'Must provide status, description, title, priority, sprint_id, tags, order, assignee, agent_assignee, dependencies, is_objective, and/or claude_model/codex_model/pi_model/effort/agent_permission_mode/claude_design_mode' }));
       }
 
       try {
-        const updateFields = { status, description, title, priority, tags, order, assignee, agentAssignee: agent_assignee, claudeModel: claude_model, codexModel: codex_model, piModel: pi_model, effort, claudeDesignMode: claude_design_mode, dependencies, isObjective: is_objective };
+        // TPT9063: agentPermissionMode rides the camelCase key api-backend.js's updateTask() reads
+        // (it forwards an explicit null and drops undefined, like effort).
+        const updateFields = { status, description, title, priority, tags, order, assignee, agentAssignee: agent_assignee, claudeModel: claude_model, codexModel: codex_model, piModel: pi_model, effort, agentPermissionMode: agent_permission_mode, claudeDesignMode: claude_design_mode, dependencies, isObjective: is_objective };
         if (sprint_id === null) updateFields.priority = 0;
         // C1165: objective-chat's absent-target PATCH fallback (buildModifiedTaskPatch)
         // sets this flag instead of a status when the proposal carried none — reopen a
@@ -3221,7 +3293,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         // api-backend.js's _rawUpdateTask()'s `_parentRescheduled` meta field. `undefined`
         // when absent (no cascade fired, or the offline-queued `fresh` re-fetch above never
         // carries it) drops out of JSON.stringify on its own — no `if (…) {}` needed here.
-        res.end(JSON.stringify({ ok: true, id, status: fresh.status, description: fresh.description, title: fresh.title, priority: fresh.priority, tags: fresh.tags, order: fresh.order, assignee: fresh.assignee, agentAssignee: fresh.agentAssignee, claudeModel: fresh.claudeModel, codexModel: fresh.codexModel, piModel: fresh.piModel, effort: fresh.effort ?? null, claudeDesignMode: fresh.claudeDesignMode, dependencies: fresh.dependencies, dbId: fresh.dbId, parentDbId: fresh.parentDbId, parentRescheduled: fresh._parentRescheduled }));
+        res.end(JSON.stringify({ ok: true, id, status: fresh.status, description: fresh.description, title: fresh.title, priority: fresh.priority, tags: fresh.tags, order: fresh.order, assignee: fresh.assignee, agentAssignee: fresh.agentAssignee, claudeModel: fresh.claudeModel, codexModel: fresh.codexModel, piModel: fresh.piModel, effort: fresh.effort ?? null, agentPermissionMode: fresh.agentPermissionMode ?? null, claudeDesignMode: fresh.claudeDesignMode, dependencies: fresh.dependencies, dbId: fresh.dbId, parentDbId: fresh.parentDbId, parentRescheduled: fresh._parentRescheduled }));
         // (C1259) Project-scoped when the client's project is known (Electron: main.js's
         // onBeforeSendHeaders injects x-tipatask-project on every request automatically, no
         // client change needed — see resolveBackend() above) — a card update now sends one
@@ -4255,7 +4327,10 @@ async function launchNewTerminalSession(ctx) {
     }
   }
 
-  if (ws && ws.readyState === ws.OPEN) wireClient(ws, session, taskId, sessionKey, sessions, backend);
+  if (ws && ws.readyState === ws.OPEN) {
+    wireClient(ws, session, taskId, sessionKey, sessions, backend);
+    if (session._imageOperation && !session.alive) ws.send(JSON.stringify(buildTerminalExitFrame(session, session.exitCode)));
+  }
   } finally {
     session._launching = false;
     drainSessionQueue();
@@ -4396,12 +4471,25 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
   }
 
   {
+    // Image operations need neither KB context nor the optional LLM re-indexer.
+    let imageConnection = !!sessions.get(sessionKey)?._imageOperation;
+    if (!imageConnection && !planOnly && !discussionMode && _isRealTaskKey(taskId)
+      && !taskId.startsWith('__') && (agentParam || resolveTaskAgentId(projectPath, null)) === 'pi') {
+      const root = projectPath || config.PROJECT_ROOT;
+      const rows = readPiEntries(readProjectConfig(root));
+      if (rows.some(row => row.purpose === 'image')) {
+        try {
+          const task = modelParam ? null : await backend.getTask(taskId);
+          imageConnection = !!require('./image-task').resolveImageEntry(root, modelParam, task);
+        } catch { /* a failed task read is handled by the launch gate */ }
+      }
+    }
     // Auto session-sync on WS connect: use the per-window projectPath when
     // available so the version cache writes to the project dir, not to the
     // read-only app.asar bundle in packaged Electron builds (C884 fix).
     const syncCfg = projectPath ? (readProjectConfig(projectPath) || {}) : {};
     const syncBackend = syncCfg.TASK_BACKEND || config.TASK_BACKEND;
-    if (syncBackend === 'api') {
+    if (syncBackend === 'api' && !imageConnection) {
       try {
         const { baseUrl, projectId: liveProjectId, token } = backend.getCredentials();
         const _root = projectPath || config.PROJECT_ROOT;
@@ -5389,7 +5477,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
     taskAgentLabel: taskAgent.label,
     agentLabels: _agentLabels(),
     planApprovalCommand: taskAgent.approvalCommand,
-    supportsPlanMode: taskAgent.supportsPlanMode,
+    supportsPlanMode: session._imageOperation ? false : taskAgent.supportsPlanMode,
     // (C1259) Peek variants — same reasoning as the board watcher's config frame above.
     availableAgents: getAvailableAgentsPeek(_clientCfg),
     agentStatuses: listTaskAgentStatusesPeek(config),
@@ -5407,6 +5495,18 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
   ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
+
+    if (msg.type === 'image-task-retry' && session._imageOperation && ['generate', 'resume'].includes(msg.mode)) {
+      try {
+        if (session._imageRetry) await session._imageRetry(msg.mode, msg.runId);
+        emitTerminalState(session);
+      } catch (err) {
+        const { imageTaskCopy } = require('../image-task-copy.mjs');
+        const locale = readProjectConfig(session.projectPath || config.PROJECT_ROOT)?.language;
+        sendWsJson(ws, { type: 'image-task-error', message: imageTaskCopy(locale, `imageTask.error.${err.code}`) });
+      }
+      return;
+    }
 
     // A torn-down chat (kill, save, socket close) takes no further turns — and restart must not
     // resurrect it: clearContext() would re-open a session that is no longer in the map.
@@ -5462,6 +5562,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           // const (which in packaged builds pointed at the app bundle). Falls back to
           // config.PROJECT_ROOT (dev/single-project — unchanged) (C894).
           const objProjectRoot = session.projectPath || config.PROJECT_ROOT;
+          if (backend.getEffectiveProjectSettings) await backend.getEffectiveProjectSettings();
           // Pre-warm arch-doc disk cache so the first get_tag_architectures hook hits cache (~0ms) vs MCP stdio (~386ms).
           if (!config.SIMPLE_MODE && config.API_PROJECT_ID) {
             _fetchTaskTags(backend, taskId).then(ttTags => {
@@ -5759,7 +5860,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           id: projectId,
           name: settings?.name || localConfig.projectName || config.projectName || `Project ${projectId}`,
           description: settings?.description || '',
-          language: settings?.language || localConfig.language || '',
+          language: settings?.language || require('./project-config').readProjectLanguage(session.projectPath || config.PROJECT_ROOT),
           task_group_label: settings?.task_group_label || '',
           sprints_enabled: settings?.sprints_enabled ?? null,
         };
@@ -6193,6 +6294,8 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       } else {
         emitTerminalState(session); // already running — resync a stale banner
       }
+    } else if (msg.type === 'permission-answer') {
+      session._permissionGate?.answer(msg.id, msg.allow);
     } else if (msg.type === 'plan-approve') {
       if (session.type !== 'objective') approvePlan(session);
     } else if (msg.type === 'paste-image') {

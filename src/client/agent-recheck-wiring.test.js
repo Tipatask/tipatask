@@ -135,7 +135,7 @@ test('chat-ui.js: exports invalidateObjectiveProviders() for project switches', 
 
 test('template.html: a project switch invalidates the objective provider list', () => {
   const src = readSource('template.html');
-  const handler = src.indexOf('window.electronAPI.onProjectChanged(async (dir, name) => {');
+  const handler = src.indexOf('window.electronAPI.onProjectChanged(async (dir, name, contextChanged = false) => {');
   assert.ok(handler >= 0, 'onProjectChanged handler not found');
   const end = src.indexOf('await loadAndRender({ scrollToTop: true, force: true });', handler);
   const block = src.slice(handler, end);

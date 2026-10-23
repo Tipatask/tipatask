@@ -1,5 +1,7 @@
 'use strict';
 
+const { isImageModel } = require('../../pi-image-settings');
+
 // Objective-chat provider/model registry (C1029).
 // Leaf module — depends only on config + project-config (and pi-custom-endpoint's row-capability
 // helper, itself depending only on project-config) + task-agent detection, never
@@ -92,9 +94,14 @@ function configForProject(projectPath) {
   // model id is unioned into PI_MODELS so isValidSelection() accepts all of them, not
   // just the default.
   const piEntries = readPiEntries(cfg);
+  const imageIds = piEntries.filter(isImageModel).map(e => e.model);
+  if (imageIds.length) {
+    if (!view) view = Object.create(config);
+    view.PI_IMAGE_MODELS = imageIds;
+  }
   if (piEntries.length) {
     if (!view) view = Object.create(config);
-    if (view.PI_MODEL !== piEntries[0].model) view.PI_MODEL = piEntries[0].model;
+    view.PI_MODEL = piEntries.find(e => !isImageModel(e))?.model || '';
     const list = config.PI_MODELS || [];
     const ids = piEntries.map(e => e.model);
     const merged = [...list, ...ids.filter(id => !list.includes(id))];
@@ -228,7 +235,7 @@ function isValidSelection(str, cfg = config) {
   // comment. This is the unchanged pre-C1515 check (cfg.PI_MODELS, the wide back-compat
   // list), byte-for-byte: meta.modelsKey for pi is already 'PI_MODELS'.
   const ids = parsed.providerId === 'pi' ? (cfg.PI_MODELS || []) : allowedModelIds(parsed.providerId, cfg);
-  return ids.includes(parsed.model);
+  return ids.includes(parsed.model) && !(parsed.providerId === 'pi' && (cfg.PI_IMAGE_MODELS || []).includes(parsed.model));
 }
 
 // Always returns a valid {providerId, model} pair — falls back to config.OBJECTIVE_PROVIDER
@@ -327,7 +334,9 @@ function listObjectiveProviders(cfg, { statuses = null } = {}) {
     // them for this project. (C1515) Claude/Codex/Gemini instead go through offeredModelIds()
     // — the live-registry ladder for claude/codex, falling back to the static cfg[modelsKey]
     // allowlist for all three when there's no live cache (gemini has no probe at all).
-    const modelIds = providerId === 'pi' ? (cfg.PI_CONFIGURED_MODELS || []) : offeredModelIds(providerId, cfg);
+    const allPiIds = cfg.PI_CONFIGURED_MODELS || [];
+    const imageModels = providerId === 'pi' ? (cfg.PI_IMAGE_MODELS || []) : [];
+    const modelIds = providerId === 'pi' ? allPiIds.filter(id => !imageModels.includes(id)) : offeredModelIds(providerId, cfg);
     const models = modelIds.map((value) => ({ value }));
     // (C1515) The wider validation allowlist — see allowedModelIds()'s comment for why pi is
     // excepted (its `models` above already IS the narrow value applyModelSelection() must
@@ -379,12 +388,13 @@ function listObjectiveProviders(cfg, { statuses = null } = {}) {
       // apiKeys). Same value as `models` above for pi as of C1136 (both narrowed to the
       // project's own configured ids) — kept as a separate field since console-modal.js's
       // launch-time agent picker reads this one specifically.
-      configuredModels: providerId === 'pi' ? modelIds : [],
+      configuredModels: providerId === 'pi' ? allPiIds : [],
+      imageModels,
       // Pi-only: the subset of configuredModels whose row sets `tools: false` (ids only). The
       // objective chat offers them (`models` is unfiltered); the task-start pickers and the
       // task/project chat selector leave them out, since a task terminal and a task chat both
       // refuse such a row.
-      toolLessModels: providerId === 'pi' ? (cfg.PI_TOOLLESS_MODELS || []).filter((id) => modelIds.includes(id)) : [],
+      toolLessModels: providerId === 'pi' ? (cfg.PI_TOOLLESS_MODELS || []).filter((id) => allPiIds.includes(id)) : [],
     };
   });
 }
@@ -393,7 +403,7 @@ function listObjectiveProviders(cfg, { statuses = null } = {}) {
 // validation so the picker and server gate agree. An empty list is valid.
 function listVisibleObjectiveProviders(cfg, opts) {
   const all = listObjectiveProviders(cfg, opts);
-  const selectable = all.filter(p => p.selectable);
+  const selectable = all.filter(p => p.selectable || (p.id === 'pi' && p.enabled && p.imageModels?.length));
   if (selectable.length) return selectable;
   if (readAvailableAgents(cfg).length === 0) return [];
   return all.filter(p => p.enabled);

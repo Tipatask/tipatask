@@ -816,6 +816,18 @@ async function associateDeviceProject({ apiBaseUrl, token, deviceId, projectId }
   });
 }
 
+// API reads initialize a personal snapshot once; never upload checkout defaults
+// during setup. The same entry point hydrates runtime and reconnect mirrors.
+async function initializeProjectSettings({ projectRoot = PROJECT_ROOT, backend } = {}) {
+  const ownBackend = !backend;
+  const target = backend || require('../server/api-backend').createApiBackend(null, projectRoot);
+  try {
+    return await target.getEffectiveProjectSettings({ refresh: true, strict: true });
+  } finally {
+    if (ownBackend) target.dispose();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -942,6 +954,7 @@ async function main() {
       updates.DEVICE_NAME = device.name;
     }
     writeEnv(ENV_PATH, initialEnv.lines, updates, projectRoot);
+    if (initialEnv.values.API_PROJECT_ID) await initializeProjectSettings({ projectRoot });
     console.log(`\n  ${GREEN}Signed in. Credentials saved to the account store.${RESET}\n`);
     return;
   }
@@ -1158,6 +1171,8 @@ async function main() {
     DEVICE_NAME: device.name,
   }, projectRoot);
 
+  await initializeProjectSettings({ projectRoot });
+
   // Push merged agent config to API device record
   try {
     let machineIdForSync;
@@ -1333,4 +1348,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { registerDevice, createApiProject, associateDeviceProject, analyzeSetupState, runSyncSetupStep, configureMcpServers, readEnv };
+module.exports = { registerDevice, createApiProject, associateDeviceProject, initializeProjectSettings, analyzeSetupState, runSyncSetupStep, configureMcpServers, readEnv };

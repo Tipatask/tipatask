@@ -93,5 +93,12 @@ function piMcpBridgePath(userDataRoot) {
 }
 
 module.exports = {
+  stagePermissionGate(userDataRoot) {
+    const dir = path.join(userDataRoot, 'pi-ext');
+    fs.mkdirSync(dir, { recursive: true });
+    const target = path.join(dir, 'permission-gate.mjs');
+    stageFile(path.join(SOURCE_DIR, 'permission-gate.mjs'), target);
+    return target;
+  },
   materializePiTaskTools, stagePiMcpBridge, piMcpBridgePath, resolvePiMcpBridge, SOURCE_DIR, FILES, ENTRY, BRIDGE_FILE, BRIDGE_SOURCE,
 };

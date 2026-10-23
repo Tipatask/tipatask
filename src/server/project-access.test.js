@@ -20,6 +20,7 @@ function mainFunction(name) {
 
 function harness(overrides = {}) {
   const events = [];
+  const windowCalls = [];
   let token = 'wrong-account';
   const config = { API_BASE_URL: 'https://api.test', API_PROJECT_ID: 2, language: 'uk' };
   const gate = createProjectAccessGate({
@@ -54,7 +55,11 @@ function harness(overrides = {}) {
     rememberRecentProject: () => events.push(['recent']),
     addToWorkspace: () => events.push(['workspace']),
     getDisplayName: (dir) => dir, getWindowTitle: (name) => name,
-    ownerOf: (dir) => owners.get(dir), focusWindow: () => true,
+    ownerOf: (dir) => owners.get(dir),
+    focusWindow: (w) => { windowCalls.push(['focus', w.webContents.id]); return true; },
+    // Only tracking is reached by the extracted window-creation functions.
+    // Notification raises have their own harness in notify-target.test.js.
+    notifyTarget: { trackOnScreen: (w) => { windowCalls.push(['trackOnScreen', w.webContents.id]); } },
     claimProject: (dir, win) => owners.set(dir, win),
     writeProjectMcpConfig() {}, writeProjectSkillsConfig() {}, writeProjectCodexConfig() {},
     BrowserWindow: FakeWindow, attachExternalLinkPolicy() {}, scheduleOpenProjectsSync() {},
@@ -64,7 +69,7 @@ function harness(overrides = {}) {
   });
   vm.runInContext(mainFunction('createProjectWindow'), context);
   vm.runInContext(mainFunction('createInitialWindows'), context);
-  return { gate, events, windows, context, open: context.createProjectWindow };
+  return { gate, events, windowCalls, windows, context, open: context.createProjectWindow };
 }
 
 for (const status of [403, 404]) {
@@ -72,6 +77,7 @@ for (const status of [403, 404]) {
     const h = harness({ request: async () => ({ status }), prompt: async () => false });
     assert.equal(await h.open('/foreign'), null);
     assert.deepEqual(h.events, []);
+    assert.deepEqual(h.windowCalls, []);
     assert.equal(h.windows.length, 0);
   });
 }
@@ -86,6 +92,7 @@ test('denial → re-auth → fresh probe precedes backend and board; second proj
   assert.equal(h.windows.length, 2);
   assert.equal(h.events.filter(e => e[0] === 'signin').length, 1);
   assert.equal(h.events.filter(e => e[0] === 'probe').at(-1)[2], 'Bearer right-account');
+  assert.deepEqual(h.windowCalls, [['trackOnScreen', 1], ['trackOnScreen', 2]]);
 });
 
 test('concurrent duplicate opens share one sign-in and create one window', async () => {
@@ -95,6 +102,7 @@ test('concurrent duplicate opens share one sign-in and create one window', async
   assert.equal(h.windows.length, 1);
   assert.equal(h.events.filter(e => e[0] === 'dialog').length, 1);
   assert.equal(h.events.filter(e => e[0] === 'signin').length, 1);
+  assert.deepEqual(h.windowCalls, [['trackOnScreen', 1], ['focus', 1]]);
 });
 
 test('different concurrent projects serialize recovery and re-read account credentials', async () => {
@@ -102,6 +110,7 @@ test('different concurrent projects serialize recovery and re-read account crede
   await Promise.all([h.open('/a'), h.open('/b')]);
   assert.equal(h.windows.length, 2);
   assert.equal(h.events.filter(e => e[0] === 'signin').length, 1);
+  assert.deepEqual(h.windowCalls, [['trackOnScreen', 1], ['trackOnScreen', 2]]);
 });
 
 test('wrong account after sign-in stays blocked; Cancel stops retries', async () => {
@@ -146,6 +155,7 @@ test('missing token and 401 offer sign-in before opening', async () => {
       prompt: async (_, __, kind) => { assert.equal(kind, 'signin'); return true; },
     });
     assert.ok(await h.open('/project'));
+    assert.deepEqual(h.windowCalls, [['trackOnScreen', 1]]);
   }
 });
 
@@ -161,6 +171,7 @@ test('canceling every restored project creates an unbound welcome window', async
   assert.equal(h.windows.length, 1);
   assert.deepEqual(h.events.filter(e => e[0] === 'bind'), [['bind', null]]);
   assert.match(h.events.find(e => e[0] === 'load')[1], /todo\.html$/);
+  assert.deepEqual(h.windowCalls, [['trackOnScreen', 1]]);
 });
 
 function ipcHandler(channel, context) {

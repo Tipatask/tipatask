@@ -346,10 +346,10 @@ test('all three status observers share the transition guard and retain a silent 
 test('browser WS, Electron event, and status poll all call the shared observer', () => {
   const source = readFileSync(new URL('./template.html', import.meta.url), 'utf8');
   const call = 'completionNotifications.observeTaskStatusForCompletion(';
-  assert.equal(source.split(call).length - 1, 3);
+  assert.equal(source.split(call).length - 1, 2);
   assert.match(source, /function syncNavStatusesFromServer[\s\S]*?observeTaskStatusForCompletion\(state\.taskStatusById, id, t\.status, t\.title\)/);
   assert.match(source, /function handleObjectiveTaskStateEvent[\s\S]*?observeTaskStatusForCompletion\(\s*state\.taskStatusById, taskId, msg\.task\.status, msg\.task\.title\)/);
-  assert.match(source, /function connectBoardWs[\s\S]*?observeTaskStatusForCompletion\(\s*state\.taskStatusById, t\.id, t\.status, t\.title\)/);
+  assert.match(source, /function connectBoardWs[\s\S]*?handleObjectiveTaskStateEvent\(msg\)/);
 });
 
 test('maybeNotifyCompletion does not fire for a non-complete status, and clears the ledger on the way out', () => {

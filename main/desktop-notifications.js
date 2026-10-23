@@ -12,9 +12,10 @@ const PAD = 16, HEADER = 24, GAP = 8, CARD = 70, MORE = 24, WIDTH = 336;
 // Blur → focus gap while the user switches between two Tipatask windows. The surface waits this
 // long before re-deciding, so the banner never flashes up in between.
 const SURFACE_SETTLE_MS = 120;
-// Longest a card click keeps the banner up while its onClick raises the project window. The
-// raise settles in about 1.4 s at most; a reopened project can wait on an access dialog.
-const CLICK_HOLD_MS = 3000;
+// Longest a card click keeps the banner's surface decision deferred while its onClick raises
+// the project window. The raise ladder settles in about 3.5 s at most (focus retries, then the
+// LaunchServices and Space fallbacks); a reopened project can wait on an access dialog.
+const CLICK_HOLD_MS = 4000;
 const CATEGORIES = ['attention', 'completed', 'objective', 'activity', 'merge'];
 const THEME_KEYS = ['bg', 'text', 'muted', 'border', 'primary', 'warning', 'success', 'shadow'];
 // Live native notifications retained until their terminal event (TPT487); FIFO backstop.
@@ -82,16 +83,21 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   // Project window that owns the full list ("Show More"): { win, wc, opened, detach }.
   // `opened` turns true once notify:desktop-list-open was actually sent to a loaded page.
   let panel = null;
-  // A banner Show More whose target is still being resolved (async onShowMore).
+  // A banner Show More whose target is still being resolved (async onShowMore). Treated like a
+  // pending card click by renderSurface(): the raise is the same.
   let showMorePending = false;
   // (TPT505) Banner dismissed with Hide: stays hidden, entries kept, until a new or changed
   // alert arrives (upsert) or Show on Top is toggled. The in-app panel is unaffected.
   let bannerHidden = false;
-  // (TPT645) Card clicks whose onClick (raise the project window, then deliver the click) has
-  // not settled. While one is pending the banner is not hidden, so the desktop never flashes
-  // between banner and window; `hideHeld` remembers a hide that was skipped for it.
+  // (TPT645/TPT9056) Card clicks whose onClick (raise the project window, then deliver the
+  // click) has not settled. While one is pending the banner's surface decision is deferred
+  // (`surfaceHeld`, applied by settleClick()). On macOS the banner is hidden for the raise:
+  // the app must have no window on the user's current Space for activation to switch to the
+  // project window's Space, and the banner panel sits on every Space — it comes back only when
+  // no project window took the alerts. Elsewhere it stays up, minus the clicked card, so the
+  // desktop never flashes between banner and window.
   let clicksPending = 0;
-  let hideHeld = false;
+  let surfaceHeld = false;
   // (TPT487) "Show on Top" off: one transient OS notification per alert, keyed like entries.
   // Referenced until click/close/failed so V8 can't collect one before the OS shows it.
   const natives = new Map();
@@ -129,7 +135,8 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
 
   // Exactly one surface holds the alerts: the in-app panel of the focused project window, or
   // the always-on-top banner while another app is focused. Never focuses or raises anything.
-  // A pending card click keeps the banner up (minus that card) until its window is raised.
+  // A pending card click or banner Show More defers the banner's decision until its window is
+  // raised (see clicksPending): hidden for the raise on macOS, kept up minus that card elsewhere.
   function renderSurface() {
     const list = snapshot();
     const current = hostLive();
@@ -144,9 +151,16 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     if (!window || window.isDestroyed() || loading) return;
     layout();
     window.webContents.send('notify:desktop-state', { entries: list, theme });
-    hideHeld = false;
-    if (list.length && enabled && !current && !bannerHidden) window.showInactive();
-    else if (clicksPending && enabled && !bannerHidden) hideHeld = true;
+    surfaceHeld = false;
+    const wanted = list.length && enabled && !current && !bannerHidden;
+    const pending = (clicksPending || showMorePending) && enabled && !bannerHidden;
+    if (pending && platform === 'darwin') {
+      surfaceHeld = !current;
+      window.hide();
+      return;
+    }
+    if (wanted) window.showInactive();
+    else if (pending) surfaceHeld = true;
     else window.hide();
   }
 
@@ -330,7 +344,11 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
       const target = onShowMore(newest);
       if (typeof target?.then !== 'function') return attachPanel(target);
       showMorePending = true;
-      target.then(attachPanel).catch(() => {}).finally(() => { showMorePending = false; });
+      publish();
+      target.then(attachPanel).catch(() => {}).finally(() => {
+        showMorePending = false;
+        if (!disposed && surfaceHeld) renderSurface();
+      });
       return;
     }
     const entry = entries.get(id);
@@ -348,8 +366,9 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     settleClick(result);
   }
 
-  // Ends one card click's banner hold once its onClick settles (at most CLICK_HOLD_MS), then
-  // applies a hide the hold skipped: by then the raised project window hosts the alerts.
+  // Ends one card click's hold once its onClick settles (at most CLICK_HOLD_MS), then applies
+  // the deferred surface decision: the raised project window hosts the alerts by then, or —
+  // nothing raised — the banner shows them again.
   function settleClick(result) {
     let timer = null;
     let settled = false;
@@ -358,7 +377,7 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
       settled = true;
       clearTimeout(timer);
       clicksPending -= 1;
-      if (!disposed && !clicksPending && hideHeld) renderSurface();
+      if (!disposed && !clicksPending && surfaceHeld) renderSurface();
     };
     if (typeof result?.then !== 'function') return release();
     timer = setTimeout(release, CLICK_HOLD_MS);

@@ -32,7 +32,10 @@ async function withClient(run) {
         export * as dialogFocus from './src/client/dialog-focus.js';
         export * as actionConfirm from './src/client/action-confirm.js';
         export * as wizard from './src/client/project-creation-wizard.js';
-        export * as setupModal from './src/client/setup-modal.js';`, resolveDir: root },
+        export * as setupModal from './src/client/setup-modal.js';
+        export * as permissionModeSelect from './src/client/permission-mode-select.js';
+        export * as permissionMode from './src/client/permission-mode.js';
+        export * as i18n from './src/client/i18n.js';`, resolveDir: root },
       bundle: true, platform: 'node', format: 'esm', write: false, loader: { '.css': 'empty' },
       plugins: [{ name: 'terminal-double', setup(build) {
         build.onResolve({ filter: /^@xterm\/(xterm|addon-fit)$/ }, args => ({ path: args.path, namespace: 'terminal-double' }));
@@ -326,6 +329,73 @@ test('setup / re-auth modal is interactive over the workspace and every dismiss 
       assert.equal(document.activeElement, title, `${dismiss}: focus returns to the workspace`);
     }
     assert.equal(workspaceEscapes, 0, 'Escape on the modal never reaches the workspace closer');
+  });
+});
+
+// (TPT9084) permission-mode-select.js moves its open listbox to <body>; dialog-focus.js admits it
+// to whichever layer holds its trigger, so neither the workspace layer nor a Settings layer over
+// it inerts the menu or steals focus from its rows.
+test('a permission-mode listbox portaled to body belongs to the layer holding its trigger', async () => {
+  await withClient(async ({ dialogFocus, permissionModeSelect, permissionMode, i18n, flush }) => {
+    const { t } = i18n;
+    document.body.innerHTML = '<button id="bg">bg</button>';
+    const { workspace } = openWorkspace(dialogFocus);
+    workspace.insertAdjacentHTML('beforeend', permissionModeSelect.renderPermissionModeSelect({
+      name: 'modal-permission-mode', options: permissionMode.buildTaskModeOptions(null, 'auto', t), t,
+    }));
+    const control = permissionModeSelect.bindPermissionModeSelect(workspace, () => {});
+    await flush();
+    assert.equal(document.getElementById('bg').inert, true);
+    workspace.querySelector('.permission-mode-select-trigger').click();
+    const menu = document.querySelector('.permission-mode-select-menu');
+    assert.equal(menu.parentElement, document.body, 'open listbox is portaled to body');
+    const rows = [...menu.querySelectorAll('[role="option"]')];
+    assert.equal(document.activeElement, rows[0], 'the layer did not pull focus off the portaled row');
+    await flush();
+    assert.notEqual(menu.inert, true, 'the workspace layer keeps its own menu interactive');
+    assert.equal(document.getElementById('bg').inert, true);
+    rows[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    assert.equal(document.activeElement, rows[1], 'arrow focus stays inside the open menu');
+    // A dialog opening above the workspace inerts the body-level menu, then takes focus: the
+    // menu dismisses (focus left it) and returns to its widget without that inert flag.
+    document.body.insertAdjacentHTML('beforeend', '<div id="above"><button>ok</button></div>');
+    const above = dialogFocus.activateDialogFocus({ root: document.getElementById('above') });
+    await flush();
+    assert.equal(menu.hidden, true, 'a layer opening above dismisses the menu');
+    assert.equal(menu.parentElement.closest('#task-edit-modal'), workspace);
+    assert.notEqual(menu.inert, true, 'the dismissed menu keeps no inert flag of its own');
+    assert.equal(workspace.inert, true);
+    above.close();
+    document.getElementById('above').remove();
+    await flush();
+    workspace.querySelector('.permission-mode-select-trigger').click();
+    assert.equal(document.activeElement, rows[0], 'reopened menu focuses its row again');
+    await flush();
+    assert.notEqual(menu.inert, true);
+    escape();
+    assert.equal(menu.parentElement.closest('#task-edit-modal'), workspace, 'Escape puts the menu back');
+    assert.equal(document.activeElement, workspace.querySelector('.permission-mode-select-trigger'));
+    // Settings over the workspace: its Workflow listbox is owned by the Settings layer.
+    document.body.insertAdjacentHTML('beforeend', '<div id="settings-modal" class="settings-modal--over-modal open">'
+      + permissionModeSelect.renderPermissionModeSelect({
+        name: 'settings-agent-permission-mode', options: permissionMode.buildProjectModeOptions(null, t), t,
+      }) + '</div>');
+    const settings = document.getElementById('settings-modal');
+    const settingsControl = permissionModeSelect.bindPermissionModeSelect(settings, () => {});
+    const settingsLayer = dialogFocus.activateDialogFocus({ root: settings });
+    await flush();
+    assert.equal(workspace.inert, true);
+    settings.querySelector('.permission-mode-select-trigger').click();
+    const settingsMenu = document.querySelector('.permission-mode-select-menu[data-portaled="1"]');
+    assert.equal(settingsMenu.getAttribute('aria-labelledby'), 'settings-agent-permission-mode');
+    await flush();
+    assert.notEqual(settingsMenu.inert, true, 'Settings keeps its own portaled menu interactive');
+    assert.equal(workspace.inert, true);
+    assert.ok(settingsMenu.contains(document.activeElement), 'focus stays on the Settings menu row');
+    escape();
+    settingsControl.destroy();
+    settingsLayer.close();
+    control.destroy();
   });
 });
 

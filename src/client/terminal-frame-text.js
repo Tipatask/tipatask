@@ -10,6 +10,7 @@
 // key instead of failing. Pure, node-testable.
 
 import { LOCALES, t } from './i18n.js';
+import { permissionModeLabel } from './permission-mode.js';
 
 // The key's text, or null when the key is unknown or a `{param}` the en template uses is absent
 // — so a placeholder, an empty slot or "undefined" never reaches the terminal.
@@ -34,7 +35,11 @@ export function errorFrameText(msg) {
   const code = typeof msg?.code === 'string' ? msg.code : '';
   if (!code) return fallback;
   const base = `terminal.error.${code}`;
-  const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
+  let params = msg.params && typeof msg.params === 'object' ? msg.params : {};
+  if (code === 'EPERMISSION') params = { ...params,
+    mode: params.mode ? permissionModeLabel(params.mode, t) : params.mode,
+    detail: render(`terminal.permission.support.${params.supportReason}`, {}) ?? params.detail,
+  };
   const reason = typeof msg.reason === 'string' ? msg.reason : '';
   if (code === 'EAUTH' && reason === 'expiring' && params.refreshError) {
     const text = render(`${base}.expiringNotRefreshed`, { when: params.when, error: refreshErrorText(params) });

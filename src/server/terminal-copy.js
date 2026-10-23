@@ -16,6 +16,9 @@
 // the builders that produce them are called with no locale.
 
 const en = {
+  'notice.permission.planLocked': 'Plan mode stays read-only. Choose an execution mode in task settings, then restart.',
+  'notice.permission.approval': 'Permission approval required.',
+  'notice.permission.unavailable': 'Permission gate did not start. Task prompt was not sent; restart after checking the agent installation.',
   // ── terminal-session.js notices ──
   'notice.starting': 'Starting {label}…',
   'notice.approval.stalledRetrying': '{label} approval looks stalled (no real activity yet) — retrying once.',
@@ -96,6 +99,9 @@ const en = {
 };
 
 const uk = {
+  'notice.permission.planLocked': 'Режим планування дозволяє лише читання. Виберіть режим виконання в налаштуваннях задачі та перезапустіть її.',
+  'notice.permission.approval': 'Потрібне підтвердження дозволу.',
+  'notice.permission.unavailable': 'Не вдалося запустити контроль дозволів. Запит задачі не надіслано; перевірте встановлення агента й перезапустіть.',
   'notice.starting': 'Запускаємо {label}…',
   'notice.approval.stalledRetrying': 'Схвалення в {label} виглядає завислим (реальної активності ще немає) — повторна спроба.',
   'notice.approval.stalledAfterRetry': 'Схвалення в {label} і після повторної спроби виглядає завислим (реальної активності немає — модель може повертати порожню або некоректну відповідь). Перевірте модель, налаштовану для цього проєкту.',

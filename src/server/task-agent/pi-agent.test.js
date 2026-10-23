@@ -51,6 +51,28 @@ function expectedLaunch() {
   return resolvePiLaunch() || { command: 'pi', argsPrefix: [] };
 }
 
+test('Pi Plan ignores an obsolete permission gate and sends its planning kickoff through argv', async t => {
+  const dir = makeProjectDir({ API_PROJECT_ID: '42' });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const agent = new PiAgent();
+  t.mock.method(require('../providers/pi-task-tools'), 'stagePermissionGate', () => {
+    assert.fail('Plan must not stage the tool gate');
+  });
+  for (const enforced of [false, true]) {
+    const permissionPolicy = { ...agent.buildPermissionPolicy({ mode: 'plan' }), enforced };
+    const spec = await agent.getSpawnSpec(FAKE_CONFIG, 'Work on task C1.', '', {
+      projectPath: dir, permissionPolicy,
+      permissionGate: { url: 'http://unused.test', token: 'unused' },
+    });
+    assert.ok(!spec.args.includes('--no-extensions'));
+    assert.equal(spec.env.TIPATASK_PERMISSION_URL, undefined);
+    assert.equal(spec.env.TIPATASK_PERMISSION_TOKEN, undefined);
+    assert.equal(spec.initialPrompt, undefined);
+    assert.match(kickoffText(spec), /Start in planning mode enforced by Task App/);
+    assert.match(kickoffText(spec), /Plan ready\./);
+  }
+});
+
 test('PiAgent.getSpawnSpec: uses OpenRouter interactive args and project env', async () => {
   const dir = makeProjectDir({ API_PROJECT_ID: '42', OPENROUTER_API_KEY: 'sk-or-test' });
   try {
@@ -412,7 +434,8 @@ test('spawnTerminal: a Pi task on a tools:false row fails to start with that sen
   session.taskAgent = 'pi';
   session.projectPath = dir;
   await assert.rejects(
-    spawnTerminal(session, 'Work on task C1.', 'C1', [], { sessions: new Map() }),
+    spawnTerminal(session, 'Work on task C1.', 'C1', [], { sessions: new Map(), task: { id: 'C1' },
+      backend: { getEffectiveProjectSettings: async () => ({ settings: { agent_permission_mode: null } }) } }),
     // (TPT9008) Coded, so the ESTART frame carries `reason` + params the terminal translates.
     {
       message: TOOLLESS_MESSAGE,
@@ -467,7 +490,9 @@ if (process.platform === 'win32') {
 
   test('PiAgent.detect(): a working probe is available and carries no reason', async (t) => {
     const res = await detectWithPiStub(t, '#!/bin/sh\necho 1.2.3\n');
-    assert.deepStrictEqual(res, { id: 'pi', label: 'Other Model', available: true });
+    assert.equal(res.available, true);
+    assert.equal(res.reason, undefined);
+    assert.equal(res.detail.version, '1.2.3');
   });
 }
 

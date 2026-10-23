@@ -34,7 +34,11 @@ after(() => mock.restoreAll());
 const providers = { claude: spawnObjectiveTurn, codex: spawnCodexTurn, gemini: spawnGeminiTurn, pi: spawnPiTurn };
 const objective = 'OBJECTIVE_UNIQUE ship attachments';
 const prefetch = '## Pre-fetched Workflow Data\n### list_task_id_meta\n```json\n{"active":[],"priorityBaseline":42,"marker":"TASK_META_UNIQUE"}\n```\n### get_project_tags\nTAGS_UNIQUE\n### Architecture\nARCH_UNIQUE';
-const systemMarkers = ['Communicate with the user in Ukrainian.', 'GENERAL_UNIQUE', 'CONVENTIONS_UNIQUE', 'READ-ONLY PLANNER'];
+const systemMarkers = [
+  'Communicate with the user in Ukrainian.', 'GENERAL_UNIQUE', 'CONVENTIONS_UNIQUE', 'READ-ONLY PLANNER',
+  'SOURCE MATERIAL (hard rule)',
+  'EXEMPT: the `Source material` paragraph is exempt from the 800-character cap',
+];
 const prefetchMarkers = ['TASK_META_UNIQUE', 'TAGS_UNIQUE', 'ARCH_UNIQUE'];
 
 function occurrences(text, marker, expected = 1) {

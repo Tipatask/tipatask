@@ -1132,6 +1132,7 @@ function projectEnvExtras(projectPath) {
     for (const k of CONFIG_FIELDS) {
       if (k !== 'projectName' && cfg[k] != null && cfg[k] !== '') extras[k] = String(cfg[k]);
     }
+    extras.language = require('./project-config').readProjectLanguage(projectPath);
     // The token is the signed-in account's, held app-level (account-store.js); a legacy
     // inline config.json value (copied by the loop above) is only the fallback.
     let account = null;

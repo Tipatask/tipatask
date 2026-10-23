@@ -198,10 +198,16 @@ test('forwardTaskStateMessage dispatches task-state events for board and Objecti
   try {
     assert.equal(forwardTaskStateMessage({ type: 'tasks-updated' }), true);
     assert.equal(forwardTaskStateMessage({ type: 'task:updated', task: { id: 'C2', status: 'completed' } }), true);
+    assert.equal(forwardTaskStateMessage({ type: 'task:created', task: { id: 'C3', status: 'pending' } }), true);
+    assert.equal(forwardTaskStateMessage({ type: 'task:deleted', id: 'C3' }), true);
+    assert.equal(forwardTaskStateMessage({ type: 'tasks:finalized', taskIds: ['C3'] }), true);
     assert.equal(forwardTaskStateMessage({ type: 'attention-needed' }), false);
     assert.deepEqual(events.map(event => [event.type, event.detail.type]), [
       ['tiptask:task-state-update', 'tasks-updated'],
       ['tiptask:task-state-update', 'task:updated'],
+      ['tiptask:task-state-update', 'task:created'],
+      ['tiptask:task-state-update', 'task:deleted'],
+      ['tiptask:task-state-update', 'tasks:finalized'],
     ]);
   } finally {
     if (savedDocument === undefined) delete globalThis.document;

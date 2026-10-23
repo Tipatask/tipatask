@@ -23,7 +23,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openProjectDialog: () => inv('project:open-dialog'),
   selectFolder: () => inv('dialog:selectFolder'),
   getCurrentProject: () => inv('project:get-current'),
-  onProjectChanged: (cb) => ipcRenderer.on('project:changed', (_, dir, name) => cb(dir, name)),
+  onProjectChanged: (cb) => ipcRenderer.on('project:changed', (_, dir, name, contextChanged) => cb(dir, name, contextChanged)),
   // (C1389, payload widened C1559/TPT16) Web→Task App handoff, planning branch — main.js's
   // focusAndSeedObjective() pushes this after /start-task (server child) has fully
   // validated project+account+task and main has focused/created the window. Payload:

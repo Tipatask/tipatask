@@ -51,7 +51,8 @@ try {
         export * as cards from './src/client/task-card.js';
         export * as editor from './src/client/task-edit-modal.js';
         export { default as state } from './src/client/state.js';
-        export { api } from './src/client/api-client.js';`,
+        export { api } from './src/client/api-client.js';
+        export { AGENT_PERMISSION_MODES } from './src/client/permission-mode.js';`,
       resolveDir: root,
     },
     bundle: true,
@@ -61,7 +62,7 @@ try {
     loader: { '.css': 'empty' },
   });
   writeFileSync(bundlePath, bundled.outputFiles[0].contents);
-  const { board, cards, state, api } = await import(pathToFileURL(bundlePath).href);
+  const { board, cards, state, api, AGENT_PERMISSION_MODES } = await import(pathToFileURL(bundlePath).href);
   const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   const modal = () => document.getElementById('task-edit-modal');
   const task = (id, overrides = {}) => ({
@@ -125,11 +126,61 @@ try {
   assert.equal(await confirmedClose, true);
   assert.equal(modal().hidden, true);
 
+  // Persist permission choices through the modal; reopening reads saved API state.
+  const originalUpdate = api.tasks.update;
+  api.tasks.update = async (id, patch) => {
+    const result = await originalUpdate(id, patch);
+    if ('agent_permission_mode' in patch) tasks.get(id).agentPermissionMode = patch.agent_permission_mode;
+    return result;
+  };
+  const permissionCard = document.createElement('div');
+  permissionCard.innerHTML = cards.renderCard(tasks.get('TPT1'));
+  document.body.appendChild(permissionCard);
+  await cards.openPermissionModeSettings('TPT1');
+  const permissionTrigger = () => modal().querySelector('#modal-permission-mode');
+  const permissionValue = () => modal().querySelector('input[name="modal-permission-mode"]').value;
+  const choosePermission = value => {
+    permissionTrigger().click();
+    // (TPT9084) The open listbox is portaled to <body>; closed, it sits back inside the modal.
+    document.querySelector(`.permission-mode-select-menu[data-portaled="1"] [role="option"][data-value="${value}"]`).click();
+  };
+  assert.equal(document.activeElement, permissionTrigger());
+  assert.equal(modal().querySelectorAll('[data-permission-mode-select] [role="option"]').length, AGENT_PERMISSION_MODES.length + 1);
+  assert.equal(permissionValue(), '');
+  choosePermission('bypass');
+  await cards.openPermissionModeSettings('TPT1');
+  assert.equal(permissionValue(), 'bypass', 'focusing an existing workspace keeps the draft');
+  assert.equal(document.activeElement, permissionTrigger());
+  assert.equal(writes.at(-1).patch.title, 'Edited title', 'selection waits for Save');
+  modal().querySelector('.btn-modal-save').click();
+  await tick();
+  assert.deepEqual(writes.at(-1), { id: 'TPT1', patch: { agent_permission_mode: 'bypass' } });
+  assert.ok(permissionCard.querySelector('.card-permission-btn .permission-mode-icon--bypass'));
+  board.closeTaskEditModal(true);
+  await cards.openPermissionModeSettings('TPT1');
+  assert.equal(permissionValue(), 'bypass');
+  choosePermission('plan');
+  modal().querySelector('.btn-modal-reset').click();
+  assert.equal(permissionValue(), 'bypass', 'Reset restores saved choice and rebinds widget');
+  choosePermission('');
+  modal().querySelector('.btn-modal-save').click();
+  await tick();
+  assert.deepEqual(writes.at(-1), { id: 'TPT1', patch: { agent_permission_mode: null } });
+  assert.equal(permissionCard.querySelector('.card-permission-btn').dataset.permissionMode, '');
+  board.closeTaskEditModal(true);
+  await cards.openPermissionModeSettings('TPT1');
+  assert.equal(permissionValue(), '');
+  board.closeTaskEditModal(true);
+  permissionCard.remove();
+  api.tasks.update = originalUpdate;
+  console.log('TPT9071_PERMISSION_MODE_PASS');
+
   // View-only and agent-session locks remain distinct, with comments still available.
   await board.openTaskEditModal('OTHER');
   assert.equal(modal().querySelector('.modal-title-input').readOnly, true);
   assert.equal(modal().querySelector('.btn-modal-save').disabled, true);
   assert.ok(modal().querySelector('.modal-readonly-banner'));
+  assert.equal(permissionTrigger().disabled, true);
   assert.ok(modal().querySelector('.comment-input'));
   board.closeTaskEditModal(true);
   await board.openTaskEditModal('LOCKED');

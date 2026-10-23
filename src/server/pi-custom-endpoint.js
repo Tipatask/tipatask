@@ -12,6 +12,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { isImageModel } = require('../pi-image-settings');
 const {
   PI_PROVIDERS,
   PI_CUSTOM_PROVIDER,
@@ -57,7 +58,7 @@ function _hostOf(baseUrl) {
 // legacy OpenRouter default), is tool-capable. A headless objective turn on such a row runs with
 // no tools from the first attempt; a task terminal or a task/project chat refuses to start.
 function piRowSupportsTools(entry) {
-  return !(isPiCustomEntry(entry) && entry.tools === false);
+  return !isImageModel(entry) && !(isPiCustomEntry(entry) && entry.tools === false);
 }
 
 // Where a PI_MODELS row's requests go, for user-facing error copy: a custom row's endpoint host,
@@ -81,7 +82,7 @@ function toolCompatMessage(model, host, { declared = false } = {}) {
 // row 0 unless it sets `tools: false`. A tool-less row 0 stays the objective-chat default, but must
 // not block a task start while a tool-capable row exists. null when no row takes tools.
 function piTaskDefaultEntry(cfg) {
-  return readPiEntries(cfg).find((entry) => piRowSupportsTools(entry)) || null;
+  return readPiEntries(cfg).find((entry) => isImageModel(entry) || piRowSupportsTools(entry)) || null;
 }
 
 // Whether a requested model id may run a Pi task terminal: { entry } for a configured row whose model
@@ -90,8 +91,15 @@ function piTaskDefaultEntry(cfg) {
 // saved pi_model with this; either miss falls back to the task default (piTaskDefaultEntry()).
 function piTaskEntryForModel(cfg, modelId) {
   const entry = piEntryForModel(cfg, modelId);
+  if (!entry) {
+    const requested = String(modelId || '').trim().toLowerCase();
+    const raw = (Array.isArray(cfg?.PI_MODELS) ? cfg.PI_MODELS : []).find(row => String(row?.model || '').trim().toLowerCase() === requested);
+    // Keep an explicitly selected image row on the image path even if its key/settings
+    // became invalid. The image start gate reports that problem instead of launching text.
+    if (isImageModel(raw)) return { entry: raw, reason: null };
+  }
   if (!entry) return { entry: null, reason: 'unknown' };
-  if (!piRowSupportsTools(entry)) return { entry: null, reason: 'no-tools' };
+  if (!isImageModel(entry) && !piRowSupportsTools(entry)) return { entry: null, reason: 'no-tools' };
   return { entry, reason: null };
 }
 

@@ -450,7 +450,7 @@ test('module entry points are inert before mount and idempotent per root afterwa
 
 test('template mounts the block once with the nav panel and resets it with the project dir', () => {
   const template = read('./template.html');
-  assert.match(template, /onProjectChanged\(async \(dir, name\) => \{(?:\s*\/\/[^\n]*)*\s*resetAgentQuota\(dir\);/);
+  assert.match(template, /onProjectChanged\(async \(dir, name, contextChanged = false\) => \{(?:\s*\/\/[^\n]*)*\s*resetAgentQuota\(dir\);/);
   assert.equal(template.split('initializeAgentQuotaSidebar(').length - 1, 1, 'exactly one mount call site');
   const block = template.indexOf('<section id="agent-quota-sidebar"');
   assert.ok(block > template.indexOf('id="active-sessions-list"'), 'block follows the main nav group');

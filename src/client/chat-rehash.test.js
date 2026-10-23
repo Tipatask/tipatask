@@ -27,6 +27,7 @@ function chat() {
     state, MAX_TABS: 5, DRAFT_KEY_OBJECTIVE: 'draft', ACTIVE_NEW_TAB_KEY: 'active', CHAT_STATE_KEY: 'chat',
     _pendingComposerSeed: null, _saveChatTimer: null, discussTaskCache: new Map(),
     _pendingComposerRestore: null, captureFocusedComposerForRerender: () => null,
+    _pendingTranscriptRestore: null, captureTranscriptForRerender: () => null,
     getObjectiveDraftKey: () => 'draft-' + state.activeTabId,
     loadDraft: key => drafts.get(key), saveDraft: (key, value) => drafts.set(key, value), clearDraft: key => drafts.delete(key),
     isPristineObjectiveTab: t => !t.chatState,
@@ -58,7 +59,7 @@ function chat() {
   };
   vm.createContext(env);
   for (const name of ['rehashPayload', 'spawnObjectiveTab', 'openNewTab', 'tabSubtaskCtx', 'tabOriginTaskKey',
-    'tabDiscussKey', 'renderObjectiveContent',
+    'tabDiscussKey', 'renderObjectiveContent', 'transcriptStamp', 'transcriptStampAttrs',
     'startChat', 'connectObjectiveWS', 'sendChatMessage', 'clearActiveTab',
     'saveChatState', 'restoreChatState', '_wrapChatStateInTab']) loadFunction(env, name);
   return { env, state, tab, drafts, storage, sockets };

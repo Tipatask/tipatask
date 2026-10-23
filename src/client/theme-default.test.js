@@ -304,6 +304,7 @@ test('no focus, inline-edit or current-pick rule paints an outline, border or bo
     '.preview-card:not(.card) .preview-title.editing',
     '.preview-card:not(.card) .preview-desc.editing',
     '.agent-selector-btn--current',
+    '.image-task-action:focus-visible',
   ]) {
     assert.ok(usesBorder.includes(selector), `${selector} lost --c-primary-border`);
   }
@@ -400,7 +401,7 @@ test('accent text on tinted task cards sits on an AA-safe ground', () => {
 // colour over its real ground at whatever opacity the sheet applies (container × element), so a
 // re-added fade or a token swap to a too-faint colour fails here.
 const CLEAN_RULES = [...CSS.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]*)\{([^{}]*)\}/g)]
-  .map((m) => ({ parts: splitArgs(m[1].trim()).map((p) => p.replace(/\s+/g, ' ')), body: m[2] }));
+  .map((m, index) => ({ index, parts: splitArgs(m[1].trim()).map((p) => p.replace(/\s+/g, ' ')), body: m[2] }));
 
 // Last value of `prop` among the rules whose selector list holds `selector` exactly.
 function ruleValue(selector, prop) {
@@ -425,7 +426,50 @@ function splitArgs(inner) {
   return out;
 }
 
-// Resolves hex, var(--x[, fallback]) and two-stop color-mix(in srgb, …) to a hex colour.
+// (TPT9060) sRGB hex ↔ OKLab (Björn Ottosson's matrices), for the relative oklch() colour the
+// completed-card grey is. Channels are clamped to the sRGB gamut the way a browser paints them.
+function toOklab(hex) {
+  const [r, g, b] = rgb(hex).map((channel) => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  return [
+    0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+  ];
+}
+
+function fromOklab([L, a, b]) {
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3;
+  const linear = [
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+  ];
+  return `#${linear.map((channel) => {
+    const v = Math.min(1, Math.max(0, channel));
+    const encoded = v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055;
+    return Math.round(encoded * 255).toString(16).padStart(2, '0');
+  }).join('')}`;
+}
+
+// An rgba() token composited over an opaque hex ground (the objective card's --c-primary-lighter tint).
+function overRgba(expr, groundHex) {
+  const m = /^rgba\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*\)$/.exec(expr.trim());
+  assert.ok(m, `expected an rgba() tint, got ${expr}`);
+  const alpha = Number(m[4]);
+  const ground = rgb(groundHex);
+  return `#${[m[1], m[2], m[3]].map((c, i) => Math.round(Number(c) * alpha + ground[i] * (1 - alpha)).toString(16).padStart(2, '0')).join('')}`;
+}
+
+// Resolves hex, var(--x[, fallback]), two-stop color-mix(in srgb, …) and a lightness-shifted
+// relative oklch(from … calc(l ± n) c h) to a hex colour.
 function resolveColor(expr, values) {
   const e = expr.trim();
   if (/^#[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(e)) return e;
@@ -435,6 +479,11 @@ function resolveColor(expr, values) {
     if (values[name] !== undefined) return resolveColor(values[name], values);
     assert.ok(fallback, `cannot resolve ${name}`);
     return resolveColor(fallback, values);
+  }
+  m = /^oklch\(from (.+) calc\(l ([+-]) (\d*\.?\d+)\) c h\)$/.exec(e);
+  if (m) {
+    const [L, a, b] = toOklab(resolveColor(m[1], values));
+    return fromOklab([L + (m[2] === '-' ? -1 : 1) * Number(m[3]), a, b]);
   }
   m = /^color-mix\(in srgb,(.*)\)$/.exec(e);
   assert.ok(m, `unsupported colour expression: ${e}`);
@@ -469,18 +518,17 @@ function layeredPalette(id, values, darkIds) {
   };
 }
 
-test('closed cards and done To-Do rows keep text at AA at their effective opacity in every palette', () => {
+test('canceled cards and done To-Do rows keep text at AA at their effective opacity in every palette', () => {
   const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
   assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
   const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
 
+  // (TPT9060) Completed cards paint every glyph in one grey — covered by the test below.
   const META = ':is(.deps, .card-deps-label, .effort-badge, .card-due:not(.overdue))';
   const cases = [];
-  for (const role of ['complete', 'canceled']) {
-    const card = `.card[data-status-role="${role}"]`;
-    for (const el of ['.card-title', '.card-desc', META]) {
-      cases.push({ label: `${role} card ${el === META ? 'meta' : el}`, container: card, el: `${card} ${el}`, ground: `${card}` });
-    }
+  const canceled = '.card[data-status-role="canceled"]';
+  for (const el of ['.card-title', '.card-desc', META]) {
+    cases.push({ label: `canceled card ${el === META ? 'meta' : el}`, container: canceled, el: `${canceled} ${el}`, ground: canceled });
   }
   const todo = '.todo-item[data-status-role="complete"]';
   cases.push({ label: 'done To-Do title', container: todo, el: '.todo-title.done', ground: '.todo-item' });
@@ -506,10 +554,8 @@ test('closed cards and done To-Do rows keep text at AA at their effective opacit
     }
 
     // The closed cue must survive without the fade: a dimmer title than open cards…
-    for (const role of ['complete', 'canceled']) {
-      const title = resolveColor(value(`.card[data-status-role="${role}"] .card-title`, 'color'), v);
-      assert.notEqual(title, resolveColor('var(--c-text)', v), `${id} ${role} title must not use the open-card --c-text`);
-    }
+    const title = resolveColor(value(`${canceled} .card-title`, 'color'), v);
+    assert.notEqual(title, resolveColor('var(--c-text)', v), `${id} canceled title must not use the open-card --c-text`);
     // …and, in light palettes, a closed ground distinct from the open card.
     if (!dark) {
       assert.notEqual(
@@ -527,6 +573,177 @@ test('closed cards and done To-Do rows keep text at AA at their effective opacit
   ]) {
     assert.match(ruleValue(selector, 'text-decoration') ?? '', /line-through/, `${selector} lost its strike-through closed cue`);
   }
+});
+
+// (TPT9060) A completed card paints every glyph in one grey, --c-card-completed-text: its closed
+// ground moved a fixed OKLCH lightness step, which lands just above AA in every palette with no
+// per-theme value. Chips drop their fills, so every glyph's ground is the card itself — the plain
+// closed ground, or the objective tint over it. The grey has to clear 4.5:1 on both and stay at or
+// under 6:1 on the plain ground; any brighter and the card stops reading as done.
+const COMPLETED = '.card[data-status-role="complete"]';
+const COMPLETED_TEXT_TARGETS = [
+  '.card-title', '.card-desc', '.card-desc *', '.card-preview-meta', '.id-badge', '.tag-badge', '.deps',
+  '.dep-badge', '.card-deps-label', '.card-due', '.effort-badge', '.ai-stats', '.subtask-item .subtask-title',
+];
+const COMPLETED_CHIP_TARGETS = ['.id-badge', '.tag-badge', '.dep-badge', '.card-due', '.card-desc code', '.card-desc .file-ref', '.effort-badge'];
+
+// Specificity [ids, classes, types] of one complex selector: :is()/:not()/:has() count their most
+// specific argument, :where() counts nothing, a pseudo-element counts as a type.
+function specificity(selector) {
+  const out = [0, 0, 0];
+  const name = /^[\w-]+/;
+  for (let i = 0; i < selector.length;) {
+    const ch = selector[i];
+    if (ch === '#' || ch === '.') {
+      out[ch === '#' ? 0 : 1]++;
+      i += 1 + (name.exec(selector.slice(i + 1))?.[0].length ?? 0);
+    } else if (ch === '[') {
+      out[1]++;
+      const close = selector.indexOf(']', i);
+      i = close < 0 ? selector.length : close + 1;
+    } else if (ch === ':') {
+      const element = selector[i + 1] === ':';
+      i += element ? 2 : 1;
+      const pseudo = name.exec(selector.slice(i))?.[0] ?? '';
+      i += pseudo.length;
+      let args = null;
+      if (selector[i] === '(') {
+        let depth = 0;
+        const start = i + 1;
+        for (; i < selector.length; i++) {
+          if (selector[i] === '(') depth++;
+          else if (selector[i] === ')' && --depth === 0) break;
+        }
+        args = selector.slice(start, i++);
+      }
+      if (element || ['before', 'after', 'first-line', 'first-letter'].includes(pseudo)) out[2]++;
+      else if (['is', 'not', 'has', 'matches'].includes(pseudo)) {
+        const top = splitArgs(args).map(specificity).sort(compareSpecificity).pop();
+        top.forEach((n, k) => { out[k] += n; });
+      } else if (pseudo !== 'where') out[1]++;
+    } else if (/[a-z]/i.test(ch)) {
+      out[2]++;
+      i += name.exec(selector.slice(i))[0].length;
+    } else i++;
+  }
+  return out;
+}
+
+function compareSpecificity(a, b) {
+  return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+}
+
+// The last compound selector: the part that names the element a rule styles.
+function lastCompound(selector) {
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < selector.length; i++) {
+    const ch = selector[i];
+    if (ch === '(' || ch === '[') depth++;
+    else if (ch === ')' || ch === ']') depth--;
+    else if (depth === 0 && ' >+~'.includes(ch)) start = i + 1;
+  }
+  return selector.slice(start).trim();
+}
+
+// The last `prop` a completed-card rule gives `target` — a `${COMPLETED} ${target}` selector or a
+// `${COMPLETED} :is(…)` list naming it — with that rule's specificity and source position.
+function completedRule(target, prop) {
+  let found = null;
+  for (const { index, parts, body } of CLEAN_RULES) {
+    for (const part of parts) {
+      if (!part.startsWith(`${COMPLETED} `)) continue;
+      const rest = part.slice(COMPLETED.length + 1);
+      const list = /^:is\((.*)\)$/.exec(rest);
+      if (!(list ? splitArgs(list[1]) : [rest]).includes(target)) continue;
+      for (const d of body.matchAll(new RegExp(`(?:^|[;\\s])${prop}\\s*:\\s*([^;]+)`, 'g'))) {
+        found = { value: d[1].trim(), specificity: specificity(part), index };
+      }
+    }
+  }
+  return found;
+}
+
+test('completed cards paint every glyph in one grey just above AA in every palette', () => {
+  const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
+  assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
+  const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+
+  // The objective tint below is composited from this exact layering.
+  assert.match(
+    ruleValue('.card.objective-highlight', 'background') ?? '',
+    /^linear-gradient\(var\(--c-primary-lighter\), var\(--c-primary-lighter\)\),\s*var\(--card-bg\)$/,
+    '.card.objective-highlight changed how it tints the card ground — update the objective case here',
+  );
+  for (const target of COMPLETED_TEXT_TARGETS) {
+    assert.ok(completedRule(target, 'color'), `${COMPLETED} ${target} has no color rule`);
+    assert.equal(completedRule(target, 'opacity'), null, `${COMPLETED} ${target} must not fade`);
+  }
+  for (const target of COMPLETED_CHIP_TARGETS) {
+    assert.equal(completedRule(target, 'background')?.value, 'transparent', `${COMPLETED} ${target} keeps a fill`);
+  }
+
+  for (const { id, values } of themePalettes()) {
+    if (id !== ':root') {
+      assert.equal(values['--c-card-completed-text'], undefined, `[data-theme="${id}"] must not carry its own completed-card grey`);
+    }
+    const dark = darkIds.has(id);
+    const v = layeredPalette(id, values, darkIds);
+    const value = (sel, prop) => (dark && ruleValue(`.theme-dark ${sel}`, prop)) || ruleValue(sel, prop);
+    const grey = resolveColor('var(--c-card-completed-text)', v);
+    for (const target of COMPLETED_TEXT_TARGETS) {
+      assert.equal(resolveColor(completedRule(target, 'color').value, v), grey, `${id} completed ${target} must use --c-card-completed-text`);
+    }
+    assert.equal(resolveOpacity(value(COMPLETED, 'opacity'), v), 1, `${id} completed card must not fade`);
+
+    const ground = resolveColor(value(COMPLETED, 'background'), v);
+    const plain = contrastRatio(grey, ground);
+    const tinted = contrastRatio(grey, overRgba(v['--c-primary-lighter'], ground));
+    assert.ok(plain >= 4.5, `${id} completed text is ${plain.toFixed(2)}:1 on the closed ground; expected at least 4.5:1`);
+    assert.ok(tinted >= 4.5, `${id} completed text is ${tinted.toFixed(2)}:1 under the objective tint; expected at least 4.5:1`);
+    assert.ok(plain <= 6, `${id} completed text is ${plain.toFixed(2)}:1 on the closed ground; expected at most 6:1 so it reads muted`);
+    for (const open of ['--c-text', '--c-text-secondary']) {
+      assert.notEqual(grey, resolveColor(`var(${open})`, v), `${id} completed text must not reuse the open-card ${open}`);
+    }
+  }
+});
+
+// (TPT9060) The completed-card rules sit late in styles.css because some component and
+// .theme-dark rules share their specificity. Any other rule that colours one of those elements
+// (hover states included) or fills one of the chips must lose the cascade to them: lower
+// specificity, or equal and earlier in the file.
+test('no other rule outranks the completed-card text and chip rules', () => {
+  // Never on a completed card: another status role's rules, and proposal cards (.preview-card),
+  // which carry no data-status-role at all.
+  const elsewhere = (part) => /\[data-status-role=/.test(part) || /\.preview-card\b/.test(part);
+  const names = (cls) => (part) => new RegExp(`\\.${cls}(?:--[\\w-]+)?(?![\\w-])`).test(lastCompound(part));
+  const inDesc = (last) => (part) => /\.card-desc\s/.test(part) && last.test(lastCompound(part));
+  const COLOR = /(?:^|[;\s])color\s*:/;
+  const BACKGROUND = /(?:^|[;\s])background(?:-color)?\s*:/;
+  const offenders = [];
+  const check = (target, prop, declares, styles) => {
+    const ours = completedRule(target, prop);
+    assert.ok(ours, `${COMPLETED} ${target} has no ${prop} rule`);
+    for (const { index, parts, body } of CLEAN_RULES) {
+      if (!declares.test(body)) continue;
+      for (const part of parts) {
+        if (elsewhere(part) || !styles(part)) continue;
+        if ((compareSpecificity(specificity(part), ours.specificity) || index - ours.index) > 0) {
+          offenders.push(`${part} outranks the completed-card ${target} ${prop}`);
+        }
+      }
+    }
+  };
+  for (const target of COMPLETED_TEXT_TARGETS) {
+    check(target, 'color', COLOR, target === '.card-desc *' ? inDesc(/./) : names(/([\w-]+)$/.exec(target)[1]));
+  }
+  for (const target of COMPLETED_CHIP_TARGETS) {
+    const styles = target === '.card-desc code' ? inDesc(/^code\b/)
+      : target === '.card-desc .file-ref' ? inDesc(/\.file-ref(?![\w-])/)
+      : names(target.slice(1));
+    check(target, 'background', BACKGROUND, styles);
+  }
+  assert.deepEqual(offenders, [], `rules that would recolour completed-card text: ${offenders.join('; ')}`);
 });
 
 // (TPT686) The Start button on a closed card is still an active control (it re-runs the task),

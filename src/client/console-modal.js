@@ -20,6 +20,8 @@ import { isInProgressName, isClosedName, isCompleteName, inProgressName, loadSta
 import { replayProgressLog, progressStatusLine } from './objective-progress-log.js';
 import { getAgentDisplayLabel } from './agent-select.js';
 import { piTaskModelIds, piOnlyToolLess } from './pi-task-models.js';
+import { renderTerminalPermissions } from './terminal-permissions.js';
+import { renderImageTask } from './image-task-view.js';
 import { clearAttention, markSessionLost, dismissLostSession, mergeSessionsSnapshot } from './attention-state.js';
 import { _isPinnedToBottom, createTerminalOutputWriter } from './terminal-output.js';
 
@@ -120,6 +122,7 @@ function _isPiProviderUsable() {
   const p = (state.objectiveProviders || []).find((x) => x.id === 'pi');
   if (!p) return false;
   if (piOnlyToolLess(state.objectiveProviders)) return false;
+  if (p.imageModels?.length) return p.enabled !== false && p.available !== false;
   if (typeof p.selectable === 'boolean') return p.selectable;
   return Array.isArray(p.configuredModels) && p.configuredModels.length > 0;
 }
@@ -807,6 +810,13 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   let processRunning = true;
   let restartingLoss = !!opts.restartLost;
   let terminalPhase = 'planning';
+  // (TPT9078) The run's permission mode, mirrored from each `terminal-state` frame for the
+  // header label and terminalController.permissionMode only. It never gates input: in every
+  // mode — Plan included — term.onData() keeps forwarding keystrokes to the PTY, so the agent's
+  // own dialogs (Claude's ExitPlanMode / permission menus, Codex and Pi approval prompts) are
+  // answered with 1/2/3, arrows and Enter typed straight into the xterm. The plan-ready bar and
+  // the pending-approval panel are optional mirrors of those dialogs, not the only way in.
+  let terminalPermissionMode = null;
   let terminalOpened = false;
   let terminalClosing = false;
   let terminalDisposed = false;
@@ -971,6 +981,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     dlg.querySelector('.btn-plan-proceed').addEventListener('click', () => {
       if (wsIsOpen()) ws.send(JSON.stringify({ type: 'plan-approve' }));
       setCodexPlanReady(false);
+      // (TPT9078) The click moved focus onto the button; hand it back to the xterm so the
+      // next keystroke still reaches the agent.
+      requestAnimationFrame(focusTerminalWithoutScrollJump);
     });
     dlg.querySelector('.btn-plan-discard').addEventListener('click', () => {
       dlg.remove();
@@ -1276,6 +1289,18 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       } else if (msg.type === 'terminal-state') {
         applyTaskAgentConfig(msg);
         adoptSessionAgent(taskId, msg); // (TPT413) spawnTerminal() rewrites session.taskAgent after pty.spawn
+        terminalPermissionMode = msg.permissionMode || null;
+        terminalController.permissionMode = terminalPermissionMode;
+        // (TPT9078) A pending permissionRequest renders the approval panel without taking focus
+        // from the xterm — the user may keep typing into the agent's own dialog instead. After a
+        // panel button answers, focus goes back to the terminal (the click moved it to the button).
+        renderTerminalPermissions(overlay, msg, frame => {
+          if (!wsIsOpen()) return false;
+          ws.send(JSON.stringify(frame));
+          requestAnimationFrame(focusTerminalWithoutScrollJump);
+          return true;
+        });
+        if (msg.imageTask) renderImageTask(overlay, msg.imageTask, frame => { if (wsIsOpen()) ws.send(JSON.stringify(frame)); });
         forgetQueuedStart(taskId);
         adoptSessionStart(taskId, msg);
         restartingLoss = false;
@@ -1309,7 +1334,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
               ? t('terminal.status.planningCommand', { command: state.planApprovalCommand })
               : t('terminal.status.planningDialog'))
           : t('terminal.status.executing'));
-        state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), paused: msg.paused || null });
+        state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), paused: msg.paused || null, permissionMode: msg.permissionMode ?? null, permissionSource: msg.permissionSource ?? null });
         renderWatchdogActions(msg.paused);
         syncActiveSessionsNav();
         terminalController.phase = terminalPhase;
@@ -1319,6 +1344,13 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         terminalController.planApprovalCommand = terminalPlanApprovalCommand;
         terminalController.codexPlanReady = terminalCodexPlanReady;
         maybeSendCodexResumeRedraw();
+      } else if (msg.type === 'image-task-state') {
+        renderImageTask(overlay, msg.imageTask, frame => { if (wsIsOpen()) ws.send(JSON.stringify(frame)); });
+        scheduleTerminalRefresh({ send: true });
+      } else if (msg.type === 'image-task-error') {
+        const status = overlay.querySelector('.image-task-results > p');
+        if (status) status.textContent = msg.message;
+        for (const button of overlay.querySelectorAll('.image-task-results button')) button.disabled = false;
       } else if (msg.type === 'data') {
         const isFirstResumeData = isResume && !firstResumeDataSeen;
         if (isFirstResumeData) firstResumeDataSeen = true;
@@ -1651,6 +1683,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     taskAgent: opts.agent || state.taskAgent,
     planApprovalCommand: terminalPlanApprovalCommand,
     codexPlanReady: terminalCodexPlanReady,
+    permissionMode: terminalPermissionMode, // (TPT9078) display mirror only, never an input gate
     detached: false,
     refresh({ send = false, focus = false } = {}) {
       scheduleTerminalRefresh({ send });
@@ -1920,7 +1953,9 @@ function _buildAgentSelectorButtons() {
           const current = piIsCurrent && i === 0;
           const cls = current ? ' agent-selector-btn--current' : '';
           const ariaAttr = current ? ' aria-current="true"' : '';
-          return `<button class="agent-selector-btn${cls}" data-agent="pi" data-model="${escapeAttr(model)}" title="${escapeAttr(model)}"${ariaAttr}>${_agentSelectorIcon('pi')}<span class="agent-btn-label">${escapeAttr(_shortModelName(model))}</span></button>`;
+          const image = state.objectiveProviders.find(p => p.id === 'pi')?.imageModels?.includes(model);
+          const badge = image ? ` · ${t('agentSelect.purposeImage')}` : '';
+          return `<button class="agent-selector-btn${cls}" data-agent="pi" data-model="${escapeAttr(model)}" title="${escapeAttr(model)}"${ariaAttr}>${_agentSelectorIcon('pi')}<span class="agent-btn-label">${escapeAttr(_shortModelName(model) + badge)}</span></button>`;
         }).join('');
       }
       // (C1115) Pi's card names the actually-configured model, not the generic "Other

@@ -17,6 +17,22 @@ const GIT_ALL_ON = { type: 'git', worktree: true, commit: true, pr: true };
 const BLANK_TAG_OPTS = { taskTags: ['tt-foo'], tagDescriptions: { 'tt-foo': '' } };
 const ALL_OPTS = { vcsSettings: GIT_ALL_ON, agentLimits: { maxSubagents: 5 }, ...BLANK_TAG_OPTS };
 
+test('Bypass prompts retain VCS/completion guards and omit the legacy planning pause, including simple mode', t => {
+  const config = require('../config');
+  const previous = config.SIMPLE_MODE;
+  config.SIMPLE_MODE = true;
+  t.after(() => { config.SIMPLE_MODE = previous; });
+  for (const agent of [new ClaudeAgent(), new CodexAgent(), new PiAgent()]) {
+    const permissionPolicy = agent.buildPermissionPolicy({ mode: 'bypass', source: 'task' });
+    const text = agent.buildPrompt('Implement the task.', { ...ALL_OPTS, permissionPolicy,
+      vcsContext: { verified: true, vcs: GIT_ALL_ON, projectId: 2 }, piMcpBridge: true });
+    assert.match(text, /without approval pauses/);
+    assert.match(text, /complete_task|tt complete/);
+    assert.match(text, /git commit/);
+    assert.doesNotMatch(text, /You are starting in planning mode|then wait for Task App approval/);
+  }
+});
+
 function bareAgent() {
   return new (class extends BaseTaskAgent { constructor() { super('x', 'X'); } })();
 }

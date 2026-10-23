@@ -33,7 +33,8 @@ async function withClient(lang, run) {
   class Socket {
     static OPEN = 1; static CONNECTING = 0;
     constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
-    send() {}
+    sent = [];
+    send(raw) { this.sent.push(JSON.parse(raw)); }
     close() { this.readyState = 3; this.onclose?.(); }
     open() { this.readyState = 1; this.onopen?.(); }
     error() { this.onerror?.(); }
@@ -162,9 +163,9 @@ for (const lang of ['en', 'uk']) {
       assert.equal(dot.title, copy.connected);
 
       socket.frame({ type: 'config', showAiStats: true, taskAgent: 'claude', planApprovalCommand: '/approve-plan' });
-      socket.frame({ type: 'terminal-state', phase: 'planning', taskAgent: 'claude', planApprovalCommand: '/approve-plan' });
+      socket.frame({ type: 'terminal-state', phase: 'planning', taskAgent: 'claude', permissionMode: 'plan', planApprovalCommand: '/approve-plan' });
       assert.equal(dot.title, copy.planningCommand);
-      socket.frame({ type: 'terminal-state', phase: 'planning', taskAgent: 'claude', planApprovalCommand: null });
+      socket.frame({ type: 'terminal-state', phase: 'planning', taskAgent: 'claude', permissionMode: 'plan', planApprovalCommand: null });
       assert.equal(dot.title, copy.planningDialog);
 
       socket.frame({ type: 'plan-ready' });
@@ -176,6 +177,7 @@ for (const lang of ['en', 'uk']) {
       ], copy.planReady);
       bar.querySelector('.btn-plan-proceed').click();
       assert.equal(overlay.querySelector('.plan-ready-dialog'), null, 'Proceed removes the bar');
+      assert.ok(socket.sent.some(frame => frame.type === 'plan-approve'), 'explicit Plan approves in place');
 
       // Missing token, then an invalid or expired one.
       const authCopy = () => {

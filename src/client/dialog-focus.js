@@ -5,12 +5,22 @@ const priorInert = new Map();
 let observer = null;
 
 const FOCUSABLE = 'a[href], button, input, select, textarea, [tabindex]';
+// Menus a shared widget moves to <body> while open belong to the layer that holds their
+// trigger, whatever that layer's own `portals` says (TPT9084): permission-mode-select.js's
+// listbox names its trigger in aria-labelledby.
+const SHARED_PORTALS = '.permission-mode-select-menu[data-portaled="1"]';
 
 function top() { return layers[layers.length - 1]; }
 
+function ownsSharedPortal(layer, portal) {
+  const trigger = document.getElementById(portal.getAttribute('aria-labelledby') || '');
+  return !!trigger && layer.root.contains(trigger);
+}
+
 function portalsFor(layer) {
-  return layer.portals ? [...document.body.querySelectorAll(layer.portals)]
-    .filter(el => !layer.root.contains(el) && el.isConnected) : [];
+  const own = layer.portals ? [...document.body.querySelectorAll(layer.portals)] : [];
+  const shared = [...document.body.querySelectorAll(SHARED_PORTALS)].filter(el => ownsSharedPortal(layer, el));
+  return [...new Set([...own, ...shared])].filter(el => !layer.root.contains(el) && el.isConnected);
 }
 
 function inside(layer, el) {

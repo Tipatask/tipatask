@@ -12,7 +12,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync, spawn } = require('node:child_process');
+const { execFile, execFileSync, spawn } = require('node:child_process');
 
 app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-raise-probe-')));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -39,6 +39,7 @@ if (process.argv.includes('--fullscreen-helper')) {
     const openProject = (dir, { slow = false } = {}) => {
       const w = new BrowserWindow({ width: 640, height: 400 });
       projects.set(w, dir);
+      notifyTarget.trackOnScreen(w);
       sent.set(w, []);
       let pageLoaded = false;
       w.webContents.on('did-finish-load', () => { pageLoaded = true; });
@@ -50,15 +51,20 @@ if (process.argv.includes('--fullscreen-helper')) {
     };
     const live = () => [...projects.keys()].filter((w) => !w.isDestroyed());
     const ownerOf = (dir) => live().find((w) => projects.get(w) === dir) || null;
-    // Mirrors main.js focusWindow(w, { steal: true }).
+    // Mirrors main.js focusWindow(w, { steal: true }) and focusNotificationTarget().
     const focus = (w) => {
       if (w.isDestroyed()) return false;
-      if (mac) app.focus({ steal: true });
+      if (mac) {
+        try { if (app.isHidden()) app.show(); } catch {}
+        app.focus({ steal: true });
+      }
       if (w.isMinimized()) w.restore();
       w.show(); w.focus(); w.moveTop();
       return true;
     };
-    const raise = (w) => notifyTarget.raiseWindow(w, { focus });
+    const raiseDeps = notifyTarget.createRaiseDeps({ app, exec: execFile, execPath: process.execPath });
+    let lastRaise = null;
+    const raise = (w) => notifyTarget.raiseWindow(w, { focus, ...raiseDeps, trace: (t) => { lastRaise = t; } });
     const originWindow = (origin) => ownerOf(origin.projectPath);
     const clicks = [];
     surface = createDesktopNotifications({ BrowserWindow, screen, ipcMain,
@@ -105,7 +111,8 @@ if (process.argv.includes('--fullscreen-helper')) {
       assert.equal(opened(target).every((m) => m.loaded), true, `${label}: list sent to a page that was still loading`);
       const focused = !!(await until(() => target.isFocused(), 3000));
       await delay(250);
-      rows.push({ case: label, listIn: projects.get(target), focused, bannerHidden: !banner().isVisible() });
+      rows.push({ case: label, listIn: projects.get(target), focused, bannerHidden: !banner().isVisible(),
+        stage: lastRaise ? `${lastRaise.stages.join('>')}:${lastRaise.ok ? 'ok' : 'failed'}` : null });
       console.log(JSON.stringify(rows.at(-1)));
       assert.equal(focused, true, `${label}: the list window did not take focus`);
       assert.equal(banner().isVisible(), false, `${label}: the banner stayed up over a focused list`);
@@ -162,7 +169,8 @@ if (process.argv.includes('--fullscreen-helper')) {
     wc.sendInputEvent({ type: 'mouseUp', ...point, button: 'left', clickCount: 1 });
     const pressed = await until(() => clicks[0]);
     assert.ok(pressed, 'a re-render during the press swallowed the card click');
-    rows.push({ case: 'card click with a re-render mid-press', clickIn: projects.get(pressed.w), focused: pressed.focused });
+    rows.push({ case: 'card click with a re-render mid-press', clickIn: projects.get(pressed.w), focused: pressed.focused,
+      stage: lastRaise ? `${lastRaise.stages.join('>')}:${lastRaise.ok ? 'ok' : 'failed'}` : null });
     console.log(JSON.stringify(rows.at(-1)));
     assert.equal(pressed.focused, true);
 
@@ -176,7 +184,8 @@ if (process.argv.includes('--fullscreen-helper')) {
     assert.ok(late, 'a card whose window closed did nothing');
     assert.equal(projects.get(late.w), '/probe/B');
     assert.equal(sent.get(late.w).find((m) => m.channel === 'notify:clicked').loaded, true, 'click sent to a page that was still loading');
-    rows.push({ case: 'card click after its window closed → project reopened', clickIn: '/probe/B', focused: late.focused });
+    rows.push({ case: 'card click after its window closed → project reopened', clickIn: '/probe/B', focused: late.focused,
+      stage: lastRaise ? `${lastRaise.stages.join('>')}:${lastRaise.ok ? 'ok' : 'failed'}` : null });
     console.log(JSON.stringify(rows.at(-1)));
     assert.equal(late.focused, true);
 

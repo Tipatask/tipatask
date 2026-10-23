@@ -35,6 +35,8 @@ test('actual terminal launch passes fresh project settings through the real Code
   let row = { id: 1, vcs_type: 'git', vcs_worktree_enabled: 1, vcs_commit_enabled: 1, vcs_pr_enabled: 1, vcs_merge_enabled: 1, kb_sync_as_you_go: false };
   const reads = [];
   const backend = {
+    async getTask(id) { return { id, agentPermissionMode: null }; },
+    async getEffectiveProjectSettings() { return { settings: { agent_permission_mode: null } }; },
     async getProjectSettings(opts) { reads.push(opts); return row; },
     async getStatuses() { return [{ name: 'done', is_workflow_complete: true }]; },
     async getTaskComments() { return []; },

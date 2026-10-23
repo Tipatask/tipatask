@@ -976,7 +976,7 @@ function saveTerminalDefaults(file, updates) {
 // Each native home is an immutable configuration/environment snapshot. Concurrent
 // consoles cannot overwrite effort, and token or permission changes get a new
 // daemon boundary. Project MCP wiring remains in the usual project config.
-function prepareCodexTerminalHome({ projectRoot, codexHome, effort, env = {} }) {
+function prepareCodexTerminalHome({ projectRoot, codexHome, effort, env = {}, overrides = {} }) {
   if (!['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(effort)) {
     throw new Error('Invalid Codex terminal effort');
   }
@@ -1008,6 +1008,12 @@ function prepareCodexTerminalHome({ projectRoot, codexHome, effort, env = {} }) 
   content = upsertProjectTrustLevel(content, fs.realpathSync(projectRoot));
   for (const [key, value] of Object.entries(settings)) {
     content = `${key} = ${tomlValue(value)}\n${removeTopLevelTomlKey(content, key)}`;
+  }
+  for (const [key, value] of Object.entries(overrides)) {
+    const dot = key.lastIndexOf('.');
+    content = dot < 0
+      ? `${key} = ${tomlValue(value)}\n${removeTopLevelTomlKey(content, key)}`
+      : upsertTomlKey(content, key.slice(0, dot), key.slice(dot + 1), tomlValue(value));
   }
   // Paths relative to the original user config keep their original meaning.
   for (const key of ['model_catalog_json', 'model_instructions_file', 'experimental_compact_prompt_file']) {
@@ -1183,6 +1189,7 @@ module.exports = {
   CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE,
   ensureProjectCodexHome,
   prepareCodexTerminalHome,
+  tomlValue,
   getCodexPaths,
   listProjectMcpServerNames,
   buildScopedCodexMcpOverride,

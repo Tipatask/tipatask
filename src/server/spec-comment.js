@@ -1,13 +1,8 @@
 'use strict';
 
-// C1159: original-objective spec comment gets reference-only header.
-//
-// Problem: overwriteRaw() (api-backend.js) posts the FULL objective text as a
-// comment_type='spec' comment on every new task from that objective. Executor
-// agent reads it (formatTaskCommentsBlock sorts spec first, see base-agent.js)
-// and eagerly implements scope belonging to sibling tasks. Fix: wrap spec text
-// in a header telling agent to treat it as reference only, own task desc is
-// the real scope.
+// Original-objective spec comments define whether the objective is reference
+// for sibling tasks or the binding full spec for a sole task. Executors read
+// spec comments first (formatTaskCommentsBlock in base-agent.js).
 //
 // Dependency-free — no require of project-config/config here. Caller resolves
 // project language and passes it in.
@@ -23,19 +18,35 @@ const SPEC_COMMENT_HEADERS = {
     + 'вони є окремими завданнями.\n\n---\n\n',
 };
 
-function specCommentHeader(lang) {
-  return SPEC_COMMENT_HEADERS[lang] || SPEC_COMMENT_HEADERS.en;
+const SOLE_TASK_SPEC_COMMENT_HEADERS = {
+  en: '## Original Objective (full specification)\n\n'
+    + 'This task covers the whole objective below. Treat every link, image, copy line '
+    + 'and data hint in it as binding requirements, including details omitted from '
+    + 'this task\'s description.\n\n---\n\n',
+  uk: '## Початкова ціль (повна специфікація)\n\n'
+    + 'Це завдання охоплює всю ціль нижче. Вважай кожне посилання, зображення, рядок тексту '
+    + 'та підказку щодо даних у ній обов\'язковими вимогами, включно з деталями, '
+    + 'пропущеними в описі цього завдання.\n\n---\n\n',
+};
+
+const ALL_SPEC_COMMENT_HEADERS = [
+  ...Object.values(SPEC_COMMENT_HEADERS),
+  ...Object.values(SOLE_TASK_SPEC_COMMENT_HEADERS),
+];
+
+function specCommentHeader(lang, opts) {
+  const headers = opts && opts.soleTask ? SOLE_TASK_SPEC_COMMENT_HEADERS : SPEC_COMMENT_HEADERS;
+  return headers[lang] || headers.en;
 }
 
 // header + trimmed spec. Idempotent — a spec already starting with a known
 // header is returned unchanged (dedup + revision turns can call this more
 // than once on the same source text).
-function buildSpecCommentBody(spec, lang) {
+function buildSpecCommentBody(spec, lang, opts) {
   const trimmed = String(spec || '').trim();
   if (!trimmed) return '';
-  const header = specCommentHeader(lang);
-  if (trimmed.startsWith(header)) return trimmed;
-  for (const h of Object.values(SPEC_COMMENT_HEADERS)) {
+  const header = specCommentHeader(lang, opts);
+  for (const h of ALL_SPEC_COMMENT_HEADERS) {
     if (trimmed.startsWith(h)) return trimmed;
   }
   return header + trimmed;
@@ -47,7 +58,7 @@ function buildSpecCommentBody(spec, lang) {
 // save.
 function stripSpecCommentHeader(content) {
   const trimmed = String(content || '').trim();
-  for (const h of Object.values(SPEC_COMMENT_HEADERS)) {
+  for (const h of ALL_SPEC_COMMENT_HEADERS) {
     if (trimmed.startsWith(h)) return trimmed.slice(h.length).trim();
   }
   return trimmed;
@@ -74,6 +85,47 @@ function extractRefTargets(text) {
   const str = String(text || '');
   while ((m = re.exec(str))) targets.add(m[1]);
   return targets;
+}
+
+// Keep images whole (including relative attachment URLs), without emitting their
+// embedded HTTP URL a second time. Bare URLs may end in prose/Markdown punctuation.
+function extractSourceRefs(text) {
+  const refs = [];
+  const re = /!\[[^\]\r\n]*\]\((?:[^()\r\n]|\([^()\r\n]*\))+\)|https?:\/\/[^\s<>"'`]+/gi;
+  for (const match of String(text || '').matchAll(re)) {
+    let ref = match[0];
+    if (!ref.startsWith('![')) {
+      ref = ref.replace(/[.,;:!?]+$/, '');
+      for (const [open, close] of [['(', ')'], ['[', ']'], ['{', '}']]) {
+        while (ref.endsWith(close) && ref.split(close).length > ref.split(open).length) {
+          ref = ref.slice(0, -1);
+        }
+      }
+      ref = ref.replace(/[.,;:!?]+$/, '');
+    }
+    refs.push(ref);
+  }
+  return refs;
+}
+
+function sourceRefTarget(ref) {
+  const image = /^!\[[\s\S]*?\]\(\s*(?:<([^>]+)>|(\S+?))(?:\s+["'][\s\S]*["'])?\s*\)$/.exec(ref);
+  return image ? (image[1] || image[2]) : ref;
+}
+
+// Only restore sources absent from every proposed description. Compare whole
+// destinations, so /images/12 or a different Figma node cannot hide /images/1.
+function missingSourceRefsBlock(objectiveText, descriptions, lang) {
+  const texts = (Array.isArray(descriptions) ? descriptions : [descriptions]).map(text => String(text || ''));
+  const present = new Set(texts.flatMap(text => [
+    ...extractRefTargets(text),
+    ...extractSourceRefs(text).map(sourceRefTarget),
+  ]));
+  const missing = [...new Set(extractSourceRefs(objectiveText))]
+    .filter(ref => !present.has(sourceRefTarget(ref)));
+  if (!missing.length) return '';
+  const heading = lang === 'uk' ? '### Джерельні матеріали' : '### Source material';
+  return '\n\n' + heading + '\n\n' + missing.map(ref => `- ${ref}`).join('\n');
 }
 
 function _refLabel(row, kind, index) {
@@ -127,6 +179,8 @@ module.exports = {
   stripSpecCommentHeader,
   attachmentBlockHeader,
   buildAttachmentRefsBlock,
+  extractSourceRefs,
+  missingSourceRefsBlock,
   SPEC_COMMENT_HEADERS,
   ATTACHMENT_BLOCK_HEADERS,
 };

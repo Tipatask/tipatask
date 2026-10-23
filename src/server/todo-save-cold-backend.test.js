@@ -77,6 +77,9 @@ function makeServer(state) {
       const base = '/api/projects/1';
 
       if (req.method === 'GET' && pathname === '/api/auth/me') return send(200, { user: { id: ME_ID } });
+      if (req.method === 'GET' && pathname === `${base}/settings`) {
+        return send(200, { settings: { language: 'en' }, source: 'personal', is_creator: false });
+      }
       if (req.method === 'GET' && pathname === `${base}/tasks`) {
         return setTimeout(() => send(200, { tasks: state.rows }), state.listDelayMs);
       }

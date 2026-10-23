@@ -223,9 +223,11 @@ test('the banner never activates the app when clicked: macOS borderless panel, W
   }
 });
 
-// (TPT645) A card click keeps the banner up, minus that card, until onClick has raised the
-// project window; only then does it hide for the window that now hosts the alerts.
-test('a banner card click holds the banner until onClick settles, then hides it for the raised window', async (t) => {
+// (TPT645/TPT9056) A card click defers the banner's surface decision until onClick has raised
+// the project window. On macOS the banner steps aside for the raise — the app must have no
+// window on the user's current Space for activation to switch to the project window's Space —
+// and comes back only when no project window took the alerts.
+test('macOS: a card click hides the banner for the raise and brings it back only when nothing was raised', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const flush = () => new Promise((resolve) => setImmediate(resolve));
   const a = projectWindow();
@@ -233,15 +235,79 @@ test('a banner card click holds the banner until onClick settles, then hides it 
   const f = fixture({ projects: [a], clickResult: () => new Promise((resolve) => settles.push(resolve)) });
   await show(f, 3);
   const banner = f.windows[0];
+  assert.equal(banner.visible, true);
   const [newest, ...rest] = f.surface.snapshot();
   f.action(newest.id, 'click');
   assert.equal(f.clicked[0].id, newest.id);
   assert.deepEqual(f.surface.snapshot().map((e) => e.id), rest.map((e) => e.id), 'removed before onClick runs');
   assert.deepEqual(banner.data.entries.map((e) => e.id), rest.map((e) => e.id), 'the card leaves the banner at once');
-  assert.equal(banner.visible, true);
-  // The raise focused the project window, which hosts the alerts now; the banner stays up.
+  assert.equal(banner.visible, false, 'the banner steps aside while the window is raised');
+  // The raise focused the project window, which hosts the alerts now: the banner stays down.
   f.focus(a);
   assert.equal(f.lastSurface(a).active, true);
+  assert.equal(banner.visible, false);
+  settles.shift()();
+  await flush();
+  assert.equal(banner.visible, false, 'nothing to bring back: a project window hosts the alerts');
+
+  // Nothing was raised (another app still in front): the banner returns with the remaining
+  // cards once the click settles.
+  f.focus(null);
+  assert.equal(banner.visible, true);
+  f.action(rest[0].id, 'click');
+  assert.equal(banner.visible, false, 'down for the raise');
+  settles.shift()();
+  await flush();
+  assert.equal(banner.visible, true, 'back, since no project window took the alerts');
+  assert.deepEqual(banner.data.entries.map((e) => e.id), [rest[1].id]);
+
+  // The last card: nothing to show afterwards either way.
+  f.action(rest[1].id, 'click');
+  assert.equal(banner.visible, false);
+  settles.shift()();
+  await flush();
+  assert.equal(banner.visible, false);
+  assert.equal(f.surface.snapshot().length, 0);
+
+  // A click that never settles is released by the cap, which brings the banner back then.
+  await show(f, 2);
+  assert.equal(banner.visible, true);
+  f.action(f.surface.snapshot()[0].id, 'click');
+  assert.equal(banner.visible, false);
+  t.mock.timers.tick(CLICK_HOLD_MS - 1);
+  assert.equal(banner.visible, false);
+  t.mock.timers.tick(1);
+  assert.equal(banner.visible, true, 'released by the cap');
+  settles.shift()();
+  await flush();
+  assert.equal(banner.visible, true, 'a late settle changes nothing');
+
+  // Hide still applies while a click is pending: the banner stays down after the settle.
+  await show(f, 1);
+  f.action(f.surface.snapshot()[0].id, 'click');
+  assert.equal(f.surface.snapshot().length, 1);
+  f.action(null, 'hide');
+  settles.shift()();
+  await flush();
+  assert.equal(banner.visible, false, 'Hide wins over the deferred decision');
+  f.surface.dispose();
+});
+
+// (TPT645) Windows and Linux have no Spaces to switch: the banner stays up, minus the clicked
+// card, until the raise settled, so the desktop never flashes between banner and window.
+test('elsewhere a card click keeps the banner up, minus the card, until onClick settles', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  const a = projectWindow();
+  const settles = [];
+  const f = fixture({ platform: 'win32', projects: [a], clickResult: () => new Promise((resolve) => settles.push(resolve)) });
+  await show(f, 3);
+  const banner = f.windows[0];
+  const [newest, ...rest] = f.surface.snapshot();
+  f.action(newest.id, 'click');
+  assert.deepEqual(banner.data.entries.map((e) => e.id), rest.map((e) => e.id), 'the card leaves the banner at once');
+  assert.equal(banner.visible, true);
+  f.focus(a);
   assert.equal(banner.visible, true, 'held while onClick is still raising the window');
   settles.shift()();
   await flush();
@@ -268,23 +334,16 @@ test('a banner card click holds the banner until onClick settles, then hides it 
   settles.shift()();
   await flush();
   assert.equal(banner.visible, false, 'a late settle changes nothing');
-
-  // Hide and Show on Top off still hide at once while a click is pending.
-  await show(f, 2);
-  f.action(f.surface.snapshot()[0].id, 'click');
-  f.action(null, 'hide');
-  assert.equal(banner.visible, false, 'Hide wins over the hold');
-  settles.shift()();
-  await flush();
-  assert.equal(banner.visible, false);
   f.surface.dispose();
 });
 
 test('a synchronous onClick releases the hold at once', async () => {
   const f = fixture();
-  await show(f, 1);
+  await show(f, 2);
   f.action(f.surface.snapshot()[0].id, 'click');
   assert.equal(f.clicked.length, 1);
+  assert.equal(f.windows[0].visible, true, 'nothing was raised: the remaining card is back at once');
+  f.action(f.surface.snapshot()[0].id, 'click');
   assert.equal(f.windows[0].visible, false, 'the empty banner hides right away');
   f.surface.dispose();
 });
@@ -677,19 +736,24 @@ test('Show More accepts an async target, coalesces repeat clicks and survives no
   f.action(null, 'show-more');
   f.action(null, 'show-more');
   assert.equal(f.shownMore.length, 1, 'one target resolution at a time');
+  assert.equal(f.windows[0].visible, false, '(TPT9056) macOS: the banner steps aside while the target is raised');
   assert.equal(target.webContents.sent.some((m) => m.channel === 'notify:desktop-list-open'), false);
   resolve(target);
   await new Promise((r) => setImmediate(r));
   assert.equal(target.webContents.sent.find((m) => m.channel === 'notify:desktop-list-open').data.length, 7);
+  assert.equal(f.windows[0].visible, true, 'the list window took no focus (no host): the banner is back');
+  f.focus(target);
+  assert.equal(f.windows[0].visible, false, 'hidden once the raised window hosts the alerts');
   f.action(null, 'show-more');
   assert.equal(f.shownMore.length, 2, 'a settled Show More can be repeated');
   f.surface.dispose();
 
-  // No window could be found or reopened: nothing is lost and the banner stays up.
-  for (const none of [() => null, () => Promise.resolve(null), () => Promise.reject(new Error('no window'))]) {
+  // No window could be found or reopened: nothing is lost and the banner ends up back up.
+  for (const [none, async] of [[() => null, false], [() => Promise.resolve(null), true], [() => Promise.reject(new Error('no window')), true]]) {
     const g = fixture({ showMoreTarget: none() });
     await show(g, 7);
     g.action(null, 'show-more');
+    assert.equal(g.windows[0].visible, !async, 'only an async raise takes the banner down meanwhile');
     await new Promise((r) => setImmediate(r));
     assert.equal(g.surface.snapshot().length, 7);
     assert.equal(g.windows[0].visible, true);

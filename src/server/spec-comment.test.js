@@ -7,7 +7,53 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 
-const { buildSpecCommentBody, stripSpecCommentHeader, specCommentHeader, buildAttachmentRefsBlock } = require('./spec-comment');
+const { buildSpecCommentBody, stripSpecCommentHeader, specCommentHeader, buildAttachmentRefsBlock, extractSourceRefs, missingSourceRefsBlock } = require('./spec-comment');
+
+const FIGMA_URL = 'https://www.figma.com/design/RcOVAPflBtbKMQZZw1ikSG/Seminar-Pages?node-id=1353-7890&p=f&m=dev';
+const IMAGE_REF = '![img](https://tt.apppixies.com/api/projects/3/images/259)';
+
+test('extractSourceRefs preserves Figma queries and image Markdown in source order', () => {
+  assert.deepStrictEqual(extractSourceRefs(`Updated in Figma ${FIGMA_URL} (open in my Chrome tab)\n${IMAGE_REF}\nhttp://example.com/spec.`),
+    [FIGMA_URL, IMAGE_REF, 'http://example.com/spec']);
+});
+
+test('extractSourceRefs keeps relative images and balanced URL parentheses', () => {
+  assert.deepStrictEqual(extractSourceRefs('See [spec](https://example.com/hero_(desktop)), ![hero](/api/images/1) and <https://example.com/other>.'),
+    ['https://example.com/hero_(desktop)', '![hero](/api/images/1)', 'https://example.com/other']);
+  assert.deepStrictEqual(extractSourceRefs('![hero](https://example.com/hero_(desktop))'), ['![hero](https://example.com/hero_(desktop))']);
+});
+
+test('missingSourceRefsBlock restores screenshot sources with localized heading', () => {
+  const objective = `Updated in Figma ${FIGMA_URL}\n${IMAGE_REF}`;
+  assert.strictEqual(missingSourceRefsBlock(objective, ['Refresh Master Planning hero'], 'en'),
+    `\n\n### Source material\n\n- ${FIGMA_URL}\n- ${IMAGE_REF}`);
+  assert.ok(missingSourceRefsBlock(objective, [], 'uk').startsWith('\n\n### Джерельні матеріали\n\n'));
+  assert.ok(missingSourceRefsBlock(objective, [], 'fr').includes('### Source material'));
+});
+
+test('missingSourceRefsBlock recognizes sources in any description and any image label', () => {
+  assert.strictEqual(missingSourceRefsBlock(`${FIGMA_URL}\n${IMAGE_REF}`, [
+    `[Figma design](${FIGMA_URL})`, '![different label](https://tt.apppixies.com/api/projects/3/images/259)',
+  ], 'en'), '');
+  assert.strictEqual(missingSourceRefsBlock(IMAGE_REF, ['https://tt.apppixies.com/api/projects/3/images/259'], 'en'), '');
+  assert.strictEqual(missingSourceRefsBlock('![img](/api/images/1)', ['[attachment](/api/images/1)'], 'en'), '');
+});
+
+test('missingSourceRefsBlock checks exact targets rather than URL prefixes', () => {
+  assert.ok(missingSourceRefsBlock('![img](/api/images/1)', ['![other](/api/images/12)'], 'en').includes('![img](/api/images/1)'));
+  assert.ok(missingSourceRefsBlock(FIGMA_URL, [FIGMA_URL + '2'], 'en').includes(FIGMA_URL));
+  assert.ok(missingSourceRefsBlock('https://example.com/design', ['[other](https://example.com/design-extra)'], 'en').includes('https://example.com/design'));
+});
+
+test('missingSourceRefsBlock is idempotent and handles partial, repeated or missing sources', () => {
+  const objective = `${FIGMA_URL}\n${IMAGE_REF}\n${IMAGE_REF}`;
+  const block = missingSourceRefsBlock(objective, [FIGMA_URL], 'en');
+  assert.strictEqual(block, `\n\n### Source material\n\n- ${IMAGE_REF}`);
+  assert.strictEqual(missingSourceRefsBlock(objective, [FIGMA_URL, 'Implement hero' + block], 'en'), '');
+  assert.strictEqual(missingSourceRefsBlock('No sources here', [], 'en'), '');
+  assert.strictEqual(missingSourceRefsBlock(null, null, 'en'), '');
+  assert.deepStrictEqual(extractSourceRefs(undefined), []);
+});
 
 test('buildSpecCommentBody prepends en header by default', () => {
   const body = buildSpecCommentBody('Do the whole thing', 'en');
@@ -52,6 +98,44 @@ test('stripSpecCommentHeader is a no-op on a pre-C1159 raw comment (dedup compat
 
 test('specCommentHeader falls back to en for unknown language', () => {
   assert.strictEqual(specCommentHeader('fr'), specCommentHeader('en'));
+});
+
+for (const lang of ['en', 'uk']) {
+  test(`sole-task spec header makes the full objective binding (${lang})`, () => {
+    const spec = `  ${FIGMA_URL}\n${IMAGE_REF}\nCopy: Count every item\nJoin on project_id  `;
+    const body = buildSpecCommentBody(spec, lang, { soleTask: true });
+    if (lang === 'en') {
+      assert.ok(body.startsWith('## Original Objective (full specification)'));
+      assert.ok(body.includes('This task covers the whole objective below.'));
+      assert.ok(body.includes('every link, image, copy line and data hint'));
+      assert.ok(body.includes('binding requirements'));
+      assert.ok(body.includes('including details omitted from this task\'s description'));
+    } else {
+      assert.ok(body.startsWith('## Початкова ціль (повна специфікація)'));
+      assert.ok(body.includes('Це завдання охоплює всю ціль нижче.'));
+      assert.ok(body.includes('кожне посилання, зображення, рядок тексту та підказку щодо даних'));
+      assert.ok(body.includes('обов\'язковими вимогами'));
+      assert.ok(body.includes('пропущеними в описі цього завдання'));
+    }
+    assert.strictEqual(stripSpecCommentHeader(body), spec.trim());
+    assert.ok(body.endsWith(spec.trim()));
+    for (const nextLang of ['en', 'uk']) {
+      for (const soleTask of [false, true]) {
+        assert.strictEqual(buildSpecCommentBody(body, nextLang, { soleTask }), body);
+      }
+    }
+    const reference = buildSpecCommentBody(spec, lang, { soleTask: false });
+    assert.strictEqual(reference, buildSpecCommentBody(spec, lang));
+    assert.strictEqual(buildSpecCommentBody(reference, lang, { soleTask: true }), reference);
+  });
+}
+
+test('sole-task header falls back to English and keeps empty input empty', () => {
+  assert.strictEqual(buildSpecCommentBody('Spec', 'fr', { soleTask: true }),
+    buildSpecCommentBody('Spec', 'en', { soleTask: true }));
+  for (const spec of ['', '   ', undefined]) {
+    assert.strictEqual(buildSpecCommentBody(spec, 'en', { soleTask: true }), '');
+  }
 });
 
 // ── TPT29: buildAttachmentRefsBlock ──

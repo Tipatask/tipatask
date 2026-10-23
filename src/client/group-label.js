@@ -16,6 +16,7 @@
 import { t, tc } from './i18n.js';
 import { api } from './api-client.js';
 import { maxNumbersByPrefix, isTaskKeyLike, HUMAN_TASK_PREFIX } from '../server/task-key-format.js';
+import { isAgentPermissionMode } from './permission-mode.js';
 
 // Mirrors api/src/lib/task-group-labels.js exactly.
 export const TASK_GROUP_LABELS = ['Sprints', 'Batches', 'Bags', 'Jars', 'Groups', 'Steps'];
@@ -54,6 +55,13 @@ let _sprintSortOrder = 'asc';
 // badge). Default 'C' matches the server's own legacy fallback.
 const LEGACY_TASK_PREFIX = 'C';
 let _taskPrefix = LEGACY_TASK_PREFIX;
+// (TPT9063) Project-default agent permission mode — project.agent_permission_mode, reported by
+// the settings bundle as `agentPermissionMode` (one of the five canonical modes, or null = "Not
+// set", the legacy behaviour). Same settings bundle/load-trigger reasoning as the flags above.
+// Read SYNCHRONOUSLY by card permission tips and task-board.js's active-session nav shields.
+// Workflow settings refresh it on open and through setProjectPermissionMode() after a save.
+// Null matches the migration's column default; navigation never fetches its own settings.
+let _agentPermissionMode = null;
 
 function _keyFor(label) {
   return LABEL_TO_KEY[label] || LABEL_TO_KEY[DEFAULT_TASK_GROUP_LABEL];
@@ -75,6 +83,21 @@ export function resetGroupLabel() {
   resetObjectiveGroupingEnabled();
   resetSprintSortOrder();
   resetTaskPrefix();
+  resetProjectPermissionMode();
+}
+
+// (TPT9063) Sets the project-default permission mode. Unknown/blank/null -> null ("Not set" —
+// never adopt an invalid value).
+export function setProjectPermissionMode(value) {
+  _agentPermissionMode = isAgentPermissionMode(value) ? value : null;
+}
+
+export function projectPermissionMode() {
+  return _agentPermissionMode;
+}
+
+export function resetProjectPermissionMode() {
+  _agentPermissionMode = null;
 }
 
 // (C1332) Sets sprints_enabled. Unknown/null/undefined -> true (never adopt a falsy value
@@ -166,9 +189,10 @@ export async function fetchNextTaskKey(category) {
 }
 
 // Fetches this project's task_group_label + sprints_enabled + use_objective_grouping +
-// sprint_sort_order + task_prefix via api.project.settings() (IPC in Electron, same-origin
-// GET /api/project/settings in browser — see ws-handlers.js). Never throws — a failed read
-// falls back to every default (mirrors getProjectSettings()'s fail-open contract server-side).
+// sprint_sort_order + task_prefix + agent_permission_mode via api.project.settings() (IPC in
+// Electron, same-origin GET /api/project/settings in browser — see ws-handlers.js). Never
+// throws — a failed read falls back to every default (mirrors getProjectSettings()'s fail-open
+// contract server-side).
 export async function loadGroupLabel() {
   try {
     const result = await api.project.settings();
@@ -177,12 +201,14 @@ export async function loadGroupLabel() {
     setObjectiveGroupingEnabled(result?.useObjectiveGrouping);
     setSprintSortOrder(result?.sprintSortOrder);
     setTaskPrefix(result?.taskPrefix);
+    setProjectPermissionMode(result?.agentPermissionMode);
   } catch {
     setGroupLabel(null); // -> DEFAULT
     setSprintsEnabled(null); // -> true
     setObjectiveGroupingEnabled(null); // -> true
     setSprintSortOrder(null); // -> 'asc'
     setTaskPrefix(null); // -> 'C'
+    setProjectPermissionMode(null); // -> Not set
   }
   return _label;
 }

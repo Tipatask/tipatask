@@ -25,7 +25,8 @@ test('preload exposes the push channels main/window-state.js sends on', () => {
 test('template.html routes WS and IPC api-status / task:deleted through one handler each', () => {
   const html = read('src/client/template.html');
   assert.match(html, /if \(msg\.type === 'api-status'\) \{\s*applyApiStatusFrame\(msg\);/);
-  assert.match(html, /if \(msg\.type === 'task:deleted'\) \{\s*applyTaskDeletedEvent\(msg\.id\);/);
+  assert.match(html, /if \(msg\?\.type === 'task:deleted'\) \{\s*applyTaskDeletedEvent\(msg\.id\);/);
+  assert.match(html, /function connectBoardWs[\s\S]*?handleObjectiveTaskStateEvent\(msg\)/);
   assert.match(html, /function applyApiStatusFrame\(msg, \{ banner = true \} = \{\}\)/);
   assert.match(html, /_ipcOn\.apiStatus\(\(p\) => \{[\s\S]*?applyApiStatusFrame\(p, \{ banner \}\)/);
   assert.match(html, /_ipcOn\.taskUpdated\(\(p\) => \{ if \(p\?\.task\?\.id\) handleObjectiveTaskStateEvent\(\{ type: 'task:updated', task: p\.task \}\)/);

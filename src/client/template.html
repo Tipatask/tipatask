@@ -217,6 +217,7 @@
         <span id="settings-task-group-label-caption"></span>
         <select id="settings-task-group-label"></select>
       </label>
+      <section class="permission-mode-section" id="settings-permission-mode-row"></section>
       <p class="settings-wf-caption" id="settings-workflow-caption"></p>
       <div class="settings-wf-head" id="settings-workflow-head" aria-hidden="true"></div>
       <div class="settings-wf-table" id="settings-workflow-list"></div>
@@ -960,6 +961,14 @@ function clearBoardTaskCache() {
 // to serve a cache hit. `updates` is a Map<String(taskId), partialOrFullTaskObject>.
 function patchCachedBoardTasks(updates) {
   if (!updates || updates.size === 0) return;
+  for (const [id, task] of updates) {
+    if (task.agentPermissionMode !== undefined || task.agent_permission_mode !== undefined) {
+      state.taskPermissionModeById.set(id, task.agentPermissionMode ?? task.agent_permission_mode ?? null);
+    }
+  }
+  // Reject background snapshots that began before these authoritative task patches.
+  _boardTaskCacheGeneration++;
+  _boardTaskRefreshes.clear();
   for (const entry of _boardTaskCache.values()) {
     let changed = false;
     for (let i = 0; i < (entry.tasks || []).length; i++) {
@@ -1059,37 +1068,29 @@ async function fetchObjectiveTaskState() {
   return Array.isArray(data) ? data : (data.tasks || []);
 }
 
-// (C1329) Reconciles the left-nav's status map straight from the server — the payload-less
-// `tasks-updated` signal (file watcher / API poller, or an agent completing a task through the
-// remote API in TASK_BACKEND=api, which never round-trips this server's own PATCH endpoint)
-// carries nothing to patch state with, so something has to fetch it. Deliberately NOT
-// applyObjectiveTaskState(): that helper also rewrites _boardTaskCache/state._lastVisibleTasks,
-// which must not happen from a tab that isn't rendering a board. Every write below targets
-// state.taskStatusById directly (never a Map reference captured before the await) so it
-// converges correctly no matter whether this or a concurrent loadAndRender()'s wholesale
-// rebuild (see the backfill next to state.taskStatusById's assignment further down) lands
-// first. Single-flight + a skip guard: once every live terminal session already shows a
-// complete-role status there is nothing left that can change, so steady state costs zero
-// extra fetches — a completed row is terminal, it only leaves the list when the user closes it.
+// Status-only refresh for retained terminal sessions, including sessions outside the
+// board's sprint/assignee window and sessions whose process just exited. Update the
+// caches as well as the rail map so a later cached render cannot restore an old status.
+// Coalesce overlapping requests, but retain one trailing refresh when another signal
+// arrives during a read. Completed tasks can reopen, so they are still reconciled.
 let _syncNavStatusesInFlight = null;
-// (C1356) `force` bypasses the "every live session already shows complete" skip below —
-// used by the terminal close/minimize/reattach resync (tiptask:sync-nav-statuses,
-// dispatched from console-modal.js) to guarantee an authoritative refetch at exactly the
-// moments the user is looking at the nav, regardless of what the local cache currently
-// believes. Safe to force often: fetchObjectiveTaskState() hits the SAME unfiltered
-// /api/project/tasks endpoint this function always used (getTasksUnfiltered() server-side,
-// see ws-handlers.js) — never sprint-windowed like loadAndRender()'s own rebuild — and this
-// stays single-flight either way.
-function syncNavStatusesFromServer({ force = false } = {}) {
-  const liveIds = [...state.activeSessions].filter((id) =>
+let _syncNavStatusesPending = false;
+function syncNavStatusesFromServer() {
+  const liveIds = [...new Set([...state.activeSessions, ...state.exitedSessions])].filter((id) =>
     (state.sessionMeta.get(id)?.type || 'terminal') === 'terminal');
   if (liveIds.length === 0) return Promise.resolve();
-  if (!force && liveIds.every((id) => isCompleteName(state.taskStatusById.get(id)))) return Promise.resolve();
-  if (_syncNavStatusesInFlight) return _syncNavStatusesInFlight;
+  if (_syncNavStatusesInFlight) {
+    _syncNavStatusesPending = true;
+    return _syncNavStatusesInFlight;
+  }
+  const generation = _boardTaskCacheGeneration;
   _syncNavStatusesInFlight = (async () => {
     try {
       const tasks = await fetchObjectiveTaskState();
+      // A granular event delivered during this read is newer than this response.
+      if (generation !== _boardTaskCacheGeneration) return;
       const byId = new Map(tasks.map((t) => [String(t.id), t]));
+      const updates = new Map();
       for (const id of liveIds) {
         const t = byId.get(String(id));
         if (!t) continue;
@@ -1097,12 +1098,18 @@ function syncNavStatusesFromServer({ force = false } = {}) {
         // status is only a baseline, so it must not raise a completion notification.
         if (t.status !== undefined) window.TipTask.completionNotifications.observeTaskStatusForCompletion(state.taskStatusById, id, t.status, t.title);
         if (t.title !== undefined) state.taskTitleById.set(id, t.title || '');
+        updates.set(String(id), t);
       }
+      patchCachedBoardTasks(updates);
       window.TipTask?.taskBoard?.syncActiveSessionsNav?.();
     } catch {
       // Opportunistic — the next tasks-updated frame (poller repeats every ~10s) retries.
     } finally {
       _syncNavStatusesInFlight = null;
+      if (_syncNavStatusesPending) {
+        _syncNavStatusesPending = false;
+        syncNavStatusesFromServer();
+      }
     }
   })();
   return _syncNavStatusesInFlight;
@@ -1598,7 +1605,7 @@ document.addEventListener('tiptask:board-cache-stale', () => staleBoardTaskCache
 // learn its own completion from it — see syncNavStatusesFromServer()'s own comment above
 // for why the unfiltered /api/project/tasks fetch it uses doesn't share that limitation).
 document.addEventListener('tiptask:sync-nav-statuses', () => {
-  syncNavStatusesFromServer({ force: true });
+  syncNavStatusesFromServer();
 });
 
 // (C1453) Dispatched by task-board.js's refreshParentSubtaskLabel() right after it patches a
@@ -1628,6 +1635,20 @@ document.addEventListener('tiptask:objective-tabs-sync', () => {
 // fast path; Tasks-section events patch the board behind an open terminal or force a fresh
 // render when the changed card is not currently mounted.
 function handleObjectiveTaskStateEvent(msg) {
+  if (msg?.type === 'task:deleted') {
+    applyTaskDeletedEvent(msg.id);
+    return;
+  }
+  // Structural events can add rows absent from every cached snapshot. Invalidate
+  // caches on Create too, without remounting the user's composer.
+  if (['tasks-updated', 'task:created', 'tasks:finalized'].includes(msg?.type)) {
+    staleBoardTaskCache();
+    msg = { ...msg, type: 'tasks-updated' };
+  }
+  if (msg?.type === 'task:updated' && msg.task?.id) {
+    if (!isDropInProgress()) invalidateLoadAndRender();
+    patchCachedBoardTasks(new Map([[String(msg.task.id), msg.task]]));
+  }
   // (C1329) This function is Electron's ONLY route for every task-state event — no board WS.
   // The `if (!isTasksSectionTab()) return;` below used to gate the left-nav refresh too, so a
   // session's completion tick never reached the nav while Objective or Create was the open tab.
@@ -1665,19 +1686,7 @@ function handleObjectiveTaskStateEvent(msg) {
   if (msg?.type === 'task:updated' && msg.task?.id) {
     const task = msg.task;
     const taskId = String(task.id);
-    // Drop any in-flight full render based on the previous task status before patching the
-    // currently mounted card. The cache is also patched (not wiped) so later navigation to a
-    // DIFFERENT drill-down still serves an instant cache hit instead of a cold refetch.
-    // (C1329) state.taskStatusById/taskTitleById and syncActiveSessionsNav() are already
-    // handled by the prologue above — it runs for every non-Objective tab, this one included.
-    // (TPT9025) Not during a drop: the render in flight is the drop's own, and this patch is
-    // queued to replay after it — dropping it would only cost the drop its repaint.
-    if (!isDropInProgress()) invalidateLoadAndRender();
-    // (TPT58) This event carries the full updated row, so merge it into every cached
-    // drill-down snapshot in place rather than invalidateBoardTaskCache()'s whole-Map wipe —
-    // that wipe was firing on nearly every task event while a subtask session ran, so an
-    // objective nav tab click almost never got to serve a cache hit.
-    patchCachedBoardTasks(new Map([[taskId, task]]));
+    // Maps, cache patches and stale-render invalidation already ran before the tab guards.
     if (state.pendingTaskIds.has(taskId)) state.pendingTaskIds.delete(taskId);
     if (msg.isNewlyAssigned) applyNewlyAssigned(taskId);
     const pendingCard = app.querySelector(`.card[data-id="${CSS.escape(taskId)}"]`);
@@ -1700,7 +1709,6 @@ function handleObjectiveTaskStateEvent(msg) {
     if (!isDropInProgress()) invalidateLoadAndRender(); // (TPT9025) keep the drop's own render
     // (TPT58) Payload-less — no single row to merge, so soft-stale instead of wiping; the
     // forceFresh render below still refetches the CURRENT drill-down key immediately.
-    staleBoardTaskCache();
     clearTimeout(boardRefreshTimer);
     // (TPT9023) No pendingRestoreContext from a background refresh: the render keeps the scroll and
     // the open card from its own commit-time snapshot, and an event-time context would overwrite
@@ -2190,8 +2198,10 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   // renderCard's dependency gating see a staler status than the fetch itself provided.
   const _prevTaskStatusById = state.taskStatusById;
   const _prevTaskTitleById = state.taskTitleById;
+  const prevPermissionModes = state.taskPermissionModeById;
   const taskStatusById = new Map(tasks.map(t => [t.id, t.status]));
   const taskTitleById = new Map(tasks.map(t => [t.id, t.title || '']));
+  const taskPermissionModeById = new Map(tasks.map(t => [t.id, t.agentPermissionMode ?? t.agent_permission_mode ?? null]));
   for (const id of state.activeSessions) {
     if (!taskStatusById.has(id) && _prevTaskStatusById.has(id)) {
       taskStatusById.set(id, _prevTaskStatusById.get(id));
@@ -2199,12 +2209,16 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     if (!taskTitleById.has(id) && _prevTaskTitleById.has(id)) {
       taskTitleById.set(id, _prevTaskTitleById.get(id));
     }
+    if (!taskPermissionModeById.has(id) && prevPermissionModes.has(id)) {
+      taskPermissionModeById.set(id, prevPermissionModes.get(id));
+    }
   }
   state.taskStatusById = taskStatusById; // shared with renderCard for dep-blocking
   // (C1058) Attention notifications fall back to this when no card is rendered for the task
   // (filtered out, collapsed tier, backlog, other tab) — the attention-needed WS payload
   // carries no title. See src/client/attention-notifications.js#notifyTaskNeedsAttention.
   state.taskTitleById = taskTitleById;
+  state.taskPermissionModeById = taskPermissionModeById;
   // (C1387) Guarded — never prunes a task with a still-live terminal session, see
   // attention-state.js#pruneClosedAttention. This is the render-time counterpart of the same
   // guard applyObjectiveTaskState() above uses.
@@ -3869,7 +3883,7 @@ function connectBoardWs() {
     // mode to parity. Skipped on the very first open — init() already does an initial
     // loadAndRender() + fetchActiveSessions() of its own.
     if (!_boardWsHasConnectedOnce) { _boardWsHasConnectedOnce = true; return; }
-    syncNavStatusesFromServer({ force: true });
+    syncNavStatusesFromServer();
     // (TPT58) Soft-stale, not a hard wipe — whatever was missed while the socket was down is
     // caught by the forceFresh render below (current key) and by each other entry's own
     // immediate background refetch on its next cache-hit render (storedAt zeroed).
@@ -3973,115 +3987,10 @@ function connectBoardWs() {
       return;
     }
 
-    if (msg.type === 'tasks-updated') {
-      clearTimeout(boardRefreshTimer);
-      // (C1282) Aggregate API-poll/file-watcher updates carry no task payload, but they are
-      // the normal signal for agent-driven status changes. Reconcile status-only state while
-      // Objective stays mounted; a full render would wipe the active composer.
-      if (state.activeTab === 'objective') {
-        handleObjectiveTaskStateEvent(msg);
-        return;
-      }
-      // (C1329) Reconcile the left-nav session list straight from the server on every frame,
-      // independent of the drag suppression / debounce / tab guards below — none of which the
-      // nav refresh depends on (it never touches #app), and the tab guard inside the debounced
-      // callback further down would otherwise drop it entirely while Create ('new_task') is open.
-      syncNavStatusesFromServer();
-      // Suppress re-renders while a drag-and-drop is in progress
-      if (isDragging() || isDropInProgress() || app.querySelector('.card-desc.editing')) {
-        _pendingBoardRefresh = true;
-        return;
-      }
-      boardRefreshTimer = setTimeout(() => {
-        if (state.activeTab !== 'board' && state.activeTab !== 'list' && state.activeTab !== 'todo' && state.activeTab !== 'backlog') return;
-        // (TPT9023) No pendingRestoreContext — see handleObjectiveTaskStateEvent()'s tasks-updated branch.
-        loadAndRender({ forceFresh: true });
-      }, state.activeTerminal ? 0 : 1000);
-      return;
-    }
-
-    // ── Granular task events ──
-
-    if (msg.type === 'task:updated') {
-      const t = msg.task;
-      if (!t || !t.id) return;
-
-      // (C1152) The incremental patch path below never rebuilds the maps loadAndRender()
-      // builds — keep them current so the left-nav session row restyles the moment a task
-      // completes, even on the branches further down that bail out to a debounced full refresh.
-      const _prevStatusForNotify = window.TipTask.completionNotifications.observeTaskStatusForCompletion(
-        state.taskStatusById, t.id, t.status, t.title);
-      state.taskTitleById.set(t.id, t.title || '');
-      window.TipTask?.taskBoard?.syncActiveSessionsNav?.();
-      // (C1462) Cross-window signal — see syncObjectiveTabsState()'s own doc comment.
-      if (syncObjectiveTabsState({ task: t, prevStatus: _prevStatusForNotify })) repaintObjectiveNavTabs();
-
-      // Clear pending-sync highlight once server confirms the replayed mutation
-      if (state.pendingTaskIds.has(t.id)) {
-        state.pendingTaskIds.delete(t.id);
-        const pendingCard = app.querySelector(`.card[data-id="${t.id}"]`);
-        if (pendingCard) pendingCard.classList.remove('pending-sync');
-      }
-
-      // Flag green attention if newly assigned to current user
-      if (msg.isNewlyAssigned) applyNewlyAssigned(t.id);
-
-      // (C1282) A status event while Objective is selected must update the cached navigation
-      // state without taking the destructive full-render path used by the Tasks section.
-      if (state.activeTab === 'objective') {
-        clearTimeout(boardRefreshTimer);
-        loadAndRender({ objectiveTaskUpdate: t }).catch(() => {});
-        return;
-      }
-
-      // (C1259) applyTaskPatch() (task-card.js) — was ~90 lines duplicating
-      // task-card.js's refreshCard()/regroupCardToSprint() field-by-field, including a
-      // dead `.status-select` selector that never matched real card markup (board cards
-      // only ever render `.card-status-select`) — that patch silently no-opped. One
-      // shared implementation now; 'reload' still falls back to the debounced full
-      // refresh for a card that's filtered/collapsed/paginated out, or whose target
-      // tier isn't currently rendered.
-      if (applyTaskPatch(t) === 'reload') {
-        clearTimeout(boardRefreshTimer);
-        // (C1258) applyTaskPatch() returns 'reload' whenever no .card[data-id] is in the DOM —
-        // which is ALWAYS true while the user is in Create (no cards render there at all), not
-        // just "filtered/collapsed/paginated out" as on the board. Unlike the tasks-updated
-        // (2521) and task:created/tasks:finalized (2597) branches, this one had no section
-        // guard — every task:updated event while composing scheduled a full innerHTML-wiping
-        // loadAndRender() 300ms later, destroying in-progress compose state (caret, open
-        // Embed/Import popovers, textarea height). The board cache's own fingerprint check
-        // (see § Board task cache) already re-syncs it the moment the user returns to a
-        // Tasks-section tab, so nothing is lost by skipping this while on Create.
-        if (isTasksSectionTab()) {
-          boardRefreshTimer = setTimeout(() => loadAndRender({ forceFresh: true }), 300);
-        }
-        return;
-      }
-
-      // A status update can move a card out of the selected status facet. Keep the
-      // incremental path as immediate as the checkbox filter path.
-      applySearchFilter();
-
-      // Cancel pending tasks-updated debounce (file watcher will fire ~500ms later)
-      clearTimeout(boardRefreshTimer);
-      return;
-    }
-
-    if (msg.type === 'task:deleted') {
-      applyTaskDeletedEvent(msg.id);
-      return;
-    }
-
-    if (msg.type === 'task:created' || msg.type === 'tasks:finalized') {
-      clearTimeout(boardRefreshTimer);
-      if (isDragging() || isDropInProgress() || app.querySelector('.card-desc.editing')) {
-        _pendingBoardRefresh = true;
-        return;
-      }
-      boardRefreshTimer = setTimeout(() => {
-        if (state.activeTab !== 'board' && state.activeTab !== 'list' && state.activeTab !== 'todo' && state.activeTab !== 'backlog') return;
-        loadAndRender({ forceFresh: true });
-      }, 300);
+    // Use the same task-state reconciler as Electron's attention socket and IPC.
+    // Keeping a second ladder here let browser cache/rail behavior drift apart.
+    if (['tasks-updated', 'task:updated', 'task:created', 'task:deleted', 'tasks:finalized'].includes(msg.type)) {
+      handleObjectiveTaskStateEvent(msg);
     }
   };
 
@@ -4138,6 +4047,14 @@ function applyApiStatusFrame(msg, { banner = true } = {}) {
 // Idempotent: a card already gone is a no-op.
 function applyTaskDeletedEvent(id) {
   if (!id) return;
+  if (!isDropInProgress()) invalidateLoadAndRender();
+  staleBoardTaskCache();
+  for (const entry of _boardTaskCache.values()) {
+    entry.tasks = (entry.tasks || []).filter(task => String(task.id) !== String(id));
+    if (String(entry.parentTask?.id) === String(id)) entry.parentTask = null;
+    entry.fingerprint = _boardSnapshotFingerprint(entry);
+  }
+  state._lastVisibleTasks = (state._lastVisibleTasks || []).filter(task => String(task.id) !== String(id));
   // (C1259) removeCardFromDom() (task-card.js) — was a local copy of the same
   // card+tier removal showDeleteConfirmModal() now also shares.
   removeCardFromDom(id);
@@ -4148,6 +4065,13 @@ function applyTaskDeletedEvent(id) {
     updateBulkActionBar();
   }
   clearTimeout(boardRefreshTimer);
+  // A delete must not consume a queued create/finalize refresh or cancel its only
+  // in-flight render without replacing it. Coalesce the final board state instead.
+  if (isTasksSectionTab()) {
+    boardRefreshTimer = setTimeout(() => {
+      if (isTasksSectionTab()) loadAndRender({ forceFresh: true }).catch(() => {});
+    }, 0);
+  }
 }
 
 // Lightweight DOM walk to apply/remove pending-sync class without full re-render
@@ -4709,7 +4633,7 @@ if (window.electronAPI) {
     if (_isUnboundWindowSync()) _showChooseModal();
   });
 
-  window.electronAPI.onProjectChanged(async (dir, name) => {
+  window.electronAPI.onProjectChanged(async (dir, name, contextChanged = false) => {
     // (TPT310) Electron re-sends project:changed on every window load and on rename — resetAgentQuota()
     // ignores the same project, so only a real switch to another one refetches plan usage.
     resetAgentQuota(dir);
@@ -4732,7 +4656,7 @@ if (window.electronAPI) {
       TipTask.attentionWs.closeAttentionWs();
       TipTask.attentionWs.connectAttentionWs();
     }
-    if (!dir || dir === _lastLoadedProject) return;
+    if (!dir || (dir === _lastLoadedProject && !contextChanged)) return;
     _lastLoadedProject = dir;
     // Reset per-project sprint/tier state so stale data from the previous project doesn't bleed through.
     state.sprints = [];
@@ -4755,6 +4679,7 @@ if (window.electronAPI) {
     // (C1235) Same reasoning — don't let project A's group noun leak into project B's
     // first frame while loadGroupLabel() below is still in flight.
     resetGroupLabel();
+    state.taskPermissionModeById.clear();
     // IPC mode: backend already switched in main process via bindWindowToProject.
     // Browser mode: call project-switch endpoint.
     if (!window.electronAPI?.api) {

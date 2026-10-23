@@ -2,6 +2,8 @@
 // auto-selects; no available agents shows install guidance. Resolve labels at
 // access time so project locale changes are reflected.
 import { t } from './i18n.js';
+import imageSettings from '../pi-image-settings.js';
+const { isImageModel, IMAGE_DEFAULTS, IMAGE_ASPECT_RATIOS, imageSettingsIssue } = imageSettings;
 
 const AGENT_COLORS  = { claude: '#d97757', codex: '#10a37f', pi: '#7c6af7' };
 const AGENT_INSTALL = {
@@ -178,26 +180,27 @@ export function normalizePiBaseUrl(value) {
 // a catalog that needed a just-saved key can show up on the next open.
 const _piModelCache = new Map();
 
-export function fetchPiModels(provider) {
+export function fetchPiModels(provider, purpose = 'text') {
   const id = normalizePiProvider(provider);
-  if (_piModelCache.has(id)) return _piModelCache.get(id);
+  const cacheKey = `${id}:${purpose}`;
+  if (_piModelCache.has(cacheKey)) return _piModelCache.get(cacheKey);
   const p = (async () => {
     try {
       const projectPath = new URLSearchParams(globalThis.location?.search || '').get('projectPath');
-      const r = await fetch(`/api/pi/models?provider=${encodeURIComponent(id)}`, {
+      const r = await fetch(`/api/pi/models?provider=${encodeURIComponent(id)}${purpose === 'image' ? '&purpose=image' : ''}`, {
         cache: 'no-store',
         headers: projectPath ? { 'x-tipatask-project': projectPath } : {},
       });
       const list = r.ok ? await r.json() : [];
       const ids = (Array.isArray(list) ? list : []).map((m) => String(m?.id ?? '').trim()).filter(Boolean);
-      if (!ids.length) _piModelCache.delete(id);
+      if (!ids.length) _piModelCache.delete(cacheKey);
       return ids;
     } catch {
-      _piModelCache.delete(id);
+      _piModelCache.delete(cacheKey);
       return [];
     }
   })();
-  _piModelCache.set(id, p);
+  _piModelCache.set(cacheKey, p);
   return p;
 }
 
@@ -261,6 +264,10 @@ export function piCatalogDisplayId(catalogId, provider) {
 // edit/save round-trip.
 function _rowExtras(src, id) {
   const extra = {};
+  if (isImageModel(src)) {
+    extra.purpose = 'image';
+    extra.imageDefaults = { ...IMAGE_DEFAULTS, ...src.imageDefaults };
+  }
   if (id !== PI_DEFAULT_PROVIDER) extra.provider = id;
   if (id === PI_CUSTOM_PROVIDER) {
     extra.baseUrl = String(src?.baseUrl ?? '').trim();
@@ -318,6 +325,8 @@ export function normalizePiModels(value) {
 // always; an API key unless the provider's `keyRequired` is false; a valid base URL on a
 // custom-endpoint row. The same three rules sanitizePiModels() drops a row on server-side.
 function _rowGap(row) {
+  const imageIssue = imageSettingsIssue(row);
+  if (imageIssue) return imageIssue;
   if (!String(row?.model ?? '').trim()) return 'model';
   const meta = piProviderMeta(row?.provider);
   const preservesKey = row?.apiKeyAction === 'preserve' && row?.hasApiKey
@@ -375,6 +384,7 @@ export function addPiModelIssue(rows, draft, editIdx = -1) {
   if (gap === 'model') return t('agentSelect.errModelRequired');
   if (gap === 'apiKey') return t('agentSelect.errApiKeyRequired');
   if (gap === 'baseUrl') return t('agentSelect.errBaseUrlRequired');
+  if (gap) return t(`agentSelect.err.${gap}`);
   const key = _saveKey(draft);
   const clash = (rows || []).some((r, i) => i !== editIdx && _saveKey(r) === key);
   return clash ? t('agentSelect.duplicateModel') : null;
@@ -438,7 +448,8 @@ export function buildAgentCardRows({ agents, piModels = [], enabledIds = [], def
           enabled: row.enabled !== false, isDefault: defaultId === 'pi' && i === piDefaultIdx,
           providerLabel, modelText, storedModel: _piRow(row).model,
           name: `${providerLabel} · ${modelText}`, reason: '', hasCheckbox: !single, hasRadio: true,
-          noTools: meta.id === PI_CUSTOM_PROVIDER && row.tools === false,
+          noTools: !isImageModel(row) && meta.id === PI_CUSTOM_PROVIDER && row.tools === false,
+          imagePurpose: isImageModel(row),
         });
       });
     }
@@ -647,6 +658,8 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
         baseUrl: row?.baseUrl || '',
         api: row?.api || '', // no input for it — carried so an edit never drops it
         tools: row?.tools, // the "Model supports tool calls" checkbox: false = unchecked, else checked
+        purpose: row?.purpose || 'text',
+        imageDefaults: { ...IMAGE_DEFAULTS, ...row?.imageDefaults },
       },
       issue: '',
     };
@@ -742,10 +755,11 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
   async function openSuggest(input) {
     if (!form?.draft) return;
     const provider = form.draft.provider;
-    const ids = await fetchPiModels(provider);
+    const purpose = form.draft.purpose;
+    const ids = await fetchPiModels(provider, purpose);
     // Stale by the time the catalog arrived: form closed or swapped for a Claude/Codex model form
     // (which has no draft), provider switched, focus moved on.
-    if (!form?.draft || form.draft.provider !== provider || !input.isConnected || document.activeElement !== input) return;
+    if (!form?.draft || form.draft.provider !== provider || form.draft.purpose !== purpose || !input.isConnected || document.activeElement !== input) return;
     const items = filterPiModelSuggestions(ids, input.value);
     if (!items.length) { closeSuggest(); return; }
     if (!suggest || suggest.input !== input) {
@@ -886,6 +900,17 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     // Custom endpoint only: an unchecked "Model supports tool calls" stores `tools: false`; a
     // checked one leaves the field unset, so the default (tool-capable) is never written.
     else if (el.matches('.sma-pi-tools') && form) form.draft.tools = el.checked ? undefined : false;
+    else if (el.matches('.sma-pi-purpose') && form) {
+      form.draft.purpose = el.value;
+      if (isImageModel(form.draft) && form.draft.provider !== 'openrouter') {
+        form.draft.provider = 'openrouter';
+        form.draft.apiKeyAction = 'clear';
+        form.draft.hasApiKey = false;
+        form.draft.apiKey = '';
+      }
+      closeSuggest();
+      renderGrid();
+    } else if (el.matches('.sma-pi-aspect') && form) form.draft.imageDefaults.aspectRatio = el.value;
     else if (el.matches('.sma-pi-provider') && form) {
       // (TPT163/TPT191) Provider change updates the form in place — no re-render, so focus and
       // any typed text survive: placeholders, the key label ("optional" for a keyless provider)
@@ -906,15 +931,15 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
       const keyLabel = formEl && formEl.querySelector('.sma-pi-key-label');
       const baseField = formEl && formEl.querySelector('.setup-modal-agent-extra-field--baseurl');
       const toolsField = formEl && formEl.querySelector('.setup-modal-agent-extra-field--tools');
-      if (modelInp) modelInp.placeholder = meta.modelPlaceholder;
+      if (modelInp) modelInp.placeholder = isImageModel(form.draft) ? 'recraft/recraft-v3' : meta.modelPlaceholder;
       if (keyInp) { keyInp.placeholder = meta.keyPlaceholder; keyInp.setAttribute('aria-label', _keyLabel(meta)); }
       const clearBtn = formEl && formEl.querySelector('.sma-pi-key-clear');
       if (clearBtn && !form.draft.hasApiKey) clearBtn.hidden = true;
       if (keyLabel) keyLabel.textContent = _keyLabel(meta);
       if (baseField) baseField.hidden = !meta.supportsBaseUrl;
-      if (toolsField) toolsField.hidden = meta.id !== PI_CUSTOM_PROVIDER;
+      if (toolsField) toolsField.hidden = isImageModel(form.draft) || meta.id !== PI_CUSTOM_PROVIDER;
       closeSuggest();
-      fetchPiModels(form.draft.provider); // warm the catalog for the model input
+      fetchPiModels(form.draft.provider, form.draft.purpose); // warm the catalog for the model input
       setFormIssue('');
     }
   });
@@ -929,6 +954,8 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
       form.draft.apiKeyAction = el.value.trim() ? 'replace' : (form.draft.hasApiKey ? 'preserve' : 'clear');
     }
     else if (el.matches('.sma-pi-baseurl')) form.draft.baseUrl = el.value;
+    else if (el.matches('.sma-pi-count')) form.draft.imageDefaults.count = Number(el.value);
+    else if (el.matches('.sma-pi-folder')) form.draft.imageDefaults.outputFolder = el.value;
     else return;
     if (form.issue) setFormIssue('');
   });
@@ -1083,7 +1110,9 @@ function _cardHtml(d, model = null) {
   const detailHtml = !d.available ? _detailHtml(d.detail) : '';
   // A custom row declared `tools: false`: a badge before its ✎/×; the tooltip says what it can and
   // cannot run.
-  const noToolsHtml = d.noTools
+  const noToolsHtml = d.imagePurpose
+    ? `<span class="setup-modal-agent-badge">${_esc(t('agentSelect.purposeImage'))}</span>`
+    : d.noTools
     ? `<span class="setup-modal-agent-badge" title="${_esc(t('agentSelect.noToolsHint'))}">${_esc(t('agentSelect.noTools'))}</span>`
     : '';
   const isPi = d.kind === 'pi-model' || d.kind === 'pi-empty';
@@ -1176,17 +1205,23 @@ function _piAddRowHtml(count) {
 function _piFormHtml(form, count) {
   const meta = piProviderMeta(form.draft.provider);
   const isEdit = form.mode === 'edit';
+  const image = isImageModel(form.draft);
+  const imageDefaults = { ...IMAGE_DEFAULTS, ...form.draft.imageDefaults };
   return `
       <div class="setup-modal-agent-form" data-mode="${isEdit ? 'edit' : 'add'}">
         <div class="setup-modal-agent-form-fields">
+          <label class="setup-modal-agent-extra-field setup-modal-agent-extra-field--purpose">
+            <span class="setup-modal-agent-extra-label">${_esc(t('agentSelect.purpose'))}</span>
+            <select class="setup-modal-input sma-pi-purpose"><option value="text"${image ? '' : ' selected'}>${_esc(t('agentSelect.purposeText'))}</option><option value="image"${image ? ' selected' : ''}>${_esc(t('agentSelect.purposeImage'))}</option></select>
+          </label>
           <label class="setup-modal-agent-extra-field setup-modal-agent-extra-field--provider">
             <span class="setup-modal-agent-extra-label">${_esc(t('agentSelect.provider'))}</span>
-            <select class="setup-modal-input sma-pi-provider" aria-label="${_esc(t('agentSelect.provider'))}">${_providerOptionsHtml(meta.id)}</select>
+            <select class="setup-modal-input sma-pi-provider"${image ? ' disabled' : ''} aria-label="${_esc(t('agentSelect.provider'))}">${_providerOptionsHtml(meta.id)}</select>
           </label>
           <label class="setup-modal-agent-extra-field setup-modal-agent-extra-field--model">
             <span class="setup-modal-agent-extra-label">${_esc(t('agentSelect.model'))}</span>
             <input type="text" class="setup-modal-input sma-pi-model" value="${_esc(form.draft.model)}"
-              placeholder="${_esc(meta.modelPlaceholder)}" autocomplete="off" spellcheck="false" aria-label="${_esc(t('agentSelect.model'))}"
+              placeholder="${_esc(image ? 'recraft/recraft-v3' : meta.modelPlaceholder)}" autocomplete="off" spellcheck="false" aria-label="${_esc(t('agentSelect.model'))}"
               role="combobox" aria-autocomplete="list" aria-expanded="false" />
           </label>
           <div class="setup-modal-agent-extra-field setup-modal-agent-extra-field--key">
@@ -1200,12 +1235,15 @@ function _piFormHtml(form, count) {
             <input type="url" class="setup-modal-input sma-pi-baseurl" value="${_esc(form.draft.baseUrl)}"
               placeholder="${_esc(PI_BASE_URL_PLACEHOLDER)}" autocomplete="off" spellcheck="false" aria-label="${_esc(t('agentSelect.baseUrl'))}" />
           </label>
-          <label class="setup-modal-agent-extra-field setup-modal-agent-extra-field--tools" title="${_esc(t('agentSelect.noToolsHint'))}"${meta.id === PI_CUSTOM_PROVIDER ? '' : ' hidden'}>
+          <label class="setup-modal-agent-extra-field setup-modal-agent-extra-field--tools" title="${_esc(t('agentSelect.noToolsHint'))}"${!image && meta.id === PI_CUSTOM_PROVIDER ? '' : ' hidden'}>
             <input type="checkbox" class="sma-pi-tools"${form.draft.tools === false ? '' : ' checked'} />
             <span class="setup-modal-agent-extra-label">${_esc(t('agentSelect.supportsTools'))}</span>
           </label>
+          ${image ? `<label class="setup-modal-agent-extra-field"><span class="setup-modal-agent-extra-label">${_esc(t('agentSelect.aspectRatio'))}</span><select class="setup-modal-input sma-pi-aspect">${IMAGE_ASPECT_RATIOS.map(r => `<option${r === imageDefaults.aspectRatio ? ' selected' : ''}>${r}</option>`).join('')}</select></label>
+          <label class="setup-modal-agent-extra-field"><span class="setup-modal-agent-extra-label">${_esc(t('agentSelect.imageCount'))}</span><input type="number" min="1" max="10" class="setup-modal-input sma-pi-count" value="${_esc(imageDefaults.count)}" /></label>
+          <label class="setup-modal-agent-extra-field setup-modal-agent-extra-field--folder"><span class="setup-modal-agent-extra-label">${_esc(t('agentSelect.outputFolder'))}</span><input class="setup-modal-input sma-pi-folder" value="${_esc(imageDefaults.outputFolder)}" /></label>` : ''}
         </div>
-        <p class="setup-modal-agent-extra-note">${_esc(t('agentSelect.providerHint'))}</p>
+        <p class="setup-modal-agent-extra-note">${_esc(t(image ? 'agentSelect.imageHint' : 'agentSelect.providerHint'))}</p>
         <p class="setup-modal-agent-extra-hint"${form.issue ? '' : ' hidden'}>${_esc(form.issue)}</p>
         <div class="setup-modal-agent-form-actions">
           <span class="setup-modal-agent-add-count">${count}/${PI_MAX_MODELS}</span>

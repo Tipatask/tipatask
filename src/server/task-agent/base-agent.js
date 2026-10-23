@@ -79,6 +79,35 @@ const PARENT_BLOCK_TRUNCATION_MARKER = '\n\n… (parent context truncated)';
 const EFFORT_LEVELS = Object.freeze(['low', 'medium', 'high', 'max']);
 
 class BaseTaskAgent {
+  buildPermissionPolicy(resolved) {
+    return require('../permission-policy').buildPermissionPolicy(resolved, this.id);
+  }
+
+  permissionPrompt(opts = {}) {
+    return opts.permissionPolicy?.prompt || '';
+  }
+
+  buildCommunicationDirective(opts = {}) {
+    const run = opts.permissionPolicy;
+    const { compact, clarify } = this.getPreamblePolicy();
+    if (!run?.enforced || run.planning) {
+      return clarify ? this.buildClarifyDirective({ compact }) : '';
+    }
+    const questionFlow = clarify
+      ? [
+        'Clarifying questions:',
+        run.mode === 'always_ask'
+          ? 'Ask when the task tells you to, or when a material choice remains unresolved after reading the task, comments, repository and KB.'
+          : 'Ask only the necessary questions allowed by the communication policy above; one question is enough when it resolves the missing input.',
+        'You have no question tool or picker here. Use a plain numbered text list; when choices help, give indented lettered A) B) C) options with an open "something else" last and explain how to reply. End the question response with a standalone line reading Questions ready. then wait for the answer. Do not append a plan-ready line or request a new plan approval.',
+      ].join('\n')
+      : 'Use the native question tool for necessary clarification; do not turn routine authorized decisions into preference questions.';
+    // Always ask keeps Claude's native communication unchanged.
+    return [run.communication, run.mode === 'always_ask' && !clarify ? '' : questionFlow].filter(Boolean).join('\n');
+  }
+
+  async getPermissionVersion(status) { return status.detail?.version || status.detail?.output || ''; }
+
   constructor(id, label) {
     this.id = id;
     this.label = label;
@@ -375,12 +404,13 @@ class BaseTaskAgent {
   //                separator. resourceLimits reads opts.agentLimits and is never empty.
   //   clarify    — deliberately NOT part of `directives`: it must sit directly beside the
   //                adapter's own plan-ready instruction (see buildClarifyDirective's ORDERING
-  //                note). '' when the policy says the agent has a native question tool.
+  //                note). Execution policies use mode-specific communication instead;
+  //                native-question agents omit only the text question mechanism.
   // The individual strings are returned too, for an adapter that needs to place one alone.
   // resolveVcsDirective()/buildTagDescriptionDirective() are reached through `this`, so a
   // subclass override (pi-agent.js's compact/REST wording) still applies.
-  // SIMPLE_MODE and Claude's Design Mode are NOT handled here — adapters return early, before
-  // calling this, exactly where they always skipped the directives.
+  // Legacy SIMPLE_MODE and Claude's Design Mode return early in adapters. Explicit
+  // policies retain the shared directives even in SIMPLE_MODE.
   // kbHygiene and followUps get guardedCompletion only when opts.vcsContext is present (the
   // Claude/Codex resolution mandate then finishes through complete_task); without it, args stay `variant`.
   buildSharedPreamble(opts = {}) {
@@ -394,7 +424,7 @@ class BaseTaskAgent {
     const kbHygiene = this.buildKbHygieneDirective(completion);
     const taskStatus = this.buildTaskStatusDirective(variant);
     const followUps = this.buildFollowUpDirective(completion);
-    const clarify = policy.clarify ? this.buildClarifyDirective(variant) : '';
+    const clarify = this.buildCommunicationDirective(opts);
     return {
       vcs,
       tagDesc,
@@ -552,7 +582,12 @@ class BaseTaskAgent {
   // The literal text written into the PTY on plan approval. Override to send something more
   // substantive than the default one-liner (e.g. a model that needs an explicit "don't re-ask"
   // nudge).
-  getApprovalText() { return 'Plan approved. Implement the approved plan now.'; }
+  getApprovalText(opts = {}) {
+    if (opts.permissionPolicy?.enforced && !opts.permissionPolicy.planning) {
+      return [this.permissionPrompt(opts), this.buildCommunicationDirective(opts)].filter(Boolean).join('\n');
+    }
+    return 'Plan approved. Implement the approved plan now.';
+  }
 
   // Milliseconds after approvePlan() to check whether the approval actually landed. 0 (default)
   // disables the watchdog entirely — terminal-session.js never arms a timer for an agent that

@@ -576,6 +576,7 @@ async function detectCompletedTerminalSessions() {
 
   for (const [, session] of sessions) {
     if (session.type !== 'terminal') continue;
+    if (session._imageOperation) continue; // image tasks complete through their own guarded operation
     // (C1356) `_completionEmitted` (below) is the ONLY gate on the task:updated emit now.
     // `_resolutionPosted` still gates the resolution-comment repost inside the completion
     // branch, but must no longer also block the emit: a natural PTY exit fires

@@ -11,14 +11,15 @@ import {
 import { cleanupChat } from './console-modal.js';
 import { showActionConfirm } from './action-confirm.js';
 import { hydrateModifiedCard, buildModifiedTaskPatch, reconcileModifiedCards, parseSnapshotPayload, applyModifiedCardToLiveTask } from './modified-task-merge.js';
-import { attachOriginalSpecPayload } from './objective-spec-payload.js';
+import { attachOriginalSpecPayload, getOriginalSpec } from './objective-spec-payload.js';
+import { missingSourceRefsBlock } from '../server/spec-comment.js';
 import { attachNewTagsPayload } from './objective-new-tags.js';
 import { shouldCreateObjectiveParent, buildObjectiveParentTask, insertObjectiveParent, newObjectiveParentClientId } from './objective-parent-task.js';
 import { resolveOriginPlan, attachSplitOriginPayload, adoptOriginKey, previewOriginSingleTarget, originConflictCardIndexes, outOfSubtreeModifiedIndexes } from './objective-origin-task.js';
 import { discardUnsavedProposals, isMessageFullyResolved } from './chat-finalize.js';
 // Aliased: `t` is already used locally in this file for "the card's task object"
 // (renderCardHtml's renderCard() closure) — importing i18n's t() under its own name would shadow.
-import { t as translate, tc } from './i18n.js';
+import { t as translate, tc, getLocale } from './i18n.js';
 import { groupTitle, groupNoun, getObjectiveGroupingEnabled } from './group-label.js';
 import { countPendingSubtaskCards } from './subtask-preview.js';
 import { normalizeSingleItemList } from './description-list.js';
@@ -61,9 +62,31 @@ function normalizePerformanceSuggestionCard(card) {
 
 // (TPT264) A lone "1." item is list syntax the planner contract forbids — render and save
 // it as prose. Idempotent, so running it on every render and again on save is safe.
-function normalizeCardDescription(card) {
+function normalizeCardDescription(card, msg, cs) {
   const task = card?.task;
   if (task && typeof task.description === 'string') task.description = normalizeSingleItemList(task.description);
+  // Rendering has no save context. Manual forms must not inherit an open chat's
+  // objective; modified proposals must retain their requested scope.
+  if (!task || !msg || card.type !== 'new' || card._manual) return;
+  const objective = getOriginalSpec(cs);
+  if (!objective) return;
+  const cards = msg.cards || [];
+  const newCount = cards.filter(c => c.type === 'new').length;
+  if (!newCount || (newCount > 1 && !quotesObjectiveText(task.description, objective))) return;
+  const block = missingSourceRefsBlock(objective, cards.map(c => c.task?.description), getLocale());
+  if (block) task.description = String(task.description || '').trimEnd() + block;
+}
+
+// A meaningful verbatim line or quoted phrase ties a split task to the objective.
+// Short shared words are insufficient evidence to attach unrelated source material.
+function quotesObjectiveText(description, objective) {
+  const text = String(description || '');
+  const fragments = [
+    ...objective.split(/\r?\n/).map(line => line.replace(/^\s*>\s?/, '').trim()),
+    ...[...text.matchAll(/["“]([^"”\r\n]+)["”]/g)].map(match => match[1]),
+    ...text.split(/\r?\n/).filter(line => /^\s*>/.test(line)).map(line => line.replace(/^\s*>\s?/, '').trim()),
+  ];
+  return fragments.some(fragment => fragment.length >= 20 && text.includes(fragment) && objective.includes(fragment));
 }
 
 // C1072: no longer a pure assertion — normalizes status per card type. "new" cards
@@ -788,7 +811,7 @@ export function attachCardHandlers() {
 
           for (const { card } of acceptedChanges) {
             normalizePerformanceSuggestionCard(card);
-            normalizeCardDescription(card);
+            normalizeCardDescription(card, msg, cs);
           }
 
           // Phase 2.4: preload existing snapshot + cascade client-side to absorb
@@ -1126,7 +1149,7 @@ export async function saveTaskChange(change, { msg } = {}) {
 
   assertPendingProposalStatus(change, 'chat-save-single');
   normalizePerformanceSuggestionCard(change);
-  normalizeCardDescription(change);
+  normalizeCardDescription(change, msg, cs);
   const isStepPinned = !!change.task._stepPinned;
   let objectiveParent = null; // C1339 — set below only for a type:'new', non-manual, non-subtask save
   // (C1559) originPlan.mode 'parent' means the origin task is ALREADY the is_objective

@@ -237,7 +237,9 @@ test('setup:reauth-account swaps the app-level account without a project and ret
   assert.match(handler, /authenticate\(apiBaseUrl, \{ chooseAccount: true \}\)/);
   assert.match(handler, /saveAccountForServer\(apiBaseUrl, \{ token, userId: user\?\.id, email: user\?\.email \}\)/);
   assert.match(handler, /createMenu\(\)/);
-  assert.doesNotMatch(handler, /readProjectConfig|projectPath|exchangeProjectToken/);
+  assert.doesNotMatch(handler, /projectPath|exchangeProjectToken/);
+  assert.match(handler, /if \(!dir\) continue;/, 'unbound windows do not need project config');
+  assert.match(handler, /initializeProjectSettings/, 'bound windows refresh the new account settings');
   const ret = handler.slice(handler.indexOf('return {\n'), handler.indexOf('} catch'));
   assert.match(ret, /ok: true/);
   assert.match(ret, /apiBaseUrl: saved\.apiBaseUrl/);

@@ -37,6 +37,8 @@
 # Signed-in account token store (account-store.js) — USER_DATA_ROOT is this checkout in dev
 /.tipatask-account.json
 /.tipatask-account.json.tmp.*
+# Account-scoped effective preference mirrors under USER_DATA_ROOT in source runs
+/project-settings/
 *.log
 
 /coverage/

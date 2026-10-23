@@ -353,6 +353,38 @@ test('OBJECTIVE_SYSTEM_PROMPT requires the full original and a targeted edit for
   assert.match(systemPrompt, /When the change is tags-only, priority-only, or dependencies-only, do NOT include `description` at all/);
 });
 
+test('OBJECTIVE_SYSTEM_PROMPT preserves literal source material outside the blueprint cap (TPT9081)', () => {
+  const { systemPrompt } = buildObjectivePrompt('any objective', null, null);
+
+  assert.match(systemPrompt, /SOURCE MATERIAL \(hard rule\)/);
+  assert.ok(systemPrompt.includes('every URL, `![img](url)` reference, verbatim user-supplied copy block, example value, and schema/join hint in the objective MUST appear byte-for-byte in a `Source material` paragraph of the task that owns that scope'));
+  assert.match(systemPrompt, /Preserve copy line breaks and exact URL query strings/);
+  assert.match(systemPrompt, /never paraphrase, translate, shorten, or replace source material with a summary/);
+  assert.match(systemPrompt, /Repeat a shared source in every task that needs it/);
+  assert.match(systemPrompt, /original-objective spec comment is reference only and never a substitute for a self-contained task description/);
+  assert.match(systemPrompt, /EXEMPT: the `Source material` paragraph is exempt from the 800-character cap; count only the execution blueprint toward that cap/);
+  assert.match(systemPrompt, /max 800 chars per description, excluding the Source material paragraph from the 800-character cap/);
+
+  const rightLine = systemPrompt.match(/RIGHT \(source material kept[^\n]*/)[0];
+  const right = JSON.parse(rightLine.slice(rightLine.indexOf('{'))).description;
+  const wrongLine = systemPrompt.match(/WRONG \(source material dropped[^\n]*/)[0];
+  const wrong = JSON.parse(wrongLine.slice(wrongLine.indexOf('{'))).description;
+  assert.ok(right.includes('\n\nSource material: '), 'source material must be a separate paragraph');
+  for (const source of [
+    'https://www.figma.com/design/AbC123/Events?node-id=12-34',
+    '![img](/api/projects/2/images/42)',
+    'Upcoming events\nJoin now',
+    'program_id=42',
+    'events.program_id = programs.id',
+  ]) {
+    assert.ok(right.includes(source), `RIGHT example must keep ${source} verbatim after JSON decoding`);
+    assert.ok(!wrong.includes(source), `WRONG example must illustrate dropping ${source}`);
+  }
+
+  const revision = buildObjectivePrompt('different objective', [{ type: 'new', task: { id: 'TPT1' } }], 'keep the source');
+  assert.equal(revision.systemPrompt, systemPrompt, 'source rule belongs in the shared cacheable system prompt');
+});
+
 // TPT502: `active` includes in_progress tasks, so an id-only check let the planner rewrite
 // work an executor had already started. Only pending/on_fire targets may be modified.
 test('OBJECTIVE_SYSTEM_PROMPT gates modified cards on pending/on_fire status (TPT502)', () => {

@@ -195,6 +195,8 @@ const state = {
   // Attention notifications fall back to this when no card is rendered for the task (filtered,
   // collapsed tier, backlog, other tab) — the attention-needed WS payload carries no title.
   taskTitleById: new Map(),
+  // Task overrides retained for active sessions outside the current board window.
+  taskPermissionModeById: new Map(),
 
   // Sprint records from API (array of { id, name, number, goal, task_count })
   sprints: [],

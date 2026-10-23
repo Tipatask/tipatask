@@ -932,21 +932,25 @@ function normalizeSyncAsYouGo(project) {
 async function isSyncAsYouGoEnabled(source, opts = {}) {
   if (!source) return true;
   try {
+    if (typeof source.getEffectiveProjectSettings === 'function') {
+      return normalizeSyncAsYouGo((await source.getEffectiveProjectSettings(opts))?.settings);
+    }
     if (typeof source.getProjectSettings === 'function') {
       const project = await source.getProjectSettings(opts);
       return normalizeSyncAsYouGo(project);
     }
     if (source.baseUrl && source.projectId && source.token) {
-      const cacheKey = `${source.baseUrl}|${source.projectId}`;
+      const identity = crypto.createHash('sha256').update(source.token).digest('hex');
+      const cacheKey = `${source.baseUrl}|${source.projectId}|${identity}`;
       const cached = _syncAsYouGoCache.get(cacheKey);
       if (!opts.refresh && cached && (Date.now() - cached.at) < SYNC_AS_YOU_GO_TTL_MS) return cached.value;
-      const res = await request(`${source.baseUrl}/api/projects/${source.projectId}`, {
+      const res = await request(`${source.baseUrl}/api/projects/${source.projectId}/settings`, {
         method: 'GET',
         headers: { Authorization: `Bearer ${source.token}` },
         timeoutMs: 5000,
       });
       const value = res.status >= 200 && res.status < 300
-        ? normalizeSyncAsYouGo(res.data && res.data.project)
+        ? normalizeSyncAsYouGo(res.data && res.data.settings)
         : true;
       _syncAsYouGoCache.set(cacheKey, { value, at: Date.now() });
       return value;

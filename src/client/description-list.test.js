@@ -39,6 +39,6 @@ test('chat-task-preview.js normalizes descriptions on render and both save paths
   const src = readFileSync(new URL('./chat-task-preview.js', import.meta.url), 'utf8');
   assert.match(src, /import \{ normalizeSingleItemList \} from '\.\/description-list\.js'/);
   assert.match(src, /const t = c\.task;\n\s+normalizeCardDescription\(c\);/);
-  assert.match(src, /normalizePerformanceSuggestionCard\(card\);\n\s+normalizeCardDescription\(card\);/);
-  assert.match(src, /normalizePerformanceSuggestionCard\(change\);\n\s+normalizeCardDescription\(change\);/);
+  assert.match(src, /normalizePerformanceSuggestionCard\(card\);\n\s+normalizeCardDescription\(card, msg, cs\);/);
+  assert.match(src, /normalizePerformanceSuggestionCard\(change\);\n\s+normalizeCardDescription\(change, msg, cs\);/);
 });

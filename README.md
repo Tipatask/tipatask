@@ -197,6 +197,11 @@ Tests sit next to the code they cover as `*.test.js`; `npm test` runs them all. 
 design notes are kept by the maintainers in the parent repository's `ai/architecture/`
 folder, which is not part of this repository.
 
+Effective project preferences come from the signed-in account’s API settings. Local
+preference mirrors live in `project-settings/` under the application user-data directory
+(the server checkout during source development). This ignored runtime directory contains
+separate cache files for each API server, project, and account; credentials stay outside it.
+
 ## Contributing and security
 
 Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). To report a

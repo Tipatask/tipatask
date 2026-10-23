@@ -216,10 +216,10 @@ export function handleTaskActivityMessage(msg) {
 
 // Electron deliberately uses this narrow socket instead of __board__. Forward task state
 // messages to template.html so both the mounted Objective view and the Tasks-section board
-// (including the board behind an open terminal) stay current; other board mutations remain
-// owned by the full board socket in browser mode.
+// (including the board behind an open terminal) stay current. Browser mode sends the same
+// task event types through the shared reconciler from its full board socket.
 export function forwardTaskStateMessage(msg) {
-  if (!msg || (msg.type !== 'tasks-updated' && msg.type !== 'task:updated')) return false;
+  if (!msg || !['tasks-updated', 'task:updated', 'task:created', 'task:deleted', 'tasks:finalized'].includes(msg.type)) return false;
   if (typeof document === 'undefined' || typeof document.dispatchEvent !== 'function') return false;
   if (typeof CustomEvent !== 'function') return false;
   document.dispatchEvent(new CustomEvent('tiptask:task-state-update', { detail: msg }));

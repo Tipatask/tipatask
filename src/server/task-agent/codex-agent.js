@@ -131,7 +131,7 @@ class CodexAgent extends BaseTaskAgent {
       BaseTaskAgent.prependTaskComments(prompt, opts), opts);
 
     // SIMPLE_MODE: skip static bundle + preamble, return bare task prompt
-    if (config.SIMPLE_MODE) return promptWithComments;
+    if (config.SIMPLE_MODE && !opts.permissionPolicy?.enforced && opts.permissionPolicy?.mode !== 'plan') return promptWithComments;
 
     const ttTags = (opts.taskTags || []).filter(t => t.startsWith('tt-'));
     const projectRoot = opts.projectPath || config.PROJECT_ROOT;
@@ -156,10 +156,12 @@ class CodexAgent extends BaseTaskAgent {
     const { directives, clarify } = this.buildSharedPreamble(opts);
     const body = [
       'Use the Tipatask workflow for this repository.',
+      ...(opts.permissionPolicy?.enforced && !opts.permissionPolicy.planning ? [this.permissionPrompt(opts)] : [
       'You are starting in planning mode enforced by Task App.',
       'First study the task, relevant source code, configuration files, and architecture docs.',
       'Do not implement, edit files, or run mutating commands until the user approves the plan.',
       'Do not ask whether to create a plan or wait for Shift+Tab plan mode. Write the plan immediately in normal output, then stop. After the plan, emit one final line whose only content is the words Plan ready., then wait for Task App approval before mutating files.',
+      ]),
       // C1527 — clarifying-questions directive, placed directly after the plan-ready
       // instruction above (mirrors pi-agent.js's PI_QUESTION_MECHANISM placement right after
       // its own plan-ready sentence): the two interact — the directive explicitly overrides
@@ -220,7 +222,7 @@ class CodexAgent extends BaseTaskAgent {
     let env;
     try {
       ({ env } = buildCodexEnv({ projectRoot, taskId, term: 'xterm-256color' }));
-      const launch = codexTerminalLaunchOptions(projectRoot, env.CODEX_HOME, effort ? toCodexEffort(effort) : undefined, env);
+      const launch = codexTerminalLaunchOptions(projectRoot, env.CODEX_HOME, effort ? toCodexEffort(effort) : undefined, env, opts.permissionPolicy);
       env.CODEX_HOME = launch.codexHome;
       args.unshift(...launch.args);
       console.log(`[codex:launch] task=${taskId || '(none)'} mode=${launch.mode} reason=${launch.reason}`);
@@ -243,7 +245,7 @@ class CodexAgent extends BaseTaskAgent {
     const { refreshSessionVcs, buildVcsContextDirective } = require('../vcs-context');
     const context = await refreshSessionVcs(session);
     if (session.pty !== pty || !session.alive) return;
-    const text = `${this.getApprovalText()}\n${buildVcsContextDirective(context)}`;
+    const text = `${this.getApprovalText(session)}\n${buildVcsContextDirective(context)}`;
     const handoff = this.prepareKickoff(config, text, session.taskId);
     if (handoff.kickoffFile) {
       // (TPT9048) Verified like the kickoff: the approval is a short typed handoff too.

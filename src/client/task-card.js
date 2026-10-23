@@ -22,6 +22,8 @@ import { attentionClass, isAttentionRaised, clearAttention } from './attention-s
 import { activityChipHtml, refreshActivityChip } from './task-activity.js';
 import { MERGE_DOT, mergeButtonHtml, syncTaskMergeCard, initializeTaskMerge } from './task-merge.js';
 import { FINISH_DOT, finishButtonHtml, syncTaskFinishCard, initializeTaskFinish } from './task-finish.js';
+import { openTaskWorkspace } from './task-edit-modal.js';
+import { permissionButtonHtml, syncPermissionModeButton, initializeTaskPermissionMode } from './task-permission-mode.js';
 import { isDragStateStale, resolveDropTier, shouldDeferForDrag } from './drag-state.js';
 import { collectFamilyIds } from './related-cards.js';
 import { HIDE_CLASS } from './sprint-tier-visibility.js';
@@ -30,6 +32,11 @@ import { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps }
 import { expandedCardMaxHeight, clampExpandedTop, resolveAnchorTop, shouldRestoreExpansion } from './card-placement.js';
 export { isDragStateStale, resolveDropTier, shouldDeferForDrag };
 export { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps };
+
+// Open the task workspace with its permission field focused.
+export function openPermissionModeSettings(taskId) {
+  return openTaskWorkspace(taskId, { pane: 'edit', focusField: 'modal-permission-mode' });
+}
 // (C1483) Shape check for "is this a real task key" (prefix+number or dashed epic form)
 // vs a synthetic client id ('new'/'new-<ts>-<seq>'/'new-obj-...'). Server-side module,
 // dependency-free CJS — safe to pull into the client bundle.
@@ -593,6 +600,9 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
   // matches isLeftUncommitted() (closed = complete or canceled role).
   const leftUncommitted = !preview && !!state.leftUncommitted?.has?.(t.id) && !isCompleteName(t.status) && !isCanceledName(t.status);
   const finishBtn = leftUncommitted ? finishButtonHtml(t.id) : '';
+  // (TPT9063) Permission-mode button (task-permission-mode.js) — board cards only; objectives never
+  // run an agent terminal, so their controls-row slot keeps the Subtasks button alone.
+  const permissionBtn = (preview || t.isObjective) ? '' : permissionButtonHtml(t);
   const selectBtn = `<button class="btn-select-card${isSelected ? ' checked' : ''}" data-task-id="${escapeAttr(t.id)}" data-tip="${escapeAttr(translate('tooltip.selectCard'))}" aria-label="${escapeAttr(translate('tooltip.selectCard'))}"><span class="select-dot"></span>${manualMerge ? MERGE_DOT : ''}${leftUncommitted ? FINISH_DOT : ''}</button>`;
   const agentBadge = proposal ? '' : renderAgentBadge(t);
   const effortBadge = proposal ? '' : renderEffortBadge(t);
@@ -643,7 +653,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
               <select class="card-status-select card-ctl" style="--status-color:${statusColor(t.status)}" data-task-id="${escapeAttr(t.id)}" data-current="${t.status}">
                 ${statusNames().map(s => `<option value="${s}" ${s === t.status ? 'selected' : ''}>${statusLabel(s)}</option>`).join('')}
               </select>
-              ${deviceBadge}
+              ${deviceBadge}${permissionBtn}
               ${t.isObjective
                 ? (t.hasChildren
                     ? `<button class="btn-open-subtask-board btn-subtasks-show card-ctl" data-task-key="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" title="${escapeAttr(subtasksLabel)}">${_SUBTASKS_SVG}<span>${escapeAttr(subtasksLabel)}</span></button>`
@@ -1598,6 +1608,7 @@ export function refreshCard(t) {
   if (!card) return; // card detached (e.g. sprint move pending reload) — no-op
   if (state.taskMergeStatus) syncTaskMergeCard(card);
   syncTaskFinishCard(card); // (TPT614) the Finish button follows the flag + the card's live status
+  syncPermissionModeButton(card, t); // (TPT9063) override + cached project default → tip/dataset
 
   // (TPT374) The console-control button's icon/caption now depends on status (an in-progress
   // task with a live session paints a spinner, not the plain play icon) — a status-only patch
@@ -1958,6 +1969,7 @@ export function setupCardInteractions(appEl) {
   ensureButtonTooltips(appEl);
   initializeTaskMerge(appEl);
   initializeTaskFinish(appEl);
+  initializeTaskPermissionMode(appEl, openPermissionModeSettings); // (TPT9063)
 
   // ── Status select change handlers ──
   appEl.querySelectorAll('.status-select').forEach(sel => {

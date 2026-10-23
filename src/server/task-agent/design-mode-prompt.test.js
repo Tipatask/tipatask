@@ -200,3 +200,30 @@ test('Design Mode excludes shared assembly, orders task before comments, and enf
   const huge = agent.buildPrompt('x'.repeat(10000), opts);
   assert.ok(huge.slice('/design '.length).length <= 4000);
 });
+
+for (const mode of ['plan', 'auto', 'bypass']) test(`Design Mode keeps ${mode} native permissions and a single-line kickoff`, async () => {
+  const dir = makeProjectDir({ CLAUDE_MODEL: 'opusplan' });
+  try {
+    const agent = new ClaudeAgent();
+    const permissionPolicy = agent.buildPermissionPolicy({ mode });
+    const spec = await agent.getSpawnSpec(FAKE_CONFIG, 'Make a task board', 'TPT9080', { projectPath: dir, designMode: true, permissionPolicy });
+    assert.equal(spec.args[spec.args.indexOf('--permission-mode') + 1], { plan: 'plan', auto: 'acceptEdits', bypass: 'bypassPermissions' }[mode]);
+    assert.match(spec.initialPrompt, /^\/design Make a task board/);
+    assert.ok(!spec.initialPrompt.includes('\n'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('explicit Plan preserves native flags and adds the in-run approval contract to the legacy kickoff', async () => {
+  const dir = makeProjectDir({ CLAUDE_MODEL: 'opusplan' });
+  try {
+    const agent = new ClaudeAgent();
+    const spec = mode => agent.getSpawnSpec(FAKE_CONFIG, 'Make a task board', 'TPT9080', { projectPath: dir, permissionPolicy: agent.buildPermissionPolicy({ mode }) });
+    const legacy = await spec(null);
+    const plan = await spec('plan');
+    assert.deepEqual(plan.args, legacy.args);
+    assert.ok(plan.initialPrompt.includes(legacy.initialPrompt));
+    assert.match(plan.initialPrompt, /Wait for user approval before implementing/);
+    assert.match(plan.initialPrompt, /standalone line reading Plan ready\./);
+    assert.match(plan.initialPrompt, /then implement the approved plan in this same session\.$/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

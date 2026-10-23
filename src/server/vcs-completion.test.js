@@ -71,7 +71,8 @@ test('real backend strict refresh cannot authorize from a previously cached row'
   let fail = false;
   const server = http.createServer((req, res) => {
     res.writeHead(fail ? 503 : 200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(fail ? { error: 'offline' } : { project: row }));
+    res.end(JSON.stringify(fail ? { error: 'offline' } : req.url.endsWith('/settings')
+      ? { settings: row, source: 'global', is_creator: true } : { project: row }));
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   t.after(() => new Promise(r => server.close(r)));

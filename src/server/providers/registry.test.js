@@ -48,6 +48,27 @@ test('isValidSelection rejects an unknown provider', () => {
   assert.equal(registry.isValidSelection('unknown-provider:some-model'), false);
 });
 
+test('image-purpose Pi rows are task metadata and never text/planning choices', () => {
+  const image = 'openrouter/recraft/recraft-v3';
+  const text = 'openrouter/text-model';
+  const dir = makeProjectDir({ AVAILABLE_AGENTS: 'pi', PI_MODELS: [{ model: image, apiKey: 'test-key', purpose: 'image' }, { model: text, apiKey: 'test-key' }] });
+  try {
+    const cfg = registry.configForProject(dir);
+    const pi = registry.listObjectiveProviders(cfg).find(p => p.id === 'pi');
+    assert.deepEqual(pi.configuredModels, [image, text]);
+    assert.deepEqual(pi.imageModels, [image]);
+    assert.deepEqual(pi.models, [{ value: text }]);
+    assert.equal(pi.defaultModel, text);
+    assert.equal(registry.isValidSelection(`pi:${image}`, cfg), false);
+    assert.equal(registry.isValidSelection(`pi:${text}`, cfg), true);
+    fs.writeFileSync(path.join(dir, '.tipatask/config.json'), JSON.stringify({ AVAILABLE_AGENTS: 'pi', PI_MODELS: [{ model: image, apiKey: 'test-key', purpose: 'image' }] }));
+    const only = registry.listVisibleObjectiveProviders(registry.configForProject(dir)).find(p => p.id === 'pi');
+    assert.deepEqual(only.models, []);
+    assert.deepEqual(only.configuredModels, [image]);
+    assert.equal(only.selectable, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('isValidSelection rejects a model outside the provider\'s allowlist', () => {
   assert.equal(registry.isValidSelection('claude:not-a-real-model'), false);
   assert.equal(registry.isValidSelection('gemini:not-a-real-model'), false);

@@ -193,6 +193,29 @@ test('agentSelector.title and agentSelector.remember are translated in every loc
   }
 });
 
+// (TPT9063) The permission-mode card button + dialog keys (permission-mode.js /
+// task-permission-mode.js): translated in every locale, with their placeholders intact.
+test('permissionMode.* keys are translated in every locale and keep their placeholders', () => {
+  const keys = Object.keys(LOCALES.en).filter((k) => k.startsWith('permissionMode.'));
+  assert.equal(keys.length, 20);
+  for (const key of keys) {
+    for (const [locale, table] of Object.entries(LOCALES)) {
+      assert.ok(table[key]?.trim(), `${locale}.${key} must be a non-empty string`);
+    }
+    assert.notEqual(LOCALES.uk[key], LOCALES.en[key], `uk.${key} must not be the English text`);
+  }
+  const placeholders = {
+    'permissionMode.projectDefaultWith': ['{mode}'], 'permissionMode.tip': ['{mode}'],
+    'permissionMode.hint.inherited': ['{mode}', '{hint}'], 'permissionMode.title': ['{key}'],
+    'permissionMode.taskSaved': ['{key}'], 'permissionMode.failed': ['{msg}'], 'permissionMode.errLoad': ['{id}', '{msg}'],
+  };
+  for (const [key, params] of Object.entries(placeholders)) {
+    for (const [locale, table] of Object.entries(LOCALES)) {
+      for (const p of params) assert.ok(table[key].includes(p), `${locale}.${key} must contain ${p}`);
+    }
+  }
+});
+
 // (TPT9008) The ESTART reason sub-keys: each agent's detect() codes (+ Pi's no_tool_calls), and the
 // shared detection_failed. objective-teardown-wiring.test.js checks their English against the server.
 const ESTART_REASON_KEYS = [
