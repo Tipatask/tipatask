@@ -92,7 +92,7 @@ test('console-modal.js: the terminal header seeds Pi with the picked row, else t
 
 test('task-board.js: the bulk agent lists come from _taskStartAgentIds()', () => {
   assert.match(fnBody(board, 'function _taskStartAgentIds() {'), /return piOnlyToolLess\(state\.objectiveProviders\) \? ids\.filter\(id => id !== 'pi'\) : ids;/);
-  assert.match(board, /const ids = _taskStartAgentIds\(\);\s*slot\.innerHTML = renderAgentPicker\('bulkAgent', '', false, ids\);/);
+  assert.match(fnBody(board, 'export function initBulkActionBar('), /const ids = _taskStartAgentIds\(\);[^]*?slot\.innerHTML = renderAgentPicker\('bulkAgent', _bulkChanges\.agent \|\| '', false, ids, /);
   assert.match(fnBody(board, 'export function showBulkAgentStartModal('), /const agents = opts\.agents \|\| _taskStartAgentIds\(\);/);
 });
 

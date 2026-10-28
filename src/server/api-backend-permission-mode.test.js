@@ -90,7 +90,10 @@ test('task create/read/update/bulk mappings retain modes, null and omission', as
 
 test('proposal diff detects mode-only edits while missing fields preserve stored overrides', async t => {
   const { backend, state } = await fixture(t);
-  const save = tasks => backend.overwriteRaw('```json\n' + JSON.stringify({ tasks }) + '\n```');
+  const save = async tasks => {
+    const taskBases = JSON.parse(JSON.stringify(await backend.getTasksUnfiltered()));
+    await backend.overwriteRaw('```json\n' + JSON.stringify({ tasks, writeTaskIds: tasks.map(t => t.id), taskBases }) + '\n```');
+  };
   let [task] = await backend.getTasksUnfiltered();
   delete task.agentPermissionMode;
   await save([task]);

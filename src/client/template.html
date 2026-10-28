@@ -34,221 +34,343 @@
 <div id="settings-modal" role="dialog" aria-modal="true" aria-label="Settings">
   <div class="settings-panel" role="document">
     <button class="settings-close" type="button" aria-label="Close settings">&times;</button>
-    <h2 class="settings-title">Settings</h2>
+    <!-- (TPT9111) The dialog's text nodes ship empty: _localizeSettingsModal() (task-board.js)
+         fills the title, tab buttons, section titles and fixed row labels from t() on every
+         open, and the tab populators fill the rest. This file is server-rendered once, so
+         baked-in English would never follow the project's language. The two aria-labels are
+         only the pre-open fallback. -->
+    <h2 class="settings-title" id="settings-title"></h2>
     <div class="modal-tabs">
-      <button class="modal-tab-btn active" type="button" data-tab="general">General</button>
-      <button class="modal-tab-btn" type="button" data-tab="voice" id="settings-voice-tab-btn">Voice</button>
-      <!-- (C1182/C1353) Workflow tab — custom task statuses. Static label here (matching
-           its General/Voice siblings) since _populateSettingsWorkflowTab() only re-sets it
-           on Settings-modal open; t() there overrides this for i18n. -->
-      <button class="modal-tab-btn" type="button" data-tab="workflow" id="settings-workflow-tab-btn">Workflow</button>
-      <!-- (C1490) Memory tab — Knowledge Base sync settings. Static label here (matching
-           its siblings) since _populateSettingsMemoryTab() only re-sets it on Settings-
-           modal open; t() there overrides this for i18n. -->
-      <button class="modal-tab-btn" type="button" data-tab="memory" id="settings-memory-tab-btn">Memory</button>
-      <!-- (TPT62) Version Control tab — git/svn/off + git-only worktree/commit/PR flags.
-           Static label here (matching its siblings) since
-           _populateSettingsVersionControlTab() only re-sets it on Settings-modal open;
-           t() there overrides this for i18n. Web-app twin: tt-web-settings.md § Version
-           Control tab (C1214). -->
-      <button class="modal-tab-btn" type="button" data-tab="vcs" id="settings-vcs-tab-btn">Version Control</button>
+      <button class="modal-tab-btn active" type="button" data-tab="general" id="settings-general-tab-btn"></button>
+      <button class="modal-tab-btn" type="button" data-tab="voice" id="settings-voice-tab-btn"></button>
+      <!-- (C1182/C1353) Workflow tab — custom task statuses. -->
+      <button class="modal-tab-btn" type="button" data-tab="workflow" id="settings-workflow-tab-btn"></button>
+      <!-- (C1490) Memory tab — Knowledge Base sync settings. -->
+      <button class="modal-tab-btn" type="button" data-tab="memory" id="settings-memory-tab-btn"></button>
+      <!-- (TPT62) Version Control tab — git/svn/off + the git-only worktree/commit/PR/merge
+           flags. Web-app twin: tt-web-settings.md § Version Control tab (C1214). -->
+      <button class="modal-tab-btn" type="button" data-tab="vcs" id="settings-vcs-tab-btn"></button>
     </div>
     <!-- (C1178) Each panel carries `.settings-body` itself (not a shared wrapper around
-         both) so it keeps the existing flex/gap layout untouched — nesting the two panels
-         one level inside a single .settings-body would starve the rows inside of that
-         flex context instead. -->
+         them) so it keeps its own flex layout — nesting the panels one level inside a single
+         .settings-body would starve the rows inside of that flex context instead. (TPT9110)
+         Each panel is also the modal's scroll region for its tab — the panel box is
+         fixed-size, see styles.css § Settings modal.
+         (TPT9111) Every panel shares one skeleton: a stack of section.settings-section blocks,
+         each an h3.settings-section-title followed by .settings-row rows. A row holds
+         .settings-row-label (the label, an optional .settings-row-note badge and optional
+         .settings-row-hint lines) and .settings-row-control (the control); a state message
+         is a .settings-notice inside the row it belongs to. Rows built in task-board.js
+         (agents, permission mode, voice models, Version Control) use the same classes — see
+         styles.css § Settings sections and rows. -->
     <div class="settings-body modal-tab-panel" data-tab="general">
-      <label class="settings-row">
-        <span>Theme</span>
-        <select id="settings-theme-select">
-          <optgroup label="Light">
-            <option value="paper">TipATask dawn</option>
-            <option value="parchment">Light › Parchment</option>
-            <option value="latte">Light › Sage Morning</option>
-            <option value="meadow">Light › Meadow Mist</option>
-            <option value="arctic">Light › Arctic Haze</option>
-            <option value="terracotta">Light › Terracotta</option>
-            <option value="sakura">Light › Sakura Bloom</option>
-            <option value="citrus">Light › Citrus Grove</option>
-            <option value="slate">Light › Slate Grey</option>
-            <option value="lagoon">Light › Lagoon</option>
-            <option value="iris">Light › Lavender Fields</option>
-          </optgroup>
-          <optgroup label="Dark">
-            <option value="ink">TipATask dusk</option>
-            <option value="mocha">Dark › Midnight Mocha</option>
-            <option value="ocean">Dark › Ocean Depths</option>
-            <option value="ember">Dark › Ember Dusk</option>
-            <option value="forest">Dark › Forest Night</option>
-            <option value="nord">Dark › Nordic Frost</option>
-            <option value="rose">Dark › Rose Quartz</option>
-            <option value="graphite">Dark › Graphite</option>
-            <option value="espresso">Dark › Espresso</option>
-            <option value="neon">Dark › Neon Circuit</option>
-          </optgroup>
-        </select>
-      </label>
-      <div class="settings-row" id="settings-notifications-row">
-        <span>Notifications <small class="settings-row-note" id="settings-notifications-state"></small></span>
-        <span class="settings-row-controls">
-          <button type="button" class="settings-row-btn" id="settings-notifications-test">Test</button>
-        </span>
-      </div>
-      <div class="settings-row-hint" id="settings-notifications-hint" hidden>
-        <span id="settings-notifications-hint-text"></span>
-        <button type="button" class="settings-row-btn" id="settings-notifications-repair" hidden></button>
-      </div>
-      <div class="settings-row-hint" id="settings-notifications-style-hint" hidden>
-        <span id="settings-notifications-style-text"></span>
-        <button type="button" class="settings-row-btn" id="settings-notifications-style-btn"></button>
-      </div>
-      <div class="settings-row" id="settings-agents-row" style="display:none">
-        <span>Agents</span>
-        <span class="settings-row-controls">
-          <span class="settings-row-value" id="settings-agents-summary"></span>
-          <button type="button" class="settings-row-btn" id="settings-agents-edit">Edit</button>
-        </span>
-      </div>
-      <label class="settings-row" id="settings-language-row" title="Applies to every member of this project">
-        <span>Language <small class="settings-row-note">project-wide</small></span>
-        <select id="settings-language-select">
-          <option value="en">English</option>
-          <option value="uk">Українська (Ukrainian)</option>
-        </select>
-      </label>
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-display-title"></h3>
+        <!-- (C940/C941) Language is a whole-project setting for every member (badge + hint). -->
+        <div class="settings-row" id="settings-language-row">
+          <div class="settings-row-label">
+            <label for="settings-language-select" id="settings-language-label"></label>
+            <small class="settings-row-note" id="settings-language-note"></small>
+            <p class="settings-row-hint" id="settings-language-hint"></p>
+          </div>
+          <div class="settings-row-control">
+            <select id="settings-language-select">
+              <option value="en">English</option>
+              <option value="uk">Українська (Ukrainian)</option>
+            </select>
+          </div>
+        </div>
+        <div class="settings-row" id="settings-theme-row">
+          <div class="settings-row-label">
+            <label for="settings-theme-select" id="settings-theme-label"></label>
+          </div>
+          <div class="settings-row-control">
+            <select id="settings-theme-select">
+              <optgroup label="Light">
+                <option value="paper">TipATask dawn</option>
+                <option value="parchment">Light › Parchment</option>
+                <option value="latte">Light › Sage Morning</option>
+                <option value="meadow">Light › Meadow Mist</option>
+                <option value="arctic">Light › Arctic Haze</option>
+                <option value="terracotta">Light › Terracotta</option>
+                <option value="sakura">Light › Sakura Bloom</option>
+                <option value="citrus">Light › Citrus Grove</option>
+                <option value="slate">Light › Slate Grey</option>
+                <option value="lagoon">Light › Lagoon</option>
+                <option value="iris">Light › Lavender Fields</option>
+              </optgroup>
+              <optgroup label="Dark">
+                <option value="ink">TipATask dusk</option>
+                <option value="mocha">Dark › Midnight Mocha</option>
+                <option value="ocean">Dark › Ocean Depths</option>
+                <option value="ember">Dark › Ember Dusk</option>
+                <option value="forest">Dark › Forest Night</option>
+                <option value="nord">Dark › Nordic Frost</option>
+                <option value="rose">Dark › Rose Quartz</option>
+                <option value="graphite">Dark › Graphite</option>
+                <option value="espresso">Dark › Espresso</option>
+                <option value="neon">Dark › Neon Circuit</option>
+              </optgroup>
+            </select>
+          </div>
+        </div>
+      </section>
+      <!-- (C1124) One row per enabled agent, built into #settings-agents-summary by
+           _populateSettingsAgentsRow() from this window's own project config, then the row
+           whose Edit button opens agents-modal.js. The section hides while no project is
+           bound to the window. -->
+      <section class="settings-section" id="settings-agents-section">
+        <h3 class="settings-section-title" id="settings-agents-title"></h3>
+        <div id="settings-agents-summary"></div>
+        <div class="settings-row" id="settings-agents-row">
+          <div class="settings-row-label">
+            <span id="settings-agents-label"></span>
+            <p class="settings-row-hint" id="settings-agents-hint"></p>
+          </div>
+          <div class="settings-row-control">
+            <button type="button" class="settings-row-btn" id="settings-agents-edit"></button>
+          </div>
+        </div>
+      </section>
+      <!-- (C1058) Delivery status badge + Test/Enable button. Both notices ship hidden;
+           _populateSettingsNotificationsRows() shows #settings-notifications-hint when
+           delivery is blocked (with Repair for duplicate LaunchServices claimants, C1355) and
+           #settings-notifications-style-hint for the macOS Banner-vs-Alert advice (C1137). -->
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-notifications-title"></h3>
+        <div class="settings-row" id="settings-notifications-row">
+          <div class="settings-row-label">
+            <span id="settings-notifications-label"></span>
+            <small class="settings-row-note" id="settings-notifications-state"></small>
+            <p class="settings-row-hint" id="settings-notifications-row-hint"></p>
+          </div>
+          <div class="settings-row-control">
+            <button type="button" class="settings-row-btn" id="settings-notifications-test"></button>
+          </div>
+          <div class="settings-notice" id="settings-notifications-hint" hidden>
+            <span id="settings-notifications-hint-text"></span>
+            <button type="button" class="settings-row-btn" id="settings-notifications-repair" hidden></button>
+          </div>
+          <div class="settings-notice settings-notice--info" id="settings-notifications-style-hint" hidden>
+            <span id="settings-notifications-style-text"></span>
+            <button type="button" class="settings-row-btn" id="settings-notifications-style-btn"></button>
+          </div>
+        </div>
+      </section>
       <!-- (C1259) Click-to-render perf logging (src/client/perf-log.js). Off by default;
            toggling writes .tipatask/config.json's debugPerfLog (task-board.js
-           writeDebugPerfLog()) so every window sharing this project picks it up on its
-           next loadStatuses()-style project-config read, same discipline as theme/language. -->
-      <label class="settings-row" id="settings-debug-row">
-        <span>Debug <small class="settings-row-note">click-to-render perf log</small></span>
-        <input type="checkbox" id="settings-debug-perf-toggle">
-      </label>
-      <div class="settings-row-hint" id="settings-debug-perf-hint" hidden>
-        <span id="settings-debug-perf-path"></span>
-        <button type="button" class="settings-row-btn" id="settings-debug-perf-copy">Copy path</button>
-        <button type="button" class="settings-row-btn" id="settings-debug-perf-reveal" hidden>Reveal</button>
-      </div>
+           writeDebugPerfLog()) so every window sharing this project picks it up on its next
+           project-config read. The notice shows the log file while logging is on. -->
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-debug-title"></h3>
+        <div class="settings-row" id="settings-debug-row">
+          <div class="settings-row-label">
+            <label for="settings-debug-perf-toggle" id="settings-debug-label"></label>
+            <p class="settings-row-hint" id="settings-debug-perf-note"></p>
+          </div>
+          <div class="settings-row-control">
+            <input type="checkbox" id="settings-debug-perf-toggle">
+          </div>
+          <div class="settings-notice settings-notice--info" id="settings-debug-perf-hint" hidden>
+            <code id="settings-debug-perf-path"></code>
+            <button type="button" class="settings-row-btn" id="settings-debug-perf-copy"></button>
+            <button type="button" class="settings-row-btn" id="settings-debug-perf-reveal" hidden></button>
+          </div>
+        </div>
+      </section>
     </div>
     <!-- (C1195) Voice tab. One radio group (`settings-voice-engine`) spans the static
-         AssemblyAI row below plus the dynamically-rendered local-model rows in
-         #settings-voice-local-list — the panel has no <form> ancestor, so radios still group
-         and stay mutually exclusive by `name` across that static/dynamic DOM split. The
-         AssemblyAI row is deliberately static markup (not re-rendered per open) so its key
-         input/Save/Clear keep the listeners _wireVoiceKeyButtons()/_wireVoiceAssemblyaiRow()
-         attach once. Text content is deliberately NOT hardcoded here (unlike the General tab
-         above, a pre-existing i18n gap — see tt-audio-input.md) — every label is set via t()
-         from _populateSettingsVoiceTab()/_localizeVoiceStaticLabels() in task-board.js so
-         this panel actually relocalizes. The AssemblyAI key is never round-tripped back into
-         this input's value — see task-board.js's readProjectVoiceSettings() for why (only a
-         `hasAssemblyaiKey` boolean flows back). The key row is always visible (not gated on
-         selection) so the key can be entered/cleared regardless of which row is picked. -->
+         AssemblyAI row plus the local-model rows rendered into #settings-voice-local-list —
+         the panel has no <form> ancestor, so radios still group and stay mutually exclusive
+         by `name` across that static/dynamic DOM split. The AssemblyAI row is deliberately
+         static markup (not re-rendered per open) so its key input/Save/Clear keep the
+         listeners _wireVoiceKeyButtons()/_wireVoiceAssemblyaiRow() attach once. Its text is
+         set via t() from _populateSettingsVoiceTab()/_localizeVoiceStaticLabels(). The
+         AssemblyAI key is never round-tripped back into the input's value — see
+         readProjectVoiceSettings() (only a `hasAssemblyaiKey` boolean flows back). -->
     <div class="settings-body modal-tab-panel" data-tab="voice" hidden>
-      <!-- (C1204) Input device applies to both engines below, so it sits above the radio
-           list. Options are built entirely in JS (_populateVoiceInputDeviceSelect(),
-           task-board.js) — device labels are arbitrary OS strings, and the row is hidden
-           outright when navigator.mediaDevices is unavailable (insecure-context browser mode). -->
-      <label class="settings-row" id="settings-voice-input-device-row">
-        <span id="settings-voice-input-device-label"></span>
-        <select id="settings-voice-input-device"></select>
-      </label>
-      <!-- (C1210) Global keyboard shortcut. Curated <select> (VOICE_SHORTCUT_OPTIONS,
-           voice-shortcut.js) rather than a live key-capture widget — deliberately avoids ever
-           letting a user pick a combo this app already uses (Cmd+Q/Shift+O/Shift+W/,) or
-           one macOS is likely to intercept (see the hint below and tt-audio-input.md § Keyboard
-           Shortcut, C1210, for why Space specifically was never safe). -->
-      <label class="settings-row" id="settings-voice-shortcut-row">
-        <span id="settings-voice-shortcut-label"></span>
-        <select id="settings-voice-shortcut"></select>
-      </label>
-      <p class="settings-row-hint" id="settings-voice-shortcut-hint"></p>
-      <div class="settings-voice-engine-list">
-        <div class="settings-voice-model-row settings-voice-engine-row" id="settings-voice-assemblyai-row">
-          <label class="settings-voice-model-label">
-            <input type="radio" name="settings-voice-engine" value="assemblyai" id="settings-voice-preset-assemblyai">
-            <span class="settings-voice-model-name" id="settings-voice-preset-assemblyai-label"></span>
-          </label>
-          <div class="settings-voice-key-row">
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-voice-input-title"></h3>
+        <!-- (TPT9156) Recording mode, `voiceMode` in .tipatask/config.json: Standard streams text
+             in as you speak, Thank You records until the stop phrase and then transcribes and
+             cleans up the whole recording once. The radios are the segments of the row's
+             .settings-segmented control, as on the Version Control tab; the hint describes
+             whichever mode is checked (_applyVoiceModeSelection(), task-board.js). -->
+        <div class="settings-row" id="settings-voice-mode-row">
+          <div class="settings-row-label">
+            <span id="settings-voice-mode-label"></span>
+            <p class="settings-row-hint" id="settings-voice-mode-hint"></p>
+          </div>
+          <div class="settings-row-control settings-segmented" id="settings-voice-mode-options" role="radiogroup" aria-labelledby="settings-voice-mode-label" aria-describedby="settings-voice-mode-hint">
+            <label>
+              <input type="radio" name="settings-voice-mode" value="standard" id="settings-voice-mode-standard">
+              <span id="settings-voice-mode-standard-label"></span>
+            </label>
+            <label>
+              <input type="radio" name="settings-voice-mode" value="thankyou" id="settings-voice-mode-thankyou">
+              <span id="settings-voice-mode-thankyou-label"></span>
+            </label>
+          </div>
+        </div>
+        <!-- (C1204) The input device applies to both engines below. Options are built in JS
+             (_populateVoiceInputDeviceSelect()) — device labels are arbitrary OS strings — and
+             the row is hidden outright when navigator.mediaDevices is unavailable
+             (insecure-context browser mode). -->
+        <div class="settings-row" id="settings-voice-input-device-row">
+          <div class="settings-row-label">
+            <label for="settings-voice-input-device" id="settings-voice-input-device-label"></label>
+          </div>
+          <div class="settings-row-control">
+            <select id="settings-voice-input-device"></select>
+          </div>
+        </div>
+        <!-- (C1210) Global keyboard shortcut. A curated <select> (VOICE_SHORTCUT_OPTIONS,
+             voice-shortcut.js) rather than a key-capture widget, so a combo this app already
+             uses or macOS is likely to intercept can never be picked (tt-audio-input.md
+             § Keyboard Shortcut). -->
+        <div class="settings-row" id="settings-voice-shortcut-row">
+          <div class="settings-row-label">
+            <label for="settings-voice-shortcut" id="settings-voice-shortcut-label"></label>
+            <p class="settings-row-hint" id="settings-voice-shortcut-hint"></p>
+          </div>
+          <div class="settings-row-control">
+            <select id="settings-voice-shortcut"></select>
+          </div>
+        </div>
+      </section>
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-voice-engine-title"></h3>
+        <div class="settings-row" id="settings-voice-assemblyai-row">
+          <div class="settings-row-label">
+            <label class="settings-voice-model-label">
+              <input type="radio" name="settings-voice-engine" value="assemblyai" id="settings-voice-preset-assemblyai">
+              <span class="settings-voice-model-name" id="settings-voice-preset-assemblyai-label"></span>
+            </label>
+          </div>
+          <div class="settings-row-control">
             <input type="password" id="settings-voice-assemblyai-key" class="settings-voice-key-input" autocomplete="off" spellcheck="false">
             <button type="button" class="settings-row-btn" id="settings-voice-key-save"></button>
             <button type="button" class="settings-row-btn settings-row-btn-ghost" id="settings-voice-key-clear" hidden></button>
           </div>
-          <div class="settings-row-hint settings-voice-key-status" id="settings-voice-key-status" hidden></div>
+          <div class="settings-notice" id="settings-voice-key-status" hidden></div>
         </div>
-        <div class="settings-voice-local-list" id="settings-voice-local-list"></div>
-      </div>
-      <div class="settings-row-hint" id="settings-voice-local-not-wired-hint" hidden></div>
+        <div id="settings-voice-local-list"></div>
+        <div class="settings-notice settings-notice--info" id="settings-voice-local-not-wired-hint" hidden></div>
+      </section>
     </div>
-    <!-- (C1182) Workflow tab — status table (drag handle, chip+delete, task count, 4
-         role radios) + add-status form. All content is JS-rendered by
-         _populateSettingsWorkflowTab()/_renderWorkflowRows() in task-board.js, same as
-         the Voice tab's model list, since row count is dynamic. Caption + stage-column
-         header (C1192) are separate siblings, both filled via t() in
-         _populateSettingsWorkflowTab() — kept OUT of #settings-workflow-list because that
-         element is a scroll container (max-height/overflow-y) and the drag-reorder code
-         queries its .settings-wf-row children by index; a header row inside it would both
-         scroll away and get treated as a draggable row. -->
+    <!-- (C1182) Workflow tab. Board-shape toggles, the project's agent permission default and
+         the status table; every caption and the table itself are filled by
+         _populateSettingsWorkflowTab() and the row populators it calls. -->
     <div class="settings-body modal-tab-panel" data-tab="workflow" hidden>
-      <!-- (C1332) Show Sprints — project-wide sprints_enabled toggle (C1330 migration/PATCH).
-           Caption filled by _populateSettingsSprintsRow() in task-board.js, dynamic-noun
-           label ("Show Batches"/"Show Sprints"/...) matching the current Group Tasks Into
-           value. Sits above that row because it controls that row's visibility (hidden
-           entirely, not just its <select>, when sprints are off). Web-app twin: C1331. -->
-      <!-- (C1558) Use Objective Tasks Grouping — project-wide use_objective_grouping toggle
-           (C1556 migration/PATCH). Caption filled by
-           _populateSettingsObjectiveGroupingRow() in task-board.js. Sits above the Show
-           Sprints row — unrelated to the sprint/batch container, but the same "workflow
-           shape" tier of setting. Web-app twin: C1557. -->
-      <label class="settings-row" id="settings-objective-grouping-row">
-        <span id="settings-objective-grouping-caption"></span>
-        <input type="checkbox" id="settings-objective-grouping-toggle">
-      </label>
-      <label class="settings-row" id="settings-sprints-enabled-row">
-        <span id="settings-sprints-enabled-caption"></span>
-        <input type="checkbox" id="settings-sprints-enabled-toggle">
-      </label>
-      <!-- (C1271) Group Tasks Into — project-wide noun for board group containers
-           (projects.task_group_label, C1232). Label + options filled by
-           _populateSettingsGroupLabelRow() in task-board.js, same t()-from-JS discipline
-           as the rest of this panel. Sibling of #settings-workflow-list, not inside it —
-           that container is drag-reorder-indexed by .settings-wf-row children. Web-app
-           twin: tt-web-settings § Group Tasks Into (C1233), General tab there instead. -->
-      <label class="settings-row" id="settings-task-group-label-row">
-        <span id="settings-task-group-label-caption"></span>
-        <select id="settings-task-group-label"></select>
-      </label>
-      <section class="permission-mode-section" id="settings-permission-mode-row"></section>
-      <p class="settings-wf-caption" id="settings-workflow-caption"></p>
-      <div class="settings-wf-head" id="settings-workflow-head" aria-hidden="true"></div>
-      <div class="settings-wf-table" id="settings-workflow-list"></div>
-      <form class="settings-wf-add-form" id="settings-workflow-add-form">
-        <input type="text" id="settings-workflow-add-name" class="settings-wf-add-input" autocomplete="off" maxlength="64">
-        <select id="settings-workflow-add-color" class="settings-wf-add-color"></select>
-        <button type="submit" class="settings-row-btn" id="settings-workflow-add-btn"></button>
-      </form>
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-workflow-board-title"></h3>
+        <!-- (C1558) Use Objective Tasks Grouping — project-wide use_objective_grouping toggle
+             (C1556 migration/PATCH); caption filled by _populateSettingsObjectiveGroupingRow().
+             Web-app twin: C1557. -->
+        <div class="settings-row" id="settings-objective-grouping-row">
+          <div class="settings-row-label">
+            <label for="settings-objective-grouping-toggle"><span id="settings-objective-grouping-caption"></span></label>
+          </div>
+          <div class="settings-row-control">
+            <input type="checkbox" id="settings-objective-grouping-toggle">
+          </div>
+        </div>
+        <!-- (C1332) Show Sprints — project-wide sprints_enabled toggle (C1330 migration/PATCH).
+             Caption filled by _populateSettingsSprintsRow() with the current group noun ("Show
+             Batches"/"Show Sprints"/...). Sits above Group Tasks Into because it owns that
+             row's visibility (the whole row hides while sprints are off). Web-app twin: C1331. -->
+        <div class="settings-row" id="settings-sprints-enabled-row">
+          <div class="settings-row-label">
+            <label for="settings-sprints-enabled-toggle"><span id="settings-sprints-enabled-caption"></span></label>
+          </div>
+          <div class="settings-row-control">
+            <input type="checkbox" id="settings-sprints-enabled-toggle">
+          </div>
+        </div>
+        <!-- (C1271) Group Tasks Into — project-wide noun for board group containers
+             (projects.task_group_label, C1232). Label + options filled by
+             _populateSettingsGroupLabelRow(). Web-app twin: tt-web-settings § Group Tasks
+             Into (C1233), General tab there instead. -->
+        <div class="settings-row" id="settings-task-group-label-row">
+          <div class="settings-row-label">
+            <label for="settings-task-group-label"><span id="settings-task-group-label-caption"></span></label>
+          </div>
+          <div class="settings-row-control">
+            <select id="settings-task-group-label"></select>
+          </div>
+        </div>
+      </section>
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-workflow-agents-title"></h3>
+        <!-- Project default agent permission mode; the row is rebuilt by
+             _populateSettingsPermissionModeRow(). -->
+        <div class="settings-row" id="settings-permission-mode-row">
+          <div class="settings-row-label"></div>
+          <div class="settings-row-control"></div>
+        </div>
+      </section>
+      <!-- (C1182) Status table (drag handle, chip + colour dot, task count, 4 role radios,
+           delete) + add-status form, JS-rendered by _populateSettingsWorkflowTab()/
+           _renderWorkflowRows() since row count is dynamic. The stage header (C1192) stays OUT
+           of #settings-workflow-list because the drag-reorder code indexes that list's
+           .settings-wf-row children; a header inside it would be treated as a draggable row.
+           (TPT9110) The list has no scroll of its own: the pane is the modal's only scroll
+           region and the header is sticky in it. -->
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-workflow-statuses-title"></h3>
+        <div class="settings-row settings-row--stacked" id="settings-workflow-statuses-row">
+          <div class="settings-row-label">
+            <p class="settings-row-hint" id="settings-workflow-caption"></p>
+          </div>
+          <div class="settings-row-control">
+            <div class="settings-wf-head" id="settings-workflow-head" aria-hidden="true"></div>
+            <div class="settings-wf-table" id="settings-workflow-list"></div>
+            <form class="settings-wf-add-form" id="settings-workflow-add-form">
+              <input type="text" id="settings-workflow-add-name" class="settings-wf-add-input" autocomplete="off" maxlength="64">
+              <select id="settings-workflow-add-color" class="settings-wf-add-color"></select>
+              <button type="submit" class="settings-row-btn" id="settings-workflow-add-btn"></button>
+            </form>
+          </div>
+        </div>
+      </section>
     </div>
     <!-- (C1490) Memory tab — project-wide kb_sync_as_you_go toggle (C1488 migration/PATCH).
-         ON (default): KB sync forced on every task completion (today's behavior). OFF: sync
-         only happens on app startup + manual Project > Knowledge Base > Sync. Caption filled
-         by _populateSettingsMemoryTab() in task-board.js. Web-app twin: tt-web-settings.md
-         § Memory tab (C1489). See tt-knowledge-sync.md § Sync as you go (C1490). -->
+         ON (default): KB sync forced on every task completion. OFF: sync only happens on app
+         startup + manual Project > Knowledge Base > Sync. Caption filled by
+         _populateSettingsMemoryTab(). Web-app twin: tt-web-settings.md § Memory tab (C1489).
+         See tt-knowledge-sync.md § Sync as you go (C1490). -->
     <div class="settings-body modal-tab-panel" data-tab="memory" hidden>
-      <label class="settings-row" id="settings-kb-sync-row">
-        <span id="settings-kb-sync-caption"></span>
-        <input type="checkbox" id="settings-kb-sync-toggle">
-      </label>
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-memory-kb-title"></h3>
+        <div class="settings-row" id="settings-kb-sync-row">
+          <div class="settings-row-label">
+            <label for="settings-kb-sync-toggle"><span id="settings-kb-sync-caption"></span></label>
+            <p class="settings-row-hint" id="settings-kb-sync-hint"></p>
+          </div>
+          <div class="settings-row-control">
+            <input type="checkbox" id="settings-kb-sync-toggle">
+          </div>
+        </div>
+      </section>
     </div>
-    <!-- (TPT62) Version Control tab — vcs_type radio (git/svn/off) + the three git-only
-         suboption checkboxes (worktree/commit/pr), hidden unless git is selected. Both
-         lists are rendered from JS (VCS_TYPES/VCS_GIT_FLAGS in vcs-form.js) by
-         _populateSettingsVersionControlTab() in task-board.js, not baked into this
-         server-rendered-once markup — same discipline as every other tab here. See
-         tt-version-control-agents.md § Task App Settings UI. -->
+    <!-- (TPT62) Version Control tab — vcs_type (git/svn/off) as one segmented radio group,
+         then the git-only flag rows (worktree/commit/PR/merge) in #settings-vcs-git-options,
+         hidden unless git is selected. Both are rendered from JS (VCS_TYPES/VCS_GIT_FLAGS in
+         vcs-form.js) by _populateSettingsVersionControlTab(). #settings-vcs-hint is the
+         load-failure notice. See tt-version-control-agents.md § Task App Settings UI. -->
     <div class="settings-body modal-tab-panel" data-tab="vcs" hidden>
-      <p class="settings-wf-caption" id="settings-vcs-caption"></p>
-      <div class="settings-vcs-options" id="settings-vcs-type-options"></div>
-      <div class="settings-vcs-suboptions" id="settings-vcs-git-options" hidden></div>
-      <p class="settings-row-hint" id="settings-vcs-hint" hidden></p>
+      <p class="settings-notice" id="settings-vcs-hint" hidden></p>
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-vcs-title"></h3>
+        <div class="settings-row" id="settings-vcs-type-row">
+          <div class="settings-row-label">
+            <span id="settings-vcs-type-label"></span>
+            <p class="settings-row-hint" id="settings-vcs-caption"></p>
+          </div>
+          <div class="settings-row-control settings-segmented" id="settings-vcs-type-options" role="radiogroup" aria-labelledby="settings-vcs-type-label"></div>
+        </div>
+      </section>
+      <section class="settings-section" id="settings-vcs-git-options" hidden></section>
     </div>
   </div>
 </div>
@@ -345,6 +467,7 @@ const { nextStatusSelection } = window.TipTask.statusFilterSelect;
 // (TPT624) Manual New Task sprint selection — raw combo value -> pinned priority, dependency
 // floor with a visible move reason. Pure, DOM-free (src/client/new-task-sprint.js).
 const { resolveManualSprintSelection, manualDependencyFloor, applyManualDependencyFloor, missingDependencyIds, dependencyFloorRows } = window.TipTask.newTaskSprint;
+const { normalizeAgentAssignee } = window.TipTask.agentAssignee;
 
 const {
   renderCard, collapseCard, takeExpandedCard, restoreExpandedCard,
@@ -3076,7 +3199,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       const s = state.manualTaskState || {};
       const category = s.category === 'HUMAN' ? 'HUMAN' : 'CODING';
       const status = s.status || startName();
-      const agentAssignee = s.agentAssignee || (category === 'HUMAN' ? 'human' : '');
+      const agentAssignee = normalizeAgentAssignee(s.agentAssignee) || (category === 'HUMAN' ? 'human' : null);
       // No state yet (form never touched) => same current-user default the form rendered.
       const memberAssignee = Object.hasOwn(s, 'assignee') ? (s.assignee ?? null) : (state.currentUserId ?? null);
       const claudeModel = s.claudeModel || null;
@@ -3084,6 +3207,10 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       const piModel = s.piModel || null;
       const effort = s.effort || null;
       const claudeDesignMode = !!s.claudeDesignMode;
+      if (state.debugPerfLog) console.debug('[new-task-agent] preview', {
+        pickerValue: s.agentAssignee ?? '', agent_assignee: agentAssignee,
+        claude_model: claudeModel, codex_model: codexModel, pi_model: piModel,
+      });
       const dependencies = Array.isArray(s.dependencies) ? s.dependencies : [];
       const { priority, moved: sprintMove } = selection.pinned
         ? applyManualDependencyFloor(selection.priority, manualDependencyFloor(dependencies, dependencyFloorRows(dependencies, tasks, getProjectTaskList())))
@@ -3150,7 +3277,9 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       // counter the save really draws from) replaces it when it arrives. Fire-and-forget:
       // Preview never waits, and a failed/slow request simply leaves the guess. Ignored once
       // this Preview is gone (Back, Confirm, or a re-Preview built a new previewTask). The id
-      // stays display-only either way — Confirm below drops it.
+      // stays display-only either way — Confirm below drops it. (TPT9147) The card is the
+      // board's renderCard() (task-board.js renderNewTaskPreviewCard()): data-task-id on its
+      // root, the key in its .id-badge, the NEW chip right after it.
       fetchNextTaskKey(category).then((key) => {
         const ms = state.manualTaskState;
         if (!key || !ms || ms.phase !== 'preview' || ms.previewTask !== previewTask) return;
@@ -3185,6 +3314,13 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       // single-allocator rule), so the API allocates the real key atomically.
       const { _sprintMove, id: _previewKeyGuess, ...previewTask } = state.manualTaskState.previewTask;
       const change = { type: 'new', task: previewTask };
+      // Normalize again for a restored Preview draft or an older renderer's state.
+      change.task.agentAssignee = normalizeAgentAssignee(previewTask.agentAssignee)
+        || (previewTask.category === 'HUMAN' ? 'human' : null);
+      if (state.debugPerfLog) console.debug('[new-task-agent] confirm', {
+        agent_assignee: change.task.agentAssignee, claude_model: change.task.claudeModel,
+        codex_model: change.task.codexModel, pi_model: change.task.piModel,
+      });
       // (C1245) Only default to the current user when the Member select was left
       // on "(none)" — an explicit pick from the New Task form's Member Assignee
       // select must survive, not get clobbered by the old unconditional self-assign.
@@ -3902,6 +4038,11 @@ function connectBoardWs() {
     // (TPT345) merge:* job frames + worktree-dirty-on-complete — browser mode only; Electron
     // dispatches these from attention-ws.js (connectBoardWs() is skipped there).
     if (handleMergeWsMessage(msg)) return;
+    // (TPT9116) The project's chat history index changed — same browser-only split.
+    if (msg.type === 'chat-history-updated') {
+      window.TipTask?.taskChat?.historyUpdated?.(msg);
+      return;
+    }
 
     if (msg.type === 'config') {
       state.showAiStats = msg.showAiStats;
@@ -4496,6 +4637,36 @@ if (window.electronAPI) {
         finish();
       },
       onCancel: finish,
+    });
+  }
+
+  // (TPT9169) Project ▸ Import…: main checked the chosen archive (main/project-import.js) and
+  // sends its summary; the setup modal's import mode collects name, folder and agents, and main
+  // builds the project and opens it — adopted here when this window has no project, else in a
+  // new window. One wizard at a time: with another one open, the import is released again. Get
+  // Started (z-index 9999) sits above .setup-modal, so it hides while the wizard is up and comes
+  // back after it whenever this window is still unbound.
+  window.electronAPI.onProjectImport?.((payload) => _openImportWizard(payload));
+  function _openImportWizard({ importId, archiveName, summary } = {}) {
+    if (!importId) return;
+    if (document.querySelector('.setup-modal')) {
+      window.electronAPI.cancelProjectImport?.(importId);
+      showToast(t('import.wizardBusy'), 'error');
+      return;
+    }
+    _chooseModal.style.display = 'none';
+    window.TipTask.setupModal.openImport({
+      importId,
+      archiveName,
+      summary,
+      onComplete: ({ projectName, opened, report } = {}) => {
+        const details = report
+          ? [tc('import.tasks', report.tasks), tc('import.sprints', report.sprints), tc('import.kbFiles', report.kbWritten)].join(', ')
+          : '';
+        showToast(t('import.done', { name: projectName || '', details }), 'success');
+        if (opened !== 'current' && _isUnboundWindowSync()) _showChooseModal();
+      },
+      onCancel: () => { if (_isUnboundWindowSync()) _showChooseModal(); },
     });
   }
 

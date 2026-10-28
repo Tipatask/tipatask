@@ -20,9 +20,9 @@ const { createBackendEvictor, BACKEND_EVICT_SWEEP_MS } = require('./backend-evic
 const { createHttpHandler, handleConnection, drainSessionQueue, sessionQueue } = require('./ws-handlers');
 const websocket = require('./websocket');
 const { preloadAgentDetection, listAllAgentModels } = require('./task-agent');
-const { fetchStatusRoles } = require('./status-roles');
+const { fetchStatusRoles, isClosedName } = require('./status-roles');
 const { createTaskChangePoll } = require('./task-change-poll');
-const { getAttentionPromptMatch, shouldHoldAttention, bgAgentsBusy, emitTerminalNotice, noticeCopy, sessionLocale, killRunawaySession, pauseRunawaySession, maybeNudgeIdleSession } = require('./terminal-session'); // (C1386, C1565, TPT348, TPT357, TPT612, TPT9002)
+const { getAttentionPromptMatch, shouldHoldAttention, bgAgentsBusy, emitTerminalNotice, noticeCopy, sessionLocale, killRunawaySession, pauseRunawaySession, maybeNudgeIdleSession, cowboyRunTokens } = require('./terminal-session'); // (C1386, C1565, TPT348, TPT357, TPT612, TPT9002, TPT9162)
 const { snapshotProcesses, sweepDescendantWatchdog, resolveAgentLimits } = require('./process-group'); // (C1565, TPT357/TPT370)
 const { installShutdownReaper } = require('./shutdown-reaper'); // (TPT295)
 const { installCrashGuard } = require('./crash-guard'); // (TPT356)
@@ -373,6 +373,8 @@ process.on('message', msg => {
 const _registryOps = {
   projectRegistry, getOrCreateBackend, setActiveProject, getBackendForPath,
   getActiveProjectPath: () => activeProjectPath,
+  // (TPT9162) A cowboy chain's sessions have no socket — they raise attention like a Start's.
+  broadcastAttentionFor, broadcastAttentionCleared,
   resolveProjectPathViaMain, sendOpenObjective, sendStartTask, confirmHandoffViaMain,
 };
 
@@ -420,6 +422,7 @@ const localAccess = createLocalAccess({
   secret: LOCAL_SECRET || undefined,
   electron: !!LOCAL_SECRET,
   getActiveProjectPath: () => activeProjectPath,
+  liveRunTokens: (taskKey) => cowboyRunTokens(sessions, taskKey), // (TPT9162)
 });
 const httpHandler = createHttpHandler(sessions, getActiveBackend, _registryOps);
 const server = http.createServer((req, res) => {
@@ -484,7 +487,7 @@ const wss = createWebSocketGate(server, (ws, req) => {
   guardUpgrade: (req, socket, head, laneWss) => localAccess.guardUpgrade(req, socket, head, laneWss),
 });
 
-websocket.init(wss);
+websocket.init(wss, { onTaskUpdated: noteAttentionTaskUpdate });
 const { broadcast } = websocket;
 
 // (C1057) Idle fallback threshold — pattern match (terminal-session.js's feedAttentionChunk,
@@ -508,6 +511,7 @@ const ATTENTION_STALE_MS = 120000; // stale-latch guard: clear a pattern match t
 
 function terminalIdleFallbackNeeded(session, now = Date.now()) {
   if (ATTENTION_IDLE_MS <= 0) return false;
+  if (session._taskClosed) return false;
   if (session._attentionState) return false; // a real prompt match always wins — never let idle swallow it
   if (!session._terminalOutputSeen) return false;
   // (TPT348) A Claude turn that ended with "Waiting for N background agents to finish" leaves a
@@ -515,6 +519,28 @@ function terminalIdleFallbackNeeded(session, now = Date.now()) {
   // human". Returning false also lets the sweep below withdraw an idle dot already broadcast.
   if (bgAgentsBusy(session, now)) return false;
   return now - session.lastOutputAt > ATTENTION_IDLE_MS;
+}
+
+function setSessionTaskClosed(sessionKey, session, status, roles) {
+  session._taskClosed = isClosedName(status, roles);
+  if (session._taskClosed && session._attentionLastBroadcast?.kind === 'idle') {
+    broadcastAttentionCleared(sessionKey);
+  }
+}
+
+// Task keys can repeat across projects. An unscoped update belongs to the singleton's
+// configured project, never every terminal that happens to share the key.
+async function noteAttentionTaskUpdate(task, projectPath) {
+  if (!task?.id || !task.status) return;
+  const target = projectPath || config.PROJECT_ROOT;
+  for (const [key, session] of sessions) {
+    if (session.type !== 'terminal' || session.taskId !== task.id) continue;
+    if ((session.projectPath || config.PROJECT_ROOT) !== target) continue;
+    const revision = session._taskStatusRevision = (session._taskStatusRevision || 0) + 1;
+    const roles = await fetchStatusRoles(session.backend || backend);
+    if (session._taskStatusRevision !== revision || sessions.get(key) !== session) continue;
+    setSessionTaskClosed(key, session, task.status, roles);
+  }
 }
 
 // (TPT668) Connection-state + offline-drain broadcasts — the singleton's stay unscoped;
@@ -574,7 +600,7 @@ async function detectCompletedTerminalSessions() {
     return rolesByBackend.get(b);
   };
 
-  for (const [, session] of sessions) {
+  for (const [sessionKey, session] of sessions) {
     if (session.type !== 'terminal') continue;
     if (session._imageOperation) continue; // image tasks complete through their own guarded operation
     // (C1356) `_completionEmitted` (below) is the ONLY gate on the task:updated emit now.
@@ -587,13 +613,13 @@ async function detectCompletedTerminalSessions() {
     // task:updated emitted at all — the left-nav tick relied entirely on the next
     // payload-less tasks-updated poll picking it up. A naturally-exited session also stays
     // in `sessions` (only terminateTerminalSession() deletes it) with session.alive=false,
-    // so this no longer skips on !session.alive either — a completed-then-exited session
-    // gets exactly one more look before _completionEmitted silences it for good.
-    if (session._completionEmitted || !session._terminalOutputSeen) continue;
-    if (typeof session.onSessionExit !== 'function' || !session.taskId) continue;
+    // so an exited session still gets one completion check. Live completed sessions keep
+    // polling closure so reopening can restore idle fallback without repeating completion.
+    if (session._completionEmitted && !session.alive) continue;
+    if (!session._terminalOutputSeen || !session.taskId) continue;
     const sessionBackend = session.backend || backend;
+    const revision = session._taskStatusRevision || 0;
     const roles = await rolesFor(sessionBackend);
-    if (session._spawnStatus === roles.complete) continue; // spawned already-done — no transition to fire on
     let task;
     try {
       // getTask() is uncached (unlike getTasks*/getTasksUnfiltered, 1500ms TTL) — a
@@ -603,11 +629,18 @@ async function detectCompletedTerminalSessions() {
       console.error(`[completion] status check failed for ${session.taskId}:`, err.message);
       continue;
     }
+    // Remote MCP/REST completion and cancellation bypass this process's task writes.
+    // Keep closure current even after completion was emitted, including later reopening.
+    if ((session._taskStatusRevision || 0) !== revision || sessions.get(sessionKey) !== session) continue;
+    if (task?.status) setSessionTaskClosed(sessionKey, session, task.status, roles);
+    if (session._completionEmitted || typeof session.onSessionExit !== 'function') continue;
+    if (session._spawnStatus === roles.complete) continue; // spawned already-done — no transition to fire on
     if (task && task.status === roles.complete) {
       try {
         const gate = await require('./git-merge/completion-guard').guardCompletionTransition({
           session, backend: sessionBackend, projectRoot: session.projectPath || config.PROJECT_ROOT,
         });
+        if ((session._taskStatusRevision || 0) !== revision || sessions.get(sessionKey) !== session) continue;
         if (!gate.allowed) {
           const reason = JSON.stringify(gate.verification.blockers);
           if (session._vcsBlockedNotice !== reason) {
@@ -615,6 +648,7 @@ async function detectCompletedTerminalSessions() {
             session._vcsBlockedNotice = reason;
           }
           if (gate.task) websocket.emitTaskUpdated(gate.task, null, session.projectPath);
+          if (gate.task?.status) setSessionTaskClosed(sessionKey, session, gate.task.status, roles);
           continue;
         }
         session._vcsBlockedNotice = null;
@@ -632,6 +666,7 @@ async function detectCompletedTerminalSessions() {
       // (template.html), same as a manual board edit. _completionEmitted above guards this
       // to firing once per session, independent of the resolution-comment dedupe below.
       session._completionEmitted = true;
+      setSessionTaskClosed(sessionKey, session, task.status, roles);
       endSessionMemory(session, 'completed');
       console.log(`[completion] ${session.taskId} → ${roles.complete}, emitting task:updated (project=${session.projectPath || '<default>'})`);
       websocket.emitTaskUpdated(task, null, session.projectPath);

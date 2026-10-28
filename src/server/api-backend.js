@@ -1,6 +1,7 @@
 'use strict';
 
 const config = require('./config');
+const { normalizeAgentAssignee } = require('../agent-assignee.mjs');
 const { getApiCredentials, createTokenWatch } = require('./api-credentials');
 const { request } = require('../cli/http');
 const { STATUS_CODES } = require('node:http');
@@ -864,6 +865,10 @@ function fromApi(t) {
     // tasksDiffer() and the edit-modal dirty check both compare with ?? null, and a
     // null-vs-false mismatch would mark every task dirty.
     claudeDesignMode: !!t.claude_design_mode,
+    // (TPT9161) Cowboy-coding mode (tasks.cowboy_mode, TPT9160). Same TINYINT(1) NOT NULL
+    // coercion as claudeDesignMode; an API without the column reads as off. The API stores it
+    // only while the effective permission mode is bypass — see cowboyModeOn() (permission-mode.js).
+    cowboyMode: !!t.cowboy_mode,
     due_date: t.due_date ?? null,
     // C1017: unfinalized reserve_task_keys placeholder marker. Not sent back by
     // toApi() below — it's server-owned, cleared only by a real PATCH/finalize.
@@ -891,7 +896,7 @@ function toApi(t) {
     dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
     tags: Array.isArray(t.tags) ? t.tags : [],
     assignee: t.assignee ?? null,
-    agent_assignee: t.agentAssignee ?? null,
+    agent_assignee: normalizeAgentAssignee(t.agentAssignee),
     due_date: t.due_date ?? null,
   };
   // Per-task model override forwarded ONLY when explicitly set to a non-empty
@@ -910,6 +915,11 @@ function toApi(t) {
   // the project default into tasks: inheritance is resolved only when a run starts.
   const permissionMode = t.agentPermissionMode !== undefined ? t.agentPermissionMode : t.agent_permission_mode;
   if (permissionMode !== undefined) out.agent_permission_mode = permissionMode;
+  // (TPT9161) Unlike claudeDesignMode below, an omitted cowboy_mode is not "false": bulk PUT
+  // keeps the stored flag for a row without the field, so only a value the row carries is sent
+  // — false included. The API re-checks the bypass-only rule on every write that carries it.
+  const cowboyMode = t.cowboyMode !== undefined ? t.cowboyMode : t.cowboy_mode;
+  if (cowboyMode !== undefined) out.cowboy_mode = !!cowboyMode;
   // C1207: same conditional-omit shape as the model fields above, different reason —
   // for a boolean, omitting *is* "false": the API's POST/PUT readers do
   // `toBoolInt(t.claude_design_mode)` → 0, identical to the column default.
@@ -977,6 +987,12 @@ function _parseTodoPayload(content) {
   }
   if (!parsed.tasks || !Array.isArray(parsed.tasks)) {
     throw _codedError('TODO_PAYLOAD_INVALID', 'Invalid task data: missing tasks array', 'parse-payload');
+  }
+  if ((parsed.writeTaskIds !== undefined && (!Array.isArray(parsed.writeTaskIds)
+    || parsed.writeTaskIds.some(id => typeof id !== 'string' || !id.trim())))
+    || (parsed.taskBases !== undefined && (!Array.isArray(parsed.taskBases)
+      || parsed.taskBases.some(t => !t || typeof t.id !== 'string')))) {
+    throw _codedError('TODO_PAYLOAD_INVALID', 'Invalid task write intent or snapshot bases', 'parse-payload');
   }
   return parsed;
 }
@@ -1059,26 +1075,29 @@ async function assignIncomingNewTaskIds(backend, incomingNewTasks, liveTasks) {
   return idRemap;
 }
 
-// Field-level diff used by overwriteRaw (C980) to decide whether a carried-over
-// task actually needs a PATCH, or can be skipped — avoids re-sending every task in
-// the project on every save now that persistence is targeted-PATCH, not bulk-PUT.
+// Only differences against the client's own read base represent edits. Comparing
+// against live rows would misclassify concurrent changes as requested reversions.
 const DIFF_FIELDS = ['title', 'description', 'category', 'status', 'priority', 'order',
-  'dependencies', 'tags', 'assignee', 'agentAssignee', 'claudeModel', 'codexModel', 'piModel', 'effort', 'agentPermissionMode', 'claudeDesignMode', 'due_date', 'parentDbId', 'isObjective'];
-function tasksDiffer(incoming, live) {
-  if (!live) return true;
+  'dependencies', 'tags', 'assignee', 'agentAssignee', 'claudeModel', 'codexModel', 'piModel', 'effort', 'agentPermissionMode', 'claudeDesignMode', 'cowboyMode', 'due_date', 'parentDbId', 'isObjective', 'type', 'parentId'];
+function taskFieldChanges(incoming, base) {
+  const patch = {};
   const permissionMode = incoming.agentPermissionMode !== undefined ? incoming.agentPermissionMode : incoming.agent_permission_mode;
+  const cowboyMode = incoming.cowboyMode !== undefined ? incoming.cowboyMode : incoming.cowboy_mode;
   for (const f of DIFF_FIELDS) {
-    // Older editors/proposals omit this field; omission is not a reset to inherit.
-    if (f === 'agentPermissionMode' && permissionMode === undefined) continue;
-    const a = f === 'agentPermissionMode' ? permissionMode : incoming[f];
-    const b = live[f];
-    if (Array.isArray(a) || Array.isArray(b)) {
-      if (JSON.stringify(a || []) !== JSON.stringify(b || [])) return true;
+    const a = f === 'agentPermissionMode' ? permissionMode : f === 'cowboyMode' ? cowboyMode : incoming[f];
+    if (a === undefined) continue; // omission preserves the live field
+    const b = base[f];
+    // (TPT9161) A boolean with no third state: a base without the field counts as off, so a
+    // snapshot that never carried it cannot turn an untouched `false` into a clearing write.
+    if (f === 'cowboyMode') {
+      if (!!a !== !!b) patch[f] = !!a;
+    } else if (Array.isArray(a) || Array.isArray(b)) {
+      if (JSON.stringify(a || []) !== JSON.stringify(b || [])) patch[f] = a;
     } else if ((a ?? null) !== (b ?? null)) {
-      return true;
+      patch[f] = a;
     }
   }
-  return false;
+  return patch;
 }
 
 // ── Task list row mapper ──
@@ -1138,7 +1157,7 @@ async function _rawUpdateTask(id, fields, opts = {}) {
   if (fields.type !== undefined) body.type = fields.type;
   if (fields.dependencies !== undefined) body.dependencies = fields.dependencies;
   const agentAssignee = fields.agentAssignee !== undefined ? fields.agentAssignee : fields.agent_assignee;
-  if (agentAssignee !== undefined) body.agent_assignee = agentAssignee;
+  if (agentAssignee !== undefined) body.agent_assignee = normalizeAgentAssignee(agentAssignee);
   const claudeModel = fields.claudeModel !== undefined ? fields.claudeModel : fields.claude_model;
   if (claudeModel !== undefined) body.claude_model = claudeModel;
   const codexModel = fields.codexModel !== undefined ? fields.codexModel : fields.codex_model;
@@ -1154,6 +1173,10 @@ async function _rawUpdateTask(id, fields, opts = {}) {
   // route — not ws-handlers.js's HTTP PATCH — is the primary path for api.tasks.update().
   const claudeDesignMode = fields.claudeDesignMode !== undefined ? fields.claudeDesignMode : fields.claude_design_mode;
   if (claudeDesignMode !== undefined) body.claude_design_mode = !!claudeDesignMode;
+  // (TPT9161) Same mandatory snake_case fallback as claudeDesignMode above (the edit modal's
+  // patch reaches here verbatim over IPC). The API stores false unless the effective mode is bypass.
+  const cowboyMode = fields.cowboyMode !== undefined ? fields.cowboyMode : fields.cowboy_mode;
+  if (cowboyMode !== undefined) body.cowboy_mode = !!cowboyMode;
   // Was missing entirely (migration 055 shipped the column but no client write path
   // ever set it) — same shape as claudeDesignMode above.
   const isObjective = fields.isObjective !== undefined ? fields.isObjective : fields.is_objective;
@@ -1735,12 +1758,13 @@ const backend = {
   // the fresh list back from the API in the same response, so it repopulates the cache
   // directly instead of dropping it — saves the immediate re-fetch every reorder would
   // otherwise cause.
-  async createStatus({ name, color, is_workflow_start, is_in_progress, is_workflow_complete } = {}) {
+  async createStatus({ name, color, is_workflow_start, is_in_progress, is_workflow_complete, is_workflow_canceled } = {}) {
     const body = { name };
     if (color !== undefined) body.color = color;
     if (is_workflow_start !== undefined) body.is_workflow_start = is_workflow_start;
     if (is_in_progress !== undefined) body.is_in_progress = is_in_progress;
     if (is_workflow_complete !== undefined) body.is_workflow_complete = is_workflow_complete;
+    if (is_workflow_canceled !== undefined) body.is_workflow_canceled = is_workflow_canceled;
     try {
       const data = await apiRequest('POST', '/statuses', body);
       _statusesEntry = null;
@@ -1911,8 +1935,9 @@ const backend = {
   },
 
   // opts.autoRegisterTags (TPT623): Task App UI edits only — see _rawUpdateTask.
+  // opts.queueOffline === false: never queue — same rule as createTask() below.
   async updateTask(id, fields, opts = {}) {
-    if (!_isOffline()) {
+    if (!_isOffline() || opts.queueOffline === false) {
       // Capture original objective text before adoption PATCH, but post its spec
       // comment only after a successful write. A failed PATCH must not leave a
       // comment that suppresses capture on retry. Offline replay bypasses this.
@@ -1925,12 +1950,13 @@ const backend = {
         }
         return result;
       } catch (err) {
-        if (!err.networkError) throw err;
+        if (!err.networkError || opts.queueOffline === false) throw err;
         // Fell offline during request — fall through to queue
       }
     }
     _enqueueMutation('update', [id, fields, opts], id);
     const permissionMode = fields.agentPermissionMode !== undefined ? fields.agentPermissionMode : fields.agent_permission_mode;
+    const cowboyMode = fields.cowboyMode !== undefined ? fields.cowboyMode : fields.cowboy_mode;
     // Optimistic: mutate cached row in both unfiltered and scoped caches
     let _found = null;
     _eachListCache(cache => {
@@ -1948,6 +1974,7 @@ const backend = {
         if (fields.effort !== undefined) row.effort = fields.effort || null;
         if (permissionMode !== undefined) row.agentPermissionMode = permissionMode;
         if (fields.claudeDesignMode !== undefined) row.claudeDesignMode = !!fields.claudeDesignMode;
+        if (cowboyMode !== undefined) row.cowboyMode = !!cowboyMode;
         if (fields.isObjective !== undefined) row.isObjective = !!fields.isObjective;
         if (fields.order !== undefined) row.order = fields.order;
         if (fields.assignee !== undefined) row.assignee = fields.assignee;
@@ -1956,7 +1983,7 @@ const backend = {
       }
     });
     if (_found) return _found;
-    return { id, ...fields, ...(permissionMode !== undefined ? { agentPermissionMode: permissionMode } : {}), _pendingSync: true };
+    return { id, ...fields, ...(permissionMode !== undefined ? { agentPermissionMode: permissionMode } : {}), ...(cowboyMode !== undefined ? { cowboyMode: !!cowboyMode } : {}), _pendingSync: true };
   },
 
   async addTokenUsage(taskKey, tokens) {
@@ -1983,12 +2010,14 @@ const backend = {
   },
 
   // opts.autoRegisterTags (TPT623): Task App UI creates only — see _rawCreateTask.
+  // opts.queueOffline === false: never queue. The create is always sent and a network failure
+  // is thrown, for callers that need the API-allocated key at once (project import).
   async createTask(task, opts = {}) {
-    if (!_isOffline()) {
+    if (!_isOffline() || opts.queueOffline === false) {
       try {
         return await _rawCreateTask(task, opts);
       } catch (err) {
-        if (!err.networkError) throw err;
+        if (!err.networkError || opts.queueOffline === false) throw err;
       }
     }
     const tmpId = `tmp-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
@@ -2054,9 +2083,15 @@ const backend = {
     return (data && data.sprints) ? data.sprints : (Array.isArray(data) ? data : []);
   },
 
-  async createSprint(name, number) {
+  // extra (optional): { goal, start_date, end_date } — the other fields POST /sprints accepts
+  // (dates as YYYY-MM-DD). Project import (project-archive.js) uses it to restore a sprint.
+  async createSprint(name, number, extra = {}) {
+    const body = { name, number };
+    for (const field of ['goal', 'start_date', 'end_date']) {
+      if (extra[field] !== undefined) body[field] = extra[field];
+    }
     try {
-      const data = await apiRequest('POST', '/sprints', { name, number });
+      const data = await apiRequest('POST', '/sprints', body);
       return data && data.sprint ? data.sprint : null;
     } catch (err) {
       if (err.statusCode === 409) return null; // already exists
@@ -2135,10 +2170,6 @@ const backend = {
     const newTaskIdSet = new Set(newTaskIds);
     delete parsed.originalSpec;
     delete parsed.newTaskIds;
-    // Ensure required fields have values before sending to API
-    for (const t of parsed.tasks) {
-      if (!t.description) t.description = t.title || 'No description';
-    }
     // Resolve parentId (string task_key) → parentDbId (int FK) before persisting.
     // toApi() only writes parent_id from parentDbId; the string parentId field is
     // dropped, so without this pass new subtasks save with parent_id=NULL and
@@ -2240,13 +2271,7 @@ const backend = {
       }
     }
 
-    // C1439: gate only the tasks this save actually PATCHes/creates, not every task
-    // echoed back in `parsed.tasks` (the client's whole scoped TODO.md list) — a legacy
-    // carried-over task holding a since-deleted tag used to block an unrelated save
-    // before this fix (see objective-parent-task.js's `tags: []` workaround comment,
-    // which predates this narrowing and remains harmless belt-and-suspenders after it).
-    // selectTasksToWrite mirrors the write loop's own skip rule below exactly.
-    const tasksToWrite = selectTasksToWrite(parsedById, liveById, newTaskIdSet, tasksDiffer);
+    const tasksToWrite = selectTasksToWrite(parsedById, liveById, newTaskIdSet, taskFieldChanges, parsed);
     const writtenTagNames = tasksToWrite.flatMap(([, t]) => (Array.isArray(t.tags) ? t.tags : []));
     // primaryRows reuses the existingTagRows read from above (no extra network on the
     // happy path); extraKnown folds in tagRegistrations (tags/new_tags this same save
@@ -2282,6 +2307,7 @@ const backend = {
 
       await _saveStep(`write-task:${id}`, async () => {
         if (isNew || !liveTask) {
+          if (!t.description) t.description = t.title || 'No description';
           if (liveTask) {
             // Expected path: id is a real reservation placeholder row (booked live via
             // reserve_task_keys or a web-frontend create form) — finalize it in place.

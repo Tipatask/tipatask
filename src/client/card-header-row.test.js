@@ -312,3 +312,35 @@ test('proposal accept/reject match the board .card-btn-group button pill', () =>
   assert.match(ruleBody(/\n\s*\.preview-card-actions \.btn-accept-card:not\(\.active\):hover/), /var\(--c-primary\)/);
   assert.match(css, /\.theme-dark \.preview-card-actions button:not\(\.active\) \{/);
 });
+
+// (TPT9147) New Task Preview card: renderCard() in proposal mode at the board's card width, with
+// the NEW chip in .card-top flow and nothing that can clip, overlap or float over the content.
+test('New Task Preview card: board width, NEW chip in flow, unclamped, static meta badges', () => {
+  // The board's adaptive width rule (C1580) sizes it, from its own grow ceiling.
+  const width = css.match(/([^{}]*)\{\s*--card-basis:\s*252px;([^}]*)\}/);
+  assert.ok(width && width[1].includes('.tier-cards > .card') && width[1].includes('.preview-cards-inline > .card'),
+    'preview card not under the adaptive card-width rule');
+  for (const variant of ['card--medium', 'card--wide']) {
+    assert.match(css, new RegExp(String.raw`\.preview-cards-inline > \.card\.${variant}\s*[,{]`), `${variant} basis missing`);
+  }
+  const row = ruleBody(/\n\s*\.preview-cards-inline/);
+  assert.match(row, /display:\s*flex/);
+  assert.match(row, /--card-grow-ceiling:/);
+  assert.doesNotMatch(row, /grid-template-columns/);
+  // NEW chip: a .card-top flex item at the key badge's height, never positioned over the title.
+  const chip = ruleBody(/\n\s*\.card\.preview-card \.card-top > \.change-label/);
+  assert.match(chip, /line-height:\s*1\.05rem/);
+  assert.match(chip, /padding:\s*0\.15rem/);
+  assert.doesNotMatch(chip, /position:/);
+  assert.doesNotMatch(ruleBody(/\n\s*\.preview-card \.change-label/), /position:\s*absolute/);
+  // The card grows to its content: no description clamp, no mask fade, no empty strip.
+  const desc = ruleBody(/\n\s*\.preview-cards-inline > \.card\.preview-card:not\(\.card-expanded\) \.card-desc/);
+  assert.match(desc, /max-height:\s*none/);
+  assert.match(desc, /mask-image:\s*none/);
+  assert.match(ruleBody(/\n\s*\.preview-cards-inline > \.card\.preview-card \.card-desc:empty/), /display:\s*none/);
+  assert.match(ruleBody(/\n\s*\.card\.preview-card:not\(\.card-expanded\)/), /max-height:\s*none/);
+  // Effort chip and member avatar end the meta row with the agent badge, never in a corner. The
+  // rules are scoped to every preview card, so the task chat and Discuss cards share them (TPT9153).
+  assert.match(ruleBody(/\n\s*\.card\.card--preview \.preview-meta-badges/), /margin-left:\s*auto/);
+  assert.match(ruleBody(/\n\s*\.card\.card--preview \.preview-meta-badges :is\(\.member-badge, \.effort-badge, \.agent-badge\)/), /position:\s*static/);
+});

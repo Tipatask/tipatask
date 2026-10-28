@@ -310,6 +310,17 @@ export function stripTaskEditNote(text) {
   return text.replace(TASK_EDITS_RE, '');
 }
 
+// What a message's Copy action puts on the clipboard: its markdown source as the transcript shows
+// it — a reply without its `ask_user` fence (the dialog widget stands for it), a user turn without
+// the `task_edits` note. Attachment references stay, so the text pasted into the composer attaches
+// the same files again. A notice has nothing to copy. Blank lines around the text are dropped.
+export function messageCopyText(message) {
+  const m = message || {};
+  const text = m.role === 'assistant' ? stripAskUserFence(m.content)
+    : m.role === 'user' ? stripTaskEditNote(m.content) : '';
+  return text.replace(/^(?:[ \t]*\n)+/, '').replace(/\s+$/, '');
+}
+
 // Server history -> transcript entries. The generated first message (`seed: true`: task JSON,
 // comments, opening ask) is context for the agent, not part of the conversation; so is the
 // `task_edits` block a user turn may open with. A dialog answer turn (isDialogAnswerTurn()) is

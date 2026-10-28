@@ -40,17 +40,22 @@ import { ensureFileLinkHandler } from './file-attach.js';
 import * as tagMatch from './tag-match.js';
 import * as statusFilterSelect from './status-filter-select.js';
 import * as newTaskSprint from './new-task-sprint.js'; // (TPT624) manual New Task sprint selection rules, used by template.html's Preview handler
+import * as agentAssignee from '../agent-assignee.mjs';
 import * as agentQuota from './agent-quota.js'; // (TPT310) left-nav plan-usage block; template.html mounts it and resets it on project change
 import * as mergeBranchesModal from './merge-branches-modal.js'; // (TPT345) Merge task branches panel; template.html reaches it via the Project menu
 import * as taskFetch from './task-fetch.js'; // (TPT672) template.html's Objective hand-off + parent-pane task reads
+import { handleProjectExportStatus } from './project-export.js';
 
 notifications.requestPermission();
 // (TPT484) Shared alert registry: click/dismiss bridge plus main's surface decision for this window.
 notifications.ensureNotificationBridge();
 notificationCenter.installNotificationSurface();
+// (TPT9167) Project ▸ Export… runs in Electron main; its `project:export` frames drive one toast here.
+window.electronAPI?.onProjectExport?.((msg) => handleProjectExportStatus(msg));
 
 // Expose modules globally so the inline <script> in template.html can access them.
 window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, ...consoleModal, ...recipeSidebar, chatUI, chatTaskPreview, specChat, taskChat, setupModal, notifications, attentionNotifications, completionNotifications, attentionWs, attentionState, taskActivity, activityNotifications, notificationCenter, apiConnection, projectCreationWizard, projectOpenFlow, audioRecorder, perfLog, tagMatch, statusFilterSelect, newTaskSprint, agentQuota, mergeBranchesModal, taskFetch };
+window.TipTask.agentAssignee = agentAssignee;
 // Terminal task-title links need a page-level bridge: task-board.js owns the modal,
 // while template.html owns loadAndRender() and can select Project Board first.
 window.TipTask.openTaskEditModal = taskBoard.openTaskEditModalFromTerminal;

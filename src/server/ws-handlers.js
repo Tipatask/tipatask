@@ -5,6 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn: spawnChild } = require('node:child_process');
 const config = require('./config');
+const { VALID_AGENT_ASSIGNEES } = require('../agent-assignee.mjs');
 const { readLastExitSince, readLostSessions, forgetLostSession } = require('./last-exit');
 const leftUncommittedRegistry = require('./left-uncommitted'); // (TPT664) exit-backstop flag registry
 const { normalizeProposals, applyRehashIntent, spawnObjectiveTurn, killObjectiveProc, escalateKill, clearRetryTimers, clearTurnDeadline, prewarmObjective, killPrewarm, teardownObjectiveSession, trackHelperProc, clearHeartbeat, prewarmObjectiveCold, killColdPrewarm, startSleepWatchdog, objectiveCacheActivity, ensureSessionStartName, computeTurnSpans } = require('./claude-session');
@@ -17,7 +18,7 @@ const { providerSupportsProfile } = require('./providers/tool-profiles');
 const { findOpenDialog, resolveDialogAnswer, replayTaskChatTurn, taskFrame, changedTaskFields, buildTaskEditNote, dropTaskChatUserTurn } = require('./task-chat-widgets');
 const { killProcessGroup, killWindowsChildTree, resolveAgentLimits } = require('./process-group');
 const { createSessionQueue } = require('./session-queue');
-const { emitTerminalState, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, replayLiveTerminal, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, piPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary, exitRunSnapshot, flagTaskLeftUncommitted } = require('./terminal-session');
+const { emitTerminalState, emitPermissionModeState, permissionModeFrame, requestPermissionMode, handleTerminalInput, spawnTerminal, approvePlan, sanitizeReplayBuffer, replayLiveTerminal, buildTerminalExitFrame, injectPastedImage, forceResumeRepaint, requiresExplicitPlanReadyPattern, planReadyMinBufferLength, codexPlanReadyIsFresh, piPlanReadyIsFresh, killPausedTargets, resumeRunawaySession, pausedSummary, exitRunSnapshot, flagTaskLeftUncommitted, launchCowboyChain } = require('./terminal-session');
 const { buildExitResolutionComment, hasSelfAuthoredResolution, waitForFinalMessage, selectFinalMessage } = require('./exit-resolution');
 const { getTaskAgentInfo, getTaskAgentLabels, getAvailableAgents, getAvailableAgentsPeek, listTaskAgentStatuses, listTaskAgentStatusesPeek, refreshAgentDetection, resolveTaskAgentId, listAgentModels, listAllAgentModels } = require('./task-agent');
 const { isModelAllowed } = require('./task-agent/model-registry');
@@ -54,6 +55,7 @@ const { classifySaveError } = require('./todo-save-error');
 const { applyReopenToPatch } = require('./reopen-closed-task');
 const { fetchStatusContext } = require('./status-roles');
 const { VOICE_MODEL_IDS, VOICE_MODEL_ERRORS, listVoiceModels, getVoiceModelStatus, downloadVoiceModel, abortVoiceModelDownload, deleteVoiceModel } = require('./voice-model-manager');
+const { modeSwitchError } = require('./permission-policy');
 const { contentSecurityPolicy } = require('./content-security-policy');
 const { decodeRequestComponent, wrapHttpHandler } = require('./http-request-boundary');
 
@@ -247,7 +249,10 @@ function replayExitedTerminal(ws, session) {
 function sessionMetaRow(s) {
   return { agent: s.taskAgent || null, label: s.taskAgentLabel || '', type: s.type || 'terminal', alive: !!s.alive,
     paused: pausedSummary(s),
-    ...(s.permissionPolicy ? { permissionMode: s.permissionPolicy.mode, permissionSource: s.permissionPolicy.source } : {}),
+    // Chats never carry a permission mode. A pending chat still has the default terminal type
+    // until its start-* message, so its id is what keeps the fields off.
+    ...(!isAgentChatId(s.tabId) && (s.permissionPolicy || (s.type === 'terminal' && s.permissionMode))
+      ? { permissionMode: permissionModeFrame(s), permissionSource: s.permissionPolicy?.source ?? null } : {}),
     ...(s.startedAt ? { startedAt: s.startedAt } : {}),
     // (TPT469) A project chat is listed in the left menu once it has a title — its first user
     // message. Untitled ones are drafts the next Start Chat reuses.
@@ -346,6 +351,7 @@ const BULK_BODY_MAX_BYTES = 32 * 1024 * 1024;
 const CHAT_BODY_MAX_BYTES = 32 * 1024 * 1024;
 const IMAGE_BODY_MAX_BYTES = 15 * 1024 * 1024;
 const MULTIPART_AUDIO_MAX_BYTES = ASSEMBLYAI_MAX_AUDIO_BYTES + 1024 * 1024;
+const VOICE_CLEANUP_MAX_BYTES = 32 * 1024; // POST /api/voice/cleanup: one dictation's text as JSON
 
 function parsePiModelList(output, provider) {
   const requested = String(provider || '').trim().toLowerCase();
@@ -1099,6 +1105,15 @@ function getTaskFinishPromptKey(urlPath) {
   return encoded ? decodeRequestComponent(encoded) : null;
 }
 
+// TPT9162 — /api/tasks/:taskKey/cowboy-next (a cowboy run's chain), same key-parse shape.
+function getTaskCowboyNextKey(urlPath) {
+  const prefix = '/api/tasks/';
+  const suffix = '/cowboy-next';
+  if (!urlPath.startsWith(prefix) || !urlPath.endsWith(suffix)) return null;
+  const encoded = urlPath.slice(prefix.length, -suffix.length);
+  return encoded ? decodeRequestComponent(encoded) : null;
+}
+
 function _httpError(message, statusCode) {
   const err = new Error(message);
   err.statusCode = statusCode;
@@ -1259,6 +1274,16 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       res.writeHead(403); return res.end('Forbidden');
     }
 
+    // (TPT9162) A run token (local-access.js kind 'run') opens POST /api/tasks/:key/cowboy-next
+    // for its own task and nothing else; that route takes no other credential.
+    const cowboyNextKey = getTaskCowboyNextKey(urlPath);
+    if ((req.localAccess?.kind === 'run' || cowboyNextKey !== null)
+      && (req.method !== 'POST' || cowboyNextKey === null || req.localAccess?.kind !== 'run'
+        || req.localAccess.taskKey !== cowboyNextKey)) {
+      res.writeHead(403, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      return res.end(JSON.stringify({ error: 'Forbidden', code: 'COWBOY_FORBIDDEN' }));
+    }
+
     if (req.localAccess?.kind === 'handoff' || (req.localAccess?.kind === 'electron'
       && (urlPath === '/start-task' || urlPath === '/open-objective'))) {
       // This is the sole unauthenticated route, and Electron's own capability does
@@ -1290,6 +1315,32 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       return getActiveBackend();
     }
     const backend = resolveBackend(req);
+
+    // (TPT9162) POST /api/tasks/:key/cowboy-next — the agent of a cowboy run, once complete_task
+    // succeeded, asks for its chain: terminal-session.js launchCowboyChain() picks the next tasks
+    // (cowboy-next.js selectNextCowboyTasks()) and startChainedTaskSession() starts each one. Only
+    // the run's own token reaches here (checked above and in local-access.js). 200 { started,
+    // reason } for a decision (a repeat is a no-op: 'already_launched' + `previous`), 409 for a
+    // refusal, 503 when the tasks could not be read (the run may ask again).
+    // Contract: ai/architecture/tt-claude-session-terminal.md § Cowboy chains.
+    if (cowboyNextKey !== null) {
+      const sendCowboyJson = (status, body) => {
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify(body));
+      };
+      const projectPath = req.localAccess.projectPath || '';
+      try {
+        const result = await launchCowboyChain(resolveProjectRoot(req), cowboyNextKey, {
+          sessions, backend,
+          startTask: launch => startChainedTaskSession(launch, { sessions, backend, projectPath, registryOps }),
+        });
+        const refused = ['no_session', 'not_cowboy', 'not_bypass', 'not_finished'].includes(result.reason);
+        return sendCowboyJson(refused ? 409 : 200, result);
+      } catch (err) {
+        console.error(`[cowboy] ${cowboyNextKey}: chain failed: ${err.message}`);
+        return sendCowboyJson(503, { started: [], reason: 'unavailable', error: err.message });
+      }
+    }
 
     if (req.method === 'GET' && urlPath === '/api/image-task/result') {
       try {
@@ -3010,6 +3061,37 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       }
     }
 
+    // POST /api/voice/cleanup — (TPT9157) Thank You voice mode's single cleanup pass over a
+    // finished dictation before it is inserted: JSON { text, language } → { text, cleaned }.
+    // voice-cleanup.js runs one tool-less prompt through the caller's project's default
+    // objective-chat provider within its 60s budget (CLEANUP_BUDGET_MS). Once the body parses
+    // the answer is always 200: a failed, empty or over-budget cleanup gives the raw text back
+    // with cleaned:false, so a recording is never lost.
+    if (req.method === 'POST' && urlPath === '/api/voice/cleanup') {
+      const body = await readCappedBody(req, res, VOICE_CLEANUP_MAX_BYTES, {
+        error: 'Transcript exceeds 32 KB limit',
+        code: 'TRANSCRIPT_TOO_LARGE',
+      });
+      if (body === null) return; // readCappedBody already responded (413 or client disconnect)
+      let parsed;
+      try { parsed = JSON.parse(body.toString('utf8')); } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+      if (!parsed || typeof parsed.text !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Expected a string "text" field', code: 'INVALID_TEXT' }));
+      }
+      let clientGone = false;
+      res.once?.('close', () => { clientGone = true; });
+      const result = await require('./voice-cleanup').cleanupTranscript(parsed.text, parsed.language, {
+        projectRoot: resolveProjectRoot(req),
+      });
+      if (clientGone || res.writableEnded) return;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(result));
+    }
+
     // ── Voice models (C1176) — GET /api/voice-models[/:id], POST /api/voice-models/:id/download,
     // POST /api/voice-models/:id/abort, DELETE /api/voice-models/:id (C1197). Deliberately NOT
     // project-scoped: no x-tipatask-project
@@ -3125,7 +3207,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
 
-      const { status, description, title, priority, tags, order, assignee, agent_assignee, sprint_id, claude_model, codex_model, pi_model, effort, agent_permission_mode, claude_design_mode, dependencies, reopen_if_closed, is_objective, auto_register_tags } = parsed;
+      const { status, description, title, priority, tags, order, assignee, agent_assignee, sprint_id, claude_model, codex_model, pi_model, effort, agent_permission_mode, claude_design_mode, cowboy_mode, dependencies, reopen_if_closed, is_objective, auto_register_tags } = parsed;
 
       // Validate status against THIS project's own registry (C1184), not a hardcoded
       // literal list — a project can rename/add/remove statuses. fetchStatusContext()
@@ -3188,10 +3270,9 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'Assignee must be an integer or null' }));
       }
 
-      const validAgentAssignees = ['human', 'claude', 'codex', 'pi'];
-      if (agent_assignee !== undefined && agent_assignee !== null && !validAgentAssignees.includes(agent_assignee)) {
+      if (agent_assignee !== undefined && agent_assignee !== null && !VALID_AGENT_ASSIGNEES.includes(agent_assignee)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: `Invalid agent_assignee. Must be one of: ${validAgentAssignees.join(', ')} or null` }));
+        return res.end(JSON.stringify({ error: `Invalid agent_assignee. Must be one of: ${VALID_AGENT_ASSIGNEES.join(', ')} or null` }));
       }
 
       if (claude_model !== undefined && claude_model !== null && typeof claude_model !== 'string') {
@@ -3232,6 +3313,13 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'claude_design_mode must be a boolean' }));
       }
 
+      // (TPT9161) Cowboy-coding mode — same boolean shape as claude_design_mode. The API keeps it
+      // only while the task's effective permission mode is bypass and stores false otherwise.
+      if (cowboy_mode !== undefined && cowboy_mode !== null && typeof cowboy_mode !== 'boolean') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'cowboy_mode must be a boolean' }));
+      }
+
       // C1165: chat-driven-edit opt-in flag — not a field to persist, so it does NOT
       // count toward the "must provide" guard below.
       if (reopen_if_closed !== undefined && typeof reopen_if_closed !== 'boolean') {
@@ -3248,15 +3336,15 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'is_objective must be a boolean' }));
       }
 
-      if (status === undefined && description === undefined && title === undefined && priority === undefined && sprint_id === undefined && tags === undefined && order === undefined && assignee === undefined && agent_assignee === undefined && claude_model === undefined && codex_model === undefined && pi_model === undefined && effort === undefined && agent_permission_mode === undefined && claude_design_mode === undefined && dependencies === undefined && is_objective === undefined) {
+      if (status === undefined && description === undefined && title === undefined && priority === undefined && sprint_id === undefined && tags === undefined && order === undefined && assignee === undefined && agent_assignee === undefined && claude_model === undefined && codex_model === undefined && pi_model === undefined && effort === undefined && agent_permission_mode === undefined && claude_design_mode === undefined && cowboy_mode === undefined && dependencies === undefined && is_objective === undefined) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'Must provide status, description, title, priority, sprint_id, tags, order, assignee, agent_assignee, dependencies, is_objective, and/or claude_model/codex_model/pi_model/effort/agent_permission_mode/claude_design_mode' }));
+        return res.end(JSON.stringify({ error: 'Must provide status, description, title, priority, sprint_id, tags, order, assignee, agent_assignee, dependencies, is_objective, and/or claude_model/codex_model/pi_model/effort/agent_permission_mode/claude_design_mode/cowboy_mode' }));
       }
 
       try {
         // TPT9063: agentPermissionMode rides the camelCase key api-backend.js's updateTask() reads
         // (it forwards an explicit null and drops undefined, like effort).
-        const updateFields = { status, description, title, priority, tags, order, assignee, agentAssignee: agent_assignee, claudeModel: claude_model, codexModel: codex_model, piModel: pi_model, effort, agentPermissionMode: agent_permission_mode, claudeDesignMode: claude_design_mode, dependencies, isObjective: is_objective };
+        const updateFields = { status, description, title, priority, tags, order, assignee, agentAssignee: agent_assignee, claudeModel: claude_model, codexModel: codex_model, piModel: pi_model, effort, agentPermissionMode: agent_permission_mode, claudeDesignMode: claude_design_mode, cowboyMode: cowboy_mode, dependencies, isObjective: is_objective };
         if (sprint_id === null) updateFields.priority = 0;
         // C1165: objective-chat's absent-target PATCH fallback (buildModifiedTaskPatch)
         // sets this flag instead of a status when the proposal carried none — reopen a
@@ -3293,7 +3381,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         // api-backend.js's _rawUpdateTask()'s `_parentRescheduled` meta field. `undefined`
         // when absent (no cascade fired, or the offline-queued `fresh` re-fetch above never
         // carries it) drops out of JSON.stringify on its own — no `if (…) {}` needed here.
-        res.end(JSON.stringify({ ok: true, id, status: fresh.status, description: fresh.description, title: fresh.title, priority: fresh.priority, tags: fresh.tags, order: fresh.order, assignee: fresh.assignee, agentAssignee: fresh.agentAssignee, claudeModel: fresh.claudeModel, codexModel: fresh.codexModel, piModel: fresh.piModel, effort: fresh.effort ?? null, agentPermissionMode: fresh.agentPermissionMode ?? null, claudeDesignMode: fresh.claudeDesignMode, dependencies: fresh.dependencies, dbId: fresh.dbId, parentDbId: fresh.parentDbId, parentRescheduled: fresh._parentRescheduled }));
+        res.end(JSON.stringify({ ok: true, id, status: fresh.status, description: fresh.description, title: fresh.title, priority: fresh.priority, tags: fresh.tags, order: fresh.order, assignee: fresh.assignee, agentAssignee: fresh.agentAssignee, claudeModel: fresh.claudeModel, codexModel: fresh.codexModel, piModel: fresh.piModel, effort: fresh.effort ?? null, agentPermissionMode: fresh.agentPermissionMode ?? null, claudeDesignMode: fresh.claudeDesignMode, cowboyMode: fresh.cowboyMode, dependencies: fresh.dependencies, dbId: fresh.dbId, parentDbId: fresh.parentDbId, parentRescheduled: fresh._parentRescheduled }));
         // (C1259) Project-scoped when the client's project is known (Electron: main.js's
         // onBeforeSendHeaders injects x-tipatask-project on every request automatically, no
         // client change needed — see resolveBackend() above) — a card update now sends one
@@ -4235,7 +4323,7 @@ function sessKey(id, projectPath) {
 // `session.ws`, and a session whose socket is gone is simply left running unattached, exactly
 // like one minimized after start.
 async function launchNewTerminalSession(ctx) {
-  const { session, prompt, taskId, sessionKey, sessions, backend, projectPath, initialCols, initialRows, _piModelParam } = ctx;
+  const { session, prompt, taskId, sessionKey, sessions, backend, projectPath, initialCols, initialRows, _piModelParam, cowboyChain = false, env } = ctx;
   detachQueuedClient(session);
   let ws = session.ws && session.ws.readyState === session.ws.OPEN ? session.ws : null;
   try {
@@ -4291,7 +4379,8 @@ async function launchNewTerminalSession(ctx) {
       _task = await claimUnassignedTaskOnStart(backend, taskId, _task, _me, projectPath);
       // C1122 — _piModelParam prefixed so the validated launch-time pick survives even
       // when the getTask() try/catch above swallowed an error before _taskModel was set.
-      await spawnTerminal(session, prompt, taskId, taskTags, { sessions, initialCols, initialRows, backend, model: _piModelParam || _taskModel, discovery, designMode: _designMode, task: _task });
+      // (TPT9162) cowboyChain + env (TIPATASK_COWBOY_TOKEN) come only from startChainedTaskSession().
+      await spawnTerminal(session, prompt, taskId, taskTags, { sessions, initialCols, initialRows, backend, model: _piModelParam || _taskModel, discovery, designMode: _designMode, task: _task, cowboyChain, env });
       if (session.alive) forgetLostSession(taskId, projectPath || config.PROJECT_ROOT, config.USER_DATA_ROOT);
       if (session._terminated || sessions.get(sessionKey) !== session) {
         try { ws && ws.close(); } catch { /* already closed */ }
@@ -4335,6 +4424,55 @@ async function launchNewTerminalSession(ctx) {
     session._launching = false;
     drainSessionQueue();
   }
+}
+
+function hasLiveTerminal(session) {
+  return !!session && (session.alive || session._starting || session._launching || session._queued);
+}
+
+// (TPT9162) One cowboy-chain start (terminal-session.js launchCowboyChain()), with no socket: the
+// session setup handleConnection()'s "Spawn new session" branch does for a Start — the task's own
+// agent when it is available (else the project default, as a Start falls back), attention and
+// lifecycle wiring — then the device start queue and launchNewTerminalSession(), whose
+// spawnTerminal() gets { cowboyChain, env }. An exited run's retained session is replaced, as a
+// Start replaces it. Resolves true once the session is admitted or queued, false when the task
+// already has a live, starting or queued session. A failure after that ends the session through
+// the usual `start-failed` session-ended broadcast.
+async function startChainedTaskSession(launch, { sessions, backend, projectPath = '', registryOps = null }) {
+  const taskId = launch.task.id;
+  const sessionKey = sessKey(taskId, projectPath);
+  if (hasLiveTerminal(sessions.get(sessionKey))) return false;
+  const session = createSession(null, false, taskId, projectPath);
+  if (projectPath) session.projectPath = projectPath;
+  if (typeof registryOps?.broadcastAttentionFor === 'function') {
+    session.onAttentionNeeded = (detail) => registryOps.broadcastAttentionFor(sessionKey, detail);
+  }
+  if (typeof registryOps?.broadcastAttentionCleared === 'function') {
+    session.onAttentionCleared = () => registryOps.broadcastAttentionCleared(sessionKey);
+  }
+  if (launch.agent) {
+    if ((await getAvailableAgents(configForProject(projectPath))).includes(launch.agent)) {
+      const chosen = getTaskAgentInfo(launch.agent);
+      session.taskAgent = chosen.id;
+      session.taskAgentLabel = chosen.label;
+      session.planApprovalCommand = chosen.approvalCommand;
+    } else {
+      console.warn(`[cowboy] ${taskId}: agent ${launch.agent} is unavailable — starting with ${session.taskAgent}`);
+    }
+  }
+  // The availability read awaited: a Start may have claimed the key meanwhile.
+  const existing = sessions.get(sessionKey);
+  if (hasLiveTerminal(existing)) return false;
+  if (existing) sessions.delete(sessionKey);
+  sessions.set(sessionKey, session);
+  wireSessionLifecycle(session, taskId, backend, { sessions, sessionKey });
+  const launchCtx = { session, prompt: launch.prompt, taskId, sessionKey, sessions, backend, projectPath,
+    initialCols: 0, initialRows: 0, _piModelParam: '', cowboyChain: launch.cowboyChain === true, env: launch.env };
+  const admitted = sessionQueue.submit({ key: sessionKey, session, taskId, start: () => launchNewTerminalSession(launchCtx) });
+  if (!admitted.queued) {
+    Promise.resolve(admitted.done).catch(err => console.warn(`[cowboy] ${taskId}: start failed: ${err.message}`));
+  }
+  return true;
 }
 
 async function handleConnection(ws, req, sessions, getActiveBackend, onAttentionNeeded, onAttentionCleared, getBackendForPath = null) {
@@ -5488,13 +5626,31 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
     objectiveProviders: _clientVisibleProviders,
     objectiveSelection: _clientSel ? formatSelection(_clientSel.providerId, _clientSel.model) : '',
   }));
-  if (!isAgentChatType(session.type)) {
-    emitTerminalState(session);
+  // A chat socket's first connect is a pending session that still has the default terminal
+  // type, so the id decides: chats get no terminal or permission-mode state.
+  if (!isAgentChatType(session.type) && !isAgentChatId(taskId)) {
+    emitPermissionModeState(session);
   }
   wireSessionLifecycle(session, taskId, backend, { sessions, sessionKey });
   ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
+
+    if (msg.type === 'session:permission-mode') {
+      // Resolve only this socket's scoped Map key. Payload ids/project paths cannot
+      // select another session; a displaced socket has no authority over its owner.
+      if (session.ws !== ws || sessions.get(sessionKey) !== session) return;
+      try {
+        // A pending chat still has the terminal type; refuse it by id before its state is touched.
+        if (session.type !== 'terminal' || isAgentChatId(taskId)) throw modeSwitchError('inactive');
+        await requestPermissionMode(sessionKey, msg.mode, sessions);
+      } catch (err) {
+        sendWsJson(ws, { type: 'session:permission-mode-changed', taskId, tabId: session.tabId,
+          startedAt: session.startedAt, ...permissionModeFrame(session),
+          error: { code: 'EPERMISSION_MODE', reason: err.reason || 'failed', message: err.message } });
+      }
+      return;
+    }
 
     if (msg.type === 'image-task-retry' && session._imageOperation && ['generate', 'resume'].includes(msg.mode)) {
       try {
@@ -5956,16 +6112,19 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       }
 
     } else if ((msg.type === 'task-chat-message' || msg.type === 'task-chat-answer') && session.type === 'taskChat') {
-      const _chatError = (message) => {
+      const _chatError = (message, extra = {}) => {
         if (session.ws && session.ws.readyState === session.ws.OPEN) {
-          session.ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message }));
+          session.ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message, ...extra }));
         }
       };
-      // session._spawning covers Codex's async image-localize window (see the `chat` handler).
-      if (session.proc || session._spawning || session._projectChatStarting) {
-        _chatError('A turn is still in progress. Wait for chat-ready.');
-        return;
-      }
+      // Recheck after model validation too: another message can acquire the turn
+      // while this handler awaits it. Reject before storing a duplicate user turn.
+      const _rejectBusyTurn = () => {
+        if (!session.proc && !session._spawning && !session._projectChatStarting) return false;
+        _chatError('A turn is still in progress. Wait for chat-ready.', { reason: 'turn-in-progress', running: true });
+        return true;
+      };
+      if (_rejectBusyTurn()) return;
       // An answer to a dialog is a user turn like any other; what differs is where its text
       // comes from — the options picked, checked against the dialog the agent actually asked.
       let content;
@@ -5995,6 +6154,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       }
       // Torn down or restarted while the selection was being validated.
       if (session._closed || (session._epoch || 0) !== epochAtReceipt) return;
+      if (_rejectBusyTurn()) return;
       ensureTaskChatSystemPrompt(session);
       console.log(`[task-chat] Follow-up for ${taskId}: "${content.slice(0, 80)}"`);
       const _userMsg = { role: 'user', content, timestamp: Date.now() };
@@ -6208,6 +6368,10 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         killObjectiveProc(session, 'SIGTERM');
         escalateKill(session, taskId);
       }
+      if (session.type === 'taskChat' && session.providerType === 'codex') {
+        const { finishFailedTaskChatTurn } = require('./providers/codex-session');
+        finishFailedTaskChatTurn(session, session._codexTurn, () => {});
+      }
       // The aborted turn's user message is dropped — except a task chat's generated seed, which
       // is the chat's context, not something the user typed and can retype.
       const _lastMsg = session.messages[session.messages.length - 1];
@@ -6295,9 +6459,11 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         emitTerminalState(session); // already running — resync a stale banner
       }
     } else if (msg.type === 'permission-answer') {
-      session._permissionGate?.answer(msg.id, msg.allow);
+      if (session.ws === ws && sessions.get(sessionKey) === session && !session.permissionMode?.pending) {
+        session._permissionGate?.answer(msg.id, msg.allow);
+      }
     } else if (msg.type === 'plan-approve') {
-      if (session.type !== 'objective') approvePlan(session);
+      if (session.ws === ws && sessions.get(sessionKey) === session && !isAgentChatType(session.type)) approvePlan(session);
     } else if (msg.type === 'paste-image') {
       // Terminal image paste (C809, C1003): save clipboard image locally, inject as a
       // bracketed-paste bare path so Claude Code attaches it as native [Image #N].
@@ -6383,4 +6549,6 @@ module.exports = {
   // (TPT613) Exported for unit testing — the exit backstop's Terminate path, see
   // exit-resolution-lifecycle.test.js.
   terminateTerminalSession,
+  // (TPT9162) Exported for unit testing — see cowboy-chain-route.test.js.
+  startChainedTaskSession,
 };

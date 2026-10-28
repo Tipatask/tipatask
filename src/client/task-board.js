@@ -16,7 +16,7 @@ import { escapeAttr, insertAtCursor, markTruncatedCards, loadDraft, saveDraft, c
 import { computeTierWindow, HIDE_CLASS } from './sprint-tier-visibility.js';
 import { isStatusRowChecked } from './status-filter-select.js';
 import { buildWsUrl, terminateTaskSession, resumePausedTaskSession } from './ws-client.js';
-import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys, hasTaskSession, deferUntilDragEnds, syncExpandedOverlay } from './task-card.js';
+import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, renderEffortBadge, renderMemberBadge, renderSprintBadgeLabel, renderCard, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys, hasTaskSession, deferUntilDragEnds, syncExpandedOverlay } from './task-card.js';
 import { buildSubtasksLabel, closedDelta, applyChildStatusDelta, countChildProgress } from './subtask-count.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { createMemberCache } from './member-cache.js';
@@ -29,9 +29,10 @@ import { serializeBoardFilters, sanitizeBoardFilters } from './board-filter-pref
 import { openAgentsModal } from './agents-modal.js';
 import { activateDialogFocus } from './dialog-focus.js';
 import { voiceModelBadge, applyVoiceModelProgress, voiceModelAction, voiceModelStateLabelKey, voiceModelNeedsDownload, isVoiceInputReady } from './voice-model-state.js';
-import { setVoiceInputAvailability, setVoiceInputDeviceId, isAnyVoiceCaptureActive, attachAudioRecorder, setVoiceShortcut } from './audio-recorder.js';
+import { setVoiceInputAvailability, setVoiceInputDeviceId, isAnyVoiceCaptureActive, attachAudioRecorder, setVoiceShortcut, setVoiceMode, getVoiceMode } from './audio-recorder.js';
 import { filterAudioInputs, labelsUnlocked, buildInputDeviceOptions } from './voice-devices.js';
 import { VOICE_SHORTCUT_OPTIONS, DEFAULT_VOICE_SHORTCUT, normalizeVoiceShortcut } from './voice-shortcut.js';
+import { VOICE_MODE_OPTIONS, DEFAULT_VOICE_MODE, normalizeVoiceMode, voiceModeOption } from './voice-mode.js';
 import { groupNoun, groupTitle, groupShowMore, groupLoadMore, groupEmpty, groupPriorityFieldLabel, TASK_GROUP_LABELS, DEFAULT_TASK_GROUP_LABEL, getGroupLabel, setGroupLabel, loadGroupLabel, groupPluralFor, getSprintsEnabled, setSprintsEnabled, getObjectiveGroupingEnabled, setObjectiveGroupingEnabled, getSprintSortOrder, isGeneratedGroupName } from './group-label.js';
 // The Create header is shared by Objective chat and New Task without a board/chat import cycle.
 import { renderComposerHeader } from './composer-header.js';
@@ -45,6 +46,7 @@ import { formSprintValue } from './new-task-sprint.js';
 import { VCS_TYPES, VCS_GIT_FLAGS, buildVcsPatchBody } from './vcs-form.js';
 import { shouldTypeToFilter } from './type-to-filter.js';
 import { piTaskModelIds, piOnlyToolLess, piTaskPinHint } from './pi-task-models.js';
+import { hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkDesignMode, bulkPatchBody } from './bulk-changes.js';
 import { projectPermissionMode, setProjectPermissionMode } from './group-label.js';
 import { buildProjectModeOptions, effectivePermissionMode, permissionModeIcon, permissionModeTip, isAgentPermissionMode } from './permission-mode.js';
 import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
@@ -509,6 +511,34 @@ export function ensureManualTaskState() {
   return state.manualTaskState;
 }
 
+// (TPT9147) The New Task Preview card is the board's own renderCard() in proposal mode, the path
+// objective-chat proposals take, so its key, title, markdown description and tags are the card
+// the board shows once the task is saved. Proposal mode keeps the .preview-card / .preview-title /
+// .preview-desc hooks template.html's Preview and Confirm handlers read, and no board lookup
+// attribute. The NEW chip sits beside the key in .card-top. The meta row holds the status, the
+// sprint (renderSprintBadgeLabel(): "Sprint 412" or the localized Backlog; none while sprints are
+// off, like the board), the deps, then the effort, member and agent badges the board pins to the
+// card corners — in a row they can never cover the description.
+export function renderNewTaskPreviewCard(pt) {
+  const task = { ...pt, description: pt.description || '', dependencies: pt.dependencies || [], tags: pt.tags || [] };
+  const status = `<span class="status card-ctl" style="--status-color:${statusColor(task.status)}" data-status-role="${statusRoleToken(task.status)}">${escapeAttr(statusLabel(task.status))}</span>`;
+  const sprint = getSprintsEnabled() ? `<span class="step-label card-ctl">${escapeAttr(renderSprintBadgeLabel(task))}</span>` : '';
+  const depList = escapeAttr(task.dependencies.join(', '));
+  const deps = task.dependencies.length ? `<span class="preview-deps" title="Deps: ${depList}">Deps: ${depList}</span>` : '';
+  const badges = `${renderEffortBadge(task)}${renderMemberBadge(task)}${renderAgentBadge(task)}`;
+  const footHtml = task._sprintMove ? `<div class="preview-sprint-move" role="note">${escapeAttr(t('form.sprintMovedForDep', {
+    from: groupTitle(task._sprintMove.from), to: groupTitle(task._sprintMove.to),
+    dep: task._sprintMove.depId, depSprint: groupTitle(task._sprintMove.depPriority),
+  }))}</div>` : '';
+  return renderCard(task, { proposal: {
+    rootClass: 'new-task',
+    rootAttrs: `data-task-id="${escapeAttr(task.id)}"`,
+    badgeHtml: `<span class="change-label">${escapeAttr(t('form.newLabel'))}</span>`,
+    metaHtml: `<span class="preview-meta-controls">${status}${sprint}</span>${deps}${badges ? `<span class="preview-meta-badges">${badges}</span>` : ''}`,
+    footHtml,
+  } });
+}
+
 // ── New Task form (reusable — shared by root New Task and subtask creation) ──
 export function renderNewTaskForm(tasks, tierKeys, parentTaskKey = null) {
   const parentAttr = `data-parent-task-key="${escapeAttr(parentTaskKey || '')}"`;
@@ -590,43 +620,13 @@ export function renderNewTaskForm(tasks, tierKeys, parentTaskKey = null) {
         </div>`;
   }
   if (state.manualTaskState.phase === 'preview') {
-    const pt = state.manualTaskState.previewTask;
-    const idBadgeClass = pt.category === 'CODING' ? 'coding' : 'human';
-    const agentLabel = pt.agentAssignee ? (_AGENT_PICKER_LABELS[pt.agentAssignee] || pt.agentAssignee) : '';
-    const memberName = pt.assignee != null
-      ? (Array.isArray(state.projectMembers) ? state.projectMembers.find(m => Number(m.user_id) === Number(pt.assignee)) : null)?.name
-      : null;
-    const metaExtras = [
-      agentLabel ? `<span>${t('field.agent')}: ${escapeAttr(agentLabel)}</span>` : '',
-      memberName ? `<span>${t('field.memberAssignee')}: ${escapeAttr(memberName)}</span>` : '',
-      (pt.dependencies && pt.dependencies.length) ? `<span class="preview-deps">Deps: ${escapeAttr(pt.dependencies.join(', '))}</span>` : '',
-    ].filter(Boolean).join('');
     return `
         <div class="objective-form" ${parentAttr}>
           <div class="objective-header">
             <span class="objective-header-label">${t('form.preview')}</span>
           </div>
           <div class="preview-cards-inline">
-            <div class="preview-card new-task" data-task-id="${escapeAttr(pt.id)}">
-              <span class="change-label">${t('form.newLabel')}</span>
-              <div class="card-top">
-                <span class="id-badge ${idBadgeClass}">${pt.id}</span>
-                <span class="preview-title" contenteditable="false" data-field="title">${escapeAttr(pt.title)}</span>
-              </div>
-              <div class="preview-desc" contenteditable="false" data-field="description" data-raw="${escapeAttr(pt.description)}">${renderMarkdown(pt.description)}</div>
-              <div class="preview-meta">
-                <span class="status" style="--status-color:${statusColor(pt.status)}" data-status-role="${statusRoleToken(pt.status)}">${statusLabel(pt.status)}</span>
-                <span>${getSprintsEnabled()
-                  ? escapeAttr(t('form.sprintValue', { label: groupNoun(), sprint: pt.priority > 0 ? groupTitle(pt.priority) : t('backlog.title') }))
-                  : t('form.priorityValue', { n: pt.priority })}</span>
-                ${metaExtras}
-              </div>
-              ${pt._sprintMove ? `<div class="preview-sprint-move" role="note">${escapeAttr(t('form.sprintMovedForDep', {
-                from: groupTitle(pt._sprintMove.from), to: groupTitle(pt._sprintMove.to),
-                dep: pt._sprintMove.depId, depSprint: groupTitle(pt._sprintMove.depPriority),
-              }))}</div>` : ''}
-              ${(pt.tags && pt.tags.length) ? `<div class="card-tags">${pt.tags.map(tag => { const tagDesc = state.tagDescriptions.get(tag); return `<span class="tag-badge"${tagDesc ? ` title="${escapeAttr(tagDesc)}"` : ''}>${escapeAttr(tag)}</span>`; }).join('')}</div>` : ''}
-            </div>
+            ${renderNewTaskPreviewCard(state.manualTaskState.previewTask)}
           </div>
           <div class="preview-actions-inline">
             <button class="btn-discard" id="new-task-back">${t('btn.back')}</button>
@@ -3110,6 +3110,15 @@ let _bulkBarInited = false;
 let _bulkOnLoadAndRender = null;
 let _bulkStartTaskSession = null;
 let _bulkFetchActiveSessions = null;
+// (TPT9159) Edits staged in the bar, written only by Apply — see bulk-changes.js. Hiding the
+// bar (Clear, a filter or tab change, an emptied selection) discards them.
+let _bulkChanges = {};
+let _bulkApplying = false;
+
+function _bulkCardStatus(id) {
+  const card = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
+  return card ? card.dataset.status : startName();
+}
 
 function _findTaskForBulkStart(id) {
   for (const list of Object.values(state.tiers || {})) {
@@ -3203,16 +3212,22 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // wrappers are divs, not wrapping <label>s — a wrapping label forwarded clicks to
   // the agent picker's trigger button (double toggle); native controls get a
   // for-bound label instead, the custom agent picker gets aria-labelledby.
+  // (TPT9159) The fields only stage changes; Reset/Apply close the edit group. The Design
+  // mode toggle's <label> wraps just its own checkbox, never the agent picker.
   bar.innerHTML = `
     <div class="bulk-group bulk-group--selection">
       <span class="bulk-count"></span>
       <button type="button" class="bulk-clear bulk-btn bulk-btn--ghost" title="${escapeAttr(t('btn.clearSelection'))}" aria-label="${escapeAttr(t('btn.clearSelection'))}"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg><span class="bulk-clear-text">${t('bulk.clear')}</span></button>
     </div>
     <div class="bulk-group bulk-group--edit">
-      <div class="bulk-field bulk-move-label bulk-move-priority-label"><label class="bulk-field-label bulk-move-text" for="bulk-move-input">${t('bulk.moveTo')}</label><div class="sprint-combo sprint-combo--plain bulk-priority-combo" data-id="__bulk__" data-current=""><input id="bulk-move-input" class="sprint-combo-input" type="text" readonly placeholder="${escapeAttr(t('bulk.moveToPlaceholder'))}"><div class="sprint-combo-dropdown" hidden></div></div></div>
-      <div class="bulk-field bulk-move-label"><label class="bulk-field-label bulk-status-text" for="bulk-status-select">${t('bulk.status')}</label><select id="bulk-status-select" class="bulk-status-select" aria-label="${escapeAttr(t('bulk.status'))}"></select></div>
-      <div class="bulk-field bulk-move-label"><span class="bulk-field-label bulk-agent-text" id="bulk-agent-label">${t('bulk.agent')}</span><span class="bulk-agent-picker-slot"></span></div>
-      <div class="bulk-field bulk-move-label bulk-assignee-label"><label class="bulk-field-label bulk-assignee-text" for="bulk-assignee-input">${t('bulk.assignee')}</label><span class="bulk-assignee-picker-slot"></span></div>
+      <div class="bulk-field bulk-move-label bulk-move-priority-label" data-bulk-field="priority"><label class="bulk-field-label bulk-move-text" for="bulk-move-input">${t('bulk.moveTo')}</label><div class="sprint-combo sprint-combo--plain bulk-priority-combo" data-id="__bulk__" data-current=""><input id="bulk-move-input" class="sprint-combo-input" type="text" readonly placeholder="${escapeAttr(t('bulk.moveToPlaceholder'))}"><div class="sprint-combo-dropdown" hidden></div></div></div>
+      <div class="bulk-field bulk-move-label" data-bulk-field="status"><label class="bulk-field-label bulk-status-text" for="bulk-status-select">${t('bulk.status')}</label><select id="bulk-status-select" class="bulk-status-select" aria-label="${escapeAttr(t('bulk.status'))}"></select></div>
+      <div class="bulk-field bulk-move-label" data-bulk-field="agent"><span class="bulk-field-label bulk-agent-text" id="bulk-agent-label">${t('bulk.agent')}</span><span class="bulk-agent-picker-slot"></span><label class="bulk-design-mode" hidden title="${escapeAttr(t('bulk.designModeHint'))}"><input type="checkbox" class="bulk-design-mode-input"><span class="bulk-design-mode-text">${t('bulk.designMode')}</span></label></div>
+      <div class="bulk-field bulk-move-label bulk-assignee-label" data-bulk-field="assignee"><label class="bulk-field-label bulk-assignee-text" for="bulk-assignee-input">${t('bulk.assignee')}</label><span class="bulk-assignee-picker-slot"></span></div>
+      <div class="bulk-apply-actions">
+        <button type="button" class="btn-bulk-reset bulk-btn bulk-btn--ghost" hidden title="${escapeAttr(t('bulk.resetHint'))}">${t('bulk.reset')}</button>
+        <button type="button" class="btn-bulk-apply bulk-btn bulk-btn--primary" disabled title="${escapeAttr(t('bulk.applyIdle'))}">${t('bulk.apply')}</button>
+      </div>
     </div>
     <div class="bulk-group bulk-group--actions">
       <button type="button" class="btn-bulk-start bulk-btn bulk-btn--primary">${t('btn.start')}</button>
@@ -3249,44 +3264,16 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     }
   });
 
-  function rebuildStatusOptions() {
-    const select = bar.querySelector('.bulk-status-select');
-    if (!select) return;
-    const current = select.value;
-    const names = statusNames();
-    select.innerHTML = `<option value="">${escapeAttr(t('bulk.statusPlaceholder'))}</option>`
-      + names.map(name => `<option value="${escapeAttr(name)}">${escapeAttr(statusLabel(name))}</option>`).join('');
-    select.value = names.includes(current) ? current : '';
-  }
-
-  async function bulkPatchStatus(status, confirmMsgFn) {
-    const ids = [...state.selectedCardIds];
-    if (!ids.length) return;
-    if (!(await showActionConfirm({ message: confirmMsgFn(ids.length), confirmLabel: t('btn.confirm'), overlayClass: 'modal-overlay--over-board' }))) return;
-    showSavingIndicator();
-    try {
-      for (const id of ids) {
-        await api.tasks.update(id, { status }).catch(() => {});
-      }
-      state.selectedCardIds.clear();
-      updateBulkActionBar();
-      if (_bulkOnLoadAndRender) await _bulkOnLoadAndRender();
-    } finally {
-      hideSavingIndicator();
-    }
-  }
-
-  bar.querySelector('.bulk-status-select').addEventListener('change', async (event) => {
-    const select = event.currentTarget;
-    const status = select.value;
-    if (!status) return;
-    // (C1458) Reset the select before awaiting the now-async confirm — otherwise it would
-    // visibly sit on the chosen status for as long as the non-blocking dialog is open.
-    select.value = '';
-    await bulkPatchStatus(status, (n) => tc('bulk.confirmStatus', n, { status: statusLabel(status) }));
+  // (TPT9159) Picking a status only stages it; the placeholder option unstages it.
+  bar.querySelector('.bulk-status-select').addEventListener('change', (event) => {
+    _bulkChanges = stageBulkField(_bulkChanges, 'status', event.currentTarget.value);
+    syncBulkChanges();
   });
-  rebuildStatusOptions();
+  _syncBulkStatusOptions(bar);
   bar.querySelector('.btn-bulk-start').addEventListener('click', async () => {
+    // (TPT9159) Starting would run on the saved agent and then drop the staged edits with
+    // the selection — the button reads unavailable until they are applied or reset.
+    if (hasBulkChanges(_bulkChanges)) return;
     const ids = [...state.selectedCardIds];
     if (!ids.length) return;
     const tasks = ids.map(_findTaskForBulkStart).filter(Boolean).filter(canStartTaskCard);
@@ -3358,6 +3345,8 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   });
 
   bar.querySelector('.btn-bulk-deps').addEventListener('click', () => {
+    // (TPT9159) Its save clears the selection, which would drop the staged edits unsaved.
+    if (hasBulkChanges(_bulkChanges)) return;
     const ids = [...state.selectedCardIds];
     if (!ids.length) return;
     showBulkDepsModal(ids, async (picked) => {
@@ -3388,117 +3377,145 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     });
   });
 
-  initSprintCombobox(bar.querySelector('.bulk-priority-combo'), { onSelect: async (raw) => {
+  // (TPT9159) Picking a sprint only stages it; Apply moves the tasks.
+  initSprintCombobox(bar.querySelector('.bulk-priority-combo'), { onSelect: (raw) => {
     if (!raw) return;
-    const isNewSprint = raw === '__new__';
-    const isBacklog = raw === 'null';
-    const newPriority = isNewSprint
-      ? Math.max(...(state.tierKeys || []), 0, sprintRecordMax(state.sprints)) + 1
-      : isBacklog ? 0
-      : Number(raw);
-    const ids = [...state.selectedCardIds];
-    showSavingIndicator();
-    try {
-      // TPT3 — capture each PATCH response instead of discarding it: a moved subtask can
-      // carry its own objective parent along (parent_rescheduled), and that cascade needs
-      // applying to the board same as the child's own move does, below.
-      const results = [];
-      for (const id of ids) {
-        results.push(await api.tasks.update(id, { priority: newPriority }).catch(() => null));
-      }
-      state.expandedTiers.add(newPriority);
-      state.collapsedTiers.delete(newPriority);
-      // Immediately regroup cards to the new sprint tier; reload only when needed
-      let needsReload = isNewSprint;
-      if (!isNewSprint) {
-        for (const id of ids) {
-          // Clear selection visual before moving
-          const card = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
-          if (card) { card.classList.remove('selected'); card.querySelector('.btn-select-card')?.classList.remove('checked'); }
-          const r = regroupCardToSprint(id, newPriority, isBacklog);
-          if (regroupNeedsReload(r)) needsReload = true;
-        }
-      }
-      for (const res of results) {
-        if (res?.parentRescheduled && applyParentSprintFollow(res.parentRescheduled)) needsReload = true;
-      }
-      state.selectedCardIds.clear();
-      updateBulkActionBar();
-      if (needsReload && _bulkOnLoadAndRender) await _bulkOnLoadAndRender({ forceFresh: true });
-    } finally {
-      hideSavingIndicator();
-    }
+    _bulkChanges = stageBulkField(_bulkChanges, 'priority', raw);
+    syncBulkChanges();
   }});
 
-  async function handleBulkAgentChange(agentId) {
-    if (!agentId) return;
+  // (TPT9159) Writes every staged field to every selected task in one pass — one PATCH per
+  // task carrying all of them — then closes the bar. A locked task (in progress, canceled)
+  // keeps its agent and Design mode, as when the agent picker saved on its own.
+  async function applyBulkChanges() {
+    if (_bulkApplying) return;
+    bar._flushBulkAssignee?.();
     const ids = [...state.selectedCardIds];
-    if (!ids.length) { rebuildAgentOptions(); return; }
+    const changes = { ..._bulkChanges };
+    if (!ids.length || !hasBulkChanges(changes)) return;
 
-    // Must be a live function, not a Set snapshotted at module-eval time — the registry
-    // may not have loaded yet when this module first evaluates (C1187).
-    const isLocked = (s) => isInProgressName(s) || isCanceledName(s);
-    const reassignable = [];
-    const locked = [];
-    for (const id of ids) {
-      const card = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
-      const status = card ? card.dataset.status : startName();
-      (isLocked(status) ? locked : reassignable).push(id);
+    let reassignable = new Set(ids);
+    if (changes.agent) {
+      const locked = ids.filter(id => isAgentLocked(_bulkCardStatus(id)));
+      if (locked.length === ids.length) {
+        showToast(t('bulk.allLocked'), 'error');
+        return;
+      }
+      if (locked.length > 0) {
+        reassignable = new Set(ids.filter(id => !locked.includes(id)));
+        const agentLabel = escapeAttr(_AGENT_PICKER_LABELS[changes.agent] || changes.agent);
+        _bulkApplying = true;
+        syncBulkChanges();
+        const ok = await showActionConfirm({
+          message: t('bulk.confirmSkipLocked', { locked: locked.length, n: reassignable.size, agent: agentLabel }),
+          confirmLabel: t('btn.confirm'),
+          overlayClass: 'modal-overlay--over-board',
+        });
+        _bulkApplying = false;
+        syncBulkChanges();
+        if (!ok) return;
+      }
     }
 
-    if (reassignable.length === 0) {
+    const isNewSprint = changes.priority === '__new__';
+    const isBacklog = changes.priority === 'null';
+    const newPriority = changes.priority === undefined ? undefined
+      : isNewSprint ? Math.max(...(state.tierKeys || []), 0, sprintRecordMax(state.sprints)) + 1
+      : isBacklog ? 0
+      : Number(changes.priority);
+
+    _bulkApplying = true;
+    syncBulkChanges();
+    showSavingIndicator();
+    const failed = [];
+    try {
+      // TPT3 — keep each PATCH response: a moved subtask can carry its objective parent
+      // along (parentRescheduled), applied to the board below like the child's own move.
+      const results = [];
+      const saved = [];
+      for (const id of ids) {
+        const body = bulkPatchBody(changes, { priority: newPriority, reassign: reassignable.has(id) });
+        if (!Object.keys(body).length) continue;
+        try {
+          results.push(await api.tasks.update(id, body));
+          saved.push(id);
+        } catch {
+          failed.push(id);
+        }
+      }
+      // Nothing saved (offline browser tab, a rejected value): keep the bar and its staged edits
+      // so Apply can be retried; the toast below names the tasks.
+      if (!saved.length) {
+        _bulkApplying = false;
+        syncBulkChanges();
+        if (failed.length) showToast(t('bulk.errApplyFailed', { ids: failed.join(', ') }), 'error');
+        return;
+      }
+      // Selection Set and card markers go first: renderCard() reads selectedCardIds at markup time.
+      state.selectedCardIds.clear();
+      document.querySelectorAll('.card.selected').forEach(c => c.classList.remove('selected'));
+      document.querySelectorAll('.btn-select-card.checked').forEach(b => b.classList.remove('checked'));
+      let needsReload = false;
+      if (newPriority !== undefined) {
+        state.expandedTiers.add(newPriority);
+        state.collapsedTiers.delete(newPriority);
+        // Regroup the moved cards straight away; reload only when needed.
+        needsReload = isNewSprint;
+        if (!isNewSprint) {
+          for (const id of saved) {
+            if (regroupNeedsReload(regroupCardToSprint(id, newPriority, isBacklog))) needsReload = true;
+          }
+        }
+        for (const res of results) {
+          if (res?.parentRescheduled && applyParentSprintFollow(res.parentRescheduled)) needsReload = true;
+        }
+      }
+      _bulkApplying = false;
+      updateBulkActionBar(); // empty selection: the bar hides and the applied record is dropped
+      // A move alone is already on screen (regrouped above). Anything else repaints from a fresh
+      // snapshot: a desktop-app write broadcasts no task:updated, and a cache entry younger
+      // than BOARD_TASK_REFRESH_MIN_AGE_MS could otherwise repaint the pre-Apply values.
+      const movedOnly = stagedBulkFields(changes).every(key => key === 'priority');
+      if (_bulkOnLoadAndRender && (needsReload || !movedOnly)) await _bulkOnLoadAndRender({ forceFresh: true });
+    } finally {
+      _bulkApplying = false;
+      hideSavingIndicator();
+    }
+    if (failed.length) showToast(t('bulk.errApplyFailed', { ids: failed.join(', ') }), 'error');
+  }
+
+  // (TPT9159) Picking an agent only stages it; the "Change agent…" option unstages it. A
+  // selection where no task can change agent (all in progress or canceled) is refused at once,
+  // as before; Apply checks again against the selection it then has.
+  function stageAgent(agentId, { piModel = null } = {}, picker = null) {
+    const ids = [...state.selectedCardIds];
+    if (agentId && ids.length && ids.every(id => isAgentLocked(_bulkCardStatus(id)))) {
       showToast(t('bulk.allLocked'), 'error');
       rebuildAgentOptions();
       return;
     }
-    if (locked.length > 0) {
-      const agentLabel = escapeAttr(_AGENT_PICKER_LABELS[agentId] || agentId);
-      const ok = await showActionConfirm({
-        message: t('bulk.confirmSkipLocked', { locked: locked.length, n: reassignable.length, agent: agentLabel }),
-        confirmLabel: t('btn.confirm'),
-        overlayClass: 'modal-overlay--over-board',
-      });
-      if (!ok) { rebuildAgentOptions(); return; }
-    }
-    showSavingIndicator();
-    try {
-      for (const id of reassignable) {
-        await api.tasks.update(id, { agent_assignee: agentId }).catch(() => {});
-      }
-      state.selectedCardIds.clear();
-      updateBulkActionBar();
-      if (_bulkOnLoadAndRender) await _bulkOnLoadAndRender();
-    } finally {
-      hideSavingIndicator();
-    }
+    _bulkChanges = stageBulkAgent(_bulkChanges, agentId, piModel);
+    // A re-render while its dropdown was open replaced this picker; show the pick on the new one.
+    if (picker && !picker.isConnected) rebuildAgentOptions();
+    syncBulkChanges();
   }
 
   function rebuildAgentOptions() {
     const slot = bar.querySelector('.bulk-agent-picker-slot');
     if (!slot) return;
     const ids = _taskStartAgentIds();
-    slot.innerHTML = renderAgentPicker('bulkAgent', '', false, ids);
+    // A staged agent the project can no longer run is dropped, like a deleted status.
+    if (_bulkChanges.agent && !ids.includes(_bulkChanges.agent)) _bulkChanges = stageBulkAgent(_bulkChanges, '');
+    slot.innerHTML = renderAgentPicker('bulkAgent', _bulkChanges.agent || '', false, ids, _bulkChanges.piModel || null, { emptyLabel: t('bulk.agentPlaceholder') });
     const picker = slot.querySelector('.agent-picker');
-    if (picker) initAgentPicker(picker, { onChange: handleBulkAgentChange });
+    if (picker) initAgentPicker(picker, { onChange: (agentId, opts) => stageAgent(agentId, opts, picker) });
     slot.querySelector('.agent-picker-trigger')?.setAttribute('aria-labelledby', 'bulk-agent-label');
   }
 
-  async function handleBulkAssigneeChange(assignee) {
-    const ids = [...state.selectedCardIds];
-    if (!ids.length) return;
-    showSavingIndicator();
-    try {
-      for (const id of ids) {
-        await api.tasks.update(id, { assignee }).catch(() => {});
-      }
-      bar._resetBulkAssigneePicker?.();
-      state.selectedCardIds.clear();
-      updateBulkActionBar();
-      if (_bulkOnLoadAndRender) await _bulkOnLoadAndRender();
-    } finally {
-      hideSavingIndicator();
-    }
-  }
+  bar.querySelector('.bulk-design-mode-input').addEventListener('change', (event) => {
+    _bulkChanges = stageBulkDesignMode(_bulkChanges, event.currentTarget.checked);
+    syncBulkChanges();
+  });
 
   function rebuildAssigneePicker() {
     const slot = bar.querySelector('.bulk-assignee-picker-slot');
@@ -3531,6 +3548,16 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
       dropdown.hidden = true;
       input.setAttribute('aria-expanded', 'false');
     };
+    // (TPT9159) Leaving the picker without a choice shows the staged member again; leaving
+    // it emptied unstages the assignee.
+    const dismiss = () => {
+      if (!input.value.trim()) _bulkChanges = stageBulkField(_bulkChanges, 'assignee', undefined, { assigneeName: '' });
+      else input.value = _bulkChanges.assigneeName || '';
+      close();
+      renderOptions();
+      syncBulkChanges();
+    };
+    const isUnsettled = () => !dropdown.hidden || input.value !== (_bulkChanges.assigneeName || '');
 
     // (C1520) Focus is the one moment worth a round-trip — `input` fires per
     // keystroke, so it keeps the cache-only `open()`. Repainting an open list is
@@ -3550,7 +3577,7 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     input.addEventListener('input', open);
     input.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
-        close();
+        dismiss();
         return;
       }
       if (event.key !== 'Enter') return;
@@ -3565,11 +3592,13 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
       event.preventDefault();
       input.value = option.dataset.name || '';
       close();
-      void handleBulkAssigneeChange(Number(option.dataset.value));
+      // (TPT9159) Staged, not saved — Apply writes it.
+      _bulkChanges = stageBulkField(_bulkChanges, 'assignee', Number(option.dataset.value), { assigneeName: input.value });
+      syncBulkChanges();
     });
 
     document.addEventListener('click', (event) => {
-      if (!picker.contains(event.target)) close();
+      if (!picker.contains(event.target) && isUnsettled()) dismiss();
     });
 
     bar._refreshBulkAssigneePicker = renderOptions;
@@ -3578,12 +3607,69 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
       close();
       renderOptions();
     };
+    // Apply settles a half-typed query first, so it writes what the field shows.
+    bar._flushBulkAssignee = () => { if (isUnsettled()) dismiss(); };
     renderOptions();
   }
 
+  // (TPT9159) Paints the staged record onto the bar: staged fields get a marker, Design mode
+  // shows only beside a staged Claude, Apply and Reset wake up, and Start and Deps wait —
+  // Start would run on the saved agent, and both clear the selection the edits are staged on.
+  function syncBulkChanges() {
+    const staged = stagedBulkFields(_bulkChanges);
+    const dirty = staged.length > 0;
+    bar.classList.toggle('bulk-action-bar--staged', dirty);
+    bar.querySelectorAll('[data-bulk-field]').forEach(el => el.classList.toggle('is-staged', staged.includes(el.dataset.bulkField)));
+    const designMode = bar.querySelector('.bulk-design-mode');
+    const designModeInput = designMode.querySelector('.bulk-design-mode-input');
+    designMode.hidden = _bulkChanges.agent !== 'claude';
+    designModeInput.checked = _bulkChanges.claudeDesignMode === true;
+    designMode.classList.toggle('is-checked', designModeInput.checked);
+    const apply = bar.querySelector('.btn-bulk-apply');
+    apply.disabled = !dirty || _bulkApplying;
+    apply.title = dirty ? t('bulk.applyHint') : t('bulk.applyIdle');
+    bar.querySelector('.btn-bulk-reset').hidden = !dirty;
+    for (const btn of bar.querySelectorAll('.btn-bulk-start, .btn-bulk-deps')) {
+      if (dirty) {
+        btn.setAttribute('aria-disabled', 'true');
+        btn.title = t('bulk.applyFirst');
+      } else {
+        btn.removeAttribute('aria-disabled');
+        btn.removeAttribute('title');
+      }
+    }
+  }
+
+  // (TPT9159) Reset, and closing the bar any way (updateBulkActionBar() on hide), throw the
+  // staged edits away and put every field back on its placeholder.
+  function discardBulkChanges() {
+    _bulkChanges = {};
+    const select = bar.querySelector('.bulk-status-select');
+    if (select) select.value = '';
+    const combo = bar.querySelector('.bulk-priority-combo');
+    if (combo) {
+      combo.dataset.current = '';
+      const input = combo.querySelector('.sprint-combo-input');
+      if (input) input.value = '';
+    }
+    bar._resetBulkAssigneePicker?.();
+    rebuildAgentOptions();
+    syncBulkChanges();
+  }
+
+  bar.querySelector('.btn-bulk-apply').addEventListener('click', () => { void applyBulkChanges(); });
+  bar.querySelector('.btn-bulk-reset').addEventListener('click', () => {
+    discardBulkChanges();
+    // The Reset button hides itself; keep keyboard focus in the bar.
+    bar.querySelector('.bulk-status-select')?.focus();
+  });
+
   bar._rebuildAgentOptions = rebuildAgentOptions;
+  bar._syncBulkChanges = syncBulkChanges;
+  bar._discardBulkChanges = discardBulkChanges;
   rebuildAgentOptions();
   rebuildAssigneePicker();
+  syncBulkChanges();
   void ensureProjectMembers().then(() => {
     if (bar.isConnected) bar._refreshBulkAssigneePicker?.();
   });
@@ -3606,13 +3692,44 @@ function isBulkBarTab(tab = state.activeTab) {
   return tab === 'board' || tab === 'backlog';
 }
 
+// (TPT9159) Status options carry the staged status across re-renders; a staged status the
+// project no longer has (renamed, deleted) is dropped rather than written.
+function _syncBulkStatusOptions(bar) {
+  const select = bar.querySelector('.bulk-status-select');
+  if (!select) return;
+  const names = statusNames();
+  if (_bulkChanges.status && !names.includes(_bulkChanges.status)) _bulkChanges = stageBulkField(_bulkChanges, 'status', undefined);
+  select.setAttribute('aria-label', t('bulk.status'));
+  select.innerHTML = `<option value="">${escapeAttr(t('bulk.statusPlaceholder'))}</option>`
+    + names.map(name => `<option value="${escapeAttr(name)}">${escapeAttr(statusLabel(name))}</option>`).join('');
+  select.value = _bulkChanges.status || '';
+}
+
+// (TPT9159) Puts the staged sprint back into the rebuilt Move to combo — label from its
+// dropdown item, else the sprint's own title. Left alone while its dropdown is open, so a
+// re-render never overwrites what the user is typing.
+function _syncBulkSprintCombo(combo) {
+  if (combo._portaledDropdown) return;
+  const raw = _bulkChanges.priority ?? '';
+  combo.dataset.current = raw;
+  const input = combo.querySelector('.sprint-combo-input');
+  if (!input) return;
+  const item = raw ? [...combo.querySelectorAll('.sprint-combo-item')].find(el => el.dataset.value === raw) : null;
+  input.value = raw ? (item?.textContent || (Number(raw) > 0 ? groupTitle(raw) : '')) : '';
+}
+
 export function updateBulkActionBar() {
   const bar = document.getElementById('bulk-action-bar');
   if (!bar) return;
-  if (!isBulkBarTab()) { bar.hidden = true; return; }
+  // (TPT9159) A hidden bar is a closed one: whatever was staged is discarded.
+  const hide = () => {
+    bar.hidden = true;
+    if (hasBulkChanges(_bulkChanges) || bar.querySelector('.bulk-assignee-input')?.value) bar._discardBulkChanges?.();
+  };
+  if (!isBulkBarTab()) { hide(); return; }
   const count = state.selectedCardIds.size;
-  bar.hidden = count === 0;
-  if (count === 0) return;
+  if (count === 0) { hide(); return; }
+  bar.hidden = false;
 
   bar.querySelector('.bulk-count').textContent = t('bulk.selected', { n: count });
   // Refresh static labels: the bar is built once, so a locale switch would
@@ -3624,25 +3741,30 @@ export function updateBulkActionBar() {
   bar.querySelector('.bulk-delete').textContent = t('btn.delete');
   bar.querySelector('.btn-bulk-start').textContent = t('btn.start');
   bar.querySelector('.btn-bulk-deps').textContent = t('bulk.deps');
+  const applyBtn = bar.querySelector('.btn-bulk-apply');
+  if (applyBtn) applyBtn.textContent = t('bulk.apply');
+  const resetBtn = bar.querySelector('.btn-bulk-reset');
+  if (resetBtn) {
+    resetBtn.textContent = t('bulk.reset');
+    resetBtn.title = t('bulk.resetHint');
+  }
+  const designMode = bar.querySelector('.bulk-design-mode');
+  if (designMode) {
+    designMode.title = t('bulk.designModeHint');
+    designMode.querySelector('.bulk-design-mode-text').textContent = t('bulk.designMode');
+  }
   // (C1333) "Move to" combo built once at init and never removed — sync its visibility to
   // the live sprints_enabled flag every refresh, so toggling Show Sprints hides it without
   // needing a page reload (initBulkActionBar/updateBulkActionBar already re-run every
-  // loadAndRender via tiptask:reload).
+  // loadAndRender via tiptask:reload). A sprint staged in it is dropped once it hides.
   const moveLabel = bar.querySelector('.bulk-move-priority-label');
   if (moveLabel) moveLabel.hidden = !getSprintsEnabled();
+  if (!getSprintsEnabled() && _bulkChanges.priority !== undefined) _bulkChanges = stageBulkField(_bulkChanges, 'priority', undefined);
   const moveText = bar.querySelector('.bulk-move-text');
   if (moveText) moveText.textContent = t('bulk.moveTo');
   const statusText = bar.querySelector('.bulk-status-text');
   if (statusText) statusText.textContent = t('bulk.status');
-  const statusSelect = bar.querySelector('.bulk-status-select');
-  if (statusSelect) {
-    statusSelect.setAttribute('aria-label', t('bulk.status'));
-    const currentStatus = statusSelect.value;
-    const names = statusNames();
-    statusSelect.innerHTML = `<option value="">${escapeAttr(t('bulk.statusPlaceholder'))}</option>`
-      + names.map(name => `<option value="${escapeAttr(name)}">${escapeAttr(statusLabel(name))}</option>`).join('');
-    statusSelect.value = names.includes(currentStatus) ? currentStatus : '';
-  }
+  _syncBulkStatusOptions(bar);
   const agentText = bar.querySelector('.bulk-agent-text');
   if (agentText) agentText.textContent = t('bulk.agent');
   const assigneeText = bar.querySelector('.bulk-assignee-text');
@@ -3666,13 +3788,12 @@ export function updateBulkActionBar() {
     const allSprintKeys = (state.tierKeys || []).filter(k => k > 0);
     const globalMaxKey = Math.max(allSprintKeys.length ? Math.max(...allSprintKeys) : 0, sprintRecordMax(state.sprints));
     refreshSprintComboboxItems(combo, activeKeys, { includeBacklog: true, globalMaxKey });
-    combo.dataset.current = '';
-    const input = combo.querySelector('.sprint-combo-input');
-    if (input) input.value = '';
+    _syncBulkSprintCombo(combo);
   }
 
   if (bar._rebuildAgentOptions) bar._rebuildAgentOptions();
   if (bar._refreshBulkAssigneePicker) bar._refreshBulkAssigneePicker();
+  if (bar._syncBulkChanges) bar._syncBulkChanges();
 }
 
 // ── Agent assignment modal ──
@@ -4027,9 +4148,11 @@ function _applyAgentPickerSelection(draft, value, { piModel } = {}, emptyValue =
   if (value === 'pi') draft.piModel = piModel || null;
 }
 
-export function renderAgentPicker(name, currentValue, disabled, agents, currentPiModel = null) {
+// `emptyLabel` renames the empty first option — the bulk bar's reads "Change agent…", since
+// there it means "no change", not "unassigned".
+export function renderAgentPicker(name, currentValue, disabled, agents, currentPiModel = null, { emptyLabel } = {}) {
   const allOpts = [
-    { id: '', piModel: null, label: t('agent.unassigned'), icon: '' },
+    { id: '', piModel: null, label: emptyLabel || t('agent.unassigned'), icon: '' },
     ...agents.map(_normalizeAgentPickerOption),
   ];
   const cur = allOpts.find(o => _agentPickerOptionMatches(o, currentValue, currentPiModel))
@@ -5246,10 +5369,70 @@ export function attachNewTaskFormHandlers(root, { onRerender } = {}) {
 // layer inerts every other body child, Settings painted on top yet took no clicks or focus.
 let _settingsFocus = null;
 
+// (TPT9111) The dialog's fixed text — title, tab buttons, section titles and the static row
+// labels/hints — as [element id, i18n key]. template.html ships these elements empty (it is
+// server-rendered once, so baked-in English would never follow the project's language);
+// _localizeSettingsModal() fills them on every open, before the tab populators run. Text a
+// populator writes itself (captions with a badge, rows it builds) is not listed here.
+const _SETTINGS_TEXT = [
+  ['settings-title', 'settings.title'],
+  ['settings-general-tab-btn', 'settings.tabGeneral'],
+  ['settings-voice-tab-btn', 'settings.tabVoice'],
+  ['settings-workflow-tab-btn', 'settings.workflow.tab'],
+  ['settings-memory-tab-btn', 'settings.memory.tab'],
+  ['settings-vcs-tab-btn', 'settings.vcs.tab'],
+  ['settings-display-title', 'settings.sectionDisplay'],
+  ['settings-language-label', 'settings.language'],
+  ['settings-language-note', 'settings.projectWide'],
+  ['settings-language-hint', 'settings.languageTooltip'],
+  ['settings-theme-label', 'settings.theme'],
+  ['settings-agents-title', 'settings.agents'],
+  ['settings-agents-label', 'settings.agentsSetup'],
+  ['settings-agents-hint', 'settings.agentsSetupHint'],
+  ['settings-agents-edit', 'settings.agentsEdit'],
+  ['settings-notifications-title', 'settings.notifications'],
+  ['settings-notifications-label', 'settings.notifDesktop'],
+  ['settings-notifications-row-hint', 'settings.notifDesktopHint'],
+  ['settings-notifications-test', 'settings.notifTest'],
+  ['settings-debug-title', 'settings.debug'],
+  ['settings-debug-label', 'settings.debugPerfLog'],
+  ['settings-debug-perf-note', 'settings.debugPerfLogHint'],
+  ['settings-debug-perf-copy', 'settings.debugCopyPath'],
+  ['settings-debug-perf-reveal', 'settings.debugReveal'],
+  ['settings-voice-input-title', 'settings.voiceSectionInput'],
+  ['settings-voice-engine-title', 'settings.voiceSectionEngine'],
+  ['settings-workflow-board-title', 'settings.workflow.sectionBoard'],
+  ['settings-workflow-agents-title', 'settings.agents'],
+  ['settings-workflow-statuses-title', 'settings.workflow.sectionStatuses'],
+  ['settings-memory-kb-title', 'settings.memory.section'],
+  ['settings-kb-sync-hint', 'settings.memory.syncAsYouGoHint'],
+  ['settings-vcs-title', 'settings.vcs.tab'],
+];
+
+function _localizeSettingsModal() {
+  const modal = document.getElementById('settings-modal');
+  if (!modal) return;
+  modal.setAttribute('aria-label', t('settings.title'));
+  modal.querySelector('.settings-close')?.setAttribute('aria-label', t('settings.close'));
+  for (const [id, key] of _SETTINGS_TEXT) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = t(key);
+  }
+}
+
 export function openSettingsModal() {
+  _localizeSettingsModal();
   const modal = document.getElementById('settings-modal');
   if (modal) {
+    const wasOpen = modal.classList.contains('open');
     modal.classList.add('open');
+    // (TPT9110) A fresh open shows the active pane from its top, as a tab switch does: the
+    // pane keeps its old scroll offset while hidden. Only after .open — a display:none pane
+    // ignores scrollTop writes.
+    if (!wasOpen) {
+      const pane = modal.querySelector('.modal-tab-panel:not([hidden])');
+      if (pane) pane.scrollTop = 0;
+    }
     const workspace = document.getElementById('task-edit-modal');
     modal.classList.toggle('settings-modal--over-modal', !!workspace && !workspace.hidden);
     // Once per open — a repeated ⌘, while Settings is already up must not stack a second layer.
@@ -5627,6 +5810,10 @@ async function writeProjectLanguage(val, prev) {
     setLocale(lang);
     try { await window.electronAPI?.setAppLocale?.(lang); } catch { /* non-fatal, see applyProjectLanguage() */ }
     document.dispatchEvent(new Event('tiptask:reload'));
+    // (TPT9111) The Settings dialog this change was made in relabels in place too. A repeat
+    // openSettingsModal() re-runs the localizer and every tab populator; it stacks no second
+    // focus layer and leaves the pane's scroll alone.
+    if (document.getElementById('settings-modal')?.classList.contains('open')) openSettingsModal();
   } catch (err) {
     console.error('[settings] Failed to save project language:', err.message);
     const sel = document.getElementById('settings-language-select');
@@ -5782,7 +5969,7 @@ function _fmtBytes(n) {
 // IPC and HTTP both mask the AssemblyAI key. On failure, ok:false tells availability
 // checks to keep their current state; display callers may still use the defaults.
 async function readProjectVoiceSettings() {
-  const defaults = { voicePreset: 'assemblyai', voiceLocalModel: 'whisper-base', hasAssemblyaiKey: false, voiceInputDeviceId: '', voiceShortcut: DEFAULT_VOICE_SHORTCUT };
+  const defaults = { voicePreset: 'assemblyai', voiceLocalModel: 'whisper-base', hasAssemblyaiKey: false, voiceInputDeviceId: '', voiceShortcut: DEFAULT_VOICE_SHORTCUT, voiceMode: DEFAULT_VOICE_MODE };
   try {
     if (window.electronAPI?.api) {
       const ctx = await window.electronAPI.api.project.config();
@@ -5793,6 +5980,7 @@ async function readProjectVoiceSettings() {
         hasAssemblyaiKey: !!cfg.hasAssemblyaiKey,
         voiceInputDeviceId: cfg.voiceInputDeviceId || defaults.voiceInputDeviceId,
         voiceShortcut: normalizeVoiceShortcut(cfg.voiceShortcut),
+        voiceMode: normalizeVoiceMode(cfg.voiceMode),
         ok: true,
       };
     }
@@ -5806,6 +5994,7 @@ async function readProjectVoiceSettings() {
         hasAssemblyaiKey: !!cfg.hasAssemblyaiKey,
         voiceInputDeviceId: cfg.voiceInputDeviceId || defaults.voiceInputDeviceId,
         voiceShortcut: normalizeVoiceShortcut(cfg.voiceShortcut),
+        voiceMode: normalizeVoiceMode(cfg.voiceMode),
         ok: true,
       };
     }
@@ -5834,10 +6023,10 @@ function writeProjectVoiceSettings(partial) {
   });
 }
 
-// Static Voice-panel labels aren't hardcoded in template.html (unlike the General tab —
-// a pre-existing i18n gap, see tt-audio-input.md) so they actually relocalize. Called once
-// from initSettingsModal() and again from _populateSettingsVoiceTab() on every open, in
-// case the project language changed while the modal was closed.
+// Static Voice-panel labels aren't hardcoded in template.html so they actually relocalize
+// (the section titles come from _localizeSettingsModal()). Called from
+// _populateSettingsVoiceTab() on every open, in case the project language changed while the
+// modal was closed.
 function _localizeVoiceStaticLabels() {
   const setText = (id, key) => { const el = document.getElementById(id); if (el) el.textContent = t(key); };
   setText('settings-voice-tab-btn', 'settings.tabVoice');
@@ -5853,6 +6042,8 @@ function _localizeVoiceStaticLabels() {
   setText('settings-voice-local-not-wired-hint', 'settings.voiceLocalNotWired');
   setText('settings-voice-shortcut-label', 'settings.voiceShortcut');
   setText('settings-voice-shortcut-hint', 'settings.voiceShortcutHint');
+  setText('settings-voice-mode-label', 'settings.voiceMode');
+  for (const opt of VOICE_MODE_OPTIONS) setText(`settings-voice-mode-${opt.value}-label`, opt.labelKey);
 }
 
 // (C1210) Global shortcut picker. Unlike the input-device <select> above this list is static
@@ -5881,6 +6072,37 @@ function _wireVoiceShortcutSelect() {
     setVoiceShortcut(opt); // instant effect — no round-trip, matches the input-device select
     writeProjectVoiceSettings({ voiceShortcut: opt }).catch((err) => {
       showToast(t('settings.voiceModelActionFailed', { msg: err.message }), 'error');
+    });
+  });
+}
+
+// (TPT9156) Mode row. Its radios are static markup, like the AssemblyAI radio, so a saved mode
+// is checked here instead of at render time; the hint under the label describes whichever mode
+// is checked. `_voiceModeWriteSeq` lets a config read that was already in flight when the user
+// picked a mode drop its now-stale value, the same race _voiceInputDeviceWriteSeq closes below.
+let _voiceModeWriteSeq = 0;
+
+function _applyVoiceModeSelection(mode) {
+  const selected = voiceModeOption(mode);
+  document.querySelectorAll('input[name="settings-voice-mode"]').forEach((radio) => {
+    radio.checked = radio.value === selected.value;
+  });
+  const hint = document.getElementById('settings-voice-mode-hint');
+  if (hint) hint.textContent = t(selected.hintKey);
+}
+
+// Wired once from initSettingsModal(), like _wireVoiceShortcutSelect() above.
+function _wireVoiceModeRadios() {
+  document.querySelectorAll('input[name="settings-voice-mode"]').forEach((radio) => {
+    radio.addEventListener('change', (e) => {
+      if (!e.target.checked) return;
+      const mode = normalizeVoiceMode(e.target.value);
+      _voiceModeWriteSeq++;
+      setVoiceMode(mode); // instant effect — no round-trip, matches the shortcut select
+      _applyVoiceModeSelection(mode);
+      writeProjectVoiceSettings({ voiceMode: mode }).catch((err) => {
+        showToast(t('settings.voiceModeSaveFailed', { msg: err.message }), 'error');
+      });
     });
   });
 }
@@ -6005,18 +6227,24 @@ function _voiceModelRowHtml(m, selected) {
   // _markVoiceModelRowDownloading() has an element to unhide+repurpose as Abort the instant
   // a just-selected row starts downloading, without a re-render (C1193's synchronous feedback).
   const dangerClass = action === 'delete' ? ' settings-row-btn-danger' : '';
+  // (TPT9111) A shared .settings-row: radio + name + size in the label column, state badge +
+  // action in the control column, the download bar across both.
   return `
-    <div class="settings-voice-model-row" data-model-id="${escapeAttr(m.modelId)}">
-      <label class="settings-voice-model-label">
-        <input type="radio" name="settings-voice-engine" value="${escapeAttr(m.modelId)}"${selected ? ' checked' : ''}>
-        <span class="settings-voice-model-name">${escapeAttr(m.label || m.modelId)}</span>
-        ${size ? `<span class="settings-voice-model-size">${escapeAttr(size)}</span>` : ''}
-      </label>
-      <span class="settings-voice-model-state" data-state="${escapeAttr(badge.key)}">${escapeAttr(t(voiceModelStateLabelKey(badge.key)))}</span>
+    <div class="settings-row settings-voice-model-row" data-model-id="${escapeAttr(m.modelId)}">
+      <div class="settings-row-label">
+        <label class="settings-voice-model-label">
+          <input type="radio" name="settings-voice-engine" value="${escapeAttr(m.modelId)}"${selected ? ' checked' : ''}>
+          <span class="settings-voice-model-name">${escapeAttr(m.label || m.modelId)}</span>
+          ${size ? `<span class="settings-voice-model-size">${escapeAttr(size)}</span>` : ''}
+        </label>
+      </div>
+      <div class="settings-row-control">
+        <span class="settings-voice-model-state" data-state="${escapeAttr(badge.key)}">${escapeAttr(t(voiceModelStateLabelKey(badge.key)))}</span>
+        <button type="button" class="settings-row-btn settings-voice-model-action${dangerClass}" data-action="${action || ''}"${action ? '' : ' hidden'}>${action ? escapeAttr(t(_VOICE_ACTION_LABEL_KEY[action])) : ''}</button>
+      </div>
       <div class="settings-voice-model-progress"${badge.key === 'downloading' ? '' : ' hidden'}>
         <div class="settings-voice-model-progress-bar" style="width:${badge.percent ?? 0}%"></div>
       </div>
-      <button type="button" class="settings-row-btn settings-voice-model-action${dangerClass}" data-action="${action || ''}"${action ? '' : ' hidden'}>${action ? escapeAttr(t(_VOICE_ACTION_LABEL_KEY[action])) : ''}</button>
     </div>`;
 }
 
@@ -6147,6 +6375,7 @@ async function _populateSettingsVoiceTab() {
   if (!localList) return; // modal markup not present (shouldn't happen, defensive)
 
   _localizeVoiceStaticLabels();
+  const modeWriteSeqAtStart = _voiceModeWriteSeq;
   const settings = await readProjectVoiceSettings();
   _applyVoiceEngineSelection(settings.voicePreset);
   // (C1209) Pre-fetch pass — reads whatever _voiceModelsCache last held (could be stale/empty
@@ -6165,6 +6394,14 @@ async function _populateSettingsVoiceTab() {
   // like setVoiceInputDeviceId() above, plus the Settings row reflecting current config.
   setVoiceShortcut(settings.voiceShortcut);
   _populateVoiceShortcutSelect(settings.voiceShortcut);
+  // (TPT9156) Mode — instant effect like the shortcut, plus the row's radios and hint. A failed
+  // read keeps the mode already in effect rather than its 'standard' default, and a mode picked
+  // while the read was in flight stays as picked.
+  if (modeWriteSeqAtStart === _voiceModeWriteSeq) {
+    const mode = settings.ok === false ? getVoiceMode() : settings.voiceMode;
+    setVoiceMode(mode);
+    _applyVoiceModeSelection(mode);
+  }
 
   try {
     const { models } = await api.voiceModels.list();
@@ -6190,7 +6427,7 @@ async function _populateSettingsVoiceTab() {
   } catch (err) {
     console.error('[settings] Failed to load voice models:', err.message);
     const list = document.getElementById('settings-voice-local-list');
-    if (list) list.innerHTML = `<div class="settings-row-hint">${escapeAttr(t('settings.voiceModelsLoadFailed'))}</div>`;
+    if (list) list.innerHTML = `<div class="settings-notice">${escapeAttr(t('settings.voiceModelsLoadFailed'))}</div>`;
   }
 }
 
@@ -6230,7 +6467,7 @@ function _wireVoiceKeyButtons() {
   const showStatus = (key, cls) => {
     if (!status) return;
     status.hidden = false;
-    status.className = `settings-row-hint${cls ? ` ${cls}` : ''}`;
+    status.className = `settings-notice${cls ? ` ${cls}` : ''}`;
     status.textContent = t(key);
   };
   if (saveBtn && input) {
@@ -6241,7 +6478,7 @@ function _wireVoiceKeyButtons() {
       try {
         await writeProjectVoiceSettings({ assemblyaiKey: { action: 'replace', value } });
         _applyVoiceKeyMaskedState(true);
-        showStatus('settings.voiceKeySaved', 'settings-row-hint--success');
+        showStatus('settings.voiceKeySaved', 'settings-notice--success');
       } catch (err) {
         showStatus('settings.voiceKeySaveFailed', null);
         if (status) status.textContent = t('settings.voiceKeySaveFailed', { msg: err.message });
@@ -6255,7 +6492,7 @@ function _wireVoiceKeyButtons() {
       try {
         await writeProjectVoiceSettings({ assemblyaiKey: { action: 'clear' } });
         _applyVoiceKeyMaskedState(false);
-        showStatus('settings.voiceKeyCleared', 'settings-row-hint--success');
+        showStatus('settings.voiceKeyCleared', 'settings-notice--success');
       } catch (err) {
         showStatus('settings.voiceKeySaveFailed', null);
         if (status) status.textContent = t('settings.voiceKeySaveFailed', { msg: err.message });
@@ -6361,11 +6598,16 @@ function _populateSettingsPermissionModeRow() {
   _settingsPermissionControl?.destroy();
   const options = buildProjectModeOptions(projectPermissionMode(), t);
   const hint = options.find(row => row.selected)?.hint || '';
+  // (TPT9111) host is a .settings-row: label + mode hint + project note, then the select.
   host.innerHTML = `
-    <label class="permission-mode-label" for="settings-agent-permission-mode">${escapeAttr(t('settings.workflow.agentPermissions'))}</label>
-    ${renderPermissionModeSelect({ name: 'settings-agent-permission-mode', options, t })}
-    <p class="settings-row-hint">${escapeAttr(hint)}</p>
-    <p class="settings-row-hint">${escapeAttr(t('permissionMode.projectNote'))}</p>`;
+    <div class="settings-row-label">
+      <label for="settings-agent-permission-mode">${escapeAttr(t('settings.workflow.agentPermissions'))}</label>
+      <p class="settings-row-hint">${escapeAttr(hint)}</p>
+      <p class="settings-row-hint">${escapeAttr(t('permissionMode.projectNote'))}</p>
+    </div>
+    <div class="settings-row-control">
+      ${renderPermissionModeSelect({ name: 'settings-agent-permission-mode', options, t })}
+    </div>`;
   _settingsPermissionControl = bindPermissionModeSelect(host, async value => {
     if (!isAgentPermissionMode(value)) return;
     const control = _settingsPermissionControl;
@@ -6426,7 +6668,7 @@ async function _populateSettingsWorkflowTab() {
     _workflowStatuses = await api.statuses.list();
     seedStatuses(_workflowStatuses); // (C1187) inform the shared registry — no extra HTTP
   } catch (err) {
-    list.innerHTML = `<div class="settings-row-hint">${escapeAttr(t('settings.workflow.loadFailed', { msg: err.message }))}</div>`;
+    list.innerHTML = `<div class="settings-notice">${escapeAttr(t('settings.workflow.loadFailed', { msg: err.message }))}</div>`;
     return;
   }
   _renderWorkflowRows();
@@ -6467,29 +6709,39 @@ let _vcsSettings = { type: '', flags: {} };
 // the tab is reopened.
 async function _populateSettingsVersionControlTab() {
   const tabBtn = document.getElementById('settings-vcs-tab-btn');
+  const typeLabel = document.getElementById('settings-vcs-type-label');
   const caption = document.getElementById('settings-vcs-caption');
   const typeOptions = document.getElementById('settings-vcs-type-options');
   const gitOptions = document.getElementById('settings-vcs-git-options');
   const hint = document.getElementById('settings-vcs-hint');
   if (!tabBtn) return;
   tabBtn.textContent = t('settings.vcs.tab');
-  if (caption) {
-    caption.innerHTML = `${escapeAttr(t('settings.vcs.caption'))} <small class="settings-row-note">${escapeAttr(t('settings.vcs.note'))}</small>`;
+  if (typeLabel) {
+    typeLabel.innerHTML = `${escapeAttr(t('settings.vcs.typeLabel'))} <small class="settings-row-note">${escapeAttr(t('settings.vcs.note'))}</small>`;
   }
+  if (caption) caption.textContent = t('settings.vcs.caption');
+  // (TPT9111) The type radios are the segments of the row's .settings-segmented control.
   if (typeOptions) {
     typeOptions.innerHTML = VCS_TYPES.map((opt) => `
-      <label class="settings-vcs-option">
+      <label>
         <input type="radio" name="settings-vcs-type" value="${escapeAttr(opt.value)}">
-        <span class="settings-vcs-option-label">${escapeAttr(t(opt.labelKey))}</span>
+        <span>${escapeAttr(t(opt.labelKey))}</span>
       </label>`).join('');
   }
+  // The git-only section: its title plus one .settings-row per flag (label + hint, switch).
   if (gitOptions) {
-    gitOptions.innerHTML = VCS_GIT_FLAGS.map((f) => `
-      <label class="settings-vcs-suboption">
-        <input type="checkbox" data-field="${escapeAttr(f.field)}">
-        <span class="settings-vcs-suboption-label">${escapeAttr(t(f.labelKey))}</span>
-        <span class="settings-vcs-suboption-hint">${escapeAttr(t(f.hintKey))}</span>
-      </label>`).join('');
+    gitOptions.innerHTML = `
+      <h3 class="settings-section-title">${escapeAttr(t('settings.vcs.gitSection'))}</h3>
+      ${VCS_GIT_FLAGS.map((f) => `
+      <div class="settings-row">
+        <div class="settings-row-label">
+          <label for="settings-vcs-flag-${escapeAttr(f.field)}">${escapeAttr(t(f.labelKey))}</label>
+          <p class="settings-row-hint">${escapeAttr(t(f.hintKey))}</p>
+        </div>
+        <div class="settings-row-control">
+          <input type="checkbox" id="settings-vcs-flag-${escapeAttr(f.field)}" data-field="${escapeAttr(f.field)}">
+        </div>
+      </div>`).join('')}`;
   }
   if (hint) hint.hidden = true;
   try {
@@ -6841,6 +7093,7 @@ export function refreshVoiceInputAvailability() {
   // refresh right as the device select's own change handler fires), the read's
   // now-stale voiceInputDeviceId must not clobber the fresher in-memory selection.
   const deviceWriteSeqAtStart = _voiceInputDeviceWriteSeq;
+  const modeWriteSeqAtStart = _voiceModeWriteSeq;
   _refreshInFlight = Promise.all([readProjectVoiceSettings(), api.voiceModels.list()]).then(([settings, { models }]) => {
     _voiceModelsCache = Array.isArray(models) ? models : [];
     // (C1202) `settings.ok === false` means the config read itself failed — readProjectVoiceSettings()
@@ -6860,6 +7113,9 @@ export function refreshVoiceInputAvailability() {
     // guard against yet (the shortcut <select> only exists once Settings has opened at least
     // once), but reads the same settings snapshot for consistency.
     setVoiceShortcut(settings.voiceShortcut);
+    // (TPT9156) The saved mode is live from boot too — audio-recorder.js's getVoiceMode() must
+    // answer for a project whose Settings never open. Guarded like the device id above.
+    if (modeWriteSeqAtStart === _voiceModeWriteSeq) setVoiceMode(settings.voiceMode);
     const modal = document.getElementById('settings-modal');
     if (modal && modal.classList.contains('open')) {
       _renderVoiceModelRows(_voiceModelsCache, settings.voicePreset, settings.voiceLocalModel);
@@ -7058,16 +7314,19 @@ async function _populateSettingsNotificationsRows() {
 // (wrong project in multi-window Electron; a location inside the packaged app bundle if
 // TIPATASK_PROJECT_ROOT was never set at all) rather than necessarily this window's project.
 // agentsSummary, when passed (agents-modal.js's onSaved callback), skips the re-fetch.
+// (TPT9111) Renders one .settings-row per enabled agent (summarizeAgents()'s `entries`): the
+// agent's label, a badge on the default one new tasks start with, and its configured model(s)
+// in the control column. The Edit row after them is static markup.
 async function _populateSettingsAgentsRow(agentsSummary) {
-  const row = document.getElementById('settings-agents-row');
-  const el = document.getElementById('settings-agents-summary');
-  if (!row || !el) return;
+  const section = document.getElementById('settings-agents-section');
+  const list = document.getElementById('settings-agents-summary');
+  if (!section || !list) return;
   let agents = agentsSummary;
   if (!agents) {
     try {
       if (window.electronAPI?.api) {
         const ctx = await window.electronAPI.api.project.config();
-        if (!ctx) { row.style.display = 'none'; return; } // no project bound to this window
+        if (!ctx) { section.hidden = true; return; } // no project bound to this window
         agents = ctx.agents;
       } else {
         const r = await fetch('/api/agents-config', { cache: 'no-store' });
@@ -7075,9 +7334,21 @@ async function _populateSettingsAgentsRow(agentsSummary) {
       }
     } catch (err) { console.error('[settings] Failed to load agents summary:', err.message); }
   }
-  row.style.display = '';
-  el.textContent = agents?.summary || t('settings.agentsNone');
-  el.title = el.textContent;
+  section.hidden = false;
+  const entries = Array.isArray(agents?.entries) ? agents.entries : [];
+  list.innerHTML = entries.length
+    ? entries.map((entry) => `
+      <div class="settings-row" data-agent="${escapeAttr(entry.id)}">
+        <div class="settings-row-label">${escapeAttr(entry.label || entry.id)}${entry.isDefault ? ` <small class="settings-row-note">${escapeAttr(t('settings.agentDefault'))}</small>` : ''}</div>
+        <div class="settings-row-control">
+          <span class="settings-row-value">${escapeAttr(entry.models?.length ? entry.models.join(', ') : t('settings.agentModelDefault'))}</span>
+        </div>
+      </div>`).join('')
+    : `
+      <div class="settings-row">
+        <div class="settings-row-label">${escapeAttr(agents?.summary || t('settings.agentsNone'))}</div>
+        <div class="settings-row-control"></div>
+      </div>`;
 }
 
 let _settingsModalWired = false;
@@ -7100,10 +7371,20 @@ export function initSettingsModal() {
   // directly rather than a `.settings-body` ancestor.
   modal.querySelectorAll('.modal-tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
+      // (TPT9110) Re-clicking the active tab leaves its pane where the user scrolled it.
+      const switching = !btn.classList.contains('active');
       modal.querySelectorAll('.modal-tab-btn').forEach(b => b.classList.toggle('active', b === btn));
       modal.querySelectorAll('.modal-tab-panel').forEach(panel => {
         panel.hidden = panel.dataset.tab !== btn.dataset.tab;
+        // (TPT9110) The dialog box is fixed-size and each pane scrolls on its own (styles.css
+        // § Settings modal); a newly shown pane starts at its top, not at a stale offset.
+        if (switching && !panel.hidden) panel.scrollTop = 0;
       });
+      // (TPT9110) Focus stays on the activated tab. A click that leaves focus elsewhere (a
+      // scripted click, or an engine that does not focus buttons on click) would strand it in
+      // the pane just hidden; the browser drops it to <body> and dialog-focus.js then sends the
+      // next Tab to the dialog's first control instead of into this tab's pane.
+      if (document.activeElement !== btn) btn.focus({ preventScroll: true });
       // (C1204) _populateSettingsVoiceTab() (called once per modal OPEN, not per tab switch)
       // only allows the label-unlock capture when Voice is already the active tab at that
       // moment — switching to Voice afterward needs its own trigger, now that the panel is
@@ -7118,6 +7399,7 @@ export function initSettingsModal() {
   _wireVoiceKeyButtons();
   _wireVoiceInputDeviceSelect();
   _wireVoiceShortcutSelect();
+  _wireVoiceModeRadios();
   // (C1204) Repopulate on hardware change (device plugged/unplugged) while Voice is the
   // visible tab — debounced (macOS/Windows can fire several devicechange events per physical
   // plug event) and gated behind isAnyVoiceCaptureActive() the same way the initial populate
@@ -7275,9 +7557,9 @@ export function initSettingsModal() {
       if (!text) return;
       try {
         await navigator.clipboard.writeText(text);
-        showToast('Log path copied', 'success');
+        showToast(t('settings.debugPathCopied'), 'success');
       } catch {
-        showToast('Could not copy — select and copy the path manually', 'error');
+        showToast(t('settings.debugPathCopyFailed'), 'error');
       }
     });
   }

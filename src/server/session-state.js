@@ -66,8 +66,16 @@ function createSession(ws, pending, tabId, projectPath) {
     taskAgentLabel: taskAgent.label,
     taskAgentModel: '',       // (C1118) resolved --model value from the last spawnTerminal(), for the terminal header caption
     terminalPhase: 'planning',
-    permissionPolicy: null, // Frozen launch snapshot; settings edits apply only to a new run.
+    permissionPolicy: null, // Immutable snapshot, replaced only at launch or a confirmed live switch.
+    permissionMode: { requested: null, confirmed: null, pending: false, error: null },
+    _permissionEpoch: 0, // Invalidates queued approval submissions across live switches.
     _permissionGate: null,
+    // (TPT9162) Cowboy chain run state, reset by every spawnTerminal(): a bypass run whose task has
+    // cowboyMode on or that launchCowboyChain() started; its per-run token (TIPATASK_COWBOY_TOKEN,
+    // never sent to a client); and the one chain decision it made ({ started, reason } once made).
+    cowboyChain: false,
+    _cowboyToken: null,
+    _cowboyNext: null,
     planApprovalCommand: taskAgent.approvalCommand,
     _userInteracted: false,
     _localCommandBuffer: '',
@@ -84,6 +92,7 @@ function createSession(ws, pending, tabId, projectPath) {
     toolProfile: null,        // providers/tool-profiles.js profile name; null = the provider's objective (read-only planner) fence
     pendingResult: null,      // turn result finished while no client was attached — flushed on reconnect
     _taskChatTurn: null,      // the running turn's dialogs/tools/task events (task-chat-widgets.js); reset per turn
+    _codexTurn: null,         // Codex task-chat ownership token; settled before failure/Stop releases the turn
     onTaskChatMutation: null, // set by ws-handlers.js at start-task-chat: a create/update tool call succeeded
     onNativeSession: null,    // set by ws-handlers.js for task/project chats: a provider emitted its session id or finished a turn (chat-history index)
     _resumedHistory: null,    // { historyId, provider, nativeSessionId, transcriptUnavailable } when the chat continues a native session from the history index

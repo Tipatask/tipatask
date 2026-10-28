@@ -21,6 +21,18 @@ const config = require('./config');
 const CodexAgent = require('./task-agent/codex-agent');
 const { buildCodexArgs } = require('./providers/codex-session');
 const { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, terminalDaemonFallback, toCodexEffort } = require('./codex-env');
+
+test('policyToCodexConfig gives launch and live resume one policy triple for every mode', () => {
+  const { policyToCodexConfig } = require('./codex-env');
+  for (const [mode, sandbox, approval, reviewer] of [
+    ['plan', undefined, 'on-request', 'user'],
+    ['auto', 'workspace-write', 'on-request', 'auto_review'],
+    ['bypass', 'danger-full-access', 'never', 'user'],
+  ]) assert.deepEqual(policyToCodexConfig(mode), {
+    sandbox_mode: sandbox, approval_policy: approval, approvals_reviewer: reviewer,
+  });
+  assert.throws(() => policyToCodexConfig('other'), { code: 'EPERMISSION' });
+});
 const { writeProjectConfig: writeLiveProjectConfig } = require('./project-config');
 
 function makeTempDir() {

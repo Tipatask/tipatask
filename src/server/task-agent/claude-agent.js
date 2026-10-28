@@ -11,6 +11,7 @@ const { matchPromptLine, CLAUDE_PROMPT_PATTERNS, CLAUDE_PENDING_PASTE_RE } = req
 const { buildClaudeModelList } = require('./model-registry');
 const { buildHeadersHelperCommand, writeSpawnMcpConfig } = require('../mcp-spawn-config');
 const { writeProjectClaudeTrust } = require('../project-config');
+const claudeLive = require('./claude-live-mode');
 
 // ── Model probe (C1504) ──
 // No CLI path exists for this at all: `claude --help` has no `models` subcommand, `--model`
@@ -45,13 +46,15 @@ const DESIGN_BRIEF_MAX_CHARS = 4000;
 // "settle the aesthetic with the user") so a design-mode task never stalls on a clarifying
 // question with no human in the loop — the skill's own "When you cannot ask" clause is what
 // this sentence invokes.
-// ── Effort flag probe (TPT286) ──
+// ── `claude --help` probe (TPT286, TPT9136) ──
 // CLAUDE_CODE_EFFORT_LEVEL is always exported when a task sets an effort; the `--effort`
 // flag is added only when the installed CLI's own `--help` lists it (older builds reject
-// an unknown option at startup). Memoized per binary fingerprint (realpath:size — changes on
-// every `claude update`, same idea as getModelProbeKey()), so the probe runs once per install.
-const EFFORT_HELP_TIMEOUT_MS = 10_000;
-const _effortFlagCache = new Map(); // fingerprint -> Promise<boolean>
+// an unknown option at startup). The same help text says whether `--permission-mode` offers
+// `auto` and whether `--allow-dangerously-skip-permissions` exists (claude-live-mode.js).
+// Memoized per binary fingerprint (realpath:size — changes on every `claude update`, same idea
+// as getModelProbeKey()), so the probe runs once per install.
+const CLI_HELP_TIMEOUT_MS = 10_000;
+const _cliHelpCache = new Map(); // fingerprint -> Promise<string|null>
 
 // ── headersHelper probe (TPT349) ──
 // `headersHelper` on an http MCP server entry (a shell command whose JSON stdout supplies
@@ -229,7 +232,18 @@ class ClaudeAgent extends BaseTaskAgent {
     }
     const projectRoot = opts.projectPath || config.PROJECT_ROOT;
     const mode = opts.permissionPolicy?.mode;
-    writeProjectClaudeTrust(projectRoot, mode);
+    // (TPT9136) Native modes for this run: Auto launches Claude's native auto mode unless the CLI,
+    // settings or account rule it out (then acceptEdits), and a Plan/Auto task whose project
+    // default is Bypass pre-enables bypass so a live switch can reach it. The bypass
+    // acknowledgement is recorded first; without it the flag would open the CLI's startup warning.
+    const native = await ClaudeAgent._resolveNativePermissions(config, { policy: opts.permissionPolicy, projectRoot, backend: opts.backend });
+    const trusted = writeProjectClaudeTrust(projectRoot, mode, { acceptBypass: native.preEnableBypass });
+    if (native.preEnableBypass && !trusted) Object.assign(native, { bypass: false, bypassReason: 'consent', preEnableBypass: false });
+    // The run's policy text follows what Auto means natively here (permission-policy.js).
+    if (opts.permissionPolicy) opts = { ...opts, permissionPolicy: this.buildPermissionPolicy({ ...opts.permissionPolicy, nativeAuto: native.auto }) };
+    console.log(`[claude-agent] permission mode=${mode || 'legacy'} native=${native.launch}`
+      + ` auto=${native.auto}${native.autoReason ? ` (fallback: ${native.autoReason})` : ''}`
+      + ` bypass=${native.preEnableBypass ? 'pre-enabled' : native.bypass ? 'launch' : `off (${native.bypassReason})`}`);
     const env = augmentPathEnv({ TERM: 'xterm-256color', ...projectEnvExtras(opts.projectPath) });
     if (taskId) {
       env.TIPATASK_TASK_ID = taskId;
@@ -242,8 +256,8 @@ class ClaudeAgent extends BaseTaskAgent {
     // TPT286 — per-task effort (null = CLI's own default, spawn left untouched).
     const effort = this.resolveEffort(opts.task);
     console.log(`[claude-agent] model=${model} (task=${opts.model || '-'}) effort=${effort || '-'}`);
-    const nativeMode = mode === 'bypass' ? 'bypassPermissions' : mode === 'auto' ? 'acceptEdits' : 'plan';
-    const args = ['--model', model, '--permission-mode', nativeMode];
+    const args = ['--model', model, '--permission-mode', native.launch];
+    if (native.preEnableBypass) args.push('--allow-dangerously-skip-permissions');
     // (TPT354) Pin the session uuid so the exit-comment builder can find this run's transcript
     // (final-message.js) instead of guessing among the project's sessions. terminal-session.js
     // mints it per spawn and stores it on session._transcriptHint; absent for any caller that
@@ -319,35 +333,78 @@ class ClaudeAgent extends BaseTaskAgent {
     // TPT349 — lets terminal-session.js word its mid-session token-expiry notice (reconnect vs
     // restart). Like `model`, never persisted.
     spec.mcpHeadersHelper = mcpHeadersHelper;
+    // (TPT9136) terminal-session.js adopts the refined policy and keeps the native modes on the
+    // session (session._claudeNative) for live switching and the terminal header.
+    if (opts.permissionPolicy) spec.permissionPolicy = opts.permissionPolicy;
+    spec.nativePermission = { launch: native.launch, auto: native.auto, autoReason: native.autoReason,
+      bypass: native.bypass, bypassReason: native.bypassReason, preEnableBypass: native.preEnableBypass };
     return spec;
   }
 
-  // (TPT286) Resolves true when `<CLAUDE_BIN> --help` lists `--effort`. Async (execFile, never
-  // spawnSync) so a first-time probe never blocks the event loop; any failure resolves false —
-  // the env var still carries the effort. Only reached when a task actually sets an effort.
-  static _cliSupportsEffortFlag(config) {
+  // ── Live permission-mode switch (TPT9136) ──
+  // Native Shift+Tab cycling confirmed by the footer, then the mode directive as a submitted
+  // message — see claude-live-mode.js. Runs launched by this adapter record their native modes.
+  supportsLivePermissionSwitch(session) {
+    return !!session?._claudeNative && !session._imageOperation;
+  }
+
+  async switchPermissionMode(session, mode) {
+    return claudeLive.switchMode(this, session, mode);
+  }
+
+  // A footer mode change seen in the PTY (terminal-session.js feedAttentionChunk()).
+  observeModeChange(session, change, now) {
+    claudeLive.observeModeChange(this, session, change, now);
+  }
+
+  nativePermissionSummary(session) {
+    return claudeLive.nativeSummary(session);
+  }
+
+  // `<CLAUDE_BIN> --help` output, or null when it cannot be read. Async (execFile, never
+  // spawnSync) so a first-time probe never blocks the event loop; a failure is not cached.
+  static _cliHelpText(config) {
     // Probe the same binary getSpawnSpec() launches; fingerprint its resolved path.
     const bin = config.CLAUDE_BIN || resolveBin('claude');
-    if (!bin) return Promise.resolve(false);
+    if (!bin) return Promise.resolve(null);
     const key = claudeBinFingerprint(path.isAbsolute(bin) ? bin : (resolveBin('claude') || bin));
-    if (!_effortFlagCache.has(key)) {
+    if (!_cliHelpCache.has(key)) {
       // prependPathEnv keeps the env at one PATH key (TPT566) — never `env.PATH = …`.
       const env = prependPathEnv(augmentPathEnv({}), resolveNvmBinDir(config.CLAUDE_BIN));
       // argv via winExecSpec(): a Windows claude.cmd launcher runs through cmd.exe (Node >= 22
       // rejects a shell-less execFile of a .cmd with EINVAL); .exe/POSIX paths pass through.
       const spec = winExecSpec(bin, ['--help']);
-      _effortFlagCache.set(key, new Promise((resolve) => {
-        execFile(spec.command, spec.args, { ...spec.options, env, timeout: EFFORT_HELP_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      _cliHelpCache.set(key, new Promise((resolve) => {
+        execFile(spec.command, spec.args, { ...spec.options, env, timeout: CLI_HELP_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
           if (err) {
-            console.log(`[claude-agent] --help effort probe failed: ${err.code || err.message}`);
-            _effortFlagCache.delete(key); // retry on the next effort spawn
-            return resolve(false);
+            console.log(`[claude-agent] --help probe failed: ${err.code || err.message}`);
+            _cliHelpCache.delete(key); // retry on the next spawn
+            return resolve(null);
           }
-          resolve(/--effort\b/.test(`${stdout || ''}\n${stderr || ''}`));
+          resolve(`${stdout || ''}\n${stderr || ''}`);
         });
       }));
     }
-    return _effortFlagCache.get(key);
+    return _cliHelpCache.get(key);
+  }
+
+  // (TPT286) True when `--help` lists `--effort`; any failure is false — the env var still
+  // carries the effort. Only reached when a task actually sets an effort.
+  static async _cliSupportsEffortFlag(config) {
+    const help = await ClaudeAgent._cliHelpText(config);
+    return !!help && /--effort\b/.test(help);
+  }
+
+  // (TPT9136) { autoMode, allowBypassFlag, choices } from `--help`; an unreadable help text means
+  // neither (Auto then launches acceptEdits and bypass is never pre-enabled).
+  static async _cliPermissionCapabilities(config) {
+    return claudeLive.cliPermissionCapabilities(await ClaudeAgent._cliHelpText(config));
+  }
+
+  // (TPT9136) Native modes for one launch — see claude-live-mode.js resolveNativePermissions().
+  static async _resolveNativePermissions(config, { policy, projectRoot, backend } = {}) {
+    const capabilities = await ClaudeAgent._cliPermissionCapabilities(config);
+    return claudeLive.resolveNativePermissions({ policy, projectRoot, backend, capabilities });
   }
 
   // (TPT349) Resolves true when the CLI bundle contains `headersHelper`. Streamed with an early
@@ -400,14 +457,25 @@ class ClaudeAgent extends BaseTaskAgent {
 
   approvePlan(session) {
     if (!session.pty) return;
+    const current = this.approvalSubmissionGuard(session);
+    if (!current()) return;
+    // (TPT9136) With bypass pre-enabled, Shift+Tab from plan would enter bypass. While the prompt
+    // shows the plan footer, drive to where Proceed lands without it instead (auto, else manual).
+    if (session._claudeNative?.preEnableBypass && claudeLive.footerMode(session) === 'plan' && !claudeLive.dialogOpen(session)) {
+      claudeLive.approveFromPlan(this, session, current).catch((err) => {
+        console.log(`[claude-agent] plan approval for task ${session.taskId} could not leave plan mode: ${err.reason || err.message}`);
+        try { require('../terminal-session').warningCopy(session, 'notice.permission.claudeProceedFailed'); } catch { /* no terminal */ }
+      });
+      return;
+    }
     session.pty.write('\x1b[Z');
     setTimeout(() => {
-      if (session.pty) {
+      if (current()) {
         session.pty.write(this.getApprovalText(session));
       }
     }, 120);
     setTimeout(() => {
-      if (session.pty) session.pty.write('\r');
+      if (current()) session.pty.write('\r');
     }, 220);
   }
 

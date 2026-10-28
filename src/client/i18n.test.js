@@ -27,9 +27,10 @@ test('every locale defines at least every key en defines', () => {
 // translation — a uk string that dropped `{shortcut}` would pass the test above yet ship a mic
 // tooltip/aria-label with no combo in it, exactly the regression this task exists to prevent.
 // audio-recorder.js has no DOM test harness (see tt-audio-input.md), so this is the only
-// mechanical guard on voice.record/voice.stop keeping their interpolation param.
-test('voice.record and voice.stop keep the {shortcut} placeholder in every locale', () => {
-  for (const key of ['voice.record', 'voice.stop']) {
+// mechanical guard on voice.record/voice.stop keeping their interpolation param. (TPT9165) The
+// recording widget's screen-reader label and Stop button title name the combo the same way.
+test('voice.record, voice.stop and the recording widget labels keep the {shortcut} placeholder in every locale', () => {
+  for (const key of ['voice.record', 'voice.stop', 'voice.recordingToast', 'voice.stopRecording']) {
     for (const [locale, table] of Object.entries(LOCALES)) {
       assert.ok(table[key]?.includes('{shortcut}'), `${locale}.${key} must contain {shortcut}`);
     }
@@ -191,6 +192,19 @@ test('agentSelector.title and agentSelector.remember are translated in every loc
     }
     assert.notEqual(LOCALES.uk[key], LOCALES.en[key], `uk.${key} must not be the English text`);
   }
+});
+
+// (TPT9161) Cowboy-coding mode: the Task Edit label and hint, and the card shield tip marker.
+test('Cowboy-coding mode label, hint and marker are translated in every locale', () => {
+  for (const key of ['field.cowboyMode', 'cowboyMode.hint', 'cowboyMode.marker']) {
+    for (const [locale, table] of Object.entries(LOCALES)) {
+      assert.ok(table[key]?.trim(), `${locale}.${key} must be a non-empty string`);
+    }
+    assert.notEqual(LOCALES.uk[key], LOCALES.en[key], `uk.${key} must not be the English text`);
+  }
+  assert.equal(LOCALES.en['cowboyMode.hint'], 'Starts sessions for the next startable tasks when this one finishes. Bypass only.');
+  // The hint names Bypass by its label in each locale.
+  assert.ok(LOCALES.uk['cowboyMode.hint'].includes(LOCALES.uk['permissionMode.bypass']));
 });
 
 // (TPT9063) The permission-mode card button + dialog keys (permission-mode.js /

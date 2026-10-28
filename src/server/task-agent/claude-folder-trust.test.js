@@ -189,8 +189,11 @@ test('MCP setup accepts folder trust even when its MCP registration is already c
   assert.equal(fs.statSync(mcpPath).mtimeMs, mtime);
 });
 
-async function spawnSpec(t, projectRoot, opts = {}) {
+// (TPT9136) A CLI without native auto mode by default, so Auto launches acceptEdits here;
+// claude-native-spawn.test.js covers native auto and the bypass pre-enable rules.
+async function spawnSpec(t, projectRoot, opts = {}, capabilities = { autoMode: false, allowBypassFlag: true, choices: [] }) {
   t.mock.method(ClaudeAgent, '_cliSupportsHeadersHelper', async () => false);
+  t.mock.method(ClaudeAgent, '_cliPermissionCapabilities', async () => capabilities);
   return new ClaudeAgent().getSpawnSpec({
     CLAUDE_BIN: 'claude', SIMPLE_MODE: true, PROJECT_ROOT: projectRoot, USER_DATA_ROOT: path.dirname(projectRoot),
   }, 'Review this task.', null, opts);

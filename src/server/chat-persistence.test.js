@@ -236,3 +236,59 @@ test('chat history is per project path, capped, and survives a malformed index a
   try { assert.deepEqual(await f.store.readChatHistory('/project-a'), []); }
   finally { console.warn = original; }
 });
+
+// ── (TPT9116) every history write is announced once it is on disk ─────────────────────────
+
+test('chat history upsert announces each write once, after it is on disk; a failed write announces nothing', async (t) => {
+  const userDataRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'tt-chat-persist-'));
+  t.after(() => fs.rm(userDataRoot, { recursive: true, force: true }));
+  const notices = [];
+  let failRename = false;
+  const store = createChatPersistence({
+    userDataRoot,
+    fsOps: { ...fs, async rename(from, to) { if (failRename) throw new Error('injected rename failure'); return fs.rename(from, to); } },
+    onHistoryUpdated(projectPath, entry) {
+      const onDisk = JSON.parse(require('node:fs').readFileSync(historyPath(userDataRoot, projectPath), 'utf8'));
+      notices.push({ projectPath, entry, onDisk: onDisk.entries.map(e => e.historyId) });
+    },
+  });
+  await store.upsertChatHistory('/project', { historyId: 'a', kind: 'task', taskKey: 'TPT1', projectId: '2', createdAt: 100, lastActivityAt: 100 });
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].projectPath, '/project');
+  assert.deepEqual(notices[0].onDisk, ['a'], 'the entry is already in the index when the notice runs');
+  const saved = await store.upsertChatHistory('/project', { historyId: 'a', title: 'Renamed', lastActivityAt: 200 });
+  assert.equal(notices.length, 2, 'one notice per write');
+  assert.equal(notices[1].entry, saved, 'the merged entry, as returned');
+  assert.equal(notices[1].entry.createdAt, 100);
+  assert.equal(notices[1].entry.taskKey, 'TPT1');
+  failRename = true;
+  await assert.rejects(store.upsertChatHistory('/project', { historyId: 'b', lastActivityAt: 300 }), /injected rename failure/);
+  await assert.rejects(store.upsertChatHistory('/project', { provider: 'claude' }), { code: 'INVALID_CHAT_HISTORY' });
+  assert.equal(notices.length, 2, 'nothing for a write that did not land or was refused');
+});
+
+test('chat history: a throwing listener never fails the write; the default listener announces to the project watchers', async (t) => {
+  const userDataRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'tt-chat-persist-'));
+  t.after(() => fs.rm(userDataRoot, { recursive: true, force: true }));
+  const original = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    const store = createChatPersistence({ userDataRoot, onHistoryUpdated() { throw new Error('listener boom'); } });
+    const saved = await store.upsertChatHistory('/project', { historyId: 'a', lastActivityAt: 1 });
+    assert.equal(saved.historyId, 'a');
+    assert.equal((await store.readChatHistory('/project')).length, 1);
+    assert.match(warnings.join('\n'), /listener boom/);
+  } finally {
+    console.warn = original;
+  }
+  const websocket = require('./websocket');
+  const sent = [];
+  const watcherA = { readyState: 1, _attentionSubscriber: true, _projectPath: '/project', send: raw => sent.push(['a', JSON.parse(raw)]) };
+  const watcherB = { readyState: 1, _attentionSubscriber: true, _projectPath: '/other', send: raw => sent.push(['b', JSON.parse(raw)]) };
+  websocket.init({ clients: new Set([watcherA, watcherB]) });
+  t.after(() => websocket.init(null));
+  const store = createChatPersistence({ userDataRoot });
+  await store.upsertChatHistory('/project', { historyId: 'c', kind: 'project', taskKey: null, projectId: '2', nativeSessionId: 'n', lastActivityAt: 2 });
+  assert.deepEqual(sent, [['a', { type: 'chat-history-updated', historyId: 'c', kind: 'project', taskKey: null, projectId: '2' }]]);
+});

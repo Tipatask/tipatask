@@ -46,6 +46,7 @@ test('buildSharedPreamble: absent optional data emits no empty directive', () =>
     const p = agent.buildSharedPreamble({});
     assert.equal(p.vcs, '');
     assert.equal(p.tagDesc, '');
+    assert.equal(p.cowboy, '');
     assert.deepEqual(p.directives, [p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus, p.followUps]);
     assert.ok(p.directives.every(d => typeof d === 'string' && d.trim().length > 0));
   }
@@ -61,6 +62,21 @@ test('buildSharedPreamble: fixed order vcs -> tagDesc -> processSafety -> resour
     const p = agent.buildSharedPreamble(ALL_OPTS);
     assert.ok(p.vcs && p.tagDesc, 'both optional directives must render for this fixture');
     assert.deepEqual(p.directives, [p.vcs, p.tagDesc, p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus, p.followUps]);
+  }
+});
+
+test('buildSharedPreamble: a bypass cowboy run adds the cowboy slot last, after followUps', () => {
+  for (const agent of [bareAgent(), new ClaudeAgent(), new CodexAgent(), new PiAgent()]) {
+    const permissionPolicy = agent.buildPermissionPolicy({ mode: 'bypass', source: 'task' });
+    const p = agent.buildSharedPreamble({ ...ALL_OPTS, permissionPolicy, cowboyChain: true });
+    assert.ok(p.cowboy.startsWith('Cowboy chain:'));
+    assert.deepEqual(p.directives, [p.vcs, p.tagDesc, p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus, p.followUps, p.cowboy]);
+    // Pi gets compact wording whatever the caller passes; the others follow the policy's variant.
+    const variant = agent.getPreamblePolicy().compact ? { compact: true } : {};
+    assert.equal(p.cowboy, agent.buildCowboyDirective({ ...ALL_OPTS, permissionPolicy, cowboyChain: true, ...variant }));
+    assert.equal(agent.buildSharedPreamble({ ...ALL_OPTS, permissionPolicy }).cowboy, '');
+    const auto = agent.buildPermissionPolicy({ mode: 'auto', source: 'task' });
+    assert.equal(agent.buildSharedPreamble({ ...ALL_OPTS, permissionPolicy: auto, cowboyChain: true }).cowboy, '');
   }
 });
 

@@ -19,6 +19,11 @@ const en = {
   'notice.permission.planLocked': 'Plan mode stays read-only. Choose an execution mode in task settings, then restart.',
   'notice.permission.approval': 'Permission approval required.',
   'notice.permission.unavailable': 'Permission gate did not start. Task prompt was not sent; restart after checking the agent installation.',
+  // (TPT9136) claude-live-mode.js / claude-agent.js
+  'notice.permission.claudeAutoFallback': "Claude's auto mode is unavailable for this run. Auto now accepts project file edits and asks in the terminal before other actions.",
+  'notice.permission.claudeRestoreFailed': "Claude's previous permission mode could not be restored (it shows {mode}), so the run was stopped.",
+  'notice.permission.claudeRestoreDeferred': "The switch did not complete and Claude stays in {mode} for now; its previous permission mode is restored as soon as its prompt is free again.",
+  'notice.permission.claudeProceedFailed': "Claude did not leave plan mode for the approved plan. Approve the plan in the terminal.",
   // ── terminal-session.js notices ──
   'notice.starting': 'Starting {label}…',
   'notice.approval.stalledRetrying': '{label} approval looks stalled (no real activity yet) — retrying once.',
@@ -102,6 +107,10 @@ const uk = {
   'notice.permission.planLocked': 'Режим планування дозволяє лише читання. Виберіть режим виконання в налаштуваннях задачі та перезапустіть її.',
   'notice.permission.approval': 'Потрібне підтвердження дозволу.',
   'notice.permission.unavailable': 'Не вдалося запустити контроль дозволів. Запит задачі не надіслано; перевірте встановлення агента й перезапустіть.',
+  'notice.permission.claudeAutoFallback': 'Автоматичний режим Claude недоступний для цього запуску. Режим Auto тепер приймає зміни файлів проєкту, а перед іншими діями запитує в терміналі.',
+  'notice.permission.claudeRestoreFailed': 'Не вдалося повернути попередній режим дозволів Claude (зараз показано {mode}), тому запуск зупинено.',
+  'notice.permission.claudeRestoreDeferred': 'Перемикання не завершилося, тому поки що Claude залишається в режимі {mode}; попередній режим дозволів буде відновлено, щойно поле введення знову звільниться.',
+  'notice.permission.claudeProceedFailed': 'Claude не вийшов із режиму планування для схваленого плану. Схваліть план у терміналі.',
   'notice.starting': 'Запускаємо {label}…',
   'notice.approval.stalledRetrying': 'Схвалення в {label} виглядає завислим (реальної активності ще немає) — повторна спроба.',
   'notice.approval.stalledAfterRetry': 'Схвалення в {label} і після повторної спроби виглядає завислим (реальної активності немає — модель може повертати порожню або некоректну відповідь). Перевірте модель, налаштовану для цього проєкту.',

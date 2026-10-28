@@ -19,6 +19,15 @@ const COMMIT_ON = { type: 'git', worktree: false, commit: true, pr: false, merge
 const MISSING = [{ code: 'TASK_COMMIT_MISSING', message: 'Commits are enabled for this project and no commit starting with TPT9 is reachable from the main checkout HEAD: git add the task changes and commit them with a message starting with TPT9 before completing the task.' }];
 const base = { status: 'in_progress', roles: ROLES, vcs: COMMIT_ON, blockers: MISSING, nudgeCount: 0 };
 
+test('closed workflow roles never produce either idle nudge, including overlapping role flags', () => {
+  const roles = { in_progress: 'Doing', complete: 'Shipped', canceled: 'Dropped' };
+  for (const status of [roles.complete, roles.canceled]) {
+    const input = { ...base, status, roles, verified: true, ready: true };
+    assert.equal(nudgeKind(input), null);
+    assert.equal(nudgeKind({ ...input, roles: { ...roles, in_progress: status } }), null);
+  }
+});
+
 test('shouldNudge: only an in-progress task, commits on, with a commit/merge blocker, under the cap', () => {
   assert.equal(shouldNudge(base), true);
   assert.equal(shouldNudge({ ...base, nudgeCount: MAX_NUDGES - 1 }), true);

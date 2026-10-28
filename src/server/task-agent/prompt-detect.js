@@ -202,12 +202,14 @@ const CLAUDE_FIRST_RUN_PATTERNS = [
 // screen's line-scoped state goes inactive, but an option-less intermediate wait between two
 // onboarding steps (e.g. "opening browser for login…") also looks inactive — pure silence would
 // paste into that wait. Both markers verified present in the installed claude 2.1.241 binary via
-// a `strings` dump: the CLI's own REPL footer hint, and this app's spawn always passes
-// `--permission-mode plan` (claude-agent.js), which renders a "plan mode on" indicator once the
-// REPL is truly up.
+// a `strings` dump: the CLI's own REPL footer hint, and the "plan mode on" indicator a Plan launch
+// renders once the REPL is truly up. (TPT9136) claude 2.1.311 no longer prints the shortcuts hint;
+// every launch mode instead shows its own footer indicator (⏵⏵ auto mode on / accept edits on /
+// bypass permissions on, ⏸ manual mode on), which only the ready REPL paints.
 const CLAUDE_REPL_READY_PATTERNS = [
   /\?\s*for\s*shortcuts\b/i,
   /\bplan\s*mode\s*on\b/i,
+  /[⏸⏵]\s*(?:auto\s*mode|accept\s*edits|bypass\s*permissions|manual\s*mode|don['’]?t\s*ask)\s*on\b/i,
 ];
 function isClaudeReplReady(tail) {
   return typeof tail === 'string' && CLAUDE_REPL_READY_PATTERNS.some((re) => re.test(tail));

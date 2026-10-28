@@ -5,7 +5,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { beginSessionMemory, endSessionMemory } = require('./session-memory');
 const { refreshSessionVcs } = require('./vcs-context');
-const { resolvePermissionMode, assertPermissionSupport, permissionError } = require('./permission-policy');
+const { resolvePermissionMode, assertPermissionSupport, permissionError, applyLivePolicy,
+  validateLiveMode, modeSwitchError, permissionModeSnapshot, versionAtLeast, PI_GATE_VERSION } = require('./permission-policy');
 const { createPermissionGate } = require('./permission-gate');
 let pty;
 try {
@@ -26,13 +27,16 @@ const { getTaskAgent } = require('./task-agent');
 const BaseTaskAgent = require('./task-agent/base-agent');
 const { buildLegacyPatternTable, sanitizePromptText, isClaudeReplReady, matchClaudeBgAgentsLine, CODEX_COMPOSER_PLACEHOLDERS, CODEX_EMPTY_COMPOSER_RE } = require('./task-agent/prompt-detect');
 const { reflowChunk, carveReflowLines, resetReflow } = require('./screen-reflow');
-const { matchClaudePlanOutcomeLine, trackTypedLine, classifyTypedSubmission } = require('./plan-approval-detect'); // (TPT654)
+const { matchClaudePlanOutcomeLine, trackTypedLine, classifyTypedSubmission, trackClaudeScreen } = require('./plan-approval-detect'); // (TPT654, TPT9136)
 const { maxCommentId, isTerminalTailExitComment } = require('./exit-resolution');
 const { syncOnSessionStart, isSyncAsYouGoEnabled } = require('../cli/knowledge-sync');
 const archCache = require('../mcp/architecture-cache');
 const { getTagsForTask } = require('./tag-cache');
 const { resolveAttachmentDir } = require('./attachment-paths');
 const { openPtyTrace } = require('./pty-trace'); // (TPT9048) TIPATASK_PTY_TRACE kickoff diagnostics
+const { selectNextCowboyTasks, effectivePermissionMode, chainKickoffPrompt, chainLaunchAgent } = require('./cowboy-next'); // (TPT9162)
+const { withProjectLock } = require('./project-mutex');
+const { LOCAL_HOST } = require('./local-access');
 const {
   killProcessGroup,
   killProcessTree,
@@ -144,10 +148,10 @@ const RESUME_REPAINT_WOBBLE_MS = 120;  // gap between resize-down and resize-res
 // (C1260) spec.preludePrompt phase — a slash command (e.g. /design) submitted alone
 // before the task prompt so it actually runs as a command instead of being swallowed as
 // the task prompt's first line. Completion is judged by PTY SILENCE, not readiness:
-// isClaudeReplReady() matches "plan mode on" (this app always spawns
-// --permission-mode plan), which is present in the footer WHILE the turn is still
-// running too, so it can't be the signal a turn ended. A real turn repaints its spinner
-// continuously; only a multi-second quiet window means it's actually done.
+// isClaudeReplReady() matches the permission-mode footer ("plan mode on", "auto mode on", …),
+// which is present WHILE the turn is still running too, so it can't be the signal a turn
+// ended. A real turn repaints its spinner continuously; only a multi-second quiet window
+// means it's actually done.
 const PRELUDE_MIN_RUN_MS = 3000;   // floor: never call it done before /design even starts rendering
 const PRELUDE_QUIET_MS = 5000;     // required silence (off session.lastOutputAt) before release
 const PRELUDE_MAX_WAIT_MS = 30 * 60 * 1000;  // give-up ceiling, mirrors MAX_FIRST_RUN_RETRIES's ~30min budget
@@ -230,6 +234,9 @@ function shouldReleasePrelude({ waitedMs, quietMs, gated, replReady }) {
 // empty-composer marker) are not submissions (they also remain visible during active work).
 const CODEX_PLAN_QUIET_MS = 2000;
 function codexTurnMarker(line) {
+  // Worked-for duration, model/effort status and warning footers are idle chrome:
+  // none matches the submission or active-work markers below. They cannot create
+  // readiness on their own, and must not discard a preceding plan sentinel.
   const prompt = /^\s*[›❯>]\s*(\S.*)$/.exec(line);
   // Prefixes matter too: the placeholder itself can arrive in split PTY writes.
   // Check input before the sentinel: "› Plan ready." is an echoed submission.
@@ -326,6 +333,7 @@ function feedCodexPlan(session, agent, lines, carry, hit) {
     // sentinel instruction. Nothing Codex paints before the kickoff Enter can be a real plan —
     // leave the candidate and let the genuine post-submit sentinel re-arm this timer.
     if (session._injectDone === false) return;
+    const wasAnnounced = session._planReadySent;
     state.ready = true;
     session.agentPlanReady = true;
     session.codexPlanReady = true;
@@ -340,6 +348,9 @@ function feedCodexPlan(session, agent, lines, carry, hit) {
       session._planReadySent = true;
       session.ws.send(JSON.stringify({ type: 'plan-ready', tabId: session.tabId, codexPlanReady: true }));
     }
+    // Publish the rising edge as well as invalidateCodexPlan's falling edge.
+    // A resize repaint of an announced plan keeps the same client dialog.
+    if (!wasAnnounced) emitTerminalState(session);
   }, state.repainting && !state.candidate
     ? Math.max(0, state.repaintDeadline - Date.now()) : CODEX_PLAN_QUIET_MS);
   session._planIdleTimer.unref?.();
@@ -500,7 +511,14 @@ function feedAttentionChunk(session, agent, rawChunk, cleanChunk, now = Date.now
   // (TPT654) The answered ExitPlanMode dialog collapses to a transcript row (or the mode footer
   // changes after a shift+tab) — a plan approved inside Claude's own TUI. Same stream-order row
   // set as trackBgAgents() above; acts only on a planning session past its kickoff.
-  if (agent.id === 'claude') trackClaudePlanOutcome(session, rowChunk == null ? legacyLines : rowLines);
+  // (TPT9136) The chunk also updates session._claudeTui, a screen grid read for the footer mode,
+  // an open dialog and the composer — what confirms live switches (Ink writes only changed cells,
+  // so rows alone cannot); a footer change nobody requested goes to the adapter.
+  if (agent.id === 'claude') {
+    const modeChange = trackClaudeScreen(session, rawChunk, { now, rows: session.pty?.rows, cols: session.pty?.cols });
+    if (modeChange) agent.observeModeChange?.(session, modeChange, now);
+    trackClaudePlanOutcome(session, rowChunk == null ? legacyLines : rowLines);
+  }
   if (agent.id === 'codex') {
     feedCodexPlan(session, agent, rowChunk == null ? legacyLines : rowLines,
       rowChunk == null ? session._attentionLineCarry : session._attentionRowCarry, hit);
@@ -778,6 +796,7 @@ function emitTerminalState(session) {
       startedAt: session.startedAt,
       phase: session.terminalPhase,
       permissionMode: session.permissionPolicy?.mode ?? null,
+      permissionModeState: permissionModeFrame(session),
       permissionSource: session.permissionPolicy?.source ?? null,
       permissionRequest: session._permissionGate?.snapshot() || null,
       ...(session._imageState ? { imageTask: session._imageState } : {}),
@@ -792,6 +811,126 @@ function emitTerminalState(session) {
       }),
       paused: pausedSummary(session),
     }));
+  }
+}
+
+// (TPT9139) Whether this run offers live switching at all: a task terminal with a resolved policy
+// whose adapter implements it (supportsLivePermissionSwitch()) and has not refused this run as
+// unsupported. Clients hide their selector while false; it never authorizes a switch.
+function permissionModeSupported(session) {
+  if (!session || session.type !== 'terminal' || !session.permissionPolicy || session._imageOperation) return false;
+  if (session.permissionMode?.error?.reason === 'unsupported') return false;
+  try {
+    return getTaskAgent(session.taskAgent).supportsLivePermissionSwitch?.(session) === true;
+  } catch { return false; }
+}
+
+// The state every client-facing frame carries: the snapshot plus `supported`, and (TPT9136)
+// `native` when the run's adapter reports what its modes mean natively (Claude: whether Auto is
+// native auto or the acceptEdits fallback, and whether Bypass is reachable).
+function permissionModeFrame(session) {
+  const frame = { ...permissionModeSnapshot(session), supported: permissionModeSupported(session) };
+  let native = null;
+  try { native = session?.permissionPolicy ? getTaskAgent(session.taskAgent).nativePermissionSummary?.(session) || null : null; } catch { native = null; }
+  if (native) frame.native = native;
+  return frame;
+}
+
+function emitPermissionModeState(session) {
+  // Tool calls a pending switch held at the Pi gate are decided once it settles.
+  session._permissionGate?.policyChanged?.();
+  // Backstop for chats: wireClient() neither replays nor switches a chat's mode, but a pending
+  // chat still has the default terminal type, so any other caller gets only the terminal-state
+  // reply, never a permission-mode frame or project broadcast.
+  if (require('./session-state').isAgentChatId(session.taskId || session.tabId)) {
+    emitTerminalState(session);
+    return;
+  }
+  const payload = { taskId: session.taskId || session.tabId, tabId: session.tabId,
+    startedAt: session.startedAt, ...permissionModeFrame(session) };
+  if (session.ws && session.ws.readyState === session.ws.OPEN) {
+    session.ws.send(JSON.stringify({ type: 'session:permission-mode-changed', ...payload }));
+  }
+  require('./websocket').emitSessionPermissionModeChanged(session.projectPath, payload);
+  emitTerminalState(session);
+}
+
+// id is the server's project-scoped sessions Map key, never a client-supplied task id.
+async function requestPermissionMode(id, mode, sessions) {
+  const session = sessions?.get(id);
+  if (!session) throw modeSwitchError('inactive');
+  if (session.permissionMode?.pending) throw modeSwitchError('busy');
+  const state = permissionModeSnapshot(session);
+  session.permissionMode = state;
+  const fail = err => {
+    state.pending = false;
+    state.error = { code: err.code || 'EPERMISSION_MODE', reason: err.reason || 'failed',
+      message: err.message || modeSwitchError('failed').message };
+    emitPermissionModeState(session);
+    return permissionModeSnapshot(session);
+  };
+  try {
+    // Keep untrusted malformed inputs out of session inventory and broadcast frames.
+    if (typeof mode === 'string' && mode.length <= 32) state.requested = mode;
+    validateLiveMode(mode);
+    if (session.type !== 'terminal' || !session.alive || !session.pty || session._terminated
+      || session._starting || session._imageOperation || !session.permissionPolicy) throw modeSwitchError('inactive');
+    if (mode === state.confirmed) {
+      state.error = null;
+      emitPermissionModeState(session);
+      return permissionModeSnapshot(session);
+    }
+  } catch (err) { return fail(err); }
+
+  const agent = getTaskAgent(session.taskAgent);
+  const ptyAtRequest = session.pty;
+  const startedAt = session.startedAt;
+  state.pending = true;
+  state.error = null;
+  session._permissionEpoch = (session._permissionEpoch || 0) + 1;
+  // Revoke queued app approvals before awaiting the provider. Failed switches also
+  // require fresh approval IDs; they cannot revive an old authorization.
+  if (session._approvalWatchdogTimer) clearTimeout(session._approvalWatchdogTimer);
+  session._approvalWatchdogTimer = null;
+  session._permissionGate?.cancelPending();
+  emitPermissionModeState(session);
+  try {
+    const result = await agent.switchPermissionMode(session, mode);
+    if (session.permissionMode !== state) return permissionModeSnapshot(session); // a fresh launch owns state now
+    if (sessions.get(id) !== session || !session.alive || session._terminated
+      || session.pty !== ptyAtRequest || session.startedAt !== startedAt) throw modeSwitchError('session_changed');
+    if (result?.supported !== true) throw modeSwitchError('unsupported');
+    if (result.confirmed !== mode) throw modeSwitchError('unconfirmed');
+    applyLivePolicy(session, mode);
+    state.confirmed = mode;
+    state.pending = false;
+    state.error = null;
+    session._permissionGate?.cancelPending();
+    // Clear the awaiting-plan state used by plan-approval-detect.js and its timers.
+    clearTimeout(session._planIdleTimer);
+    session._planIdleTimer = null;
+    session._planFirstArmedAt = null;
+    session._codexPlan = { candidate: null, ready: false };
+    session._planReadySent = false;
+    session.codexPlanReady = false;
+    session.agentPlanReady = false;
+    session._typedLine = '';
+    session._typedPasting = false;
+    session._localCommandBuffer = '';
+    session._interceptingApprovalCommand = false;
+    session.planOnly = false;
+    session.discussionMode = false;
+    session.terminalPhase = 'executing';
+    if (session._attentionState?.kind === 'planReady') {
+      session._attentionState = null;
+      session._patternAttentionNeeded = false;
+      session.onAttentionCleared?.();
+    }
+    emitPermissionModeState(session);
+    return permissionModeSnapshot(session);
+  } catch (err) {
+    if (session.permissionMode !== state) return permissionModeSnapshot(session);
+    return fail(err);
   }
 }
 
@@ -1211,6 +1350,7 @@ function armApprovalWatchdog(session, agent, isRetry = false) {
 }
 
 function approvePlan(session) {
+  if (session.permissionMode?.pending) return;
   if (session.taskAgent === 'codex') invalidateCodexPlan(session);
   if (session._planIdleTimer) { clearTimeout(session._planIdleTimer); session._planIdleTimer = null; }
   if (session._approvalWatchdogTimer) { clearTimeout(session._approvalWatchdogTimer); session._approvalWatchdogTimer = null; }
@@ -1240,7 +1380,7 @@ function approvePlan(session) {
 // completion nudge (maybeNudgeIdleSession) nor the exit backstop (flagTaskLeftUncommitted) ever
 // guarded its commit requirement. Returns false (no-op) unless the session is still planning.
 function markPlanApprovedInTui(session, how) {
-  if (!session || session.terminalPhase !== 'planning') return false;
+  if (!session || session.terminalPhase !== 'planning' || session.permissionMode?.pending) return false;
   if (session.taskAgent === 'codex') invalidateCodexPlan(session);
   if (session._planIdleTimer) { clearTimeout(session._planIdleTimer); session._planIdleTimer = null; }
   session.codexPlanReady = false;
@@ -1280,7 +1420,8 @@ function trackClaudePlanOutcome(session, lines) {
 // so a Stop/Restart in between turns the rest into a no-op.
 function pasteAndSubmit(session, agent, text, typedLine = '', { verify = null } = {}) {
   const quietMs = agent.getPasteSilenceMs();
-  const live = () => session.alive && session.pty && !session._terminated;
+  const permissionEpoch = session._permissionEpoch;
+  const live = () => session.alive && session.pty && !session._terminated && session._permissionEpoch === permissionEpoch;
   const later = (fn, ms) => { const timer = setTimeout(fn, ms); if (timer.unref) timer.unref(); };
   const plain = typeof agent.wrapsBracketedPaste === 'function' && agent.wrapsBracketedPaste() === false;
   const frame = (body) => (plain ? body : `\x1b[200~${body}\x1b[201~`);
@@ -1318,7 +1459,8 @@ function pasteAndSubmit(session, agent, text, typedLine = '', { verify = null } 
 // liveness, so a Stop/Restart turns the rest into a no-op.
 function verifyPastedSubmission(session, agent, { echoRe, label = 'submission' }) {
   if (!echoRe) return;
-  const live = () => session.alive && session.pty && !session._terminated;
+  const permissionEpoch = session._permissionEpoch;
+  const live = () => session.alive && session.pty && !session._terminated && session._permissionEpoch === permissionEpoch;
   const later = (fn, ms) => { const timer = setTimeout(fn, ms); if (timer.unref) timer.unref(); };
   let retries = 0;
   let startupWaitSeenAt = 0;
@@ -1366,6 +1508,7 @@ async function maybeNudgeIdleSession(session, { backend = session && session.bac
   if (!session || session.type !== 'terminal' || !session.alive || !session.pty || !session.taskId) return { nudged: false, reason: 'not_task_terminal' };
   if (session.terminalPhase !== 'executing' || session._injectDone !== true) return { nudged: false, reason: 'not_executing' };
   if (session._terminated || session._completionEmitted || session._pause) return { nudged: false, reason: 'inactive' };
+  if (session._taskClosed) return { nudged: false, reason: 'task_closed' };
   if ((session.nudgeCount || 0) >= nudge.MAX_NUDGES) return { nudged: false, reason: 'max_nudges' };
   if (session._nudgeInFlight || session._nudgeCheckedOutputAt === session.lastOutputAt) return { nudged: false, reason: 'already_checked' };
   if (!backend) return { nudged: false, reason: 'no_backend' };
@@ -1386,7 +1529,7 @@ async function maybeNudgeIdleSession(session, { backend = session && session.bac
     });
     if (!kind) return { nudged: false, reason: 'no_nudge_needed' };
     // The agent may have resumed (or the session ended) during the async checks.
-    if (!session.alive || !session.pty || session._terminated || session.lastOutputAt !== idleSince) return { nudged: false, reason: 'resumed' };
+    if (!session.alive || !session.pty || session._terminated || session._taskClosed || session._completionEmitted || session.lastOutputAt !== idleSince) return { nudged: false, reason: 'resumed' };
     session.nudgeCount = (session.nudgeCount || 0) + 1;
     const agent = getTaskAgent(session.taskAgent);
     const count = `${session.nudgeCount}/${nudge.MAX_NUDGES}`;
@@ -1505,6 +1648,155 @@ async function flagTaskLeftUncommitted(run, { backend, projectRoot, reason, term
   }
 }
 
+// ── Cowboy-coding chains (TPT9162) ──
+// A cowboy run is a bypass run whose task has cowboyMode on, or one launchCowboyChain() started
+// (spawnTerminal() opts.cowboyChain). Its PTY env carries a per-run token and the exact URL of
+// POST /api/tasks/<key>/cowboy-next; local-access.js lets that token, sent as the
+// x-tipatask-run-token header while the run is live, open that one route for that one task. The
+// agent's start_next_tasks tool and `tt next` send it (cowboy-next-request.js, TPT9163).
+const { COWBOY_TOKEN_ENV, COWBOY_URL_ENV } = require('./cowboy-next-request');
+
+function mintCowboyToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function cowboyNextUrl(taskId) {
+  return `http://${LOCAL_HOST}:${config.PORT}/api/tasks/${encodeURIComponent(taskId)}/cowboy-next`;
+}
+
+// The spawn env with this run's cowboy variables, and without any inherited from the server's
+// own environment (a server started from a cowboy terminal would otherwise pass its parent's on).
+function withCowboyEnv(env, session, taskId) {
+  const out = { ...(env || {}) };
+  delete out[COWBOY_TOKEN_ENV];
+  delete out[COWBOY_URL_ENV];
+  if (session.cowboyChain && session._cowboyToken) {
+    out[COWBOY_TOKEN_ENV] = session._cowboyToken;
+    out[COWBOY_URL_ENV] = cowboyNextUrl(taskId);
+  }
+  return out;
+}
+
+function sessionRoot(session) {
+  return session.projectPath || config.PROJECT_ROOT;
+}
+
+function sessionTaskKey(session) {
+  return session.taskId || session.tabId || null;
+}
+
+// The live task terminal of `taskKey` in this project, or null.
+function findCowboyRun(sessions, projectRoot, taskKey) {
+  for (const session of sessions?.values() || []) {
+    if (session && session.type === 'terminal' && session.alive && sessionTaskKey(session) === taskKey
+      && sessionRoot(session) === projectRoot) return session;
+  }
+  return null;
+}
+
+// Task keys in this project with a live, starting or queued terminal session.
+function liveTerminalTaskKeys(sessions, projectRoot) {
+  const keys = new Set();
+  for (const session of sessions?.values() || []) {
+    if (!session || session.type !== 'terminal' || sessionRoot(session) !== projectRoot) continue;
+    if (session.alive || session._starting || session._launching || session._queued) {
+      const key = sessionTaskKey(session);
+      if (key) keys.add(key);
+    }
+  }
+  return keys;
+}
+
+// local-access.js liveRunTokens(): { token, projectPath } of every live cowboy run of `taskKey`.
+function cowboyRunTokens(sessions, taskKey) {
+  const runs = [];
+  for (const session of sessions?.values() || []) {
+    if (session && session.type === 'terminal' && session.alive && session.cowboyChain
+      && session._cowboyToken && sessionTaskKey(session) === taskKey) {
+      runs.push({ token: session._cowboyToken, projectPath: session.projectPath || '' });
+    }
+  }
+  return runs;
+}
+
+async function readProjectPermissionMode(backend) {
+  try {
+    const result = await backend.getEffectiveProjectSettings({ strict: true, refresh: true });
+    return result?.settings?.agent_permission_mode ?? null;
+  } catch { return null; }
+}
+
+// Starts the next tasks of a cowboy chain once the run of `finishedKey` has finished its task —
+// POST /api/tasks/:key/cowboy-next. Refuses (reason, nothing started) unless that run is live,
+// carries cowboyChain and is still confirmed in bypass, and its task — read fresh — is in the
+// complete role with a stored effective mode of bypass. The picks are selectNextCowboyTasks()
+// (cowboy-next.js) over a fresh read; each one starts through deps.startTask() — ws-handlers.js
+// startChainedTaskSession(): the session setup, start queue and spawnTerminal() a Start uses — with
+// the task's own agent, its Start kickoff, { cowboyChain: true } and its own TIPATASK_COWBOY_TOKEN.
+// One decision per run: a repeat returns 'already_launched' and starts nothing. Chains of one
+// project run one at a time, so two runs finishing together never start the same task.
+// Returns { started, reason } (+ `previous` on a repeat); a failed task read throws and leaves the
+// run free to ask again. deps: { sessions, backend, startTask, fetchStatusRoles?, websocket? }.
+async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
+  const { sessions, backend, startTask } = deps;
+  const root = projectRoot || config.PROJECT_ROOT;
+  const run = findCowboyRun(sessions, root, finishedKey);
+  if (!run) return { started: [], reason: 'no_session' };
+  if (!run.cowboyChain) return { started: [], reason: 'not_cowboy' };
+  if (run._cowboyNext) {
+    return run._cowboyNext.pending
+      ? { started: [], reason: 'already_launched' }
+      : { started: [], reason: 'already_launched', previous: { started: run._cowboyNext.started, reason: run._cowboyNext.reason } };
+  }
+  if (run.permissionPolicy?.mode !== 'bypass') return { started: [], reason: 'not_bypass' };
+  run._cowboyNext = { pending: true };
+  let decision = null;
+  try {
+    decision = await withProjectLock(`cowboy\0${root}`, async () => {
+      const fetchRoles = deps.fetchStatusRoles || BaseTaskAgent.fetchStatusRoles;
+      const [tasks, statusRoles, projectMode, currentUserId, finished] = await Promise.all([
+        backend.getTasksUnfiltered(),
+        fetchRoles(backend),
+        readProjectPermissionMode(backend),
+        Promise.resolve(typeof backend.getCurrentUserId === 'function' ? backend.getCurrentUserId() : null).catch(() => null),
+        backend.getTask(finishedKey),
+      ]);
+      if (!finished || finished.status !== statusRoles.complete) return { started: [], reason: 'not_finished' };
+      if (effectivePermissionMode(finished, projectMode) !== 'bypass') return { started: [], reason: 'not_bypass' };
+      // The task list is cached briefly; the finished row is the fresh read.
+      const rows = [finished, ...(tasks || []).filter(t => t && t.id !== finished.id)];
+      const picked = selectNextCowboyTasks(finished, rows, {
+        statusRoles, projectMode, currentUserId, liveTaskIds: liveTerminalTaskKeys(sessions, root),
+      });
+      const started = [];
+      for (const task of picked.tasks) {
+        let ok = false;
+        try {
+          ok = await startTask({
+            task,
+            agent: chainLaunchAgent(task),
+            prompt: chainKickoffPrompt(task),
+            cowboyChain: true,
+            env: { [COWBOY_TOKEN_ENV]: mintCowboyToken() },
+          });
+        } catch (err) {
+          console.warn(`[cowboy] ${finishedKey}: could not start ${task.id}: ${err.message}`);
+        }
+        if (ok) started.push(task.id);
+      }
+      const reason = started.length || !picked.tasks.length ? picked.reason : 'start_failed';
+      return { started, reason, decided: true };
+    });
+  } finally {
+    run._cowboyNext = decision && decision.decided ? { started: decision.started, reason: decision.reason } : null;
+  }
+  console.log(`[cowboy] ${finishedKey}: ${decision.reason} — started ${decision.started.join(', ') || 'nothing'}`);
+  if (decision.started.length) {
+    (deps.websocket || require('./websocket')).emitCowboyChainStarted(run.projectPath || '', { taskId: finishedKey, started: decision.started });
+  }
+  return { started: decision.started, reason: decision.reason };
+}
+
 // (C1444) Thin wrapper — flags the session as "starting" for the full duration of
 // _spawnTerminal()'s awaited remote round-trips (KB pull, task comments, status/VCS
 // settings) before pty.spawn() flips `alive`. GET /api/sessions (ws-handlers.js
@@ -1540,9 +1832,19 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   noticeCopy(session, 'notice.starting', { label: permissionAgent.label }, { retain: true });
   const resolved = await resolvePermissionMode({ backend: opts.backend, task: opts.task, taskId, planOnly: session.planOnly || session.discussionMode });
   throwIfTerminated(session);
-  // Includes communication rules: all prompts/continuations consume this frozen
-  // snapshot. Only a fresh spawn (including relaunch) resolves preferences again.
+  // (TPT9162) A chain launch (launchCowboyChain()) runs only in bypass. The task's own cowboyMode
+  // counts only while this run is bypass: a stored flag can outlive the mode it was set under.
+  if (opts.cowboyChain === true && resolved.mode !== 'bypass') {
+    throw new Error('Cowboy chain launches run only in Bypass mode.');
+  }
+  session.cowboyChain = resolved.mode === 'bypass' && (opts.cowboyChain === true || opts.task?.cowboyMode === true);
+  session._cowboyToken = session.cowboyChain ? (opts.env?.[COWBOY_TOKEN_ENV] || mintCowboyToken()) : null;
+  session._cowboyNext = null;
+  // Only a fresh spawn resolves stored preferences. Live switches replace this
+  // snapshot after the provider confirms enforcement and behavioral instructions.
   session.permissionPolicy = permissionAgent.buildPermissionPolicy(resolved);
+  session.permissionMode = { requested: resolved.mode, confirmed: resolved.mode, pending: false, error: null };
+  session._permissionEpoch = (session._permissionEpoch || 0) + 1;
   session._permissionGate?.close();
   session._permissionGate = null;
   if (session.taskAgent === 'pi' && opts.task) {
@@ -1686,22 +1988,29 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   const agentLimits = scaleAgentLimitsForConcurrency(
     resolveAgentLimits(session.projectPath || config.PROJECT_ROOT), activeCount,
   );
-  if (session.permissionPolicy.enforced && agent.id === 'pi' && resolved.mode !== 'bypass') {
+  // (TPT9138) Pi loads the gate in every mode, so a live switch takes effect at the next tool call.
+  // Auto already required this CLI version (assertPermissionSupport); an older Pi keeps launching
+  // Plan and Bypass without the gate and offers no live switch.
+  if (agent.id === 'pi' && versionAtLeast(cliVersion, PI_GATE_VERSION)) {
     session._permissionGate = await createPermissionGate(session, {
       root: session.projectPath || config.PROJECT_ROOT, changed: () => emitTerminalState(session),
       attentionText: terminalCopy(sessionLocale(session), 'notice.permission.approval'),
     });
   }
-  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate });
+  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate, backend: opts.backend, cowboyChain: session.cowboyChain });
   throwIfTerminated(session);
+  spec.env = withCowboyEnv(spec.env, session, taskId); // (TPT9162)
   const spawnedAt = Date.now(); // (TPT354) lower bound for locating this run's transcript file
-  const ptyProcess = pty.spawn(spec.command, spec.args, {
+  const nativePty = pty.spawn(spec.command, spec.args, {
     name: 'xterm-256color',
     cols: opts.initialCols || 120,
     rows: opts.initialRows || 40,
     cwd: spec.cwd,
     env: spec.env,
   });
+  const ptyProcess = agent.wrapPty
+    ? agent.wrapPty(nativePty, { spawn: pty.spawn.bind(pty), spec, session, version: cliVersion })
+    : nativePty;
   if (session._terminated) {
     killSpawnedPty(ptyProcess);
     throw terminalStartCanceledError();
@@ -1731,6 +2040,17 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   session.taskAgent = agent.id;
   session.taskAgentLabel = agent.label;
   session.taskAgentModel = spec.model || ''; // (C1118) resolved --model value, for the terminal header caption
+  // (TPT9136) An agent may refine the run's policy with what it resolved at launch (Claude: the
+  // text for native auto vs. the acceptEdits fallback); the mode itself never changes here.
+  if (spec.permissionPolicy && spec.permissionPolicy.mode === session.permissionPolicy?.mode) {
+    session.permissionPolicy = spec.permissionPolicy;
+  }
+  // Claude's native modes for this run (claude-live-mode.js); `expected` is the native mode the
+  // app last put it in. The footer tracker and the user's own Shift+Tab start fresh per spawn.
+  session._claudeNative = spec.nativePermission ? { ...spec.nativePermission, expected: spec.nativePermission.launch } : null;
+  session._claudeTui = null;
+  session._claudeDriving = false;
+  session._userModeKeyAt = 0;
   session.planApprovalCommand = agent.approvalCommand;
   session.pty = ptyProcess;
   session.ptyPid = ptyProcess.pid; // (C1565) survives session.pty being nulled on terminate
@@ -2436,6 +2756,10 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
 
 function handleTerminalInput(session, data) {
   if (!session.alive || !session.pty || typeof data !== 'string' || !data.length) return;
+  if (session.permissionMode?.pending) return;
+  // (TPT9136) The user's own Shift+Tab: the footer change that follows is their choice, never
+  // read as the CLI refusing auto mode (claude-live-mode.js observeModeChange()).
+  if (data.includes('\x1b[Z')) session._userModeKeyAt = Date.now();
   // (TPT654) Agents without a slash approval command (Codex, Pi) are approved by typing into their
   // own composer. Rebuild the typed line and, once plan-ready has latched, treat an approval-worded
   // submission as the go-ahead; any other line is plan feedback and keeps the run planning. Runs
@@ -2654,6 +2978,9 @@ module.exports = {
   SUBMIT_STARTUP_WAIT_MAX_MS,   // (TPT9048)
   verifyPastedSubmission,       // (TPT9048)
   emitTerminalState,
+  emitPermissionModeState,
+  permissionModeFrame,          // (TPT9139)
+  requestPermissionMode,
   emitTerminalNotice,
   emitTerminalWarning,
   sessionLocale,
@@ -2697,4 +3024,9 @@ module.exports = {
   maybeNudgeIdleSession,
   exitRunSnapshot,
   flagTaskLeftUncommitted,
+  COWBOY_TOKEN_ENV,             // (TPT9162)
+  COWBOY_URL_ENV,               // (TPT9162)
+  withCowboyEnv,                // (TPT9162)
+  cowboyRunTokens,              // (TPT9162)
+  launchCowboyChain,            // (TPT9162)
 };

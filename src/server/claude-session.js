@@ -160,6 +160,7 @@ const OBJECTIVE_DISALLOWED_TOOLS = [
   'mcp__tipatask__ensure_project_tag', 'mcp__tipatask__purge_stale_reservations',
   'mcp__tipatask-local__push_knowledge', 'mcp__tipatask-local__pull_knowledge',
   'mcp__tipatask-local__git_worktree_status', 'mcp__tipatask-local__complete_task',
+  'mcp__tipatask-local__start_next_tasks',
   'Agent', 'Task', 'MultiEdit',
 ].join(',');
 

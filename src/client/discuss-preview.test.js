@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
 // (TPT179) Rehash → Discuss: pinned task-card preview + read-only modal opening.
@@ -100,6 +102,29 @@ test('renderCard(preview) keeps what a card shows and drops every control and bo
   ]) assert.ok(!html.includes(banned), `preview card must not contain "${banned}"`);
 });
 
+// (TPT9153) The task chat card and the pinned Discuss card end their meta row with the effort chip,
+// member avatar and agent badge (the New Task Preview's order). Corner badges and their band hooks
+// are board-card only: in a preview they sat on the last tag or description line.
+test('renderCard(preview) ends the meta row with the badges; only a board card draws them in the corners', () => {
+  const env = cardEnv({
+    renderEffortBadge: () => '<span class="effort-badge">max</span>',
+    renderMemberBadge: () => '<span class="member-badge">A</span>',
+    renderAgentBadge: () => '<span class="agent-badge"></span>',
+  });
+  const html = env.renderCard(task, { preview: true });
+  const meta = html.match(/<div class="card-preview-meta">([\s\S]*?)<\/div>/);
+  assert.ok(meta, 'preview meta row missing');
+  assert.match(meta[1], /^<span class="status"[^>]*>label:in_progress<\/span><span class="card-preview-deps"[^>]*>Deps: TPT210<\/span><span class="preview-meta-badges"><span class="effort-badge">max<\/span><span class="member-badge">A<\/span><span class="agent-badge"><\/span><\/span>$/);
+  assert.equal((html.match(/class="(?:effort|member|agent)-badge"/g) || []).length, 3, 'each badge once, inside the meta row');
+  assert.doesNotMatch(html, /has-(?:agent|effort|member)-badge/);
+  // No badge to show: no empty group either.
+  assert.doesNotMatch(cardEnv({ renderAgentBadge: () => '', renderMemberBadge: () => '' }).renderCard(task, { preview: true }), /preview-meta-badges/);
+  // A board card keeps them as corner badges, with the band hooks.
+  const board = env.renderCard(task);
+  assert.match(board, /class="card[^"]* has-agent-badge has-effort-badge has-member-badge/);
+  assert.doesNotMatch(board, /preview-meta-badges/);
+});
+
 test('renderCard sends the paragraph-truncated description to markdown while retaining full raw text', () => {
   const fullDescription = 'First paragraph.\n\nSecond paragraph that crosses the preview limit.';
   const html = cardEnv({ truncateMarkdownAtParagraph: () => 'First paragraph.\n\n… (truncated)' })
@@ -193,7 +218,9 @@ test('chat-task-preview.js: proposal cards go through the board renderCard() in 
   assert.ok(!body.includes('<div class="preview-card '), 'bespoke .preview-card markup must be gone');
   assert.ok(!body.includes('class="preview-desc"'), 'bespoke .preview-desc markup must be gone');
   const css = read('styles.css');
-  assert.match(css, /\.preview-card:not\(\.card\) \.preview-desc \{/);
+  // (TPT9147) The New Task Preview was the last bespoke .preview-card; it is a renderCard() card
+  // now, so no layout rule for a non-card .preview-card is left.
+  assert.doesNotMatch(css, /\.preview-card:not\(\.card\)/);
   assert.match(css, /\.card\.preview-card:not\(\.card-expanded\) \.card-desc \{/);
 });
 
@@ -283,6 +310,17 @@ test('chat-ui.js wiring: preview sits outside .chat-body, hint/placeholder are d
   assert.match(src, /openTaskEditModal\(card\.dataset\.discussTask, \{ readOnly: true \}\)/);
   // Errors must stay cached so a permanently failing key can't refetch on every re-render.
   assert.match(src, /\(\) => discussTaskCache\.set\(key, \{ error: true \}\)/);
+});
+
+// (TPT9155) setupCardInteractions() runs over all of #app, the pinned Discuss card included. That
+// card's agent badge stays inert, so its click opens the discussed task read-only, never the agent
+// assign modal; a board card's badge still opens it. Real DOM clicks run in a happy-dom process.
+test('pinned Discuss card: an agent badge click opens the task read-only; a board card badge still opens the assign modal', () => {
+  const runner = new URL('./discuss-preview-dom-runner.mjs', import.meta.url);
+  const result = spawnSync(process.execPath, [fileURLToPath(runner)], { encoding: 'utf8', timeout: 30_000 });
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /TPT9155_DISCUSS_DOM_PASS/);
 });
 
 test('i18n: discuss keys exist in en and uk; orphaned toast is gone', () => {

@@ -87,7 +87,7 @@ test('template.html declares the Version Control tab button and panel', () => {
 
 test('the Version Control tab caption/panel text stays empty markup (text set at open time, not baked in)', () => {
   const html = readSource('template.html');
-  const capMatch = /<p class="settings-wf-caption" id="settings-vcs-caption">([^<]*)<\/p>/.exec(html);
+  const capMatch = /<p class="settings-row-hint" id="settings-vcs-caption">([^<]*)<\/p>/.exec(html);
   assert.ok(capMatch, '#settings-vcs-caption not found in template.html');
   assert.strictEqual(
     capMatch[1].trim(),
@@ -146,6 +146,40 @@ function vcsHarness() {
     },
   };
 }
+
+// (TPT9111) The tab is built on the shared Settings skeleton: the type radios are the segments of
+// one .settings-row's control, and every git flag is its own row in the git-only section.
+test('VCS settings render onto the shared section and row skeleton', async () => {
+  setLocale('en');
+  const h = vcsHarness();
+  try {
+    await h.populate();
+    const group = h.document.querySelector('#settings-vcs-type-options');
+    assert.ok(group.classList.contains('settings-row-control') && group.classList.contains('settings-segmented'));
+    assert.equal(group.getAttribute('role'), 'radiogroup');
+    assert.equal(group.closest('.settings-row').id, 'settings-vcs-type-row');
+    assert.deepEqual([...group.querySelectorAll('input[name="settings-vcs-type"]')].map(el => el.value), VCS_TYPES.map(o => o.value));
+    assert.equal(h.document.querySelector('#settings-vcs-caption').textContent, t('settings.vcs.caption'));
+    assert.ok(h.document.querySelector('#settings-vcs-type-label').textContent.startsWith(t('settings.vcs.typeLabel')));
+    const git = h.document.querySelector('#settings-vcs-git-options');
+    assert.ok(git.classList.contains('settings-section'));
+    assert.ok(git.firstElementChild.classList.contains('settings-section-title'));
+    assert.equal(git.firstElementChild.textContent, t('settings.vcs.gitSection'));
+    const rows = [...git.children].filter(el => el.classList.contains('settings-row'));
+    assert.equal(rows.length, VCS_GIT_FLAGS.length);
+    rows.forEach((row, i) => {
+      const [label, control] = row.children;
+      assert.ok(label.classList.contains('settings-row-label'), 'label column first');
+      assert.ok(control.classList.contains('settings-row-control'), 'control column second');
+      const input = control.querySelector('input[type="checkbox"]');
+      assert.equal(input.dataset.field, VCS_GIT_FLAGS[i].field);
+      assert.equal(label.querySelector('label').getAttribute('for'), input.id);
+      assert.equal(label.querySelector('.settings-row-hint').textContent, t(VCS_GIT_FLAGS[i].hintKey));
+    });
+  } finally {
+    await h.window.happyDOM.close();
+  }
+});
 
 for (const locale of ['en', 'uk']) {
   test(`VCS settings render localized merge checkbox and persist it (${locale})`, async () => {

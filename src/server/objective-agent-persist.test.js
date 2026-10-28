@@ -250,7 +250,11 @@ test('an effort-only change on a live task still PATCHes (effort is in DIFF_FIEL
   await withFakeApiServer(makeServer(state), async (backend) => {
     // Every other DIFF_FIELDS value matches the live row, so without `effort` in DIFF_FIELDS
     // overwriteRaw would skip this task entirely (no PATCH).
-    await backend.overwriteRaw(todoBody([proposalTask({ id: 'C904', agentAssignee: 'claude', claudeDesignMode: false, isObjective: false, effort: 'low' })]));
+    const taskBases = await backend.getTasksUnfiltered();
+    await backend.overwriteRaw('```json\n' + JSON.stringify({
+      tasks: [proposalTask({ id: 'C904', agentAssignee: 'claude', claudeDesignMode: false, isObjective: false, effort: 'low' })],
+      writeTaskIds: ['C904'], taskBases,
+    }) + '\n```');
     // The live-task update path may re-read the single row; that GET isn't under test here.
     assert.deepStrictEqual(state.unexpected.filter(u => u !== 'GET /api/projects/1/tasks/C904'), []);
     assert.strictEqual(state.patches.length, 1);

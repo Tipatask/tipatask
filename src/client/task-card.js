@@ -425,6 +425,11 @@ export function renderEffortBadge(t) {
 }
 
 function bindAgentBadge(badge) {
+  // (TPT9147/TPT9155) Every preview card's badge is display-only. A chat proposal's or New Task
+  // Preview's key has no task on the server yet; the task chat card and the pinned Discuss card
+  // open their task on click instead (the Discuss card read-only: its task is locked while it is
+  // discussed). So a click must not open the assign modal; it reaches the preview's click target.
+  if (badge.closest('.preview-card, .card--preview')) return;
   badge.addEventListener('click', (e) => {
     e.stopPropagation();
     if (badge.classList.contains('agent-badge--locked')) return;
@@ -436,7 +441,7 @@ function bindAgentBadge(badge) {
   });
 }
 
-function renderMemberBadge(t) {
+export function renderMemberBadge(t) {
   if (t.assignee == null) return '';
   const members = Array.isArray(state.projectMembers) ? state.projectMembers : [];
   const member = members.find(m => Number(m.user_id) === Number(t.assignee));
@@ -449,9 +454,12 @@ function renderMemberBadge(t) {
   return `<span class="member-badge member-badge--initials" title="${title}">${initial}</span>`;
 }
 
-function renderSprintBadgeLabel(task) {
+// (TPT9147) A task's sprint as one label: the project's group noun and number ("Sprint 412",
+// "Batch 412", "Партія 412" — groupTitle()) or the localized Backlog title. The id-badge tooltip
+// and the New Task Preview's sprint chip both read it, so neither repeats the noun.
+export function renderSprintBadgeLabel(task) {
   const p = task?.priority;
-  if (task?.sprint_id === null || task?.sprintId === null || (p !== undefined && p !== '' && Number(p) === 0)) return 'Backlog';
+  if (task?.sprint_id === null || task?.sprintId === null || (p !== undefined && p !== '' && Number(p) === 0)) return translate('backlog.title');
   return groupTitle(task.priority ?? '?');
 }
 
@@ -604,9 +612,14 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
   // run an agent terminal, so their controls-row slot keeps the Subtasks button alone.
   const permissionBtn = (preview || t.isObjective) ? '' : permissionButtonHtml(t);
   const selectBtn = `<button class="btn-select-card${isSelected ? ' checked' : ''}" data-task-id="${escapeAttr(t.id)}" data-tip="${escapeAttr(translate('tooltip.selectCard'))}" aria-label="${escapeAttr(translate('tooltip.selectCard'))}"><span class="select-dot"></span>${manualMerge ? MERGE_DOT : ''}${leftUncommitted ? FINISH_DOT : ''}</button>`;
-  const agentBadge = proposal ? '' : renderAgentBadge(t);
-  const effortBadge = proposal ? '' : renderEffortBadge(t);
-  const memberBadge = proposal ? '' : renderMemberBadge(t);
+  // (TPT9149/TPT9153) Only a board card draws these as absolute corner badges, over the bottom
+  // band its has-*-badge root classes reserve. A preview ends its meta row with them instead
+  // (.preview-meta-badges, same order as the New Task Preview); a proposal's caller puts its
+  // badges in metaHtml (TPT9147).
+  const agentBadge = preview ? '' : renderAgentBadge(t);
+  const effortBadge = preview ? '' : renderEffortBadge(t);
+  const memberBadge = preview ? '' : renderMemberBadge(t);
+  const previewBadges = preview && !proposal ? `${renderEffortBadge(t)}${renderMemberBadge(t)}${renderAgentBadge(t)}` : '';
   // (TPT12) Unread-activity chip — someone else commented on/changed this task. Both of
   // .card's pseudo-element slots are taken (::before orange attention dot, ::after green
   // newly-assigned dot) and all four corners are occupied by badges, so this is a real
@@ -632,7 +645,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
     : `data-id="${escapeAttr(t.id)}" data-status="${t.status}" data-status-role="${statusRoleToken(t.status)}" data-priority="${t.priority ?? ''}" data-sprint-label="${escapeAttr(sprintBadgeLabel)}" data-assignee="${t.assignee ?? ''}" data-agent-assignee="${escapeAttr(t.agentAssignee || '')}" data-pi-model="${escapeAttr(t.piModel || '')}" data-objective="${t.isObjective ? '1' : ''}" data-db-id="${escapeAttr(t.dbId ?? '')}" data-parent-db-id="${escapeAttr(t.parentDbId ?? '')}" data-deps='${JSON.stringify(t.dependencies)}' data-tags='${JSON.stringify(t.tags || [])}'${depsBlocked ? ' data-deps-blocked="1"' : ''}${lockIntent ? ` data-lock-intent="${lockIntent}"` : ''}`;
   const previewMetaHtml = proposal
     ? `<div class="card-preview-meta">${proposal.metaHtml || ''}</div>`
-    : `<div class="card-preview-meta"><span class="status" style="--status-color:${statusColor(t.status)}" data-status-role="${statusRoleToken(t.status)}">${escapeAttr(statusLabel(t.status))}</span>${t.dependencies.length ? `<span class="card-preview-deps" title="Deps: ${escapeAttr(t.dependencies.join(', '))}">Deps: ${escapeAttr(t.dependencies.join(', '))}</span>` : ''}</div>`;
+    : `<div class="card-preview-meta"><span class="status" style="--status-color:${statusColor(t.status)}" data-status-role="${statusRoleToken(t.status)}">${escapeAttr(statusLabel(t.status))}</span>${t.dependencies.length ? `<span class="card-preview-deps" title="Deps: ${escapeAttr(t.dependencies.join(', '))}">Deps: ${escapeAttr(t.dependencies.join(', '))}</span>` : ''}${previewBadges ? `<span class="preview-meta-badges">${previewBadges}</span>` : ''}</div>`;
   // (C1387) needs-attention is intrinsic to the card markup, not applied post-render only —
   // a full board re-render used to permanently drop the ring for any card without a Start
   // button (objective/human-assigned cards). syncAttentionClasses() (attention-state.js) is
@@ -641,7 +654,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
       <div class="card${wideClass}${isSelected ? ' selected' : ''}${agentBadge ? ' has-agent-badge' : ''}${effortBadge ? ' has-effort-badge' : ''}${memberBadge ? ' has-member-badge' : ''}${isPendingSync ? ' pending-sync' : ''}${preview ? ' card--preview' : attentionClass(t.id)}${proposal ? ` preview-card${proposal.rootClass ? ' ' + proposal.rootClass : ''}` : ''}${activityChip ? ' has-activity-badge' : ''}${t.isObjective ? ' objective-highlight' : ''}${discussing ? ' card--discussing' : ''}" ${rootAttrs} style="--card-max-w:${cardMaxW}px">
         ${proposal ? (proposal.headHtml || '') : ''}<div class="card-top${proposal ? ' card-top--proposal' : ''}">
           <span class="id-badge ${badgeClass}" ${idAttr}="${escapeAttr(t.id)}" title="${escapeAttr(idBadgeTitle)}"${proposal && proposal.hideIdBadge ? ' hidden>' : `>${t.id}`}</span>
-          ${activityChip}
+          ${activityChip}${proposal ? (proposal.badgeHtml || '') : ''}
           <span class="card-title${proposal ? ' preview-title' : ''}"${proposal ? ' data-field="title" contenteditable="false"' : ''} ${idAttr}="${escapeAttr(t.id)}" title="${escapeAttr(t.title)}"><span class="card-title-inner">${escapeAttr(t.title)}</span></span>
           ${preview ? '' : `<div class="card-btn-group">
             ${selectBtn}<div class="card-action-menu" role="group" aria-label="${escapeAttr(translate('card.actionsMenu'))}">${editBtn}${chatBtn}${chainBtn}${reiterateBtn}${deleteBtn}${mergeBtn}${finishBtn}</div>

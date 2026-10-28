@@ -42,6 +42,10 @@ const {
 // coverage is unaffected in production: the numbered option rows a real AskUserQuestion dialog
 // also renders (`❯ 1. …`) still match the (still-ungated) ❯-digit generic pattern.
 const CASES = [
+  ['codex', CODEX_PROMPT_PATTERNS, 'Worked for 2m 55s • 12:29', null],
+  ['codex', CODEX_PROMPT_PATTERNS, '› Ask Codex to do anything', null],
+  ['codex', CODEX_PROMPT_PATTERNS, 'GPT-6.1-Sol xhigh · ~/Projects/Photoassistant/www_aider · Review project architecture · ← for agents', null],
+  ['codex', CODEX_PROMPT_PATTERNS, '⚠ 1 warning · f2 to view', null],
   ['generic', GENERIC_PROMPT_PATTERNS, '│ Do you want to proceed? │', 'attention'],
   ['generic', GENERIC_PROMPT_PATTERNS, '[y/n]', 'attention'],
   ['generic', GENERIC_PROMPT_PATTERNS, 'random log line with no prompt', null],
@@ -375,6 +379,19 @@ test('C1219: isClaudeReplReady matches the plan-mode REPL footer and nothing in 
   assert.equal(isClaudeReplReady(undefined), false);
   for (const line of FIRST_RUN_POSITIVE_CASES) {
     assert.equal(isClaudeReplReady(line), false, `onboarding frame should not look REPL-ready: ${JSON.stringify(line)}`);
+  }
+});
+
+test('TPT9136: isClaudeReplReady accepts every launch mode\'s footer (claude 2.1.311 prints no shortcuts hint), not prose', () => {
+  for (const tail of [
+    '❯ Try "fix typecheck errors"\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents',
+    '  ⏵⏵ accept edits on   (shift+tab to cycle)',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    '  ⏸ manual mode on · ← 1 agent',
+    '⏵⏵automodeon (shift+tabtocycle)',
+  ]) assert.ok(isClaudeReplReady(tail), tail);
+  for (const tail of ['Turn on auto mode on the settings page', 'accept edits on save', 'bypass permissions only in a sandbox']) {
+    assert.equal(isClaudeReplReady(tail), false, tail);
   }
 });
 

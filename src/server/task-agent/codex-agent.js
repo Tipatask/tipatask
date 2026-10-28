@@ -47,6 +47,23 @@ class CodexAgent extends BaseTaskAgent {
     this.approvalCommand = null;
   }
 
+  wrapPty(native, options) {
+    return new (require('./codex-live-mode').CodexLivePty)(native, options);
+  }
+
+  supportsLivePermissionSwitch(session) {
+    return require('./codex-live-mode').supported(session);
+  }
+
+  async switchPermissionMode(session, mode) {
+    require('../permission-policy').validateLiveMode(mode);
+    if (!this.supportsLivePermissionSwitch(session)) return { supported: false };
+    if (!session._injectDone) throw require('../permission-policy').modeSwitchError('busy');
+    // Native /permissions changes the preset but cannot replace launch-time MCP/app
+    // tool fences. Resume the same rollout with the complete authoritative policy.
+    return session.pty.switchMode(this, mode);
+  }
+
   // (C1057) Codex-specific prompt/dialog wording layered over the generic table — see
   // prompt-detect.js for the verified pattern list and the HARD RULE about toolApproval/
   // mcpTrust kinds.
@@ -220,8 +237,10 @@ class CodexAgent extends BaseTaskAgent {
     // project-relative path; the Task App is a standalone checkout.
     // env + CODEX_HOME/MCP wiring shared with the objective-chat Codex provider (C1029) — see codex-env.js.
     let env;
+    let codexSwitch;
     try {
       ({ env } = buildCodexEnv({ projectRoot, taskId, term: 'xterm-256color' }));
+      codexSwitch = { baseHome: env.CODEX_HOME, effort: effort ? toCodexEffort(effort) : undefined };
       const launch = codexTerminalLaunchOptions(projectRoot, env.CODEX_HOME, effort ? toCodexEffort(effort) : undefined, env, opts.permissionPolicy);
       env.CODEX_HOME = launch.codexHome;
       args.unshift(...launch.args);
@@ -236,15 +255,18 @@ class CodexAgent extends BaseTaskAgent {
       env,
       ...kickoff,
       model: _codexModel,
+      codexSwitch,
     };
   }
 
   async approvePlan(session) {
     if (!session.pty) return;
+    const current = this.approvalSubmissionGuard(session);
+    if (!current()) return;
     const pty = session.pty;
     const { refreshSessionVcs, buildVcsContextDirective } = require('../vcs-context');
     const context = await refreshSessionVcs(session);
-    if (session.pty !== pty || !session.alive) return;
+    if (session.pty !== pty || !session.alive || !current()) return;
     const text = `${this.getApprovalText(session)}\n${buildVcsContextDirective(context)}`;
     const handoff = this.prepareKickoff(config, text, session.taskId);
     if (handoff.kickoffFile) {
@@ -256,7 +278,7 @@ class CodexAgent extends BaseTaskAgent {
     }
     session.pty.write(`\x1b[200~${text}\x1b[201~`);
     setTimeout(() => {
-      if (session.pty) session.pty.write('\r');
+      if (current()) session.pty.write('\r');
     }, 100);
   }
 

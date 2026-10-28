@@ -201,13 +201,20 @@ test('Design Mode excludes shared assembly, orders task before comments, and enf
   assert.ok(huge.slice('/design '.length).length <= 4000);
 });
 
-for (const mode of ['plan', 'auto', 'bypass']) test(`Design Mode keeps ${mode} native permissions and a single-line kickoff`, async () => {
+for (const mode of ['plan', 'auto', 'bypass']) test(`Design Mode keeps ${mode} native permissions and a single-line kickoff`, async (t) => {
   const dir = makeProjectDir({ CLAUDE_MODEL: 'opusplan' });
+  // (TPT9136) A CLI that offers native auto mode; claude-native-spawn.test.js covers the fallback.
+  t.mock.method(ClaudeAgent, '_cliPermissionCapabilities', async () => ({ autoMode: true, allowBypassFlag: true, choices: ['auto'] }));
+  t.mock.method(ClaudeAgent, '_cliSupportsHeadersHelper', async () => false);
+  // A scratch Claude profile: no cached account gate, and trust is written there.
+  const priorConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = path.join(dir, 'profile');
+  t.after(() => { if (priorConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = priorConfigDir; });
   try {
     const agent = new ClaudeAgent();
     const permissionPolicy = agent.buildPermissionPolicy({ mode });
     const spec = await agent.getSpawnSpec(FAKE_CONFIG, 'Make a task board', 'TPT9080', { projectPath: dir, designMode: true, permissionPolicy });
-    assert.equal(spec.args[spec.args.indexOf('--permission-mode') + 1], { plan: 'plan', auto: 'acceptEdits', bypass: 'bypassPermissions' }[mode]);
+    assert.equal(spec.args[spec.args.indexOf('--permission-mode') + 1], { plan: 'plan', auto: 'auto', bypass: 'bypassPermissions' }[mode]);
     assert.match(spec.initialPrompt, /^\/design Make a task board/);
     assert.ok(!spec.initialPrompt.includes('\n'));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }

@@ -71,6 +71,15 @@ const { LOCALES, setMenuLocale, getMenuLocale, mt } = require('./main/menu-i18n'
 // (C1532) About + Third-Party Licenses windows — see about-window.js header.
 const { openAboutWindow, openNoticesWindow } = require('./main/about-window');
 const { createProjectAccessGate, projectAccessDialog } = require('./main/project-access');
+// (TPT9167) Project ▸ Export… — save dialog + archive write; the archive itself is built
+// by src/server/project-archive.js, required lazily on the first export.
+const { EXPORT_MENU_ITEM_ID, focusedProjectWindow, createProjectExporter } = require('./main/project-export');
+// (TPT9169) Project ▸ Import… — open dialog, archive check, pending imports and the import
+// sequence; the project steps it runs are the closures passed in below (projectImporter).
+const { createProjectImporter } = require('./main/project-import');
+// (TPT9112) Startup macOS permission requests — see os-permissions.js header. No electron
+// import, no module-scope I/O.
+const { requestStartupPermissions } = require('./main/os-permissions');
 const { resolveAppVersion } = require('./src/server/app-version');
 const { ensureBundleSignatureHealthy } = require('./src/server/bundle-signature');
 // (C1355) Duplicate-LaunchServices-claimant self-heal — see ls-registration.js's header comment.
@@ -758,6 +767,7 @@ async function adoptProjectIntoWindow(senderWebContents, projectRoot) {
   projectDirs.set(wcId, projectRoot);
   claimProject(projectRoot, w);
   bindWindowToProject(wcId, projectRoot);
+  syncProjectMenuState();
   w.setTitle(getWindowTitle(getDisplayName(projectRoot)));
   scheduleOpenProjectsSync();
   senderWebContents.send('project:changed', projectRoot, getDisplayName(projectRoot));
@@ -962,6 +972,7 @@ function registerIpcHandlers() {
     claimProject(dir, w);
     scheduleOpenProjectsSync();
     bindWindowToProject(wcId, dir);
+    syncProjectMenuState();
     w.setTitle(getWindowTitle(getDisplayName(dir)));
 
     w.webContents.once('did-finish-load', () => {
@@ -1120,8 +1131,9 @@ function registerIpcHandlers() {
     try { return systemPreferences.getMediaAccessStatus('microphone'); } catch { return 'unknown'; }
   });
   // Triggers the actual OS prompt (only fires once per install — see notes above the
-  // Settings > Voice UI). Called from the renderer right before the FIRST getUserMedia() of a
-  // session, never at boot, so a user who never touches voice input is never prompted.
+  // Settings > Voice UI). (TPT9112) macOS is now asked at startup (main/os-permissions.js);
+  // the renderer still calls this right before a getUserMedia() that finds the status
+  // 'not-determined' — a startup prompt left unanswered, or a grant reset since.
   ipcMain.handle('voice:request-mic-access', async () => {
     if (process.platform !== 'darwin') return true;
     try { return await systemPreferences.askForMediaAccess('microphone'); } catch { return false; }
@@ -1773,6 +1785,12 @@ function registerIpcHandlers() {
       return { ok: false, error: err.message };
     }
   });
+
+  // (TPT9169) Project ▸ Import… wizard (setup-modal.js import mode) → main/project-import.js:
+  // the folder step's check, the import itself, and the release of a cancelled import.
+  ipcMain.handle('project:import-folder-check', (_event, { importId, folder } = {}) => projectImporter.checkFolder(importId, folder));
+  ipcMain.handle('project:import-from-wizard', (event, detail) => projectImporter.run(event.sender, detail || {}));
+  ipcMain.handle('project:import-cancel', (_event, importId) => projectImporter.cancel(importId));
 }
 
 function resolveServerPaths() {
@@ -2035,6 +2053,156 @@ function notificationsMenu() {
   };
 }
 
+// (TPT9167) Project ▸ Export… acts on the focused, configured project window only. The
+// application menu is one app-level object, so syncProjectMenuState() re-derives the item's
+// enabled state on window focus/blur, on an in-place rebind and when a project window closes.
+function exportTargetWindow() {
+  return focusedProjectWindow({
+    BrowserWindow,
+    projectDirs,
+    hasBackend: (w) => !!getWindowState(w.webContents.id).backend,
+  });
+}
+
+function syncProjectMenuState() {
+  const item = Menu.getApplicationMenu()?.getMenuItemById(EXPORT_MENU_ITEM_ID);
+  if (item) item.enabled = !!exportTargetWindow();
+}
+
+const exportProject = createProjectExporter({
+  dialog,
+  buildArchive: (dir, backend) => require('./src/server/project-archive')
+    .buildProjectArchive(dir, backend, { appVersion: app.getVersion() }),
+  fileNameFor: (name) => require('./src/server/project-archive').archiveFileName(name),
+});
+
+function exportProjectFromMenu(win) {
+  const target = exportTargetWindow();
+  if (!target || (win && win !== target)) return;
+  const dir = projectDirs.get(target.webContents.id);
+  exportProject(target, {
+    projectDir: dir,
+    projectName: getDisplayName(dir),
+    backend: getWindowState(target.webContents.id).backend,
+  }).catch((err) => console.warn('[project-export] export failed:', err.message));
+}
+
+// (TPT9169) project:create-from-wizard's steps 3–8 for an imported project: device link, token
+// exchange, .tipatask/config.json, settings snapshot, project.json. The import wizard has no
+// device step — registerDevice() reuses this machine's device, else names it after the host.
+async function configureImportedProject({ projectPath, apiBaseUrl, token, projectId, name, agentPreference }) {
+  const os = require('node:os');
+  const { registerDevice, associateDeviceProject, initializeProjectSettings } = require('./src/cli/setup');
+  const { exchangeProjectToken } = require('./src/cli/auth');
+  const device = await registerDevice({ apiBaseUrl, token, machineId: getOrCreateMachineId(), name: os.hostname() });
+  await associateDeviceProject({ apiBaseUrl, token, deviceId: device.id, projectId });
+  const scopedToken = await exchangeProjectToken(apiBaseUrl, token, projectId);
+
+  let TASK_AGENT = agentPreference?.taskAgent || '';
+  let AVAILABLE_AGENTS = Array.isArray(agentPreference?.availableAgents) ? agentPreference.availableAgents.join(',') : '';
+  if (!TASK_AGENT) {
+    TASK_AGENT = 'claude';
+    AVAILABLE_AGENTS = 'claude';
+    try {
+      const { listAvailableTaskAgents } = require('./src/server/task-agent');
+      const agents = await listAvailableTaskAgents(require('./src/server/config'));
+      if (agents.length > 0) { AVAILABLE_AGENTS = agents.map(a => a.id).join(','); TASK_AGENT = agents[0].id; }
+    } catch { /* non-fatal */ }
+  }
+  const { writeProjectConfig, sanitizePiModels } = require('./src/server/project-config');
+  const piModels = sanitizePiModels(agentPreference);
+  writeProjectConfig(projectPath, {
+    TASK_BACKEND: 'api',
+    API_BASE_URL: apiBaseUrl,
+    API_TOKEN: scopedToken,
+    API_PROJECT_ID: String(projectId),
+    DEVICE_ID: String(device.id),
+    DEVICE_NAME: device.name,
+    TASK_AGENT,
+    AVAILABLE_AGENTS,
+    projectName: name,
+    ...(piModels.length ? { PI_MODELS: piModels } : {}),
+  });
+  await initializeProjectSettings({ projectRoot: projectPath });
+  writeProjectMeta(projectPath, { name, apiProjectId: projectId, updatedAt: new Date().toISOString() });
+  return { token: scopedToken };
+}
+
+// (TPT9169) project:create-from-wizard's closing steps for an imported project, each one
+// non-fatal: harness files (CLAUDE.md / AGENTS.md only where the archive brought none — files
+// in the folder are kept), the KB push and the MCP configs.
+async function finishImportedProject({ projectPath, apiBaseUrl, token, projectId }) {
+  try { writeProjectSkillsConfig(projectPath, __dirname); } catch (e) {
+    console.warn('[skills-config] import write failed:', e.message);
+  }
+  // A KB version cache left in the folder belongs to no project (the folder had no
+  // config.json) and would make the push skip files the new project does not have yet.
+  try { fs.rmSync(path.join(projectPath, '.tipatask', 'knowledge-versions.json'), { force: true }); } catch { /* none */ }
+  try {
+    const { pushAll, pushArchitectureDocs } = require('./src/cli/knowledge-sync');
+    await pushAll(apiBaseUrl, projectId, token, projectPath);
+    await pushArchitectureDocs(apiBaseUrl, projectId, token, projectPath);
+  } catch (err) {
+    console.warn('[project-import] KB push failed:', err.message);
+  }
+  try { writeProjectMcpConfig(projectPath, __dirname); } catch (e) {
+    console.warn('[mcp-config] import .mcp.json write failed:', e.message);
+  }
+  try { writeProjectCodexConfig(projectPath, __dirname); } catch (e) {
+    console.warn('[codex-config] import write failed:', e.message);
+  }
+}
+
+// (TPT9169) Rollback of a failed import: deletes the API project that import created.
+async function removeImportedApiProject({ apiBaseUrl, token, projectId }) {
+  const { request } = require('./src/cli/http');
+  const { status, data } = await request(`${apiBaseUrl}/api/projects/${encodeURIComponent(projectId)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+    timeoutMs: 15000,
+  });
+  if (status >= 400) throw new Error(`API returned ${status}${data && data.error ? `: ${data.error}` : ''}`);
+}
+
+// (TPT9169) Where an imported project opens: a window with no project (Get Started) adopts it
+// in place; a project window keeps its own project and the import opens in a new window.
+async function openImportedProject(sender, projectPath) {
+  if (sender && !sender.isDestroyed() && projectDirs.has(sender.id) && !projectDirs.get(sender.id)) {
+    const r = await adoptProjectIntoWindow(sender, projectPath);
+    if (r.adopted) return 'current';
+    if (r.focused) return 'focused';
+  }
+  return (await createProjectWindow(projectPath)) ? 'new' : null;
+}
+
+const projectImporter = createProjectImporter({
+  dialog,
+  validateArchive: (zipPath) => require('./src/server/project-archive').validateProjectArchive(zipPath),
+  isFolderOpen: (dir) => !!(ownerOf(dir) || setupFor(dir)),
+  createProject: ({ apiBaseUrl, token, name }) => require('./src/cli/setup').createApiProject({ apiBaseUrl, token, name }),
+  configureProject: configureImportedProject,
+  importArchive: async (zipPath, opts) => {
+    // A backend of its own, bound to the new folder's config.json, for the import's API calls.
+    const backend = require('./src/server/api-backend').createApiBackend(null, opts.projectRoot);
+    try {
+      return await require('./src/server/project-archive').importProjectArchive(zipPath, { ...opts, backend });
+    } finally {
+      backend.dispose();
+    }
+  },
+  finishProject: finishImportedProject,
+  removeProject: removeImportedApiProject,
+  openProject: openImportedProject,
+});
+
+// (TPT9169) Project ▸ Import… runs in the focused app window — a project window or an unbound
+// (Get Started) one, never the splash, About or the notification banner; that window's
+// renderer opens the import wizard on `project:import-open`.
+function importProjectFromMenu(win) {
+  if (!win || win.isDestroyed() || !projectDirs.has(win.webContents.id)) return;
+  projectImporter.chooseArchive(win).catch((err) => console.warn('[project-import] import failed:', err.message));
+}
+
 function createMenu() {
   const isMac = process.platform === 'darwin';
   const recentProjectItems = loadRecentProjects().map(projectPath => ({
@@ -2103,6 +2271,20 @@ function createMenu() {
           // (TPT345) Opens the "Merge task branches" panel (src/client/merge-branches-modal.js).
           label: mt('menu.mergeTaskBranches'),
           click: (mi, window) => { if (window && !window.isDestroyed()) window.webContents.send('project:menu', 'merge-branches'); },
+        },
+        { type: 'separator' },
+        {
+          // (TPT9167) Saves the focused project as one .zip (main/project-export.js).
+          id: EXPORT_MENU_ITEM_ID,
+          label: mt('menu.exportProject'),
+          enabled: !!exportTargetWindow(),
+          click: (mi, window) => exportProjectFromMenu(window),
+        },
+        {
+          // (TPT9169) Builds a new project from such a .zip (main/project-import.js) — from a
+          // project window or from Get Started, so it needs no project of its own.
+          label: mt('menu.importProject'),
+          click: (mi, window) => importProjectFromMenu(window),
         },
         { type: 'separator' },
         {
@@ -2483,6 +2665,7 @@ async function createProjectWindow(projectDir, { deferShow = false } = {}) {
       }
       if (migrated) {
         bindWindowToProject(wcId, currentProjectDir);
+        syncProjectMenuState();
       } else {
         w.webContents.send('setup:open-for-path', currentProjectDir);
       }
@@ -2515,6 +2698,7 @@ async function createProjectWindow(projectDir, { deferShow = false } = {}) {
     const dir = projectDirs.get(wcId) || null;
     projectDirs.delete(wcId);
     dropWindow(wcId);
+    syncProjectMenuState();
     releaseSetup(w);
     quitIfOnlyNotificationWindowRemains();
     if (dir && releaseProject(dir, w)) {
@@ -2695,6 +2879,20 @@ app.whenReady()
     const restoredPaths = shouldRestoreFromDevice(sessionPaths) ? await restoreFromLastUsedDevice() : [];
     await createInitialWindows(resolveStartupProjectPaths(sessionPaths, restoredPaths), { deferShow: true });
     _initialWindowsCreated = true; // C1006: real windows exist; quit guards released
+    // (TPT9112) Ask macOS once, up front, for every permission an agent run can need, so a
+    // first task never stalls on a system prompt. Fire-and-forget: the explanation (a sheet on
+    // the first project window once it is shown) and the prompts never hold up this chain.
+    const startupProjects = openProjectPaths();
+    requestStartupPermissions({
+      projectPaths: startupProjects,
+      userDataPath: app.getPath('userData'),
+      parentWindow: (startupProjects[0] && ownerOf(startupProjects[0])) || openProjectWindows()[0] || null,
+      localeFor: (dir) => require('./src/server/project-config').readProjectLanguage(dir),
+      systemPreferences, Notification, dialog,
+      appVersion: app.getVersion(),
+    }).then((outcome) => {
+      if (!outcome.skipped) console.log('[os-permissions] startup check:', JSON.stringify(outcome.results));
+    }).catch((err) => console.warn('[os-permissions] startup request failed (non-fatal):', err?.message || err));
   })
   .catch((err) => {
     // Surface any unhandled startup failure instead of silently producing a
@@ -2793,3 +2991,7 @@ app.on('browser-window-focus', (_event, w) => {
     console.warn('[menu-i18n] browser-window-focus locale sync failed (non-fatal):', e.message);
   }
 });
+
+// (TPT9167) Project ▸ Export… follows the focused window — see syncProjectMenuState().
+app.on('browser-window-focus', () => syncProjectMenuState());
+app.on('browser-window-blur', () => syncProjectMenuState());

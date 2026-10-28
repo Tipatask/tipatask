@@ -53,6 +53,7 @@ const {
   exitRunSnapshot,
   flagTaskLeftUncommitted,
   markPlanApprovedInTui,
+  permissionModeFrame,
 } = require('./terminal-session');
 const { parsePsOutput, sweepDescendantWatchdog } = require('./process-group');
 const config = require('./config');
@@ -1119,13 +1120,14 @@ test('Codex split command repaint dismisses an announced plan even after readine
   const agent = getTaskAgent('codex');
   feedRaw(session, agent, '\x1b[2J\x1b[HPlan ready.\n');
   assert.equal(session.codexPlanReady, false);
-  assert.equal(messages.length, 1, 'repaint does not flicker the existing dialog');
+  assert.equal(messages.length, 2, 'repaint does not flicker the existing dialog');
   feedRaw(session, agent, '\x1b[8;1H• R');
   feedRaw(session, agent, 'an npm test');
   feedRaw(session, agent, '\x1b[9;1H  └ (no output)');
   t.mock.timers.tick(30000);
-  assert.deepEqual(messages.map(e => e.type), ['plan-ready', 'terminal-state']);
-  assert.equal(messages[1].codexPlanReady, false);
+  assert.deepEqual(messages.map(e => e.type), ['plan-ready', 'terminal-state', 'terminal-state']);
+  assert.equal(messages[1].codexPlanReady, true);
+  assert.equal(messages[2].codexPlanReady, false);
   assert.equal(events.filter(e => e.type === 'clear').length, 1);
 });
 
@@ -1157,7 +1159,7 @@ test('Codex incomplete repaint expires approval and explicit submission cancels 
       tick: ms => t.mock.timers.tick(ms), details: true,
     });
     feedRaw(session, getTaskAgent('codex'), '\x1b[2J\x1b[H› Old request\n');
-    assert.equal(messages.length, 1);
+    assert.equal(messages.length, 2);
     if (submitted) {
       session.pty = { write() {} };
       handleTerminalInput(session, 'New request\r');
@@ -1221,7 +1223,7 @@ test('Codex genuine split readiness emits once, survives idle repaint, and expir
   assert.equal(codexPlanReadyIsFresh(session), false, 'reconnect waits for full repaint to settle');
   t.mock.timers.tick(CODEX_PLAN_QUIET_MS);
   assert.equal(events.filter(e => e.type === 'raise').length, 1, 'same plan repaint is deduplicated');
-  assert.equal(messages.length, 1);
+  assert.equal(messages.length, 2);
   feedRaw(session, agent, '• Working (1s • esc to interrupt)\n');
   assert.equal(codexPlanReadyIsFresh(session), false);
   assert.equal(session.codexPlanReady, false);
@@ -1250,8 +1252,9 @@ test('Codex submitted input cancels readiness before output, while typing does n
   assert.equal(codexPlanReadyIsFresh(session), false);
   assert.deepEqual(writes, ['Please revise', '\r']);
   t.mock.timers.tick(20000);
-  assert.deepEqual(messages.map(e => e.type), ['plan-ready', 'terminal-state']);
-  assert.equal(messages[1].codexPlanReady, false);
+  assert.deepEqual(messages.map(e => e.type), ['plan-ready', 'terminal-state', 'terminal-state']);
+  assert.equal(messages[1].codexPlanReady, true);
+  assert.equal(messages[2].codexPlanReady, false);
 });
 
 test('Codex pending readiness cannot hide tool approval or question attention', (t) => {
@@ -1276,19 +1279,19 @@ test('Codex reconnect rejects stale latches, replays genuine readiness, and rech
     tick: ms => t.mock.timers.tick(ms), details: true,
   });
   maybeRefirePlanReady(session, session.ws);
-  assert.equal(messages.length, 2, 'fresh readiness replays on reconnect');
+  assert.equal(messages.length, 3, 'fresh readiness replays on reconnect');
   session._codexPlan = { ready: false };
   for (const sent of [true, false]) {
     session._planReadySent = sent;
     maybeRefirePlanReady(session, session.ws);
   }
-  assert.equal(messages.length, 2, 'old booleans cannot bypass freshness');
+  assert.equal(messages.length, 3, 'old booleans cannot bypass freshness');
   session._codexPlan = { ready: true };
   session.lastOutputAt = Date.now();
   maybeRefirePlanReady(session, session.ws);
   session._codexPlan = { ready: false };
   t.mock.timers.tick(CODEX_PLAN_QUIET_MS);
-  assert.equal(messages.length, 2, 'timer rechecks current freshness');
+  assert.equal(messages.length, 3, 'timer rechecks current freshness');
 });
 
 test('C1116 regression: Pi planning-phase fixture (echoed kickoff prompt + study narration) never triggers planReady', () => {
@@ -2443,7 +2446,7 @@ const CODEX_SPINNER = '• Working (2s • esc to interrupt)\n';
 const CODEX_TURN_OUTPUT = `› Work on task TPT571\n${'.'.repeat(SUBMIT_MARKER_TRAILING_MAX + 100)}\n${CODEX_SPINNER}`;
 
 // One spawn on a fresh session. Returns handles to feed PTY output and inspect PTY input.
-async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, specExtras, sessions, captureSpawn, onDetect, designMode = false, backend = legacyPermissionBackend, task } = {}) {
+async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, specExtras, sessions, captureSpawn, onDetect, designMode = false, backend = legacyPermissionBackend, task, version } = {}) {
   const writes = [];
   const sent = [];
   let dataCb = null;
@@ -2460,7 +2463,7 @@ async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364',
   const agent = getTaskAgent(agentId);
   t.mock.method(agent, 'cachedDetect', async () => {
     onDetect?.(sent);
-    return { id: agentId, label: agent.label, available: true, detail: { version: { claude: '2.1.306', codex: '0.163.0', pi: '0.84.1' }[agentId] } };
+    return { id: agentId, label: agent.label, available: true, detail: { version: version || { claude: '2.1.306', codex: '0.163.0', pi: '0.84.1' }[agentId] } };
   });
   t.mock.method(agent, 'getSpawnSpec', async (_config, prompt, taskId, opts) => {
     captureSpawn?.(agent, prompt, opts);
@@ -2589,6 +2592,40 @@ for (const mode of ['plan', 'auto', 'bypass']) test(`Claude ${mode} pastes kicko
   assert.ok(k.sent.filter(m => m.type === 'terminal-state').every(m => m.permissionRequest === null));
 });
 
+// (TPT9136) The spawn adopts the agent's launch-resolved policy and native record; PTY output keeps
+// the footer tracker current; a Shift+Tab the user types is recorded, and the footer change that
+// follows is theirs — never read as the CLI refusing auto mode.
+test('TPT9136 Claude spawn adopts the refined policy and native modes; footer tracked; the user\'s own Shift+Tab is theirs', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const { buildPermissionPolicy } = require('./permission-policy');
+  const refined = buildPermissionPolicy({ mode: 'auto', source: 'task', inherited: false, nativeAuto: 'auto' }, 'claude');
+  const nativePermission = { launch: 'auto', auto: 'auto', autoReason: null, bypass: false, bypassReason: 'project', preEnableBypass: false };
+  const k = await startClaudeKickoff(t, {
+    task: { agentPermissionMode: 'auto' },
+    captureSpawn: (_agent, _prompt, opts) => assert.equal(opts.backend, legacyPermissionBackend, 'the backend reaches getSpawnSpec'),
+    specExtras: { permissionPolicy: refined, nativePermission },
+  });
+  t.after(() => stopSession(k.session));
+  assert.equal(k.session.permissionPolicy, refined);
+  assert.deepEqual(k.session._claudeNative, { ...nativePermission, expected: 'auto' });
+  assert.equal(k.session._claudeTui, null);
+  // Claude's prompt: its input box (rule, composer, rule) with the mode footer below it.
+  const promptFrame = (footer) => `\x1b[2J\x1b[H${'─'.repeat(80)}\r\n❯\r\n${'─'.repeat(80)}\r\n\r\n  ${footer}`;
+  k.feed(promptFrame('⏵⏵ auto mode on (shift+tab to cycle) · ← for agents'));
+  assert.equal(k.session._claudeTui.mode, 'auto');
+  assert.equal(getTaskAgent('claude').supportsLivePermissionSwitch(k.session), true);
+  assert.deepEqual(permissionModeFrame(k.session).native, { auto: 'auto', bypass: false });
+  t.mock.timers.tick(10); // the mocked clock starts at 0
+  handleTerminalInput(k.session, '\x1b[Z');
+  assert.ok(k.writes.includes('\x1b[Z'), 'the key reaches the TUI');
+  assert.equal(k.session._userModeKeyAt, Date.now());
+  k.feed(promptFrame('⏸ manual mode on · ← 1 agent'));
+  assert.equal(k.session._claudeTui.mode, 'default');
+  assert.equal(k.session._claudeNative.auto, 'auto', 'no fallback for the user\'s own choice');
+  assert.equal(k.session._claudeNative.expected, null);
+  assert.equal(k.writes.filter(w => w === '\x1b[Z').length, 1, 'nothing pressed on the user\'s behalf');
+});
+
 test('Pi Auto withholds kickoff until the native startup handshake', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const k = await startKickoff(t, 'pi', { task: { agentPermissionMode: 'auto' } });
@@ -2599,6 +2636,37 @@ test('Pi Auto withholds kickoff until the native startup handshake', async t => 
   assert.equal(k.pastes(), 0);
   k.session._permissionGate.ready = true;
   assert.equal(k.advanceUntil(k.pasteWritten), true);
+});
+
+// (TPT9138) A Pi run of any mode loads the gate, so the run can be switched live.
+for (const mode of [null, 'plan', 'bypass']) test(`Pi ${mode || 'legacy'} loads the live-switch gate and withholds kickoff until its handshake`, async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let spawnGate;
+  const k = await startKickoff(t, 'pi', { task: { agentPermissionMode: mode },
+    captureSpawn: (_agent, _prompt, opts) => { spawnGate = opts.permissionGate; } });
+  t.after(() => stopSession(k.session));
+  assert.ok(spawnGate, 'getSpawnSpec receives the gate');
+  assert.equal(spawnGate, k.session._permissionGate);
+  assert.equal(k.session.terminalPhase, mode === 'bypass' ? 'executing' : 'planning');
+  assert.equal(getTaskAgent('pi').supportsLivePermissionSwitch(k.session), true);
+  k.feed(BOOT_OUTPUT);
+  k.advance(5000);
+  assert.equal(k.pastes(), 0);
+  k.session._permissionGate.ready = true;
+  assert.equal(k.advanceUntil(k.pasteWritten), true);
+});
+
+test('an older Pi launches Plan and Bypass without the gate and offers no live switch', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  for (const mode of ['plan', 'bypass']) {
+    const k = await startKickoff(t, 'pi', { task: { agentPermissionMode: mode }, version: '0.80.0',
+      captureSpawn: (_agent, _prompt, opts) => assert.equal(opts.permissionGate, null) });
+    assert.equal(k.session._permissionGate, null);
+    assert.equal(getTaskAgent('pi').supportsLivePermissionSwitch(k.session), false);
+    stopSession(k.session);
+  }
+  await assert.rejects(startKickoff(t, 'pi', { task: { agentPermissionMode: 'auto' }, version: '0.80.0' }),
+    { code: 'EPERMISSION', reason: 'unsupported' });
 });
 
 test('agent startup reports progress before CLI detection can leave an empty terminal', async t => {
@@ -3227,6 +3295,18 @@ function nudgeDeps(check, calls = []) {
 }
 const MISSING_CHECK = { verified: true, vcs: NUDGE_VCS, ready: false, blockers: [{ code: 'TASK_COMMIT_MISSING', message: 'no commit starting with TPT1' }] };
 
+test('maybeNudgeIdleSession: closed flag skips reads and closure during verification prevents delivery', async () => {
+  const { session, writes } = makeNudgeSession({ _taskClosed: true });
+  const backend = { getTask() { throw new Error('closed tasks must not be read'); } };
+  assert.equal((await maybeNudgeIdleSession(session, { backend })).reason, 'task_closed');
+  session._taskClosed = false;
+  const deps = nudgeDeps(MISSING_CHECK);
+  deps.checkTaskCommit = async () => { session._taskClosed = true; return MISSING_CHECK; };
+  assert.equal((await maybeNudgeIdleSession(session, { backend: nudgeBackend(), deps })).nudged, false);
+  assert.equal(writes.length, 0);
+  assert.equal(session.nudgeCount, 0);
+});
+
 test('maybeNudgeIdleSession: in-progress task without its commit gets one pasted nudge per idle period, max 2', async (t) => {
   const { session, writes } = makeNudgeSession();
   t.after(() => { session.alive = false; });
@@ -3695,6 +3775,51 @@ test('TPT654 Claude: leaving plan mode via shift+tab (mode footer) counts; a pla
     const other = tuiSession(agentId);
     for (const raw of [CLAUDE_APPROVED_CHUNK, '⏵⏵ accept edits on\n']) feedRaw(other.session, getTaskAgent(agentId), raw);
     assert.equal(other.session.terminalPhase, 'planning', agentId);
+  }
+});
+
+test('repeat Codex plans survive revision feedback and screenshot footer, then reconnect once', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const { maybeRefirePlanReady } = require('./ws-handlers');
+  for (const feedback of ['Please revise step 2', 'Yes, simplify step 2', 'Continue investigating the memory limit']) {
+    const { session, messages, events } = replayAgentKind(['First plan.\nPlan ready.\n'], 'codex', 'planReady', {
+      tick: ms => t.mock.timers.tick(ms), details: true,
+    });
+    Object.assign(session, { type: 'terminal', planApprovalCommand: null, _injectDone: true, pty: { write() {} } });
+    const firstPlan = session._codexPlan;
+    handleTerminalInput(session, feedback);
+    handleTerminalInput(session, '\r');
+    assert.equal(session.terminalPhase, 'planning', feedback);
+    assert.equal(session._planReadySent, false);
+    const reconnected = [];
+    const ws = { OPEN: 1, readyState: 1, send: raw => reconnected.push(JSON.parse(raw)) };
+    maybeRefirePlanReady(session, ws);
+    assert.deepEqual(reconnected, [], 'the first plan cannot replay after feedback');
+    for (const raw of [
+      `› ${feedback}\n• Working (15s • esc to interrupt)\n`,
+      'Revised plan.\nPlan rea', 'dy.\n', 'Worked for 2m 55s • 12:29\n',
+      '› Ask Codex to do anything\n',
+      'GPT-6.1-Sol xhigh · ~/Projects/Photoassistant/www_aider · Review project architecture · ← for agents\n',
+      '⚠ 1 warning · f2 to view\n',
+    ]) {
+      session._attentionTail += stripAnsi(raw);
+      feedRaw(session, getTaskAgent('codex'), raw);
+      t.mock.timers.tick(100);
+    }
+    maybeRefirePlanReady(session, ws);
+    assert.deepEqual(reconnected, [], 'the second plan must settle before reconnect can replay it');
+    t.mock.timers.tick(CODEX_PLAN_QUIET_MS);
+    assert.notEqual(session._codexPlan, firstPlan);
+    assert.equal(codexPlanReadyIsFresh(session), true);
+    assert.equal(messages.filter(m => m.type === 'plan-ready').length, 2);
+    assert.equal(events.filter(e => e.type === 'raise' && e.kind === 'planReady').length, 2);
+    assert.equal(messages.filter(m => m.type === 'terminal-state' && m.codexPlanReady === true).length, 2);
+    maybeRefirePlanReady(session, ws);
+    t.mock.timers.tick(CODEX_PLAN_QUIET_MS * 2);
+    assert.deepEqual(reconnected, [{ type: 'plan-ready', tabId: session.tabId, codexPlanReady: true }]);
+    assert.equal(messages.filter(m => m.type === 'plan-ready').length, 2, 'no duplicate timer notification');
+    handleTerminalInput(session, 'Yes, implement the plan\r');
+    assert.equal(session.terminalPhase, 'executing');
   }
 });
 

@@ -477,6 +477,21 @@ test('settings writes preserve, replace, clear, and isolate credentials by proje
   assert.strictEqual(mergeRendererProjectConfig(a, rendererProjectConfig(a)).PI_MODELS[0].apiKey, 'a-pi');
 });
 
+// (TPT9156) Settings > Voice > Mode saves through the same renderer merge as every other voice
+// preference (POST /api/project-config and IPC api:project.mergeConfig both call it); a key
+// missing from either list is silently dropped on write or hidden on read.
+test('voiceMode survives a renderer settings write and the next read from disk', (t) => {
+  const root = makeRoot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  writeProjectConfig(root, { API_BASE_URL: 'https://voice.example.test', API_PROJECT_ID: '1', voicePreset: 'local' });
+  writeProjectConfig(root, mergeRendererProjectConfig(readProjectConfig(root), { voiceMode: 'thankyou' }));
+  const saved = readProjectConfig(root);
+  assert.strictEqual(saved.voiceMode, 'thankyou');
+  assert.strictEqual(saved.voicePreset, 'local', 'a partial write leaves the other voice settings alone');
+  assert.strictEqual(rendererProjectConfig(saved).voiceMode, 'thankyou');
+  assert.ok(!Object.hasOwn(rendererProjectConfig({ API_PROJECT_ID: '1' }), 'voiceMode'), 'an unset mode stays absent; the renderer defaults it');
+});
+
 test('summarizeAgents: LAST_AGENT outranks TASK_AGENT, matching resolveTaskAgentId precedence', () => {
   const s = summarizeAgents({ TASK_AGENT: 'claude', LAST_AGENT: 'codex', AVAILABLE_AGENTS: 'claude,codex' });
   assert.strictEqual(s.taskAgent, 'codex');

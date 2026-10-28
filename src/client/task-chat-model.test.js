@@ -371,6 +371,28 @@ test('stripTaskEditNote: removes exactly the block the server puts in front of a
   assert.equal(m.stripTaskEditNote(undefined), '');
 });
 
+test('(TPT9134) messageCopyText: a reply\'s markdown source without its ask_user fence', () => {
+  const reply = 'Two options:\n\n```js\nconst a = 1;\n```\n\n```ask_user\n{"question":"Which?"}\n```\n';
+  assert.equal(m.messageCopyText({ role: 'assistant', content: reply }), 'Two options:\n\n```js\nconst a = 1;\n```');
+  assert.equal(m.messageCopyText({ role: 'assistant', content: 'Still typing\n\n```ask_user\n{"quest' }), 'Still typing',
+    'a fence still streaming goes too');
+  assert.equal(m.messageCopyText({ role: 'assistant', content: '\n\n    indented code\nrest  \n\n' }), '    indented code\nrest',
+    'blank lines around the text go, the first line keeps its indent');
+  assert.equal(m.messageCopyText({ role: 'assistant', content: '```ask_user\n{"question":"Which?"}\n```' }), '',
+    'a reply that is only a dialog has nothing to copy');
+});
+
+test('(TPT9134) messageCopyText: a user turn without its task_edits note, attachment references kept; notices give nothing', () => {
+  const note = buildTaskEditNote([{ task: { id: 'TPT5', title: 'T' }, changed: ['title'] }]);
+  assert.equal(m.messageCopyText({ role: 'user', content: `${note}\n\nAnd rename it.` }), 'And rename it.');
+  const withImage = 'See this:\n![img](https://h/api/projects/2/images/9)';
+  assert.equal(m.messageCopyText({ role: 'user', content: withImage }), withImage);
+  assert.equal(m.messageCopyText({ role: 'system', content: 'The connection to this chat was lost.' }), '');
+  assert.equal(m.messageCopyText({ role: 'system', kind: 'resumed', content: '' }), '');
+  assert.equal(m.messageCopyText(null), '');
+  assert.equal(m.messageCopyText({ role: 'assistant' }), '');
+});
+
 test('visibleHistory: a dialog answer turn is left out; a typed user turn stays and loses its task_edits block', () => {
   const note = buildTaskEditNote([{ task: { id: 'TPT5', title: 'T' }, changed: ['title'] }]);
   const asked = { id: 'dlg-1', answer: { selected: ['Backlog'], indexes: [1], other: 'soon' } };

@@ -93,6 +93,53 @@ test('Claude Auto directs approvals to the native terminal dialog without changi
   }
 });
 
+test('Claude Auto text follows the run\'s native mode: classifier for native auto, the dialog for the acceptEdits fallback', () => {
+  const native = buildPermissionPolicy({ mode: 'auto', nativeAuto: 'auto' }, 'claude');
+  assert.match(native.prompt, /native auto mode is on: its classifier checks each tool call/);
+  assert.doesNotMatch(native.prompt, /allow \/ allow-all \/ deny/);
+  assert.match(native.prompt, /do not impose a separate plan-approval pause/);
+  for (const nativeAuto of ['acceptEdits', undefined, 'bogus']) {
+    const fallback = buildPermissionPolicy({ mode: 'auto', nativeAuto }, 'claude');
+    assert.match(fallback.prompt, /file edits are accepted automatically/);
+    assert.match(fallback.prompt, /allow \/ allow-all \/ deny permission dialog/);
+  }
+  // The choice survives a live rebuild and reaches the switch directive.
+  const { applyLivePolicy } = require('./permission-policy');
+  const session = { taskAgent: 'claude', permissionPolicy: buildPermissionPolicy({ mode: 'bypass', source: 'task', nativeAuto: 'auto' }, 'claude') };
+  applyLivePolicy(session, 'auto');
+  assert.equal(session.permissionPolicy.nativeAuto, 'auto');
+  assert.match(session.permissionPolicy.prompt, /native auto mode is on/);
+  const ClaudeAgent = require('./task-agent/claude-agent');
+  assert.match(new ClaudeAgent().buildModeSwitchDirective('auto', { nativeAuto: 'auto' }), /native auto mode is on/);
+  assert.match(new ClaudeAgent().buildModeSwitchDirective('auto'), /allow \/ allow-all \/ deny/);
+  // Other providers ignore it.
+  assert.match(buildPermissionPolicy({ mode: 'auto', nativeAuto: 'auto' }, 'pi').prompt, /uncertain actions require approval/);
+});
+
+test('project default mode for launch decisions: the inherited mode, a strict fresh read for task overrides, null otherwise', async () => {
+  const { resolveProjectPermissionMode } = require('./permission-policy');
+  const backend = (value) => ({ calls: [], async getEffectiveProjectSettings(o) { this.calls.push(o); if (value instanceof Error) throw value; return { settings: { agent_permission_mode: value } }; } });
+  assert.equal(await resolveProjectPermissionMode({ resolved: { mode: 'auto', source: 'project' } }), 'auto');
+  const fetched = backend('bypass');
+  assert.equal(await resolveProjectPermissionMode({ backend: fetched, resolved: { mode: 'plan', source: 'task' } }), 'bypass');
+  assert.deepEqual(fetched.calls, [{ strict: true, refresh: true }]);
+  for (const [b, resolved] of [
+    [backend('bypass'), { mode: 'plan', source: 'planning' }],
+    [backend('bypass'), { mode: null, source: 'legacy' }],
+    [backend(new Error('offline')), { mode: 'auto', source: 'task' }],
+    [backend('nonsense'), { mode: 'auto', source: 'task' }],
+    [null, { mode: 'auto', source: 'task' }],
+  ]) assert.equal(await resolveProjectPermissionMode({ backend: b, resolved }), null, JSON.stringify(resolved));
+});
+
+test('live-switch refusals name what to do: starting, a prompt in the terminal, bypass not enabled at launch', () => {
+  const { modeSwitchError } = require('./permission-policy');
+  assert.match(modeSwitchError('starting').message, /still starting/);
+  assert.match(modeSwitchError('prompt_open').message, /prompt is open in the terminal/);
+  assert.match(modeSwitchError('bypass_unavailable').message, /Bypass was not enabled when this run started/);
+  for (const reason of ['starting', 'prompt_open', 'bypass_unavailable']) assert.equal(modeSwitchError(reason).reason, reason);
+});
+
 test('read-command assessment rejects command execution, redirects, pipelines and tool escape flags', () => {
   for (const cmd of ['pwd', 'ls -la', 'cat src/a.js', 'head -n 30 src/a.js', 'rg --files', 'rg -n needle src']) assert.ok(isReadCommand(cmd), cmd);
   for (const cmd of ['cat a > b', 'ls; touch b', 'ls | sh', 'rg --pre=sh x', 'rg --pre sh x', 'sed -i s/a/b/ f',
@@ -225,4 +272,188 @@ test('three canonical modes normalize retired values and Plan uses legacy policy
     }
     assert.equal(policy.communication, '');
   }
+});
+
+
+test('live policy rebuild covers Plan to execution and Auto/Bypass in both directions without changing constraints', () => {
+  const { applyLivePolicy } = require('./permission-policy');
+  for (const agent of ['claude', 'codex', 'pi']) {
+    for (const [from, to] of [['plan', 'auto'], ['plan', 'bypass'], ['auto', 'bypass'], ['bypass', 'auto'], [null, 'auto']]) {
+      const vcsContext = { verified: true, vcs: { type: 'git', commit: false } };
+      const session = { taskAgent: agent, vcsContext,
+        permissionPolicy: buildPermissionPolicy({ mode: from, source: 'task', completionGuard: 'required' }, agent) };
+      const launch = session.permissionPolicy;
+      const policy = applyLivePolicy(session, to);
+      assert.equal(session.permissionPolicy, policy);
+      assert.equal(policy.mode, to);
+      assert.equal(policy.source, 'session');
+      assert.equal(policy.inherited, false);
+      assert.equal(policy.completionGuard, 'required');
+      assert.equal(policy.planning, false);
+      assert.equal(session.vcsContext, vcsContext);
+      assert.equal(launch.mode, from, 'old snapshots remain immutable');
+      assert.ok(Object.isFrozen(policy));
+      assert.match(policy.prompt, /VCS permissions and guarded completion remain mandatory/);
+      if (to === 'auto') assert.match(policy.prompt, /require approval|native allow/);
+    }
+    const session = { taskAgent: agent, permissionPolicy: buildPermissionPolicy({ mode: 'bypass' }, agent) };
+    const original = session.permissionPolicy;
+    for (const mode of ['plan', null, undefined, 'typo', 'always_ask', {}, 'accept_edits']) {
+      assert.throws(() => applyLivePolicy(session, mode), { code: 'EPERMISSION_MODE', reason: mode === 'plan' ? 'plan_target' : 'invalid_target' });
+      assert.equal(session.permissionPolicy, original);
+    }
+  }
+});
+
+test('BaseTaskAgent live switching defaults to unsupported; mode directives authorize implementation and retain guards', async () => {
+  const BaseTaskAgent = require('./task-agent/base-agent');
+  const agent = new BaseTaskAgent('stub', 'Stub');
+  assert.deepEqual(await agent.switchPermissionMode({}, 'auto'), { supported: false });
+  for (const mode of ['auto', 'bypass']) {
+    const directive = agent.buildModeSwitchDirective(mode);
+    assert.match(directive, /Leaving Plan explicitly authorizes implementation now/);
+    assert.match(directive, /existing conversation context and progress/);
+    assert.match(directive, /VCS restrictions, guarded completion requirements and explicit user instructions/);
+    assert.match(directive, /does not cancel or reverse an action already running/);
+    assert.match(directive, new RegExp(`Permission policy for this run \\(${mode}\\)`));
+  }
+  assert.throws(() => agent.buildModeSwitchDirective('plan'), { reason: 'plan_target' });
+});
+
+// What requestPermissionMode() does around a provider's answer (terminal-session.js).
+function beginSwitch(session, mode) {
+  Object.assign(session.permissionMode, { requested: mode, pending: true });
+}
+function settleSwitch(session, gate, mode) {
+  if (mode) {
+    require('./permission-policy').applyLivePolicy(session, mode);
+    session.permissionMode.confirmed = mode;
+  }
+  session.permissionMode.pending = false;
+  gate.policyChanged();
+}
+const settledWithin = (promise, ms) => Promise.race([promise.then(() => true), new Promise(r => setTimeout(() => r(false), ms))]);
+const untilSnapshot = gate => new Promise(resolve => { const poll = () => gate.snapshot() ? resolve() : setTimeout(poll, 5); poll(); });
+
+test('live changes revoke every queued approval, reject stale answers and hold new gate requests until confirmation', async t => {
+  const session = { permissionPolicy: buildPermissionPolicy({ mode: 'auto' }, 'pi'),
+    permissionMode: { requested: 'auto', confirmed: 'auto', pending: false, error: null } };
+  const gate = await createPermissionGate(session, { root: os.tmpdir(), timeoutMs: 1000 });
+  t.after(() => gate.close());
+  const call = () => fetch(gate.url, { method: 'POST', headers: { Authorization: `Bearer ${gate.token}` },
+    body: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'bash', tool_input: { command: 'touch x' } }) }).then(r => r.json());
+  const pending = call();
+  await untilSnapshot(gate);
+  const id = gate.snapshot().id;
+  beginSwitch(session, 'bypass');
+  assert.equal(gate.answer(id, true), false);
+  gate.cancelPending();
+  assert.equal((await pending).decision, 'deny');
+  assert.equal(gate.snapshot(), null);
+  const held = call();
+  assert.equal(await settledWithin(held, 100), false, 'a call during the switch waits for it');
+  assert.equal(gate.snapshot(), null, 'a held call never becomes an approval request under the old mode');
+  settleSwitch(session, gate, 'bypass');
+  assert.deepEqual(await held, { decision: 'allow', mode: 'bypass', reason: 'Allowed by the run permission policy.',
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'Allowed by the run permission policy.' } });
+  assert.equal(gate.answer(id, true), false);
+  assert.equal((await call()).decision, 'allow');
+
+  // Bypass to Auto: the next action is prompted again, with a fresh request.
+  beginSwitch(session, 'auto');
+  const prompted = call();
+  assert.equal(await settledWithin(prompted, 100), false);
+  settleSwitch(session, gate, 'auto');
+  await untilSnapshot(gate);
+  assert.notEqual(gate.snapshot().id, id, 'Bypass to Auto restores fresh approval requests');
+  gate.answer(gate.snapshot().id, false);
+  assert.deepEqual([(await prompted).decision, (await prompted).mode], ['deny', 'auto']);
+
+  // A failed switch decides held calls under the mode that is still confirmed.
+  beginSwitch(session, 'bypass');
+  const kept = call();
+  assert.equal(await settledWithin(kept, 100), false);
+  settleSwitch(session, gate, null);
+  await untilSnapshot(gate);
+  gate.answer(gate.snapshot().id, true);
+  assert.deepEqual([(await kept).decision, (await kept).mode], ['allow', 'auto']);
+
+  // A switch that never settles releases its held calls as denials at the gate deadline.
+  beginSwitch(session, 'bypass');
+  const stuck = await call();
+  assert.equal(stuck.decision, 'deny');
+  assert.match(stuck.reason, /did not finish/);
+  session.permissionMode.pending = false;
+});
+
+test('the gate enforces the confirmed mode: Plan is read-only until approval, Auto prompts, Bypass allows', async t => {
+  const { gatePolicy } = require('./permission-policy');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'permission-gate-mode-'));
+  const session = { permissionPolicy: buildPermissionPolicy({ mode: 'plan' }, 'pi'), terminalPhase: 'planning',
+    permissionMode: { requested: 'plan', confirmed: 'plan', pending: false, error: null } };
+  const decisions = [];
+  const gate = await createPermissionGate(session, { root, timeoutMs: 1000, onDecision: d => decisions.push(d) });
+  t.after(() => { gate.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const call = (tool_name, tool_input = {}) => fetch(gate.url, { method: 'POST', headers: { Authorization: `Bearer ${gate.token}` },
+    body: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name, tool_input }) }).then(r => r.json());
+
+  assert.deepEqual(gatePolicy(session), { mode: 'plan', assess: 'plan' });
+  assert.equal((await call('read', { path: 'a' })).decision, 'allow');
+  for (const [tool, input] of [['write', { path: 'a', content: 'x' }], ['edit', { path: 'a' }], ['bash', { command: 'ls' }], ['tipatask__update_task', {}]]) {
+    const result = await call(tool, input);
+    assert.deepEqual([result.decision, result.mode], ['deny', 'plan'], tool);
+    assert.match(result.reason, /Plan mode allows only read-only tools until the plan is approved/);
+  }
+  assert.equal(decisions.at(-1).mode, 'plan');
+  session.terminalPhase = 'executing'; // approved in place: the legacy unattended loop
+  assert.deepEqual(gatePolicy(session), { mode: 'plan', assess: 'approved' });
+  assert.deepEqual([(await call('write', { path: 'a' })).decision, (await call('bash', { command: 'npm test' })).reason],
+    ['allow', 'Allowed: the plan was approved.']);
+  for (const confirmed of [null, 'plan']) {
+    session.permissionMode.confirmed = confirmed;
+    session.terminalPhase = 'planning';
+    assert.equal((await call('bash', { command: 'ls' })).decision, 'deny', `${confirmed} plans read-only`);
+  }
+  // The policy object can be ahead of the confirmation; only the confirmed mode counts.
+  session.permissionPolicy = buildPermissionPolicy({ mode: 'bypass' }, 'pi');
+  session.permissionMode = { requested: 'bypass', confirmed: 'auto', pending: false, error: null };
+  assert.deepEqual(gatePolicy(session), { mode: 'auto', assess: 'auto' });
+  assert.equal((await call('write', { path: 'new-file' })).decision, 'allow');
+  const asked = call('bash', { command: 'npm test' });
+  await untilSnapshot(gate);
+  gate.answer(gate.snapshot().id, true);
+  assert.deepEqual([(await asked).decision, decisions.at(-1).prompted], ['allow', true]);
+  session.permissionMode.confirmed = 'bypass';
+  assert.equal((await call('spawn_agent')).decision, 'allow');
+  session.permissionMode.confirmed = 'typo';
+  session.terminalPhase = 'executing';
+  assert.deepEqual(gatePolicy(session), { mode: 'typo', assess: 'plan' }, 'an unknown mode fails closed');
+  assert.deepEqual(gatePolicy({ permissionPolicy: buildPermissionPolicy({ mode: 'auto' }, 'pi') }), { mode: 'auto', assess: 'auto' });
+});
+
+test('a live switch is confirmed only by the report of its submitted directive', async t => {
+  const session = { permissionPolicy: buildPermissionPolicy({ mode: 'auto' }, 'pi'),
+    permissionMode: { requested: 'bypass', confirmed: 'auto', pending: true, error: null } };
+  const gate = await createPermissionGate(session, { root: os.tmpdir(), timeoutMs: 1000 });
+  t.after(() => gate.close());
+  const report = permission_mode => fetch(gate.url, { method: 'POST', headers: { Authorization: `Bearer ${gate.token}` },
+    body: JSON.stringify({ hook_event_name: 'UserPromptSubmit', permission_mode }) }).then(r => r.json());
+  const expected = gate.expectModeSwitch('bypass', { timeoutMs: 1000 });
+  assert.deepEqual(await report('bypass'), { decision: 'allow', mode: 'auto', reason: 'Input accepted.' },
+    'a report before the directive was submitted confirms nothing');
+  expected.markSubmitted();
+  assert.equal((await report('auto')).mode, 'auto', 'a report for another mode confirms nothing');
+  assert.equal(await settledWithin(expected.promise, 50), false);
+  assert.deepEqual(await report('bypass'), { decision: 'allow', mode: 'bypass', reason: 'Permission mode change delivered.' });
+  assert.equal(await expected.promise, 'bypass');
+  assert.equal((await report('bypass')).mode, 'auto', 'a confirmation is single-use');
+
+  const late = gate.expectModeSwitch('auto', { timeoutMs: 30 });
+  await assert.rejects(late.promise, { code: 'EPERMISSION_MODE', reason: 'unconfirmed' });
+  const replaced = gate.expectModeSwitch('auto');
+  const newer = gate.expectModeSwitch('bypass');
+  await assert.rejects(replaced.promise, { reason: 'session_changed' });
+  gate.close();
+  await assert.rejects(newer.promise, { reason: 'session_changed' });
+  await assert.rejects(gate.expectModeSwitch('auto').promise, { reason: 'session_changed' });
 });

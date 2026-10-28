@@ -3,12 +3,17 @@
 
 // Credential-safe REST recovery and Pi terminal tools. Bodies/resolutions arrive
 // on stdin; tokens are read internally and never passed through argv or stdout.
-async function run(argv, { input = '', fetchImpl = fetch } = {}) {
+// `next <key>` (TPT9163) is a cowboy chain run's start_next_tasks: it sends only the
+// run's own TIPATASK_COWBOY_TOKEN, never the account token.
+async function run(argv, { input = '', fetchImpl = fetch, env = process.env } = {}) {
+  const [command, target] = argv;
+  if (command === 'next') {
+    return require('../server/cowboy-next-request').requestNextTasks(target, { env, fetchImpl });
+  }
   const { resolveProjectRoot } = require('../server/project-root');
   const root = resolveProjectRoot();
   const { getApiCredentials } = require('../server/api-credentials');
   const { baseUrl, projectId, token } = getApiCredentials(root);
-  const [command, target] = argv;
   if (command === 'verify' || command === 'complete') {
     const { createPerProjectBackend } = require('../server/task-backend');
     const backend = createPerProjectBackend({ TASK_BACKEND: 'api' }, root);
@@ -39,7 +44,7 @@ if (require.main === module) {
   const input = ['POST', 'PATCH', 'complete'].includes(command) ? require('node:fs').readFileSync(0, 'utf8') : '';
   run(process.argv.slice(2), { input }).then(result => {
     process.stdout.write(JSON.stringify(result) + '\n');
-    if (result.completed === false || result.verified === false || result.status >= 400) process.exitCode = 1;
+    if (result.completed === false || result.verified === false || result.ok === false || result.status >= 400) process.exitCode = 1;
   }).catch(err => { console.error(err.missingCredentials || err.authError ? err.message : 'Tipatask request failed; check method, body, project and sign-in.'); process.exitCode = 1; });
 }
 module.exports = { run };

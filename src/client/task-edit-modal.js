@@ -22,7 +22,7 @@ import { groupNoun, groupTitle, getSprintsEnabled, projectPermissionMode } from 
 import { perfStart, perfEnd } from './perf-log.js';
 import { tagDescription, filterTagOptions } from './tag-match.js';
 import { showActionConfirm } from './action-confirm.js';
-import { buildTaskModeOptions, normalizePermissionMode } from './permission-mode.js';
+import { buildTaskModeOptions, normalizePermissionMode, effectivePermissionMode } from './permission-mode.js';
 import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
 import { activateDialogFocus } from './dialog-focus.js';
 
@@ -1198,6 +1198,33 @@ export function _agentModelControlHtml(assignee, draft, projectConfig, { hidden 
             <div class="modal-field-row modal-codex-browser-row"${hidden || hideBrowserTools || assignee !== 'codex' ? ' hidden' : ''}><label>${t('field.browserTools')}</label><span class="modal-browser-tools" title="${escapeAttr(t('tooltip.browserTools'))}">${_browserToolCheckboxHtml('playwright', t('label.playwright'), disabled)}${_browserToolCheckboxHtml('chrome-devtools', t('label.chromeDevtools'), disabled)}</span></div>`;
 }
 
+// (TPT9161) Cowboy-coding mode is offered only while the draft starts in Bypass — its own override,
+// else the cached project default (effectivePermissionMode()). In every other mode the row is
+// hidden and the box unchecked; the permission select's handler clears the draft flag to match.
+function _draftStartsInBypass(draft) {
+  return effectivePermissionMode(draft, projectPermissionMode()).mode === 'bypass';
+}
+
+// Sits right after the Permission mode row. The hint rides title (like Design mode) and the
+// box's accessible description. Disabled only in read-only mode, like the permission select:
+// both configure what happens when a run ends, so they stay editable while one is active.
+function _cowboyModeRowHtml(draft, disabled) {
+  const bypass = _draftStartsInBypass(draft);
+  const hint = escapeAttr(t('cowboyMode.hint'));
+  return `<div class="modal-field-row modal-cowboy-mode-row"${bypass ? '' : ' hidden'}><label for="modal-cowboy-mode">${t('field.cowboyMode')}</label><input type="checkbox" id="modal-cowboy-mode" class="modal-cowboy-mode"${bypass && draft.cowboyMode ? ' checked' : ''}${disabled ? ' disabled' : ''} title="${hint}" aria-describedby="modal-cowboy-mode-hint"><span id="modal-cowboy-mode-hint" hidden>${hint}</span></div>`;
+}
+
+// Re-derives the row from the draft after a permission change: shown only in Bypass, checked only
+// when the draft flag is on there.
+function _syncCowboyModeRow(modal, draft) {
+  const row = modal.querySelector('.modal-cowboy-mode-row');
+  const box = row?.querySelector('.modal-cowboy-mode');
+  if (!row || !box) return;
+  const bypass = _draftStartsInBypass(draft);
+  row.hidden = !bypass;
+  box.checked = bypass && !!draft.cowboyMode;
+}
+
 function _renderTaskEditModal() {
   const modal = document.getElementById('task-edit-modal');
   if (!modal) return;
@@ -1338,7 +1365,8 @@ function _renderTaskEditModal() {
               <div class="modal-field-group-title">${t('modal.groupAgent')}</div>
             <div class="modal-field-row"><label>${t('field.agent')}</label>${agentPickerHtml}</div>
             ${_agentModelControlHtml(assignee, draft, projectConfig, { hideBrowserTools: isPreviewTask, disabled: agentLocked })}
-            ${!isPreviewTask ? `<div class="modal-field-row"><label for="modal-permission-mode">${t('field.permissionMode')}</label>${renderPermissionModeSelect({ name: 'modal-permission-mode', options: buildTaskModeOptions(draft.agentPermissionMode !== undefined ? draft.agentPermissionMode : draft.agent_permission_mode, projectPermissionMode(), t), t })}</div>` : ''}
+            ${!isPreviewTask ? `<div class="modal-field-row"><label for="modal-permission-mode">${t('field.permissionMode')}</label>${renderPermissionModeSelect({ name: 'modal-permission-mode', options: buildTaskModeOptions(draft.agentPermissionMode !== undefined ? draft.agentPermissionMode : draft.agent_permission_mode, projectPermissionMode(), t), t })}</div>
+            ${_cowboyModeRowHtml(draft, readOnly)}` : ''}
             </section>
             <section class="modal-field-group modal-field-group--wide" data-group="links">
             <div class="modal-field-row"><label>${t('field.tags')}</label>
@@ -1778,7 +1806,13 @@ function _attachModalHandlers(modal) {
   const permissionSelect = modal.querySelector('[data-permission-mode-select]');
   if (permissionSelect) {
     _modalState._permissionModeSelect = bindPermissionModeSelect(permissionSelect, value => {
-      _modalState.draft.agentPermissionMode = value || null;
+      const draft = _modalState.draft;
+      const wasBypass = _draftStartsInBypass(draft);
+      draft.agentPermissionMode = value || null;
+      // (TPT9161) Hidden means unchecked: leaving Bypass clears the Cowboy-coding flag, and a
+      // return to Bypass starts unchecked. Bypass to Bypass (override ⇄ an inherited Bypass) keeps it.
+      if (draft.cowboyMode && (!wasBypass || !_draftStartsInBypass(draft))) draft.cowboyMode = false;
+      _syncCowboyModeRow(modal, draft);
       upd();
     });
     // Permission changes configure the next run, including while a session is active.
@@ -2072,6 +2106,10 @@ function _attachModalHandlers(modal) {
   const designModeCb = modal.querySelector('.modal-claude-design-mode');
   if (designModeCb) designModeCb.addEventListener('change', () => { _modalState.draft.claudeDesignMode = designModeCb.checked; upd(); });
 
+  // (TPT9161) Cowboy-coding mode checkbox — only reachable while the draft starts in Bypass.
+  const cowboyModeCb = modal.querySelector('.modal-cowboy-mode');
+  if (cowboyModeCb) cowboyModeCb.addEventListener('change', () => { _modalState.draft.cowboyMode = cowboyModeCb.checked; upd(); });
+
   // (TPT285) Per-task effort — blank option = null (inherit the agent default).
   const effortSel = modal.querySelector('.modal-effort-select');
   if (effortSel) effortSel.addEventListener('change', () => { _modalState.draft.effort = effortSel.value || null; upd(); });
@@ -2135,6 +2173,12 @@ function _attachModalHandlers(modal) {
     // `false || null` is `null`, and `null !== false` would fire a spurious PATCH on every
     // save of any task with design mode off.
     if (!!draft.claudeDesignMode !== !!original.claudeDesignMode) patch.claude_design_mode = !!draft.claudeDesignMode;
+    // (TPT9161) Cowboy-coding mode, `!!` on both sides like design mode. The permission select's
+    // handler clears the draft flag whenever the draft leaves Bypass, so a stored flag the hidden
+    // box no longer shows is saved as an explicit false. An untouched flag stored under a Bypass the
+    // project default no longer gives is left alone: the cached default may lag the server's, and
+    // the API clears the flag itself whenever this patch moves the override off Bypass.
+    if (!!draft.cowboyMode !== !!original.cowboyMode) patch.cowboy_mode = !!draft.cowboyMode;
     if (!Object.keys(patch).length) return true;
     // In-memory proposal save: delegate to caller, skip all DB/board-DOM operations.
     if (callbacks.onSavePreview) {

@@ -200,6 +200,51 @@ test('Settings is interactive over the workspace and closing it restores the wor
   });
 });
 
+// (TPT9110) The Settings box is fixed-size and each tab pane scrolls on its own.
+test('Settings tab switch keeps focus on the activated tab and shows the pane from its top', async () => {
+  await withClient(async ({ board, flush }) => {
+    document.body.innerHTML = `<div id="settings-modal" role="dialog" aria-modal="true">
+      <div class="settings-panel"><button class="settings-close" type="button">x</button>
+        <div class="modal-tabs"><button class="modal-tab-btn active" data-tab="general">General</button>
+          <button class="modal-tab-btn" data-tab="voice">Voice</button></div>
+        <div class="settings-body modal-tab-panel" data-tab="general"><select id="settings-theme-select"></select></div>
+        <div class="settings-body modal-tab-panel" data-tab="voice" hidden></div></div></div>`;
+    board.initSettingsModal();
+    board.openSettingsModal();
+    await flush();
+    const modal = document.getElementById('settings-modal');
+    const tab = (name) => modal.querySelector(`.modal-tab-btn[data-tab="${name}"]`);
+    const pane = (name) => modal.querySelector(`.modal-tab-panel[data-tab="${name}"]`);
+    try {
+      modal.querySelector('#settings-theme-select').focus();
+      tab('voice').click(); // a scripted click does not focus the button itself
+      assert.equal(pane('general').hidden, true);
+      // ok(===), not equal(): a failing equal() would util.inspect two happy-dom nodes for minutes.
+      assert.ok(document.activeElement === tab('voice'), 'focus leaves the hidden pane for the activated tab');
+
+      pane('voice').scrollTop = 40;
+      tab('voice').click();
+      assert.equal(pane('voice').scrollTop, 40, 're-clicking the active tab keeps its scroll');
+      tab('general').click();
+      assert.ok(document.activeElement === tab('general'), 'focus follows every switch');
+      tab('voice').click();
+      assert.equal(pane('voice').scrollTop, 0, 'a newly shown pane starts at its top');
+
+      pane('voice').scrollTop = 40;
+      board.closeSettingsModal();
+      board.openSettingsModal();
+      await flush();
+      assert.equal(pane('voice').scrollTop, 0, 'reopening starts the active pane at its top');
+      pane('voice').scrollTop = 40;
+      board.openSettingsModal(); // a repeated ⌘, while open leaves the pane alone
+      assert.equal(pane('voice').scrollTop, 40);
+    } finally {
+      board.closeSettingsModal(); // release the Settings layer even when an assertion fails
+      await flush();
+    }
+  });
+});
+
 test('generic action confirm is interactive over the workspace on every resolve path', async () => {
   await withClient(async ({ actionConfirm, dialogFocus, flush }) => {
     document.body.innerHTML = '';

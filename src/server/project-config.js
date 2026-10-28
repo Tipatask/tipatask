@@ -269,7 +269,7 @@ function rendererProjectConfig(cfg = {}) {
     'TASK_BACKEND', 'API_BASE_URL', 'API_PROJECT_ID', 'projectName', 'DEVICE_ID',
     'DEVICE_NAME', 'TASK_AGENT', 'LAST_AGENT', 'AVAILABLE_AGENTS', 'CLAUDE_MODEL',
     'CODEX_MODEL', 'theme', 'language', 'voicePreset', 'voiceLocalModel',
-    'voiceInputDeviceId', 'voiceShortcut', 'boardFilters', 'debugPerfLog',
+    'voiceInputDeviceId', 'voiceShortcut', 'voiceMode', 'boardFilters', 'debugPerfLog',
     'MCP_BROWSER_TOOLS',
   ]) {
     if (cfg[key] !== undefined) safe[key] = cfg[key];
@@ -319,7 +319,7 @@ function mergeRendererProjectConfig(existing, patch = {}, { allowApiToken = fals
     'TASK_BACKEND', 'API_BASE_URL', 'API_PROJECT_ID', 'projectName', 'DEVICE_ID',
     'DEVICE_NAME', 'TASK_AGENT', 'LAST_AGENT', 'AVAILABLE_AGENTS', 'CLAUDE_MODEL',
     'CODEX_MODEL', 'theme', 'language', 'voicePreset', 'voiceLocalModel',
-    'voiceInputDeviceId', 'voiceShortcut', 'boardFilters', 'debugPerfLog',
+    'voiceInputDeviceId', 'voiceShortcut', 'voiceMode', 'boardFilters', 'debugPerfLog',
     'MCP_BROWSER_TOOLS',
   ]) {
     if (Object.hasOwn(patch, key)) merged[key] = patch[key];
@@ -761,7 +761,10 @@ function _ensureGitignoreLine(dir, line) {
 
 // Record folder trust and an explicitly selected Bypass acknowledgement. Never
 // replace malformed user state; failure leaves the CLI's normal trust dialog available.
-function writeProjectClaudeTrust(projectRoot, permissionMode = null) {
+// `acceptBypass` also records it for a Plan/Auto launch that pre-enables Bypass
+// (--allow-dangerously-skip-permissions, claude-live-mode.js): without it the CLI opens its
+// bypass warning at startup, whose focused "No, exit" an Enter would confirm.
+function writeProjectClaudeTrust(projectRoot, permissionMode = null, { acceptBypass: preEnableBypass = false } = {}) {
   let tmp;
   try {
     const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -794,7 +797,7 @@ function writeProjectClaudeTrust(projectRoot, permissionMode = null) {
     }
     const entry = settings.projects?.[absProjectRoot];
     if (entry !== undefined && !isObject(entry)) throw new Error('Invalid Claude project configuration');
-    const acceptBypass = permissionMode === 'bypass';
+    const acceptBypass = permissionMode === 'bypass' || preEnableBypass === true;
     // Current CLIs read the acknowledgement from user settings; older CLIs read
     // .claude.json. Read both before writing so malformed settings stay intact.
     const userSettings = acceptBypass ? read(path.join(process.env.CLAUDE_CONFIG_DIR

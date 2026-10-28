@@ -1,18 +1,8 @@
 import { t } from './i18n.js';
-import { permissionModeLabel } from './permission-mode.js';
 
+// The pending-approval panel. The run's mode itself is shown next to the agent caption by
+// session-mode-control.js (TPT9139).
 export function renderTerminalPermissions(overlay, message, send) {
-  let label = overlay.querySelector('.terminal-permission-mode');
-  if (message.permissionMode) {
-    if (!label) {
-      label = document.createElement('span');
-      label.className = 'terminal-permission-mode';
-      const header = overlay.querySelector('.terminal-header');
-      header.insertBefore(label, header.querySelector('.terminal-header-actions'));
-    }
-    label.textContent = t('terminal.permission.run', { mode: permissionModeLabel(message.permissionMode, t) });
-    label.title = t(message.permissionSource === 'project' ? 'terminal.permission.inherited' : 'terminal.permission.fixed');
-  } else label?.remove();
   const request = message.permissionRequest;
   let panel = overlay.querySelector('.terminal-permission-request');
   if (!request) { panel?.remove(); return; }

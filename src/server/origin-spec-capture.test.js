@@ -278,10 +278,12 @@ test('api-backend.js: postOriginSpecComment() is called AFTER _rawUpdateTask(id,
 });
 
 test('api-backend.js: the snapshot call sits inside the online branch, before the offline queue fallback', () => {
-  const onlineBranchIdx = API_BACKEND_SRC.indexOf('if (!_isOffline()) {');
+  // updateTask's sending branch: online, or forced by opts.queueOffline === false (TPT9168).
+  const updateIdx = API_BACKEND_SRC.indexOf('async updateTask(id, fields, opts = {}) {');
+  const onlineBranchIdx = API_BACKEND_SRC.indexOf('if (!_isOffline() || opts.queueOffline === false) {', updateIdx);
   const snapshotIdx = API_BACKEND_SRC.indexOf('readOriginSpecSnapshot(');
   const enqueueIdx = API_BACKEND_SRC.indexOf("_enqueueMutation('update'");
-  assert.ok(onlineBranchIdx > -1 && onlineBranchIdx < snapshotIdx, 'snapshot must run inside the !_isOffline() branch');
+  assert.ok(updateIdx > -1 && onlineBranchIdx > updateIdx && onlineBranchIdx < snapshotIdx, 'snapshot must run inside updateTask\'s sending branch');
   assert.ok(snapshotIdx < enqueueIdx, 'snapshot must run before the offline-queue fallback');
 });
 

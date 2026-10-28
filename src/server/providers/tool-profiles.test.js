@@ -45,7 +45,8 @@ test('claude task chat: task tools allowed, file-editing and shell tools denied'
   }
   // .claude/settings.local.json allows the tipatask servers wholesale — the local tools that
   // write the checkout or run the completion flow are only out because they are denied by name.
-  for (const tool of ['mcp__tipatask-local__push_knowledge', 'mcp__tipatask-local__pull_knowledge', 'mcp__tipatask-local__complete_task']) {
+  for (const tool of ['mcp__tipatask-local__push_knowledge', 'mcp__tipatask-local__pull_knowledge', 'mcp__tipatask-local__complete_task',
+    'mcp__tipatask-local__start_next_tasks']) {
     assert.ok(denied.includes(tool), `${tool} must be denied`);
   }
   assert.ok(!denied.includes('ToolSearch'), 'deferred MCP tool schemas stay loadable');
@@ -61,6 +62,8 @@ test('claude objective argv is untouched by the profile branch', () => {
   assert.match(allowed, /^Read,/);
   assert.doesNotMatch(allowed, /update_task/);
   assert.match(flag(args, '--disallowedTools'), /mcp__tipatask__update_task/);
+  // A planner never starts a cowboy chain's sessions.
+  assert.ok(flag(args, '--disallowedTools').split(',').includes('mcp__tipatask-local__start_next_tasks'));
 });
 
 test('codex task chat: read-only sandbox on fresh and resumed turns, MCP narrowed by config', () => {
@@ -118,7 +121,7 @@ const eFlags = args => args.filter((a, i) => args[i - 1] === '-e');
 // Every MCP tool a Pi turn must never reach under its bridged name.
 const PI_NEVER_BRIDGED = ['tipatask__purge_stale_reservations', 'tipatask__reserve_task_keys',
   'tipatask-local__push_knowledge', 'tipatask-local__pull_knowledge', 'tipatask-local__complete_task',
-  'tipatask-local__git_worktree_status'];
+  'tipatask-local__git_worktree_status', 'tipatask-local__start_next_tasks'];
 
 test('pi task chat with the MCP bridge: bridged task tools replace the REST tool, writes stay off', () => {
   const args = buildPiArgs(chat({ providerType: 'pi' }), { extensionPath: '/data/pi-ext/task-tools.mjs', mcpBridgePath: '/data/pi-ext/mcp-bridge.mjs' });

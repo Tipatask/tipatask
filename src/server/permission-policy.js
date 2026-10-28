@@ -16,6 +16,8 @@ const SUPPORT_REASONS = Object.freeze({
   provider: 'no permission adapter is registered',
   images: 'image tasks use a separate generation approval flow',
 });
+// First Pi CLI whose extension tool_call handlers can block a tool (the gate's requirement).
+const PI_GATE_VERSION = Object.freeze([0, 84, 1]);
 
 function permissionError(reason, params = {}) {
   if (params.supportReason) params = { ...params, detail: SUPPORT_REASONS[params.supportReason] };
@@ -56,13 +58,34 @@ async function resolvePermissionMode({ backend, task, taskId, planOnly = false }
   return Object.freeze({ mode, source: mode ? 'project' : 'legacy', inherited: true });
 }
 
+// (TPT9136) The project's effective default mode, for launch decisions that follow it even when a
+// task override chose the run's mode. Read fresh and strict: a cached, offline or unreadable value
+// returns null and never widens a run. Planning launches and legacy runs have none.
+async function resolveProjectPermissionMode({ backend, resolved } = {}) {
+  if (resolved?.source === 'project') return validateMode(resolved.mode);
+  if (resolved?.source !== 'task') return null;
+  try {
+    const result = await backend?.getEffectiveProjectSettings({ strict: true, refresh: true });
+    return validateMode(result?.settings?.agent_permission_mode);
+  } catch { return null; }
+}
+
+// Claude's Auto: native auto mode lets the CLI's classifier decide each tool call; when this run
+// cannot use it (CLI, settings, account or model), Auto launches acceptEdits instead and the
+// native dialog decides everything beyond project edits. `resolved.nativeAuto` carries which one
+// the run uses (ClaudeAgent#getSpawnSpec(), claude-live-mode.js); absent means the dialog text.
+const CLAUDE_AUTO_TEXT = Object.freeze({
+  auto: "Auto mode: Claude Code's native auto mode is on: its classifier checks each tool call, runs routine actions it assesses as lower-risk without asking, and blocks risky ones. A blocked action needs a different approach or the user's explicit approval in the terminal.",
+  acceptEdits: "Auto mode: project file edits are accepted automatically; other actions follow Claude's native allow / allow-all / deny permission dialog, answered in the terminal.",
+});
+
 function buildPermissionPolicy(resolved, agent) {
   const mode = validateMode(resolved?.mode);
   const planning = mode === null || mode === 'plan';
   const instructions = {
     plan: 'First study the task, relevant source code, configuration files, and architecture docs. Present the plan, then end with a standalone line reading Plan ready. Wait for user approval before implementing, editing files, changing tasks, or running mutating commands. After approval, implement the approved plan in this same session, verify the changes, and finish through the guarded completion tool.',
     auto: (agent === 'claude'
-      ? "Auto mode: project file edits are accepted automatically; other actions follow Claude's native allow / allow-all / deny permission dialog, answered in the terminal."
+      ? CLAUDE_AUTO_TEXT[resolved?.nativeAuto === 'auto' ? 'auto' : 'acceptEdits']
       : 'Auto mode: known read-only actions and project file edits are assessed automatically; uncertain actions require approval.')
       + ' Start implementing the requested task; do not impose a separate plan-approval pause.',
     bypass: 'Bypass mode: the user authorizes carrying out this task without approval pauses. Implement, verify, make all required VCS commits, and finish through the guarded completion tool in this run. Do not stop for a plan approval, ask permission for already-authorized work, or offer to finish later. VCS settings and completion guards still apply.',
@@ -73,7 +96,62 @@ function buildPermissionPolicy(resolved, agent) {
   });
 }
 
-// Communication follows the same frozen run policy as tool permissions. It never
+function modeSwitchError(reason) {
+  const messages = {
+    plan_target: 'Switching back to Plan is not supported.',
+    invalid_target: 'Permission mode must be auto or bypass.',
+    inactive: 'Permission mode can only change in a running task terminal.',
+    busy: 'A permission-mode change is already pending.',
+    unsupported: 'This provider does not support live permission-mode changes.',
+    unconfirmed: 'The provider did not confirm the requested permission mode.',
+    session_changed: 'The terminal run ended or changed before permission mode was confirmed.',
+    failed: 'The provider could not change permission mode.',
+    starting: 'The agent is still starting. Switch once its first prompt has been sent.',
+    prompt_open: 'A prompt is open in the terminal. Answer it there, then switch again.',
+    prompt_busy: 'There is unsent text in the terminal prompt. Send or clear it, then switch again.',
+    bypass_unavailable: 'Bypass was not enabled when this run started. Restart the task in Bypass to use it.',
+  };
+  return Object.assign(new Error(messages[reason] || messages.failed), { code: 'EPERMISSION_MODE', reason });
+}
+
+function validateLiveMode(mode) {
+  if (mode === 'plan') throw modeSwitchError('plan_target');
+  if (mode !== 'auto' && mode !== 'bypass') throw modeSwitchError('invalid_target');
+  return mode;
+}
+
+// Rebuild on the existing session, retaining immutable snapshots and all unrelated
+// constraints (including the separately verified VCS context). No preference writes.
+function applyLivePolicy(session, mode) {
+  validateLiveMode(mode);
+  if (!session.permissionPolicy) throw modeSwitchError('inactive');
+  session.permissionPolicy = buildPermissionPolicy({ ...session.permissionPolicy,
+    mode, source: 'session', inherited: false }, session.taskAgent || session.permissionPolicy.agent);
+  return session.permissionPolicy;
+}
+
+function permissionModeSnapshot(session) {
+  return { ...(session.permissionMode || {
+    requested: session.permissionPolicy?.mode ?? null,
+    confirmed: session.permissionPolicy?.mode ?? null,
+    pending: false, error: null,
+  }) };
+}
+
+// What a session's tool gate enforces now: always the confirmed mode, never a requested one
+// (permission-gate.js holds decisions while a switch is pending). `assess` is the rule set:
+// Plan and legacy null stay read-only while planning; once the plan is approved in place
+// ('approved') the run keeps the provider's unattended tool loop, as before the gate loaded
+// in those modes. Any other value is treated as Plan.
+function gatePolicy(session) {
+  const state = session?.permissionMode;
+  const mode = state ? (state.confirmed ?? null) : (session?.permissionPolicy?.mode ?? null);
+  if (mode === 'auto' || mode === 'bypass') return { mode, assess: mode };
+  const planFirst = mode === null || mode === 'plan';
+  return { mode, assess: planFirst && session?.terminalPhase === 'executing' ? 'approved' : 'plan' };
+}
+
+// Communication follows the same confirmed run policy as tool permissions. It never
 // authorizes an action: the native/bridged gate still decides whether it can run.
 function communicationDirective(mode) {
   const scopes = {
@@ -109,12 +187,14 @@ function assertPermissionSupport(policy, version, platform = process.platform) {
     else if (!versionAtLeast(version, [0, 163, 0])) supportReason = 'codexVersion';
     else if (mode === 'plan' && platform === 'win32') supportReason = 'windows';
   } else if (agent === 'claude') {
-    // Native plan/acceptEdits/bypassPermissions do not require blocking hook support.
+    // Native plan/auto/acceptEdits/bypassPermissions do not require blocking hook support; Auto
+    // falls back to acceptEdits at spawn when native auto is unavailable (claude-live-mode.js).
   } else if (agent === 'pi') {
-    if (mode !== 'bypass' && !versionAtLeast(version, [0, 84, 1])) supportReason = 'piVersion';
+    if (mode !== 'bypass' && !versionAtLeast(version, PI_GATE_VERSION)) supportReason = 'piVersion';
   } else supportReason = 'provider';
   if (supportReason) throw permissionError('unsupported', { mode, agent, supportReason });
 }
 
-module.exports = { MODES, READ_TASK_TOOLS, READ_LOCAL_TOOLS, permissionError, validateMode,
-  resolvePermissionMode, buildPermissionPolicy, assertPermissionSupport, versionAtLeast };
+module.exports = { MODES, READ_TASK_TOOLS, READ_LOCAL_TOOLS, PI_GATE_VERSION, permissionError, validateMode,
+  resolvePermissionMode, resolveProjectPermissionMode, buildPermissionPolicy, assertPermissionSupport, versionAtLeast,
+  applyLivePolicy, validateLiveMode, modeSwitchError, permissionModeSnapshot, gatePolicy };

@@ -27,7 +27,10 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
   const validation = { samples: [], lifecycle: [], watchdog: [], stops: 0, trackerOptions: null };
   const flagLoads = [];
   const quotaLoads = [];
-  let shutdownOptions, listenCallback;
+  let shutdownOptions, listenCallback, onTaskUpdated;
+  const frames = [];
+  const nudges = [];
+  const clients = new Set([{ _boardWatcher: true }]);
   const proc = Object.assign(new EventEmitter(), {
     env: { TIPATASK_WATCHDOG_KILL: killEnv, TIPATASK_TASK_POLL_MS: taskPollMs }, platform, arch: 'arm64',
     exit: code => exits.push(code),
@@ -52,13 +55,16 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
       sample: (...args) => validation.samples.push(args), lifecycle: e => validation.lifecycle.push(e),
       watchdog: e => validation.watchdog.push(e), stop() { validation.stops++; },
     }) },
-    './ws-upgrade': { createWebSocketGate: () => ({ clients: new Set([{ _boardWatcher: true }]) }) },
-    './websocket': { init() {}, emitTaskUpdated() {}, emitSessionRunaway() {} },
+    './ws-upgrade': { createWebSocketGate: () => ({ clients }) },
+    './websocket': { init(wss, opts) { onTaskUpdated = opts.onTaskUpdated; }, emitTaskUpdated() {}, emitSessionRunaway() {},
+      broadcastToProject: (projectPath, type, payload) => frames.push({ projectPath, type, ...payload }) },
     './task-agent': { preloadAgentDetection: async () => {}, listAllAgentModels: async () => [] },
-    './status-roles': { fetchStatusRoles: async () => ({ complete: 'completed' }) },
+    './status-roles': { fetchStatusRoles: async b => b.roles || ({ complete: 'completed', canceled: 'canceled' }),
+      isClosedName: require('./status-roles').isClosedName },
     './git-merge/completion-guard': { guardCompletionTransition: async () => ({ allowed: true }), warnIfCompletedWorktreeDirty: async () => {} },
     './task-change-poll': { createTaskChangePoll: () => ({ tick: async () => { throw new TypeError('poll failed'); } }) },
-    './terminal-session': { killRunawaySession, pauseRunawaySession },
+    './terminal-session': { killRunawaySession, pauseRunawaySession, bgAgentsBusy: () => false,
+      maybeNudgeIdleSession: async s => nudges.push(s) },
     './process-group': { snapshotProcesses: async () => ({}), resolveAgentLimits,
       sweepDescendantWatchdog: (...args) => sweeps.push(args) },
     './shutdown-reaper': { installShutdownReaper(opts) { shutdownOptions = opts; } },
@@ -93,8 +99,73 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
   if (!failStartup) assert.ok(timers.has(10000));
   if (!failStartup && taskPollMs === '20000') assert.ok(timers.has(20000));
   return { sessions: module.exports.sessions, timers, proc, exits, lines, sweeps, memory, validation, execCalls,
-    server, shutdownOptions, flagLoads, quotaLoads, ready: () => listenCallback(), getMemoryTelemetry: module.exports.getMemoryTelemetry };
+    server, shutdownOptions, flagLoads, quotaLoads, backend, frames, nudges, clients, onTaskUpdated,
+    ready: () => listenCallback(), getMemoryTelemetry: module.exports.getMemoryTelemetry };
 }
+
+test('closed task updates clear idle attention and prevent later idle frames; reopening restores fallback', async () => {
+  const h = await harness();
+  const roles = { complete: 'Shipped', canceled: 'Dropped' };
+  for (const status of Object.values(roles)) {
+    const s = { type: 'terminal', alive: true, taskId: 'TPT1', tabId: 'TPT1', projectPath: '/project-a',
+      backend: { roles }, _terminalOutputSeen: true, lastOutputAt: Date.now() - 120000 };
+    const other = { ...s, projectPath: '/project-b' };
+    h.sessions.set('a', s);
+    h.sessions.set('b', other);
+    h.timers.get(1000)();
+    assert.equal(s._attentionLastBroadcast.kind, 'idle');
+    h.frames.length = 0;
+    h.clients.clear();
+    await h.onTaskUpdated({ id: 'TPT1', status }, '/project-a');
+    assert.equal(s._taskClosed, true);
+    assert.equal(other._taskClosed, undefined, 'same key in another project is untouched');
+    assert.deepEqual(h.frames, [{ projectPath: '/project-a', type: 'attention-cleared', taskId: 'TPT1' }]);
+    h.frames.length = 0;
+    h.nudges.length = 0;
+    h.clients.add({ _boardWatcher: true });
+    s.lastOutputAt -= 120000; // well past ATTENTION_IDLE_MS, terminal remains alive
+    h.timers.get(1000)();
+    assert.equal(h.frames.length, 0);
+    assert.equal(h.nudges.includes(s), false);
+    await h.onTaskUpdated({ id: 'TPT1', status: 'Doing' }, '/project-a');
+    assert.equal(s._taskClosed, false);
+    h.timers.get(1000)();
+    assert.equal(h.frames[0].kind, 'idle');
+  }
+});
+
+test('a stale poll cannot undo a newer closed task update', async () => {
+  const h = await harness();
+  let resolveTask;
+  h.backend.getTask = () => new Promise(resolve => { resolveTask = resolve; });
+  const s = { type: 'terminal', alive: true, taskId: 'TPT1', _terminalOutputSeen: true };
+  h.sessions.set('TPT1', s);
+  const poll = h.timers.get(10000)();
+  await new Promise(resolve => setImmediate(resolve));
+  await h.onTaskUpdated({ id: 'TPT1', status: 'canceled' });
+  resolveTask({ id: 'TPT1', status: 'in_progress' });
+  await poll;
+  assert.equal(s._taskClosed, true);
+});
+
+test('closed tasks retain real prompt attention and polls observe remote cancellation and reopening', async () => {
+  const h = await harness();
+  h.backend.roles = { complete: 'Shipped', canceled: 'Dropped' };
+  h.backend.getTask = async () => ({ id: 'TPT1', status: 'Dropped' });
+  const s = { type: 'terminal', alive: true, taskId: 'TPT1', tabId: 'TPT1', _terminalOutputSeen: true,
+    lastOutputAt: Date.now() - 120000, _attentionState: { kind: 'toolApproval', promptText: 'Approve command', at: Date.now() } };
+  h.sessions.set('TPT1', s);
+  await h.timers.get(10000)();
+  assert.equal(s._taskClosed, true);
+  h.timers.get(1000)();
+  assert.equal(h.frames[0].kind, 'toolApproval');
+  await h.onTaskUpdated({ id: 'TPT1', status: 'Shipped' });
+  assert.equal(h.frames.length, 1, 'closure never clears a real prompt');
+  h.backend.getTask = async () => ({ id: 'TPT1', status: 'Doing' });
+  s._completionEmitted = true;
+  await h.timers.get(10000)();
+  assert.equal(s._taskClosed, false, 'poll closure stays current after completion');
+});
 
 // TPT670 — the exit backstop's left-uncommitted registry is restored from USER_DATA_ROOT once, at
 // module load, so the first GET /api/sessions and connect replay after a relaunch already carry it.
@@ -214,6 +285,7 @@ test('completion sweep freezes task memory history even while terminal remains a
   h.sessions.set('TPT1', s);
   await h.timers.get(10000)(); // the completion sweep alone — no longer chained to the task-change poll
   assert.equal(s.alive, true);
+  assert.equal(s._taskClosed, true);
   assert.equal(h.memory.ended.length, 1);
   assert.equal(h.memory.ended[0][0], s);
   assert.equal(h.memory.ended[0][1], 'completed');

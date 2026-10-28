@@ -1228,6 +1228,11 @@ export function showProgressToast(initialText) {
       label.textContent = text;
       dismiss(3000);
     },
+    // Fade out with no outcome message — for an operation whose result shows up elsewhere
+    // (a dictation landing in its field, TPT9158).
+    close() {
+      dismiss(0);
+    },
   };
 }
 

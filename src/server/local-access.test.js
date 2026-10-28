@@ -24,7 +24,7 @@ test('Electron stamps only its local window traffic and replaces renderer-suppli
   assert.equal(unknown['x-tipatask-capability'], undefined);
 });
 
-async function fixture(t, { electron = false, activeProject = '/alpha' } = {}) {
+async function fixture(t, { electron = false, activeProject = '/alpha', liveRunTokens } = {}) {
   const secret = 'test-only-secret';
   let access;
   let httpCalls = 0;
@@ -34,14 +34,15 @@ async function fixture(t, { electron = false, activeProject = '/alpha' } = {}) {
   const server = http.createServer((req, res) => access.guardHttp(req, res, (request, response) => {
     httpCalls++;
     response.writeHead(200, { 'Content-Type': 'application/json' });
-    response.end(JSON.stringify({ projectPath: request.localAccess.projectPath, kind: request.localAccess.kind }));
+    const { projectPath, kind, taskKey } = request.localAccess;
+    response.end(JSON.stringify({ projectPath, kind, ...(taskKey ? { taskKey, selector: request.headers['x-tipatask-project'] ?? null } : {}) }));
   }));
   server.on('upgrade', (req, socket, head) => access.guardUpgrade(req, socket, head, wss));
   await new Promise(resolve => server.listen(0, LOCAL_HOST, resolve));
   t.after(() => new Promise(resolve => { wss.close(); server.close(resolve); }));
   const port = server.address().port;
   assert.equal(server.address().address, '127.0.0.1');
-  access = createLocalAccess({ port, secret, electron, getActiveProjectPath: () => activeProject });
+  access = createLocalAccess({ port, secret, electron, getActiveProjectPath: () => activeProject, liveRunTokens });
 
   function request(path, { method = 'GET', headers = {}, body = '' } = {}) {
     return new Promise((resolve, reject) => {
@@ -124,6 +125,31 @@ test('browser bootstrap issues a one-time, same-site session', async t => {
   assert.equal((await f.request('/api/sessions', { headers: { Cookie: cookie, Origin: 'http://evil.example' } })).status, 403);
   assert.equal(await f.socket('/?taskId=__attention__', { headers: { Cookie: cookie } }), 101);
   assert.equal(await f.socket('/?taskId=__attention__', { origin: 'http://evil.example', headers: { Cookie: cookie } }), 403);
+});
+
+// (TPT9162) A live cowboy run's token opens POST /api/tasks/<its key>/cowboy-next and nothing else;
+// the run, never a request selector, names the project.
+test('a run token opens only its own task\'s cowboy-next route, scoped to the run\'s project', async t => {
+  const asked = [];
+  const runs = { TPT1: [{ token: 'tok-1', projectPath: '/alpha' }], TPT2: [{ token: 'tok-2', projectPath: '' }] };
+  for (const electron of [false, true]) {
+    const f = await fixture(t, { electron, liveRunTokens: key => { asked.push(key); return runs[key] || []; } });
+    const url = '/api/tasks/TPT1/cowboy-next';
+    const post = (path, headers = {}) => f.request(path, { method: 'POST', headers });
+    assert.equal((await post(url)).status, 403);
+    assert.equal((await post(url, { 'x-tipatask-run-token': 'tok-2' })).status, 403, 'another run\'s token');
+    assert.equal((await post(url, { 'x-tipatask-run-token': ['tok-1', 'tok-1'] })).status, 403, 'a repeated header');
+    assert.equal((await post('/api/tasks/TPT1/cowboy-next/', { 'x-tipatask-run-token': 'tok-1' })).status, 401, 'no other path');
+    assert.equal((await post(url, { 'x-tipatask-run-token': 'tok-1', Origin: 'http://evil.example' })).status, 403);
+    assert.equal(await f.socket(url, { headers: { 'x-tipatask-run-token': 'tok-1' } }), 403);
+    assert.equal(f.httpCalls, 0);
+    const allowed = await post(url, { 'x-tipatask-run-token': 'tok-1', 'x-tipatask-project': '/beta' });
+    assert.equal(allowed.status, 200);
+    assert.deepEqual(JSON.parse(allowed.text), { projectPath: '/alpha', kind: 'run', taskKey: 'TPT1', selector: '/alpha' });
+    const encoded = await post('/api/tasks/TPT%32/cowboy-next', { 'x-tipatask-run-token': 'tok-2' });
+    assert.deepEqual(JSON.parse(encoded.text), { projectPath: '', kind: 'run', taskKey: 'TPT2', selector: null });
+  }
+  assert.ok(asked.every(key => key === 'TPT1' || key === 'TPT2'));
 });
 
 test('web and Electron handoffs stop before backend selection when native confirmation is denied', async () => {

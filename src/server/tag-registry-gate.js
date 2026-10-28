@@ -92,19 +92,37 @@ function unregisteredTagError(unknown, { projectId, registrySize, note } = {}) {
   return err;
 }
 
-// Pure selector mirroring overwriteRaw()'s write-loop skip rule — used to narrow the
-// tag gate to only the tasks that will actually be PATCHed/created this save, not
-// every task echoed back in the payload. C1439: a legacy carried-over task holding a
-// since-deleted tag used to block an unrelated save (see objective-parent-task.js's
-// `tags: []` workaround comment, which predates this fix). `tasksDiffer` is injected
-// so this stays a pure function testable without importing api-backend.js.
-function selectTasksToWrite(parsedById, liveById, newTaskIdSet, tasksDiffer) {
+// Return full new rows and base-relative patches for explicitly edited existing
+// rows. Live differences alone never establish write intent: the payload includes
+// untouched snapshot rows that other processes may have changed since the read.
+// The tag gate consumes these same patches, so untouched tags need no validation.
+function selectTasksToWrite(parsedById, liveById, newTaskIdSet, changedFields, { writeTaskIds, taskBases = [] } = {}) {
   const out = [];
+  const writes = new Set(writeTaskIds || []);
+  const bases = new Map(taskBases.map(t => [String(t.id), t]));
   for (const [id, t] of parsedById) {
     const liveTask = liveById.get(id);
     const isNew = newTaskIdSet.has(id);
-    if (!isNew && !tasksDiffer(t, liveTask)) continue; // carried over unchanged — nothing to persist or validate
-    out.push([id, t]);
+    if (isNew) {
+      out.push([id, t]);
+      continue;
+    }
+    // Preserve legacy direct-create/IPC callers without granting them permission
+    // to overwrite existing rows. Current clients name every intended write.
+    if (!writes.has(id) && (writeTaskIds !== undefined || liveTask)) continue;
+    const base = bases.get(id);
+    if (!liveTask) {
+      if (base) throw Object.assign(new Error(`Modified task ${id} no longer exists`), { statusCode: 404 });
+      out.push([id, t]);
+      continue;
+    }
+    if (!base) {
+      throw Object.assign(new Error(`Missing snapshot base for modified task ${id}`), {
+        code: 'TODO_PAYLOAD_INVALID', saveStep: 'parse-payload',
+      });
+    }
+    const patch = changedFields(t, base);
+    if (Object.keys(patch).length) out.push([id, patch]);
   }
   return out;
 }

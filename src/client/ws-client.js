@@ -1,5 +1,7 @@
 // ── WebSocket shared helpers ──
+import state from './state.js';
 import { forgetQueuedStart } from './queued-start-rollback.js';
+import { liveModeState } from './permission-mode.js';
 
 // One IPC bridge per renderer. Socket owners subscribe independently, including
 // retained terminals whose viewport listeners are detached while minimized.
@@ -215,6 +217,51 @@ export function terminateObjectiveSessions(parentKey, { confirmed = false } = {}
   });
 }
 
+// ── Live permission mode (TPT9139) ──
+// A running task terminal can change permission mode without a restart; the server owns the
+// state machine (requestPermissionMode(), terminal-session.js) and accepts the request only on
+// the socket that currently owns the session. The terminal registers that socket here.
+// state.sessionMeta[id].permissionMode keeps the run's { requested, confirmed, pending, error,
+// supported } object, the shape GET /api/sessions returns; only a server frame ever changes
+// `confirmed`.
+const _sessionSockets = new Map();
+
+export function bindSessionSocket(sessionId, ws) {
+  _sessionSockets.set(sessionId, ws);
+  return () => { if (_sessionSockets.get(sessionId) === ws) _sessionSockets.delete(sessionId); };
+}
+
+// Sends `session:permission-mode` and records the request as pending, so the terminal shows
+// "Switching to {mode}…" at once and cannot send a second one before the server answers.
+// Returns { ok: true, state } or { ok: false, reason } — a reason
+// liveModeErrorText() knows (`offline`, `busy`, `plan_target`, `invalid_target`) or `unchanged`.
+export function requestPermissionMode(sessionId, mode) {
+  const meta = state.sessionMeta.get(sessionId) || {};
+  const current = liveModeState(meta.permissionMode);
+  if (mode === 'plan') return { ok: false, reason: 'plan_target' };
+  if (mode !== 'auto' && mode !== 'bypass') return { ok: false, reason: 'invalid_target' };
+  if (current.pending) return { ok: false, reason: 'busy' };
+  if (mode === current.confirmed) return { ok: false, reason: 'unchanged' };
+  const ws = _sessionSockets.get(sessionId);
+  if (!ws || ws.readyState !== WebSocket.OPEN) return { ok: false, reason: 'offline' };
+  ws.send(JSON.stringify({ type: WS_SEND_TYPES.SESSION_PERMISSION_MODE, mode }));
+  const next = { ...current, requested: mode, pending: true, error: null };
+  state.sessionMeta.set(sessionId, { ...meta, permissionMode: next });
+  return { ok: true, state: next };
+}
+
+// Applies a `session:permission-mode-changed` frame to state.sessionMeta and returns the run's
+// state, or null for any other frame and for a frame from an earlier run of the task.
+export function applyPermissionModeChanged(msg) {
+  if (!msg || msg.type !== WS_RECV_TYPES.SESSION_PERMISSION_MODE_CHANGED || !msg.taskId) return null;
+  const meta = state.sessionMeta.get(msg.taskId) || {};
+  const startedAt = Number.isFinite(msg.startedAt) && msg.startedAt > 0 ? msg.startedAt : null;
+  if (startedAt && Number.isFinite(meta.startedAt) && startedAt < meta.startedAt) return null;
+  const next = liveModeState(msg);
+  state.sessionMeta.set(msg.taskId, { ...meta, ...(startedAt ? { startedAt } : {}), permissionMode: next });
+  return next;
+}
+
 // Types the client sends to the server
 export const WS_SEND_TYPES = {
   DATA: 'data',
@@ -232,6 +279,7 @@ export const WS_SEND_TYPES = {
   TASK_CHAT_MESSAGE: 'task-chat-message',
   TASK_CHAT_ANSWER: 'task-chat-answer',
   TASK_CHAT_TASK_EDITED: 'task-chat-task-edited', // the user saved a task from one of the chat's cards
+  SESSION_PERMISSION_MODE: 'session:permission-mode', // (TPT9139) { mode: 'auto' | 'bypass' }
 };
 
 // ── api-status subscription ──
@@ -260,6 +308,7 @@ export const WS_RECV_TYPES = {
   CHAT_HISTORY_RESET: 'chat-history-reset',
   CHAT_HISTORY_RESUMED: 'chat-history-resumed',
   CHAT_HISTORY_CHANGED: 'chat-history-changed',
+  CHAT_HISTORY_UPDATED: 'chat-history-updated', // (TPT9116) watcher sockets: the project's chat history index was written
   CHAT_READY: 'chat-ready',
   TASK_CARDS: 'task-cards',
   GENERATION_ABORTED: 'generation-aborted',
@@ -288,4 +337,6 @@ export const WS_RECV_TYPES = {
   // (C1463) Objective tab close — see terminateObjectiveSessions() above
   OBJECTIVE_CLOSE_NEEDS_CONFIRM: 'objective-close-needs-confirm',
   OBJECTIVE_SESSIONS_TERMINATED: 'objective-sessions-terminated',
+  // (TPT9139) A task terminal's live permission-mode state — see applyPermissionModeChanged()
+  SESSION_PERMISSION_MODE_CHANGED: 'session:permission-mode-changed',
 };

@@ -14,18 +14,27 @@ const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir } = require('./spawn-
 const { ensureProjectCodexHome, prepareCodexTerminalHome, tomlValue } = require('../codex-mcp-config');
 const { permissionError } = require('./permission-policy');
 
+function policyToCodexConfig(mode) {
+  // Plan retains the user's sandbox; planning itself is the existing prompt gate.
+  if (mode === 'plan') return { sandbox_mode: undefined, approval_policy: 'on-request', approvals_reviewer: 'user' };
+  if (mode === 'auto') return { sandbox_mode: 'workspace-write', approval_policy: 'on-request', approvals_reviewer: 'auto_review' };
+  if (mode === 'bypass') return { sandbox_mode: 'danger-full-access', approval_policy: 'never', approvals_reviewer: 'user' };
+  throw permissionError('invalid');
+}
+
 function codexPermissionOverrides(policy, parsed) {
   // Planning is a prompt gate; execution continues with native user approvals.
-  if (policy?.mode === 'plan') return { approval_policy: 'on-request', approvals_reviewer: 'user' };
+  if (policy?.mode === 'plan') {
+    const { sandbox_mode, ...overrides } = policyToCodexConfig('plan');
+    return overrides;
+  }
   if (!policy?.enforced) return {};
   if (parsed.default_permissions) throw permissionError('unsupported', {
     mode: policy.mode, agent: 'codex', supportReason: 'codexProfiles',
   });
   const auto = policy.mode === 'auto';
   const result = {
-    sandbox_mode: auto ? 'workspace-write' : 'danger-full-access',
-    approval_policy: auto ? 'on-request' : 'never',
-    approvals_reviewer: auto ? 'auto_review' : 'user',
+    ...policyToCodexConfig(policy.mode),
     'features.guardian_approval': auto,
     'sandbox_workspace_write.network_access': false,
     'sandbox_workspace_write.writable_roots': [],
@@ -243,4 +252,4 @@ function buildCodexEnv({ projectRoot, taskId, term = 'dumb' } = {}) {
   return { env };
 }
 
-module.exports = { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, terminalDaemonFallback, toCodexEffort, codexPermissionOverrides };
+module.exports = { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, terminalDaemonFallback, toCodexEffort, codexPermissionOverrides, policyToCodexConfig };

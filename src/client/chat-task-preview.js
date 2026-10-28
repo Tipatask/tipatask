@@ -791,6 +791,7 @@ export function attachCardHandlers() {
           }
 
           await assertEditableModifiedCards(acceptedChanges.map(({ card }) => card), taskMap);
+          const taskBases = JSON.parse(JSON.stringify(data.tasks));
 
           // Phase 1: ensure every new card has a unique client-side key.
           for (const { card } of acceptedChanges) {
@@ -949,6 +950,7 @@ export function attachCardHandlers() {
           );
           attachSplitOriginPayload(data, resolveOriginPlan(cs, proposedNewCount, newCardTasks.map(t => t.id)));
           data.newTaskPinnedIds = pinned;
+          attachTaskWriteIntent(data, taskBases, acceptedChanges.map(({ card }) => card.task.id));
 
           const jsonStr = JSON.stringify(data, null, 2);
           const newTodoText = text.replace(/```json\s*[\s\S]*```/, () => '```json\n' + jsonStr + '\n```');
@@ -1138,6 +1140,7 @@ export async function saveTaskChange(change, { msg } = {}) {
   }
 
   await assertEditableModifiedCards([change], taskMap);
+  const taskBases = JSON.parse(JSON.stringify(data.tasks));
 
   // Fill in any field a `modified` proposal omitted, from the freshly-read live task
   // (C1071) — a modified card must never acquire fields (e.g. assignee) nobody changed.
@@ -1286,6 +1289,7 @@ export async function saveTaskChange(change, { msg } = {}) {
     attachSplitOriginPayload(data, resolveOriginPlan(cs, proposedNewCount, [change.task.id]));
   }
   data.newTaskPinnedIds = change.type === 'new' && !change._manual && isStepPinned ? [change.task.id] : [];
+  attachTaskWriteIntent(data, taskBases, [change.task.id]);
   const jsonStr = JSON.stringify(data, null, 2);
   const newTodoText = text.replace(/```json\s*[\s\S]*```/, () => '```json\n' + jsonStr + '\n```');
   const putRes = await fetchWithRetry('/api/todo', {
@@ -1320,6 +1324,16 @@ export async function saveTaskChange(change, { msg } = {}) {
     } catch { /* non-critical — ID already committed to file */ }
   }
   releaseDiscussLock(cs); // (TPT271) PUT succeeded — the discussion is resolved
+}
+
+// Keep snapshot context separate from write intent. Bases are copied before any
+// merge; only accepted existing targets (including split-origin promotion) need
+// their field values on the wire. New objective parents use newTaskIds as before.
+function attachTaskWriteIntent(data, bases, taskIds) {
+  const ids = new Set(taskIds.map(String));
+  if (data.splitOrigin) ids.add(String(data.splitOrigin.originKey));
+  data.writeTaskIds = [...ids];
+  data.taskBases = bases.filter(t => ids.has(String(t.id)) && !(data.newTaskIds || []).includes(t.id));
 }
 
 // ── (TPT271/TPT283) Release a Rehash → Discuss/Split lock after a successful save ──

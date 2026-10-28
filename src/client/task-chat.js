@@ -22,7 +22,7 @@ import {
   taskChatProviders, pickSelection, buildModelOptionsHtml, stripAskUserFence,
   visibleHistory, upsertById, shortToolName, hasWidgets, collapseTaskEvents,
   dialogSubmission, localAnswer, dialogWidgetHtml, toolChipHtml,
-  userMessageHtml, stripPendingImageRefs,
+  userMessageHtml, stripPendingImageRefs, messageCopyText,
   dialogState, lastTurnMessage, isDialogAnswerTurn, answeredDialog,
   resumedIndicator, providerName, historyQuery, historyRowHtml, historyFocusIndex,
 } from './task-chat-model.js';
@@ -36,11 +36,14 @@ const DRAFT_STORAGE_PREFIX = 'tipatask-task-chat-draft:';
 const STICK_THRESHOLD_PX = 64;
 const FRESH_START_TIMEOUT_MS = 3000;
 const HISTORY_SEARCH_DEBOUNCE_MS = 250;
+const COPIED_LABEL_MS = 1500;
 
 const ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7z"/></svg>';
 const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
 const ICON_CLOSE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>';
 const ICON_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="m6 13 6 6 6-6"/></svg>';
+const ICON_COPY = '<svg class="task-chat-copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+const ICON_COPIED = '<svg class="task-chat-copy-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
 const ICON_CHAT = CHAT_BUBBLE_SVG;
 // (TPT469) A project holds several chats, `projectChat:<projectId>:<chatId>`. The bare
 // `projectChat:<projectId>` is a chat started before that, still reopened from the left menu.
@@ -63,6 +66,7 @@ let freshTimer = null;
 let awaitingStart = false;  // the start gate is up: connected, no session, nothing sent yet
 let starting = false;       // Start was pressed on this socket — a second press sends nothing
 let resuming = false;       // a start frame with a historyId went out; waiting for resumed / refused
+let listOnTurn = false;     // (TPT9116) a task chat was just started here: list it in the left menu on its first turn frame
 // (TPT539) History picker at the start gate: earlier chats of this task (or project chats).
 let historyRows = [];
 let historyStatus = 'idle'; // 'idle' | 'loading' | 'ready' | 'error'
@@ -80,6 +84,8 @@ let renderedLocale = '';     // locale the window's labels were last written in
 let pendingAnswer = null;   // { dialog } — an answer sent, no frame of its turn back yet
 let widgetSeq = 0;
 const widgetSig = new WeakMap(); // widget element -> signature of the record it was built from
+const codeCopyButtons = new WeakMap(); // message element -> Copy buttons of its code blocks, in order
+const copyResetTimers = new WeakMap(); // Copy button -> timer that turns "Copied" back into its label
 let embedded = null;        // { host, onOpenTask, onClosed } while mounted in a workspace pane
 let uploadsPending = 0;     // attachments uploading into the composer; Send waits for them
 let uploadGen = 0;          // bumped per built window; a late upload callback of an old one is ignored
@@ -206,6 +212,22 @@ function refreshSessionsNav(refetch = false) {
   Promise.resolve(window.TipTask?.fetchActiveSessions?.()).then(repaint).catch(() => {});
 }
 
+// (TPT9116) `chat-history-updated` — this window's project wrote its chat history index (a chat
+// reported its native session, finished a turn, ended or was resumed). It arrives on the window's
+// watcher socket: attention-ws.js in Electron, template.html's __board__ socket in browser mode.
+// The left menu lists started chats from GET /api/sessions, so that list is refetched and
+// repainted. A start gate on screen re-reads its history picker when the entry is one of its own
+// task's chats (task chat) or a project chat (project chat).
+export function historyUpdated(msg) {
+  refreshSessionsNav(true);
+  if (!root || !chat || !awaitingStart || !msg) return;
+  // Task keys match case-insensitively, as the history route's `taskKey` filter does.
+  const ours = chat.kind === 'project'
+    ? msg.kind === 'project'
+    : msg.kind === 'task' && String(msg.taskKey || '').toUpperCase() === String(chat.key).toUpperCase();
+  if (ours) loadHistory(historySearch, { quiet: true });
+}
+
 // A chat about the project selected in this window, with no task. The id is read from this
 // window's own project config (header-scoped) — the one the server checks the session id against.
 // Without `chatId` (Start Chat) it opens the project's draft chat; a left-menu row passes its own.
@@ -247,6 +269,10 @@ function openChat(target, embedOpts = null) {
   selection = pickSelection({ providers, stored: readStoredSelection(), fallback: state.objectiveModel });
   running = false;
   connected = false;
+  sawReset = false;
+  ended = false;
+  resetSelection = '';
+  resuming = false;
   wantFresh = false;
   awaitingStart = false;
   starting = false;
@@ -291,10 +317,14 @@ export function close() {
   messages = [];
   running = false;
   connected = false;
+  sawReset = false;
+  ended = false;
+  resetSelection = '';
   wantFresh = false;
   awaitingStart = false;
   starting = false;
   resuming = false;
+  listOnTurn = false;
   pendingAnswer = null;
   clearTimeout(historyTimer);
   historyTimer = null;
@@ -659,6 +689,8 @@ function beginChat() {
   starting = true;
   awaitingStart = false;
   historyError = '';
+  // The server lists a task chat once its start is accepted, before the CLI reports a session.
+  listOnTurn = chat.kind === 'task';
   syncStartGate();
   pushMessage({ role: 'assistant', content: '', streaming: true });
   setRunning(true);
@@ -723,13 +755,18 @@ function historyItems() {
   return root ? [...root.querySelectorAll('.task-chat-history-item')] : [];
 }
 
-async function loadHistory(q = '') {
+// `quiet` (TPT9116, a live refresh): rows already on screen stay put while the new ones load, and
+// a failed read keeps them instead of showing the error state.
+async function loadHistory(q = '', { quiet = false } = {}) {
   if (!root || !chat) return;
   const seq = ++historySeq;
   const target = chat;
+  const keepRows = quiet && historyStatus === 'ready';
   historySearch = String(q || '');
-  historyStatus = 'loading';
-  renderHistoryPicker();
+  if (!keepRows) {
+    historyStatus = 'loading';
+    renderHistoryPicker();
+  }
   let rows = null;
   try {
     const res = await fetch(historyQuery({ kind: chat.kind, key: chat.key, q: historySearch }), {
@@ -741,6 +778,7 @@ async function loadHistory(q = '') {
     }
   } catch { /* shown as the error state */ }
   if (seq !== historySeq || chat !== target || !root) return;
+  if (!rows && keepRows) return;
   historyStatus = rows ? 'ready' : 'error';
   if (rows) historyRows = rows;
   renderHistoryPicker();
@@ -909,6 +947,7 @@ function buildMessageEl(m) {
   }
   m.el = el;
   if (m.role === 'assistant') { paintAssistant(m); paintWidgets(m); }
+  else if (m.role === 'user') attachCopyControls(el, m);
   return el;
 }
 
@@ -920,6 +959,8 @@ function assistantMarkdown(m) {
 function paintAssistant(m) {
   const body = m.el && m.el.querySelector('.task-chat-body');
   if (!body) return;
+  // A code block's Copy button focused in the old render moves into the new one: keep its focus.
+  const focused = body.contains(document.activeElement) ? document.activeElement : null;
   const md = assistantMarkdown(m);
   if (md) {
     body.innerHTML = renderMarkdown(md, { cache: !m.streaming });
@@ -931,6 +972,82 @@ function paintAssistant(m) {
   // A reply that is only widgets (a dialog, a task card) has no text row to show.
   body.hidden = !md && !m.streaming;
   m.el.classList.toggle('task-chat-msg--streaming', !!m.streaming);
+  attachCopyControls(m.el, m);
+  if (focused && focused.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
+}
+
+// ── Copy ──
+// Every reply and user turn has a Copy action for its whole text, and every code block of a reply
+// one for that block alone. They are added by the paint step after each markdown render, never by
+// renderMarkdown() (its memoized HTML is shared with the board), so they come back with every
+// re-render of a streaming reply. A code block's button is kept by position across re-renders:
+// the same element moves into the new block, so a press, its focus and "Copied" are not lost.
+
+function attachCopyControls(msgEl, m) {
+  if (!msgEl || !m || (m.role !== 'assistant' && m.role !== 'user')) return;
+  let whole = msgEl.querySelector(':scope > .task-chat-msg-copy');
+  if (!whole) {
+    whole = copyButton('task-chat-msg-copy', 'taskChat.copy.message');
+    // A reply's sits on its author line, a user turn's beside the bubble (styles.css).
+    const author = msgEl.querySelector(':scope > .task-chat-author');
+    if (author) author.after(whole);
+    else msgEl.appendChild(whole);
+  }
+  // A reply still streaming is not done yet; one that is only widgets has no text at all.
+  whole.hidden = !!m.streaming || !messageCopyText(m);
+  const kept = codeCopyButtons.get(msgEl) || [];
+  const blocks = [...msgEl.querySelectorAll('.task-chat-body pre')];
+  codeCopyButtons.set(msgEl, blocks.map((pre, i) => {
+    const btn = kept[i] || copyButton('task-chat-copy', 'taskChat.copy.button');
+    pre.appendChild(btn);
+    return btn;
+  }));
+}
+
+function copyButton(cls, labelKey) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = cls;
+  btn.dataset.labelKey = labelKey;
+  btn.innerHTML = `${ICON_COPY}${ICON_COPIED}<span class="task-chat-copy-label"></span>`;
+  setCopyLabel(btn, false);
+  btn.addEventListener('click', () => copySnippet(btn));
+  return btn;
+}
+
+// The label is the button's name (a visually hidden span, inside the transcript's live region, so
+// "Copied" is announced) and its tooltip; `data-copied` swaps the icon for a check mark.
+function setCopyLabel(btn, copied) {
+  const label = t(copied ? 'taskChat.copy.copied' : btn.dataset.labelKey);
+  btn.querySelector('.task-chat-copy-label').textContent = label;
+  btn.title = label;
+  btn.toggleAttribute('data-copied', copied);
+}
+
+// What a Copy button puts on the clipboard: a code block's own text (every node of the `pre` but
+// the button, less the newline marked ends a block with), or a whole message's markdown source.
+function copySnippetText(el) {
+  if (!el) return '';
+  if (el.tagName === 'PRE') {
+    return [...el.childNodes]
+      .filter(node => !(node.classList && node.classList.contains('task-chat-copy')))
+      .map(node => node.textContent).join('').replace(/\n$/, '');
+  }
+  return messageCopyText(messages.find(m => m.el === el));
+}
+
+async function copySnippet(btn) {
+  const text = copySnippetText(btn.closest('pre') || btn.closest('.task-chat-msg'));
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    showToast(t('taskChat.copy.failed'), 'error');
+    return;
+  }
+  clearTimeout(copyResetTimers.get(btn));
+  setCopyLabel(btn, true);
+  copyResetTimers.set(btn, setTimeout(() => setCopyLabel(btn, false), COPIED_LABEL_MS));
 }
 
 function pushMessage(m) {
@@ -1412,6 +1529,7 @@ function connect() {
   awaitingStart = false;
   starting = false;
   resuming = false;
+  listOnTurn = false;
   syncStartGate();
   const socket = new WebSocket(buildWsUrl(chat.sessionId));
   ws = socket;
@@ -1470,13 +1588,20 @@ const PROGRESS_KEYS = {
   'pi-compaction': 'taskChat.status.compacting',
 };
 
-function turnFailed(text) {
-  // No completed reply yet means the chat never got going (start refused, first turn died, or
-  // the session is gone) — there is nothing to continue, so retrying starts a new chat.
-  const established = messages.some(m => m.role === 'assistant' && !m.streaming);
+function turnFailed(text, { chatContinues = false } = {}) {
+  // Terminal provider failures can retain a resumable chat even before its first
+  // completed reply. Only offer a fresh chat when no continuation is known.
+  const established = chatContinues || messages.some(m => m.role === 'assistant' && !m.streaming);
   finishStreaming();
   setRunning(false);
   pushNotice(text, { error: true, retry: established ? null : startFresh });
+}
+
+function turnStillRunning(text) {
+  revertPendingAnswer();
+  ensureStreaming();
+  setRunning(true);
+  pushNotice(text, { error: true });
 }
 
 // The server removed the turn: discard its partial reply and return its submission.
@@ -1505,6 +1630,8 @@ const TURN_FRAMES = new Set([
 
 function handleFrame(msg) {
   if (pendingAnswer && TURN_FRAMES.has(msg.type)) pendingAnswer = null;
+  // (TPT9116) The chat started here is running: its left-menu row exists now.
+  if (listOnTurn && TURN_FRAMES.has(msg.type)) { listOnTurn = false; refreshSessionsNav(true); }
   switch (msg.type) {
     case WS_RECV_TYPES.CHAT_HISTORY_RESET: {
       sawReset = true;
@@ -1514,8 +1641,8 @@ function handleFrame(msg) {
       messages = visibleHistory(msg.messages);
       if (msg.title) applyProjectChatTitle(msg.title);
       if (msg.running) messages.push({ role: 'assistant', content: '', streaming: true, dialogs: [], tools: [], taskEvents: [] });
-      running = !!msg.running;
       renderTranscript();
+      setRunning(msg.running);
       break;
     }
 
@@ -1657,6 +1784,10 @@ function handleFrame(msg) {
     case 'objective-error': {
       if (msg.droppedUserTurn === true) restoreDroppedTurn();
       const reason = msg.reason || 'error';
+      if (reason === 'turn-in-progress') {
+        turnStillRunning(msg.detail || msg.message || t('taskChat.error.selection'));
+        break;
+      }
       if (reason === 'history-unavailable') {
         pendingAnswer = null;
         if (resuming) { resumeRefused(msg); break; }
@@ -1670,7 +1801,7 @@ function handleFrame(msg) {
       }
       let text;
       if (reason === 'session-gone') text = t('taskChat.error.sessionGone');
-      else if (reason === 'provider-unavailable' || reason === 'turn-in-progress') text = msg.detail || t('taskChat.error.selection');
+      else if (reason === 'provider-unavailable') text = msg.detail || t('taskChat.error.selection');
       // The model takes no tool definitions (pi-session.js toolCompatMessage): the server's own sentence, alone.
       else if (reason === 'model-no-tools') text = msg.detail || msg.message || t('taskChat.error.turn', { reason });
       else text = t('taskChat.error.turn', { reason }) + ((msg.detail || msg.message) ? ` ${msg.detail || msg.message}` : '');
@@ -1679,18 +1810,22 @@ function handleFrame(msg) {
         finishStreaming();
         setRunning(false);
         pushNotice(text, { error: true, retry: startFresh });
-      } else if ((reason === 'provider-unavailable' || reason === 'turn-in-progress') && revertPendingAnswer()) {
+      } else if (reason === 'provider-unavailable' && revertPendingAnswer()) {
         // Refused before the answer was stored: the dialog is open again for another model.
         setRunning(false);
         pushNotice(text, { error: true });
       } else {
         pendingAnswer = null;
-        turnFailed(text);
+        turnFailed(text, { chatContinues: msg.chatContinues === true });
       }
       break;
     }
 
     case WS_RECV_TYPES.ERROR:
+      if (msg.reason === 'turn-in-progress') {
+        turnStillRunning(msg.message || t('taskChat.error.selection'));
+        break;
+      }
       if (revertPendingAnswer()) {
         setRunning(false);
         pushNotice(msg.message || t('taskChat.error.turn', { reason: 'error' }), { error: true });

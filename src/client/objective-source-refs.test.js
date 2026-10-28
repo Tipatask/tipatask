@@ -21,7 +21,7 @@ const newCard = (description = 'Refresh hero with live event dates.', extra = {}
   type: 'new', task: { id: 'TPT1', title: 'Refresh Master Planning hero', description, category: 'CODING', status: 'pending', priority: 1, tags: [], dependencies: [] }, ...extra,
 });
 
-function fixture(cards, { objective = OBJECTIVE, lang = 'en', accepted = cards.map(() => true) } = {}) {
+function fixture(cards, { objective = OBJECTIVE, lang = 'en', accepted = cards.map(() => true), tasks = [] } = {}) {
   cards.forEach((card, index) => { card.task.id = `TPT${index + 1}`; });
   const msg = { cards, acceptedMask: accepted, confirmedMask: [], _existingTasksSnapshot: new Map() };
   const cs = { messages: [{ role: 'user', content: objective }, msg] };
@@ -36,13 +36,14 @@ function fixture(cards, { objective = OBJECTIVE, lang = 'en', accepted = cards.m
     hydrateModifiedCard, buildModifiedTaskPatch, applyModifiedCardToLiveTask, reconcileModifiedCards, buildUsedIds, upsertTaskEntry,
     getLocale: () => lang, getObjectiveGroupingEnabled: () => false, shouldCreateObjectiveParent: () => false,
     startName: () => 'pending', isStartName: status => status === 'pending', isLockedTargetStatus: () => false,
+    loadStatuses: async () => [],
     projectHeader: () => ({}), captureCardEdits() {}, showSavingIndicator() {}, hideSavingIndicator() {},
     showSaveToast() {}, saveChatState() {}, discardUnsavedProposals() {}, cleanupChat() {}, repaintAfterSavedChatClosed() {},
     translate: (key, params) => params?.msg || key,
     showToast: (message, type) => { if (type === 'error') errors.push(message); },
     api: { tasks: { get: async id => ({ id, status: 'pending' }) } },
     async fetchWithRetry(url, options) {
-      if (url.startsWith('./TODO.md')) return { ok: true, text: async () => '```json\n{"tasks":[]}\n```' };
+      if (url.startsWith('./TODO.md')) return { ok: true, text: async () => '```json\n' + JSON.stringify({ tasks }) + '\n```' };
       if (url === '/api/resolve-sprints') return { ok: true, json: async () => ({ changes: [] }) };
       assert.equal(url, '/api/todo');
       writes.push(JSON.parse(options.body.match(/```json\s*\n([\s\S]*?)```/)[1]));
@@ -64,6 +65,24 @@ function fixture(cards, { objective = OBJECTIVE, lang = 'en', accepted = cards.m
 
 for (const bulk of [false, true]) {
   const path = bulk ? 'bulk Save Tasks' : 'single Accept';
+  test(`${path} names only accepted writes and sends the base before modified-card merge`, async () => {
+    const base = { id: 'TPT1', title: 'Original', description: 'Original body', status: 'pending', priority: 1, tags: [] };
+    const untouched = { ...base, id: 'TPT99', status: 'in_progress' };
+    const card = { type: 'modified', task: { id: base.id, title: 'Accepted title' } };
+    const payload = await fixture([card], { tasks: [base, untouched] }).save(bulk);
+    assert.deepEqual(payload.writeTaskIds, ['TPT1']);
+    assert.deepEqual(payload.taskBases, [base]);
+    assert.equal(payload.tasks[0].title, 'Accepted title');
+    assert.deepEqual(payload.tasks[1], untouched);
+  });
+
+  test(`${path} names new writes without treating unrelated snapshot tasks as edited`, async () => {
+    const untouched = { id: 'TPT99', title: 'Unrelated', description: 'Body', status: 'in_progress', priority: 1 };
+    const payload = await fixture([newCard()], { tasks: [untouched] }).save(bulk);
+    assert.deepEqual(payload.writeTaskIds, ['TPT1']);
+    assert.deepEqual(payload.taskBases, []);
+    assert.deepEqual(payload.newTaskIds, ['TPT1']);
+  });
   test(`${path} persists dropped screenshot Figma URL and image, idempotently`, async () => {
     const card = newCard();
     const f = fixture([card]);

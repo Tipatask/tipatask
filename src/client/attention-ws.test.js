@@ -345,6 +345,18 @@ test('session-queue-state updates the queue and refetches sessions only when a t
   globalThis.window.TipTask.fetchActiveSessions = async () => {};
 });
 
+test('cowboy-chain-started refetches sessions and repaints without raising attention (TPT9162)', async () => {
+  let fetched = 0;
+  globalThis.window.TipTask.fetchActiveSessions = async () => { fetched++; };
+  assert.equal(handleAttentionMessage({ type: 'cowboy-chain-started', projectPath: '', taskId: 'C1', started: ['C2', 'C3'] }), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fetched, 1);
+  assert.equal(updateClaudeButtonsCount, 1);
+  assert.equal(state.attentionSessions.has('C2'), false);
+  assert.equal(constructorCount, 0);
+  globalThis.window.TipTask.fetchActiveSessions = async () => {};
+});
+
 // ── Exit backstop frame (TPT613) ──
 const leftFrame = (taskId, exitId) => ({
   type: 'task-left-uncommitted', projectPath: '', taskId, exitId, status: 'on_fire', nudgeCount: 1, agent: 'claude',
@@ -436,4 +448,44 @@ test('template.html dispatches task-left-uncommitted on the browser __board__ so
   const { readFileSync } = await import('node:fs');
   const html = readFileSync(new URL('./template.html', import.meta.url), 'utf8');
   assert.match(html, /if \(msg\.type === 'task-left-uncommitted'\) \{[\s\S]{0,400}?TipTask\.attentionWs\.handleAttentionMessage\(msg\);\s*return;\s*\}/);
+});
+
+// (TPT9116) The project's chat history index changed: in Electron this socket hands the frame to
+// task-chat.js; browser mode leaves it to the __board__ socket (template.html) so it runs once.
+test('chat-history-updated on the __attention__ socket reaches task-chat.js in Electron only', async () => {
+  const { connectAttentionWs, closeAttentionWs } = await import('./attention-ws.js');
+  const sockets = [];
+  const hadWebSocket = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket');
+  Object.defineProperty(globalThis, 'WebSocket', {
+    configurable: true,
+    writable: true,
+    value: class {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
+      close() { this.readyState = 3; }
+    },
+  });
+  globalThis.location = { protocol: 'http:', host: 'localhost:4455', search: '' };
+  const seen = [];
+  window.TipTask.taskChat = { historyUpdated: msg => seen.push(msg) };
+  const frame = { type: 'chat-history-updated', historyId: 'h1', kind: 'task', taskKey: 'TPT1', projectId: '2' };
+  try {
+    window.electronAPI = { api: {} };
+    connectAttentionWs();
+    sockets.at(-1).onmessage({ data: JSON.stringify(frame) });
+    assert.deepEqual(seen, [frame]);
+    closeAttentionWs();
+    delete window.electronAPI;
+    connectAttentionWs();
+    sockets.at(-1).onmessage({ data: JSON.stringify(frame) });
+    assert.equal(seen.length, 1, 'browser mode: the __board__ socket dispatches it instead');
+  } finally {
+    closeAttentionWs();
+    delete window.electronAPI;
+    delete window.TipTask.taskChat;
+    delete globalThis.location;
+    if (hadWebSocket) Object.defineProperty(globalThis, 'WebSocket', hadWebSocket);
+    else delete globalThis.WebSocket;
+  }
 });

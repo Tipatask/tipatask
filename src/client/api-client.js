@@ -417,4 +417,17 @@ export const api = {
     if (!res.ok) throw await _transcribeError(res);
     return res.json();
   },
+  // (TPT9157) Thank You voice mode: the single cleanup pass over a finished dictation before it
+  // is inserted (POST /api/voice/cleanup → voice-cleanup.js). Always a direct fetch, like
+  // transcribeAudio above. Never rejects: an HTTP error, no answer at all or an unusable body
+  // resolves to the raw text, so a failed cleanup never loses the recording.
+  async cleanupVoiceTranscript(text, language) {
+    try {
+      const data = await _http('POST', '/api/voice/cleanup', { text, language });
+      return typeof data?.text === 'string' && data.text.trim() ? data.text : text;
+    } catch (err) {
+      console.warn('[voice] transcript cleanup failed, keeping the raw text:', err?.message || err);
+      return text;
+    }
+  },
 };

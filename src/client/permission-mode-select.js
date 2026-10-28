@@ -59,6 +59,8 @@ export function bindPermissionModeSelect(host, onChange) {
   // Below the trigger, left/width from it; above it when the room below runs out and there is
   // more above. max-height is the free room in that direction, so a cramped viewport scrolls the
   // list inside the menu instead of cutting it. Re-run on capture-phase scroll and on resize.
+  // A menu a stylesheet min-width makes wider than its trigger (the terminal header's compact
+  // live selector, TPT9139) shifts left rather than run off the viewport's right edge.
   function place() {
     if (!trigger.isConnected || !trigger.getClientRects().length) { close(); return; }
     const rect = trigger.getBoundingClientRect();
@@ -66,8 +68,10 @@ export function bindPermissionModeSelect(host, onChange) {
     const above = rect.top - MENU_GAP - MENU_EDGE;
     const need = menu.scrollHeight + menu.offsetHeight - menu.clientHeight;
     const flip = need > below && above > below;
-    menu.style.left = `${rect.left}px`;
     menu.style.width = `${rect.width}px`;
+    const width = Math.max(rect.width, menu.offsetWidth);
+    const overflow = rect.left + width > view.innerWidth - MENU_EDGE;
+    menu.style.left = `${overflow ? Math.max(MENU_EDGE, view.innerWidth - width - MENU_EDGE) : rect.left}px`;
     menu.style.maxHeight = `${Math.max(flip ? above : below, MENU_MIN_HEIGHT)}px`;
     menu.style.top = flip ? 'auto' : `${rect.bottom + MENU_GAP}px`;
     menu.style.bottom = flip ? `${view.innerHeight - rect.top + MENU_GAP}px` : 'auto';

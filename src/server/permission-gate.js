@@ -4,7 +4,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomBytes, randomUUID } = require('node:crypto');
-const { READ_TASK_TOOLS, READ_LOCAL_TOOLS } = require('./permission-policy');
+const { READ_TASK_TOOLS, READ_LOCAL_TOOLS, gatePolicy, modeSwitchError } = require('./permission-policy');
 
 const READ_TOOLS = new Set(['Read', 'Glob', 'Grep', 'read', 'grep', 'find', 'ls', 'view_image']);
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'edit', 'write', 'apply_patch']);
@@ -66,8 +66,8 @@ function workspaceEdit(input, root) {
 
 function assessAction(mode, name, input, root) {
   if (mode === 'bypass') return 'allow';
-  // Delegation can create an unguarded child; only Bypass permits it. Plan-mode
-  // changes happen through a new launch, never from model output or a tool call.
+  // Delegation can create an unguarded child; only Bypass permits it. Mode changes come
+  // from a new launch or the user's live session control, never from model output or a tool call.
   if (BLOCKED_DELEGATION.has(name)) return 'deny';
   const read = knownReadTool(name)
     || (['Bash', 'bash', 'exec_command', 'shell_command'].includes(name) && isReadCommand(input?.command ?? input?.cmd));
@@ -81,33 +81,125 @@ function assessAction(mode, name, input, root) {
   return 'ask';
 }
 
-function hookResult(allow, reason) {
-  return { hookSpecificOutput: { hookEventName: 'PreToolUse',
-    permissionDecision: allow ? 'allow' : 'deny', permissionDecisionReason: reason } };
+// Every gate answer: `decision` (allow | deny) and the confirmed `mode` it was made under, plus
+// the same verdict in Claude's PreToolUse hook shape for hook-format clients.
+function decisionBody(decision, mode, reason) {
+  return { decision, mode, reason, hookSpecificOutput: { hookEventName: 'PreToolUse',
+    permissionDecision: decision === 'allow' ? 'allow' : 'deny', permissionDecisionReason: reason } };
 }
 
+const PLAN_DENIED = 'Blocked: Plan mode allows only read-only tools until the plan is approved.';
+const HELD_POLL_MS = 250;
+
 async function createPermissionGate(session, { root, changed = () => {}, timeoutMs = 600000,
-  attentionText = 'Permission approval required.' } = {}) {
+  attentionText = 'Permission approval required.', onDecision = () => {} } = {}) {
   const token = randomBytes(32).toString('hex');
   const pending = new Map();
+  // Tool calls that arrived during a live switch. They wait for it to settle and are then
+  // decided under whichever mode is confirmed — never under the requested one before then.
+  const held = new Set();
+  let expected = null;
+  let heldTimer = null;
   let closed = false;
   const gate = {
     ready: false,
     snapshot: () => pending.values().next().value?.public || null,
     answer(id, allow) {
       const request = pending.get(id);
-      if (!request || typeof allow !== 'boolean' || closed) return false;
+      if (!request || typeof allow !== 'boolean' || closed || session.permissionMode?.pending) return false;
       request.finish(allow, allow ? 'Approved for this action.' : 'Denied by user.');
       return true;
+    },
+    cancelPending(reason = 'Permission mode changed. Retry the action.') {
+      for (const request of [...pending.values()]) request.finish(false, reason);
+    },
+    // A live switch to `mode` waits for the provider's confirmation: the gate extension's report
+    // (UserPromptSubmit naming `mode`) that the switch directive submitted after markSubmitted()
+    // reached this run. That report is the first gate answer under the requested mode. The
+    // promise rejects on timeout, a newer switch or close; enforcement only changes when the
+    // caller then confirms the mode on the session.
+    expectModeSwitch(mode, { timeoutMs: confirmMs = 60000 } = {}) {
+      expected?.fail(modeSwitchError('session_changed'));
+      let resolve;
+      let reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      const settle = (fn, value) => {
+        if (expected !== handle) return;
+        expected = null;
+        clearTimeout(timer);
+        fn(value);
+      };
+      const handle = {
+        mode, submitted: false, promise,
+        markSubmitted() { if (expected === handle) handle.submitted = true; },
+        confirm() { settle(resolve, mode); },
+        fail(err) { settle(reject, err); },
+      };
+      expected = handle;
+      const timer = setTimeout(() => handle.fail(modeSwitchError('unconfirmed')), confirmMs);
+      timer.unref?.();
+      if (closed) handle.fail(modeSwitchError('session_changed'));
+      return handle;
+    },
+    // Re-decides held tool calls once no switch is pending; terminal-session.js calls this on
+    // every permission-mode state change, with a poll as the fallback.
+    policyChanged() {
+      for (const entry of [...held]) {
+        if (closed) entry.end('Permission session ended.');
+        else if (Date.now() >= entry.deadline) entry.end('Permission mode change did not finish. Retry the action.');
+        else if (!session.permissionMode?.pending) entry.release();
+      }
+      if (held.size && !heldTimer && !closed) {
+        heldTimer = setTimeout(() => { heldTimer = null; gate.policyChanged(); }, HELD_POLL_MS);
+        heldTimer.unref?.();
+      }
     },
     close() {
       if (closed) return;
       closed = true;
+      expected?.fail(modeSwitchError('session_changed'));
       for (const request of [...pending.values()]) request.finish(false, 'Permission session ended.');
+      clearTimeout(heldTimer);
+      heldTimer = null;
+      gate.policyChanged();
       server.close();
       server.closeAllConnections();
     },
   };
+  const report = info => { try { onDecision(info); } catch { /* observers never block a decision */ } };
+  function decide(event, reply, res) {
+    const policy = gatePolicy(session);
+    const respond = (decision, reason) => {
+      report({ tool: event.tool_name, input: event.tool_input, decision, mode: policy.mode });
+      reply(200, decisionBody(decision, policy.mode, reason));
+    };
+    if (policy.assess === 'approved') return respond('allow', 'Allowed: the plan was approved.');
+    const decision = assessAction(policy.assess, event.tool_name, event.tool_input, root);
+    if (decision === 'allow') return respond('allow', 'Allowed by the run permission policy.');
+    if (decision === 'deny') return respond('deny', policy.assess === 'plan' ? PLAN_DENIED
+      : `Blocked by the run permission policy (${policy.mode}).`);
+    if (pending.size >= 16) return respond('deny', 'Too many pending permission requests.');
+    const id = randomUUID();
+    let timer;
+    const request = {
+      public: { id, tool: event.tool_name, input: JSON.stringify(event.tool_input ?? {}).slice(0, 12000) },
+      finish(allow, reason) {
+        if (!pending.delete(id)) return;
+        clearTimeout(timer);
+        const decided = allow ? 'allow' : 'deny';
+        const { mode } = gatePolicy(session);
+        report({ tool: event.tool_name, input: event.tool_input, decision: decided, mode, prompted: true });
+        reply(200, decisionBody(decided, mode, reason));
+        changed();
+      },
+    };
+    pending.set(id, request);
+    timer = setTimeout(() => request.finish(false, 'Approval expired. Retry the action.'), timeoutMs);
+    timer.unref?.();
+    res.on('close', () => request.finish(false, 'Approval connection closed.'));
+    changed();
+    session.onAttentionNeeded?.({ kind: 'attention', promptText: attentionText });
+  }
   const server = http.createServer(async (req, res) => {
     const reply = (code, data) => { if (!res.destroyed) { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); } };
     if (closed || req.method !== 'POST' || req.url !== '/check'
@@ -121,32 +213,31 @@ async function createPermissionGate(session, { root, changed = () => {}, timeout
       }
       event = JSON.parse(body);
     } catch { return reply(400, { error: 'Invalid request' }); }
+    if (!event || typeof event !== 'object') return reply(400, { error: 'Invalid event' });
     if (event.hook_event_name === 'SessionStart') {
       gate.ready = true;
-      return reply(200, {});
+      return reply(200, { mode: gatePolicy(session).mode });
+    }
+    // The extension reports a submitted mode-switch directive. It never changes a mode itself:
+    // it only confirms a switch the user requested and this session already submitted.
+    if (event.hook_event_name === 'UserPromptSubmit') {
+      const target = expected;
+      if (target?.submitted && event.permission_mode === target.mode) {
+        target.confirm();
+        return reply(200, { decision: 'allow', mode: target.mode, reason: 'Permission mode change delivered.' });
+      }
+      return reply(200, { decision: 'allow', mode: gatePolicy(session).mode, reason: 'Input accepted.' });
     }
     if (event.hook_event_name !== 'PreToolUse' || typeof event.tool_name !== 'string') return reply(400, { error: 'Invalid event' });
-    const decision = assessAction(session.permissionPolicy.mode, event.tool_name, event.tool_input, root);
-    if (decision !== 'ask') return reply(200, hookResult(decision === 'allow', decision === 'allow'
-      ? 'Allowed by the run permission policy.' : 'Blocked by the run permission policy.'));
-    if (pending.size >= 16) return reply(200, hookResult(false, 'Too many pending permission requests.'));
-    const id = randomUUID();
-    let timer;
-    const request = {
-      public: { id, tool: event.tool_name, input: JSON.stringify(event.tool_input ?? {}).slice(0, 12000) },
-      finish(allow, reason) {
-        if (!pending.delete(id)) return;
-        clearTimeout(timer);
-        reply(200, hookResult(allow, reason));
-        changed();
-      },
+    if (!session.permissionMode?.pending) return decide(event, reply, res);
+    const entry = {
+      deadline: Date.now() + timeoutMs,
+      release() { held.delete(entry); decide(event, reply, res); },
+      end(reason) { held.delete(entry); reply(200, decisionBody('deny', gatePolicy(session).mode, reason)); },
     };
-    pending.set(id, request);
-    timer = setTimeout(() => request.finish(false, 'Approval expired. Retry the action.'), timeoutMs);
-    timer.unref?.();
-    res.on('close', () => request.finish(false, 'Approval connection closed.'));
-    changed();
-    session.onAttentionNeeded?.({ kind: 'attention', promptText: attentionText });
+    held.add(entry);
+    res.on('close', () => held.delete(entry));
+    gate.policyChanged();
   });
   await new Promise((resolve, reject) => {
     server.once('error', reject);

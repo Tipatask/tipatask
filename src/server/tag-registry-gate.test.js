@@ -90,10 +90,9 @@ test('unregisteredTagError: message names the tag(s), the project id, the regist
   assert.match(err.message, /create_system_tag/);
 });
 
-test('selectTasksToWrite: excludes an unchanged carried-over task (the objective-parent-task.js `tags: []` scenario) but includes new/modified/live-less tasks', () => {
-  const tasksDiffer = (incoming, live) => {
-    if (!live) return true;
-    return JSON.stringify(incoming.tags || []) !== JSON.stringify(live.tags || []);
+test('selectTasksToWrite gates only intended edits and new tasks, returning patches for existing rows', () => {
+  const changedFields = (incoming, base) => {
+    return JSON.stringify(incoming.tags || []) !== JSON.stringify(base.tags || []) ? { tags: incoming.tags } : {};
   };
   const parsedById = new Map([
     ['C1', { id: 'C1', tags: ['stale-deleted-tag'] }],   // unchanged carried-over — must be EXCLUDED
@@ -108,9 +107,12 @@ test('selectTasksToWrite: excludes an unchanged carried-over task (the objective
   ]);
   const newTaskIdSet = new Set(['C3']);
 
-  const result = selectTasksToWrite(parsedById, liveById, newTaskIdSet, tasksDiffer);
+  const result = selectTasksToWrite(parsedById, liveById, newTaskIdSet, changedFields, {
+    writeTaskIds: ['C2', 'C4'], taskBases: [{ id: 'C2', tags: ['old-tag'] }],
+  });
   const ids = result.map(([id]) => id);
   assert.deepEqual(ids.sort(), ['C2', 'C3', 'C4']);
+  assert.deepEqual(result.find(([id]) => id === 'C2')[1], { tags: ['bugfix'] });
 });
 
 // ── TPT623: automatic registration of unknown tags ──

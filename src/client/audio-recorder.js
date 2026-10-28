@@ -1,6 +1,6 @@
 import { api } from './api-client.js';
-import { createLiveInserter, showToast } from './utils.js';
-import { t } from './i18n.js';
+import { createLiveInserter, showToast, showProgressToast } from './utils.js';
+import { t, getLocale } from './i18n.js';
 import { createVoiceStream } from './voice-stream.js';
 import { transcribeErrorMessage } from './voice-errors.js';
 import { isVoiceInputReady, voiceModelStateLabelKey } from './voice-model-state.js';
@@ -12,6 +12,12 @@ import {
   matchesVoiceShortcut as pureMatchesVoiceShortcut,
   voiceShortcutLabel as pureVoiceShortcutLabel,
 } from './voice-shortcut.js';
+import { DEFAULT_VOICE_MODE, normalizeVoiceMode } from './voice-mode.js';
+import { createStopPhraseDetector, stopPhraseLabel, stripStopPhrase } from './voice-stop-phrase.js';
+import {
+  formatRecordingTime, waveLevelFromRms, smoothWaveLevel, advanceWavePhase, wavePoints, placeVoiceWidget,
+} from './voice-widget.js';
+import { frameLevel } from './pcm.js';
 
 // (C1185, arm-on-speech logic moved to voice-silence.js in C1206) Silence auto-stop — recording
 // stops after this much continuous below-threshold mic level ONCE at least one above-threshold
@@ -128,23 +134,56 @@ export function resolveVoiceTarget() {
   return null;
 }
 
-// ── Recording toast (C1175) ─────────────────────────────────────────────────
-// One bottom-right pill that lives for the whole recording and pulses, so an open
-// mic is never missed when the button itself is off-screen (minimized terminal,
-// scrolled form) or was never looked at (Cmd/Ctrl+Shift+Space start).
-// Ref-counted: the terminal mic and a field mic can be live simultaneously — the
-// toast only leaves when the last recorder stops.
+// ── Recording widget (C1175, bottom-center waveform TPT9165) ───────────────
+// One bottom-center card that lives for the whole recording — pulsing dot, mm:ss timer, a wave
+// line that follows the mic's loudness, and a Stop button — so an open mic is never missed when
+// the button itself is off-screen (minimized terminal, scrolled form) or was never looked at
+// (shortcut start). Ref-counted: the terminal mic and a field mic can be live simultaneously —
+// each live recording holds one entry ({ stop, tap }) and the card only leaves when the last one
+// stops. The pure timer/wave/placement math lives in voice-widget.js.
+const _recToastEntries = new Set();
 let _recToastEl = null;
-let _recToastCount = 0;
+let _recToastFadingEl = null;
 let _recToastRemoveTimer = 0;
+let _recToastStartedAt = 0;
+let _recToastTicker = 0;
+let _waveRaf = 0;
+let _waveLevel = 0;
+let _wavePhase = 0;
+let _waveLastFrame = 0;
+let _waveStyle = null;
 
-export function showRecordingToast() {
-  _recToastCount += 1;
+// Surfaces the card keeps clear of (voice-widget.js's placeVoiceWidget()): the bottom-docked
+// composers, the bulk bar, the bottom-right notification column and corner toasts.
+const VOICE_WIDGET_OBSTACLES = [
+  '.chat-input-area', '.task-chat-footer', '.new-task-composer-card', '.bulk-action-bar',
+  '.agent-notice-toast', '#tt-notif-stack', '#tt-desktop-notif-panel', '#tt-saving-indicator',
+  '.tt-saving-indicator--toast', '#api-status-banner',
+].join(', ');
+// A terminal's prompt sits in its last rows (the agent's input box and footer), where dictated
+// text lands: that band of the terminal stays uncovered too.
+const TERMINAL_PROMPT_BAND = 144;
+// Room kept above and below the line's peaks for the stroke and its blurred glow.
+const WAVE_PAD = 6;
+// :root's --c-voice-wave-from/-to, for a canvas that cannot read or parse the tokens.
+const WAVE_FALLBACK = ['#8467d8', '#c2549c'];
+
+function prefersReducedMotion() {
+  try { return !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches; } catch { return false; }
+}
+
+// `entry` is the recording's own slot ({ stop, tap }, see createVoiceRecorder()); returned so the
+// caller hands the same object back to hideRecordingToast().
+export function showRecordingToast(entry = {}) {
+  _recToastEntries.add(entry);
   // Guard on createElement, not just `document` — same reasoning as
   // notification-center.js#_render(): unit tests stub a minimal document.
-  if (typeof document === 'undefined' || typeof document.createElement !== 'function') return;
-  if (_recToastEl) return;
+  if (typeof document === 'undefined' || typeof document.createElement !== 'function') return entry;
+  if (_recToastEl) return entry;
+  // A card still fading out from the previous recording goes now, so two never share the id.
   if (_recToastRemoveTimer) { clearTimeout(_recToastRemoveTimer); _recToastRemoveTimer = 0; }
+  if (_recToastFadingEl) { _recToastFadingEl.remove(); _recToastFadingEl = null; }
+  const shortcut = voiceShortcutLabel();
   const el = document.createElement('div');
   el.id = 'voice-rec-toast';
   el.setAttribute('role', 'status');
@@ -152,23 +191,223 @@ export function showRecordingToast() {
   const dot = document.createElement('span');
   dot.className = 'voice-rec-dot';
   dot.setAttribute('aria-hidden', 'true');
+  // Ticks every second: kept out of the live region's announcements.
+  const timer = document.createElement('span');
+  timer.className = 'voice-rec-timer';
+  timer.setAttribute('role', 'timer');
+  timer.setAttribute('aria-live', 'off');
+  timer.textContent = formatRecordingTime(0);
+  const wave = document.createElement('canvas');
+  wave.className = 'voice-rec-wave';
+  wave.setAttribute('aria-hidden', 'true');
+  const stopBtn = document.createElement('button');
+  stopBtn.type = 'button';
+  stopBtn.className = 'voice-rec-stop';
+  setMicButtonLabel(stopBtn, t('voice.stopRecording', { shortcut }));
+  stopBtn.innerHTML = '<span class="voice-rec-stop-glyph" aria-hidden="true"></span>';
+  // Same as the mic buttons (C1212): never take focus from the field being dictated into.
+  stopBtn.addEventListener('mousedown', e => e.preventDefault());
+  stopBtn.addEventListener('click', stopAllRecordings);
+  // What a screen reader hears when the card appears (first, before the button's name); the
+  // card shows no words of its own.
   const label = document.createElement('span');
-  label.textContent = t('voice.recordingToast', { shortcut: voiceShortcutLabel() });
-  el.append(dot, label);
+  label.className = 'voice-rec-label';
+  label.textContent = t('voice.recordingToast', { shortcut });
+  el.append(label, dot, timer, wave, stopBtn);
   document.body.appendChild(el);
   _recToastEl = el;
+  _recToastStartedAt = Date.now();
+  placeRecordingToast();
+  _recToastTicker = window.setInterval(tickRecordingToast, 250);
+  window.addEventListener('resize', placeRecordingToast);
+  startVoiceWave();
   // rAF reveal — same idiom as showCornerBadge() in utils.js and
   // notification-center.js's `.is-shown`.
   requestAnimationFrame(() => el.classList.add('voice-toast-active'));
+  return entry;
 }
 
-export function hideRecordingToast() {
-  if (_recToastCount > 0) _recToastCount -= 1;
-  if (_recToastCount > 0 || !_recToastEl) return;
+export function hideRecordingToast(entry) {
+  if (_recToastEntries.delete(entry)) closeVoiceWaveTap(entry.tap);
+  if (_recToastEntries.size > 0 || !_recToastEl) return;
+  stopVoiceWave();
+  window.clearInterval(_recToastTicker);
+  _recToastTicker = 0;
+  window.removeEventListener('resize', placeRecordingToast);
   const el = _recToastEl;
   _recToastEl = null;
+  _recToastFadingEl = el;
   el.classList.remove('voice-toast-active');
-  _recToastRemoveTimer = setTimeout(() => { el.remove(); _recToastRemoveTimer = 0; }, 200);
+  _recToastRemoveTimer = setTimeout(() => {
+    el.remove();
+    if (_recToastFadingEl === el) _recToastFadingEl = null;
+    _recToastRemoveTimer = 0;
+  }, 200);
+}
+
+// The card's Stop button: ends every live recording, each through its own stop() — the same
+// path as its mic button or the shortcut, so each one still transcribes and lands where it would.
+function stopAllRecordings() {
+  for (const entry of [..._recToastEntries]) {
+    if (typeof entry.stop === 'function') entry.stop();
+  }
+}
+
+function tickRecordingToast() {
+  if (!_recToastEl) return;
+  const timer = _recToastEl.querySelector('.voice-rec-timer');
+  const text = formatRecordingTime(Date.now() - _recToastStartedAt);
+  if (timer && timer.textContent !== text) timer.textContent = text;
+  placeRecordingToast();
+  // A static (reduced-motion) line follows the card's width without a frame loop.
+  if (!_waveRaf) paintVoiceWave(0, 0);
+}
+
+// Viewport rects of everything visible the card must not cover — see VOICE_WIDGET_OBSTACLES.
+// The focused text field counts too: whatever is being dictated into stays in view.
+function voiceWidgetObstacles() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const rects = [];
+  const add = (r) => {
+    if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw) rects.push(r);
+  };
+  for (const el of document.querySelectorAll(VOICE_WIDGET_OBSTACLES)) add(el.getBoundingClientRect());
+  const active = document.activeElement;
+  if (active && (active.matches?.('textarea, input') || active.isContentEditable) && !active.classList.contains('xterm-helper-textarea')) {
+    add(active.getBoundingClientRect());
+  }
+  for (const body of document.querySelectorAll('.terminal-body')) {
+    const r = body.getBoundingClientRect();
+    const band = Math.min(TERMINAL_PROMPT_BAND, r.height * 0.35);
+    add({ left: r.left, right: r.right, top: r.bottom - band, bottom: r.bottom, width: r.width, height: band });
+  }
+  return rects;
+}
+
+function placeRecordingToast() {
+  const el = _recToastEl;
+  if (!el || !window.innerWidth || !window.innerHeight) return;
+  const { bottom, width } = placeVoiceWidget({
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    height: el.offsetHeight,
+    obstacles: voiceWidgetObstacles(),
+  });
+  el.style.setProperty('--voice-rec-bottom', `${bottom}px`);
+  el.style.setProperty('--voice-rec-width', `${width}px`);
+}
+
+// ── Recording widget wave (TPT9165) ─────────────────────────────────────────
+// Each recording opens a visual-only level tap on its own mic stream: an AudioContext with an
+// AnalyserNode that is never connected to the speakers. It only paints the wave — the silence
+// watchdog keeps reading voice-stream.js's level, which does not stall with the frame loop. Null
+// where Web Audio is missing (unit-test DOMs); the line then stays flat.
+function openVoiceWaveTap(stream) {
+  const Ctx = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext);
+  if (!Ctx || !stream) return null;
+  try {
+    const ctx = new Ctx();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    return { ctx, source, analyser, samples: new Float32Array(analyser.fftSize) };
+  } catch (err) {
+    console.warn('[voice] waveform analyser unavailable —', err?.message || err);
+    return null;
+  }
+}
+
+function closeVoiceWaveTap(tap) {
+  if (!tap) return;
+  try { tap.source.disconnect(); } catch {}
+  try { Promise.resolve(tap.ctx.close()).catch(() => {}); } catch {}
+}
+
+function voiceWaveTapRms(tap) {
+  tap.analyser.getFloatTimeDomainData(tap.samples);
+  return frameLevel(tap.samples).rms;
+}
+
+function startVoiceWave() {
+  if (_waveRaf) return;
+  _waveLevel = 0;
+  _wavePhase = 0;
+  _waveLastFrame = 0;
+  _waveStyle = null;
+  // No 2D canvas (unit-test DOMs): nothing to draw, so no frame loop either.
+  if (!paintVoiceWave(0, 0)) return;
+  // Reduced motion keeps the flat line just drawn; the pulse and fades stop in CSS.
+  if (prefersReducedMotion()) return;
+  _waveRaf = requestAnimationFrame(drawVoiceWave);
+}
+
+function stopVoiceWave() {
+  if (_waveRaf) cancelAnimationFrame(_waveRaf);
+  _waveRaf = 0;
+  _waveStyle = null;
+}
+
+// One frame of the wave: the loudest live tap's RMS sets the target level, the shown level eases
+// toward it (quick attack, slower release, so a quiet mic settles to a flat line), the curve
+// drifts sideways and is repainted. Re-schedules itself until hideRecordingToast() cancels it.
+function drawVoiceWave(now) {
+  _waveRaf = 0;
+  if (!_recToastEl) return;
+  const dt = _waveLastFrame ? Math.min(now - _waveLastFrame, 250) : 16;
+  _waveLastFrame = now;
+  let rms = 0;
+  for (const entry of _recToastEntries) {
+    if (entry.tap) rms = Math.max(rms, voiceWaveTapRms(entry.tap));
+  }
+  _waveLevel = smoothWaveLevel(_waveLevel, waveLevelFromRms(rms), dt);
+  _wavePhase = advanceWavePhase(_wavePhase, _waveLevel, dt);
+  paintVoiceWave(_waveLevel, _wavePhase);
+  _waveRaf = requestAnimationFrame(drawVoiceWave);
+}
+
+// Paints the wave at `level`/`phase` on the card's canvas, sized for the device pixel ratio, in a
+// left-to-right gradient between the --c-voice-wave-from/-to theme tokens (read live, so a theme
+// switch mid-recording repaints in the new colours). A blurred wider pass under the line gives it
+// its soft glow. False when there is no canvas to paint on.
+function paintVoiceWave(level, phase) {
+  const canvas = _recToastEl && _recToastEl.querySelector('.voice-rec-wave');
+  const g = canvas && canvas.getContext ? canvas.getContext('2d') : null;
+  if (!g) return false;
+  const cssW = canvas.clientWidth;
+  const cssH = canvas.clientHeight;
+  if (!cssW || !cssH) return true;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(cssW * dpr);
+  const h = Math.round(cssH * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, cssW, cssH);
+  _waveStyle ??= window.getComputedStyle(canvas);
+  const gradient = g.createLinearGradient(0, 0, cssW, 0);
+  try {
+    gradient.addColorStop(0, _waveStyle.getPropertyValue('--c-voice-wave-from').trim() || WAVE_FALLBACK[0]);
+    gradient.addColorStop(1, _waveStyle.getPropertyValue('--c-voice-wave-to').trim() || WAVE_FALLBACK[1]);
+  } catch {
+    gradient.addColorStop(0, WAVE_FALLBACK[0]);
+    gradient.addColorStop(1, WAVE_FALLBACK[1]);
+  }
+  const points = wavePoints(cssW, cssH, level, phase, { pad: WAVE_PAD });
+  g.lineCap = 'round';
+  g.lineJoin = 'round';
+  g.strokeStyle = gradient;
+  for (const [alpha, width, filter] of [[0.3, 5, 'blur(2px)'], [1, 2.25, 'none']]) {
+    g.filter = filter;
+    g.globalAlpha = alpha;
+    g.lineWidth = width;
+    g.beginPath();
+    points.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
+    g.stroke();
+  }
+  g.globalAlpha = 1;
+  return true;
 }
 
 // (C1185) Silence-countdown hint shown inside the toast for the last SILENCE_HINT_MS of the
@@ -179,7 +418,7 @@ export function setRecordingToastHint(text) {
   if (!_recToastEl) return;
   let hintEl = _recToastEl.querySelector('.voice-rec-hint');
   if (!text) {
-    if (hintEl) hintEl.remove();
+    if (hintEl) { hintEl.remove(); placeRecordingToast(); }
     return;
   }
   if (!hintEl) {
@@ -187,7 +426,12 @@ export function setRecordingToastHint(text) {
     hintEl.className = 'voice-rec-hint';
     _recToastEl.appendChild(hintEl);
   }
-  hintEl.textContent = text;
+  // Callers re-send the same hint on every level frame; rewriting identical text would make
+  // the polite live region announce it again.
+  if (hintEl.textContent !== text) {
+    hintEl.textContent = text;
+    placeRecordingToast(); // (TPT9165) the hint row changes the card's height
+  }
 }
 
 // ── Voice input availability (C1199) ────────────────────────────────────────
@@ -265,6 +509,15 @@ export function setVoiceInputAvailability(voicePreset, models, selectedModelId) 
 let _voiceInputDeviceId = '';
 export function setVoiceInputDeviceId(id) { _voiceInputDeviceId = id || ''; }
 
+// (TPT9156) Voice mode (Settings > Voice > Mode, `voiceMode` in .tipatask/config.json) —
+// 'standard' or 'thankyou', see voice-mode.js. Same "module-level store + setter, fanned out
+// from task-board.js" shape as setVoiceShortcut()/setVoiceInputDeviceId(): read at call time,
+// never cached, so a mic already on the page follows a settings change with no re-wiring.
+// Anything else normalizes to 'standard'.
+let _voiceMode = DEFAULT_VOICE_MODE;
+export function setVoiceMode(mode) { _voiceMode = normalizeVoiceMode(mode); }
+export function getVoiceMode() { return _voiceMode; }
+
 // (C1204) Whether ANY mic on the page is mid-recording or mid-finish right now — used by
 // task-board.js's device-list label-unlock (a throwaway getUserMedia() to reveal real device
 // names, see voice-devices.js#labelsUnlocked) to avoid opening a second capture while one is
@@ -297,12 +550,37 @@ export function isAnyVoiceCaptureActive() {
 // a dead mic never auto-stops on that timer — it keeps recording until the user gives up. The
 // last few seconds of an armed countdown show a "stopping in Ns…" hint on the recording toast;
 // before that first speech, a distinct "no sound yet" hint fills the same slot instead.
+//
+// (TPT9158) Everything above is Standard mode. A recording started while getVoiceMode() is
+// 'thankyou' runs in Thank You mode for its whole life: partials and finals are buffered
+// instead of reaching onPartial/onFinal, the silence watchdog never stops it, and it stops
+// when the live transcript ends with the stop phrase (voice-stop-phrase.js) or on a manual
+// stop. The buffered finals (or the batch fallback's transcript) then lose the stop phrase, go
+// through one api.cleanupVoiceTranscript() pass and reach onTranscript exactly once — see
+// finishThankYou() below.
 export function createVoiceRecorder({ button, iconSize = 14, onTranscript, onError, onPartial, onFinal, onSessionStart, onSessionEnd }) {
   let recorder = null;
   let stream = null;
   let chunks = [];
   let voiceStream = null;
   let streamingDelivered = false;
+  // (TPT9158) Thank You mode state, set afresh for every recording in start(). `stopLocale` is
+  // the project language the recording started in: it picks the stop phrase and is the cleanup
+  // pass's language hint. `restingHint` is what the toast's hint slot shows when no other hint
+  // applies (null in Standard mode, where an empty slot is the resting state).
+  let thankYou = false;
+  let stopLocale = 'en';
+  let stopDetector = null;
+  let heardFinals = [];
+  let heardPartial = '';
+  let stopPhraseHearable = true;
+  let restingHint = null;
+  let loadingHint = null;
+  let finishingToast = null;
+  // (TPT9165) This recording's slot in the shared recording widget: how the widget's Stop button
+  // stops it, and the analyser tap its wave reads. Opened after recorder.start(), handed back to
+  // hideRecordingToast() in the 'stop' listener, which closes the tap's AudioContext.
+  let toastEntry = null;
   // (C1206) Arm-on-speech silence watchdog — see voice-silence.js's header comment. Reset fresh
   // at the top of every start().
   const silenceWatchdog = createSilenceWatchdog();
@@ -360,14 +638,24 @@ export function createVoiceRecorder({ button, iconSize = 14, onTranscript, onErr
     button.innerHTML = MIC_SVG(iconSize);
     setMicButtonLabel(button, reason || micIdleLabel());
     // (C1200) setIdle() is the single point both the streaming-delivered early-return and the
-    // batch-fallback finally() converge on — i.e. "this recording is fully over, however it
-    // ended" — so it's the right place to fire onSessionEnd exactly once per recording.
+    // batch-fallback finally() converge on (TPT9158: and Thank You mode's finishThankYou()) —
+    // i.e. "this recording is fully over, however it ended" — so it's the right place to fire
+    // onSessionEnd exactly once per recording.
     if (onSessionEnd) onSessionEnd();
   }
 
   function handleLevel(rms) {
     const now = Date.now();
     const { armed, stop: shouldStop, hintSeconds } = silenceWatchdog.update(rms, now);
+    if (thankYou) {
+      if (!recorder) return; // already stopping — the toast may belong to another mic now
+      // The level is the stop-phrase detector's clock: a pending stop fires once the mic has
+      // been quiet long enough after the phrase (see createStopPhraseDetector()). The silence
+      // watchdog's own stop is ignored — pauses are part of a Thank You dictation.
+      if (stopDetector.level(rms, now)) { stop(); return; }
+      refreshThankYouHint();
+      return;
+    }
     if (!armed) {
       // (C1206) Not yet armed — nothing has crossed the speech threshold this recording, so the
       // watchdog itself is deliberately not counting down (see its header comment). Surface a
@@ -402,6 +690,106 @@ export function createVoiceRecorder({ button, iconSize = 14, onTranscript, onErr
       modelLoading: modelStillLoading,
     });
     onError ? onError(msg) : showToast(msg);
+  }
+
+  // (TPT9158) What a Thank You recording's toast hint slot shows right now: "no sound yet"
+  // while nothing has crossed the speech threshold past NO_SOUND_HINT_DELAY_MS (the same
+  // dead-mic signal as Standard mode), else the model-loading note, else the resting hint —
+  // the stop phrase to say, or the manual stop when the phrase cannot be heard. Never a
+  // silence countdown.
+  function refreshThankYouHint() {
+    if (!thankYou || !recorder) return;
+    const noSound = !silenceWatchdog.armed && Date.now() - recordingStartedAt >= NO_SOUND_HINT_DELAY_MS;
+    setRecordingToastHint(noSound ? t('voice.noSoundYet') : loadingHint || restingHint);
+  }
+
+  // (TPT9158) The stop phrase is only heard while the live transcript flows. A streaming
+  // failure points the resting hint at the manual stop; the next partial or final points it
+  // back, since not every voice:error ends the stream (a local decode error does not).
+  function setStopPhraseHearable(hearable) {
+    if (!thankYou || !recorder || hearable === stopPhraseHearable) return;
+    stopPhraseHearable = hearable;
+    const phrase = stopPhraseLabel(stopLocale);
+    if (hearable) {
+      restingHint = t('voice.sayStopPhrase', { phrase });
+    } else {
+      loadingHint = null; // a failed stream is no longer loading anything
+      restingHint = t('voice.stopPhraseUnavailable', { phrase, shortcut: voiceShortcutLabel() });
+    }
+    refreshThankYouHint();
+  }
+
+  // (TPT9158) Thank You mode's live transcript: every final so far plus the current partial,
+  // which no final has replaced yet. That partial stays part of it to the end: a recording
+  // whose last utterance is never finalized before the drain gives up keeps those words, as
+  // its live caption would in Standard mode.
+  function heardText() {
+    return [...heardFinals, heardPartial].map(text => (text || '').trim()).filter(Boolean).join(' ');
+  }
+
+  // (TPT9158) Thank You mode's onPartial/onFinal: buffer, then ask the detector whether the
+  // transcript now ends with the stop phrase. Only while recording — finals that arrive during
+  // the drain after stop() are just buffered.
+  function bufferHeard(text, final) {
+    if (final) { heardFinals.push(text); heardPartial = ''; }
+    else heardPartial = text || '';
+    if (!recorder) return;
+    setStopPhraseHearable(true);
+    if (stopDetector.heard(heardText(), { final, now: Date.now() })) stop();
+  }
+
+  // (TPT9158) Thank You mode puts nothing in the field until the transcript is complete and
+  // cleaned up, so each step of that wait is named on the busy mic and in a progress toast.
+  function showFinishingStep(label) {
+    button.classList.add('is-busy');
+    button.innerHTML = MIC_SVG(iconSize);
+    button.disabled = true;
+    setMicButtonLabel(button, label);
+    if (finishingToast) { finishingToast.update(label); return; }
+    try { finishingToast = showProgressToast(label); } catch { finishingToast = null; }
+  }
+
+  function closeFinishingToast() {
+    if (finishingToast) finishingToast.close();
+    finishingToast = null;
+  }
+
+  // (TPT9158) The end of every Thank You recording, however it stopped (stop phrase, manual
+  // stop, a caller tearing its mic down). Takes the buffered finals, or the batch transcript
+  // when streaming never finalized anything (the same fallback rule as Standard mode), removes
+  // the stop phrase, runs the one cleanup pass and hands the result to onTranscript once. The
+  // cleanup never rejects: on any failure it resolves to the text it was given.
+  async function finishThankYou(blob, streamOutcome) {
+    try {
+      let text = heardText();
+      if (!streamingDelivered) {
+        try {
+          const { transcript } = await api.transcribeAudio(blob);
+          if (transcript && transcript.trim()) text = transcript;
+        } catch (err) {
+          // A live partial is still better than losing the dictation to a failed batch leg.
+          if (!text) throw err;
+          console.warn('[voice] batch transcription failed, keeping the live transcript:', err?.message || err);
+        }
+      }
+      if (!text) {
+        closeFinishingToast();
+        reportNothingProduced(lastMicAccess, streamOutcome ? streamOutcome.micPeak : null);
+        return;
+      }
+      const dictation = stripStopPhrase(text, stopLocale);
+      if (!dictation) return; // only the stop phrase was said — nothing to insert
+      showFinishingStep(t('voice.cleaningUp'));
+      onTranscript(await api.cleanupVoiceTranscript(dictation, stopLocale));
+    } catch (err) {
+      closeFinishingToast();
+      const msg = transcribeErrorMessage(err);
+      onError ? onError(msg) : showToast(msg);
+    } finally {
+      closeFinishingToast();
+      finishing = false;
+      setIdle();
+    }
   }
 
   async function start() {
@@ -476,10 +864,21 @@ export function createVoiceRecorder({ button, iconSize = 14, onTranscript, onErr
       streamIssue = null;
       micWasMuted = false;
       modelStillLoading = false;
+      // (TPT9158) The mode and language a recording starts in hold until it ends, whatever
+      // Settings or the project language do meanwhile.
+      thankYou = getVoiceMode() === 'thankyou';
+      stopLocale = getLocale();
+      stopDetector = thankYou ? createStopPhraseDetector({ locale: stopLocale }) : null;
+      heardFinals = [];
+      heardPartial = '';
+      stopPhraseHearable = true;
+      restingHint = thankYou ? t('voice.sayStopPhrase', { phrase: stopPhraseLabel(stopLocale) }) : null;
+      loadingHint = null;
       recorder = new MediaRecorder(stream);
       recorder.addEventListener('dataavailable', e => { if (e.data.size > 0) chunks.push(e.data); });
       recorder.addEventListener('stop', async () => {
-        hideRecordingToast();
+        hideRecordingToast(toastEntry);
+        toastEntry = null;
         finishing = true;
         // Release the mic hardware immediately — unrelated to how long the WS drain below takes,
         // and the recording indicator (browser tab dot, OS mic light) should clear right away.
@@ -489,6 +888,7 @@ export function createVoiceRecorder({ button, iconSize = 14, onTranscript, onErr
         chunks = [];
         recorder = null;
         button.classList.remove('is-recording');
+        if (thankYou) showFinishingStep(t('voice.transcribing'));
         // (C1202) stop() is now async — it waits for the server's voice:done (capped, see
         // voice-stream.js's DRAIN_MS/DRAIN_MS_LOADING) instead of firing-and-forgetting a flat
         // 1500ms close. Show busy state for this whole wait, not just the batch-fallback leg
@@ -505,6 +905,10 @@ export function createVoiceRecorder({ button, iconSize = 14, onTranscript, onErr
           streamOutcome = await vs.stop();
         }
         setRecordingToastHint(null);
+        if (thankYou) {
+          await finishThankYou(blob, streamOutcome);
+          return;
+        }
         if (streamingDelivered) {
           // Streaming already delivered live text for this recording — the batch blob above is
           // redundant (would either duplicate the transcript or waste an API call).
@@ -528,7 +932,8 @@ export function createVoiceRecorder({ button, iconSize = 14, onTranscript, onErr
         }
       });
       recorder.start();
-      showRecordingToast();
+      toastEntry = showRecordingToast({ stop: () => stop(), tap: openVoiceWaveTap(stream) });
+      refreshThankYouHint();
       if (onSessionStart) onSessionStart();
       button.classList.add('is-recording');
       button.innerHTML = STOP_SVG(iconSize - 2);
@@ -538,24 +943,43 @@ export function createVoiceRecorder({ button, iconSize = 14, onTranscript, onErr
         // (C1202) Clears the loading hint the instant the recognizer's actually ready — matters
         // for a cold parakeet-v3 build that DOES finish mid-recording (not just the "gave up
         // while it was still loading" case reportNothingProduced() handles).
-        onReady: () => { modelStillLoading = false; setRecordingToastHint(null); },
+        onReady: () => {
+          modelStillLoading = false;
+          loadingHint = null;
+          if (thankYou) refreshThankYouHint(); // back to the stop-phrase hint, not an empty slot
+          else setRecordingToastHint(null);
+        },
         onLoading: payload => {
           modelStillLoading = true;
-          setRecordingToastHint(t('voice.loadingModel', { model: (payload && payload.modelId) || '' }));
+          loadingHint = t('voice.loadingModel', { model: (payload && payload.modelId) || '' });
+          if (thankYou) refreshThankYouHint();
+          else setRecordingToastHint(loadingHint);
         },
-        onPartial: text => { if (onPartial) onPartial(text); },
-        onFinal: text => { streamingDelivered = true; if (onFinal) onFinal(text); },
+        // (TPT9158) Thank You mode buffers both instead of inserting — see bufferHeard().
+        onPartial: text => {
+          if (thankYou) { bufferHeard(text, false); return; }
+          if (onPartial) onPartial(text);
+        },
+        onFinal: text => {
+          streamingDelivered = true;
+          if (thankYou) { bufferHeard(text, true); return; }
+          if (onFinal) onFinal(text);
+        },
         // (C1200) No immediate user-facing toast here — the MediaRecorder fallback above covers
         // both cases, and a voice:error/voice:unsupported the fallback goes on to cover
         // successfully is a non-event to the user. Console + streamIssue only; reportNothingProduced()
         // above is what turns this into a toast, and only if the fallback ALSO produces nothing.
+        // (TPT9158) In Thank You mode the toast hint does change: without a live transcript the
+        // stop phrase cannot be heard, so it points at the manual stop instead.
         onUnsupported: (reason, extra) => {
           console.warn('[voice] streaming unsupported —', reason, extra || '');
           if (!streamIssue) streamIssue = { kind: 'unsupported', message: reason };
+          setStopPhraseHearable(false);
         },
         onError: message => {
           console.warn('[voice] streaming error —', message);
           if (!streamIssue || streamIssue.kind !== 'error') streamIssue = { kind: 'error', message };
+          setStopPhraseHearable(false);
         },
         onLevel: handleLevel,
         // (C1202) The single most direct client-side signal of this task's root cause — a track

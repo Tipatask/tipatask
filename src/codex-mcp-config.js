@@ -10,8 +10,9 @@ const toml = require('toml');
 const TIPATASK_MCP_NAME = 'tipatask';
 // C1382 — the local-only companion server name. The remote 'tipatask' server (17
 // tools, api/src/routes/mcp.js) is now the primary registration; this stdio server
-// keeps only the 4 tools that need a repo checkout or git worktree (batch_grep_tags,
-// push_knowledge, pull_knowledge, git_worktree_status) — see tt-mcp-server.md.
+// keeps only the tools that need a repo checkout, git worktree or the local Task App
+// (batch_grep_tags, push_knowledge, pull_knowledge, git_worktree_status, complete_task,
+// start_next_tasks) — see tt-mcp-server.md.
 const TIPATASK_MCP_LOCAL_NAME = 'tipatask-local';
 // The stdio server shipped by THIS checkout. Callers that don't pass mcpServerPath get the
 // running install — never a path guessed relative to the project being configured.
@@ -836,6 +837,10 @@ function buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath } = {}
   // The account token is shared by projects on one API server. A shell-launched Codex
   // does not inherit Electron's userData path, so the local MCP needs it explicitly.
   const userDataRoot = require('./server/account-store').userDataRoot({ serverRoot: computedServerRoot });
+  // (TPT9163) Codex hands a stdio MCP server only a few default variables plus `env` and the names
+  // listed in `env_vars`, so a cowboy chain run's TIPATASK_COWBOY_TOKEN/URL (set on the Codex
+  // process by terminal-session.js) reach start_next_tasks only through this list.
+  const envVarsLine = `env_vars = ${tomlValue([...require('./server/cowboy-next-request').COWBOY_ENV_VARS])}`;
 
   // ── Packaged-asar branch ───────────────────────────────────────────────────
   // When the MCP server path is inside an .asar archive, plain-node / shell wrappers
@@ -851,6 +856,7 @@ function buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath } = {}
         `command = ${tomlString(process.execPath)}`,
         `args = [${tomlString(resolvedMcpServerPath)}]`,
         `env = { ELECTRON_RUN_AS_NODE = "1", TIPATASK_PROJECT_ROOT = ${tomlString(resolvedProjectRoot)}, TIPATASK_SERVER_ROOT = ${tomlString(computedServerRoot)}, TIPATASK_USER_DATA = ${tomlString(userDataRoot)}, TIPATASK_MCP_LOCAL_ONLY = "1" }`,
+        envVarsLine,
         `default_tools_approval_mode = ${tomlString(CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE)}`,
         '',
       ],
@@ -872,6 +878,7 @@ function buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath } = {}
       `command = ${tomlString(command)}`,
       `args = [${tomlString(resolvedMcpServerPath)}]`,
       `env = { NODE_COMPILE_CACHE = ${tomlString(compileCacheDir)}, TIPATASK_PROJECT_ROOT = ${tomlString(resolvedProjectRoot)}, TIPATASK_SERVER_ROOT = ${tomlString(computedServerRoot)}, TIPATASK_USER_DATA = ${tomlString(userDataRoot)}, TIPATASK_MCP_LOCAL_ONLY = "1" }`,
+      envVarsLine,
       `default_tools_approval_mode = ${tomlString(CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE)}`,
       '',
     ],

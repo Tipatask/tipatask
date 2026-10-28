@@ -59,3 +59,7 @@ test('Task Edit module imports without initializing board, cards, chat, or termi
 test('Permission edits save overrides and inheritance, reopen, reset and refresh card shields (TPT9071)', () => {
   assert.match(runDomRunner().stdout, /TPT9071_PERMISSION_MODE_PASS/);
 });
+
+test('Cowboy-coding mode shows only in Bypass, clears when the mode leaves it and re-tips the card (TPT9161)', () => {
+  assert.match(runDomRunner().stdout, /TPT9161_COWBOY_MODE_PASS/);
+});

@@ -131,20 +131,20 @@ function extractCards(session, emit) {
 
 // ── Turn deadline + idle watchdog ─────────────────────────────────────────────
 
-function armTurnDeadline(session, taskId, proc, emit) {
+function armTurnDeadline(session, taskId, proc, emit, turn) {
   clearTurnDeadline(session);
   session._turnDeadlineTimer = setTimeout(() => {
-    emitCodexError(session, taskId, proc, emit, 'turn-deadline', session._retryAttempt || 0);
+    emitCodexError(session, taskId, proc, emit, 'turn-deadline', session._retryAttempt || 0, turn);
   }, config.OBJECTIVE_TURN_MAX_MS);
 }
 
 // Codex can go quiet between turn.started and the final item.completed for minutes
 // (it emits no token deltas) — a longer, Codex-specific idle budget than the
 // token-streaming providers share (config.js comment).
-function armIdleWatchdog(session, taskId, proc, emit) {
+function armIdleWatchdog(session, taskId, proc, emit, turn) {
   clearIdleWatchdog(session);
   session._idleWatchdogTimer = setTimeout(() => {
-    emitCodexError(session, taskId, proc, emit, 'stream-idle-timeout', session._retryAttempt || 0);
+    emitCodexError(session, taskId, proc, emit, 'stream-idle-timeout', session._retryAttempt || 0, turn);
   }, config.OBJECTIVE_CODEX_STREAM_IDLE_MS);
 }
 
@@ -173,27 +173,61 @@ function clearCodexTimers(session) {
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
-function emitCodexError(session, taskId, proc, emit, reason, attempts) {
-  throttle.recordTimeout(taskId, reason);
+function ownsTaskChatTurn(session, turn) {
+  return session.type === 'taskChat' && turn && session._codexTurn === turn
+    && !turn.settled && !session._closed && (session._epoch || 0) === turn.epoch
+    && (session.proc || null) === turn.proc;
+}
+
+// Release only this turn's ownership. Late errors, timers and close events must
+// never clear a replacement turn, including its attachment-localization window.
+// Stop uses the same cleanup with a silent emitter before generation-aborted.
+function finishFailedTaskChatTurn(session, turn, emit, errorFrame) {
+  if (!ownsTaskChatTurn(session, turn)) return false;
+  turn.settled = true;
+  turn.proc = null;
+  clearCodexTimers(session);
+  session.proc = null;
+  session._spawning = false;
+  session._resultFinalized = true;
+  session.turnBuffer = '';
+  session.turnRawSse = '';
+  session._taskChatTurn = null;
+  session.pendingResult = null;
+  if (errorFrame) emit({ ...errorFrame, chatContinues: true });
+  emit({ type: 'chat-ready', turnIndex: session.messages.length - 1 });
+  return true;
+}
+
+function emitCodexError(session, taskId, proc, emit, reason, attempts, turn) {
+  if (session.type === 'taskChat' && !ownsTaskChatTurn(session, turn)) return;
+  if (session.type !== 'taskChat') throttle.recordTimeout(taskId, reason);
   clearCodexTimers(session);
   session._aborted = true;
   session._spawning = false;
-  if (proc && !proc.killed) {
+  if (proc && !proc.killed && proc.exitCode == null && proc.signalCode == null) {
     // win32 has no process groups, and codex.cmd's CLI runs under the npm shim's node.exe
     // (codex.js, which starts codex.exe): taskkill the whole tree (TPT575).
     if (process.platform === 'win32') {
       killWindowsChildTree(proc);
     } else {
       try { process.kill(-proc.pid, 'SIGTERM'); } catch { /* already dead */ }
-      setTimeout(() => {
+      const killTimer = setTimeout(() => {
         try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* already dead */ }
       }, 3000);
+      killTimer.unref?.();
+      proc.once('close', () => clearTimeout(killTimer));
     }
+  }
+  const errorFrame = { type: 'objective-error', reason, attempts, provider: 'codex' };
+  if (session.type === 'taskChat') {
+    finishFailedTaskChatTurn(session, turn, emit, errorFrame);
+    return;
   }
   session.turnBuffer = '';
   session.turnRawSse = '';
   session._resultFinalized = false;
-  emit({ type: 'objective-error', reason, attempts, provider: 'codex' }); // C1031 — see claude-session.js emitObjectiveError
+  emit(errorFrame); // C1031 — see claude-session.js emitObjectiveError
 }
 
 // ── finalizeCodexTurn ────────────────────────────────────────────────────────
@@ -303,6 +337,7 @@ function finalizeCodexTurn(session, taskId, code, emit, usage) {
  * Same call signature as spawnObjectiveTurn/spawnGeminiTurn/spawnPiTurn(session, taskId).
  */
 function spawnCodexTurn(session, taskId) {
+  if (session.type === 'taskChat' && (session.proc || session._spawning)) return;
   // Torn-down chat (teardownObjectiveSession): never start another turn; free any slot a throttle
   // drain granted this call (C1031 early-return contract).
   if (session._closed) {
@@ -311,6 +346,8 @@ function spawnCodexTurn(session, taskId) {
     return;
   }
   const turnEpoch = session._epoch || 0;
+  const turn = { epoch: turnEpoch, proc: null, settled: false };
+  if (session.type === 'taskChat') session._codexTurn = turn;
   const emit = (frame) => {
     if (session.ws && session.ws.readyState === session.ws.OPEN) {
       session.ws.send(JSON.stringify({ ...frame, tabId: session.tabId }));
@@ -379,6 +416,7 @@ function spawnCodexTurn(session, taskId) {
     // Torn down or restarted during the await: teardown (or the restart's own new spawn) now owns
     // _spawning and the throttle slot — touch neither, just never spawn this stale turn.
     if ((session._epoch || 0) !== turnEpoch) return;
+    if (session.type === 'taskChat' && !ownsTaskChatTurn(session, turn)) return;
     if (session._aborted) { session._spawning = false; return; }
     const imagePaths = extractLocalImagePaths(finalPrompt);
 
@@ -391,7 +429,7 @@ function spawnCodexTurn(session, taskId) {
     } catch (err) {
       session._spawning = false;
       console.error(`[codex] env build failed task=${taskId}: ${err.message}`);
-      emitCodexError(session, taskId, null, emit, `spawn-error:${err.message}`, session._retryAttempt || 0);
+      emitCodexError(session, taskId, null, emit, `spawn-error:${err.message}`, session._retryAttempt || 0, turn);
       return;
     }
 
@@ -413,10 +451,11 @@ function spawnCodexTurn(session, taskId) {
     } catch (err) {
       session._spawning = false;
       console.error(`[codex] spawn failed task=${taskId}: ${err.message}`);
-      emitCodexError(session, taskId, null, emit, `spawn-error:${err.message}`, session._retryAttempt || 0);
+      emitCodexError(session, taskId, null, emit, `spawn-error:${err.message}`, session._retryAttempt || 0, turn);
       return;
     }
     session.proc = proc;
+    turn.proc = proc;
     session._spawning = false;
 
     if (config.OBJECTIVE_TIMING_ENABLED) session.timingMilestones.procSpawnedAt = Date.now();
@@ -428,8 +467,8 @@ function spawnCodexTurn(session, taskId) {
       proc.stdin.end();
     } catch { /* proc may have already exited */ }
 
-    armTurnDeadline(session, taskId, proc, emit);
-    armIdleWatchdog(session, taskId, proc, emit);
+    armTurnDeadline(session, taskId, proc, emit, turn);
+    armIdleWatchdog(session, taskId, proc, emit, turn);
 
     // Codex streams no text/thinking deltas, so without this the chat bubble sits
     // silent for the entire turn. Purely cosmetic — cleared alongside the other timers.
@@ -443,7 +482,7 @@ function spawnCodexTurn(session, taskId) {
     let lineBuffer = '';
     proc.stdout.on('data', (chunk) => {
       if (session.proc !== proc) return;
-      armIdleWatchdog(session, taskId, proc, emit); // any byte resets the idle clock
+      armIdleWatchdog(session, taskId, proc, emit, turn); // any byte resets the idle clock
 
       const str = chunk.toString();
       session.turnRawSse += str;
@@ -516,7 +555,8 @@ function spawnCodexTurn(session, taskId) {
         } else if (event.type === 'turn.failed' || event.type === 'error') {
           const reason = (event.message || (event.error && event.error.message) || event.error || 'codex-error');
           console.error(`[codex] error event task=${taskId}: ${String(reason).slice(0, 200)}`);
-          emitCodexError(session, taskId, proc, emit, `codex:${String(reason).slice(0, 120)}`, session._retryAttempt || 0);
+          emitCodexError(session, taskId, proc, emit, `codex:${String(reason).slice(0, 120)}`, session._retryAttempt || 0, turn);
+          if (session.type === 'taskChat') return;
         }
         // unknown event types ignored — forward-compat with codex-cli version bumps
       }
@@ -534,13 +574,22 @@ function spawnCodexTurn(session, taskId) {
       clearCodexTimers(session);
       console.log(`[codex] proc closed task=${taskId} code=${closeCode}`);
       if (session._aborted) return;
+      if (session.type === 'taskChat') {
+        if (closeCode !== 0) {
+          emitCodexError(session, taskId, proc, emit, `exit-code-${closeCode ?? 'signal'}`, session._retryAttempt || 0, turn);
+          return;
+        }
+        turn.settled = true;
+        turn.proc = null;
+        session.proc = null;
+      }
       finalizeCodexTurn(session, taskId, closeCode, emit, resultUsage);
     });
 
     proc.on('error', (err) => {
       if (session.proc !== proc) return;
       console.error(`[codex] spawn error task=${taskId}: ${err.message}`);
-      emitCodexError(session, taskId, proc, emit, 'exit-code-spawn-error', session._retryAttempt || 0);
+      emitCodexError(session, taskId, proc, emit, 'exit-code-spawn-error', session._retryAttempt || 0, turn);
     });
   })();
 }
@@ -563,4 +612,4 @@ function codexOneShotSpec({ projectRoot, model, toolless = false, cwd } = {}) {
   return { command: config.CODEX_BIN, args: buildCodexOneShotArgs({ model, toolless, cwd: runCwd }), env, cwd: runCwd };
 }
 
-module.exports = { spawnCodexTurn, resolveCodexModel, buildCodexArgs, extractLocalImagePaths, codexOneShotSpec, buildCodexOneShotArgs };
+module.exports = { spawnCodexTurn, finishFailedTaskChatTurn, resolveCodexModel, buildCodexArgs, extractLocalImagePaths, codexOneShotSpec, buildCodexOneShotArgs };

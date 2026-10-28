@@ -19,6 +19,9 @@ const voiceHelpers = {
   ...await import('./voice-devices.js'),
   ...await import('./voice-silence.js'),
   ...await import('./voice-shortcut.js'),
+  ...await import('./voice-mode.js'),
+  ...await import('./voice-widget.js'),
+  ...await import('./pcm.js'),
 };
 const recorderSource = readFileSync(new URL('./audio-recorder.js', import.meta.url), 'utf8');
 
@@ -1230,4 +1233,213 @@ test('the start gate holds only the model select and Cancel / Start; Embed waits
   assert.equal(h.$('.task-chat-input').value, '![img](http://h/api/projects/2/images/9)');
   assert.equal(h.uploads.menus[0].textarea, h.$('.task-chat-input'));
   assert.ok(h.$('.task-chat-embed-slot .embed-menu-wrap'));
+});
+
+// ── Copy buttons (TPT9134) ──
+
+// Just enough markdown for the copy tests: a fenced block becomes marked's <pre><code> (its text
+// ending in a newline), anything else a paragraph.
+function fencedMarkdown(text) {
+  const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(text).split(/```[^\n]*\n([\s\S]*?)```/)
+    .map((part, i) => (i % 2 ? `<pre><code>${esc(part)}</code></pre>` : (part.trim() ? `<p>${esc(part.trim())}</p>` : '')))
+    .join('');
+}
+
+// The window with fenced-block markdown, and spies on the clipboard, the toasts and the timers.
+function copyHarness(t) {
+  const h = harness(t);
+  const copies = [];
+  const toasts = [];
+  const timers = [];
+  h.env.renderMarkdown = fencedMarkdown;
+  // Paint every streamed chunk at once. The base stub returns its frame id after running the
+  // callback, which leaves schedulePaint() waiting forever: only the first chunk would paint.
+  h.env.requestAnimationFrame = (fn) => { fn(); return 0; };
+  h.env.navigator = { clipboard: { writeText: async (text) => { copies.push(text); } } };
+  h.env.showToast = (message, type) => toasts.push({ message, type });
+  h.env.setTimeout = (fn, ms) => timers.push({ fn, ms });
+  return Object.assign(h, { copies, toasts, timers });
+}
+
+const settleCopy = () => new Promise(resolve => setImmediate(resolve));
+
+test('(TPT9134) a streamed reply keeps one Copy button per code block through every re-render and the final result', (t) => {
+  const h = copyHarness(t);
+  h.start();
+  h.turn('Show me');
+  h.feed({ type: 'data', data: 'First:\n\n```js\nconst a = 1;\n```\n\nThen' });
+  const reply = h.$$('.task-chat-msg--assistant').at(-1);
+  const blockButtons = () => [...reply.querySelectorAll('.task-chat-body pre')].map(pre => [...pre.querySelectorAll('.task-chat-copy')]);
+  const whole = () => [...reply.querySelectorAll(':scope > .task-chat-msg-copy')];
+  const first = blockButtons()[0][0];
+  assert.ok(first, 'a finished block has its button while the reply streams');
+  assert.equal(whole().length, 1);
+  assert.equal(whole()[0].hidden, true, 'no whole-reply Copy before the reply is done');
+
+  h.feed({ type: 'data', data: ' more:\n\n```sh\nnpm test\n```' });
+  assert.deepEqual(blockButtons().map(list => list.length), [1, 1], 'one button per block, never stacked');
+  assert.ok(blockButtons()[0][0] === first, 'the same button moves into the re-rendered block');
+
+  // A tool frame reconciles the widget slot only; a dialog frame repaints the text as well.
+  h.feed({ type: 'task-chat-tool', taskKey: 'TPT1', tool: { id: 'toolu_1', name: 'Read', status: 'done' } });
+  h.feed({ type: 'task-chat-dialog', taskKey: 'TPT1', dialog: DIALOG });
+  assert.deepEqual(blockButtons().map(list => list.length), [1, 1]);
+  h.feed({
+    type: 'objective-result',
+    content: 'First:\n\n```js\nconst a = 1;\n```\n\nThen more:\n\n```sh\nnpm test\n```\n\n```ask_user\n{"question":"Where should it go?"}\n```',
+  });
+  assert.ok(h.$$('.task-chat-msg--assistant').at(-1) === reply, 'the final result repaints the same message');
+  assert.deepEqual(blockButtons().map(list => list.length), [1, 1], 'the buttons survive the final repaint');
+  assert.ok(blockButtons()[0][0] === first, 'and keeps it through the final repaint');
+  assert.equal(whole().length, 1);
+  assert.equal(whole()[0].hidden, false, 'the finished reply can be copied whole');
+  assert.equal(whole()[0].previousElementSibling.className, 'task-chat-author', 'on the author line');
+  assert.equal(reply.querySelectorAll('.task-chat-widgets .task-chat-copy, .task-chat-widgets .task-chat-msg-copy').length, 0,
+    'nothing in the widget slot');
+});
+
+test('(TPT9134) a code block\'s Copy puts that block alone on the clipboard and says Copied for a moment', async (t) => {
+  const h = copyHarness(t);
+  h.start();
+  h.turn();
+  h.feed({ type: 'objective-result', content: 'Run:\n\n```sh\nnpm ci\n```\n\nthen:\n\n```sh\nnpm test -- --watch\nnpm run build\n```\n\nDone.' });
+  const buttons = [...h.$$('.task-chat-msg--assistant').at(-1).querySelectorAll('pre > .task-chat-copy')];
+  assert.equal(buttons.length, 2);
+  const [one, two] = buttons;
+  const label = btn => btn.querySelector('.task-chat-copy-label').textContent;
+  assert.equal(two.type, 'button');
+  assert.equal(two.title, 'taskChat.copy.button');
+  assert.equal(label(two), 'taskChat.copy.button');
+
+  click(two);
+  await settleCopy();
+  assert.deepEqual(h.copies, ['npm test -- --watch\nnpm run build'], 'that block only: no prose, no button label, no trailing newline');
+  assert.equal(two.title, 'taskChat.copy.copied');
+  assert.equal(label(two), 'taskChat.copy.copied');
+  assert.ok(two.hasAttribute('data-copied'));
+  assert.equal(one.hasAttribute('data-copied'), false, 'the other block is untouched');
+
+  const reset = h.timers.filter(timer => timer.ms === 1500);
+  assert.equal(reset.length, 1);
+  reset[0].fn();
+  assert.equal(two.title, 'taskChat.copy.button');
+  assert.equal(label(two), 'taskChat.copy.button');
+  assert.equal(two.hasAttribute('data-copied'), false);
+
+  click(one);
+  await settleCopy();
+  assert.deepEqual(h.copies.at(-1), 'npm ci');
+  assert.deepEqual(h.toasts, []);
+});
+
+test('(TPT9134) a message\'s Copy puts its markdown source on the clipboard: a reply without its ask_user fence, a user turn as typed', async (t) => {
+  const h = copyHarness(t);
+  h.start();
+  h.turn('Plan the **next** step:\n- one\n- two');
+  h.feed({ type: 'data', data: 'Pick *one*.\n\n```ask_user\n{"question":"Where should it go?"}\n```' });
+  h.feed({ type: 'task-chat-dialog', taskKey: 'TPT1', dialog: DIALOG });
+  h.feed({ type: 'chat-ready' });
+  h.feed({ type: 'task-chat-task-edited', taskKey: 'TPT1', task: TASK, changed: ['title'] });
+
+  const user = h.$$('.task-chat-msg--user').at(-1);
+  const userCopy = user.querySelector(':scope > .task-chat-msg-copy');
+  assert.ok(userCopy.previousElementSibling === user.querySelector('.task-chat-body'), 'after the bubble in reading order');
+  assert.equal(userCopy.title, 'taskChat.copy.message');
+  assert.equal(userCopy.hidden, false);
+  click(userCopy);
+  await settleCopy();
+  click(h.$$('.task-chat-msg--assistant').at(-1).querySelector(':scope > .task-chat-msg-copy'));
+  await settleCopy();
+  assert.deepEqual(h.copies, ['Plan the **next** step:\n- one\n- two', 'Pick *one*.']);
+  assert.ok(userCopy.hasAttribute('data-copied'));
+
+  assert.equal(h.$$('.task-chat-msg--system').length, 1);
+  assert.equal(h.$$('.task-chat-msg--system .task-chat-msg-copy, .task-chat-msg--system .task-chat-copy').length, 0, 'a notice has no Copy');
+});
+
+test('(TPT9134) a refused clipboard shows the failure toast and leaves the label as it was', async (t) => {
+  const h = copyHarness(t);
+  h.start();
+  const whole = h.$('.task-chat-msg--assistant > .task-chat-msg-copy');
+  h.env.navigator = { clipboard: { writeText: async () => { throw new Error('Document is not focused.'); } } };
+  click(whole);
+  await settleCopy();
+  // No Clipboard API at all (an insecure origin) fails the same way.
+  h.env.navigator = {};
+  click(whole);
+  await settleCopy();
+  assert.deepEqual(h.toasts, [{ message: 'taskChat.copy.failed', type: 'error' }, { message: 'taskChat.copy.failed', type: 'error' }]);
+  assert.deepEqual(h.copies, []);
+  assert.equal(whole.title, 'taskChat.copy.message');
+  assert.equal(whole.hasAttribute('data-copied'), false);
+  assert.equal(h.timers.filter(timer => timer.ms === 1500).length, 0);
+});
+
+test('(TPT9134) a focused code-block Copy keeps its focus while the reply streams on', (t) => {
+  const h = copyHarness(t);
+  h.start();
+  h.turn();
+  h.feed({ type: 'data', data: '```sh\nnpm ci\n```\n\nNext' });
+  const button = h.$$('pre > .task-chat-copy').at(-1);
+  button.focus();
+  assert.ok(h.doc.activeElement === button);
+  h.feed({ type: 'data', data: ' step.' });
+  assert.ok(h.$$('pre > .task-chat-copy').at(-1) === button, 'the same button is in the re-rendered block');
+  assert.ok(h.doc.activeElement === button, 'the repaint does not drop keyboard focus');
+});
+
+test('(TPT9134) turns restored from history — on reattach and on a resume — carry the same Copy buttons', async (t) => {
+  const h = copyHarness(t);
+  h.env.open('TPT1');
+  h.feed({ type: 'chat-history-reset', running: false, messages: [
+    { role: 'user', content: 'seed', seed: true },
+    { role: 'assistant', content: 'Use:\n\n```sh\nnpm ci\n```' },
+    { role: 'user', content: 'Thanks' },
+  ] });
+  h.feed({ type: 'config', objectiveProviders: [] });
+  assert.equal(h.$$('.task-chat-msg--assistant pre > .task-chat-copy').length, 1);
+  assert.deepEqual(h.$$('.task-chat-msg > .task-chat-msg-copy').map(btn => btn.hidden), [false, false]);
+  h.env.close();
+
+  h.env.open('TPT2');
+  h.feed({ type: 'config', objectiveProviders: [] });
+  h.env.beginResume('h-1');
+  h.feed({
+    type: 'chat-history-resumed', historyId: 'h-1', provider: 'claude', transcriptUnavailable: false,
+    messages: [
+      { role: 'user', content: 'How do I build?', restored: true },
+      { role: 'assistant', content: 'Like this:\n\n```sh\nnpm run build\n```', restored: true },
+    ],
+  });
+  const restored = h.$$('.task-chat-msg--restored');
+  assert.equal(restored.length, 2);
+  assert.ok(restored.every(el => el.querySelector(':scope > .task-chat-msg-copy')), 'every restored turn has a whole-message Copy');
+  assert.equal(h.$$('.task-chat-msg--resumed .task-chat-msg-copy').length, 0, 'the resumed-session line has none');
+  click(h.$('.task-chat-msg--restored pre > .task-chat-copy'));
+  await settleCopy();
+  assert.deepEqual(h.copies, ['npm run build']);
+});
+
+test('(TPT9134) a language switch relabels the Copy buttons', (t) => {
+  const h = copyHarness(t);
+  h.start();
+  h.turn('Hi');
+  h.feed({ type: 'objective-result', content: '```js\nx();\n```' });
+  const names = () => h.$$('.task-chat-copy, .task-chat-msg-copy')
+    .map(btn => [btn.className, btn.title, btn.querySelector('.task-chat-copy-label').textContent]);
+  assert.deepEqual(names(), [
+    ['task-chat-msg-copy', 'taskChat.copy.message', 'taskChat.copy.message'],
+    ['task-chat-msg-copy', 'taskChat.copy.message', 'taskChat.copy.message'],
+    ['task-chat-msg-copy', 'taskChat.copy.message', 'taskChat.copy.message'],
+    ['task-chat-copy', 'taskChat.copy.button', 'taskChat.copy.button'],
+  ]);
+  h.setLocale('uk');
+  h.doc.dispatchEvent(new h.doc.defaultView.Event('tiptask:reload'));
+  assert.deepEqual(names(), [
+    ['task-chat-msg-copy', 'uk:taskChat.copy.message', 'uk:taskChat.copy.message'],
+    ['task-chat-msg-copy', 'uk:taskChat.copy.message', 'uk:taskChat.copy.message'],
+    ['task-chat-msg-copy', 'uk:taskChat.copy.message', 'uk:taskChat.copy.message'],
+    ['task-chat-copy', 'uk:taskChat.copy.button', 'uk:taskChat.copy.button'],
+  ]);
 });

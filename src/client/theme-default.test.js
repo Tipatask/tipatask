@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { WORKFLOW_COLOR_SWATCHES } from './status-registry.js';
 
 const CLIENT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const read = (name) => fs.readFileSync(path.join(CLIENT_DIR, name), 'utf8');
@@ -301,8 +302,6 @@ test('no focus, inline-edit or current-pick rule paints an outline, border or bo
     '.modal-top-bar button.task-modal-tab:focus-visible',
     '.card-desc.editing',
     '.card-title.editing',
-    '.preview-card:not(.card) .preview-title.editing',
-    '.preview-card:not(.card) .preview-desc.editing',
     '.agent-selector-btn--current',
     '.image-task-action:focus-visible',
   ]) {
@@ -468,8 +467,8 @@ function overRgba(expr, groundHex) {
   return `#${[m[1], m[2], m[3]].map((c, i) => Math.round(Number(c) * alpha + ground[i] * (1 - alpha)).toString(16).padStart(2, '0')).join('')}`;
 }
 
-// Resolves hex, var(--x[, fallback]), two-stop color-mix(in srgb, …) and a lightness-shifted
-// relative oklch(from … calc(l ± n) c h) to a hex colour.
+// Resolves hex, var(--x[, fallback]), two-stop color-mix(in srgb, …) and a relative
+// oklch(from … calc(l ± n) c h) or oklch(from … n c h) (lightness shifted or set) to a hex colour.
 function resolveColor(expr, values) {
   const e = expr.trim();
   if (/^#[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(e)) return e;
@@ -484,6 +483,11 @@ function resolveColor(expr, values) {
   if (m) {
     const [L, a, b] = toOklab(resolveColor(m[1], values));
     return fromOklab([L + (m[2] === '-' ? -1 : 1) * Number(m[3]), a, b]);
+  }
+  m = /^oklch\(from (.+) (\d*\.?\d+) c h\)$/.exec(e);
+  if (m) {
+    const [, a, b] = toOklab(resolveColor(m[1], values));
+    return fromOklab([Number(m[2]), a, b]);
   }
   m = /^color-mix\(in srgb,(.*)\)$/.exec(e);
   assert.ok(m, `unsupported colour expression: ${e}`);
@@ -818,6 +822,437 @@ test('card dependency line clears AA on the open card ground in every palette', 
   }
 });
 
+// (TPT9117) Settings ▸ Workflow status chips: the tint and the colour dot are the row's swatch
+// (--wf-color, set inline by _workflowSwatch()), and the name is --wf-ink, a readable ink derived
+// from it. The swatches are Catppuccin Mocha pastels, so the raw swatch as text vanished on its own
+// tint in every light palette. This composites each swatch's tint over the dialog ground and checks
+// the name at 4.5:1 there and on the plain field it gets while being renamed, in every palette.
+test('Settings Workflow status names clear AA on their chip for every swatch in every palette', () => {
+  const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
+  assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
+  const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+  const fallback = /function _workflowSwatch\(color\)\s*\{\s*return WORKFLOW_COLOR_SWATCHES\[color\] \|\| '([^']+)';/.exec(BOARD);
+  assert.ok(fallback, 'task-board.js _workflowSwatch() fallback not found');
+  const swatches = [...Object.entries(WORKFLOW_COLOR_SWATCHES), ['unknown token', fallback[1]]];
+
+  const CHIP = '.settings-wf-chip';
+  const NAME = '.settings-wf-chip-name';
+  const tint = /^color-mix\(in srgb, (.+) (\d+(?:\.\d+)?)%, transparent\)$/.exec(ruleValue(CHIP, 'background') ?? '');
+  assert.ok(tint, `${CHIP} background is no longer a translucent color-mix() tint`);
+  assert.match(tint[1], /^var\(--wf-color\b/, 'the chip tint must stay the row swatch');
+  assert.match(ruleValue('.settings-wf-chip-color', 'background') ?? '', /^var\(--wf-color\b/, 'the colour dot must stay the row swatch');
+
+  for (const { id, values } of themePalettes()) {
+    const dark = darkIds.has(id);
+    const value = (sel, prop) => (dark && ruleValue(`.theme-dark ${sel}`, prop)) || ruleValue(sel, prop);
+    const palette = layeredPalette(id, values, darkIds);
+    const dialog = resolveColor(ruleValue('.settings-panel', 'background'), palette);
+    for (const [name, swatch] of swatches) {
+      const v = { ...palette, '--wf-color': swatch, '--wf-ink': value(CHIP, '--wf-ink') };
+      const ink = resolveColor(value(NAME, 'color'), v);
+      for (const [ground, bg] of [
+        ['tinted chip', mixHex(resolveColor(tint[1], v), dialog, Number(tint[2]))],
+        ['rename field', resolveColor(value(`${NAME}:focus`, 'background'), v)],
+      ]) {
+        const ratio = contrastRatio(ink, bg);
+        assert.ok(ratio >= 4.5, `${id} ${name} status name on its ${ground} is ${ratio.toFixed(2)}:1; expected at least 4.5:1`);
+      }
+    }
+  }
+});
+
+// (TPT9118) Status pills: the board card's status select, the .status chip (chat proposal cards,
+// card previews, the parent-task pane, the manual-task preview), the to-do drawer's select and the
+// Task Edit header select. Each tints its --status-color swatch (set inline from statusColor()) and
+// paints the name in an ink derived from it; the old ink, the swatch 65% toward black, sat under
+// 4.5:1 on its own tint in every light palette. The tint is mixed into an opaque --c-bg-card, so the
+// pill's ground is the same on open and closed cards, proposal tints and the modal header. This
+// checks every swatch, plus each rule's own var() fallback, on that ground in every palette.
+test('status pill names clear AA on their tint for every swatch in every palette', () => {
+  const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
+  assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
+  const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+  const PILLS = ['.status-select', '.card-status-select', '.drawer-status', '.status', '.modal-top-bar .modal-status-select'];
+  const TINT = /^color-mix\(in srgb, var\(--status-color, #[0-9a-f]{3,6}\) \d+(?:\.\d+)?%, var\(--c-bg-card\)\)$/i;
+
+  for (const { id, values } of themePalettes()) {
+    const dark = darkIds.has(id);
+    const value = (sel, prop) => (dark && ruleValue(`.theme-dark ${sel}`, prop)) || ruleValue(sel, prop);
+    const palette = layeredPalette(id, values, darkIds);
+    for (const pill of PILLS) {
+      const bgExpr = value(pill, 'background-color');
+      const inkExpr = value(pill, 'color');
+      assert.ok(bgExpr && inkExpr, `${id} ${pill} has no background-color or color rule`);
+      assert.match(bgExpr, TINT, `${id} ${pill} must tint --status-color into the opaque --c-bg-card`);
+      assert.match(inkExpr, /var\(--status-color\b/, `${id} ${pill} ink must stay derived from the swatch`);
+      const fallbacks = new Set([...`${bgExpr} ${inkExpr}`.matchAll(/var\(--status-color, (#[0-9a-f]{3,6})\)/gi)].map((m) => m[1]));
+      const cases = [
+        ...Object.entries(WORKFLOW_COLOR_SWATCHES).map(([name, swatch]) => [name, { ...palette, '--status-color': swatch }]),
+        ...[...fallbacks].map((hex) => [`unset --status-color (${hex})`, palette]),
+      ];
+      for (const [name, v] of cases) {
+        const ratio = contrastRatio(resolveColor(inkExpr, v), resolveColor(bgExpr, v));
+        assert.ok(ratio >= 4.5, `${id} ${pill} ${name} status name is ${ratio.toFixed(2)}:1 on its tint; expected at least 4.5:1`);
+      }
+    }
+  }
+});
+
+// (TPT9120) Status select chevrons. The board card's select and the Task Edit header select drew
+// their dropdown chevron as a data-URI stroke in a fixed #666, which cannot follow the theme: it sat
+// at 1.01–2.36:1 on the pill in every dark palette, under the 3:1 WCAG 1.4.11 asks of a graphic that
+// identifies a control. The chevron is now two gradient strokes in currentColor, the pill's ink.
+// The first test resolves every colour a chevron paints (gradient stops, or a data-URI's stroke and
+// fill) and needs 3:1 on the pill fill for every swatch and fallback in every palette. Contextual
+// rules (hover controls, phone width, :disabled, .theme-dark) may move or remove the strokes, but may
+// only draw in currentColor, and must give each stroke its own background-position: a single
+// position stacks both arms on one spot.
+const CHEVRON_PILLS = ['.status-select', '.card-status-select', '.modal-top-bar .modal-status-select'];
+
+// The chevron pill a selector targets, or null.
+function chevronPillOf(selector) {
+  if (/\.modal-status-select(?![\w-])/.test(selector)) {
+    return /\.modal-top-bar(?![\w-])/.test(selector) ? '.modal-top-bar .modal-status-select' : null;
+  }
+  if (/\.card-status-select(?![\w-])/.test(selector)) return '.card-status-select';
+  if (/\.status-select(?![\w-])/.test(selector)) return '.status-select';
+  return null;
+}
+
+// Top-level whitespace-separated tokens of a CSS value; parenthesised groups stay whole.
+function valueTokens(text) {
+  const out = [];
+  let depth = 0;
+  let token = '';
+  for (const ch of text.trim()) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (depth === 0 && /\s/.test(ch)) {
+      if (token) out.push(token);
+      token = '';
+    } else {
+      token += ch;
+    }
+  }
+  if (token) out.push(token);
+  return out;
+}
+
+// The colours a background-image value paints: gradient colour stops, and a data-URI SVG's stroke
+// and fill attributes. `transparent` and `none` paint nothing and are left out.
+function imagePaints(image) {
+  const paints = [];
+  for (const layer of splitArgs(image)) {
+    const fn = /^([\w-]+)\(([\s\S]*)\)$/.exec(layer);
+    assert.ok(fn, `unreadable background-image layer: ${layer}`);
+    if (fn[1] === 'url') {
+      const svg = decodeURIComponent(fn[2].trim().replace(/^(["'])([\s\S]*)\1$/, '$2'));
+      for (const m of svg.matchAll(/\b(?:stroke|fill)=["']([^"']+)["']/g)) {
+        if (m[1] !== 'none') paints.push({ color: m[1], image: true });
+      }
+      continue;
+    }
+    assert.match(fn[1], /-gradient$/, `unsupported background-image layer: ${layer}`);
+    for (const stop of splitArgs(fn[2])) {
+      const [first] = valueTokens(stop);
+      // A direction, angle or shape prelude, or a bare colour hint, is not a colour stop.
+      if (/^(?:to|from|at|circle|ellipse|(?:closest|farthest)-(?:side|corner))$/.test(first)) continue;
+      if (/^(?:-?[\d.]|calc\()/.test(first) || /^transparent$/i.test(first)) continue;
+      paints.push({ color: first, image: false });
+    }
+  }
+  return paints;
+}
+
+// One chevron paint's colour on a pill. currentColor is the pill's ink, except inside a data-URI SVG:
+// an image cannot see the page's `color`, so its currentColor is the SVG's initial black.
+function paintColor(paint, inkExpr, values) {
+  if (/^currentcolor$/i.test(paint.color)) return paint.image ? '#000000' : resolveColor(inkExpr, values);
+  return resolveColor(paint.color, values);
+}
+
+// The last `prop` a rule body declares, whitespace collapsed, or null.
+function declaredValue(body, prop) {
+  let value = null;
+  for (const d of body.matchAll(new RegExp(`(?:^|[;\\s])${prop}\\s*:\\s*([^;]+)`, 'g'))) value = d[1].trim().replace(/\s+/g, ' ');
+  return value;
+}
+
+// The background image a rule body sets: its background-image, else the url() and gradient layers of
+// a background shorthand ('none' when it names none: the shorthand resets the image), else null.
+function declaredImage(body) {
+  const shorthand = declaredValue(body, 'background');
+  return declaredValue(body, 'background-image')
+    ?? (shorthand && (splitArgs(shorthand).flatMap((layer) => valueTokens(layer).filter((t) => /^(?:url|[\w-]*gradient)\(/.test(t))).join(', ') || 'none'));
+}
+
+test('status select chevrons clear 3:1 on the pill for every swatch in every palette', () => {
+  const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
+  assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
+  const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+
+  for (const { id, values } of themePalettes()) {
+    const dark = darkIds.has(id);
+    const value = (sel, prop) => (dark && ruleValue(`.theme-dark ${sel}`, prop)) || ruleValue(sel, prop);
+    const palette = layeredPalette(id, values, darkIds);
+    for (const pill of CHEVRON_PILLS) {
+      const image = value(pill, 'background-image');
+      assert.ok(image && image !== 'none', `${id} ${pill} lost its dropdown chevron`);
+      const paints = imagePaints(image);
+      assert.ok(paints.length, `${id} ${pill} chevron paints nothing`);
+      const bgExpr = value(pill, 'background-color');
+      const inkExpr = value(pill, 'color');
+      const fallbacks = new Set([...`${bgExpr} ${inkExpr}`.matchAll(/var\(--status-color, (#[0-9a-f]{3,6})\)/gi)].map((m) => m[1]));
+      const cases = [
+        ...Object.entries(WORKFLOW_COLOR_SWATCHES).map(([name, swatch]) => [name, { ...palette, '--status-color': swatch }]),
+        ...[...fallbacks].map((hex) => [`unset --status-color (${hex})`, palette]),
+      ];
+      for (const [name, v] of cases) {
+        const fill = resolveColor(bgExpr, v);
+        for (const paint of paints) {
+          const ratio = contrastRatio(paintColor(paint, inkExpr, v), fill);
+          assert.ok(ratio >= 3, `${id} ${pill} ${name} chevron (${paint.color}) is ${ratio.toFixed(2)}:1 on the pill; expected at least 3:1`);
+        }
+      }
+    }
+  }
+});
+
+test('status select chevron rules draw in currentColor and position every stroke', () => {
+  const strokes = Object.fromEntries(CHEVRON_PILLS.map((pill) => [pill, splitArgs(ruleValue(pill, 'background-image') ?? 'none').length]));
+  let checked = 0;
+  for (const { parts, body } of CLEAN_RULES) {
+    for (const selector of parts) {
+      const pill = chevronPillOf(selector);
+      if (!pill) continue;
+      const image = declaredImage(body);
+      if (image === 'none') {
+        assert.match(selector, /:disabled\b/, `${selector} removes the status select chevron; only the :disabled state may`);
+      } else if (image && !CHEVRON_PILLS.includes(selector)) {
+        for (const paint of imagePaints(image)) {
+          assert.ok(!paint.image && /^currentcolor$/i.test(paint.color), `${selector} draws its chevron in ${paint.color}; a contextual chevron rule must use currentColor (the pill ink)`);
+        }
+      }
+      const position = declaredValue(body, 'background-position');
+      if (position) {
+        checked++;
+        assert.equal(splitArgs(position).length, strokes[pill], `${selector} background-position "${position}" must give each of the ${strokes[pill]} chevron strokes its own position`);
+      }
+    }
+  }
+  assert.ok(checked >= 4, `expected the base, hover-controls, modal and phone-width chevron positions; found ${checked}`);
+  assert.equal(ruleValue('.modal-top-bar .modal-status-select:disabled', 'background-image'), 'none', 'the read-only header select must keep hiding its chevron');
+});
+
+// (TPT9124) Settings dialog select chevrons. The dialog's row selects (.settings-row-control >
+// select) and the Workflow add form's colour select drew the same fixed-#666 data-URI chevron as the
+// status selects, at 2.18–2.97:1 on their --c-bg field in seven dark palettes. They now use the
+// TPT9120 strokes in currentColor, the field's own text colour. The first test needs every chevron
+// paint to be currentColor and to clear 3:1 on the field in every palette. The second covers every
+// other rule that styles these selects (a state, a theme or width override, a select's own id): it
+// may not remove or repaint the strokes, and a background-position must place each stroke.
+const SETTINGS_SELECTS = ['.settings-row-control > select', '.settings-wf-add-color'];
+const SETTINGS_SELECT_IDS = [...TEMPLATE.matchAll(/<select\b[^>]*\bid="(settings-[\w-]+)"/g)].map((m) => m[1]);
+
+// Whether a selector styles a Settings select: its last compound names the colour select's class or
+// one of the dialog's select ids, or is a `select` under a .settings-* or #settings-* ancestor.
+function stylesSettingsSelect(selector) {
+  const subject = lastCompound(selector);
+  if (/\.settings-wf-add-color(?![\w-])/.test(subject)) return true;
+  if (SETTINGS_SELECT_IDS.some((id) => new RegExp(`#${id}(?![\\w-])`).test(subject))) return true;
+  return /^select(?![\w-])/.test(subject) && /[.#]settings-[\w-]/.test(selector.slice(0, -subject.length));
+}
+
+// A Settings chevron paint as a failure message names it. Inside a data-URI image even currentColor
+// is not the field's colour (see paintColor()).
+const settingsPaintLabel = (paint) => (paint.image ? `${paint.color} inside a data-URI image` : paint.color);
+const SETTINGS_PAINT_RULE = "it must be a currentColor gradient stroke (the field's text colour)";
+
+test('Settings select chevrons paint only currentColor and clear 3:1 on the field in every palette', () => {
+  const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
+  assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
+  const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+
+  for (const { id, values } of themePalettes()) {
+    const dark = darkIds.has(id);
+    const value = (sel, prop) => (dark && ruleValue(`.theme-dark ${sel}`, prop)) || ruleValue(sel, prop);
+    const palette = layeredPalette(id, values, darkIds);
+    for (const sel of SETTINGS_SELECTS) {
+      const image = value(sel, 'background-image');
+      assert.ok(image && image !== 'none', `${id} ${sel} lost its dropdown chevron`);
+      const paints = imagePaints(image);
+      assert.ok(paints.length, `${id} ${sel} chevron paints nothing`);
+      const bgExpr = value(sel, 'background-color');
+      const inkExpr = value(sel, 'color');
+      assert.ok(bgExpr && inkExpr, `${id} ${sel} has no background-color or color rule`);
+      const field = resolveColor(bgExpr, palette);
+      for (const paint of paints) {
+        assert.ok(!paint.image && /^currentcolor$/i.test(paint.color), `${id} ${sel} chevron paints ${settingsPaintLabel(paint)}; ${SETTINGS_PAINT_RULE}`);
+        const ratio = contrastRatio(paintColor(paint, inkExpr, palette), field);
+        assert.ok(ratio >= 3, `${id} ${sel} chevron is ${ratio.toFixed(2)}:1 on the field; expected at least 3:1`);
+      }
+    }
+  }
+});
+
+test('no rule removes, repaints or stacks the Settings select chevron strokes', () => {
+  assert.ok(SETTINGS_SELECT_IDS.includes('settings-theme-select'), 'template.html Settings select ids not found');
+  const [strokes, ...others] = SETTINGS_SELECTS.map((sel) => splitArgs(ruleValue(sel, 'background-image') ?? 'none').length);
+  assert.ok(others.every((n) => n === strokes), 'the Settings selects must share one chevron');
+  let checked = 0;
+  for (const { parts, body } of CLEAN_RULES) {
+    for (const selector of parts) {
+      if (!stylesSettingsSelect(selector)) continue;
+      const image = declaredImage(body);
+      assert.notEqual(image, 'none', `${selector} removes the Settings select chevron`);
+      for (const paint of image ? imagePaints(image) : []) {
+        assert.ok(!paint.image && /^currentcolor$/i.test(paint.color), `${selector} draws the Settings select chevron in ${settingsPaintLabel(paint)}; ${SETTINGS_PAINT_RULE}`);
+      }
+      const position = declaredValue(body, 'background-position');
+      if (position) {
+        checked++;
+        assert.equal(splitArgs(position).length, strokes, `${selector} background-position "${position}" must give each of the ${strokes} chevron strokes its own position`);
+      }
+    }
+  }
+  assert.ok(checked >= SETTINGS_SELECTS.length, `expected a chevron position for each Settings select; found ${checked}`);
+});
+
+// Forced colours (Windows contrast themes) compute a gradient background-image to none, so the
+// strokes vanish there. Each Settings select must hand the arrow back to the native control inside
+// an @media (forced-colors: active) block.
+const UNCOMMENTED_CSS = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
+
+// Every innermost rule of the sheet, comments stripped, with its source offset. `forced` marks a rule
+// inside an @media (forced-colors: active) block, nested media queries included.
+function sheetRules() {
+  const css = UNCOMMENTED_CSS;
+  const blocks = [];
+  for (const m of css.matchAll(/@media\s*\(\s*forced-colors\s*:\s*active\s*\)\s*\{/g)) {
+    const start = m.index + m[0].length;
+    let end = start;
+    for (let depth = 1; end < css.length && depth; end++) depth += css[end] === '{' ? 1 : css[end] === '}' ? -1 : 0;
+    blocks.push([start, end]);
+  }
+  return [...css.matchAll(/([^{}]*)\{([^{}]*)\}/g)].map((m) => ({
+    offset: m.index,
+    parts: splitArgs(m[1].trim()).map((p) => p.replace(/\s+/g, ' ')),
+    body: m[2],
+    forced: blocks.some(([start, end]) => m.index >= start && m.index < end),
+  }));
+}
+
+// The last appearance a forced-colours block gives each selector, as { value, offset }.
+function forcedAppearance() {
+  const out = new Map();
+  for (const { offset, parts, body, forced } of sheetRules()) {
+    const value = forced && declaredValue(body, 'appearance');
+    if (value) for (const part of parts) out.set(part, { value, offset });
+  }
+  return out;
+}
+
+test('Settings selects get the native arrow back under forced colours', () => {
+  const native = forcedAppearance();
+  for (const sel of SETTINGS_SELECTS) {
+    assert.equal(native.get(sel)?.value, 'auto', `${sel} must set appearance: auto under @media (forced-colors: active), where its gradient chevron is dropped`);
+  }
+});
+
+// (TPT9127) The status selects' TPT9120 strokes are gradients too, so they vanish under forced colours
+// the same way. Each status select must set appearance: auto in a forced-colours block, and that rule
+// must win the cascade: no other rule may set the select's appearance at a higher specificity, or at
+// the same specificity later in the sheet. The read-only header select shows no arrow outside forced
+// colours, so the block keeps it at appearance: none.
+test('status selects get the native arrow back under forced colours', () => {
+  const native = forcedAppearance();
+  const rules = sheetRules();
+  let compared = 0;
+  for (const pill of CHEVRON_PILLS) {
+    const own = native.get(pill);
+    assert.equal(own?.value, 'auto', `${pill} must set appearance: auto under @media (forced-colors: active), where its gradient chevron is dropped`);
+    for (const { offset, parts, body, forced } of rules) {
+      if (forced || !declaredValue(body, 'appearance')) continue;
+      for (const selector of parts) {
+        if (chevronPillOf(selector) !== pill || /:disabled\b/.test(selector)) continue;
+        compared++;
+        const order = compareSpecificity(specificity(selector), specificity(pill));
+        assert.ok(order < 0 || (order === 0 && offset < own.offset), `${selector} sets the appearance of ${pill} after or above its forced-colours rule, so the native arrow loses the cascade`);
+      }
+    }
+  }
+  assert.ok(compared >= CHEVRON_PILLS.length, `expected each status select's own appearance: none rule; compared ${compared}`);
+  const readOnly = '.modal-top-bar .modal-status-select:disabled';
+  assert.equal(native.get(readOnly)?.value, 'none', `${readOnly} must keep appearance: none under forced colours, as the read-only header select shows no arrow`);
+});
+
+// (TPT9130) The proposal card's sprint select draws its chevron as TPT299 gradient triangles, which
+// vanish under forced colours too. It must set appearance: auto in a forced-colours block whose rule
+// wins the cascade over every other appearance rule on the select, and give back the right padding
+// the triangles needed, since the native control reserves its own room for the arrow.
+test('the proposal sprint select gets the native arrow back under forced colours', () => {
+  const sel = '.preview-step-select';
+  const own = forcedAppearance().get(sel);
+  assert.equal(own?.value, 'auto', `${sel} must set appearance: auto under @media (forced-colors: active), where its gradient chevron is dropped`);
+  const rules = sheetRules();
+  let compared = 0;
+  for (const { offset, parts, body, forced } of rules) {
+    if (forced || !declaredValue(body, 'appearance')) continue;
+    for (const selector of parts) {
+      if (!/\.preview-step-select(?![\w-])/.test(lastCompound(selector))) continue;
+      compared++;
+      const order = compareSpecificity(specificity(selector), specificity(sel));
+      assert.ok(order < 0 || (order === 0 && offset < own.offset), `${selector} sets the appearance of ${sel} after or above its forced-colours rule, so the native arrow loses the cascade`);
+    }
+  }
+  assert.ok(compared >= 1, `expected the sprint select's own appearance: none rule; compared ${compared}`);
+  const meta = '.card.preview-card .card-preview-meta .preview-step-select';
+  const padding = rules.filter((r) => r.forced && r.parts.includes(meta)).map((r) => declaredValue(r.body, 'padding-right')).filter(Boolean).pop();
+  assert.equal(padding, 'var(--card-ctrl-pad-x)', `${meta} must drop its right padding to the .card-ctl inline padding under forced colours`);
+});
+
+// (TPT9131) The board's Status and People filter chevrons are mask-image ::after boxes painted with
+// background-color, which forced colours turn into Canvas, the ground colour. Each chevron must take
+// a foreground system colour in a forced-colours block, and for every other rule that paints the
+// chevron (the .active and :hover states included) a forced-colours rule must win the cascade: a
+// higher specificity, or the same specificity later in the sheet.
+test('the board filter chevrons keep a system colour under forced colours', () => {
+  const SYSTEM_INK = /^(ButtonText|CanvasText|FieldText)$/i;
+  const rules = sheetRules();
+  const paint = (body) => declaredValue(body, 'background-color') ?? declaredValue(body, 'background');
+  for (const name of ['status', 'people']) {
+    const chevron = new RegExp(`\\.${name}-filter-wrap(?![\\w-])[^ >+~]*::after$`);
+    const forced = [];
+    let compared = 0;
+    for (const { offset, parts, body, forced: inForced } of rules) {
+      const value = paint(body);
+      if (!value) continue;
+      for (const selector of parts) {
+        if (!chevron.test(lastCompound(selector))) continue;
+        if (inForced) {
+          assert.match(value, SYSTEM_INK, `${selector} paints the chevron ${value} under forced colours; expected ButtonText, CanvasText or FieldText`);
+          forced.push({ selector, offset });
+        }
+      }
+    }
+    const base = `.${name}-filter-wrap::after`;
+    assert.ok(forced.some((f) => f.selector === base), `${base} must take a system colour under @media (forced-colors: active), where its background-color is forced to Canvas`);
+    for (const { offset, parts, body, forced: inForced } of rules) {
+      if (inForced || !paint(body)) continue;
+      for (const selector of parts) {
+        if (!chevron.test(lastCompound(selector))) continue;
+        compared++;
+        const wins = forced.some((f) => {
+          const order = compareSpecificity(specificity(f.selector), specificity(selector));
+          return order > 0 || (order === 0 && f.offset > offset);
+        });
+        assert.ok(wins, `${selector} paints the ${name} filter chevron after or above every forced-colours rule, so the chevron vanishes under forced colours`);
+      }
+    }
+    assert.ok(compared >= 2, `expected the ${name} filter chevron's rest and .active/:hover paint rules; compared ${compared}`);
+  }
+});
+
 // (TPT652) --c-mauve / --c-green / --c-red are Catppuccin names no theme defines, so their
 // Mocha fallbacks painted in every palette. (TPT675) Widened from the .setup-modal-* rules to
 // every rule in styles.css. (TPT679) Generalised from those three names to every token: a
@@ -983,4 +1418,76 @@ test('running-session spinner button is filled from the theme accent token, afte
     CSS.indexOf('.btn-claude.session-running {') > CSS.indexOf('.btn-claude.resumable:hover'),
     '.session-running must come after .resumable so it wins at equal specificity',
   );
+});
+
+// (TPT9139) The terminal header's permission-mode control: its pending and error states paint
+// from local tokens over the theme variables (.session-mode in styles.css). Text clears 4.5:1 on
+// its own tinted ground (tints composited over the card) and the state borders clear 3:1 against
+// the card, in every palette; the static chip's muted text clears 4.5:1 on the card.
+test('session-mode pending and error tokens clear AA contrast in every palette', () => {
+  const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
+  assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
+  const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+  const token = (name) => {
+    const value = ruleValue('.session-mode', name);
+    assert.ok(value, `.session-mode has no ${name}`);
+    assert.match(value, /^var\(--c-[\w-]+\)$/, `${name} must come from a theme variable, not a literal`);
+    return value;
+  };
+  // A token that resolves to an rgba() tint is composited over the card it sits on.
+  const paint = (expr, values, ground) => {
+    const raw = /^var\((--[\w-]+)\)$/.exec(expr);
+    const value = raw ? values[raw[1]] : expr;
+    return /^rgba\(/.test(value ?? '') ? overRgba(value, ground) : resolveColor(expr, values);
+  };
+  const chipColor = ruleValue('.session-mode-chip', 'color');
+  assert.equal(chipColor, 'var(--c-text-muted)');
+  for (const { id, values: own } of themePalettes()) {
+    const values = layeredPalette(id, own, darkIds);
+    const card = resolveColor('var(--c-bg-card)', values);
+    for (const [state, minimum] of [['pending', 4.5], ['error', 4.5]]) {
+      const bg = paint(token(`--session-mode-${state}-bg`), values, card);
+      const fg = paint(token(`--session-mode-${state}-fg`), values, bg);
+      const border = paint(token(`--session-mode-${state}-border`), values, card);
+      const text = contrastRatio(fg, bg);
+      assert.ok(text >= minimum, `${id} ${state} text is ${text.toFixed(2)}:1; expected at least ${minimum}:1`);
+      const edge = contrastRatio(border, card);
+      assert.ok(edge >= 3, `${id} ${state} border is ${edge.toFixed(2)}:1 on the card; expected at least 3:1`);
+    }
+    const chip = contrastRatio(resolveColor(chipColor, values), card);
+    assert.ok(chip >= 4.5, `${id} static mode chip text is ${chip.toFixed(2)}:1; expected at least 4.5:1`);
+  }
+  for (const state of ['pending', 'error']) {
+    const rule = ruleValue(`.session-mode-${state} .permission-mode-select-trigger`, 'background');
+    assert.equal(rule, `var(--session-mode-${state}-bg)`, `.session-mode-${state} paints from its token`);
+    assert.equal(ruleValue(`.session-mode-${state} .permission-mode-select-trigger`, 'color'), `var(--session-mode-${state}-fg)`);
+  }
+});
+
+// (TPT9165) The voice recording widget, in every palette: its timer and hint text clear 4.5:1
+// on the card; the wave's gradient ends (which double as the recording dot) and the Stop glyph
+// on its own tinted ground clear the 3:1 non-text minimum. The canvas reads the gradient ends with
+// getPropertyValue(), so they must stay plain hexes in every theme block.
+test('voice recording widget text and graphics clear contrast on the card in every palette', () => {
+  const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
+  assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
+  const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+  assert.match(cssBlock('\\.voice-rec-dot'), /background:\s*var\(--c-voice-wave-to\)/, 'the dot paints with the wave end');
+  for (const { id, values: own } of themePalettes()) {
+    const dark = darkIds.has(id);
+    const values = layeredPalette(id, own, darkIds);
+    const card = resolveColor(ruleValue('#voice-rec-toast', 'background'), values);
+    for (const selector of ['.voice-rec-timer', '.voice-rec-hint']) {
+      const ratio = contrastRatio(resolveColor(ruleValue(selector, 'color'), values), card);
+      assert.ok(ratio >= 4.5, `${id} ${selector} is ${ratio.toFixed(2)}:1 on the card; expected at least 4.5:1`);
+    }
+    for (const token of ['--c-voice-wave-from', '--c-voice-wave-to']) {
+      assert.match(values[token] ?? '', /^#[0-9a-f]{6}$/i, `${id} ${token} must be a plain hex the canvas can parse`);
+      const ratio = contrastRatio(values[token], card);
+      assert.ok(ratio >= 3, `${id} ${token} is ${ratio.toFixed(2)}:1 on the card; expected at least 3:1`);
+    }
+    const stopBg = resolveColor((dark && ruleValue('.theme-dark .voice-rec-stop', 'background')) || ruleValue('.voice-rec-stop', 'background'), values);
+    const glyph = contrastRatio(resolveColor(ruleValue('.voice-rec-stop', 'color'), values), stopBg);
+    assert.ok(glyph >= 3, `${id} Stop glyph is ${glyph.toFixed(2)}:1 on its button; expected at least 3:1`);
+  }
 });

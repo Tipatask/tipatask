@@ -1,0 +1,8 @@
+{
+  "version": "0.164.0",
+  "rows": [
+    { "raw": "\u001b[K\u001b[2m• \u001b[22mPermission selection requested: Full Access\u001b[0m", "mode": null },
+    { "raw": "\u001b[K\u001b[2m  Permissions:         \u001b[22mWorkspace (Approve for me)\u001b[0m", "mode": "auto" },
+    { "raw": "\u001b[K\u001b[2m  Permissions:         \u001b[22mFull Access\u001b[0m", "mode": "bypass" }
+  ]
+}

@@ -51,25 +51,82 @@ function expectedLaunch() {
   return resolvePiLaunch() || { command: 'pi', argsPrefix: [] };
 }
 
-test('Pi Plan ignores an obsolete permission gate and sends its planning kickoff through argv', async t => {
+// (TPT9138) Every mode loads the gate a live switch needs; the kickoff waits for its handshake.
+test('Pi loads the permission gate in every mode, Plan and legacy included, and pastes the kickoff after the handshake', async t => {
   const dir = makeProjectDir({ API_PROJECT_ID: '42' });
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const agent = new PiAgent();
-  t.mock.method(require('../providers/pi-task-tools'), 'stagePermissionGate', () => {
-    assert.fail('Plan must not stage the tool gate');
-  });
-  for (const enforced of [false, true]) {
-    const permissionPolicy = { ...agent.buildPermissionPolicy({ mode: 'plan' }), enforced };
-    const spec = await agent.getSpawnSpec(FAKE_CONFIG, 'Work on task C1.', '', {
-      projectPath: dir, permissionPolicy,
-      permissionGate: { url: 'http://unused.test', token: 'unused' },
-    });
-    assert.ok(!spec.args.includes('--no-extensions'));
-    assert.equal(spec.env.TIPATASK_PERMISSION_URL, undefined);
-    assert.equal(spec.env.TIPATASK_PERMISSION_TOKEN, undefined);
-    assert.equal(spec.initialPrompt, undefined);
-    assert.match(kickoffText(spec), /Start in planning mode enforced by Task App/);
-    assert.match(kickoffText(spec), /Plan ready\./);
+  const staged = path.join(dir, 'staged-permission-gate.mjs');
+  t.mock.method(require('../providers/pi-task-tools'), 'stagePermissionGate', () => staged);
+  const permissionGate = { url: 'http://127.0.0.1:1/check', token: 'b'.repeat(64) };
+  for (const mode of [null, 'plan', 'auto', 'bypass']) {
+    const permissionPolicy = agent.buildPermissionPolicy({ mode });
+    const spec = await agent.getSpawnSpec(FAKE_CONFIG, 'Work on task C1.', '', { projectPath: dir, permissionPolicy, permissionGate });
+    const at = spec.args.indexOf(staged);
+    assert.ok(at > 0 && spec.args[at - 1] === '-e', `${mode}: gate loaded with -e`);
+    assert.ok(spec.args.indexOf('--no-extensions') < at, `${mode}: discovery off before the gate`);
+    assert.equal(spec.env.TIPATASK_PERMISSION_URL, permissionGate.url);
+    assert.equal(spec.env.TIPATASK_PERMISSION_TOKEN, permissionGate.token);
+    assert.equal(typeof spec.initialPrompt, 'string', `${mode}: kickoff pasted after the gate handshake`);
+    assert.ok(!spec.args.some(arg => arg.includes('Work on task C1.')), `${mode}: no positional kickoff`);
+    if (permissionPolicy.planning) {
+      assert.match(spec.initialPrompt, /Start in planning mode enforced by Task App/);
+      assert.match(spec.initialPrompt, /Plan ready\./);
+    }
+  }
+  // Without a gate (an older Pi, the probes) the planning kickoff still goes through argv.
+  const spec = await agent.getSpawnSpec(FAKE_CONFIG, 'Work on task C1.', '', {
+    projectPath: dir, permissionPolicy: agent.buildPermissionPolicy({ mode: 'plan' }) });
+  assert.ok(!spec.args.includes('--no-extensions'));
+  assert.equal(spec.initialPrompt, undefined);
+  assert.equal(spec.env.TIPATASK_PERMISSION_URL, undefined);
+  assert.match(kickoffText(spec), /Plan ready\./);
+});
+
+test('Pi live switch pastes at once, sends Enter after one bounded settle and abandons an ended run', t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const agent = new PiAgent();
+  const writes = [];
+  const session = { pty: { write: d => writes.push(d) }, alive: true, lastOutputAt: Date.now() };
+  const counts = { submitted: 0, abandoned: 0 };
+  const hooks = { onSubmitted: () => counts.submitted++, onAbandoned: () => counts.abandoned++ };
+  agent._submitModeSwitch(session, 'directive', () => session.alive, hooks);
+  assert.deepEqual(writes, ['\x1b[200~directive\x1b[201~'], 'no wait before the paste: mid-turn it is a steer message');
+  const repaint = ms => { for (let left = ms; left > 0; left -= 100) { session.lastOutputAt = Date.now(); t.mock.timers.tick(100); } };
+  repaint(1900);
+  assert.equal(writes.length, 1, 'Enter waits while the TUI repaints');
+  repaint(200);
+  assert.deepEqual(writes.slice(1), ['\r'], 'but never past the 2 s ceiling');
+  assert.deepEqual(counts, { submitted: 1, abandoned: 0 });
+
+  writes.length = 0;
+  agent._submitModeSwitch(session, 'directive', () => session.alive, hooks);
+  session.alive = false;
+  t.mock.timers.tick(3000);
+  assert.deepEqual(writes, ['\x1b[200~directive\x1b[201~']);
+  assert.deepEqual(counts, { submitted: 1, abandoned: 1 });
+  agent._submitModeSwitch(session, 'directive', () => session.alive, hooks);
+  assert.equal(writes.length, 1, 'nothing is written into an ended run');
+  assert.equal(counts.abandoned, 2);
+});
+
+// The switch directive is pasted into Pi's TUI and its echo passes through prompt detection.
+test('Pi live switch directives stay clear of the prompt detectors when wrapped at any width', () => {
+  const agent = new PiAgent();
+  const tail = buildLegacyPatternTable().filter(({ agents }) => !agents || agents.includes('pi'));
+  for (const mode of ['auto', 'bypass']) {
+    const directive = agent.buildModeSwitchDirective(mode);
+    for (const { re } of tail) assert.ok(!re.test(directive), `${mode}: tail-scoped pattern matched: ${re}`);
+    for (const width of [40, 60, 80, 100, 120, 160, 1000]) {
+      for (const paragraph of directive.split('\n')) {
+        for (let rest = paragraph; rest.length; rest = rest.slice(width)) {
+          const line = rest.slice(0, width);
+          assert.equal(matchPromptLine(line, PI_PROMPT_PATTERNS), null, `${mode}@${width} Pi table: ${line}`);
+          assert.equal(matchPromptLine(line, GENERIC_PROMPT_PATTERNS), null, `${mode}@${width} generic table: ${line}`);
+          assert.doesNotMatch(line, /^[\s>│┃╎┆❯➤▶›*]*(?:plan|questions) ready[.!]?\s*$/i);
+        }
+      }
+    }
   }
 });
 

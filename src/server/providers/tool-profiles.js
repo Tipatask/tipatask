@@ -29,9 +29,9 @@ const TASK_CHAT_REMOTE_TOOLS = Object.freeze([
 // Remote tools kept out of a chat: maintenance/placeholder operations with no chat use.
 const TASK_CHAT_REMOTE_DENIED = Object.freeze(['purge_stale_reservations', 'reserve_task_keys']);
 // The only `tipatask-local` tool a chat gets. The rest write the local KB checkout, run the
-// task-completion flow, or report git state.
+// task-completion flow, report git state, or start a cowboy chain's next sessions.
 const TASK_CHAT_LOCAL_TOOLS = Object.freeze(['batch_grep_tags']);
-const TASK_CHAT_LOCAL_DENIED = Object.freeze(['push_knowledge', 'pull_knowledge', 'complete_task', 'git_worktree_status']);
+const TASK_CHAT_LOCAL_DENIED = Object.freeze(['push_knowledge', 'pull_knowledge', 'complete_task', 'git_worktree_status', 'start_next_tasks']);
 
 const PI_TASK_API_TOOL = 'tipatask_api';
 

@@ -38,7 +38,10 @@
 // --trace writes the PTY I/O trace (TIPATASK_PTY_TRACE, src/server/pty-trace.js) into the
 // scratch dir and keeps it; --no-bracket / --boot-floor-ms <n> / --manual-enter-after <ms> are
 // diagnosis knobs for the Windows input path (see TPT9048).
-// Usage: npm run probe:codex-kickoff -- --yes [--keep] [--file-kickoff] [--trace] [--no-bracket]
+// --switch-mode verifies live policies and same-rollout context through the production adapter.
+// --switch-phase planning,running,approval selects matrix legs for diagnosis. Bypass never has
+// an approval prompt; Auto may review the harmless approval command automatically.
+// Usage: npm run probe:codex-kickoff -- --yes [--switch-mode] [--keep] [--file-kickoff] [--trace] [--no-bracket]
 //        [--boot-floor-ms N] [--manual-enter-after MS]
 // Exit codes: 0 = kickoff delivered · 1 = a check failed, or cleanup left a process running ·
 //             2 = refused to run (no --yes, no project/account) · 3 = Codex unavailable or never started.
@@ -66,6 +69,8 @@ function parseArgs(argv) {
   const value = (flag) => { const i = argv.indexOf(flag); return i >= 0 && argv[i + 1] ? Number(argv[i + 1]) : null; };
   return {
     yes: argv.includes('--yes'),
+    switchMode: argv.includes('--switch-mode'),
+    switchPhase: argv.includes('--switch-phase') ? argv[argv.indexOf('--switch-phase') + 1] : null,
     keep: argv.includes('--keep'),
     fileKickoff: argv.includes('--file-kickoff') || process.platform === 'win32',
     trace: argv.includes('--trace'),
@@ -334,6 +339,98 @@ async function main() {
       console.log(`Detect detail:   ${JSON.stringify(status.detail || null)}`);
       notes.push(`Codex unavailable: ${status.reason || 'unknown reason'}`);
       return 3;
+    }
+
+    if (opts.switchMode) {
+      const { requestPermissionMode, handleTerminalInput } = require('../src/server/terminal-session');
+      const { rolloutState } = require('../src/server/task-agent/codex-live-mode');
+      const wait = async (check, label, ms = 120000) => {
+        const deadline = Date.now() + ms;
+        while (Date.now() < deadline) {
+          if (check()) return;
+          await sleep(100);
+        }
+        throw new Error(`Timed out: ${label}`);
+      };
+      // Keep probe instructions separate from real task execution: no task mutations,
+      // commits or completion calls, but production spawn policy and switching code.
+      agent.buildPrompt = (prompt, options) => `${options.permissionPolicy.prompt}\n${prompt}`;
+      const originalSpec = agent.getSpawnSpec.bind(agent);
+      agent.getSpawnSpec = async (...args) => {
+        const spec = await originalSpec(...args);
+        if (!spec.args.includes('--no-daemon')) spec.args.unshift('--no-daemon');
+        codexHome = spec.env.CODEX_HOME;
+        return spec;
+      };
+      const transitions = [['plan', 'auto'], ['auto', 'bypass'], ['bypass', 'auto'], ['plan', 'bypass']];
+      for (const phase of ['planning', 'running', 'approval']) {
+        if (opts.switchPhase && !opts.switchPhase.split(',').includes(phase)) continue;
+        for (const [from, to] of transitions) {
+          // Bypass has no approval dialog: verify restored checks after this transition.
+          const session = createSession(noticeRecorder(() => {}), false, TASK_KEY, projectRoot);
+          session.taskAgent = 'codex';
+          const token = `MEMORY_${phase}_${from}_${to}`;
+          await spawnTerminal(session, `Work on task ${TASK_KEY}: This is an isolated permission-switch probe. `
+            + `Remember ${token}. Never mutate tasks or use Tipatask tools. Reply READY and wait.`, TASK_KEY, [], {
+            sessions: [], task: { id: TASK_KEY, agentPermissionMode: from, effort: 'low' },
+            backend: { getEffectiveProjectSettings: async () => ({ settings: { agent_permission_mode: from } }) },
+          });
+          ptyPids.push(session.ptyPid);
+          // Track every resumed child, including rollback, for PID-based teardown.
+          const spawn = session.pty.spawn;
+          session.pty.spawn = (...args) => { const child = spawn(...args); ptyPids.push(child.pid); return child; };
+          let file;
+          await wait(() => {
+            file = locateCodexRollout(session._transcriptHint);
+            return file && rolloutState(fs.readFileSync(file, 'utf8')).ended;
+          }, 'initial turn');
+          const originalId = JSON.parse(fs.readFileSync(file, 'utf8').split('\n')[0]).payload.id;
+          const submit = async text => {
+            handleTerminalInput(session, `\x1b[200~${text}\x1b[201~`);
+            await sleep(700);
+            handleTerminalInput(session, '\r');
+          };
+          let approval = from === 'bypass' ? 'bypass has no prompt' : 'not requested';
+          if (phase === 'running') {
+            await submit('Run exactly one shell command: sleep 4. Then reply WAITED.');
+            await wait(() => /"type":"(?:exec_command_begin|custom_tool_call|function_call)"/.test(fs.readFileSync(file, 'utf8')),
+              'running command');
+          } else if (phase === 'approval' && from !== 'bypass') {
+            await submit('Request native command approval using sandbox_permissions=require_escalated before running '
+              + '`printf PROBE_APPROVAL`. This is a permission-dialog probe; do not run a substitute command.');
+            await wait(() => session.pty.nativeApprovalPending()
+              || (rolloutState(fs.readFileSync(file, 'utf8')).ended
+                && fs.readFileSync(file, 'utf8').includes('PROBE_APPROVAL')), 'approval request');
+            approval = session.pty.nativeApprovalPending() ? 'native dialog' : 'native automatic review';
+            if (from === 'plan' && approval !== 'native dialog') throw new Error('Plan approval did not reach a native dialog');
+          }
+          const before = session.ptyPid;
+          const frames = [];
+          const send = session.ws.send.bind(session.ws);
+          session.ws.send = frame => { frames.push(JSON.parse(frame)); send(frame); };
+          const state = await requestPermissionMode('probe', to, new Map([['probe', session]]));
+          if (state.error || state.confirmed !== to || state.pending) throw new Error(JSON.stringify(state));
+          if (session.ptyPid === before) throw new Error('TUI was not resumed');
+          if (!frames.some(frame => frame.type === 'session:permission-mode-changed' && frame.pending && frame.confirmed === from)) {
+            throw new Error('No pending frame preserving previous mode');
+          }
+          const afterId = JSON.parse(fs.readFileSync(file, 'utf8').split('\n')[0]).payload.id;
+          if (afterId !== originalId) throw new Error('Rollout changed');
+          await wait(() => rolloutState(fs.readFileSync(file, 'utf8')).ended, 'directive turn');
+          await submit('Reply with the MEMORY_ codeword I gave you at the start. Do not use tools.');
+          await wait(() => {
+            const text = fs.readFileSync(file, 'utf8');
+            return rolloutState(text).ended && text.slice(text.lastIndexOf('Reply with the MEMORY_')).includes(token);
+          }, 'context recall');
+          console.log(`PASS — ${phase}: ${from} -> ${to}, native policy confirmed, same rollout, codeword recalled`
+            + (phase === 'approval' ? ` (${approval}${to === 'auto' ? '; Auto checks restored' : ''})` : ''));
+          // Stop each completed probe before launching the next; never concurrent tests.
+          await session.pty.command('/quit');
+          await wait(() => !session.alive, 'probe exit');
+        }
+      }
+      checks.composer = checks.rollout = true;
+      return 0;
     }
 
     // The idle composer as it lands in the ANSI-stripped stream: prompt glyph, then a placeholder —

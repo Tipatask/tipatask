@@ -12,12 +12,14 @@
  *                              title/description — plus its task_images/task_files attachment refs — as a
  *                              comment_type='spec' comment before the write lands. See origin-spec-capture.js.
  *   deleteTask(id)           → Promise<boolean>     Delete task, return true/false
- *   createTask(task)         → Promise<object>      Create new task, return it
+ *   createTask(task, opts?)  → Promise<object>      Create new task, return it. A network failure queues the create
+ *                              offline (optimistic tmp- row) unless opts.queueOffline === false, which throws instead;
+ *                              updateTask(id, fields, opts?) takes the same option
  *   saveTasks(tasks)         → Promise<void>        Bulk overwrite all tasks
  *   overwriteRaw(content)    → Promise<void>        Raw overwrite of the full task set (server-synthesized TODO.md wire format)
  *   finalizeChanges(changes) → Promise<void>        Apply new/modified task changes
  *   getSprints()             → Promise<Array>       List sprint objects
- *   createSprint(name, num)  → Promise<object|null> Create sprint
+ *   createSprint(name, num, extra?) → Promise<object|null> Create sprint (extra: {goal, start_date, end_date}); null when the number exists
  *   getStatuses()            → Promise<StatusRow[]>           Project's status registry: [{id, name, color, display_order, is_workflow_start, is_in_progress, is_workflow_complete, task_count}]. Live from GET /statuses (30s cache). Never throws — falls back to the legacy 5 on any failure (C1184).
  *   createStatus({name,color?,is_*?}) → Promise<StatusRow>    Add a status, appended last (C1182)
  *   updateStatus(id, fields) → Promise<StatusRow>             Rename/recolor/reorder/move-a-role on one status; a role can only be moved, never cleared (C1182)

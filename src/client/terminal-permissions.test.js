@@ -16,7 +16,7 @@ test('permission controls survive repeated state, escape tool input, send one an
   const message = { permissionMode: 'auto', permissionSource: 'project',
     permissionRequest: { id: 'one', tool: 'Write', input: '<img src=x onerror=alert(1)>' } };
   renderTerminalPermissions(overlay, message, m => sent.push(m));
-  assert.match(overlay.querySelector('.terminal-permission-mode').textContent, /Auto mode/);
+  assert.equal(overlay.querySelector('.terminal-permission-mode'), null, 'the run mode is session-mode-control.js\'s (TPT9139)');
   assert.equal(overlay.querySelector('img'), null);
   const buttons = overlay.querySelectorAll('button');
   buttons[1].click(); buttons[1].click();

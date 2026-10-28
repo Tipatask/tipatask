@@ -106,6 +106,12 @@ function piDiscoveryMandateLines(bridge = false, planning = true) {
 const PI_PROMPT_BUDGET = 12000;
 const PI_PARENT_BLOCK_MAX_CHARS = 2000;
 
+// (TPT9138) Live mode switch: how long the gate waits for Pi to report the submitted switch
+// directive (a submission typed during compaction is only processed once compaction ends), and
+// the longest settle between its paste and Enter on a TUI that keeps repainting.
+const PI_SWITCH_CONFIRM_MS = 60000;
+const PI_SWITCH_SETTLE_MAX_MS = 2000;
+
 // (TPT9008) detect()'s negatives by stable code (BaseTaskAgent#unavailableResult(), `{output}` filled
 // from its params). Each sentence is the English `reason`; the terminal shows
 // terminal.error.ESTART.<code>.pi (i18n.js) instead, whose English value must stay
@@ -155,6 +161,13 @@ class PiAgent extends BaseTaskAgent {
     return buildTagDescriptionDirective(opts.taskTags, opts.tagDescriptions, { compact: !opts.piMcpBridge });
   }
 
+  // (TPT9163) Cowboy chain hand-off, always compact: bridge mode calls the bridged tool, the REST
+  // fallback `tt next` (src/cli/task-tools.js). Both send this run's TIPATASK_COWBOY_TOKEN.
+  buildCowboyDirective(opts = {}) {
+    const nextCall = opts.piMcpBridge ? '`tipatask-local__start_next_tasks(task_key)`' : '`tt next "$TIPATASK_TASK_ID"`';
+    return super.buildCowboyDirective({ ...opts, compact: true, nextCall });
+  }
+
   // Compact wording for every shared directive — Pi's kickoff prompt is echoed verbatim into
   // its own TUI under a hard size budget, and the REST fallback has no MCP tools to name. Text clarifying
   // questions stay on: Pi has no question tool.
@@ -192,7 +205,7 @@ class PiAgent extends BaseTaskAgent {
       ? `Cross-reference scan for [${ttTags.join(', ')}] is already complete in startup context. Use shell grep/rg only for identifiers absent from that section.`
       : 'Use rg for source search.';
     // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status,
-    // follow-up capture) plus the separate clarify slot — see base-agent.js#buildSharedPreamble. All compact by policy
+    // follow-up capture, cowboy chain hand-off) plus the separate clarify slot — see base-agent.js#buildSharedPreamble. All compact by policy
     // (getPreamblePolicy() above): plain prose/bullet lines with no dialog-shaped phrasing, so
     // they stay safe under the HARD RULE above (no bare "Plan ready.", no "❯ n." prefix, no
     // "[y/n]", no "do you want to …?" etc.) and inside the echo-verbatim prompt budget —
@@ -361,8 +374,10 @@ class PiAgent extends BaseTaskAgent {
     // would have to name every bridged tool, which is only known once the servers answer.
     // Headless chat turns do pass one (tool-profiles.js piToolAllowlist) — they want a fence.
     if (bridge) args.push('-e', bridge.extensionPath);
-    const permissionGate = opts.permissionPolicy?.planning || opts.permissionPolicy?.mode === 'plan'
-      ? null : opts.permissionGate;
+    // (TPT9138) A gated run loads the blocking gate in every mode, so a live switch changes
+    // enforcement at the next tool call. Discovery stays off whatever the mode: any run can be
+    // switched to Auto, which needs the gate to be the only path to a tool.
+    const permissionGate = opts.permissionGate || null;
     if (permissionGate) {
       args.push('--no-extensions');
       env.TIPATASK_PERMISSION_URL = permissionGate.url;
@@ -420,11 +435,13 @@ class PiAgent extends BaseTaskAgent {
   // newline in Pi's editor instead of submitting.
   _submitApproval(session, text) {
     if (!session.pty) return;
+    const current = this.approvalSubmissionGuard(session);
+    if (!current()) return;
     const quietMs = this.getPasteSilenceMs();
     const ceiling = Date.now() + 10000; // don't wait forever on a permanently noisy PTY
     const waitQuiet = (cb) => {
       const check = () => {
-        if (!session.pty) return;
+        if (!current()) return;
         const idleMs = Date.now() - (session.lastOutputAt || 0);
         if (idleMs >= quietMs || Date.now() >= ceiling) { cb(); return; }
         setTimeout(check, 100);
@@ -432,16 +449,62 @@ class PiAgent extends BaseTaskAgent {
       check();
     };
     waitQuiet(() => {
-      if (!session.pty) return;
+      if (!current()) return;
       session.pty.write('\x1b[200~' + text + '\x1b[201~');
       waitQuiet(() => {
-        if (session.pty) session.pty.write('\r');
+        if (current()) session.pty.write('\r');
       });
     });
   }
 
   approvePlan(session) {
     this._submitApproval(session, this.getApprovalText(session));
+  }
+
+  // ── Live permission-mode switch (TPT9138) ──
+  // Only a run launched with the gate can switch: every tool call already asks it, and it
+  // answers from the session's confirmed mode, so enforcement needs no change inside Pi.
+  supportsLivePermissionSwitch(session) {
+    return !!session?._permissionGate && !session._imageOperation;
+  }
+
+  // The behavioral half goes in as a user message pasted into the running TUI (a steer message
+  // mid-turn, a fresh turn when idle). The gate extension's input hook reports it, and that report
+  // confirms the switch. Tool calls in between wait at the gate and are decided under whichever
+  // mode is confirmed once the switch settles.
+  async switchPermissionMode(session, mode) {
+    const gate = session?._permissionGate;
+    if (!gate) return { supported: false };
+    const { modeSwitchError } = require('../permission-policy');
+    if (!gate.ready || !session.pty) throw modeSwitchError('inactive');
+    const directive = this.buildModeSwitchDirective(mode);
+    const expected = gate.expectModeSwitch(mode, { timeoutMs: PI_SWITCH_CONFIRM_MS });
+    const confirmation = expected.promise;
+    const pty = session.pty;
+    const epoch = session._permissionEpoch;
+    const current = () => session.pty === pty && session._permissionEpoch === epoch && session.alive && !session._terminated;
+    this._submitModeSwitch(session, directive, current, {
+      onSubmitted: () => expected.markSubmitted(),
+      onAbandoned: () => expected.fail(modeSwitchError('session_changed')),
+    });
+    return { supported: true, confirmed: await confirmation };
+  }
+
+  // Unlike _submitApproval(), no wait before the paste: landing mid-turn as a steer message is the
+  // point. One settle after it so the editor has taken the paste before Enter.
+  _submitModeSwitch(session, text, current, { onSubmitted, onAbandoned }) {
+    if (!current()) { onAbandoned(); return; }
+    const quietMs = this.getPasteSilenceMs();
+    const later = (fn, ms) => { const timer = setTimeout(fn, ms); if (timer.unref) timer.unref(); };
+    session.pty.write('\x1b[200~' + text + '\x1b[201~');
+    const ceiling = Date.now() + PI_SWITCH_SETTLE_MAX_MS;
+    const check = () => {
+      if (!current()) { onAbandoned(); return; }
+      if (Date.now() - (session.lastOutputAt || 0) < quietMs && Date.now() < ceiling) { later(check, 100); return; }
+      session.pty.write('\r');
+      onSubmitted();
+    };
+    later(check, quietMs);
   }
 
   // (TPT354) See BaseTaskAgent#readFinalMessage. Pi's per-cwd session dir (or a custom-endpoint

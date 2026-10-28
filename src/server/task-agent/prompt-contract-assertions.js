@@ -68,6 +68,16 @@ function followUps(text) {
   assert.match(text, /Skip trivia/, 'trivia is skipped');
 }
 
+function cowboyChain(text) {
+  once(text, /Cowboy chain:/, 'cowboy chain directive delivered exactly once');
+  once(text, /After[^\n]*(?:complete_task`? succeeded|completion succeeds)[^\n]*(?:start_next_tasks\(task_key\)|tt next)[^\n]*exactly once/,
+    'the next tasks are requested exactly once, only after a successful completion');
+  once(text, /Never pick, start or work on the next tasks yourself/, 'the agent never picks or starts tasks itself exactly once');
+  once(text, /refused[^\n]*(?:do not call it|skip it)/, 'a refused or blocked completion starts nothing exactly once');
+  once(text, /(?:task keys it started|started task keys)[^\n]*(?:final message|reason)/, 'the started keys are reported exactly once');
+  assert.match(text, /No retry|Do not retry/, 'the request is never retried');
+}
+
 function tagBackfill(text, id) {
   once(text, /Blank tag description\(s\) on this task: tt-fixture/, 'blank registered tag needs backfill exactly once');
   assert.match(text, /[Ss]tudy the module/);
@@ -85,4 +95,4 @@ function vcsOff(text) {
   assert.match(text, /Never[^\n]*(?:attribution|Co-Authored-By)/);
 }
 
-module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, tagBackfill, vcsOff };
+module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, cowboyChain, tagBackfill, vcsOff };

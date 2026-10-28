@@ -44,6 +44,7 @@ const NUDGE_TYPED_LINE = 'Please finish the steps pasted above.';
 // The state both the nudge and the exit backstop act on: the task is in the in-progress role in a
 // git project with commits on.
 function isInProgress(status, roles) {
+  if (status && (status === roles?.complete || status === roles?.canceled)) return false;
   const inProgress = roles && roles.in_progress;
   return typeof status === 'string' && !!inProgress && status === inProgress;
 }

@@ -4,8 +4,13 @@ const crypto = require('node:crypto');
 
 const COOKIE_NAME = 'tipatask_local_session';
 const CAPABILITY_HEADER = 'x-tipatask-capability';
+const RUN_TOKEN_HEADER = 'x-tipatask-run-token';
 const MAX_LOGIN_BYTES = 1024;
 const LOCAL_HOST = '127.0.0.1';
+// (TPT9162) The one route a task run's own token opens: POST /api/tasks/<key>/cowboy-next
+// (terminal-session.js launchCowboyChain()). Neither a window capability nor a browser session
+// opens it, and the token opens nothing else.
+const RUN_TOKEN_ROUTE = /^\/api\/tasks\/([^/]+)\/cowboy-next$/;
 
 function equalSecret(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string') return false;
@@ -76,8 +81,24 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 }
 
+function runTokenRouteKey(pathname) {
+  const match = RUN_TOKEN_ROUTE.exec(pathname);
+  if (!match) return null;
+  try { return decodeURIComponent(match[1]); } catch { return ''; }
+}
+
+// The live run whose token equals the one supplied, or null. `runs` is liveRunTokens(taskKey):
+// [{ token, projectPath }] of the task's live cowboy runs; every one is compared.
+function matchRunToken(supplied, runs) {
+  let match = null;
+  for (const run of runs) {
+    if (run && equalSecret(supplied, run.token)) match = run;
+  }
+  return match;
+}
+
 function createLocalAccess({ port, secret = crypto.randomBytes(32).toString('base64url'),
-  electron = false, getActiveProjectPath = () => '' } = {}) {
+  electron = false, getActiveProjectPath = () => '', liveRunTokens = () => [] } = {}) {
   const allowedHosts = new Set([`localhost:${port}`, `127.0.0.1:${port}`]);
   const loginCode = electron ? null : crypto.randomBytes(18).toString('base64url');
   let loginCodeAvailable = !!loginCode;
@@ -96,6 +117,22 @@ function createLocalAccess({ port, secret = crypto.randomBytes(32).toString('bas
     const badAddress = validateAddress(req, { upgrade });
     if (badAddress) return { status: badAddress };
     const url = new URL(req.url, `http://${req.headers.host}`);
+    const runKey = runTokenRouteKey(url.pathname);
+    if (runKey !== null) {
+      // The run's own token, sent once, while the run is live, is the only credential this takes.
+      const supplied = req.headers[RUN_TOKEN_HEADER];
+      if (upgrade || req.method !== 'POST' || !runKey || headerCount(req, RUN_TOKEN_HEADER) !== 1
+        || typeof supplied !== 'string' || !supplied) return { status: 403 };
+      let runs = [];
+      try { runs = liveRunTokens(runKey) || []; } catch { runs = []; }
+      const run = matchRunToken(supplied, runs);
+      if (!run) return { status: 403 };
+      const projectPath = run.projectPath || '';
+      req.headers['x-tipatask-project'] = projectPath || undefined;
+      req.headers['x-tiptask-project-path'] = projectPath || undefined;
+      req.localAccess = { kind: 'run', projectPath, taskKey: runKey };
+      return req.localAccess;
+    }
     const capability = req.headers[CAPABILITY_HEADER];
     const selectorA = req.headers['x-tipatask-project'];
     const selectorB = req.headers['x-tiptask-project-path'];
@@ -214,4 +251,4 @@ function createLocalAccess({ port, secret = crypto.randomBytes(32).toString('bas
   return { guardHttp, guardUpgrade, authorize, loginCode, secret };
 }
 
-module.exports = { createLocalAccess, electronCapability, stampElectronRequest, CAPABILITY_HEADER, LOCAL_HOST };
+module.exports = { createLocalAccess, electronCapability, stampElectronRequest, CAPABILITY_HEADER, RUN_TOKEN_HEADER, LOCAL_HOST };

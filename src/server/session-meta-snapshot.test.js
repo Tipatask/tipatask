@@ -86,6 +86,20 @@ test('GET /api/sessions reports the live session agent — a rewritten taskAgent
     assert.equal(r.json.sessionMeta.TPT1.label, 'Claude Code');
     assert.equal(r.json.sessionMeta.TPT1.startedAt, s.startedAt);
 
+    s.permissionPolicy = require('./permission-policy').buildPermissionPolicy({ mode: 'auto', source: 'session' }, 'claude');
+    s.permissionMode = { requested: 'bypass', confirmed: 'auto', pending: true, error: null };
+    r = await getJson(port, '/api/sessions');
+    // (TPT9139) The row adds `supported` (the adapter switches live) to the session's state.
+    const { supported, ...row } = r.json.sessionMeta.TPT1.permissionMode;
+    assert.deepEqual(row, s.permissionMode);
+    assert.equal(supported, require('./task-agent').getTaskAgent('claude').supportsLivePermissionSwitch(s));
+    assert.equal(r.json.sessionMeta.TPT1.permissionSource, 'session');
+    s.permissionMode = { ...s.permissionMode, pending: false, error: { code: 'EPERMISSION_MODE', reason: 'unsupported' } };
+    r = await getJson(port, '/api/sessions');
+    assert.equal(r.json.sessionMeta.TPT1.permissionMode.confirmed, 'auto');
+    assert.equal(r.json.sessionMeta.TPT1.permissionMode.error.reason, 'unsupported');
+    assert.equal(r.json.sessionMeta.TPT1.permissionMode.supported, false, 'a run refused as unsupported offers no selector');
+
     // The in-place rewrite handleConnection()/spawnTerminal() perform on a restart under
     // another agent — the snapshot must follow it, not remember the first spawn.
     s.taskAgent = 'codex';
@@ -99,6 +113,34 @@ test('GET /api/sessions reports the live session agent — a rewritten taskAgent
     r = await getJson(port, '/api/sessions');
     assert.deepEqual(r.json.sessions.sort(), ['TPT1', 'TPT2']);
     assert.deepEqual(r.json.sessionMeta.TPT2, { agent: 'pi', label: 'Pi Coding Agent', type: 'terminal', alive: false, paused: null });
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+// A task or project chat connects as a pending session with the default terminal type and mode
+// state until its start-* message; its row never carries permission-mode fields.
+test('GET /api/sessions leaves permission-mode fields off chat rows, pending or started, and keeps them on terminals', async () => {
+  const { createSession } = require('./session-state');
+  const started = Object.assign(createSession(null, true, 'taskChat:TPT2', scratch), { type: 'taskChat', pending: false, taskKey: 'TPT2' });
+  const sessions = new Map([
+    ['pending-task', createSession(null, true, 'taskChat:TPT1', scratch)],
+    ['pending-project', createSession(null, true, 'projectChat:2:chat01', scratch)],
+    ['started', started],
+    ['TPT1', fakeSession({ permissionMode: { requested: null, confirmed: null, pending: false, error: null } })],
+  ]);
+  const server = http.createServer(createHttpHandler(sessions, () => ({})));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const r = await getJson(server.address().port, '/api/sessions');
+    for (const id of ['taskChat:TPT1', 'projectChat:2:chat01', 'taskChat:TPT2']) {
+      assert.ok(r.json.sessionMeta[id], id);
+      assert.equal('permissionMode' in r.json.sessionMeta[id], false, id);
+      assert.equal('permissionSource' in r.json.sessionMeta[id], false, id);
+    }
+    assert.deepEqual(r.json.sessionMeta.TPT1.permissionMode, { requested: null, confirmed: null, pending: false, error: null, supported: false });
+    assert.equal(r.json.sessionMeta.TPT1.permissionSource, null);
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));

@@ -41,7 +41,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 This appendix lists every third-party package redistributed inside the packaged app, in two groups: TipΔTask's own production dependency closure (shipped inside `app.asar`) and the bundled Pi Coding Agent's full dependency closure (shipped as `vendor/pi/node_modules`, outside the asar — see `scripts/stage-pi-bundle.js`). All packages are under permissive licenses (no copyleft). Regenerate with `node scripts/gen-third-party-notices.js`; `--check` verifies it is current.
 
-### TipΔTask app dependencies (119 packages)
+### TipΔTask app dependencies (123 packages)
 
 | Package | License | Copyright |
 |---|---|---|
@@ -54,6 +54,7 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `ajv@8.18.0` | MIT | Copyright (c) 2015-2021 Evgeny Poberezkin |
 | `ajv-formats@3.0.1` | MIT | Copyright (c) 2020 Evgeny Poberezkin |
 | `body-parser@2.3.0` | MIT | Copyright (c) 2014 Jonathan Ong <me@jongleberry.com> |
+| `buffer-crc32@1.0.0` | MIT | Copyright (c) 2013-2024 Brian J. Brennan |
 | `bundle-name@4.1.0` | MIT | Sindre Sorhus |
 | `bytes@3.1.2` | MIT | Copyright (c) 2012-2014 TJ Holowaychuk <tj@vision-media.ca> |
 | `call-bind-apply-helpers@1.0.2` | MIT | Copyright (c) 2024 Jordan Harband |
@@ -126,6 +127,7 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `parseurl@1.3.3` | MIT | Copyright (c) 2014 Jonathan Ong <me@jongleberry.com> |
 | `path-key@3.1.1` | MIT | Sindre Sorhus |
 | `path-to-regexp@8.4.2` | MIT | Copyright (c) 2014 Blake Embrey (hello@blakeembrey.com) |
+| `pend@1.2.0` | MIT | Copyright (c) 2014 Andrew Kelley |
 | `pkce-challenge@5.0.1` | MIT | Copyright (c) 2019 |
 | `proxy-addr@2.0.7` | MIT | Copyright (c) 2014-2016 Douglas Christopher Wilson |
 | `qs@6.16.0` | BSD-3-Clause | Copyright (c) 2014, Nathan LaFreniere and other [contributors](https://github.com/ljharb/qs/graphs/contributors) |
@@ -162,6 +164,8 @@ This appendix lists every third-party package redistributed inside the packaged 
 | `wrappy@1.0.2` | ISC | Isaac Z. Schlueter <i@izs.me> (http://blog.izs.me/) |
 | `ws@8.22.0` | MIT | Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com> |
 | `wsl-utils@0.1.0` | MIT | Sindre Sorhus |
+| `yauzl@3.4.0` | MIT | Copyright (c) 2014 Josh Wolfe |
+| `yazl@3.3.1` | MIT | Copyright (c) 2014 Josh Wolfe |
 | `zod@4.6.5` | MIT | Copyright (c) 2025 Colin McDonnell |
 | `zod-to-json-schema@3.25.2` | ISC | Copyright (c) 2020, Stefan Terdell |
 

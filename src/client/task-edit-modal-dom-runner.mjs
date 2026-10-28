@@ -52,7 +52,9 @@ try {
         export * as editor from './src/client/task-edit-modal.js';
         export { default as state } from './src/client/state.js';
         export { api } from './src/client/api-client.js';
-        export { AGENT_PERMISSION_MODES } from './src/client/permission-mode.js';`,
+        export { AGENT_PERMISSION_MODES } from './src/client/permission-mode.js';
+        export { setProjectPermissionMode } from './src/client/group-label.js';
+        export { setLocale } from './src/client/i18n.js';`,
       resolveDir: root,
     },
     bundle: true,
@@ -62,7 +64,7 @@ try {
     loader: { '.css': 'empty' },
   });
   writeFileSync(bundlePath, bundled.outputFiles[0].contents);
-  const { board, cards, state, api, AGENT_PERMISSION_MODES } = await import(pathToFileURL(bundlePath).href);
+  const { board, cards, state, api, AGENT_PERMISSION_MODES, setProjectPermissionMode, setLocale } = await import(pathToFileURL(bundlePath).href);
   const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   const modal = () => document.getElementById('task-edit-modal');
   const task = (id, overrides = {}) => ({
@@ -174,6 +176,126 @@ try {
   permissionCard.remove();
   api.tasks.update = originalUpdate;
   console.log('TPT9071_PERMISSION_MODE_PASS');
+
+  // (TPT9161) Cowboy-coding mode: shown only while the draft starts in Bypass (override or the
+  // project default), hidden and unchecked otherwise; Save writes cowboy_mode, an explicit false
+  // once the draft leaves Bypass. Every switch must run without a console or listener error.
+  const cowboyErrors = [];
+  const consoleError = console.error;
+  console.error = (...args) => { cowboyErrors.push(args.map(String).join(' ')); consoleError(...args); };
+  const onWindowError = event => cowboyErrors.push(String(event.error || event.message));
+  window.addEventListener('error', onWindowError);
+  api.tasks.update = async (id, patch) => {
+    const result = await originalUpdate(id, patch);
+    if ('agent_permission_mode' in patch) tasks.get(id).agentPermissionMode = patch.agent_permission_mode;
+    if ('cowboy_mode' in patch) tasks.get(id).cowboyMode = patch.cowboy_mode;
+    return result;
+  };
+  tasks.set('COW', task('COW', { agentPermissionMode: null, cowboyMode: false }));
+  tasks.set('STALE', task('STALE', { agentPermissionMode: 'auto', cowboyMode: true }));
+  tasks.set('OTHERCOW', task('OTHERCOW', { assignee: 2, agentPermissionMode: 'bypass', cowboyMode: true }));
+  const cowboyCard = document.createElement('div');
+  cowboyCard.innerHTML = cards.renderCard(tasks.get('COW'));
+  document.body.appendChild(cowboyCard);
+  const cowboyRow = () => modal().querySelector('.modal-cowboy-mode-row');
+  const cowboyBox = () => modal().querySelector('#modal-cowboy-mode');
+  const setCowboy = checked => {
+    cowboyBox().checked = checked;
+    cowboyBox().dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  const save = async () => { modal().querySelector('.btn-modal-save').click(); await tick(); };
+  const cowboyTip = () => cowboyCard.querySelector('.card-permission-btn').dataset.tip;
+  setProjectPermissionMode('auto');
+  await board.openTaskEditModal('COW');
+  assert.equal(cowboyRow().hidden, true, 'Project Default (Auto) hides the checkbox');
+  assert.equal(cowboyBox().checked, false);
+  assert.equal(modal().querySelector('label[for="modal-cowboy-mode"]').textContent, 'Cowboy-coding mode');
+  assert.equal(cowboyBox().title, 'Starts sessions for the next startable tasks when this one finishes. Bypass only.');
+  assert.equal(cowboyRow().previousElementSibling.querySelector('#modal-permission-mode') !== null, true, 'sits right after the permission select');
+  choosePermission('bypass');
+  assert.equal(cowboyRow().hidden, false, 'Bypass shows it');
+  assert.equal(cowboyBox().checked, false);
+  assert.equal(cowboyBox().disabled, false);
+  setCowboy(true);
+  await save();
+  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { agent_permission_mode: 'bypass', cowboy_mode: true } });
+  assert.equal(cowboyTip(), 'Permission mode: Bypass · 🤠 Cowboy-coding mode', 'the card tip gains the marker');
+  board.closeTaskEditModal(true);
+  await board.openTaskEditModal('COW');
+  assert.equal(cowboyRow().hidden, false);
+  assert.equal(cowboyBox().checked, true, 'reopening reads the saved flag');
+  choosePermission('');
+  assert.equal(cowboyRow().hidden, true, 'back to Project Default (Auto) hides it');
+  assert.equal(cowboyBox().checked, false);
+  choosePermission('bypass');
+  assert.equal(cowboyBox().checked, false, 'a return to Bypass starts unchecked');
+  modal().querySelector('.btn-modal-reset').click();
+  assert.equal(cowboyRow().hidden, false);
+  assert.equal(cowboyBox().checked, true, 'Reset restores the saved flag');
+  choosePermission('plan');
+  await save();
+  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { agent_permission_mode: 'plan', cowboy_mode: false } }, 'leaving Bypass saves false');
+  assert.equal(cowboyTip(), 'Permission mode: Plan mode');
+  board.closeTaskEditModal(true);
+
+  // Inherited Bypass: Project Default ⇄ Bypass keeps the box, any other mode clears it.
+  setProjectPermissionMode('bypass');
+  tasks.get('COW').agentPermissionMode = null;
+  await board.openTaskEditModal('COW');
+  assert.equal(cowboyRow().hidden, false, 'an inherited Bypass shows it');
+  setCowboy(true);
+  await save();
+  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { cowboy_mode: true } });
+  choosePermission('bypass');
+  assert.equal(cowboyBox().checked, true, 'inherited Bypass to explicit Bypass keeps it');
+  choosePermission('');
+  assert.equal(cowboyBox().checked, true);
+  assert.equal(modal().querySelector('.btn-modal-save').disabled, true, 'a round trip back to the saved mode is clean');
+  choosePermission('auto');
+  assert.equal(cowboyRow().hidden, true);
+  await save();
+  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { agent_permission_mode: 'auto', cowboy_mode: false } });
+  board.closeTaskEditModal(true);
+
+  // A flag stored under a Bypass the task no longer starts in stays hidden and untouched.
+  await board.openTaskEditModal('STALE');
+  assert.equal(cowboyRow().hidden, true);
+  assert.equal(cowboyBox().checked, false);
+  const staleTitle = modal().querySelector('.modal-title-input');
+  staleTitle.value = 'Stale edited';
+  staleTitle.dispatchEvent(new Event('input', { bubbles: true }));
+  await save();
+  assert.deepEqual(writes.at(-1), { id: 'STALE', patch: { title: 'Stale edited' } });
+  choosePermission('bypass');
+  assert.equal(cowboyRow().hidden, false);
+  assert.equal(cowboyBox().checked, false, 'a stale flag never reappears checked');
+  await save();
+  assert.deepEqual(writes.at(-1), { id: 'STALE', patch: { agent_permission_mode: 'bypass', cowboy_mode: false } });
+  board.closeTaskEditModal(true);
+
+  // Read-only tasks show the saved state but lock it; proposals never render it; Ukrainian copy.
+  await board.openTaskEditModal('OTHERCOW');
+  assert.equal(cowboyRow().hidden, false);
+  assert.equal(cowboyBox().checked, true);
+  assert.equal(cowboyBox().disabled, true);
+  board.closeTaskEditModal(true);
+  await board.openTaskEditModal('new-cow', { preloadedTask: task('new-cow', { agentPermissionMode: 'bypass' }), onSavePreview: async () => {} });
+  assert.equal(cowboyRow(), null);
+  board.closeTaskEditModal(true);
+  setLocale('uk');
+  tasks.get('COW').agentPermissionMode = 'bypass';
+  await board.openTaskEditModal('COW');
+  assert.equal(modal().querySelector('label[for="modal-cowboy-mode"]').textContent, 'Ковбойський режим');
+  assert.match(cowboyBox().title, /Без підтверджень/);
+  board.closeTaskEditModal(true);
+  setLocale('en');
+  setProjectPermissionMode(null);
+  cowboyCard.remove();
+  api.tasks.update = originalUpdate;
+  window.removeEventListener('error', onWindowError);
+  console.error = consoleError;
+  assert.deepEqual(cowboyErrors, [], 'no console or listener errors while switching modes');
+  console.log('TPT9161_COWBOY_MODE_PASS');
 
   // View-only and agent-session locks remain distinct, with comments still available.
   await board.openTaskEditModal('OTHER');

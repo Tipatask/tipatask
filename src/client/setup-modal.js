@@ -4,6 +4,8 @@
 // registers a new device). Triggered when open-project IPC returns { needsSetup: true }.
 // (TPT161) Rebuilt on project-creation-wizard.js's layout/helpers: same header, same
 // footer buttons, same Device name step, same t('wizard.*')-keyed device copy.
+// (TPT9169) Import mode (openImport()) builds a NEW project from a Project ▸ Export archive:
+// project name, folder and agents, then main's project:import-from-wizard does the rest.
 import { renderAgentSelect, piCredentialsMissing, normalizePiModels, computePiSaveRows, loadAgents } from './agent-select.js';
 import { recheckAgents, notifyServerAgentsSaved } from './agent-recheck.js';
 import { headerHtml, fitHeaderPath } from './setup-modal-header.js';
@@ -13,7 +15,7 @@ import { activateDialogFocus } from './dialog-focus.js';
 // (C1388) This module re-renders its whole overlay per step (_render()/_renderStep()),
 // so t() calls made INSIDE those render functions are naturally locale-live — never
 // capture a t() result at module scope (i18n.js's own header rule).
-import { t } from './i18n.js';
+import { t, tc, getLocale } from './i18n.js';
 
 // ── Step navigation (pure, DOM-free — see setup-modal.test.js) ──
 // Back navigation is a plain history-stack pop (see _goto/_back below) — no domain logic
@@ -26,14 +28,19 @@ const REAUTH_STEPS = ['signin', 'project', 'agent', 'confirm'];
 // (Change Account on the default empty window). Sign-in runs setup:reauth-account, which
 // authenticates and saves the account store itself; Confirm only summarizes the result.
 const ACCOUNT_STEPS = ['signin', 'confirm'];
+// 'import' — openImport() (TPT9169): a new project from an export archive. No project picker
+// and no device step; Sign-in is skipped like setup mode's when an account is stored.
+const IMPORT_STEPS = ['signin', 'name', 'folder', 'agent', 'confirm'];
 
 export function stepsFor(mode) {
   if (mode === 'account') return ACCOUNT_STEPS;
+  if (mode === 'import') return IMPORT_STEPS;
   return mode === 'reauth' ? REAUTH_STEPS : SETUP_STEPS;
 }
 
 export function nextStep(mode, from, { skipProject = false } = {}) {
   if (mode === 'account') return 'confirm';
+  if (mode === 'import') return IMPORT_STEPS[IMPORT_STEPS.indexOf(from) + 1] || 'confirm';
   if (from === 'signin') return skipProject ? 'agent' : 'project';
   if (from === 'project') return mode === 'reauth' ? 'agent' : 'device';
   if (from === 'device') return 'agent';
@@ -66,6 +73,90 @@ export function buildReauthConfig({ baseCfg, apiBaseUrl, scopedToken, selectedPr
   };
   if (piSaveRows.length) { delete savedConfig.PI_MODEL; delete savedConfig.OPENROUTER_API_KEY; }
   return savedConfig;
+}
+
+// ── Import mode copy (pure, t-backed — see setup-modal.test.js) ──
+
+// The Name step's starting value: the exported project's name, else the archive file name
+// without archiveFileName()'s "-export.zip" ending.
+export function defaultImportName(summary, archiveName) {
+  const fromManifest = typeof summary?.projectName === 'string' ? summary.projectName.trim() : '';
+  if (fromManifest) return fromManifest.slice(0, 255);
+  return String(archiveName || '').replace(/\.zip$/i, '').replace(/-export$/i, '').trim().slice(0, 255);
+}
+
+// "Exported from “Acme” on 28 Oct 2026" — null when the manifest carries neither.
+export function archiveOriginText(summary) {
+  const name = typeof summary?.projectName === 'string' ? summary.projectName.trim() : '';
+  const when = summary?.exportedAt ? new Date(summary.exportedAt) : null;
+  const date = when && !Number.isNaN(when.getTime())
+    ? when.toLocaleDateString(getLocale(), { year: 'numeric', month: 'short', day: 'numeric' })
+    : '';
+  if (name && date) return t('import.exportedFrom', { name, date });
+  if (date) return t('import.exportedOn', { date });
+  if (name) return t('import.exportedFromName', { name });
+  return null;
+}
+
+// The archive's contents the wizard reports: tasks, sprints, KB files.
+export function archiveCountTexts(summary) {
+  return [
+    tc('import.tasks', Number(summary?.taskCount) || 0),
+    tc('import.sprints', Number(summary?.sprintCount) || 0),
+    tc('import.kbFiles', Number(summary?.kbFileCount) || 0),
+  ];
+}
+
+function _fileList(keys) {
+  const shown = keys.slice(0, 3).join(', ');
+  return keys.length > 3 ? `${shown} ${t('import.moreFiles', { n: keys.length - 3 })}` : shown;
+}
+
+// The Folder step's message for main's project:import-folder-check answer (null while it runs):
+// { kind: 'error' | 'warning' | 'muted' | '', text }. An error blocks Next; the warning says the
+// folder already has ai/architecture files and which archive files it keeps instead of writing.
+export function importFolderNotice(check) {
+  if (!check) return { kind: 'muted', text: t('import.checkingFolder') };
+  if (check.ok === false) return { kind: 'error', text: check.code === 'expired' ? t('import.errExpired') : t('import.folderInvalid') };
+  if (check.blocked === 'configured') return { kind: 'error', text: t('import.folderConfigured') };
+  if (check.blocked === 'open') return { kind: 'error', text: t('import.folderOpen') };
+  if (check.blocked) return { kind: 'error', text: t('import.folderInvalid') };
+  const parts = [];
+  const archFiles = Number(check.architectureFiles) || 0;
+  const kept = Array.isArray(check.existingKbFiles) ? check.existingKbFiles : [];
+  if (archFiles > 0) parts.push(tc('import.folderHasKb', archFiles));
+  if (kept.length) parts.push(tc('import.folderKeeps', kept.length, { files: _fileList(kept) }));
+  else if (archFiles > 0) parts.push(t('import.folderAddsBeside'));
+  return parts.length ? { kind: 'warning', text: parts.join(' ') } : { kind: '', text: '' };
+}
+
+// One `project:import-progress` frame → the Confirm step's status line.
+export function importProgressText({ step, done, total } = {}) {
+  if (step === 'tasks' && Number(total) > 0) return t('import.progress.tasksCount', { done: Number(done) || 0, total });
+  const key = `import.progress.${step}`;
+  const text = t(key);
+  return text === key ? t('common.working') : text;
+}
+
+// project:import-from-wizard's { ok: false, code, … } answer → one message for the Confirm step.
+export function importErrorText(res) {
+  const r = res || {};
+  const msg = r.error || t('project.unknownError');
+  switch (r.code) {
+    case 'expired': return t('import.errExpired');
+    case 'busy': return t('import.errBusy');
+    case 'name': return t('wizard.projectNameRequired');
+    case 'signin': return t('import.errSignin');
+    case 'folder': return importFolderNotice({ blocked: r.blocked || 'invalid' }).text;
+    case 'archive': return t('import.errArchive');
+    case 'create': return t('import.errCreate', { msg });
+    case 'import': {
+      const stepKey = `import.step.${r.step}`;
+      const head = r.step && t(stepKey) !== stepKey ? t('import.errStep', { step: t(stepKey), msg }) : t('import.errFailed', { msg });
+      return `${head} ${r.removed ? t('import.errRemoved') : t('import.errNotRemoved', { name: r.projectName || '' })}`;
+    }
+    default: return t('import.errFailed', { msg });
+  }
 }
 
 let _projectPath = null;
@@ -105,6 +196,12 @@ let _availableAgents = [];
 // scalars. Mirror of project-creation-wizard.js's _piModels; always >= 1 row
 // (normalizePiModels() invariant).
 let _piModels = [{ model: '', apiKey: '' }];
+// Import mode only (TPT9169): the pending import main checked — { importId, archiveName,
+// summary } — the project name typed on the Name step, and main's answer about the chosen
+// folder (_projectPath doubles as that folder; null until one is picked).
+let _import = null;
+let _importName = '';
+let _folderCheck = null;
 
 // (C1388) onCancel added — fires on any non-completed close() (mirrors openReauth's
 // existing contract below). Lets a caller distinguish "cancelled" from "adopted" —
@@ -143,21 +240,61 @@ export function open({ projectPath, onComplete, onCancel }) {
   if (_storedAccountPending) _adoptStoredAccount();
 }
 
+// (TPT9169) Project ▸ Import…: main checked the archive the user picked (main/project-import.js)
+// and sent its summary with the pending import's id. Steps: Sign-in (skipped when an account is
+// stored, as in setup mode), project name (the exported name, editable), folder, agents,
+// Confirm. Confirm calls project:import-from-wizard, which creates the API project, imports the
+// archive into the folder and opens the project window. onComplete({ projectPath, projectName,
+// opened, report }) after a successful import; onCancel on any other close, which also releases
+// the pending import in main (project:import-cancel) — Cancel creates nothing.
+export function openImport({ importId, archiveName, summary, onComplete, onCancel }) {
+  if (_overlay) close();
+  _mode = 'import';
+  _chooseAccount = false;
+  _existingConfig = null;
+  _projectPath = null;
+  _step = 'signin';
+  _history = [];
+  _openId++;
+  _apiBaseUrl = DEFAULT_API_BASE_URL;
+  _userToken = null;
+  _userInfo = null;
+  _projects = [];
+  _selectedProject = null;
+  _deviceName = '';
+  _taskAgent = '';
+  _availableAgents = [];
+  _piModels = [{ model: '', apiKey: '' }];
+  _import = { importId, archiveName: archiveName || '', summary: summary || {} };
+  _importName = defaultImportName(summary, archiveName);
+  _folderCheck = null;
+  _onComplete = onComplete || null;
+  _onCancel = onCancel || null;
+  _completed = false;
+  _busy = false;
+  _accountResult = null;
+  _storedAccountPending = !!window.electronAPI?.setupStoredAccount;
+  _render();
+  _keyHandler = _escapeHandler;
+  document.addEventListener('keydown', _keyHandler, { capture: true });
+  if (_storedAccountPending) _adoptStoredAccount();
+}
+
 // Already signed in before the wizard opened (account store holds a live account-wide token
-// for this server) → skip Sign-in and start on the project picker. Back still reaches the
-// "Signed in as X / Use a different account" variant of Sign-in. Any miss or failure falls
-// back to the normal Sign-in step.
+// for this server) → skip Sign-in and start on the project picker (import mode: the Name
+// step). Back still reaches the "Signed in as X / Use a different account" variant of
+// Sign-in. Any miss or failure falls back to the normal Sign-in step.
 async function _adoptStoredAccount() {
   const gen = _openId;
   let acct = null;
   try { acct = await window.electronAPI.setupStoredAccount(_apiBaseUrl); } catch {}
-  if (gen !== _openId || _mode !== 'setup' || _step !== 'signin') return;
+  if (gen !== _openId || (_mode !== 'setup' && _mode !== 'import') || _step !== 'signin') return;
   _storedAccountPending = false;
   if (acct && acct.token && !_userToken) {
     _userToken = acct.token;
     _userInfo = acct.user || {};
     _history = ['signin'];
-    _step = 'project';
+    _step = nextStep(_mode, 'signin');
   }
   _render();
 }
@@ -222,6 +359,8 @@ export function openReauth({ projectPath, existingConfig, onComplete, onCancel, 
 function _escapeHandler(e) {
   if (e.key !== 'Escape') return;
   e.stopPropagation();
+  // (TPT9169) A running import cannot be abandoned midway: the wizard stays until it ends.
+  if (_busy) { e.preventDefault(); return; }
   close();
 }
 
@@ -230,6 +369,8 @@ export function close() {
   const completed = _completed; // capture before reset
   const accountDone = wasOpen && completed && _mode === 'account' ? _accountResult : null;
   const completeCb = accountDone ? _onComplete : null;
+  // (TPT9169) An import wizard closed before its import ran releases the pending import in main.
+  const releaseImportId = wasOpen && !completed && _mode === 'import' ? _import?.importId : null;
   if (_overlay) { _overlay.remove(); _overlay = null; }
   document.documentElement.style.overflowY = '';
   document.body.style.paddingRight = '';
@@ -246,7 +387,10 @@ export function close() {
   _history = [];
   _accountResult = null;
   _storedAccountPending = false;
+  _import = null;
+  _folderCheck = null;
   _openId++; // invalidate any in-flight timer/async callback from this session
+  if (releaseImportId) { try { window.electronAPI?.cancelProjectImport?.(releaseImportId); } catch {} }
   if (cancelCb) { try { cancelCb(); } catch {} }
   if (completeCb) { try { completeCb({ user: accountDone.user || {}, apiBaseUrl: accountDone.apiBaseUrl }); } catch {} }
   // Dedicated setup window: cancel before completion closes the window.
@@ -290,8 +434,11 @@ function _render() {
 
   const STEP_LABELS = {
     signin: t('setup.stepSignIn'), project: t('setup.stepProject'), device: t('wizard.stepDevice'),
+    name: t('import.stepName'), folder: t('import.stepFolder'),
     agent: t('setup.stepAgent'), confirm: t('setup.stepConfirm'),
   };
+  const title = _mode === 'account' ? t('reauth.accountHeaderTitle')
+    : _mode === 'import' ? t('import.headerTitle') : t('setup.headerTitle');
   const steps = stepsFor(_mode);
   const activeIdx = steps.indexOf(_step);
   const dots = steps.map((id, i) => {
@@ -302,7 +449,7 @@ function _render() {
   _overlay.innerHTML = `
     <div class="setup-modal-backdrop"></div>
     <div class="setup-modal-panel">
-      ${headerHtml({ title: _mode === 'account' ? t('reauth.accountHeaderTitle') : t('setup.headerTitle'), projectPath: _projectPath })}
+      ${headerHtml({ title, projectPath: _projectPath })}
       <div class="setup-modal-steps">${dots}</div>
       <div class="setup-modal-step-body" id="setup-step-body"></div>
       <div class="setup-modal-footer" id="setup-footer"></div>
@@ -319,7 +466,7 @@ function _render() {
   }
   fitHeaderPath(_overlay);
 
-  _overlay.querySelector('.setup-modal-close').addEventListener('click', close);
+  _overlay.querySelector('.setup-modal-close').addEventListener('click', () => { if (!_busy) close(); });
 
   _renderStep();
   // Repainting drops the focused element; steps that focus their own input already did.
@@ -338,7 +485,10 @@ function _renderStep() {
   if (_step === 'signin') _renderSignIn(body, footer);
   else if (_step === 'project') _renderProject(body, footer);
   else if (_step === 'device') _renderDevice(body, footer);
+  else if (_step === 'name') _renderImportName(body, footer);
+  else if (_step === 'folder') _renderImportFolder(body, footer);
   else if (_step === 'agent') _renderAgent(body, footer);
+  else if (_step === 'confirm' && _mode === 'import') _renderImportConfirm(body, footer);
   else if (_step === 'confirm') _renderConfirm(body, footer);
 }
 
@@ -393,7 +543,7 @@ function _renderSignIn(body, footer) {
     return;
   }
 
-  const heading = isReauth ? t('setup.signInToContinue') : t('setup.signIn');
+  const heading = isReauth || _mode === 'import' ? t('setup.signInToContinue') : t('setup.signIn');
   body.innerHTML = `
     <p class="setup-modal-label">${_esc(heading)}</p>
     <div class="setup-modal-row setup-modal-row--center" id="setup-auth-actions">
@@ -854,6 +1004,196 @@ function _renderConfirm(body, footer) {
       confirmBtn.disabled = false;
       footer.querySelector('#setup-back-btn').disabled = false;
     }
+  });
+}
+
+// ── Import: Name, Folder, Confirm (mode 'import', TPT9169) ─────────────────────────
+// The Agent step is _renderAgent() above. Every control is a native button or input, so the
+// steps work from the keyboard: Enter on the name moves on, Choose Folder opens the folder
+// dialog and hands focus to Next once the folder is usable, Escape cancels (not while the
+// import runs).
+
+function _archiveCardHtml() {
+  const origin = archiveOriginText(_import.summary);
+  return `
+    <div class="setup-modal-archive">
+      <div class="setup-modal-archive-name">${_esc(_import.archiveName)}</div>
+      ${origin ? `<div class="setup-modal-archive-meta">${_esc(origin)}</div>` : ''}
+      <div class="setup-modal-archive-counts">
+        ${archiveCountTexts(_import.summary).map((text) => `<span class="setup-modal-archive-count">${_esc(text)}</span>`).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function _renderImportName(body, footer) {
+  body.innerHTML = `
+    <p class="setup-modal-label">${_esc(t('import.fromArchive'))}</p>
+    ${_archiveCardHtml()}
+    <label class="setup-modal-form-label" for="setup-import-name">${_esc(t('wizard.projectName'))}</label>
+    <div class="setup-modal-row">
+      <input class="setup-modal-input" id="setup-import-name" type="text" maxlength="255"
+        value="${_esc(_importName)}" placeholder="${_esc(t('wizard.projectNamePlaceholder'))}" spellcheck="false" />
+    </div>
+    <p class="setup-modal-hint">${_esc(t('import.nameHint'))}</p>
+    <div class="setup-modal-msg setup-modal-msg--error" id="setup-import-name-msg"></div>
+  `;
+  footer.innerHTML = `
+    <button class="setup-modal-btn setup-modal-btn--secondary" id="setup-back-btn">${_esc(t('common.back'))}</button>
+    <button class="setup-modal-btn setup-modal-btn--primary" id="setup-next-btn">${_esc(t('common.next'))}</button>
+  `;
+  const input = body.querySelector('#setup-import-name');
+  const msg = body.querySelector('#setup-import-name-msg');
+  const nextBtn = footer.querySelector('#setup-next-btn');
+  nextBtn.disabled = !input.value.trim();
+  input.addEventListener('input', () => {
+    _importName = input.value;
+    nextBtn.disabled = !input.value.trim();
+    msg.textContent = '';
+  });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !nextBtn.disabled) nextBtn.click(); });
+  footer.querySelector('#setup-back-btn').addEventListener('click', _back);
+  nextBtn.addEventListener('click', () => {
+    const name = input.value.trim();
+    if (!name) { msg.textContent = t('wizard.projectNameRequired'); return; }
+    _importName = name;
+    _goto(nextStep(_mode, 'name'));
+  });
+  input.focus();
+}
+
+function _renderImportFolder(body, footer) {
+  const notice = _projectPath ? importFolderNotice(_folderCheck) : { kind: '', text: '' };
+  const usable = !!_projectPath && !!_folderCheck && _folderCheck.ok !== false && !_folderCheck.blocked;
+  body.innerHTML = `
+    <p class="setup-modal-label">${_esc(t('import.folderLabel'))}</p>
+    <p class="setup-modal-hint">${_esc(t('import.folderHint'))}</p>
+    <div class="setup-modal-row setup-modal-folder-row">
+      <button class="setup-modal-btn setup-modal-btn--secondary" id="setup-import-folder-btn">${_esc(_projectPath ? t('import.changeFolder') : t('import.chooseFolder'))}</button>
+      <span class="setup-modal-folder-path" id="setup-import-folder-path" title="${_esc(_projectPath || '')}">${_esc(_projectPath || '')}</span>
+    </div>
+    <div class="setup-modal-msg${notice.kind ? ` setup-modal-msg--${notice.kind}` : ''}" id="setup-import-folder-msg" aria-live="polite">${_esc(notice.text)}</div>
+  `;
+  footer.innerHTML = `
+    <button class="setup-modal-btn setup-modal-btn--secondary" id="setup-back-btn">${_esc(t('common.back'))}</button>
+    <button class="setup-modal-btn setup-modal-btn--primary" id="setup-next-btn"${usable ? '' : ' disabled'}>${_esc(t('common.next'))}</button>
+  `;
+  const chooseBtn = body.querySelector('#setup-import-folder-btn');
+  const nextBtn = footer.querySelector('#setup-next-btn');
+  footer.querySelector('#setup-back-btn').addEventListener('click', _back);
+  nextBtn.addEventListener('click', () => { if (usable) _goto(nextStep(_mode, 'folder')); });
+  chooseBtn.addEventListener('click', async () => {
+    const gen = _openId;
+    let folder = null;
+    try { folder = await window.electronAPI?.selectFolder?.(); } catch { /* dialog failed — nothing picked */ }
+    if (gen !== _openId || _step !== 'folder' || !folder) return;
+    _projectPath = folder;
+    _folderCheck = null;
+    _render();
+    let check;
+    try { check = await window.electronAPI.checkImportFolder(_import.importId, folder); } catch { check = { ok: false, code: 'failed' }; }
+    if (gen !== _openId || _projectPath !== folder) return;
+    _folderCheck = check || { ok: false, code: 'failed' };
+    if (_step === 'folder') _render();
+  });
+  (usable ? nextBtn : chooseBtn).focus();
+}
+
+function _renderImportConfirm(body, footer) {
+  const s = _import.summary;
+  const kept = Array.isArray(_folderCheck?.existingKbFiles) ? _folderCheck.existingKbFiles.length : 0;
+  const kbValue = tc('import.files', Number(s.kbFileCount) || 0) + (kept ? ` · ${tc('import.kept', kept)}` : '');
+  const agentLabel = _AGENT_LABELS[_taskAgent] || _taskAgent || '—';
+  const piEnabled = _availableAgents.includes('pi');
+  // Same Model row rule as _renderConfirm(): only when "Other Model" is the Default.
+  const piRows = computePiSaveRows(_piModels);
+  const modelRow = piEnabled && _taskAgent === 'pi'
+    ? `<tr><td class="setup-modal-summary-key">${_esc(piRows.length > 1 ? t('agentSelect.models') : t('agentSelect.model'))}</td>` +
+      `<td class="setup-modal-summary-val">${piRows.length ? piRows.map(m => _esc(m.model.trim())).join('<br>') : '—'}</td></tr>`
+    : '';
+  const row = (key, value) => `<tr><td class="setup-modal-summary-key">${_esc(key)}</td><td class="setup-modal-summary-val">${value}</td></tr>`;
+
+  body.innerHTML = `
+    <p class="setup-modal-label">${_esc(t('import.confirmTitle'))}</p>
+    <table class="setup-modal-summary">
+      ${row(t('import.summaryArchive'), _esc(_import.archiveName))}
+      ${row(t('wizard.summaryFolder'), _esc(_projectPath || '—'))}
+      ${row(t('setup.summaryAccount'), _esc(_userInfo?.email || '—'))}
+      ${row(t('setup.summaryProject'), `${_esc(_importName)}<span class="setup-modal-summary-badge">${_esc(t('wizard.newBadge'))}</span>`)}
+      ${row(t('import.summaryKb'), _esc(kbValue))}
+      ${row(t('import.summaryTasks'), _esc(String(Number(s.taskCount) || 0)))}
+      ${row(t('import.summarySprints'), _esc(String(Number(s.sprintCount) || 0)))}
+      ${row(t('setup.summaryAgent'), _esc(agentLabel))}
+      ${modelRow}
+    </table>
+    <div class="setup-modal-msg" id="setup-confirm-msg" aria-live="polite"></div>
+  `;
+  footer.innerHTML = `
+    <button class="setup-modal-btn setup-modal-btn--secondary" id="setup-back-btn">${_esc(t('common.back'))}</button>
+    <button class="setup-modal-btn setup-modal-btn--primary" id="setup-confirm-btn">${_esc(t('import.importBtn'))}</button>
+  `;
+  const backBtn = footer.querySelector('#setup-back-btn');
+  const confirmBtn = footer.querySelector('#setup-confirm-btn');
+  const msg = body.querySelector('#setup-confirm-msg');
+  backBtn.addEventListener('click', _back);
+
+  confirmBtn.addEventListener('click', async () => {
+    if (_busy) return;
+    const gen = _openId;
+    const importId = _import.importId;
+    _busy = true;
+    confirmBtn.disabled = true;
+    backBtn.disabled = true;
+    msg.className = 'setup-modal-msg setup-modal-msg--muted';
+    msg.textContent = importProgressText({ step: 'project' });
+    const unsubscribe = window.electronAPI.onProjectImportProgress?.((frame) => {
+      if (gen === _openId && frame?.importId === importId) msg.textContent = importProgressText(frame);
+    });
+    let res;
+    try {
+      res = await window.electronAPI.importProjectFromWizard({
+        importId,
+        projectName: _importName,
+        projectPath: _projectPath,
+        apiBaseUrl: _apiBaseUrl,
+        userToken: _userToken,
+        agentPreference: {
+          taskAgent: _taskAgent,
+          availableAgents: [..._availableAgents],
+          piModels: piEnabled ? computePiSaveRows(_piModels) : [],
+        },
+      });
+    } catch (e) {
+      res = { ok: false, code: 'failed', error: e?.message };
+    } finally {
+      try { unsubscribe?.(); } catch {}
+    }
+    if (gen !== _openId) return; // closed meanwhile; main still finishes the import
+    _busy = false;
+    if (!res?.ok) {
+      msg.className = 'setup-modal-msg setup-modal-msg--error';
+      msg.textContent = importErrorText(res);
+      if (res?.code === 'folder') _folderCheck = { ...(_folderCheck || {}), blocked: res.blocked || 'invalid' };
+      // An expired import or a changed archive cannot be retried from here; anything else can,
+      // into a new project (a failed import removes the project it created).
+      confirmBtn.disabled = res?.code === 'expired' || res?.code === 'archive';
+      backBtn.disabled = false;
+      return;
+    }
+    msg.className = 'setup-modal-msg setup-modal-msg--ok';
+    msg.textContent = t('import.doneOk');
+    // Adopted in place, this window keeps its page: same forked-server re-detect as setup mode's
+    // Confirm. A new window loads fresh and needs none.
+    if (res.opened === 'current') {
+      void notifyServerAgentsSaved(res.projectPath, { taskAgent: _taskAgent, availableAgents: _availableAgents });
+    }
+    const cb = _onComplete;
+    const detail = { projectPath: res.projectPath, projectName: _importName, opened: res.opened || null, report: res.report || null };
+    _completed = true;
+    setTimeout(() => {
+      close();
+      if (cb) cb(detail);
+    }, 300);
   });
 }
 

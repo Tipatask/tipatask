@@ -104,6 +104,14 @@
        so no [data-theme] block or .theme-dark overrides it. Was an undefined Catppuccin
        --c-peach whose fallback painted everywhere. */
     --c-attention: #fab387;
+    /* TPT9165 — the voice recording widget's violet→magenta: the canvas wave's gradient ends
+       (audio-recorder.js reads both with getPropertyValue(), so they stay plain hexes), the
+       recording dot and the Stop glyph. Palette-independent like --c-attention, so recording
+       looks the same in every theme; .theme-dark lifts them for its dark cards.
+       theme-default.test.js guards 3:1 against the card (and the Stop glyph against its tint). */
+    --c-voice-wave-from: #8467d8;
+    --c-voice-wave-to: #c2549c;
+    --c-voice-stop: #9e4a82;
   }
 
   /* C1267 — the pre-TPT220 default (violet on cool grey), kept as a first-class named
@@ -609,6 +617,10 @@
     --left-nav-active-fg: color-mix(in srgb, var(--c-primary) 30%, var(--c-text));
     --c-primary-text: color-mix(in srgb, var(--c-primary) 30%, var(--c-text));
     --c-primary-border: color-mix(in srgb, var(--c-primary) 60%, var(--c-text));
+    /* TPT9165 — see :root; lighter so the wave and Stop glyph keep 3:1 on dark cards. */
+    --c-voice-wave-from: #a993f5;
+    --c-voice-wave-to: #e27fbd;
+    --c-voice-stop: #ea9ccb;
   }
 
   /* (TPT276) Per-palette dark danger. .theme-dark above is the shared fallback; each dark id
@@ -2547,7 +2559,8 @@
      (position:fixed) card opts out entirely — see .card-expanded below. */
   .tier-cards > .card,
   .backlog-card-list > .card,
-  .list-group-cards > .card {
+  .list-group-cards > .card,
+  .preview-cards-inline > .card {
     --card-basis: 252px;
     flex: 1 1 var(--card-basis);
     min-width: min(var(--card-basis), 100%);
@@ -2555,12 +2568,14 @@
   }
   .tier-cards > .card.card--medium,
   .backlog-card-list > .card.card--medium,
-  .list-group-cards > .card.card--medium {
+  .list-group-cards > .card.card--medium,
+  .preview-cards-inline > .card.card--medium {
     --card-basis: 384px;
   }
   .tier-cards > .card.card--wide,
   .backlog-card-list > .card.card--wide,
-  .list-group-cards > .card.card--wide {
+  .list-group-cards > .card.card--wide,
+  .preview-cards-inline > .card.card--wide {
     --card-basis: 516px;
   }
 
@@ -3225,7 +3240,8 @@
   }
   .task-card-hover-controls .card-status-select {
     padding-right: 26px;
-    background-position: right 9px center;
+    /* (TPT9120) One position per chevron stroke (left arm, right arm): see .card-status-select. */
+    background-position: right 13px center, right 9px center;
   }
   .task-card-hover-controls :is(.btn-open-subtask-board, .btn-create-subtasks) svg {
     width: 14px;
@@ -3338,9 +3354,19 @@
     cursor: pointer;
     appearance: none;
     -webkit-appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='%23666' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
+    /* (TPT9120) The chevron is two currentColor diagonal strokes in 4px boxes, the same 8px open
+       chevron as before at ~1.4px with soft edges, so it is drawn in the pill's ink like
+       .preview-step-select's triangles (TPT299). The old data-URI stroke was a fixed #666 that
+       measured 1.01–2.36:1 on the pill in every dark palette (WCAG 1.4.11 asks for 3:1).
+       Each layer needs its own background-position: left arm first, 4px further from the edge.
+       (TPT9127) Forced colours drop these strokes; the native arrow takes over there, in the
+       @media (forced-colors: active) block after the Task Edit modal's phone-width rules. */
+    background-image:
+      linear-gradient(to top right, transparent calc(50% - 1px), currentColor calc(50% - 0.4px) calc(50% + 0.4px), transparent calc(50% + 1px)),
+      linear-gradient(to bottom right, transparent calc(50% - 1px), currentColor calc(50% - 0.4px) calc(50% + 0.4px), transparent calc(50% + 1px));
+    background-size: 4px 4px;
     background-repeat: no-repeat;
-    background-position: right 0.3rem center;
+    background-position: right calc(0.3rem + 4px) center, right 0.3rem center;
     line-height: 1.2;
     white-space: nowrap;
     outline: none;
@@ -3356,10 +3382,16 @@
      Driven by an inline `--status-color` custom property (status-registry.js's
      statusColor()) instead, same mechanism api/web/src/lib/statuses.js's
      statusBadgeAttrs() uses server-side. `.status` (the chat-preview chip) gets the same
-     treatment where its own base rule lives, below. */
+     treatment where its own base rule lives, below.
+     (TPT9118) The swatches are Catppuccin Mocha pastels made for dark grounds: the old ink, the
+     swatch 65% toward black, stayed under 4.5:1 on its own tint in every light palette. The ink
+     now keeps the swatch's hue and chroma at one dark OKLCH lightness, like the Settings
+     Workflow chips (TPT9117). The tint is mixed into an opaque --c-bg-card, the .tag-badge
+     ground (TPT677): a bare translucent tint took on the closed-card, proposal and modal grounds
+     and dropped the name under 4.5:1 there. theme-default.test.js checks every swatch. */
   .status-select, .card-status-select, .drawer-status {
-    background-color: color-mix(in srgb, var(--status-color, #7f849c) 18%, transparent);
-    color: color-mix(in srgb, var(--status-color, #7f849c) 65%, black);
+    background-color: color-mix(in srgb, var(--status-color, #7f849c) 18%, var(--c-bg-card));
+    color: oklch(from var(--status-color, #7f849c) 0.45 c h);
   }
 
   .device-badge {
@@ -3380,13 +3412,36 @@
     opacity: 0.85;
   }
 
+  /* ── (TPT9149) Corner badges and the room a board card keeps for them ──
+     The member avatar (bottom-left), the effort chip and the agent badge (bottom-right) are
+     absolute, so they take no room in the card's flex column. A board card that draws one turns
+     its bottom padding into a band of inset + badge + clearance, so the badges sit below the last
+     row (tags, description, due pill, AI stats) instead of on it. The hooks are renderCard()'s
+     has-member-badge / has-effort-badge / has-agent-badge root classes, which refreshCard() keeps
+     in step. The effort chip (bottom 16px, 18px tall) tops out level with the avatar and only
+     renders beside an agent badge. The card is border-box with a 500px max-height, so the band
+     comes out of the description's share and the TPT344 clamp holds. Preview and proposal cards
+     (.card--preview) carry no hooks: their badges end the meta row (TPT9147, TPT9153). */
+  .card {
+    --card-badge-inset: 8px;
+    --card-member-badge-size: 26px;
+    --card-agent-badge-size: 32px;
+    --card-badge-clearance: 8px;
+  }
+  .card:not(.card--preview):is(.has-member-badge, .has-effort-badge) {
+    padding-bottom: calc(var(--card-badge-inset) + var(--card-member-badge-size) + var(--card-badge-clearance));
+  }
+  .card:not(.card--preview).has-agent-badge {
+    padding-bottom: calc(var(--card-badge-inset) + var(--card-agent-badge-size) + var(--card-badge-clearance));
+  }
+
   /* ── Agent assignment badge (bottom-right of card) ── */
   .agent-badge {
     position: absolute;
-    bottom: 8px;
-    right: 8px;
-    width: 32px;
-    height: 32px;
+    bottom: var(--card-badge-inset, 8px);
+    right: var(--card-badge-inset, 8px);
+    width: var(--card-agent-badge-size, 32px);
+    height: var(--card-agent-badge-size, 32px);
     border-radius: 50%;
     display: inline-flex;
     align-items: center;
@@ -3433,11 +3488,11 @@
   /* ── Member assignee avatar badge (bottom-left of card) ── */
   .member-badge {
     position: absolute;
-    bottom: 8px;
-    left: 8px;
+    bottom: var(--card-badge-inset, 8px);
+    left: var(--card-badge-inset, 8px);
     z-index: 3;
-    width: 26px;
-    height: 26px;
+    width: var(--card-member-badge-size, 26px);
+    height: var(--card-member-badge-size, 26px);
     border-radius: 50%;
     object-fit: cover;
     box-shadow: 0 1px 3px rgba(0,0,0,0.18);
@@ -3510,8 +3565,6 @@
   }
   .permission-mode-head { display: flex; align-items: center; gap: 8px; }
   .permission-mode-title { margin: 0; flex: 1; font-size: 1rem; font-weight: 600; color: var(--c-text); }
-  .permission-mode-section { display: flex; flex-direction: column; gap: 6px; }
-  .permission-mode-label { font-size: 0.8rem; font-weight: 600; color: var(--c-text-secondary); }
   select.permission-mode-select, .permission-mode-select-trigger {
     width: 100%; padding: 7px 10px;
     border: 1px solid var(--c-border-input); border-radius: 8px;
@@ -3701,9 +3754,9 @@
     border-radius: 999px;
     /* (C1187) Was 5 hardcoded per-name .status-<name> rules — replaced with the same
        --status-color custom-property mechanism the .status-select/.card-status-select/
-       .drawer-status rule above uses. */
-    background-color: color-mix(in srgb, var(--status-color, #7f849c) 18%, transparent);
-    color: color-mix(in srgb, var(--status-color, #7f849c) 65%, black);
+       .drawer-status rule above uses. (TPT9118) Same ink and opaque ground as that rule. */
+    background-color: color-mix(in srgb, var(--status-color, #7f849c) 18%, var(--c-bg-card));
+    color: oklch(from var(--status-color, #7f849c) 0.45 c h);
   }
 
   /* (TPT685) --c-text-faint was 2.67–4.24:1 on --c-bg-card; --c-text-muted clears 4.5:1 in
@@ -5158,11 +5211,11 @@
     border-color: var(--c-primary);
     color: var(--c-on-primary);
   }
-  .bulk-action-bar .bulk-btn--primary:not(:disabled):hover {
+  .bulk-action-bar .bulk-btn--primary:not(:disabled):not([aria-disabled="true"]):hover {
     background: var(--c-primary-hover);
     border-color: var(--c-primary-hover);
   }
-  .bulk-action-bar .bulk-btn--secondary:not(:disabled):hover {
+  .bulk-action-bar .bulk-btn--secondary:not(:disabled):not([aria-disabled="true"]):hover {
     background: var(--c-primary-lighter);
     border-color: var(--c-primary);
   }
@@ -5188,6 +5241,78 @@
     background: var(--c-primary-lighter, rgba(139,92,246,0.12));
   }
   .bulk-btn--ghost svg { flex: none; }
+
+  /* (TPT9159) Staged edits — task-board.js syncBulkChanges(). A staged field keeps the primary
+     border and tint plus a dot after its label until Apply saves it or Reset/closing drops it.
+     Start and Deps wait meanwhile as aria-disabled (still focusable, so their title explains). */
+  .bulk-apply-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    /* Ends whichever row it wraps onto; no effect while the bar fits on one line. */
+    margin-left: auto;
+  }
+  /* .bulk-btn's inline-flex would otherwise beat the UA [hidden] rule (Reset at rest). */
+  .bulk-action-bar .bulk-btn[hidden] { display: none; }
+  .bulk-action-bar .bulk-field.is-staged .bulk-status-select,
+  .bulk-action-bar .bulk-field.is-staged .bulk-priority-combo .sprint-combo-input,
+  .bulk-action-bar .bulk-field.is-staged .bulk-assignee-input,
+  .bulk-action-bar .bulk-field.is-staged .agent-picker-trigger {
+    border-color: var(--c-primary);
+    background: var(--c-primary-lighter);
+  }
+  .bulk-field.is-staged .bulk-field-label::after {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-left: 5px;
+    border-radius: 50%;
+    background: var(--c-primary);
+    vertical-align: middle;
+  }
+  .bulk-action-bar .bulk-btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
+
+  /* Claude-only Design mode toggle beside the agent picker, on the bar's 32px control metric. */
+  .bulk-design-mode {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 32px;
+    box-sizing: border-box;
+    padding: 0 10px;
+    border: 1px solid var(--c-border-input, #555);
+    border-radius: 6px;
+    background: var(--c-bg-card, #1e1e2e);
+    color: var(--c-text, #e2e8f0);
+    font-size: 0.8rem;
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+  }
+  .bulk-design-mode[hidden] { display: none; }
+  .bulk-design-mode:hover { border-color: var(--c-primary); }
+  .bulk-design-mode.is-checked {
+    border-color: var(--c-primary);
+    background: var(--c-primary-lighter);
+  }
+  .bulk-design-mode:has(.bulk-design-mode-input:focus-visible) {
+    border-color: var(--c-primary-border);
+    box-shadow: 0 0 0 2px var(--c-primary-light, rgba(139,92,246,0.25));
+  }
+  .bulk-design-mode-input {
+    margin: 0;
+    accent-color: var(--c-primary);
+    cursor: pointer;
+  }
+  @media (forced-colors: active) {
+    .bulk-field.is-staged .bulk-field-label::after {
+      forced-color-adjust: none;
+      background: Highlight;
+    }
+  }
 
   .bulk-assignee-picker {
     position: relative;
@@ -5217,6 +5342,16 @@
   .bulk-assignee-option { cursor: pointer; }
   .bulk-assignee-option:hover { background: var(--c-primary-lighter); }
   .bulk-assignee-empty { color: var(--c-text-muted); }
+
+  /* (TPT9159) Above the ≤900px stack, a bar wider than the viewport wraps only its edit
+     fields: the selection and action clusters keep their width and every divider stays full
+     height, instead of the action cluster dropping to a second row behind a stray divider. */
+  @media (min-width: 901px) {
+    .bulk-action-bar { flex-wrap: nowrap; align-items: stretch; }
+    .bulk-group--selection { flex: 0 0 auto; }
+    .bulk-group--edit { flex: 0 1 auto; flex-wrap: wrap; align-content: center; row-gap: 8px; }
+    .bulk-group--actions { flex: 1 0 auto; }
+  }
 
   @media (max-width: 900px) {
     .bulk-action-bar {
@@ -5934,50 +6069,129 @@
     color: var(--c-primary-border);
   }
 
-  /* ── Voice recording toast (C1175) — persistent bottom-right pill, pulses for
-     the whole recording. Same pill geometry as .tt-saving-indicator, red border. ── */
+  /* ── Voice recording widget (C1175, bottom-center waveform TPT9165) — one card for every live
+     mic (audio-recorder.js): pulsing dot, mm:ss timer, a canvas wave that follows the mic's
+     loudness, and a Stop button. The values here are its resting place; placeRecordingToast()
+     then writes --voice-rec-bottom/--voice-rec-width to keep it clear of composers and the
+     bottom-right notification column (voice-widget.js). Click-through except the Stop button. ── */
   #voice-rec-toast {
     position: fixed;
-    bottom: 2rem;
-    right: 1.5rem;
-    z-index: 10003; /* top of the bottom-right ladder — above #tt-notif-stack (10002) */
-    display: flex;
+    left: 50%;
+    bottom: var(--voice-rec-bottom, 1rem);
+    z-index: 10003; /* above #tt-notif-stack (10002) and the corner pills */
+    width: var(--voice-rec-width, min(720px, 90vw));
+    max-width: calc(100vw - 2rem);
+    box-sizing: border-box;
+    display: grid;
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "dot timer wave stop"
+      "hint hint hint hint";
     align-items: center;
-    gap: 0.5rem;
-    padding: 0.45rem 0.9rem;
+    padding: 15px 15px 15px 22px;
     background: var(--c-bg-card);
     color: var(--c-text);
-    border: 1px solid #e53e3e;
-    border-radius: 999px;
-    box-shadow: 0 4px 16px var(--c-shadow);
-    font-size: 0.85rem;
-    pointer-events: none; /* non-blocking, like the rest of the corner-badge family */
+    border: 1px solid var(--c-border);
+    border-radius: 22px;
+    box-shadow: 0 12px 32px var(--c-shadow), 0 2px 6px var(--c-shadow);
+    pointer-events: none; /* non-blocking, like the corner-badge family — only Stop takes clicks */
     opacity: 0;
-    transform: translateY(6px);
-    transition: opacity 0.2s ease, transform 0.2s ease;
+    transform: translate(-50%, 10px);
+    transition: opacity 0.2s ease, transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), bottom 0.2s ease, width 0.2s ease;
   }
-  #voice-rec-toast.voice-toast-active { opacity: 1; transform: none; }
+  /* A dark palette's --c-border can equal its card; the input border still draws an edge. */
+  .theme-dark #voice-rec-toast { border-color: var(--c-border-input); }
+  #voice-rec-toast.voice-toast-active { opacity: 1; transform: translate(-50%, 0); }
   .voice-rec-dot {
-    width: 0.55rem;
-    height: 0.55rem;
-    flex: none;
+    grid-area: dot;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
-    background: #e53e3e;
+    background: var(--c-voice-wave-to);
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--c-voice-wave-to) 13%, transparent);
   }
-  /* Reuses the emphasized mic button's ring pulse — no new keyframes. */
   #voice-rec-toast.voice-toast-active .voice-rec-dot {
-    animation: voice-emphasis-pulse 1.1s ease-in-out infinite;
+    animation: voice-rec-dot-pulse 1.6s ease-in-out infinite;
   }
-  /* (C1185) Silence-countdown hint — appended only for the last few seconds before auto-stop. */
+  @keyframes voice-rec-dot-pulse {
+    0%, 100% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--c-voice-wave-to) 13%, transparent); }
+    50% { box-shadow: 0 0 0 9px color-mix(in srgb, var(--c-voice-wave-to) 5%, transparent); }
+  }
+  .voice-rec-timer {
+    grid-area: timer;
+    margin: 0 20px 0 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.875rem;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.04em;
+    color: var(--c-text-muted);
+    white-space: nowrap;
+  }
+  /* drawVoiceWave() paints it at the device pixel ratio in the --c-voice-wave-* gradient. */
+  .voice-rec-wave {
+    grid-area: wave;
+    display: block;
+    width: 100%;
+    height: 40px;
+    min-width: 0;
+  }
+  .voice-rec-stop {
+    grid-area: stop;
+    margin-left: 18px;
+    width: 42px;
+    height: 42px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--c-voice-wave-to) 14%, var(--c-border));
+    border-radius: 13px;
+    background: color-mix(in srgb, var(--c-voice-wave-to) 6%, var(--c-bg-card));
+    color: var(--c-voice-stop);
+    cursor: pointer;
+    pointer-events: auto;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+  }
+  .theme-dark .voice-rec-stop { background: color-mix(in srgb, var(--c-voice-wave-to) 12%, var(--c-bg-card)); }
+  .voice-rec-stop:hover {
+    background: color-mix(in srgb, var(--c-voice-wave-to) 12%, var(--c-bg-card));
+    border-color: color-mix(in srgb, var(--c-voice-wave-to) 32%, var(--c-border));
+  }
+  .theme-dark .voice-rec-stop:hover { background: color-mix(in srgb, var(--c-voice-wave-to) 20%, var(--c-bg-card)); }
+  .voice-rec-stop:active { transform: scale(0.95); }
+  .voice-rec-stop:focus-visible { outline: 2px solid var(--c-voice-stop); outline-offset: 2px; }
+  .voice-rec-stop-glyph {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    background: currentColor;
+  }
+  /* (C1185) Hint line under the wave: the silence countdown, "no sound yet", a loading model,
+     Thank You mode's stop phrase. Absent when there is nothing to say. */
   .voice-rec-hint {
-    color: var(--c-text-secondary);
-    border-left: 1px solid var(--c-border);
-    padding-left: 0.5rem;
-    margin-left: 0.15rem;
+    grid-area: hint;
+    margin-top: 6px;
+    font-size: 0.78rem;
+    line-height: 1.3;
+    color: var(--c-text-muted);
+    text-align: center;
+  }
+  /* Screen-reader label (voice.recordingToast) — the card shows no words of its own. */
+  .voice-rec-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   @media (prefers-reduced-motion: reduce) {
-    #voice-rec-toast { transition: none; }
+    #voice-rec-toast,
+    .voice-rec-stop { transition: none; }
     #voice-rec-toast.voice-toast-active .voice-rec-dot { animation: none; }
+  }
+  @media (forced-colors: active) {
+    .voice-rec-dot { background: Highlight; box-shadow: none; }
+    .voice-rec-stop-glyph { background: ButtonText; }
   }
 
   /* ── Subtask context banner (shown when creating a task as subtask of another) ── */
@@ -6477,16 +6691,6 @@
   body:has(#tt-saving-indicator) #tt-notif-stack {
     bottom: 8.5rem;
   }
-
-  /* (C1175) The recording toast claims the bottom row while a mic is live — shift
-     the saving pill, the corner toast, and the notification stack up one row each.
-     Declared after the body:has(#tt-saving-indicator) rules above so it wins on tie. */
-  body:has(#voice-rec-toast) #tt-saving-indicator { bottom: 5.25rem; }
-  body:has(#voice-rec-toast) .tt-saving-indicator--toast { bottom: 5.25rem; }
-  body:has(#voice-rec-toast) #tt-notif-stack { bottom: 8.5rem; }
-  /* Both up: saving pill and corner toast must not land on the same row. */
-  body:has(#voice-rec-toast):has(#tt-saving-indicator) .tt-saving-indicator--toast { bottom: 8.5rem; }
-  body:has(#voice-rec-toast):has(#tt-saving-indicator) #tt-notif-stack { bottom: 11.75rem; }
   /* Header, cards and Show More: the shared compact page in notification-cards.css (TPT484),
      imported by index.js right after this file so the banner window and this stack match. */
 
@@ -6624,10 +6828,15 @@
     color: var(--c-text-faint);
   }
 
+  /* (TPT9147) New Task Preview: the card renderCard() builds, at the width the board gives it — a
+     wrapping flex row under the same adaptive card-width rule as .tier-cards (C1580). The ceiling
+     is half of the ~900px form, about what 25% of a board row is. */
   .preview-cards-inline {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
     gap: 0.75rem;
+    --card-grow-ceiling: 50%;
   }
 
   .preview-actions-inline {
@@ -6677,28 +6886,9 @@
     cursor: not-allowed;
   }
 
-  /* Legacy proposal markup (task-board.js manual-task inline preview). Objective-chat proposal
-     cards are board cards (.card.preview-card, TPT269) and take the .card rules instead. */
-  .preview-card:not(.card) {
-    background: var(--c-bg-card);
-    border: 1.5px solid var(--c-border);
-    border-radius: 8px;
-    padding: 1rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-    max-height: 200px;
-    overflow: hidden;
-    position: relative;
-  }
-
-  .preview-card:not(.card) .preview-desc,
-  .preview-card:not(.card) .preview-title {
-    overflow-wrap: break-word;
-    word-break: break-word;
-    max-width: 100%;
-  }
-
+  /* Every .preview-card is a board card (.card.card--preview.preview-card) from renderCard() in
+     proposal mode: objective-chat proposals (TPT269) and the New Task Preview (TPT9147). They take
+     the .card rules; the rules below only add the proposal tints, labels and rows. */
   .preview-card.new-task {
     border-color: var(--c-success-border);
     /* Layer the tint over the opaque card surface so dark-theme rgba tints don't bleed */
@@ -6805,50 +6995,9 @@
     border-left: 2px solid var(--c-primary);
   }
 
-  .preview-card:not(.card) .preview-title {
-    font-weight: 600;
-    font-size: 0.95rem;
-    outline: none;
-    border-radius: 4px;
-    padding: 2px 4px;
-    margin: -2px -4px;
-    width: fit-content;
-  }
-
-  .preview-card:not(.card) .preview-title.editing {
-    outline: 1.5px solid var(--c-primary-border);
-    background: var(--c-bg);
-    width: 100%;
-  }
-
-  .preview-card:not(.card) .preview-desc {
-    font-size: 0.82rem;
-    color: var(--c-text-secondary);
-    outline: none;
-    border-radius: 4px;
-    padding: 2px 4px;
-    margin: -2px -4px;
-    width: fit-content;
-  }
-
-  .preview-card:not(.card) .preview-desc.editing {
-    outline: 1.5px solid var(--c-primary-border);
-    background: var(--c-bg);
-    width: 100%;
-  }
-
-  .preview-card:not(.card) .preview-meta {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-    font-size: 0.75rem;
-    color: var(--c-text-faint);
-    margin-top: 0.2rem;
-  }
-
-  /* (TPT624) Manual New Task Preview: a dependency moved the selected sprint. */
-  .preview-card:not(.card) .preview-sprint-move {
+  /* (TPT624) Manual New Task Preview: a dependency moved the selected sprint. (TPT9147) The
+     card's last row (renderCard()'s footHtml slot). */
+  .card.preview-card .preview-sprint-move {
     margin-top: 0.4rem;
     padding: 0.3rem 0.5rem;
     font-size: 0.75rem;
@@ -7036,6 +7185,50 @@
     transform: none;
   }
 
+  /* (TPT9147) New Task Preview card (task-board.js renderNewTaskPreviewCard()): renderCard() in
+     proposal mode, so the proposal rules above apply — the title wraps on its own full-width line
+     and the card never clips. On top of them it keeps the board card's padding, and:
+     - the NEW chip is .card-top's second item, in flow beside the key badge at the badge's height;
+     - the description is not clamped, so the card grows to its whole content;
+     - the effort chip, member avatar and agent badge end the meta row as one static group;
+     - the key badge is not a drag handle here (dragging needs .tier-cards). */
+  .preview-cards-inline > .card.preview-card { padding: 1.25rem 1.5rem; }
+  .card.preview-card .card-top > .change-label {
+    font-size: 0.68rem;
+    /* .id-badge's own line box (0.75rem × 1.4) and padding: chip and key are one height. */
+    line-height: 1.05rem;
+    padding: 0.15rem 0.45rem;
+    border-radius: 4px;
+    /* .card-top's 0.9rem gap is the key-to-title space; the chip sits closer to the key. */
+    margin-left: -0.4rem;
+  }
+  .preview-cards-inline > .card.preview-card:not(.card-expanded) .card-desc {
+    max-height: none;
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+  /* No description: no empty strip between the meta row and the card's bottom edge. */
+  .preview-cards-inline > .card.preview-card .card-desc:empty { display: none; }
+  /* The card already shows everything at rest, so its hover/click overlay (expandCard()) must not
+     open the board's 12px gap above the description: that room is for a controls row it lacks. */
+  .preview-cards-inline > .card.preview-card.card-expanded .card-desc { margin-top: -2px; }
+  /* (TPT9153) The meta-row badge group — effort chip, member avatar, agent badge — static at the
+     end of .card-preview-meta. The New Task Preview passes it in metaHtml; the other preview cards
+     (task chat card, pinned Discuss card) get it from renderCard() itself. No preview card draws
+     the board's absolute corner badges, which would sit on its last tag or description line. */
+  .card.card--preview .preview-meta-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+    margin-left: auto;
+  }
+  .card.card--preview .preview-meta-badges :is(.member-badge, .effort-badge, .agent-badge) {
+    position: static;
+    flex: none;
+  }
+  .preview-cards-inline .id-badge { cursor: default; }
+
   .btn-discard, .btn-done {
     padding: 0.5rem 1.5rem;
     border-radius: 6px;
@@ -7069,59 +7262,282 @@
     cursor: not-allowed;
   }
 
-  /* ── Settings row (label + control) ── */
+  /* ── Settings sections and rows (TPT9111) ──
+     Every Settings tab pane is a stack of .settings-section blocks: a .settings-section-title
+     eyebrow, then .settings-row rows. A row is a two-column grid — the label column
+     (.settings-row-label: label text, an optional .settings-row-note badge, optional
+     .settings-row-hint lines) and the control column (.settings-row-control) — with the label
+     column the same width in every row, so labels, hints and controls line up on the same two
+     x positions on every tab. A hairline above each row separates it from the one before (the
+     first one rules off the section title), and a hidden row takes its hairline with it. State
+     messages (blocked notifications, a failed load, a saved key) are .settings-notice callouts,
+     spanning both columns of the row they belong to. The column/field tokens live on
+     .settings-body (§ Settings modal). */
+  .settings-section-title {
+    margin: 0 0 8px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    line-height: 1.3;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--c-text-muted);
+  }
   .settings-row {
+    display: grid;
+    grid-template-columns: var(--settings-label-col) minmax(0, 1fr);
+    column-gap: 24px;
+    row-gap: 12px;
+    align-items: center;
+    padding: 12px 0;
+    border-top: 1px solid var(--settings-rule);
+  }
+  /* The grid display outranks the UA [hidden] rule (Group Tasks Into while sprints are off, the
+     input-device row without mediaDevices). */
+  .settings-row[hidden] { display: none; }
+  /* Full-width content (the Workflow status table): the label column's hint above the control. */
+  .settings-row--stacked { grid-template-columns: minmax(0, 1fr); }
+  .settings-row-label {
+    min-width: 0;
+    font-size: 0.86rem;
+    font-weight: 600;
+    line-height: 1.35;
+    color: var(--c-text);
+    overflow-wrap: break-word;
+  }
+  .settings-row-label label { cursor: pointer; }
+  .settings-row-hint {
+    margin: 4px 0 0;
+    font-size: 0.76rem;
+    font-weight: 400;
+    line-height: 1.45;
+    color: var(--c-text-muted);
+  }
+  .settings-row-label > .settings-row-hint:first-child { margin-top: 0; }
+  .settings-row-control {
+    min-width: 0;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 6px 0;
+    flex-wrap: wrap;
+    gap: 8px;
   }
-  .settings-row > span {
-    font-size: 0.88rem;
-    font-weight: 600;
-    color: var(--c-text);
-    flex-shrink: 0;
-  }
-  .settings-row select {
-    font-size: 0.82rem;
-    font-weight: 500;
-    padding: 0.28rem 1.6rem 0.28rem 0.6rem;
-    border-radius: 6px;
-    border: 1.5px solid var(--c-border-input);
-    background: var(--c-bg);
-    color: var(--c-text);
-    cursor: pointer;
-    appearance: none;
-    -webkit-appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='%23666' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 0.45rem center;
-    outline: none;
-    min-width: 140px;
-    transition: border-color 0.15s;
-  }
-  .settings-row select:hover { border-color: var(--c-primary); }
-  .settings-row select:focus { border-color: var(--c-primary-border); box-shadow: 0 0 0 3px var(--c-primary-light); }
-  /* Badge marking a setting as project-wide (vs per-user theme/agent) */
+  .settings-row--stacked > .settings-row-control { display: block; }
+  /* Badge beside a label: a project-wide setting, the default agent, the notification state. */
   .settings-row-note {
     font-size: 0.68rem;
     font-weight: 500;
     color: var(--c-text-muted);
-    border: 1px solid var(--c-border);
+    border: 1px solid var(--settings-rule);
     border-radius: 4px;
     padding: 1px 5px;
-    margin-left: 6px;
+    margin-left: 4px;
     vertical-align: middle;
+    white-space: nowrap;
+  }
+  .settings-row-note:empty { display: none; }
+  /* Read-only value in the control column (an agent's configured models). */
+  .settings-row-value {
+    font-size: 0.82rem;
+    color: var(--c-text-secondary);
+    overflow-wrap: anywhere;
   }
 
-  /* ── Notifications row (C1058): status badge + Test/Enable button, and the denial hint ── */
-  .settings-row-controls {
+  /* One field look for every select and text input in the dialog. */
+  .settings-row-control > select,
+  .settings-voice-key-input,
+  .settings-wf-add-input,
+  .settings-wf-add-color {
+    box-sizing: border-box;
+    height: var(--settings-control-h);
+    padding: 0 0.6rem;
+    border: 1.5px solid var(--c-border-input);
+    border-radius: 6px;
+    background-color: var(--c-bg);
+    color: var(--c-text);
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 500;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .settings-row-control > select,
+  .settings-wf-add-color {
+    padding-right: 1.6rem;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    /* (TPT9124) The status select's chevron (TPT9120): two currentColor diagonal strokes in 4px
+       boxes, so it is drawn in the field's --c-text. The old data-URI stroke was a fixed #666
+       that measured 2.18–2.97:1 on --c-bg in seven dark palettes (WCAG 1.4.11 asks for 3:1).
+       Each layer needs its own background-position: left arm first, 4px further from the edge. */
+    background-image:
+      linear-gradient(to top right, transparent calc(50% - 1px), currentColor calc(50% - 0.4px) calc(50% + 0.4px), transparent calc(50% + 1px)),
+      linear-gradient(to bottom right, transparent calc(50% - 1px), currentColor calc(50% - 0.4px) calc(50% + 0.4px), transparent calc(50% + 1px));
+    background-size: 4px 4px;
+    background-repeat: no-repeat;
+    background-position: right calc(0.55rem + 4px) center, right 0.55rem center;
+  }
+  /* Selects share one width, so their left and right edges line up across rows and tabs. */
+  .settings-row-control > select { width: min(100%, var(--settings-control-w)); }
+  .settings-row-control > select:hover,
+  .settings-wf-add-color:hover { border-color: var(--c-primary-border); }
+  .settings-row-control > select:focus,
+  .settings-voice-key-input:focus,
+  .settings-wf-add-input:focus,
+  .settings-wf-add-color:focus {
+    border-color: var(--c-primary-border);
+    box-shadow: 0 0 0 3px var(--c-primary-light);
+  }
+  .settings-row-control > select:disabled { opacity: 0.5; cursor: progress; }
+  /* (TPT9124) Forced colours (Windows contrast themes) compute a gradient background-image to
+     none, so the chevron strokes above vanish there. Hand the arrow back to the native control,
+     which draws it in the system colours. */
+  @media (forced-colors: active) {
+    .settings-row-control > select,
+    .settings-wf-add-color { appearance: auto; -webkit-appearance: auto; }
+  }
+  .settings-row-control > .settings-row-btn {
+    box-sizing: border-box;
+    height: var(--settings-control-h);
+  }
+  /* The project-default permission picker (permission-mode-select.js) wears the field look. */
+  .settings-row-control > .permission-mode-select { width: min(100%, var(--settings-control-w)); }
+  .settings-row-control .permission-mode-select-trigger {
+    box-sizing: border-box;
+    min-height: var(--settings-control-h);
+    padding: 0 0.6rem;
+    border-width: 1.5px;
+    border-radius: 6px;
+    background-color: var(--c-bg);
+    font-size: 0.82rem;
+    font-weight: 500;
+  }
+
+  /* Checkboxes in a control column render as switches — every one of them applies on change. */
+  .settings-row-control > input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    position: relative;
+    flex: none;
+    box-sizing: border-box;
+    width: 34px;
+    height: 20px;
+    margin: 0;
+    border-radius: 999px;
+    background: var(--c-text-faint);
+    cursor: pointer;
+    transition: background-color 0.15s;
+  }
+  .settings-row-control > input[type="checkbox"]::before {
+    content: '';
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--c-bg-card);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+    transition: transform 0.15s;
+  }
+  .settings-row-control > input[type="checkbox"]:checked { background: var(--c-primary); }
+  .settings-row-control > input[type="checkbox"]:checked::before {
+    transform: translateX(14px);
+    background: var(--c-on-primary);
+  }
+  .settings-row-control > input[type="checkbox"]:focus-visible {
+    outline: 2px solid var(--c-primary-border);
+    outline-offset: 2px;
+  }
+  .settings-row-control > input[type="checkbox"]:disabled { opacity: 0.5; cursor: progress; }
+  @media (prefers-reduced-motion: reduce) {
+    .settings-row-control > input[type="checkbox"],
+    .settings-row-control > input[type="checkbox"]::before { transition: none; }
+  }
+
+  /* A radio group drawn as one segmented control (Version Control's Disabled / Git / SVN). Each
+     native radio stays focusable and arrow-key navigable, laid transparently over its segment. */
+  .settings-segmented {
+    justify-self: start;
+    display: inline-flex;
+    flex-wrap: nowrap;
+    gap: 2px;
+    padding: 2px;
+    border: 1.5px solid var(--c-border-input);
+    border-radius: 8px;
+    background: var(--c-bg);
+  }
+  .settings-segmented > label {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    box-sizing: border-box;
+    min-height: calc(var(--settings-control-h) - 7px);
+    padding: 0 14px;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--c-text-muted);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .settings-segmented > label > input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    opacity: 0;
+    cursor: inherit;
+  }
+  .settings-segmented > label:hover { color: var(--c-text); }
+  .settings-segmented > label:has(> input:checked) {
+    background: var(--c-primary-light);
+    color: var(--c-primary-text);
+    box-shadow: inset 0 0 0 1px var(--c-primary-border);
+  }
+  .settings-segmented > label:has(> input:focus-visible) {
+    outline: 2px solid var(--c-primary-border);
+    outline-offset: 1px;
+  }
+  .settings-segmented > label:has(> input:disabled) { opacity: 0.5; cursor: not-allowed; }
+
+  /* State message: warning by default (blocked notifications, a failed load), --info for advice
+     and the debug log path, --success for a saved key. Text first, buttons after it. */
+  .settings-notice {
     display: flex;
     align-items: center;
-    gap: 8px;
-    min-width: 0; /* (C1124) let .settings-row-value's ellipsis actually work */
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--c-warning-border);
+    border-radius: 8px;
+    background: var(--c-warning-bg);
+    color: var(--c-warning);
+    font-size: 0.76rem;
+    line-height: 1.45;
   }
+  /* The flex display outranks the UA [hidden] rule; every notice ships or toggles hidden. */
+  .settings-notice[hidden] { display: none; }
+  .settings-notice > :not(button) { flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
+  .settings-notice > code { font-family: var(--c-mono, monospace); font-size: 0.74rem; }
+  .settings-notice--info {
+    border-color: var(--c-border);
+    background: var(--c-bg);
+    color: var(--c-text-secondary);
+  }
+  .settings-notice--success {
+    border-color: var(--c-success-border);
+    background: var(--c-success-bg);
+    color: var(--c-success);
+  }
+  .settings-row > .settings-notice { grid-column: 1 / -1; }
+
+  /* A narrow window stacks every row: label and hint above the control. */
+  @media (max-width: 560px) {
+    .settings-row { grid-template-columns: minmax(0, 1fr); row-gap: 8px; }
+  }
+
   .settings-row-btn {
     font-size: 0.78rem;
     font-weight: 600;
@@ -7141,57 +7557,6 @@
     opacity: 0.5;
     cursor: not-allowed;
   }
-  /* (C1124) Agents row summary — truncates long "Claude Code (opusplan) · Codex · …" text
-     instead of wrapping/overflowing the row. */
-  .settings-row-value {
-    font-size: 0.78rem;
-    color: var(--c-text-muted);
-    max-width: 260px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .settings-row-hint {
-    font-size: 0.75rem;
-    line-height: 1.35;
-    color: var(--c-warning);
-    background: var(--c-warning-bg);
-    border: 1px solid var(--c-warning-border);
-    border-radius: 6px;
-    padding: 6px 8px;
-    margin-top: -4px;
-  }
-  .settings-row-hint--success {
-    color: var(--c-success);
-    background: var(--c-success-bg);
-    border-color: var(--c-success-border);
-  }
-
-  /* ── Voice tab (C1178, merged engine list C1195): AssemblyAI row + local model list share
-     one radio group and one row layout. ── */
-  .settings-voice-engine-list {
-    display: flex;
-    flex-direction: column;
-  }
-  .settings-voice-key-row {
-    display: flex;
-    gap: 8px;
-    flex: 1 1 220px;
-    min-width: 0;
-    justify-content: flex-end;
-  }
-  .settings-voice-key-input {
-    flex: 1;
-    min-width: 0;
-    padding: 0.4rem 0.6rem;
-    border: 1.5px solid var(--c-border-input);
-    border-radius: 6px;
-    background: var(--c-bg);
-    color: var(--c-text);
-    font-size: 0.85rem;
-    outline: none;
-  }
-  .settings-voice-key-input:focus { border-color: var(--c-primary-border); }
   .settings-row-btn-ghost {
     border-color: transparent;
     background: transparent;
@@ -7207,38 +7572,30 @@
     color: var(--c-danger);
     background: var(--c-danger-bg);
   }
-  .settings-voice-key-status {
-    flex-basis: 100%;
-  }
 
-  .settings-voice-model-row {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
-    padding: 8px 0;
-    border-bottom: 1px solid var(--c-border);
-  }
-  .settings-voice-model-row:last-child { border-bottom: none; }
+  /* ── Voice tab (C1178, merged engine list C1195): the AssemblyAI row and every local model
+     row (_voiceModelRowHtml(), task-board.js) are .settings-rows sharing one radio group —
+     engine radio, name and size in the label column; key field, or state badge and action, in
+     the control column. ── */
   .settings-voice-model-label {
     display: flex;
-    align-items: baseline;
-    gap: 6px;
-    flex: 1 1 auto;
+    align-items: center;
+    gap: 8px;
     min-width: 0;
-    cursor: pointer;
   }
-  .settings-voice-model-name {
-    font-size: 0.85rem;
-    font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
+  .settings-voice-model-label > input { flex: none; margin: 0; }
+  .settings-voice-model-name { min-width: 0; }
   .settings-voice-model-size {
+    flex: none;
     font-size: 0.72rem;
+    font-weight: 500;
     color: var(--c-text-muted);
     white-space: nowrap;
+  }
+  .settings-voice-key-input {
+    flex: 1 1 160px;
+    min-width: 0;
+    max-width: var(--settings-control-w);
   }
   .settings-voice-model-state {
     font-size: 0.68rem;
@@ -7263,7 +7620,7 @@
     color: var(--c-warning);
   }
   .settings-voice-model-progress {
-    flex-basis: 100%;
+    grid-column: 1 / -1;
     height: 4px;
     border-radius: 2px;
     overflow: hidden;
@@ -7275,76 +7632,22 @@
     transition: width 0.2s ease;
   }
 
-  /* ── Version Control tab (TPT62) — radio list + git-only checkbox list. Same row shape
-     as .settings-voice-model-row above (name + muted hint, hairline separator between
-     rows), reused here instead of duplicating the layout. ── */
-  .settings-vcs-options,
-  .settings-vcs-suboptions {
-    display: flex;
-    flex-direction: column;
-  }
-  .settings-vcs-suboptions {
-    margin-top: 4px;
-    padding-left: 4px;
-  }
-  .settings-vcs-option,
-  .settings-vcs-suboption {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    padding: 8px 0;
-    border-bottom: 1px solid var(--c-border);
-    cursor: pointer;
-  }
-  .settings-vcs-option:last-child,
-  .settings-vcs-suboption:last-child {
-    border-bottom: none;
-  }
-  .settings-vcs-option-label,
-  .settings-vcs-suboption-label {
-    font-size: 0.85rem;
-    font-weight: 600;
-    color: var(--c-text);
-  }
-  .settings-vcs-suboption-hint {
-    font-size: 0.75rem;
-    color: var(--c-text-muted);
-  }
-
-  /* (C1137) macOS Alerts-style hint row — text + deep-link button share the hint pill instead
-     of the plain-text-only layout the other hint rows use. */
-  #settings-notifications-style-hint {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-  }
-  #settings-notifications-style-btn {
-    flex-shrink: 0;
-  }
-  /* The ID rule's display:flex outranks the UA [hidden] rule, so a hidden hint row would still
-     paint as an empty warning balloon with a blank button. Re-assert display:none for every
-     hint row, ID-scoped for the one that sets its own display. */
-  .settings-row-hint[hidden],
-  #settings-notifications-style-hint[hidden] { display: none; }
-
   /* ── Workflow tab (C1182) — status table + chips ── */
-  /* C1270 — 4.5rem×4 stage columns (288px) left no room for the chip inside this modal's
-     ~432px content width (.settings-panel is width:90vw, max-width:480px, padding:24px —
-     far narrower than the web app's Project Workflow card, which is why porting the web
-     app's 5.5rem stage-col verbatim still overlapped here). 3.5rem (paired with the smaller
-     .settings-wf-head-cell font below — measured: "Completed" is ~52px wide at 0.6rem, so
-     56px leaves ~4px margin) keeps "Completed"/"Canceled" — the longest single unbreakable
-     stage words — on one line, while still leaving the chip a legible width at every row. */
+  /* C1270 — compact stage columns. 3.5rem (paired with the smaller .settings-wf-head-cell
+     font below — measured: "Completed" is ~52px wide at 0.6rem, so 56px leaves ~4px margin)
+     keeps "Completed"/"Canceled" — the longest single unbreakable stage words — on one line,
+     while still leaving the chip a legible width when the panel narrows to 92vw on a small
+     window (the web app's wider Project Workflow card uses 5.5rem). */
   .settings-wf-table, .settings-wf-head {
     --wf-stage-col: 3.5rem;
   }
+  /* (TPT9110) No max-height/overflow of its own: the Workflow pane is the dialog's single
+     scroll region, so a long status list extends the pane's scroll instead of nesting a
+     second scrollbar inside it. */
   .settings-wf-table {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    max-height: 320px;
-    overflow-y: auto;
   }
   .settings-wf-row {
     display: flex;
@@ -7352,21 +7655,22 @@
     gap: 6px;
     padding: 4px 0;
   }
-  .settings-wf-caption {
-    color: var(--c-text-muted);
-    font-size: 0.8rem;
-    margin-bottom: 10px;
-  }
-  /* Stage header row (C1192) — sibling of #settings-workflow-list (which is a scroll
-     container, so a header inside it would scroll away with the rows), same cell
-     sequence/gap as .settings-wf-row so its labels sit over the matching radio columns
-     (.settings-wf-radio below shares --wf-stage-col for this to line up). */
+  /* Stage header row (C1192) — sibling of #settings-workflow-list (the drag-reorder code
+     indexes that list's .settings-wf-row children, so a header row must not live inside it),
+     same cell sequence/gap as .settings-wf-row so its labels sit over the matching radio
+     columns (.settings-wf-radio below shares --wf-stage-col for this to line up).
+     (TPT9110) Sticky at the scrolling pane's top edge — sticky offsets start inside the pane's
+     padding, so top cancels it — keeping the stage labels in view while long lists scroll. */
   .settings-wf-head {
+    position: sticky;
+    top: calc(-1 * var(--settings-pane-pad-top, 0px));
+    z-index: 1;
+    background: var(--c-bg-card);
     display: flex;
     align-items: flex-end;
     gap: 6px;
     padding: 0 0 4px;
-    border-bottom: 1px solid var(--c-border);
+    border-bottom: 1px solid var(--settings-rule);
     margin-bottom: 4px;
   }
   .settings-wf-head-spacer {
@@ -7423,6 +7727,16 @@
     padding: 2px 4px 2px 8px;
     border-radius: 9999px;
     background: color-mix(in srgb, var(--wf-color, var(--c-primary)) 18%, transparent);
+    /* (TPT9117) Ink for the status name. The swatches are Catppuccin Mocha pastels made for
+       dark grounds: as text on their own tint they vanish on light themes (yellow ~1.2:1 on
+       paper). Light themes keep the swatch's hue and chroma at one dark OKLCH lightness, so
+       every name reads in its own colour at the same weight. Dark themes lift the swatch
+       toward white instead; the raw overlay greys miss 4.5:1 there too. The tint and the dot
+       stay the raw swatch. theme-default.test.js checks every swatch in every palette. */
+    --wf-ink: oklch(from var(--wf-color, var(--c-primary)) 0.45 c h);
+  }
+  .theme-dark .settings-wf-chip {
+    --wf-ink: color-mix(in srgb, var(--wf-color, var(--c-primary)) 45%, #fff);
   }
   .settings-wf-chip-name {
     flex: 0 1 auto;
@@ -7430,7 +7744,7 @@
     min-width: 0;
     border: none;
     background: transparent;
-    color: var(--wf-color, var(--c-text));
+    color: var(--wf-ink);
     font: inherit;
     font-weight: 600;
     font-size: 0.85rem;
@@ -7458,6 +7772,9 @@
     border-radius: 50%;
     padding: 0;
     background: var(--wf-color, var(--c-primary));
+    /* (TPT9117) A hairline in the name's ink keeps pale swatches (yellow, rosewater) visible
+       on a light chip. */
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--wf-ink) 45%, transparent);
     color: transparent;
     font-size: 0;
     cursor: pointer;
@@ -7513,30 +7830,21 @@
     flex: 0 0 24px;
     margin-left: 4px;
   }
+  /* The add form's input and colour select wear the shared field look (§ Settings sections and
+     rows); this only lays them out. */
   .settings-wf-add-form {
     display: flex;
     gap: 8px;
     align-items: center;
-    margin-top: 10px;
+    margin-top: 12px;
   }
   .settings-wf-add-input {
     flex: 1;
     min-width: 0;
-    padding: 6px 8px;
-    border-radius: 6px;
-    border: 1px solid var(--c-border-input);
-    background: var(--c-bg-card);
-    color: var(--c-text);
-    font: inherit;
-    font-size: 0.85rem;
   }
-  .settings-wf-add-color {
-    padding: 6px 8px;
-    border-radius: 6px;
-    border: 1px solid var(--c-border-input);
-    background: var(--c-bg-card);
-    color: var(--c-text);
-    font-size: 0.85rem;
+  .settings-wf-add-form > .settings-row-btn {
+    box-sizing: border-box;
+    height: var(--settings-control-h);
   }
 
   /* ── Accept / Reject card controls ── */
@@ -8607,7 +8915,9 @@
     overflow-wrap: anywhere;
   }
 
-  .task-chat-msg--user { align-items: flex-end; }
+  /* A user turn runs right to left: the bubble at the right edge, its Copy action beside it. The
+     DOM keeps the bubble first, so it is read before the button. */
+  .task-chat-msg--user { flex-direction: row-reverse; align-items: flex-end; }
 
   .task-chat-msg--user .task-chat-body {
     max-width: 85%;
@@ -9071,15 +9381,20 @@
     font-family: 'SF Mono', Monaco, Consolas, monospace;
     font-size: 0.85em;
   }
+  /* The right padding is the gutter of the block's Copy button (.task-chat-copy). The block's
+     text scrolls inside its <code>, which ends at that gutter, so a long line never runs under
+     the button and the button never scrolls away with the text. */
   .task-chat-md pre {
-    padding: 0.7rem 0.85rem;
+    position: relative;
+    padding: 0.7rem 2.4rem 0.7rem 0.85rem;
     border: 1px solid var(--c-border);
     border-radius: 8px;
     background: var(--c-bg-sub-nav);
-    overflow-x: auto;
     line-height: 1.45;
   }
   .task-chat-md pre code { padding: 0; background: none; color: var(--c-text); }
+  /* Line pitch stays 1.45 of the pre's font: the code's font is 0.85 of it (.task-chat-md code). */
+  .task-chat-md pre > code { display: block; overflow-x: auto; line-height: calc(1.45 / 0.85); }
   .task-chat-md blockquote {
     padding-left: 0.85rem;
     border-left: 3px solid var(--c-border-input);
@@ -9090,6 +9405,90 @@
   .task-chat-md th, .task-chat-md td { padding: 0.3rem 0.6rem; border: 1px solid var(--c-border); text-align: left; }
   .task-chat-md th { background: var(--c-bg-sub-nav); font-weight: 600; }
   .task-chat-md img { max-width: 100%; border-radius: 6px; }
+
+  /* Copy (TPT9134, task-chat.js attachCopyControls()): an icon button in the top-right corner of
+     every code block of a reply (.task-chat-copy) and one per reply or user turn for its whole
+     text (.task-chat-msg-copy). Each shows while its block or message is hovered or while it has
+     keyboard focus, and turns into a check mark for a moment after a copy ([data-copied]). */
+  .task-chat-copy,
+  .task-chat-msg-copy {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 1.6rem;
+    height: 1.6rem;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: none;
+    color: var(--c-text-muted);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s, color 0.12s, background 0.12s, border-color 0.12s;
+  }
+
+  .task-chat-copy {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.4rem;
+    border-color: var(--c-border);
+    background: var(--c-bg-card);
+  }
+
+  .task-chat-copy svg,
+  .task-chat-msg-copy svg { width: 14px; height: 14px; }
+
+  .task-chat-copy .task-chat-copy-done,
+  .task-chat-msg-copy .task-chat-copy-done,
+  .task-chat-copy[data-copied] .task-chat-copy-icon,
+  .task-chat-msg-copy[data-copied] .task-chat-copy-icon { display: none; }
+  .task-chat-copy[data-copied] .task-chat-copy-done,
+  .task-chat-msg-copy[data-copied] .task-chat-copy-done { display: block; }
+
+  .task-chat-copy-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .task-chat-md pre:hover > .task-chat-copy,
+  .task-chat-msg:hover > .task-chat-msg-copy,
+  .task-chat-copy:focus-visible,
+  .task-chat-msg-copy:focus-visible,
+  .task-chat-copy[data-copied],
+  .task-chat-msg-copy[data-copied] { opacity: 1; }
+
+  .task-chat-copy:hover { border-color: var(--c-border-input); color: var(--c-text); }
+  .task-chat-msg-copy:hover { background: var(--c-bg-sub-nav); color: var(--c-text); }
+
+  .task-chat-copy:focus-visible,
+  .task-chat-msg-copy:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 1px; }
+
+  .task-chat-copy[data-copied],
+  .task-chat-msg-copy[data-copied] { border-color: var(--c-success-border); color: var(--c-success); }
+
+  .task-chat-msg-copy[hidden] { display: none; }
+
+  /* A reply's sits at the right end of its author line; a user turn's beside the bubble, centred
+     on a one-line bubble and level with the last line of a longer one. */
+  .task-chat-msg--assistant { position: relative; }
+  .task-chat-msg--assistant > .task-chat-msg-copy {
+    position: absolute;
+    top: -0.25rem;
+    right: 0.4rem;
+  }
+  .task-chat-msg--user > .task-chat-msg-copy { margin-bottom: 0.5rem; }
+
+  /* No hover to reveal them on a touch screen: always shown. */
+  @media (hover: none) {
+    .task-chat-copy,
+    .task-chat-msg-copy { opacity: 1; }
+  }
 
   .task-chat-footer {
     position: relative;
@@ -9583,6 +9982,8 @@
     .task-chat-panel--running .task-chat-dot,
     .task-chat-widget--tool[data-status="running"] .task-chat-tool-dot,
     .task-chat-start { animation: none; }
+    .task-chat-copy,
+    .task-chat-msg-copy { transition: none; }
   }
 
   /* ── end Task Chat window ── */
@@ -11742,15 +12143,20 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
      modal (C1298's --modal-field-control-radius). Only the status-colour tint below is card-derived. */
   border-radius: 4px; border: 1px solid var(--c-border-input);
   cursor: pointer; appearance: none; -webkit-appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg width='8' height='5' viewBox='0 0 8 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L4 4L7 1' stroke='%23666' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat; background-position: right 0.7rem center;
-  background-color: color-mix(in srgb, var(--status-color, #7f849c) 18%, transparent);
-  color: color-mix(in srgb, var(--status-color, #7f849c) 65%, black);
+  /* (TPT9120) The card pill's currentColor chevron strokes, one background-position per stroke. */
+  background-image:
+    linear-gradient(to top right, transparent calc(50% - 1px), currentColor calc(50% - 0.4px) calc(50% + 0.4px), transparent calc(50% + 1px)),
+    linear-gradient(to bottom right, transparent calc(50% - 1px), currentColor calc(50% - 0.4px) calc(50% + 0.4px), transparent calc(50% + 1px));
+  background-size: 4px 4px; background-repeat: no-repeat;
+  background-position: right calc(0.7rem + 4px) center, right 0.7rem center;
+  /* (TPT9118) Ink and opaque --c-bg-card ground as on the card's pill (see .card-status-select). */
+  background-color: color-mix(in srgb, var(--status-color, #7f849c) 18%, var(--c-bg-card));
+  color: oklch(from var(--status-color, #7f849c) 0.45 c h);
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 .theme-dark .modal-top-bar .modal-status-select {
-  background-color: color-mix(in srgb, var(--status-color, #94a3b8) 22%, transparent);
-  color: color-mix(in srgb, var(--status-color, #94a3b8) 55%, white);
+  background-color: color-mix(in srgb, var(--status-color, #94a3b8) 22%, var(--c-bg-card));
+  color: color-mix(in srgb, var(--status-color, #94a3b8) 45%, #fff);
 }
 .modal-top-bar .modal-status-select:hover:not(:disabled) { border-color: var(--c-text-muted); }
 .modal-top-bar .modal-status-select:focus-visible { outline: none; border-color: var(--c-primary-border); box-shadow: 0 0 0 3px var(--c-primary-light); }
@@ -11839,7 +12245,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   /* Same 32px height, slimmer horizontal padding, so badge + pill + Reset/Save still fit one row
      at ~390px for the default status names (longer custom names wrap, each row staying aligned). */
   .modal-task-id { padding: 0 10px; }
-  .modal-top-bar .modal-status-select { padding: 0 22px 0 10px; background-position: right 0.5rem center; }
+  .modal-top-bar .modal-status-select { padding: 0 22px 0 10px; background-position: right calc(0.5rem + 4px) center, right 0.5rem center; }
   .modal-top-bar button { padding: 0 10px; }
   /* (TPT466) Icon-only workspace tabs on a phone, so the tab strip and Reset/Save share a row. */
   .modal-top-bar .task-modal-tab { padding: 0 9px; }
@@ -11866,6 +12272,54 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
      Start/Stop keep their labels since they are the primary run action. */
   .modal-actions-manage button { width: var(--modal-ctrl-h); padding: 0; }
   .modal-actions-manage .btn-label { display: none; }
+}
+
+/* (TPT9127) Forced colours (Windows contrast themes) compute a gradient background-image to none,
+   so the status selects' chevron strokes (TPT9120) vanish there. Hand the arrow back to the native
+   control, which draws it in the system colours, as the Settings selects do (TPT9124). The native
+   control reserves its own room for the arrow at the end, so the right padding the strokes needed
+   drops to the left padding's value: the name sits centred between the left edge and the arrow,
+   and the pill stays close to its usual width. The read-only header select keeps no arrow, as it
+   does outside forced colours. This block follows every rule it overrides, the phone-width rule
+   above included, and wins at the same specificity. */
+@media (forced-colors: active) {
+  .status-select,
+  .card-status-select,
+  .modal-top-bar .modal-status-select { appearance: auto; -webkit-appearance: auto; }
+  .status-select,
+  .card-status-select { padding-right: 6px; }
+  .task-card-hover-controls .card-status-select { padding-right: var(--card-ctrl-pad-x); }
+  .modal-top-bar .modal-status-select { padding-right: 14px; }
+  .modal-top-bar .modal-status-select:disabled { appearance: none; -webkit-appearance: none; }
+  @media (max-width: 480px) {
+    .modal-top-bar .modal-status-select { padding-right: 10px; }
+  }
+}
+
+/* (TPT9130) The proposal card's sprint select draws its chevron as two gradient triangles (TPT299),
+   which forced colours drop the same way. Hand the arrow back to the native control, as the status
+   selects above do. The native control reserves its own room for the arrow at the end, so the 26px
+   right padding the triangles needed drops to the shared .card-ctl inline padding; field-sizing:
+   content still sizes the select to its selected option. This block follows every rule it overrides
+   and wins at the same specificity. */
+@media (forced-colors: active) {
+  .preview-step-select { appearance: auto; -webkit-appearance: auto; }
+  .card.preview-card .card-preview-meta .preview-step-select { padding-right: var(--card-ctrl-pad-x); }
+}
+
+/* (TPT9131) The board's Status and People filter chevrons are mask-image boxes painted with
+   background-color, which forced colours turn into Canvas, the ground colour, so they vanish. Paint
+   them in ButtonText, a system colour that survives forced colours and reads on the button. The
+   .active and :hover states repaint the chevron at a higher specificity, so they are listed here too;
+   .open only rotates it and keeps working. This block follows every rule it overrides and wins at
+   the same specificity. */
+@media (forced-colors: active) {
+  .status-filter-wrap::after,
+  .status-filter-wrap.active::after,
+  .status-filter-wrap:hover::after,
+  .people-filter-wrap::after,
+  .people-filter-wrap.active::after,
+  .people-filter-wrap:hover::after { background-color: ButtonText; }
 }
 
 /* C1310 — task-specific metadata composition. Shared controls retain their edit-modal
@@ -12621,6 +13075,62 @@ mark.mention--agent {
 .setup-modal-msg--error { color: var(--c-danger); }
 .setup-modal-msg--ok { color: var(--c-success); }
 .setup-modal-msg--muted { color: var(--c-text-muted); }
+/* (TPT9169) Import wizard: the folder already holds KB files that the import keeps. */
+.setup-modal-msg--warning {
+  color: var(--c-warning);
+  background: var(--c-warning-bg);
+  border: 1px solid var(--c-warning-border);
+  border-radius: 6px;
+  padding: 0.45rem 0.65rem;
+  line-height: 1.4;
+}
+
+/* (TPT9169) Import wizard's archive card (Name step) and folder row (Folder step). */
+/* On the panel's own ground: --c-text-muted and the --c-primary-text chips keep their contrast. */
+.setup-modal-archive {
+  border: 1px solid var(--c-border);
+  border-left: 3px solid var(--c-primary-border);
+  border-radius: 7px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 0.9rem;
+}
+.setup-modal-archive-name {
+  font-family: var(--c-mono, monospace);
+  font-size: 0.82rem;
+  color: var(--c-text);
+  overflow-wrap: anywhere;
+}
+.setup-modal-archive-meta {
+  font-size: 0.78rem;
+  color: var(--c-text-muted);
+  margin-top: 0.15rem;
+}
+.setup-modal-archive-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+.setup-modal-archive-count {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+  background: var(--c-primary-light);
+  color: var(--c-primary-text);
+}
+.setup-modal-folder-row {
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+.setup-modal-folder-path {
+  flex: 1 1 12rem;
+  min-width: 0;
+  font-family: var(--c-mono, monospace);
+  font-size: 0.8rem;
+  color: var(--c-text-secondary);
+  overflow-wrap: anywhere;
+}
 
 .setup-modal-spinner {
   font-size: 0.82rem;
@@ -12766,27 +13276,32 @@ mark.mention--agent {
 #settings-modal.settings-modal--over-modal {
   z-index: 3250;
 }
+/* (TPT9110) Fixed-size dialog: the box is sized by the viewport, never by the active tab, so
+   the title, tab strip and close button stay in place on every tab switch. Title and tab strip
+   are fixed rows of this flex column; the visible .settings-body pane below fills the rest and
+   is the dialog's only scroll region. */
 .settings-panel {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(92vw, 860px);
+  height: min(80vh, 720px);
+  overflow: hidden;
   background: var(--c-bg-card);
   color: var(--c-text);
   border: 1px solid var(--c-border);
   border-radius: 12px;
-  padding: 24px;
-  width: 90vw;
-  max-width: 480px;
-  max-height: 80vh;
-  overflow-y: auto;
   box-shadow: 0 8px 32px rgba(0,0,0,0.22);
 }
 .settings-title {
-  margin: 0 0 16px;
+  flex: none;
+  padding: 24px 56px 16px 24px;
   font-size: 1.1rem;
   font-weight: 700;
 }
 .settings-close {
   position: absolute;
-  top: 14px;
+  top: 25px; /* centred on the title line */
   right: 16px;
   background: none;
   border: none;
@@ -12799,10 +13314,42 @@ mark.mention--agent {
 .settings-close:hover {
   color: var(--c-primary-text);
 }
+#settings-modal .modal-tabs {
+  flex: none;
+  margin: 0 24px;
+}
+/* (TPT9110) Every tab pane (.settings-body.modal-tab-panel) fills the panel below the tab strip
+   and scrolls on its own; inactive panes are display:none, so the visible one is the only scroll
+   region. Full-bleed, so the scrollbar sits on the panel edge and content scrolls up to the tab
+   strip's border. scrollbar-gutter keeps the 10px themed track (::-webkit-scrollbar) reserved
+   on short panes too, so the content width is the same on every tab; the right padding is the
+   24px inset minus that gutter, lining content up with the tab strip.
+   (TPT9111) The pane also defines the section/row tokens (§ Settings sections and rows): the
+   label column width, the shared select width, the field height and the row hairline colour.
+   Its children are .settings-section blocks, 24px apart. */
 .settings-body {
+  --settings-pane-pad-top: 16px;
+  --settings-label-col: clamp(180px, 36%, 300px);
+  --settings-control-w: 280px;
+  --settings-control-h: 30px;
+  /* Row hairlines: several dark palettes set --c-border to their card colour, so a divider
+     drawn on the card in --c-border vanishes; a faint mix of the text colour shows in all. */
+  --settings-rule: color-mix(in srgb, var(--c-text) 10%, transparent);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 24px;
+  accent-color: var(--c-primary);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: var(--settings-pane-pad-top) 14px 24px 24px;
+}
+/* Rows keep their height: the pane scrolls instead of squeezing them (a row that is itself a
+   scroll box would otherwise shrink to fit). */
+.settings-body > * {
+  flex-shrink: 0;
 }
 
 /* ── Agent selection (project-creation-wizard + setup-modal) ─────────────── */
@@ -13325,16 +13872,19 @@ input.sma-pi-tools {
 
 /* ── Dark-theme overrides (.theme-dark class toggled by applyThemeClass) ── */
 
-/* Status pills — translucent tints so they read on dark cards. (C1187) Was 5 hardcoded
+/* Status pills — swatch tints so they read on dark cards. (C1187) Was 5 hardcoded
    per-name rules × 3 selectors each — replaced with the same --status-color custom
    property mechanism as the light-theme rules, blended against a dark surface instead
-   of a light one so it still reads on a dark card. */
+   of a light one so it still reads on a dark card.
+   (TPT9118) Same opaque --c-bg-card ground as the light rules. The ink lifts the swatch toward
+   white: 45%, the Settings Workflow chips' share (TPT9117), clears 4.5:1 on this 22% tint in
+   every dark palette; at 50% nord's overlay0 drops to 4.34:1. */
 .theme-dark .status-select,
 .theme-dark .card-status-select,
 .theme-dark .drawer-status,
 .theme-dark .status {
-  background-color: color-mix(in srgb, var(--status-color, #94a3b8) 22%, transparent);
-  color: color-mix(in srgb, var(--status-color, #94a3b8) 55%, white);
+  background-color: color-mix(in srgb, var(--status-color, #94a3b8) 22%, var(--c-bg-card));
+  color: color-mix(in srgb, var(--status-color, #94a3b8) 45%, #fff);
 }
 
 /* id-badge chip */
@@ -13723,7 +14273,93 @@ input.sma-pi-tools {
 .image-task-files a { color: var(--c-primary-text); font-size: 12px; }
 
 /* Per-run policy and one-action approvals in task terminals. */
-.terminal-permission-mode { font-size: 12px; color: var(--c-text-muted); }
+/* (TPT9139) The run's permission mode, next to the agent caption (session-mode-control.js): a
+   static chip shaped like .terminal-task-caption, or — when the agent can switch live — a compact
+   permission-mode-select.js trigger. Pending and error colours are local tokens over the theme
+   variables; theme-default.test.js checks their contrast in every palette. */
+.session-mode {
+  --session-mode-pending-fg: var(--c-primary-text);
+  --session-mode-pending-bg: var(--c-primary-lighter);
+  --session-mode-pending-border: var(--c-primary-border);
+  --session-mode-error-fg: var(--c-text);
+  --session-mode-error-bg: var(--c-danger-bg);
+  --session-mode-error-border: var(--c-danger);
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-width: 0;
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+.session-mode[hidden] { display: none; }
+/* .task-label clips its overflow: room for the trigger's 2px focus ring above, below and after. */
+.terminal-header .task-label:has(> .session-mode:not([hidden])) { padding-block: 3px; padding-inline-end: 3px; }
+.session-mode-body { display: inline-flex; align-items: center; min-width: 0; }
+.session-mode-status {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+.session-mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  box-sizing: border-box;
+  min-height: 24px;
+  padding: 1px 10px 1px 5px;
+  border: 1px solid var(--c-border-input);
+  border-radius: 12px;
+  font-weight: 500;
+  color: var(--c-text-muted);
+  white-space: nowrap;
+}
+.session-mode .permission-mode-icon { width: 15px; height: 15px; }
+.session-mode div.permission-mode-select { width: auto; }
+.session-mode .permission-mode-select-trigger {
+  width: auto;
+  min-height: 26px;
+  gap: 6px;
+  padding: 0 8px 0 5px;
+  border-color: var(--c-border-input);
+  border-radius: 13px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
+}
+.session-mode .permission-mode-select-value { gap: 5px; }
+.session-mode .permission-mode-select-label { overflow-wrap: normal; }
+.session-mode .permission-mode-select-chevron { line-height: 1; transform: translateY(-2px); }
+/* Same focus treatment as the header's other controls. */
+.session-mode .permission-mode-select-trigger:focus-visible {
+  outline: none;
+  border-color: var(--c-primary-border);
+  box-shadow: 0 0 0 2px var(--c-primary-light);
+}
+.session-mode-pending .permission-mode-select-trigger,
+.session-mode-pending .permission-mode-select-trigger:hover:not(:disabled) {
+  border-style: dashed;
+  border-color: var(--session-mode-pending-border);
+  background: var(--session-mode-pending-bg);
+  color: var(--session-mode-pending-fg);
+  cursor: progress;
+}
+.session-mode-pending .permission-mode-select-chevron { display: none; }
+.session-mode-pending .session-spinner { width: 12px; height: 12px; margin-inline: 1px; }
+.session-mode-error .permission-mode-select-trigger,
+.session-mode-error .permission-mode-select-trigger:hover:not(:disabled),
+.session-mode-error .permission-mode-select-trigger:focus-visible {
+  border-color: var(--session-mode-error-border);
+  background: var(--session-mode-error-bg);
+  color: var(--session-mode-error-fg);
+}
+/* The open list is portaled to <body>: wide enough for its hints, wherever the trigger sits. */
+.permission-mode-select-menu.session-mode-menu { min-width: min(360px, calc(100vw - 16px)); }
+@media (max-width: 480px) {
+  /* Mirrors the caption, which drops its text here: icon (and chevron) only, the label in the tooltip. */
+  .session-mode-label, .session-mode .permission-mode-select-label { display: none; }
+  .session-mode-chip { padding: 1px 5px; }
+}
 .terminal-permission-request { padding: 12px 16px; border-top: 1px solid var(--c-border); background: var(--c-bg-card); color: var(--c-text); flex-shrink: 0; }
 .terminal-permission-request pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; margin: 8px 0; }
 .terminal-permission-request button { margin-right: 8px; }

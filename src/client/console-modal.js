@@ -4,8 +4,8 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import state from './state.js';
 import { XTERM_THEME, MAX_DESC_LEN, CHAT_STATE_KEY, DRAFT_KEY_OBJECTIVE, LAST_PROMPT_KEY, modelLabel } from './constants.js';
-import { escapeAttr, projectHeader, fetchWithRetry, shortModelName, clearDraft } from './utils.js';
-import { buildWsUrl, startTerminalSession, terminateTaskSession, onSystemResume } from './ws-client.js';
+import { escapeAttr, projectHeader, fetchWithRetry, shortModelName, clearDraft, showToast } from './utils.js';
+import { buildWsUrl, startTerminalSession, terminateTaskSession, onSystemResume, bindSessionSocket, requestPermissionMode, applyPermissionModeChanged, WS_RECV_TYPES } from './ws-client.js';
 import { updateClaudeButtons, syncActiveSessionsNav } from './task-board.js';
 import { showActionConfirm } from './action-confirm.js';
 import { dismissNotification } from './notification-center.js';
@@ -21,6 +21,8 @@ import { replayProgressLog, progressStatusLine } from './objective-progress-log.
 import { getAgentDisplayLabel } from './agent-select.js';
 import { piTaskModelIds, piOnlyToolLess } from './pi-task-models.js';
 import { renderTerminalPermissions } from './terminal-permissions.js';
+import { createSessionModeControl } from './session-mode-control.js';
+import { liveModeState } from './permission-mode.js';
 import { renderImageTask } from './image-task-view.js';
 import { clearAttention, markSessionLost, dismissLostSession, mergeSessionsSnapshot } from './attention-state.js';
 import { _isPinnedToBottom, createTerminalOutputWriter } from './terminal-output.js';
@@ -720,10 +722,11 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // active-session rows stay clickable while a terminal is open.
   overlay.className = 'terminal-overlay terminal-overlay--task';
   if (hostEl) overlay.className = 'terminal-embed';
+  let renderedTaskLabel = renderTaskLabel(initialAgentId, _agentCaption(initialAgentId, initialAgentLabel, initialModel));
   overlay.innerHTML = `
     <div class="terminal-container">
       <div class="terminal-header">
-        <span class="task-label">${renderTaskLabel(initialAgentId, _agentCaption(initialAgentId, initialAgentLabel, initialModel))}</span>
+        <span class="task-label">${renderedTaskLabel}</span>
         <span class="status-dot" title="${escapeAttr(t('terminal.status.connected'))}"></span>
         <div class="terminal-header-actions">
           ${isObjective ? '' : `<button class="btn-show-task" type="button">${escapeAttr(t('terminal.showTask'))}</button>`}
@@ -776,6 +779,22 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     });
   });
 
+  // (TPT9139) The run's permission mode sits right after the agent caption: a live selector when
+  // the agent can switch without a restart, else a static chip (session-mode-control.js). It is
+  // fed by terminal-state and session:permission-mode-changed below; a reattach seeds it from
+  // the sessionMeta snapshot, which only ever holds the server's confirmed mode.
+  const modeControl = isObjective ? null : createSessionModeControl({
+    t, toast: showToast, request: mode => requestPermissionMode(taskId, mode),
+  });
+  let unbindModeSocket = null;
+  if (modeControl) {
+    taskLabelEl.appendChild(modeControl.root);
+    const seed = isResume ? state.sessionMeta.get(taskId) : null;
+    if (seed?.permissionMode) {
+      modeControl.update(seed.permissionMode, { startedAt: seed.startedAt, running: state.activeSessions.has(taskId), source: seed.permissionSource ?? null });
+    }
+  }
+
   // (C1118) lastKnownAgentId/lastKnownModel persist across calls so the model-less `config`
   // frame (agent/label only) can't clobber a caption already populated by `terminal-state`.
   let lastKnownAgentId = initialAgentId;
@@ -784,7 +803,14 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     if (agent) lastKnownAgentId = agent;
     if (model !== undefined) lastKnownModel = model || '';
     const safeAgentLabel = label || state.taskAgentLabel || 'Claude Code';
-    taskLabelEl.innerHTML = renderTaskLabel(lastKnownAgentId, _agentCaption(lastKnownAgentId, safeAgentLabel, lastKnownModel));
+    const html = renderTaskLabel(lastKnownAgentId, _agentCaption(lastKnownAgentId, safeAgentLabel, lastKnownModel));
+    if (html === renderedTaskLabel) return; // most frames change nothing here
+    renderedTaskLabel = html;
+    // (TPT9139) The rewrite detaches the mode control; put it back after the caption, focus and all.
+    const focused = modeControl?.root.contains(document.activeElement) ? document.activeElement : null;
+    taskLabelEl.innerHTML = html;
+    if (modeControl) taskLabelEl.appendChild(modeControl.root);
+    focused?.focus({ preventScroll: true });
   }
 
   // Init xterm.js
@@ -810,8 +836,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   let processRunning = true;
   let restartingLoss = !!opts.restartLost;
   let terminalPhase = 'planning';
-  // (TPT9078) The run's permission mode, mirrored from each `terminal-state` frame for the
-  // header label and terminalController.permissionMode only. It never gates input: in every
+  // (TPT9078) The run's confirmed permission mode, mirrored from each `terminal-state` frame for
+  // terminalController.permissionMode only (the header shows modeControl). It never gates input: in every
   // mode — Plan included — term.onData() keeps forwarding keystrokes to the PTY, so the agent's
   // own dialogs (Claude's ExitPlanMode / permission menus, Codex and Pi approval prompts) are
   // answered with 1/2/3, arrows and Enter typed straight into the xterm. The plan-ready bar and
@@ -1162,6 +1188,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
 
   function showLostSession(detail = {}, { failed = '' } = {}) {
     processRunning = false;
+    modeControl?.stop();
     setCodexPlanReady(false);
     renderWatchdogActions(null);
     markSessionLost(taskId, detail);
@@ -1194,6 +1221,11 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     const socket = new WebSocket(buildWsUrl(taskId, extra));
     ws = socket;
     terminalController.ws = ws;
+    // (TPT9139) The server takes a permission-mode request only on the socket owning the session.
+    if (modeControl) {
+      unbindModeSocket?.();
+      unbindModeSocket = bindSessionSocket(taskId, socket);
+    }
     if (previous && (previous.readyState === WebSocket.OPEN || previous.readyState === WebSocket.CONNECTING)) previous.close();
 
     // Keep the advance and acceptance tied to this socket, including a refusal that
@@ -1334,7 +1366,11 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
               ? t('terminal.status.planningCommand', { command: state.planApprovalCommand })
               : t('terminal.status.planningDialog'))
           : t('terminal.status.executing'));
-        state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), paused: msg.paused || null, permissionMode: msg.permissionMode ?? null, permissionSource: msg.permissionSource ?? null });
+        // (TPT9139) The full live state (permissionModeState), the shape GET /api/sessions keeps
+        // in sessionMeta; a frame with only the scalar confirmed mode reads as not switchable.
+        const liveMode = liveModeState(msg.permissionModeState ?? msg.permissionMode);
+        state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), paused: msg.paused || null, permissionMode: liveMode, permissionSource: msg.permissionSource ?? null });
+        modeControl?.update(liveMode, { startedAt: msg.startedAt, running: true, source: msg.permissionSource ?? null });
         renderWatchdogActions(msg.paused);
         syncActiveSessionsNav();
         terminalController.phase = terminalPhase;
@@ -1344,6 +1380,10 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         terminalController.planApprovalCommand = terminalPlanApprovalCommand;
         terminalController.codexPlanReady = terminalCodexPlanReady;
         maybeSendCodexResumeRedraw();
+      } else if (msg.type === WS_RECV_TYPES.SESSION_PERMISSION_MODE_CHANGED) {
+        // (TPT9139) Pending, confirmed or failed live switch — also the reattach replay.
+        const liveMode = applyPermissionModeChanged(msg);
+        if (liveMode && msg.taskId === taskId) modeControl?.update(liveMode, { startedAt: msg.startedAt, running: processRunning });
       } else if (msg.type === 'image-task-state') {
         renderImageTask(overlay, msg.imageTask, frame => { if (wsIsOpen()) ws.send(JSON.stringify(frame)); });
         scheduleTerminalRefresh({ send: true });
@@ -1384,6 +1424,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         });
       } else if (msg.type === 'exit') {
         processRunning = false;
+        modeControl?.stop();
         state.activeSessions.delete(taskId);
         state.exitedSessions.add(taskId);
         state.sessionMeta.set(taskId, { ...state.sessionMeta.get(taskId), alive: false });
@@ -1430,6 +1471,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
         const errorText = errorFrameText(msg);
         if (restartingLoss && knownLoss) showLostSession(knownLoss, { failed: errorText || t('terminal.sessionMissing') });
         processRunning = false;
+        modeControl?.stop();
         setCodexPlanReady(false);
         setStatus('disconnected', t('terminal.status.error'));
         term.write(`\r\n\x1b[31m${t('common.error', { msg: errorText })}\x1b[0m\r\n`);
@@ -1570,6 +1612,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     if (terminalDisposed) return;
     terminalDisposed = true;
     unsubscribeSystemResume();
+    unbindModeSocket?.();
+    unbindModeSocket = null;
+    modeControl?.destroy();
     clearTimeout(resumeRedrawTimer);
     outputWriter?.dispose();
     if (wheelHandler && term.element) {

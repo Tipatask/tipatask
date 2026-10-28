@@ -90,8 +90,9 @@ async function main() {
   // retiring this stdio server as the primary registration. TIPATASK_MCP_LOCAL_ONLY (set
   // to "1" by every config writer as of C1382 — see .mcp.json / codex-mcp-config.js)
   // registers only the local tools below that still need this: a checked-out repo
-  // (batch_grep_tags) or an API round-trip this process happens to already be set up for
-  // (push_knowledge/pull_knowledge, git_worktree_status, complete_task). Registered under the server name
+  // (batch_grep_tags), an API round-trip this process happens to already be set up for
+  // (push_knowledge/pull_knowledge, git_worktree_status, complete_task) or the local Task App
+  // (start_next_tasks, TPT9163). Registered under the server name
   // 'tipatask-local' — see the McpServer name below. Defaults to full 22-tool mode
   // (LOCAL_ONLY=false) so a stale .mcp.json/config.toml predating C1382, or a bare
   // `node server.js` invocation, keeps working exactly as before rather than silently
@@ -1206,6 +1207,22 @@ async function main() {
       });
       taskCache.invalidate();
       return { content: [{ type: 'text', text: JSON.stringify({ project_id: projectId, ...result }) }], isError: !result.completed };
+    }
+  );
+
+  // ── start_next_tasks ── (LOCAL_ONLY — always registered; see tt-mcp-server.md)
+  // TPT9163 — a cowboy chain run, once complete_task succeeded, asks Task App to start the chain's
+  // next tasks (POST /api/tasks/:key/cowboy-next with the run's TIPATASK_COWBOY_TOKEN — see
+  // ../server/cowboy-next-request.js). Task App picks and starts them; this tool reads no task and
+  // needs no backend. Outside a cowboy run (no token in this server's env) it returns isError.
+
+  server.tool(
+    'start_next_tasks',
+    'Cowboy chain runs only (Bypass, with Cowboy-coding mode on or started by a chain): after complete_task succeeded, ask Task App to start the next tasks of this chain, each in its own new agent session with that task\'s own agent and model. Call once, with the key of the task this run just completed; Task App picks the tasks — never start them yourself. Returns the started task keys and the reason.',
+    { task_key: z.string().describe('Key of the task this run just completed') },
+    async ({ task_key }) => {
+      const result = await require('../server/cowboy-next-request').requestNextTasks(normalizeTaskKey(task_key));
+      return { content: [{ type: 'text', text: JSON.stringify(result) }], isError: !result.ok };
     }
   );
 

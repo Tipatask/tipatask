@@ -74,6 +74,12 @@ export function handleAttentionMessage(msg) {
     }
     return true;
   }
+  // (TPT9162) A cowboy run's chain started sessions no socket of ours opened — same pickup.
+  if (msg.type === 'cowboy-chain-started') {
+    const repaint = () => window.TipTask?.taskBoard?.updateClaudeButtons?.();
+    Promise.resolve(window.TipTask?.fetchActiveSessions?.()).then(repaint).catch(() => {});
+    return true;
+  }
   if (msg.type === 'session-ended') {
     if (msg.taskId) {
       // (TPT613) Same as the browser __board__ handler (template.html): the session is gone, not
@@ -284,6 +290,11 @@ export function connectAttentionWs() {
     // dirty-worktree warning: browser mode already dispatches them from connectBoardWs().
     if (window.electronAPI?.api && typeof msg.type === 'string' && (msg.type.startsWith('merge:') || msg.type === 'worktree-dirty-on-complete')) {
       window.TipTask?.mergeBranchesModal?.handleMergeWsMessage?.(msg);
+    }
+    // (TPT9116) This project's chat history index changed: the left menu's chat rows (and an open
+    // start gate's history picker) refresh — task-chat.js historyUpdated(). Same Electron gate.
+    if (window.electronAPI?.api && msg.type === 'chat-history-updated') {
+      window.TipTask?.taskChat?.historyUpdated?.(msg);
     }
   };
   ws.onclose = () => {

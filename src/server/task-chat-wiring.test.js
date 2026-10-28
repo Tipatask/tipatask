@@ -421,6 +421,8 @@ test('task-chat-message is rejected mid-turn and when empty, with an error frame
   session.proc = { pid: 1 };
   await send(ws, { type: 'task-chat-message', content: 'again' });
   assert.match(framesOf(ws, 'error').at(-1).message, /still in progress/);
+  assert.equal(framesOf(ws, 'error').at(-1).reason, 'turn-in-progress');
+  assert.equal(framesOf(ws, 'error').at(-1).running, true);
   session.proc = null;
   session._spawning = true;
   await send(ws, { type: 'task-chat-message', content: 'again' });
@@ -429,6 +431,24 @@ test('task-chat-message is rejected mid-turn and when empty, with an error frame
   assert.match(framesOf(ws, 'error').at(-1).message, /`content`/);
   assert.equal(session.messages.length, 1);
   assert.equal(h.named('dispatch.spawnTurn').length, 1);
+});
+
+test('task chat rechecks turn ownership after awaiting model validation', async () => {
+  let release;
+  let hold = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  const h = harness({ applyModelSelection: async () => { if (hold) await gate; return { changed: false }; } });
+  const { session, ws } = await startedChat(h);
+  hold = true;
+  ws.emit('message', JSON.stringify({ type: 'task-chat-message', content: 'Racing message' }));
+  await flush();
+  session._spawning = true; // another request acquired ownership during validation
+  release();
+  await flush();
+  assert.equal(session.messages.length, 1, 'rejected request is never stored');
+  assert.equal(h.named('dispatch.spawnTurn').length, 1);
+  assert.equal(session._spawning, true);
+  assert.equal(framesOf(ws, 'error').at(-1).reason, 'turn-in-progress');
 });
 
 test('the system prompt is rebuilt when the provider changes, and only then', async () => {
@@ -540,6 +560,27 @@ test('abort keeps the seed but drops a typed message', async () => {
   await send(ws, { type: 'task-chat-message', content: 'typed' });
   await send(ws, { type: 'abort' });
   assert.deepEqual(session.messages.map(m => !!m.seed), [true]);
+});
+
+test('Codex Stop releases ownership before acknowledging, so the next message is accepted', async () => {
+  const h = harness({ provider: 'codex' });
+  const { session, ws } = await startedChat(h);
+  const proc = { pid: 97000 };
+  session.providerType = 'codex';
+  session.proc = proc;
+  session._codexTurn = { proc, epoch: session._epoch || 0, settled: false };
+  session.codexSessionId = 'retained-thread';
+  await send(ws, { type: 'abort' });
+  assert.equal(session.proc, null);
+  assert.equal(session._codexTurn.settled, true);
+  assert.equal(h.named('claude.killObjectiveProc').length, 1);
+  assert.equal(h.named('claude.escalateKill').length, 1);
+  assert.equal(framesOf(ws, 'generation-aborted').length, 1);
+  assert.equal(framesOf(ws, 'objective-result').length, 0);
+  await send(ws, { type: 'task-chat-message', content: 'Retry after Stop' });
+  assert.equal(h.named('dispatch.spawnTurn').length, 2);
+  assert.equal(session.codexSessionId, 'retained-thread');
+  assert.equal(framesOf(ws, 'error').length, 0);
 });
 
 test('kill tears the chat down and removes it', async () => {
@@ -1192,4 +1233,42 @@ test('(TPT539) an unreadable native session file still resumes, with an empty wi
   const session = sessions.get('projectChat:2:bbbbbb2\0/proj/a');
   assert.equal(session.messages.length, 1);
   assert.equal(session._resumedHistory.transcriptUnavailable, true);
+});
+
+// ── (TPT9116) live history list: each index write reaches the chat's project windows ───────────
+
+test('(TPT9116) a new task chat sends one chat-history-updated on its first native-session report and one per turn end, to its own project only', async (t) => {
+  const websocket = require('./websocket');
+  const socket = flags => ({ readyState: 1, ...flags, sent: [], send(raw) { this.sent.push(JSON.parse(raw)); } });
+  const projectWindow = socket({ _attentionSubscriber: true, _projectPath: '/proj/live' });
+  const otherWindow = socket({ _attentionSubscriber: true, _projectPath: '/proj/live-other' });
+  const unstamped = socket({}); // every terminal and chat socket
+  // Paths no other test uses: their late index writes must not land in these sockets.
+  websocket.init({ clients: new Set([projectWindow, otherWindow, unstamped]) });
+  t.after(() => websocket.init(null));
+  const h = harness();
+  const sessions = new Map();
+  const ws = await connect(h, sessions, projectBackend('2', 'Alpha'), CHAT_ID, '/proj/live');
+  await send(ws, { type: 'start-task-chat' });
+  const session = sessions.get(`${CHAT_ID}\0/proj/live`);
+  assert.equal(session.taskKey, 'TPT1');
+  assert.equal(projectWindow.sent.length, 0, 'nothing is written before the CLI reports a session');
+  await emitNativeSession(session, 'claude', 'claude-native-1');
+  const [entry] = await h.history.readChatHistory('/proj/live');
+  assert.deepEqual(projectWindow.sent, [{ type: 'chat-history-updated', historyId: entry.historyId, kind: 'task', taskKey: 'TPT1', projectId: '2' }],
+    'exactly one frame on the first native-session report');
+  session.onNativeSession(); // the turn ends
+  await session._historyWrite;
+  assert.equal(projectWindow.sent.length, 2, 'one frame at the turn end');
+  await send(ws, { type: 'task-chat-message', content: 'One more thing.' });
+  session.onNativeSession(); // that turn ends too
+  await session._historyWrite;
+  assert.equal(projectWindow.sent.length, 3);
+  await send(ws, { type: 'kill' });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(projectWindow.sent.length, 4, 'kill stamps endedAt, which is a write too');
+  assert.ok(projectWindow.sent.every(f => f.type === 'chat-history-updated' && f.historyId === entry.historyId));
+  assert.equal(otherWindow.sent.length, 0, "a second project's window gets no frame");
+  assert.equal(unstamped.sent.length, 0);
+  assert.equal(framesOf(ws, 'chat-history-updated').length, 0, 'never on the chat socket itself');
 });

@@ -51,6 +51,19 @@ agents need. They are yours to edit, and reopening the project keeps them up to 
 are stored on <https://web.tipatask.com> by default; to use your own server, set
 `API_BASE_URL` in the project's `.tipatask/config.json`.
 
+**Project ▸ Export…** saves the open project as one `.zip`: its knowledge base (`CLAUDE.md`,
+`AGENTS.md`, `ai/CONVENTIONS.md`, `ai/architecture/*.md`) and every task that is not closed,
+with the sprints, tags and statuses those tasks use.
+
+**Project ▸ Import…** turns such a `.zip` into a new project. Once the archive checks out, you
+name the project and pick its folder and agents; TipΔTask then creates the project, writes the
+knowledge base files into the folder (files already there are kept) and adds the tasks to their
+sprints. If an import fails partway, the project it started is removed, so you can import again.
+
+On macOS the first launch explains, then asks once for notification, microphone and folder
+access (Desktop, Documents, Downloads and your open projects), so an agent never stops mid-task
+waiting on a system prompt. You can change these later in System Settings.
+
 To update, install a newer release (or pull and rebuild) and reopen your project.
 
 ## Build from source

@@ -8,6 +8,7 @@ const config = require('./config');
 const leftUncommitted = require('./left-uncommitted'); // (TPT664) pure, no cycle
 
 let _wss = null;
+let _onTaskUpdated = null;
 
 // Track recent assignments: taskId → { assignee, at }
 const _recentAssignments = new Map();
@@ -23,8 +24,9 @@ const _recentAssignmentsPruneTimer = setInterval(() => {
 }, 30000);
 if (_recentAssignmentsPruneTimer.unref) _recentAssignmentsPruneTimer.unref();
 
-function init(wss) {
+function init(wss, { onTaskUpdated } = {}) {
   _wss = wss;
+  _onTaskUpdated = onTaskUpdated || null;
 }
 
 function broadcast(type, payload) {
@@ -47,6 +49,18 @@ function broadcastToProject(projectPath, type, payload) {
   for (const client of _wss.clients) {
     if (client.readyState !== 1) continue;
     if (projectPath && client._projectPath && client._projectPath !== projectPath) continue;
+    client.send(msg);
+  }
+}
+
+// Session-mode inventory goes only to this project's window watchers. The terminal
+// owner receives its frame directly; other terminal/chat sockets are not subscribers.
+function emitSessionPermissionModeChanged(projectPath, payload) {
+  if (!_wss) return;
+  const msg = JSON.stringify({ type: 'session:permission-mode-changed', ...payload });
+  for (const client of _wss.clients) {
+    if (client.readyState !== 1 || (!client._boardWatcher && !client._attentionSubscriber)) continue;
+    if ((client._projectPath || '') !== (projectPath || '')) continue;
     client.send(msg);
   }
 }
@@ -75,6 +89,10 @@ function emitTaskUpdated(task, opts, projectPath) {
   // status is no longer left uncommitted — drop the server registry entry and tell every window.
   const removed = leftUncommitted.noteTaskUpdate(task, projectPath);
   if (removed) emitTaskLeftUncommitted(projectPath, task.id, [], { cleared: true, exitId: removed.exitId });
+  if (_onTaskUpdated) {
+    Promise.resolve().then(() => _onTaskUpdated(task, projectPath))
+      .catch(err => console.warn('[attention] task status update failed:', err.message));
+  }
 }
 
 function emitTaskDeleted(id, projectPath) {
@@ -87,6 +105,29 @@ function emitTasksFinalized(changes, projectPath) {
   const payload = { count: changes.length, taskIds };
   if (projectPath) broadcastToProject(projectPath, 'tasks:finalized', payload);
   else broadcast('tasks:finalized', payload);
+}
+
+// (TPT9116) A project's task/project chat history index was written: chat-persistence.js
+// upsertChatHistory() calls this once per write, after it is on disk. Narrower than
+// broadcastToProject(): only the window watcher sockets (__attention__, __board__) stamped with
+// exactly this project path get it, never an unstamped terminal or chat socket, so a window of
+// another project receives nothing. Metadata only — native ids, paths and search data stay here.
+function emitChatHistoryUpdated(projectPath, { historyId, kind, taskKey, projectId } = {}) {
+  if (!_wss) return;
+  const target = projectPath || '';
+  const msg = JSON.stringify({
+    type: 'chat-history-updated',
+    historyId: historyId || null,
+    kind: kind || null,
+    taskKey: taskKey || null,
+    projectId: projectId || null,
+  });
+  for (const client of _wss.clients) {
+    if (client.readyState !== 1) continue;
+    if (!client._boardWatcher && !client._attentionSubscriber) continue;
+    if ((client._projectPath || '') !== target) continue;
+    client.send(msg);
+  }
 }
 
 // Record a task assignment (called from finalize path)
@@ -213,4 +254,15 @@ function emitTaskLeftUncommitted(projectPath, taskKey, blockers, extra = {}) {
   });
 }
 
-module.exports = { init, broadcast, broadcastToProject, emitMergeProgress, emitMergeConflict, emitMergeDone, emitMergeError, emitWorktreeDirtyOnComplete, emitTaskLeftUncommitted, emitTaskCreated, emitTaskUpdated, emitTaskDeleted, emitTasksFinalized, recordAssignment, getRecentAssignments, emitObjectiveQueueState, emitSessionQueueState, emitApiStatus, emitMutationsDropped, emitVoiceModelProgress, emitVoiceModelComplete, emitVoiceModelError, emitVoiceModelDeleted, broadcastKbReindexResult, emitSessionRunaway };
+// (TPT9162) A cowboy run's chain started task sessions no socket of any window opened
+// (terminal-session.js launchCowboyChain()). `taskId` is the finished task, `started` the keys
+// whose sessions were admitted or queued; windows re-read /api/sessions to show them.
+function emitCowboyChainStarted(projectPath, { taskId, started }) {
+  broadcastToProject(projectPath || '', 'cowboy-chain-started', {
+    projectPath: projectPath || '',
+    taskId,
+    started: Array.isArray(started) ? started : [],
+  });
+}
+
+module.exports = { init, broadcast, broadcastToProject, emitSessionPermissionModeChanged, emitMergeProgress, emitMergeConflict, emitMergeDone, emitMergeError, emitWorktreeDirtyOnComplete, emitTaskLeftUncommitted, emitCowboyChainStarted, emitTaskCreated, emitTaskUpdated, emitTaskDeleted, emitTasksFinalized, emitChatHistoryUpdated, recordAssignment, getRecentAssignments, emitObjectiveQueueState, emitSessionQueueState, emitApiStatus, emitMutationsDropped, emitVoiceModelProgress, emitVoiceModelComplete, emitVoiceModelError, emitVoiceModelDeleted, broadcastKbReindexResult, emitSessionRunaway };

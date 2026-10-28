@@ -47,7 +47,15 @@ function hashProject(projectPath) {
   return crypto.createHash('md5').update(String(projectPath) + (identity ? '\0' + identity : '')).digest('hex').slice(0, identity ? 16 : 8);
 }
 
-function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROOT } = {}) {
+// (TPT9116) Default `onHistoryUpdated`: tell the project's windows their chat history list changed
+// (websocket.js emitChatHistoryUpdated()). Required lazily, so a process that never writes the
+// index never loads the WS layer.
+function announceHistoryUpdate(projectPath, entry) {
+  require('./websocket').emitChatHistoryUpdated(projectPath, entry);
+}
+
+// `onHistoryUpdated(projectPath, savedEntry)` runs once per history index write, after it is on disk.
+function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROOT, onHistoryUpdated = announceHistoryUpdate } = {}) {
   const queues = new Map();
 
   function chatDraftPath(projectPath) {
@@ -241,25 +249,31 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
       throw err;
     }
     const filePath = chatHistoryPath(projectPath);
-    return forProject(projectPath, async () => {
+    const saved = await forProject(projectPath, async () => {
       await cleanupStaleTemps(filePath);
       const entries = await readHistoryFile(filePath);
       const index = entries.findIndex(e => e.historyId === entry.historyId);
       const previous = index >= 0 ? entries[index] : null;
       const now = Date.now();
-      const saved = {
+      const merged = {
         ...(previous || {}),
         ...entry,
         createdAt: previous?.createdAt || entry.createdAt || now,
         lastActivityAt: entry.lastActivityAt || now,
       };
       if (index >= 0) entries.splice(index, 1);
-      entries.unshift(saved);
+      entries.unshift(merged);
       entries.sort((a, b) => (b.lastActivityAt || 0) - (a.lastActivityAt || 0));
       const kept = entries.slice(0, CHAT_HISTORY_MAX_ENTRIES);
       await atomicWrite(filePath, JSON.stringify({ version: CHAT_HISTORY_VERSION, entries: kept }, null, 2));
-      return saved;
+      return merged;
     });
+    // The write landed. A failing listener must not turn it into a failed write.
+    if (typeof onHistoryUpdated === 'function') {
+      try { onHistoryUpdated(projectPath || '', saved); }
+      catch (error) { console.warn(`[chat-history] update notice failed: ${error.message}`); }
+    }
+    return saved;
   }
 
   return {

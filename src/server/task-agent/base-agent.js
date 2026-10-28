@@ -87,6 +87,39 @@ class BaseTaskAgent {
     return opts.permissionPolicy?.prompt || '';
   }
 
+  // Resolve only after native enforcement AND behavioral instructions take effect.
+  // Adapters return { supported: true, confirmed: mode }; a PTY write is not confirmation.
+  // Failures must retain the previous enforcement. Adapters own native in-flight
+  // request invalidation and must bind async work to this run, never a replacement.
+  async switchPermissionMode(session, mode) { return { supported: false }; }
+
+  // (TPT9139) Whether the terminal header offers its live selector for this run: true once the
+  // adapter implements switchPermissionMode(). One that can switch only under conditions (CLI
+  // version, launch flags) overrides this to decline a run it cannot serve.
+  supportsLivePermissionSwitch(session) {
+    return this.switchPermissionMode !== BaseTaskAgent.prototype.switchPermissionMode;
+  }
+
+  approvalSubmissionGuard(session) {
+    const pty = session.pty;
+    const epoch = session._permissionEpoch;
+    return () => !!pty && session.pty === pty && session._permissionEpoch === epoch
+      && !session._terminated && !session.permissionMode?.pending;
+  }
+
+  // `resolved` adds run-specific policy inputs, e.g. Claude's { nativeAuto } (claude-live-mode.js).
+  buildModeSwitchDirective(mode, resolved = {}) {
+    const { validateLiveMode } = require('../permission-policy');
+    validateLiveMode(mode);
+    const policy = this.buildPermissionPolicy({ ...resolved, mode, source: 'session', inherited: false });
+    return [
+      `The user selected ${mode} for this session. Leaving Plan explicitly authorizes implementation now and clears the planning pause. Continue the current task with its existing conversation context and progress.`,
+      policy.prompt,
+      this.buildCommunicationDirective({ permissionPolicy: policy }),
+      'Preserve project VCS restrictions, guarded completion requirements and explicit user instructions. This change applies to future actions; it does not cancel or reverse an action already running.',
+    ].filter(Boolean).join('\n');
+  }
+
   buildCommunicationDirective(opts = {}) {
     const run = opts.permissionPolicy;
     const { compact, clarify } = this.getPreamblePolicy();
@@ -367,6 +400,31 @@ class BaseTaskAgent {
     ].join('\n');
   }
 
+  // (TPT9163) Cowboy chain hand-off (ai/architecture/tt-task-agent.md § Cowboy Directive). Only a run
+  // spawned with opts.cowboyChain (terminal-session.js: a bypass run whose task has cowboyMode on, or
+  // one launchCowboyChain() started) whose policy is bypass gets it; every other run gets ''. Task App
+  // picks and starts the next tasks (POST /api/tasks/:key/cowboy-next); the agent only asks, once,
+  // after a successful completion. opts.nextCall is how this agent reaches start_next_tasks (Pi passes
+  // its bridged tool or `tt next`). Compact wording is echoed by Pi: no questions or status literals.
+  buildCowboyDirective(opts = {}) {
+    if (opts.cowboyChain !== true || opts.permissionPolicy?.mode !== 'bypass') return '';
+    const call = opts.nextCall || '`start_next_tasks(task_key)`';
+    if (opts.compact) {
+      return [
+        'Cowboy chain:',
+        `- After completion succeeds (completed:true), run ${call} exactly once, before your final message; Task App starts the next tasks in new sessions.`,
+        '- Never pick, start or work on the next tasks yourself. Completion refused or blocked: skip it, the chain stops. No retry; list the started task keys (or none) and the reason in your final message.',
+      ].join('\n');
+    }
+    return [
+      'Cowboy chain:',
+      `- This Bypass run is part of a cowboy chain. After \`complete_task\` succeeded (it returned completed: true), call the tipatask-local tool ${call} exactly once, with this task's key, before your final message. Task App then picks the next tasks and starts each one in its own new agent session with that task's own agent and model.`,
+      '- Never pick, start or work on the next tasks yourself: no status changes on them, no new terminals, agent sessions or CLI launches. That tool is the only way the chain continues.',
+      '- If `complete_task` refused or this task ends blocked, do not call it: the chain stops here.',
+      '- Do not retry it, even when it reports an error or starts nothing. In your final message, list the task keys it started (or that none started) and the reason it returned.',
+    ].join('\n');
+  }
+
   // TPT611 — closing sentence for the Claude/Codex guarded-completion mandate: the last message
   // must carry the evidence the definition-of-done line (vcs-settings.js) gates on, beside the
   // follow-up keys, and only after follow-up capture and complete_task. The sha clause follows
@@ -398,10 +456,10 @@ class BaseTaskAgent {
   // (Claude joins with blank lines inside one template, Codex/Pi splice array lines, and Pi
   // places the directives after its grep note where Codex places them before), so each
   // buildPrompt() keeps ownership of where the slots land.
-  //   directives — [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus, followUps]
+  //   directives — [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, cowboy]
   //                in that fixed order, empties dropped, so absent optional data (no opts.vcsSettings,
-  //                nothing blank in opts.tagDescriptions) emits no directive and no stray
-  //                separator. resourceLimits reads opts.agentLimits and is never empty.
+  //                nothing blank in opts.tagDescriptions, no bypass opts.cowboyChain) emits no
+  //                directive and no stray separator. resourceLimits reads opts.agentLimits and is never empty.
   //   clarify    — deliberately NOT part of `directives`: it must sit directly beside the
   //                adapter's own plan-ready instruction (see buildClarifyDirective's ORDERING
   //                note). Execution policies use mode-specific communication instead;
@@ -424,6 +482,7 @@ class BaseTaskAgent {
     const kbHygiene = this.buildKbHygieneDirective(completion);
     const taskStatus = this.buildTaskStatusDirective(variant);
     const followUps = this.buildFollowUpDirective(completion);
+    const cowboy = this.buildCowboyDirective({ ...opts, ...variant });
     const clarify = this.buildCommunicationDirective(opts);
     return {
       vcs,
@@ -433,7 +492,8 @@ class BaseTaskAgent {
       kbHygiene,
       taskStatus,
       followUps,
-      directives: [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus, followUps].filter(Boolean),
+      cowboy,
+      directives: [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, cowboy].filter(Boolean),
       clarify,
     };
   }

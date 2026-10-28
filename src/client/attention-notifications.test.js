@@ -50,6 +50,7 @@ const {
 } = await import('./attention-notifications.js');
 const { getNotificationEntries, clearAllNotifications } = await import('./notification-center.js');
 const { raiseAttention, clearAttention, _resetAttentionState } = await import('./attention-state.js');
+const { seedStatuses, resetStatuses } = await import('./status-registry.js');
 
 function makeCard({ title = 'Task Title', status = 'in_progress', containsActive = false, hover = false } = {}) {
   return {
@@ -75,6 +76,8 @@ beforeEach(() => {
   state.attentionDetails = new Map();
   _resetAttentionState();
   state.taskTitleById = new Map();
+  state.taskStatusById = new Map();
+  resetStatuses();
   state.projectName = ''; // (C1137) default: no project-name prefix
   appNode = { querySelector: () => makeCard() };
   modalNode = { hidden: true, dataset: {} };
@@ -85,6 +88,33 @@ beforeEach(() => {
   // attention-notifications.js's own "already told the user" ledger (C1058).
   clearDebounce('C1');
   forgetTaskAttention('C1');
+});
+
+test('idle alerts for complete/canceled roles reach neither notification surface; pending still notifies', () => {
+  visibilityState = 'hidden';
+  seedStatuses([
+    { name: 'Todo', is_workflow_start: true },
+    { name: 'Shipped', is_workflow_complete: true },
+    { name: 'Dropped', is_workflow_canceled: true },
+  ]);
+  for (const status of ['Shipped', 'Dropped']) {
+    state.taskStatusById.set('C1', status);
+    assert.equal(notifyTaskNeedsAttention('C1', { kind: 'idle' }), false);
+    assert.equal(lastNotification, null);
+    assert.equal(getNotificationEntries().length, 0);
+  }
+  state.taskStatusById.set('C1', 'Todo');
+  assert.equal(notifyTaskNeedsAttention('C1', { kind: 'idle' }), true);
+  assert.ok(lastNotification);
+  assert.equal(getNotificationEntries().length, 1);
+});
+
+test('closed card blocks idle without cached status; real prompts on closed tasks still notify', () => {
+  visibilityState = 'hidden';
+  appNode = { querySelector: () => makeCard({ status: 'completed' }) };
+  assert.equal(notifyTaskNeedsAttention('C1', { kind: 'idle' }), false);
+  assert.equal(getNotificationEntries().length, 0);
+  assert.equal(notifyTaskNeedsAttention('C1', { kind: 'toolApproval', promptText: 'Approve command' }), true);
 });
 
 test('isTaskInUserFocus is true for focused active terminal task', () => {

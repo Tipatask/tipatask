@@ -34,3 +34,14 @@ test('isAgentChatId recognises chat session ids by prefix, never a task key', ()
   for (const id of ['obj-1790000000', 'specChat:C524', 'taskChat:TPT420', 'projectChat:2']) assert.equal(isAgentChatId(id), true, id);
   for (const id of ['TPT420', 'C524', 'H12', '', null, undefined, 42, 'xtaskChat:TPT1']) assert.equal(isAgentChatId(id), false, String(id));
 });
+
+
+test('permission-mode requests are unset at creation and isolated per session', () => {
+  const a = createSession(null, true, 'a', '');
+  const b = createSession(null, true, 'b', '');
+  assert.deepEqual(a.permissionMode, { requested: null, confirmed: null, pending: false, error: null });
+  a.permissionMode.requested = 'bypass';
+  a.permissionMode.pending = true;
+  assert.equal(b.permissionMode.requested, null);
+  assert.equal(b.permissionMode.pending, false);
+});

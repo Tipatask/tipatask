@@ -2,7 +2,7 @@ import state from './state.js';
 import { notify, onNotifyFailed, debugNotifyLog, isNotifyEnabled } from './notifications.js';
 import { t } from './i18n.js';
 import { pushNotification, dismissNotification } from './notification-center.js';
-import { inProgressName } from './status-registry.js';
+import { inProgressName, isClosedName } from './status-registry.js';
 
 // (C1058) Per-task record of the last prompt signature we actually surfaced to the user (or
 // deliberately skipped because they were already looking at it) — see forgetTaskAttention()
@@ -126,6 +126,9 @@ export function buildNotificationTitle(taskId, title) {
 // already-seen prompt signature, category pref off, or no permission).
 export function notifyTaskNeedsAttention(taskId, detail = state.attentionDetails?.get(taskId)) {
   if (!taskId) return false;
+  const card = _taskCard(taskId);
+  const status = state.taskStatusById?.get(taskId) || card?.dataset?.status || inProgressName();
+  if (detail?.kind === 'idle' && isClosedName(status)) return false;
 
   const sig = _signature(detail);
   if (_notifiedPrompts.get(taskId) === sig) {
@@ -141,12 +144,10 @@ export function notifyTaskNeedsAttention(taskId, detail = state.attentionDetails
     return false;
   }
 
-  const card = _taskCard(taskId);
   // Raw task title — feeds openTerminal()'s header, must NOT carry the project/taskId prefix
   // buildNotificationTitle() below adds for the banner/in-app card.
   const title = card?.querySelector?.('.card-title-inner')?.textContent?.trim()
     || state.taskTitleById?.get(taskId) || taskId;
-  const status = card?.dataset?.status || inProgressName();
   const body = buildAttentionBody(detail);
   const onClick = detail?.kind === 'uncommitted'
     ? () => openLeftUncommittedTask(taskId, status)

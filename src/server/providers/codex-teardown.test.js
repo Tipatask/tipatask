@@ -15,7 +15,7 @@ const { EventEmitter } = require('node:events');
 
 const throttle = require('../objective-throttle');
 
-function harness(t, { realEnv = false } = {}) {
+function harness(t, { realEnv = false, envError = false, spawnError = false } = {}) {
   // The spawned turn arms a 10-minute deadline + a ticker; mocked so they can't hold the process.
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const spawned = [];
@@ -25,6 +25,7 @@ function harness(t, { realEnv = false } = {}) {
   const realRequire = createRequire(filename);
   const mocks = {
     'node:child_process': { spawn(command, args, options) {
+      if (spawnError) throw new Error('spawn fixture failed');
       const proc = new EventEmitter();
       proc.pid = 97000 + spawned.length;
       proc.stdout = new EventEmitter();
@@ -35,7 +36,10 @@ function harness(t, { realEnv = false } = {}) {
       spawned.push(proc);
       return proc;
     } },
-    '../codex-env': { ...realRequire('../codex-env'), buildCodexEnv: () => ({ env: { TIPATASK_API_TOKEN: 'fixture-token' } }) },
+    '../codex-env': { ...realRequire('../codex-env'), buildCodexEnv: () => {
+      if (envError) throw new Error('env fixture failed');
+      return { env: { TIPATASK_API_TOKEN: 'fixture-token' } };
+    } },
     '../../codex-mcp-config': { buildScopedCodexMcpOverride: () => 'mcp_servers={}' },
     '../claude-session': { normalizeProposals: x => x },
     './transcript': { buildTurnPrompt: (_session, opts) => ({ prompt: 'plan it', mode: opts.hasProviderSession ? 'resume' : 'fresh' }), buildNudgeMessage: () => 'nudge' },
@@ -57,6 +61,129 @@ function harness(t, { realEnv = false } = {}) {
 }
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
+
+function taskChat(h) {
+  const frames = [];
+  Object.assign(h.session, { type: 'taskChat', toolProfile: 'taskChat', taskKey: 'TPT1',
+    codexSessionId: 'retained-thread', totalTokens: { input: 0, output: 0 },
+    ws: { OPEN: 1, readyState: 1, send: raw => frames.push(JSON.parse(raw)) } });
+  return frames;
+}
+
+const output = (proc, ...events) => proc.stdout.emit('data', Buffer.from(events.map(event => JSON.stringify(event)).join('\n') + '\n'));
+
+for (const failure of ['capacity', 'process-error', 'exit', 'signal', 'deadline', 'idle']) {
+  test(`Codex task chat ${failure} settles once and a retry owns its process`, async t => {
+    const h = harness(t);
+    const config = require('../config');
+    if (failure === 'deadline') {
+      const idleMs = config.OBJECTIVE_CODEX_STREAM_IDLE_MS;
+      config.OBJECTIVE_CODEX_STREAM_IDLE_MS = config.OBJECTIVE_TURN_MAX_MS + 1;
+      t.after(() => { config.OBJECTIVE_CODEX_STREAM_IDLE_MS = idleMs; });
+    }
+    const frames = taskChat(h);
+    h.session.messages.push({ role: 'assistant', content: 'Prior reply' }, { role: 'user', content: 'Continue' });
+    const history = [...h.session.messages];
+    h.codex.spawnCodexTurn(h.session, 'taskChat:TPT1');
+    h.releaseLocalize();
+    await settle();
+    const failed = h.spawned[0];
+    const liveTurn = h.session._codexTurn;
+    h.codex.spawnCodexTurn(h.session, 'taskChat:TPT1');
+    assert.equal(h.session._codexTurn, liveTurn, 'a concurrent spawn cannot replace a live owner');
+    if (failure === 'capacity') output(failed,
+      { type: 'error', message: 'Model is at capacity' },
+      { type: 'turn.failed', error: { message: 'Model is at capacity' } },
+      { type: 'item.completed', item: { type: 'agent_message', text: 'Must be ignored' } });
+    else if (failure === 'process-error') failed.emit('error', new Error('ENOENT'));
+    else if (failure === 'exit' || failure === 'signal') {
+      failed.exitCode = failure === 'exit' ? 1 : null;
+      failed.signalCode = failure === 'signal' ? 'SIGTERM' : null;
+      failed.emit('close', failed.exitCode);
+    } else {
+      t.mock.timers.tick(failure === 'deadline' ? config.OBJECTIVE_TURN_MAX_MS : config.OBJECTIVE_CODEX_STREAM_IDLE_MS);
+    }
+    assert.equal(h.session.proc, null);
+    assert.equal(liveTurn.proc, null, 'settled ownership does not retain the retired child');
+    assert.equal(h.session._spawning, false);
+    assert.equal(h.session._turnDeadlineTimer, null);
+    assert.equal(h.session._idleWatchdogTimer, null);
+    assert.equal(h.session._workingTicker, null);
+    assert.deepEqual(h.session.messages, history, 'failed turn keeps conversation and user submission');
+    assert.equal(h.session.codexSessionId, 'retained-thread');
+    assert.deepEqual(frames.filter(f => ['objective-error', 'chat-ready', 'objective-result'].includes(f.type)).map(f => f.type),
+      ['objective-error', 'chat-ready']);
+    assert.equal(frames.find(f => f.type === 'objective-error').chatContinues, true);
+    if (failure === 'deadline' || failure === 'idle') {
+      assert.equal(frames.find(f => f.type === 'objective-error').reason,
+        failure === 'deadline' ? 'turn-deadline' : 'stream-idle-timeout');
+    }
+
+    h.codex.spawnCodexTurn(h.session, 'taskChat:TPT1');
+    const replacement = h.session._codexTurn;
+    assert.equal(h.codex.finishFailedTaskChatTurn(h.session, { ...replacement }, () => assert.fail('not the owner')), false);
+    failed.emit('close', 1);
+    failed.emit('error', new Error('late error'));
+    await settle();
+    const retry = h.spawned[1];
+    assert.equal(h.session.proc, retry, 'old close/error cannot clear the retry');
+    assert.ok(h.session._turnDeadlineTimer);
+    assert.equal(frames.filter(f => f.type === 'chat-ready').length, 1);
+    output(retry, { type: 'item.completed', item: { type: 'agent_message', text: 'Recovered' } });
+    retry.emit('close', 0);
+    retry.emit('close', 0);
+    assert.equal(h.session.proc, null);
+    assert.equal(h.session.messages.at(-1).content, 'Recovered');
+    assert.equal(replacement.proc, null);
+    assert.equal(frames.filter(f => f.type === 'objective-result').length, 1);
+    assert.equal(frames.filter(f => f.type === 'chat-ready').length, 2);
+  });
+}
+
+for (const stage of ['envError', 'spawnError']) {
+  test(`Codex task chat releases preparation after ${stage}`, async t => {
+    const h = harness(t, { [stage]: true });
+    const frames = taskChat(h);
+    h.codex.spawnCodexTurn(h.session, 'taskChat:TPT1');
+    h.releaseLocalize();
+    await settle();
+    assert.equal(h.session._spawning, false);
+    assert.equal(h.session.proc, null);
+    assert.deepEqual(frames.map(f => f.type), ['objective-error', 'chat-ready']);
+  });
+}
+
+test('Stop during Codex task chat preparation invalidates the old continuation without touching a new one', async t => {
+  const h = harness(t);
+  taskChat(h);
+  h.codex.spawnCodexTurn(h.session, 'taskChat:TPT1');
+  const stopped = h.session._codexTurn;
+  h.session._aborted = true;
+  assert.equal(h.codex.finishFailedTaskChatTurn(h.session, stopped, () => {}), true);
+  h.codex.spawnCodexTurn(h.session, 'taskChat:TPT1');
+  assert.equal(h.codex.finishFailedTaskChatTurn(h.session, stopped, () => assert.fail('stale Stop')), false);
+  assert.equal(h.session._spawning, true);
+  h.releaseLocalize();
+  await settle();
+  assert.equal(h.spawned.length, 1, 'only the replacement reaches spawn');
+  assert.equal(h.session.proc, h.spawned[0]);
+});
+
+test('Codex task chat can recover while detached without adding a successful reply', async t => {
+  const h = harness(t);
+  taskChat(h);
+  h.session.ws = null;
+  h.codex.spawnCodexTurn(h.session, 'taskChat:TPT1');
+  h.releaseLocalize();
+  await settle();
+  output(h.spawned[0], { type: 'turn.failed', error: { message: 'Model is at capacity' } });
+  h.spawned[0].emit('close', 1);
+  assert.equal(h.session.proc, null);
+  assert.equal(h.session._spawning, false);
+  assert.equal(h.session.messages.length, 1);
+  assert.equal(h.session.pendingResult, null);
+  assert.equal(h.session.codexSessionId, 'retained-thread');
+});
 
 test('control: an undisturbed Codex turn spawns once localization resolves', async t => {
   const h = harness(t);
@@ -167,6 +294,7 @@ for (const code of ['EPERM', 'EINVAL']) {
       assert.equal(fs.lstatSync(chatAuth).isFile(), true);
       assert.equal(fs.readFileSync(chatAuth, 'utf8'), auth);
       assert.equal(h.session._spawning, false);
+      h.spawned.at(-1).emit('close', 0);
     }
   });
 }

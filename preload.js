@@ -34,6 +34,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // pushes this. Payload: { taskKey, children }.
   onStartTask: (cb) => ipcRenderer.on('start-task', (_, payload) => cb(payload)),
   onProjectMenu: (cb) => ipcRenderer.on('project:menu', (_, action) => cb(action)),
+  // (TPT9167) Project ▸ Export… progress/outcome frames from main/project-export.js.
+  onProjectExport: (cb) => ipcRenderer.on('project:export', (_, payload) => cb(payload)),
+  // (TPT9169) Project ▸ Import… (main/project-import.js): main sends `project:import-open`
+  // { importId, archiveName, summary } once the chosen archive passed validation; the setup
+  // modal's import mode then checks the folder, runs the import or releases it on cancel.
+  onProjectImport: (cb) => ipcRenderer.on('project:import-open', (_, payload) => cb(payload)),
+  onProjectImportProgress: (cb) => {
+    const handler = (_, frame) => cb(frame);
+    ipcRenderer.on('project:import-progress', handler);
+    return () => ipcRenderer.removeListener('project:import-progress', handler);
+  },
+  checkImportFolder: (importId, folder) => inv('project:import-folder-check', { importId, folder }),
+  importProjectFromWizard: (detail) => inv('project:import-from-wizard', detail),
+  cancelProjectImport: (importId) => inv('project:import-cancel', importId),
   onForceReauth: (cb) => ipcRenderer.on('force-reauth', (_e) => cb()),
   closeCurrentProject: () => inv('project:close'),
   closeProject: (p) => inv('project:remove', p),
