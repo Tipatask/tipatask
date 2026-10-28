@@ -260,7 +260,13 @@ function sessionMetaRow(s) {
     // (TPT526) A started task chat is listed too, under a task key badge. A pending chat has no
     // taskKey yet; a spec chat carries one but is not a 'taskChat'.
     ...(s.type === 'taskChat' && s.taskKey && !s.chatProjectId
-      ? { taskKey: s.taskKey, title: s._taskChatTask?.title || '' } : {}) };
+      ? { taskKey: s.taskKey, title: s._taskChatTask?.title || '' } : {}),
+    // A started chat says whether a turn is under way and whether the agent has answered at all
+    // (a resumed chat counts), so Start Chat can tell a live draft from one whose first turn
+    // failed or was stopped.
+    ...(s.type === 'taskChat'
+      ? { running: !!(s.proc || s._spawning || s._projectChatStarting),
+        answered: !!s._resumedHistory || (s.messages || []).some(m => m.role === 'assistant') } : {}) };
 }
 
 // Blocks starting a task assigned to someone else. Replaces the guard that used to sit
@@ -5060,6 +5066,12 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     } else if (existing.type === 'specChat' || existing.type === 'taskChat') {
       clearContext(existing, taskId);
     }
+    // A chat gate still open on another socket would send its Start to a session that is no
+    // longer in the map: that socket is told it was replaced, as a reattach tells it.
+    if (existing.pending && isAgentChatId(taskId) && existing.ws && existing.ws !== ws) {
+      _sendIfOpen(existing.ws, { type: 'detached', tabId: existing.tabId, message: 'Another client attached' });
+      try { existing.ws.close(); } catch { /* already closed */ }
+    }
     sessions.delete(sessionKey);
   }
 
@@ -5136,6 +5148,17 @@ function _sendSessionGone(ws, tabId, provider) {
   if (ws && ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify({ type: 'objective-error', tabId, reason: 'session-gone', attempts: 0, provider })); // C1031 shape
   }
+}
+
+// A chat start that awaited (task, project context, model check) checks it still owns its
+// session before going on. One that was ended (kill, terminate) already told its client; one
+// that lost its map entry otherwise answers `session-gone`, so the window never waits on a turn
+// nothing will run.
+function _chatStartLost(session, sessions, sessionKey) {
+  if (session._closed) return true;
+  if (sessions.get(sessionKey) === session) return false;
+  _sendSessionGone(session.ws, session.tabId, session.providerType || config.OBJECTIVE_PROVIDER);
+  return true;
 }
 
 // Gate an objective turn through the circuit breaker + queue.
@@ -5355,9 +5378,10 @@ async function resumeChatFromHistory(session, { sessions, sessionKey, taskId, hi
   if (!nativeFile) {
     return fail(`The saved ${label} session for this chat is no longer available (deleted by the provider, moved, or stored for another checkout). Start a new chat.`, 410);
   }
-  const sel = await applyModelSelection(session, formatSelection(entry.provider, entry.model || ''), { taskId });
+  // A recorded model the catalog does not list (yet) is left to the default-model check below.
+  const sel = await applyModelSelection(session, formatSelection(entry.provider, entry.model || ''), { taskId, ignoreUnknown: true });
   if (sel && sel.error) return fail(`${label} is not available to resume this chat: ${sel.reason || sel.error}`, 409);
-  if (sessions.get(sessionKey) !== session || session._closed) return false;
+  if (_chatStartLost(session, sessions, sessionKey)) return false;
   let applied = currentSelection(session, configForProject(cwd));
   if (applied.providerId !== entry.provider && entry.model && !session.proc && !session._spawning
     && entry.model === getProviderDefaultModel(entry.provider, configForProject(cwd))) {
@@ -6007,7 +6031,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           // A resumed chat sends no seed, so it needs no task list.
           msg.historyId != null ? [] : (backend.getTasksUnfiltered ? backend.getTasksUnfiltered() : backend.getTasks()),
         ]);
-        if (sessions.get(sessionKey) !== session || session._closed) return;
+        if (_chatStartLost(session, sessions, sessionKey)) return;
         if (settings?.id != null && String(settings.id) !== projectId) {
           throw new Error('Project settings do not match the selected project.');
         }
@@ -6041,7 +6065,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           }
           return;
         }
-        if (sessions.get(sessionKey) !== session || session._closed) return;
+        if (_chatStartLost(session, sessions, sessionKey)) return;
         ensureTaskChatSystemPrompt(session);
         const seed = buildTaskChatSeed({ project, tasks, openingMessage: typeof msg.openingMessage === 'string' ? msg.openingMessage : '' });
         session.messages.push({ role: 'user', content: seed, seed: true, timestamp: Date.now() });
@@ -6065,6 +6089,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           // Comment history is context, not a precondition — a failed read starts the chat without it.
           msg.historyId != null ? [] : Promise.resolve().then(() => backend.getTaskComments(taskKey)).catch(() => []),
         ]);
+        if (_chatStartLost(session, sessions, sessionKey)) return;
         if (!task) {
           if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
           if (session.ws && session.ws.readyState === session.ws.OPEN) {
@@ -6097,6 +6122,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           }
           return;
         }
+        if (_chatStartLost(session, sessions, sessionKey)) return;
         ensureTaskChatSystemPrompt(session);
         const seed = buildTaskChatSeed({ task, comments, openingMessage: typeof msg.openingMessage === 'string' ? msg.openingMessage : '' });
         // `seed: true` marks the generated first message so a client can leave it out of the transcript.
@@ -6372,6 +6398,14 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         const { finishFailedTaskChatTurn } = require('./providers/codex-session');
         finishFailedTaskChatTurn(session, session._codexTurn, () => {});
       }
+      if (session.type === 'taskChat') {
+        // The stopped turn is over now, on every provider: the killed process sends nothing more,
+        // so a message sent before it exits must not be refused as a turn still running.
+        session.proc = null;
+        for (const key of ['_turnDeadlineTimer', '_idleWatchdogTimer']) {
+          if (session[key]) { clearTimeout(session[key]); session[key] = null; }
+        }
+      }
       // The aborted turn's user message is dropped — except a task chat's generated seed, which
       // is the chat's context, not something the user typed and can retype.
       const _lastMsg = session.messages[session.messages.length - 1];
@@ -6491,7 +6525,9 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       deleteDeviceSession(taskId, backend);
     }
     if (session.pending) {
-      sessions.delete(sessionKey);
+      // Only its own entry: a newer connect may already have replaced this pending session, and
+      // deleting that one would leave its Start with no session to run in.
+      if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
     } else if (session.type === 'objective' && isCurrentWs && !session.proc) {
       // A socket displaced by "Another client attached" (isCurrentWs false) must not tear down
       // the session its replacement now owns.

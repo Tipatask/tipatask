@@ -19,7 +19,10 @@ function stub(relPath, exportsObj) {
 stub('../claude-session.js', { spawnObjectiveTurn: (s, id) => calls.push(['claude', s, id]), killPrewarm() {}, killColdPrewarm() {} });
 stub('./gemini-session.js', { spawnGeminiTurn: (s, id) => calls.push(['gemini', s, id]) });
 stub('./pi-session.js', { spawnPiTurn: (s, id) => calls.push(['pi', s, id]) });
-stub('./codex-session.js', { spawnCodexTurn: (s, id) => calls.push(['codex', s, id]) });
+stub('./codex-session.js', { spawnCodexTurn: (s, id) => {
+  if (s.spawnThrows) throw new Error(s.spawnThrows);
+  calls.push(['codex', s, id]);
+} });
 
 const { spawnTurn } = require('./dispatch');
 
@@ -171,6 +174,39 @@ test('(TPT538) a chat resumed from history never spawns without its native sessi
   assert.equal(calls.length, 0);
   assert.equal(frames[0].reason, 'history-unavailable');
   assert.equal(frames[0].historyId, 'h1');
+  assert.equal(frames[1].type, 'chat-ready', 'the refused turn is ended for the waiting window');
   session.codexSessionId = 'tid';
   assert.equal(route(session), 'codex', 'with the restored id the turn resumes normally');
+});
+
+// TPT9179 — a provider spawn that throws before it owns a process must still end the turn:
+// nothing else would ever answer the window that is waiting on it.
+test('a provider spawn that throws ends a task chat turn with objective-error and chat-ready', () => {
+  calls.length = 0;
+  const frames = [];
+  const session = {
+    type: 'taskChat', toolProfile: 'taskChat', providerType: 'codex', tabId: 'projectChat:2:abcdef1',
+    spawnThrows: 'argv fixture failed', _spawning: true, messages: [{ role: 'user', content: 'seed', seed: true }],
+    ws: { readyState: 1, send: raw => frames.push(JSON.parse(raw)) },
+  };
+  const original = console.error;
+  console.error = () => {};
+  try { assert.doesNotThrow(() => spawnTurn(session, 'projectChat:2:abcdef1')); } finally { console.error = original; }
+  assert.equal(calls.length, 0);
+  assert.equal(session._spawning, false, 'the failed start no longer counts as a running turn');
+  assert.deepEqual(frames.map(f => f.type), ['objective-error', 'chat-ready']);
+  assert.equal(frames[0].reason, 'spawn-error');
+  assert.equal(frames[0].detail, 'argv fixture failed');
+  assert.equal(frames[0].tabId, 'projectChat:2:abcdef1');
+  assert.equal(frames[1].turnIndex, 0);
+});
+
+test('a failed objective spawn sends objective-error only', () => {
+  const frames = [];
+  const session = { type: 'objective', providerType: 'codex', tabId: 'obj-1', spawnThrows: 'boom',
+    ws: { readyState: 1, send: raw => frames.push(JSON.parse(raw)) } };
+  const original = console.error;
+  console.error = () => {};
+  try { spawnTurn(session, 'obj-1'); } finally { console.error = original; }
+  assert.deepEqual(frames.map(f => [f.type, f.reason]), [['objective-error', 'spawn-error']]);
 });

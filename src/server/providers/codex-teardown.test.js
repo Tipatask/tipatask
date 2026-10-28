@@ -140,6 +140,49 @@ for (const failure of ['capacity', 'process-error', 'exit', 'signal', 'deadline'
   });
 }
 
+// TPT9179 — 'close' waits for every stdio pipe; a descendant of the CLI can keep one open after
+// the CLI exited. The exit alone must still end the turn, after a short grace.
+for (const code of [0, 1]) {
+  test(`Codex task chat ends its turn after an exit (${code}) whose pipes never close`, async t => {
+    const h = harness(t);
+    const frames = taskChat(h);
+    h.codex.spawnCodexTurn(h.session, 'taskChat:TPT1');
+    h.releaseLocalize();
+    await settle();
+    const proc = h.spawned[0];
+    if (code === 0) output(proc, { type: 'item.completed', item: { type: 'agent_message', text: 'Answer' } }, { type: 'turn.completed', usage: {} });
+    proc.exitCode = code;
+    proc.emit('exit', code, null);
+    t.mock.timers.tick(1999);
+    assert.equal(h.session.proc, proc, 'a fresh exit still waits for close to drain stdout');
+    t.mock.timers.tick(1);
+    assert.equal(h.session.proc, null);
+    assert.equal(h.session._spawning, false);
+    assert.equal(h.session._idleWatchdogTimer, null, 'no idle timeout is left to fire later');
+    const ends = () => frames.filter(f => ['objective-error', 'objective-result', 'chat-ready'].includes(f.type)).map(f => f.type);
+    assert.deepEqual(ends(), code === 0 ? ['objective-result', 'chat-ready'] : ['objective-error', 'chat-ready']);
+    if (code === 0) assert.equal(h.session.messages.at(-1).content, 'Answer');
+    else assert.equal(frames.find(f => f.type === 'objective-error').reason, 'exit-code-1');
+    proc.emit('close', code);
+    assert.deepEqual(ends(), code === 0 ? ['objective-result', 'chat-ready'] : ['objective-error', 'chat-ready'], 'the late close settles nothing twice');
+  });
+}
+
+test('Codex task chat: a close right after the exit settles the turn once', async t => {
+  const h = harness(t);
+  const frames = taskChat(h);
+  h.codex.spawnCodexTurn(h.session, 'taskChat:TPT1');
+  h.releaseLocalize();
+  await settle();
+  const proc = h.spawned[0];
+  output(proc, { type: 'item.completed', item: { type: 'agent_message', text: 'Answer' } });
+  proc.emit('exit', 0, null);
+  proc.emit('close', 0);
+  t.mock.timers.tick(5000);
+  assert.equal(frames.filter(f => f.type === 'objective-result').length, 1);
+  assert.equal(frames.filter(f => f.type === 'chat-ready').length, 1);
+});
+
 for (const stage of ['envError', 'spawnError']) {
   test(`Codex task chat releases preparation after ${stage}`, async t => {
     const h = harness(t, { [stage]: true });

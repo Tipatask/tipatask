@@ -256,6 +256,9 @@ function emitPiError(session, taskId, proc, emit, reason, attempts, extraDetail)
   clearPiTimers(session);
   session._aborted = true;
   killPiProc(proc);
+  // The failed turn no longer holds the session: its close returns early, so without this every
+  // later turn, model switch and reconnect would see a turn still running.
+  if (session.proc === proc) session.proc = null;
   // Clean turn buffers
   session.turnBuffer = '';
   session.turnRawSse = '';
@@ -269,6 +272,8 @@ function emitPiError(session, taskId, proc, emit, reason, attempts, extraDetail)
   console.error(`[pi] objective-error task=${taskId} model=${model} reason=${reason}${tail ? ` stderr=${JSON.stringify(detail)}` : ''}`);
   // C1031 — see claude-session.js emitObjectiveError. model/detail name what failed and why.
   emit({ type: 'objective-error', reason, attempts, provider: 'pi', model, detail });
+  // A task/project chat's failed turn is over: chat-ready ends it, as on Claude and Codex.
+  if (session.type === 'taskChat') emit({ type: 'chat-ready', turnIndex: session.messages.length - 1 });
 }
 
 // ── finalizePiTurn ────────────────────────────────────────────────────────────
@@ -725,7 +730,8 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
     }
     clearPiTimers(session);
     console.log(`[pi] proc closed task=${taskId} code=${code}`);
-    if (session._aborted) return;
+    // A stopped turn is over too: release the session so the chat takes its next message.
+    if (session._aborted) { session.proc = null; return; }
     // Died without producing any text — surface it instead of finalizing an empty turn.
     if (code && !session.turnBuffer.trim()) {
       emitPiError(session, taskId, proc, emit, `pi-exit:${code}`, session._retryAttempt || 0);

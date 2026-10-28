@@ -18,6 +18,28 @@ const { listTaskAgentStatuses } = require('../task-agent');
 const { providerSupportsProfile } = require('./tool-profiles');
 const { prepareObjectiveProposalContext } = require('../objective-proposal-status');
 
+// Every turn either reaches a provider or fails visibly: a refused or failed turn sends
+// `objective-error`, and a task/project chat also gets the `chat-ready` that ends its turn, so
+// a waiting window never keeps showing a pending reply.
+function failTurn(session, frame) {
+  if (session.ws?.readyState !== 1) return;
+  session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId, ...frame }));
+  if (session.type === 'taskChat') {
+    session.ws.send(JSON.stringify({ type: 'chat-ready', tabId: session.tabId, turnIndex: (session.messages || []).length - 1 }));
+  }
+}
+
+// A provider spawn that throws before it owns a process (prompt assembly, argv, env) ends the
+// turn here instead of escaping into the WS handler, where nothing would ever answer it.
+function failSpawn(session, taskId, err) {
+  console.error(`[${session.type}] turn spawn failed for task ${taskId}: ${err && err.stack || err}`);
+  session._spawning = false;
+  // The throttle slot an objective turn was granted (C1031 early-return contract).
+  if (session.type === 'objective') require('../objective-throttle').recordAbort(taskId);
+  failTurn(session, { reason: 'spawn-error', provider: session.providerType || config.OBJECTIVE_PROVIDER,
+    detail: String((err && err.message) || err).slice(0, 300) });
+}
+
 /**
  * Provider-agnostic objective-turn entry point.
  * Drop-in replacement for spawnObjectiveTurn(session, taskId) — same signature.
@@ -26,8 +48,7 @@ function spawnTurn(session, taskId) {
   const identity = require('../api-credentials').projectContextIdentity(session.projectPath);
   if (session._agentContextIdentity !== undefined && session._agentContextIdentity !== identity) {
     registry.clearAllProviderSessionIds(session);
-    if (session.ws?.readyState === 1) session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId,
-      reason: 'project-context-changed', status: 409, detail: 'Project or account changed. Start a new chat.' }));
+    failTurn(session, { reason: 'project-context-changed', status: 409, detail: 'Project or account changed. Start a new chat.' });
     return;
   }
   session._agentContextIdentity = identity;
@@ -36,9 +57,8 @@ function spawnTurn(session, taskId) {
   // conversation, so it is refused instead.
   const resumed = session._resumedHistory;
   if (resumed && resumed.provider === (session.providerType || config.OBJECTIVE_PROVIDER) && !providerSessionId(session)) {
-    if (session.ws?.readyState === 1) session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId,
-      reason: 'history-unavailable', status: 410, historyId: resumed.historyId,
-      detail: 'The saved session for this chat is no longer attached. Start a new chat.' }));
+    failTurn(session, { reason: 'history-unavailable', status: 410, historyId: resumed.historyId,
+      detail: 'The saved session for this chat is no longer attached. Start a new chat.' });
     return;
   }
   if (session.type === 'objective' && session.backend) {
@@ -53,10 +73,19 @@ function spawnTurn(session, taskId) {
       if (session._closed || session._aborted || (session._epoch || 0) !== epoch
         || session._proposalContext !== context) return;
       session._spawning = false;
-      return spawnPreparedTurn(session, taskId);
+      return spawnGuarded(session, taskId);
     });
   }
-  return spawnPreparedTurn(session, taskId);
+  return spawnGuarded(session, taskId);
+}
+
+function spawnGuarded(session, taskId) {
+  try {
+    return spawnPreparedTurn(session, taskId);
+  } catch (err) {
+    failSpawn(session, taskId, err);
+    return undefined;
+  }
 }
 
 function spawnPreparedTurn(session, taskId) {
@@ -105,15 +134,24 @@ function clearProviderSessionId(session) {
  *   { changed: true, providerChanged: bool }     — applied
  *   { error: 'provider-unavailable'|'turn-in-progress' } — caller must reject the turn
  *
- * A stale or malformed client value NEVER breaks the chat — it's treated as "keep current."
+ * A stale or malformed client value never breaks an objective chat — it's treated as "keep
+ * current." A task/project chat (tool profile) refuses it with `provider-unavailable` instead,
+ * unless `ignoreUnknown` (a history resume, which checks the recorded model itself).
  */
-async function applyModelSelection(session, raw, { taskId } = {}) {
+async function applyModelSelection(session, raw, { taskId, ignoreUnknown = false } = {}) {
   if (!session || session.type === 'specChat') return { changed: false };
   if (!raw) return { changed: false };
   // C1101 — project-scoped view so a project's saved "Other Model" (PI_MODEL) choice
   // validates instead of being rejected against the global PI_MODELS allowlist.
   const cfg = registry.configForProject(session.projectPath);
   if (!registry.isValidSelection(raw, cfg)) {
+    // A task or project chat runs exactly the model it names: answering from another one would
+    // hide the failure, so the turn is refused and the client shows its own "pick another model"
+    // text. Objective chat keeps its current model, as below.
+    if (session.toolProfile && !ignoreUnknown) {
+      console.warn(`[${session.type}:model] refusing unknown selection "${raw}" for ${taskId}`);
+      return { error: 'provider-unavailable' };
+    }
     console.warn(`[objective:model] ignoring invalid selection "${raw}" for task ${taskId}`);
     return { changed: false };
   }

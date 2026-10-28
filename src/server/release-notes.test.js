@@ -291,6 +291,28 @@ test('resolveReleaseBase: first release, frozen, no tag, version order', (t) => 
   assert.equal(rn.resolveReleaseBase({ src: f.src, ref: 'HEAD', dest: newer.dest, destIsCheckout: true, version: '0.9.3', git }).status, 'skipped-version-order');
 });
 
+test('resolveReleaseBase: regeneration skips the current tag and retains the preceding release base', async (t) => {
+  if (fx.skipUnless(t)) return;
+  const f = buildSrc(t);
+  const d = buildDest(f.git, f.home, { tag: 'v0.9.1', tagMessage: `Previous release\n\nPrivate-Commit: ${f.c0}` });
+  fx.commit(f.git, d.dest, { 'src/a.js': 'current release\n' }, `Current release\n\nPrivate-Commit: ${f.c1}`);
+  f.git(d.dest, ['tag', '-a', 'v0.9.2', '-m', `Current release\n\nPrivate-Commit: ${f.c1}`]);
+  const args = { src: f.src, ref: 'HEAD', dest: d.dest, destIsCheckout: true, version: '0.9.2', git: realGit() };
+  assert.equal(rn.resolveReleaseBase(args).status, 'frozen');
+  const r = rn.resolveReleaseBase({ ...args, regenerate: true });
+  assert.equal(r.status, 'resolved');
+  assert.equal(r.prevTag, 'v0.9.1');
+  assert.equal(r.base, f.c0, 'the current tag marker would lose the earlier board change');
+  const out = [];
+  assert.equal(await rn.main(['resolve', '--src', f.src, '--ref', 'HEAD', '--dest', d.dest,
+    '--dest-is-checkout', '--version', '0.9.2', '--regenerate'], { stdout: s => out.push(s), stderr: () => {} }), 0);
+  assert.ok(out.includes(`base=${f.c0}\n`), 'CLI forwards regeneration to base resolution');
+  const first = buildDest(f.git, f.home, { name: 'first', tag: 'v0.9.2' });
+  assert.equal(rn.resolveReleaseBase({ ...args, dest: first.dest, regenerate: true }).status, 'first-release');
+  const untagged = buildDest(f.git, f.home, { name: 'untagged' });
+  assert.equal(rn.resolveReleaseBase({ ...args, dest: untagged.dest, regenerate: true }).status, 'first-release');
+});
+
 test('resolveReleaseBase: tag annotation trailer beats the commit trailer; commit trailer alone works', (t) => {
   if (fx.skipUnless(t)) return;
   const f = buildSrc(t);
@@ -516,14 +538,177 @@ test('main generate: empty exported range writes a stub without a model call; fi
   assert.ok(prompts[0].includes('first public release'));
   assert.ok(prompts[0].includes('Runs coding agents against a task board'));
   assert.ok(!prompts[0].includes('Commits in this release'));
+  fs.writeFileSync(paths, exported.join('\n'));
+  outLines.length = 0;
+  await rn.main(['generate', '--src', f.src, '--ref', 'HEAD', '--dest', path.join(f.home, 'newdest'), '--stage', stage,
+    '--version', '0.9.3', '--project-root', f.home, '--base-status', 'first-release', '--paths', paths, '--regenerate'], deps);
+  assert.equal(kv().status, 'generated');
+  assert.match(prompts[1], /first public release/);
+  assert.match(prompts[1], /faster board/);
+  assert.match(prompts[1], /Fix notifications/);
+  assert.ok(!prompts[1].includes('private planning only'));
 });
 
 // ---------------------------------------------------------------- website Changelog drafts (TPT9040)
 
 const EN_NOTES = '## Highlights\n\n- **Faster board.** The board renders faster.\n\n## Fixes\n\n- Notifications work again.';
 const UK_NOTES = '## Головне\n\n- **Швидша дошка.** Дошка відображається швидше.\n\n## Виправлення\n\n- Сповіщення знову працюють.';
+const EN_ARTICLE = `## Less waiting, clearer signals
+
+The latest Tipatask update focuses on two familiar parts of everyday task management: getting a useful view of your work and knowing when something needs your attention. A quicker board and restored notifications make this release about the moments between tasks, when you are deciding what to do next or waiting for news about work already underway.
+
+For people who return to the board throughout the day, improved rendering means less time spent waiting to see their tasks. It makes checking the state of a project more immediate, whether you are reviewing priorities at the start of a session or coming back after working elsewhere. The release notes do not claim a particular speed increase, but the focus is on making that routine interaction smoother.
+
+Notifications provide the other part of that picture. With alerts working again, users can receive updates as they happen and use the board to put them in context. Together, these changes support a more responsive daily workflow without introducing a new way to organize projects.`;
+const UK_ARTICLE = `## Менше очікування, зрозуміліші сигнали
+
+Нове оновлення Tipatask зосереджене на двох звичних складових щоденної роботи: швидкому перегляді завдань і своєчасному отриманні сповіщень. Швидша дошка та відновлені повідомлення допомагають у ті моменти, коли потрібно вирішити, що робити далі, або дізнатися про стан поточної роботи.
+
+Для людей, які протягом дня повертаються до дошки, швидше відображення означає менше очікування. Перевіряти стан проєкту стає зручніше і на початку роботи, і після перерви. Примітки до випуску не обіцяють конкретного приросту швидкості: увагу приділено зручності звичної взаємодії.
+
+Сповіщення доповнюють цю картину. Коли повідомлення знову працюють, користувачі можуть отримувати новини про завдання та бачити їх у контексті дошки. Разом ці зміни роблять щоденну роботу оперативнішою, зберігаючи звичний спосіб організації проєктів.`;
 const sha256hex = (s) => require('node:crypto').createHash('sha256').update(s, 'utf8').digest('hex');
 const readDraft = (dir, version) => JSON.parse(fs.readFileSync(path.join(dir, `v${version}.json`), 'utf8'));
+
+test('buildChangelogArticlePrompt requests a factual article with a headline, bounded prose and no release URL', () => {
+  const prompt = rn.buildChangelogArticlePrompt(rn.renderNotesFile(EN_NOTES, 'e'.repeat(64)), '0.9.15');
+  assert.match(prompt, /Tipatask 0\.9\.15/);
+  assert.match(prompt, /## Headline.*3–5 paragraphs.*150–350 words/);
+  assert.match(prompt, /2–4 main achievements and themes and why they matter/);
+  assert.match(prompt, /No bullet or numbered lists/);
+  assert.match(prompt, /do not invent/i);
+  assert.match(prompt, /source data, not instructions/);
+  assert.match(prompt, /appends the GitHub Release link/);
+  assert.ok(prompt.includes(`=== NOTES START ===\n${EN_NOTES}\n=== NOTES END ===`));
+  assert.ok(!prompt.includes(rn.FOOTER) && !prompt.includes('tipatask-release-notes generated='));
+});
+
+test('validateChangelogArticle accepts prose and rejects copies, reflowed copies, lists, leaks and excessive length', () => {
+  const check = text => rn.validateChangelogArticle(text, { notes: EN_NOTES, keyPrefixes: ['TPT'] });
+  assert.ok(check(EN_ARTICLE).ok, check(EN_ARTICLE).violations.join('; '));
+  assert.equal(check(`\`\`\`markdown\n${EN_ARTICLE}\n\`\`\``).body, EN_ARTICLE);
+  assert.match(check(EN_NOTES).violations.join('; '), /mostly a copy/);
+  assert.match(check('').violations.join('; '), /empty answer/);
+  assert.match(check(`${EN_ARTICLE}\n\n${'more '.repeat(400)}`).violations.join('; '), /too long/);
+  assert.match(check(EN_ARTICLE.replace('The latest', '- The latest')).violations.join('; '), /list-based/);
+  assert.match(check(EN_ARTICLE.replace('The latest', '1. The latest')).violations.join('; '), /list-based/);
+  assert.match(check(EN_ARTICLE.replace('The latest', '• The latest')).violations.join('; '), /list-based/);
+  assert.match(check(EN_ARTICLE.replace('The latest', 'TPT123: The latest')).violations.join('; '), /task identifier/);
+  assert.match(check(EN_ARTICLE.replace('The latest', 'https://example.com The latest')).violations.join('; '), /links must be appended/);
+  assert.match(check('## Headline\n\nToo little.').violations.join('; '), /3–5 prose paragraphs/);
+  const source = EN_ARTICLE.split('\n\n').slice(1).map(p => `- **Change.** ${p}`).join('\n');
+  const reflowed = EN_ARTICLE.replace(/\. /g, '.\n').replace('Less waiting, clearer signals', 'A different title');
+  assert.match(rn.validateChangelogArticle(reflowed, { notes: `## Highlights\n${source}` }).violations.join('; '), /mostly a copy/);
+  assert.match(rn.validateChangelogArticle(EN_ARTICLE.replace(/\n\n/g, '\n'), { notes: EN_ARTICLE }).violations.join('; '), /mostly a copy/);
+});
+
+test('appendReleaseLink adds the exact final URL once for both locales', () => {
+  const url = 'https://github.com/Tipatask/tipatask/releases/tag/v0.9.15';
+  for (const body of [EN_ARTICLE, UK_ARTICLE]) {
+    assert.equal(rn.appendReleaseLink(` ${body}\n`, '0.9.15'), `${body}\n\n${url}`);
+    assert.equal(rn.appendReleaseLink(rn.appendReleaseLink(body, '0.9.15'), 'v0.9.15'), `${body}\n\n${url}`);
+  }
+  assert.throws(() => rn.appendReleaseLink(EN_ARTICLE, '../bad'), /invalid release version/);
+});
+
+test('article translation preserves paragraphs and refuses inserted or changed URLs', () => {
+  const check = text => rn.validateTranslation(text, { sourceBody: EN_ARTICLE });
+  assert.ok(check(UK_ARTICLE).ok, check(UK_ARTICLE).violations.join('; '));
+  assert.match(check(UK_ARTICLE.replace('\n\nДля', '\nДля')).violations.join('; '), /same article paragraphs/);
+  assert.match(check(`${UK_ARTICLE}\n\nhttps://example.com/wrong`).violations.join('; '), /URLs must stay unchanged/);
+  const sourceBody = rn.appendReleaseLink(EN_ARTICLE, '0.9.15');
+  const translated = rn.appendReleaseLink(UK_ARTICLE, '0.9.15');
+  assert.ok(rn.validateTranslation(translated, { sourceBody }).ok);
+  assert.match(rn.validateTranslation(translated.replace('/v0.9.15', '/v0.9.16'), { sourceBody }).violations.join('; '), /URLs must stay unchanged/);
+});
+
+test('article failure paths use a templated summary, never raw notes, and retry generation later', async (t) => {
+  for (const generateArticle of [async () => EN_NOTES, async () => '', async () => null, async () => { throw new Error('offline'); }]) {
+    const dir = path.join(scratch(t), 'drafts');
+    const translations = [];
+    const args = { version: '0.9.15', notesText: EN_NOTES, changelogDir: dir, generateArticle,
+      translate: async body => { translations.push(body); return { status: 'failed' }; } };
+    const r = await rn.exportChangelogDraft(args);
+    const a = readDraft(dir, '0.9.15');
+    assert.match(r.message, /using a short templated summary/);
+    assert.equal(a.source.article_fallback, true);
+    assert.notEqual(translations[0], EN_NOTES);
+    assert.equal(a.drafts[0].body, rn.appendReleaseLink(rn.fallbackChangelogArticle(EN_NOTES, '0.9.15'), '0.9.15'));
+    assert.ok(!a.drafts[0].body.includes('The board renders faster.'));
+    assert.ok(rn.validateChangelogArticle(translations[0], { notes: EN_NOTES }).ok);
+    await rn.exportChangelogDraft({ ...args, generateArticle: async () => EN_ARTICLE,
+      translate: async () => ({ status: 'ok', body: UK_ARTICLE }) });
+    assert.equal(readDraft(dir, '0.9.15').source.article_fallback, false);
+    assert.equal(readDraft(dir, '0.9.15').drafts[0].body, rn.appendReleaseLink(EN_ARTICLE, '0.9.15'));
+  }
+});
+
+test('legacy copied drafts are replaced even when the notes hash matches; malformed cached articles and links are repaired', async (t) => {
+  const dir = scratch(t);
+  const file = path.join(dir, 'v0.9.15.json');
+  const legacy = { kind: rn.CHANGELOG_KIND, schema: 1, version: '0.9.15', source: { sha256: sha256hex(EN_NOTES) },
+    drafts: [{ locale: 'en', body: EN_NOTES }, { locale: 'uk', body: UK_NOTES }] };
+  fs.writeFileSync(file, JSON.stringify(legacy));
+  let generated = 0;
+  let translated = 0;
+  const args = { version: '0.9.15', notesText: EN_NOTES, changelogDir: dir,
+    generateArticle: async () => { generated++; return EN_ARTICLE; },
+    translate: async () => { translated++; return { status: 'ok', body: UK_ARTICLE }; } };
+  assert.equal((await rn.exportChangelogDraft({ ...args, dryRun: true })).status, 'would-write');
+  assert.equal(generated + translated, 0);
+  assert.equal((await rn.exportChangelogDraft(args)).status, 'written');
+  assert.equal(readDraft(dir, '0.9.15').drafts[0].body, rn.appendReleaseLink(EN_ARTICLE, '0.9.15'));
+
+  let a = readDraft(dir, '0.9.15');
+  a.drafts[1].body = a.drafts[1].body.replace('/v0.9.15', '/v0.9.16');
+  fs.writeFileSync(file, JSON.stringify(a));
+  await rn.exportChangelogDraft(args);
+  assert.deepEqual([generated, translated], [1, 2], 'a broken translation does not regenerate the English article');
+  assert.ok(readDraft(dir, '0.9.15').drafts[1].body.endsWith('/v0.9.15'));
+
+  a = readDraft(dir, '0.9.15');
+  a.drafts[0].body = rn.appendReleaseLink(EN_NOTES, '0.9.15');
+  fs.writeFileSync(file, JSON.stringify(a));
+  await rn.exportChangelogDraft(args);
+  assert.deepEqual([generated, translated], [2, 3], 'a copied article invalidates both cached locales');
+
+  a = readDraft(dir, '0.9.15');
+  a.source.article_fallback = true;
+  fs.writeFileSync(file, JSON.stringify(a));
+  await rn.exportChangelogDraft(args);
+  assert.deepEqual([generated, translated], [3, 4], 'even a translated fallback must retry generation');
+});
+
+test('changelog-draft article and translation share the selected tool-less runner and separate temporary directories', async (t) => {
+  const dir = scratch(t);
+  const notes = path.join(dir, 'notes.md');
+  fs.writeFileSync(notes, EN_NOTES);
+  const calls = [];
+  const sanitizeEnv = env => env;
+  const oneShot = { stripSensitiveEnv: sanitizeEnv,
+    resolveDefaultSelection: () => ({ providerId: 'claude', model: 'default' }),
+    runOneShotPrompt: async (prompt, opts) => {
+      calls.push({ prompt, opts });
+      assert.ok(fs.existsSync(opts.cwd));
+      return prompt.includes('=== NOTES START ===') ? EN_ARTICLE : UK_ARTICLE;
+    } };
+  assert.equal(await rn.main(['changelog-draft', '--notes', notes, '--version', '0.9.15', '--changelog-dir', path.join(dir, 'drafts'),
+    '--project-root', dir, '--provider', 'codex', '--model', 'chosen-model'], {
+    oneShot, registry: { SELECTABLE_PROVIDERS: ['claude', 'codex'] }, stdout: () => {}, stderr: () => {},
+  }), 0);
+  assert.equal(calls.length, 2);
+  for (const { opts } of calls) {
+    assert.deepEqual(opts.selection, { providerId: 'codex', model: 'chosen-model' });
+    assert.equal(opts.toolless, true);
+    assert.equal(opts.fallbackToClaude, false);
+    assert.equal(opts.sanitizeEnv, sanitizeEnv);
+    assert.equal(opts.projectRoot, dir);
+    assert.ok(!fs.existsSync(opts.cwd), 'temporary model cwd removed');
+  }
+  assert.notEqual(calls[0].opts.cwd, calls[1].opts.cwd);
+  assert.ok(calls[1].prompt.includes(EN_ARTICLE));
+  assert.ok(!calls[1].prompt.includes('https://github.com/'));
+});
 
 test('changelogBodyFromNotes drops the marker and the installer footer; isStubNotes spots the no-changes stub', () => {
   const file = rn.renderNotesFile(EN_NOTES, 'e'.repeat(64));
@@ -593,16 +778,19 @@ test('translateChangelog retries once with the violations, then reports rejected
   assert.equal(r.status, 'failed');
 });
 
-test('exportChangelogDraft: en from the notes, uk translated once per notes version and retried after a failure, nothing for leaks or stubs', async (t) => {
+test('exportChangelogDraft: cached article and translation, retries after a failure, nothing for leaks or stubs', async (t) => {
   const dir = path.join(scratch(t), 'drafts');
   const notes = rn.renderNotesFile(EN_NOTES, 'e'.repeat(64));
   const calls = [];
-  const translate = async (body, version) => { calls.push({ body, version }); return { status: 'ok', body: UK_NOTES, violations: [] }; };
-  const run = (extra = {}) => rn.exportChangelogDraft({ version: '0.9.15', notesText: notes, changelogDir: dir, translate, ...extra });
+  const translate = async (body, version) => { calls.push({ body, version }); return { status: 'ok', body: UK_ARTICLE, violations: [] }; };
+  const articleCalls = [];
+  const generateArticle = async (body, version) => { articleCalls.push({ body, version }); return body.includes('reliably') ? EN_ARTICLE.replace('latest Tipatask', 'latest reliable Tipatask') : EN_ARTICLE; };
+  const run = (extra = {}) => rn.exportChangelogDraft({ version: '0.9.15', notesText: notes, changelogDir: dir, generateArticle, translate, ...extra });
 
   let r = await run({ dryRun: true, translate: async () => { throw new Error('must not translate'); } });
   assert.equal(r.status, 'would-write');
   assert.ok(!fs.existsSync(dir), 'a dry run creates nothing');
+  assert.equal(articleCalls.length, 0);
 
   r = await run();
   assert.equal(r.status, 'written', r.message);
@@ -611,23 +799,27 @@ test('exportChangelogDraft: en from the notes, uk translated once per notes vers
   const a = readDraft(dir, '0.9.15');
   assert.deepEqual([a.kind, a.schema, a.version, a.source.notes_file, a.source.sha256], ['tipatask-changelog-draft', 1, '0.9.15', 'docs/releases/v0.9.15.md', sha256hex(EN_NOTES)]);
   assert.deepEqual(a.drafts.map(d => [d.locale, d.origin, d.title]), [['en', 'release-notes', 'Tipatask 0.9.15'], ['uk', 'machine-translation', 'Tipatask 0.9.15']]);
-  assert.equal(a.drafts[0].body, EN_NOTES, 'the English entry is the notes body itself');
-  assert.equal(a.drafts[1].body, UK_NOTES);
+  assert.equal(a.drafts[0].body, rn.appendReleaseLink(EN_ARTICLE, '0.9.15'));
+  assert.equal(a.drafts[1].body, rn.appendReleaseLink(UK_ARTICLE, '0.9.15'));
+  assert.deepEqual(articleCalls, [{ body: EN_NOTES, version: '0.9.15' }]);
   assert.ok(!JSON.stringify(a).includes('tipatask-release-notes') && !JSON.stringify(a).includes('attached below'), 'no marker, no installer footer');
   assert.ok(!Object.keys(a).some(k => /publish|status/.test(k)) && a.drafts.every(d => !Object.keys(d).some(k => /publish|status/.test(k))), 'no publication state');
-  assert.deepEqual(calls, [{ body: EN_NOTES, version: '0.9.15' }]);
+  assert.deepEqual(calls, [{ body: EN_ARTICLE, version: '0.9.15' }]);
   assert.deepEqual(fs.readdirSync(dir), ['v0.9.15.json'], 'no temp file left');
 
   const before = fs.statSync(r.file).mtimeMs;
   r = await run();
   assert.equal(r.status, 'up-to-date');
   assert.equal(calls.length, 1, 'unchanged notes reuse the translation');
+  assert.equal(articleCalls.length, 1, 'unchanged notes reuse the article');
+  assert.equal((await run({ dryRun: true })).status, 'up-to-date');
   assert.equal(fs.statSync(r.file).mtimeMs, before);
 
   r = await run({ notesText: notes.replace('work again', 'work again, reliably') });
   assert.equal(r.status, 'written');
   assert.equal(calls.length, 2);
-  assert.ok(readDraft(dir, '0.9.15').drafts[0].body.includes('reliably'));
+  assert.ok(readDraft(dir, '0.9.15').drafts[0].body.includes('reliable'));
+  assert.equal(articleCalls.length, 2);
 
   r = await run({ translate: async () => ({ status: 'failed', message: 'timed out', violations: [] }) });
   assert.equal(r.status, 'written-partial');
@@ -652,6 +844,7 @@ test('exportChangelogDraft: en from the notes, uk translated once per notes vers
   assert.equal(r.status, 'skipped');
   assert.ok(!fs.existsSync(path.join(dir, 'v0.9.16.json')));
   assert.equal(calls.length, 3);
+  assert.equal(articleCalls.length, 3, 'only the failed translation is retried for a cached article');
 });
 
 test('main generate --changelog-dir: a draft only from usable notes; dry runs never write or call the model; a draft crash keeps the notes status', async (t) => {
@@ -672,7 +865,7 @@ test('main generate --changelog-dir: a draft only from usable notes; dry runs ne
     oneShot: { resolveDefaultSelection: () => ({ providerId: 'claude', model: 'm' }), stripSensitiveEnv: e => e },
     registry: { SELECTABLE_PROVIDERS: ['claude', 'codex', 'gemini', 'pi'] },
     fetchComments: async () => ({ status: 404, body: {} }),
-    runPrompt: async (p) => { prompts.push(p); return p.includes('=== SOURCE START ===') ? UK_NOTES : notesReply; },
+    runPrompt: async (p) => { prompts.push(p); return p.includes('=== SOURCE START ===') ? UK_ARTICLE : p.includes('=== NOTES START ===') ? EN_ARTICLE : notesReply; },
   };
   const common = ['generate', '--src', f.src, '--ref', 'HEAD', '--dest', d.dest, '--stage', stage, '--version', '0.9.3', '--project-root', f.home,
     '--base-status', 'resolved', '--base', f.c0, '--prev-tag', 'v0.9.2', '--paths', paths];
@@ -701,10 +894,11 @@ test('main generate --changelog-dir: a draft only from usable notes; dry runs ne
   assert.equal(r.changelog, 'written', r.changelog_message);
   assert.equal(r.changelog_locales, 'en,uk');
   assert.equal(r.changelog_file, path.join(drafts, 'v0.9.3.json'));
-  assert.equal(prompts.length, 2, 'the notes, then the translation');
+  assert.equal(prompts.length, 3, 'the notes, then the article, then its translation');
   const staged = fs.readFileSync(path.join(stage, 'docs/releases/v0.9.3.md'), 'utf8');
-  assert.equal(readDraft(drafts, '0.9.3').drafts[0].body, rn.changelogBodyFromNotes(staged));
-  assert.equal(readDraft(drafts, '0.9.3').drafts[0].body, EN_NOTES);
+  assert.equal(readDraft(drafts, '0.9.3').drafts[0].body, rn.appendReleaseLink(EN_ARTICLE, '0.9.3'));
+  assert.ok(prompts[1].includes(EN_NOTES));
+  assert.ok(prompts[2].includes(EN_ARTICLE) && !prompts[2].includes('https://github.com/'));
 
   fs.mkdirSync(path.join(d.dest, 'docs/releases'), { recursive: true });
   fs.writeFileSync(path.join(d.dest, 'docs/releases/v0.9.3.md'), staged);
@@ -712,21 +906,21 @@ test('main generate --changelog-dir: a draft only from usable notes; dry runs ne
   r = await run(['--changelog-dir', drafts]);
   assert.equal(r.status, 'up-to-date');
   assert.equal(r.changelog, 'up-to-date');
-  assert.equal(prompts.length, 2);
+  assert.equal(prompts.length, 3);
 
   const fresh = path.join(f.home, 'fresh-drafts');
   r = await run(['--dry-run', '--changelog-dir', fresh]);
   assert.equal(r.status, 'up-to-date');
   assert.equal(r.changelog, 'would-write');
-  assert.equal(prompts.length, 2);
+  assert.equal(prompts.length, 3);
   assert.ok(!fs.existsSync(fresh));
 
   fs.writeFileSync(path.join(d.dest, 'docs/releases/v0.9.3.md'), staged.replace('work again', 'work again, reliably'));
   r = await run(['--changelog-dir', drafts]);
   assert.equal(r.status, 'kept-edited');
   assert.equal(r.changelog, 'written');
-  assert.equal(prompts.length, 3);
-  assert.ok(readDraft(drafts, '0.9.3').drafts[0].body.includes('reliably'));
+  assert.equal(prompts.length, 5);
+  assert.ok(prompts[3].includes('reliably'), 'edited notes regenerate the article');
 
   const g = realGit();
   r = await run(['--changelog-dir', drafts], { ...deps, git: (cwd, a, o) => { if (a[0] === 'show') throw new Error('boom'); return g(cwd, a, o); } });
@@ -756,7 +950,7 @@ test('main generate --changelog-dir: the previous release and a frozen version d
     stdout: (s) => outLines.push(s), stderr: () => {},
     oneShot: { resolveDefaultSelection: () => ({ providerId: 'claude', model: 'm' }), stripSensitiveEnv: e => e },
     registry: { SELECTABLE_PROVIDERS: ['claude'] },
-    runPrompt: async (p) => { prompts.push(p); return UK_NOTES; },
+    runPrompt: async (p) => { prompts.push(p); return p.includes('=== NOTES START ===') ? EN_ARTICLE : UK_ARTICLE; },
   };
   const base = ['generate', '--src', home, '--ref', 'HEAD', '--dest', dest, '--stage', path.join(home, 'stage'), '--project-root', home, '--changelog-dir', drafts];
   const run = async (extra) => { outLines.length = 0; assert.equal(await rn.main([...base, ...extra], deps), 0); return kv(); };
@@ -772,22 +966,22 @@ test('main generate --changelog-dir: the previous release and a frozen version d
 
   r = await run(['--version', '0.9.4', '--base-status', 'skipped-unresolved-base', '--prev-tag', 'v0.9.2']);
   assert.equal(r.changelog_prev, 'written', r.changelog_prev_message);
-  assert.equal(readDraft(drafts, '0.9.2').drafts[0].body, EN_NOTES);
+  assert.equal(readDraft(drafts, '0.9.2').drafts[0].body, rn.appendReleaseLink(EN_ARTICLE, '0.9.2'));
   assert.deepEqual(fs.readdirSync(drafts).sort(), ['v0.9.1.json', 'v0.9.2.json'], 'the untagged v0.9.3 draft goes; older ones stay');
-  assert.equal(prompts.length, 1);
+  assert.equal(prompts.length, 2);
 
   r = await run(['--version', '0.9.2', '--base-status', 'frozen', '--prev-tag', 'v0.9.2']);
   assert.equal(r.status, 'frozen');
   assert.equal(r.changelog, 'up-to-date', r.changelog_message);
   assert.equal(r.changelog_prev, undefined, 'the frozen version is not drafted twice');
-  assert.equal(prompts.length, 1);
+  assert.equal(prompts.length, 2);
 
   r = await run(['--version', '0.9.5', '--base-status', 'frozen', '--prev-tag', 'v0.9.5']);
   assert.equal(r.changelog, 'skipped');
   assert.match(r.changelog_message, /the v0\.9\.5 tag carries no docs\/releases\/v0\.9\.5\.md/);
 });
 
-test('changelog-draft rebuilds one draft from a notes file; a provider problem only drops the Ukrainian entry', async (t) => {
+test('changelog-draft rebuilds an article from notes; a provider problem uses a summary and drops Ukrainian', async (t) => {
   const dir = scratch(t);
   const notesFile = path.join(dir, 'v0.9.5.md');
   fs.writeFileSync(notesFile, rn.renderNotesFile(EN_NOTES, 'e'.repeat(64)));
@@ -797,13 +991,13 @@ test('changelog-draft rebuilds one draft from a notes file; a provider problem o
     stdout: (s) => outLines.push(s), stderr: () => {},
     oneShot: { resolveDefaultSelection: () => ({ providerId: 'claude', model: 'm' }), stripSensitiveEnv: e => e },
     registry: { SELECTABLE_PROVIDERS: ['claude'] },
-    runPrompt: async () => UK_NOTES,
+    runPrompt: async p => p.includes('=== NOTES START ===') ? EN_ARTICLE : UK_ARTICLE,
   };
   const drafts = path.join(dir, 'drafts');
   assert.equal(await rn.main(['changelog-draft', '--notes', notesFile, '--version', 'v0.9.5', '--changelog-dir', drafts, '--project-root', dir], deps), 0);
   let r = kv();
   assert.equal(r.changelog, 'written', r.changelog_message);
-  assert.equal(readDraft(drafts, '0.9.5').drafts[1].body, UK_NOTES);
+  assert.equal(readDraft(drafts, '0.9.5').drafts[1].body, rn.appendReleaseLink(UK_ARTICLE, '0.9.5'));
   outLines.length = 0;
   assert.equal(await rn.main(['changelog-draft', '--notes', path.join(dir, 'missing.md'), '--version', '0.9.5', '--changelog-dir', drafts], deps), 1);
   assert.equal(kv().changelog, 'failed');
@@ -815,4 +1009,84 @@ test('changelog-draft rebuilds one draft from a notes file; a provider problem o
   assert.equal(r.changelog, 'written-partial');
   assert.match(r.changelog_message, /unknown provider "nope"/);
   assert.deepEqual(readDraft(drafts, '0.9.6').drafts.map(x => x.locale), ['en']);
+});
+
+test('real exporter --no-version-bump rewrites tagged and edited notes for the whole release, then regenerates the article', (t) => {
+  if (fx.skipUnless(t)) return;
+  const exporter = path.resolve(__dirname, '../../../../../export-task-app.sh');
+  if (!fs.existsSync(exporter)) { t.skip('root exporter is not shipped in the public Task App checkout'); return; }
+  const { execFileSync } = require('node:child_process');
+  const home = scratch(t, 'rn-export-');
+  const git = fx.makeGit(home);
+  const src = path.join(home, 'src');
+  const dest = path.join(home, 'dest');
+  const drafts = path.join(home, 'drafts');
+  const promptsFile = path.join(home, 'prompts.jsonl');
+  const generator = require.resolve('../../scripts/release-notes');
+  const manifest = { name: 'tipatask', version: '0.9.2', license: 'Apache-2.0', repository: 'Tipatask/tipatask', engines: { node: '>=22.19.0' } };
+  const manifestText = JSON.stringify(manifest, null, 2);
+  // The real generator runs in a child process; only the model and API responses are fake.
+  const wrapper = `const fs = require('node:fs');
+const rn = require(${JSON.stringify(generator)});
+rn.main(process.argv.slice(2), {
+  oneShot: { resolveDefaultSelection: () => ({ providerId: 'claude', model: 'fixture' }) },
+  registry: { SELECTABLE_PROVIDERS: ['claude'] },
+  fetchComments: async () => ({ status: 404, body: {} }),
+  runPrompt: async prompt => {
+    fs.appendFileSync(process.env.RELEASE_NOTES_PROBE_PROMPTS, JSON.stringify(prompt) + '\\n');
+    return prompt.includes('=== NOTES START ===') ? ${JSON.stringify(EN_ARTICLE)}
+      : prompt.includes('=== SOURCE START ===') ? ${JSON.stringify(UK_ARTICLE)} : ${JSON.stringify(EN_NOTES)};
+  },
+}).then(code => { process.exitCode = code; });\n`;
+  fx.initRepo(git, src, { files: {
+    'package.json': manifestText, 'package-lock.json': JSON.stringify({ ...manifest, lockfileVersion: 3, packages: { '': manifest } }, null, 2),
+    'scripts/release-notes.js': wrapper,
+    'scripts/check-node-version.js': fs.readFileSync(path.join(__dirname, '../../scripts/check-node-version.js')),
+    'LICENSE': 'Apache License\n', 'NOTICE': 'Anton Matiienko and Apppixies\n', 'RELEASING.md': 'Release procedure\n',
+    'docs/social-preview.jpg': 'fixture', '.github/workflows/test.yml': 'name: test\n', '.github/workflows/build.yml': 'name: build\n',
+    'src/board.js': 'initial\n',
+  } });
+  const base = git(src, ['rev-parse', 'HEAD']);
+  const earlier = fx.commit(git, src, { 'src/board.js': 'faster\n' }, 'Speed up board rendering');
+  fx.initRepo(git, dest, { files: { 'package.json': manifestText } });
+  git(dest, ['tag', '-a', 'v0.9.1', '-m', `Previous release\n\nPrivate-Commit: ${base}`]);
+  const oldNotes = '## Highlights\n\n- Faster board rendering.\n';
+  fx.commit(git, dest, { 'docs/releases/v0.9.2.md': oldNotes }, `Current release\n\nPrivate-Commit: ${earlier}`);
+  git(dest, ['tag', '-a', 'v0.9.2', '-m', `Current release\n\nPrivate-Commit: ${earlier}`]);
+  const tagged = git(dest, ['rev-parse', 'refs/tags/v0.9.2']);
+  fx.commit(git, src, { 'src/notifications.js': 'fixed\n' }, 'Restore notification delivery');
+  const editedNotes = oldNotes + '\nHand-edited wording.\n';
+  fs.writeFileSync(path.join(dest, 'docs/releases/v0.9.2.md'), editedNotes);
+  const env = { ...fx.fixtureEnv(home), PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH}`,
+    npm_config_update_notifier: 'false', CHANGELOG_DRAFTS_DIR: drafts, RELEASE_NOTES_PROBE_PROMPTS: promptsFile };
+  const run = (...flags) => execFileSync('bash', [exporter, '--src', src, '--dest', dest, '--no-version-bump', ...flags],
+    { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000 });
+
+  assert.match(run('--check-only'), /would regenerate/);
+  assert.ok(!fs.existsSync(promptsFile) && !fs.existsSync(drafts));
+  assert.equal(fs.readFileSync(path.join(dest, 'docs/releases/v0.9.2.md'), 'utf8'), editedNotes);
+
+  assert.match(run(), /Release notes: regenerated/);
+  const prompts = fs.readFileSync(promptsFile, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(prompts.length, 3);
+  assert.match(prompts[0], /previous public release was v0\.9\.1/);
+  assert.match(prompts[0], /Speed up board rendering/);
+  assert.match(prompts[0], /Restore notification delivery/);
+  assert.ok(prompts[1].includes(EN_NOTES));
+  assert.ok(prompts[2].includes(EN_ARTICLE));
+  assert.equal(rn.changelogBodyFromNotes(fs.readFileSync(path.join(dest, 'docs/releases/v0.9.2.md'), 'utf8')), EN_NOTES);
+  assert.equal(readDraft(drafts, '0.9.2').drafts[0].body, rn.appendReleaseLink(EN_ARTICLE, '0.9.2'));
+  assert.equal(readDraft(drafts, '0.9.2').drafts[1].body, rn.appendReleaseLink(UK_ARTICLE, '0.9.2'));
+  assert.equal(git(dest, ['rev-parse', 'refs/tags/v0.9.2']), tagged, 'export does not move tags');
+  assert.equal(fs.readFileSync(path.join(src, 'package.json'), 'utf8'), manifestText, 'source version untouched');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dest, 'package.json'), 'utf8')).version, '0.9.2');
+
+  assert.match(run(), /Release notes: regenerated/);
+  assert.equal(fs.readFileSync(promptsFile, 'utf8').trim().split('\n').length, 6,
+    'explicit same-version refresh regenerates notes and article even when their output is unchanged');
+  run('--no-notes');
+  assert.equal(fs.readFileSync(promptsFile, 'utf8').trim().split('\n').length, 6, '--no-notes still opts out');
+  fs.writeFileSync(path.join(dest, 'src/board.js'), 'unrelated public edit\n');
+  assert.throws(() => run(), /changes this script did not make/);
+  assert.equal(fs.readFileSync(promptsFile, 'utf8').trim().split('\n').length, 6, 'unrelated edits stop the export before model calls');
 });

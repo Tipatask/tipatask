@@ -30,6 +30,8 @@ const CODEX_TOOL_FENCE =
 
 const MAX_IMAGE_ATTACH = 8;
 const IMAGE_ATTACH_RE = /@(\S+\.(?:png|jpe?g|gif|webp|svg))/gi;
+// How long an exited CLI may keep its stdio pipes open before the exit alone ends the turn.
+const CODEX_EXIT_GRACE_MS = 2000;
 
 function resolveCodexModel(session) {
   if (!session || session.type === 'specChat') return config.CODEX_MODEL;
@@ -568,7 +570,7 @@ function spawnCodexTurn(session, taskId) {
       if (msg) console.warn(`[codex:stderr] task=${taskId}: ${msg.slice(0, 200)}`);
     });
 
-    proc.on('close', (closeCode) => {
+    const procEnded = (closeCode) => {
       if (session.proc !== proc) return;
       if (config.OBJECTIVE_TIMING_ENABLED) session.timingMilestones.procCloseAt = Date.now();
       clearCodexTimers(session);
@@ -584,6 +586,19 @@ function spawnCodexTurn(session, taskId) {
         session.proc = null;
       }
       finalizeCodexTurn(session, taskId, closeCode, emit, resultUsage);
+    };
+    // 'close' waits for every stdio pipe to close. Something the CLI started can keep one open
+    // after the CLI itself exited, and the turn would then wait for the idle watchdog and end as a
+    // timeout: once the exit is CODEX_EXIT_GRACE_MS old, it ends the turn the way 'close' does.
+    let exitGrace = null;
+    proc.on('exit', (exitCode) => {
+      if (session.proc !== proc) return;
+      exitGrace = setTimeout(() => procEnded(exitCode), CODEX_EXIT_GRACE_MS);
+      exitGrace.unref?.();
+    });
+    proc.on('close', (closeCode) => {
+      clearTimeout(exitGrace);
+      procEnded(closeCode);
     });
 
     proc.on('error', (err) => {

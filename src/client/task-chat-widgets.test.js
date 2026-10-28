@@ -1128,6 +1128,81 @@ test('(TPT469) Start Chat reuses the untouched draft; a named chat sends the nex
   assert.equal(h.$('.task-chat-title-text').textContent, 'Which tasks block the release?');
 });
 
+// TPT9179 — a draft whose first turn failed or was stopped never traps Start Chat: the pending
+// reply clears, and the next Start Chat ends that draft and opens a new chat that starts and sends.
+for (const how of ['failed', 'stopped']) {
+  test(`Start Chat after a ${how} first turn ends that draft and opens a new chat that starts and sends`, async (t) => {
+    const h = harness(t);
+    const ended = [];
+    h.env.terminateTaskSession = async (id, opts) => { ended.push([id, opts.timeoutMs]); return { ok: true }; };
+    h.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '2', projectName: 'Tipatask' } }) });
+    await h.env.openProjectChat();
+    const draftId = h.sockets[0].url.split('taskId=')[1];
+    h.feed({ type: 'config', objectiveProviders: PROVIDERS });
+    click(h.$('.task-chat-start-go'));
+    assert.ok(h.$('.task-chat-msg--streaming .chat-typing-indicator'), 'the pending reply shows while the turn runs');
+    if (how === 'failed') {
+      h.feed({ type: 'objective-error', reason: 'codex:The model is not supported', chatContinues: true });
+      h.feed({ type: 'chat-ready' });
+      assert.match(h.$('.task-chat-msg--error').textContent, /codex:The model is not supported/, 'the error text is shown');
+    } else {
+      click(h.$('.task-chat-stop'));
+      assert.equal(h.sent.at(-1).type, 'abort');
+      h.feed({ type: 'generation-aborted' });
+    }
+    assert.equal(h.$('.task-chat-msg--streaming'), null, 'no pending reply is left behind');
+    assert.equal(h.$('.task-chat-stop').hidden, true);
+    // GET /api/sessions: a started draft that is idle and never answered.
+    h.env.state.sessionMeta = new Map([[draftId, { type: 'taskChat', chatProjectId: '2', title: '', running: false, answered: false, startedAt: 1 }]]);
+    h.env.close();
+    await h.env.openProjectChat();
+    assert.deepEqual(ended, [[draftId, 5000]], 'the failed draft is ended — no left-menu row could end it');
+    const nextId = h.sockets.at(-1).url.split('taskId=')[1];
+    assert.notEqual(nextId, draftId, 'Start Chat opens a new chat');
+    assert.match(nextId, /^projectChat:2:[a-z0-9]{6,32}$/);
+    h.feed({ type: 'config', objectiveProviders: PROVIDERS });
+    assert.equal(h.$('.task-chat-start').hidden, false, 'the new chat waits at its gate');
+    h.sent.length = 0;
+    click(h.$('.task-chat-start-go'));
+    assert.deepEqual(h.sent, [{ type: 'start-project-chat', model: 'claude:opus' }]);
+    h.feed({ type: 'data', data: 'Hello.' });
+    h.feed({ type: 'chat-ready' });
+    h.sent.length = 0;
+    h.$('.task-chat-input').value = 'Which tasks block the release?';
+    h.env.sendMessage();
+    assert.deepEqual(h.sent, [{ type: 'task-chat-message', content: 'Which tasks block the release?', model: 'claude:opus' }]);
+    h.env.close();
+    h.env.state.sessionMeta = new Map([[nextId, { type: 'taskChat', chatProjectId: '2', title: '', running: true, answered: true, startedAt: 2 }]]);
+    await h.env.openProjectChat();
+    assert.equal(h.sockets.at(-1).url.split('taskId=')[1], nextId, 'a draft that answered is reused as before');
+    assert.equal(ended.length, 1);
+  });
+}
+
+test('Start Chat reattaches a draft whose first turn is still running', async (t) => {
+  const h = harness(t);
+  const ended = [];
+  h.env.terminateTaskSession = async (id) => { ended.push(id); return { ok: true }; };
+  h.env.fetch = async () => ({ ok: true, json: async () => ({ config: { API_PROJECT_ID: '2' } }) });
+  await h.env.openProjectChat();
+  const draftId = h.sockets[0].url.split('taskId=')[1];
+  h.env.close();
+  h.env.state.sessionMeta = new Map([[draftId, { type: 'taskChat', chatProjectId: '2', title: '', running: true, answered: false, startedAt: 1 }]]);
+  await h.env.openProjectChat();
+  assert.equal(h.sockets[1].url, h.sockets[0].url, 'the greeting is still on its way: same chat');
+  assert.deepEqual(ended, []);
+  h.env.close();
+  // Another window's failed draft is skipped, never ended from here.
+  h.env.state.sessionMeta = new Map([
+    [draftId, { type: 'taskChat', chatProjectId: '2', title: 'Named now', running: false, answered: true, startedAt: 1 }],
+    ['projectChat:2:other01', { type: 'taskChat', chatProjectId: '2', title: '', running: false, answered: false, startedAt: 5 }],
+  ]);
+  await h.env.openProjectChat();
+  assert.doesNotMatch(h.sockets[2].url, /other01/);
+  assert.notEqual(h.sockets[2].url, h.sockets[0].url, 'a named chat is opened only from its row');
+  assert.deepEqual(ended, []);
+});
+
 test('(TPT469) Start Chat picks up an untitled chat the server holds; a row of another project opens nothing', async (t) => {
   const h = harness(t);
   h.env.state.sessionMeta = new Map([

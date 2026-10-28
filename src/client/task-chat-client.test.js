@@ -167,8 +167,9 @@ test('task-chat.js: Cancel at the gate only closes — it never kills or starts'
   const cancel = taskChat.slice(taskChat.indexOf("querySelector('.task-chat-start-cancel').addEventListener('click'"), taskChat.indexOf("querySelector('.task-chat-start-go').addEventListener('click', beginChat)"));
   assert.match(cancel, /if \(embedded && embedded\.onOpenTask && chat\) embedded\.onOpenTask\(chat\.key\);\s*else close\(\);/);
   assert.doesNotMatch(cancel, /wsSend|KILL|START_/);
-  // The server drops a still-pending session when its socket closes, so nothing was spawned.
-  assert.match(wsHandlers, /if \(session\.pending\) \{\s*sessions\.delete\(sessionKey\);/);
+  // The server drops a still-pending session when its socket closes, so nothing was spawned —
+  // only its own map entry, never a newer connect's replacement.
+  assert.match(wsHandlers, /if \(session\.pending\) \{[^}]*?if \(sessions\.get\(sessionKey\) === session\) sessions\.delete\(sessionKey\);/);
 });
 
 test('ws-client: start-project-chat matches the string the server handles', () => {

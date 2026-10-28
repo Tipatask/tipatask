@@ -41,7 +41,7 @@ test.after(() => { for (const root of historyRoots) fs.rmSync(root, { recursive:
 
 // `readConversation`: stub for the transcript read-back (default: an empty conversation);
 // `true` uses the real parser on whatever file `locateNativeSession` names.
-function harness({ provider = 'claude', applyModelSelection, locateNativeSession, readConversation } = {}) {
+function harness({ provider = 'claude', applyModelSelection, locateNativeSession, readConversation, claude = {} } = {}) {
   const calls = [];
   const historyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-chat-history-'));
   historyRoots.push(historyRoot);
@@ -55,6 +55,7 @@ function harness({ provider = 'claude', applyModelSelection, locateNativeSession
     './claude-session': spyModule(calls, 'claude', {
       startSleepWatchdog() {},
       objectiveCacheActivity: () => ({}),
+      ...claude,
     }),
     './objective-throttle': spyModule(calls, 'throttle', {
       getStatus: () => ({ active: 0, pending: 0 }),
@@ -324,6 +325,89 @@ test('reconnect during project context fetch retains the pending Start and chose
   assert.equal(starting.messages.length, 1);
   assert.deepEqual(selected, ['codex:gpt-6']);
   assert.equal(h.named('dispatch.spawnTurn').length, 1);
+});
+
+// TPT9179 — a chat window must never wait on a Start that nothing will answer.
+test('a replaced pending chat socket is detached, and its late close keeps the newer session', async () => {
+  const h = harness();
+  const sessions = new Map();
+  const backend = projectBackend('2', 'Alpha');
+  const id = 'projectChat:2:dddddd4';
+  const key = `${id}\0/proj/a`;
+  const older = await connect(h, sessions, backend, id, '/proj/a');
+  const newer = await connect(h, sessions, backend, id, '/proj/a');
+  const session = sessions.get(key);
+  assert.equal(session.ws, newer);
+  assert.equal(framesOf(older, 'detached').length, 1, 'the older gate learns it was replaced');
+  assert.equal(older.closed, true);
+  older.emit('close');
+  assert.equal(sessions.get(key), session, 'the older socket closing late leaves the newer session in place');
+  await send(newer, { type: 'start-project-chat' });
+  assert.equal(h.named('dispatch.spawnTurn').length, 1);
+  assert.equal(framesOf(newer, 'objective-error').length, 0);
+});
+
+test('a project Start whose session left the map while loading answers session-gone; a killed one stays quiet', async () => {
+  for (const how of ['displaced', 'killed']) {
+    // One shared promise: the connect-time KB sync reads project settings through the same backend.
+    let resolveSettings;
+    const settings = new Promise(resolve => { resolveSettings = resolve; });
+    // The teardown a kill runs closes the session, as claude-session.js does.
+    const h = harness({ claude: { teardownObjectiveSession: (session) => { session._closed = true; } } });
+    const sessions = new Map();
+    const backend = projectBackend('2', 'Alpha');
+    backend.getProjectSettings = () => settings;
+    const ws = await connect(h, sessions, backend, 'projectChat:2', '/proj/a');
+    ws.emit('message', JSON.stringify({ type: 'start-project-chat', model: 'codex:gpt-6' }));
+    await flush();
+    if (how === 'displaced') sessions.delete('projectChat:2\0/proj/a');
+    else await send(ws, { type: 'kill' });
+    resolveSettings({ id: '2', name: 'Alpha' });
+    await flush();
+    assert.deepEqual(framesOf(ws, 'objective-error').map(f => f.reason), how === 'displaced' ? ['session-gone'] : [], how);
+    assert.equal(framesOf(ws, 'chat-ended').length, how === 'killed' ? 1 : 0, how);
+    assert.equal(h.named('dispatch.spawnTurn').length, 0, how);
+  }
+});
+
+test('a task Start whose session left the map while the task loaded answers session-gone and spawns nothing', async () => {
+  let releaseTask;
+  const h = harness();
+  const sessions = new Map();
+  const backend = fakeBackend({ getTask: () => new Promise(resolve => { releaseTask = resolve; }) });
+  const ws = await connect(h, sessions, backend);
+  ws.emit('message', JSON.stringify({ type: 'start-task-chat' }));
+  await flush();
+  sessions.delete(CHAT_ID);
+  releaseTask(TASK);
+  await flush();
+  assert.deepEqual(framesOf(ws, 'objective-error').map(f => f.reason), ['session-gone']);
+  assert.equal(h.named('dispatch.spawnTurn').length, 0);
+});
+
+test('a started chat row says whether a turn runs and whether the agent has answered', async () => {
+  let resolveSettings;
+  const settings = new Promise(resolve => { resolveSettings = resolve; });
+  const h = harness();
+  const sessions = new Map();
+  const backend = projectBackend('2', 'Alpha');
+  backend.getProjectSettings = () => settings;
+  const id = 'projectChat:2:eeeeee5';
+  const ws = await connect(h, sessions, backend, id, '/proj/a');
+  const session = sessions.get(`${id}\0/proj/a`);
+  assert.equal('running' in h.exports.sessionMetaRow(session), false, 'a pending chat reports nothing yet');
+  ws.emit('message', JSON.stringify({ type: 'start-project-chat' }));
+  await flush();
+  assert.equal(h.exports.sessionMetaRow(session).running, true, 'the start itself counts as running');
+  resolveSettings({ id: '2', name: 'Alpha' });
+  await flush();
+  // The dispatcher is a spy: no process, so the first turn is over without a reply — a failed draft.
+  const row = h.exports.sessionMetaRow(session);
+  assert.deepEqual([row.running, row.answered, row.title], [false, false, '']);
+  session.messages.push({ role: 'assistant', content: 'Hi' });
+  assert.equal(h.exports.sessionMetaRow(session).answered, true);
+  session.proc = {};
+  assert.equal(h.exports.sessionMetaRow(session).running, true);
 });
 
 test('start-task-chat seeds task JSON plus comments and spawns through the dispatcher', async () => {

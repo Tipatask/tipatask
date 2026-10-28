@@ -21,8 +21,20 @@
 // It talks to whatever API .tipatask/config.json points at — usually production — and spends
 // four real model turns per provider. Hence the explicit --yes.
 //
-// Usage: npm run probe:task-chat -- --yes [--provider claude,codex,pi] [--keep] [--verbose]
-// Exit codes: 0 = every provider that ran passed all five checks · 1 = a check failed ·
+// --project-chat instead runs a project chat per provider, started as `start-project-chat` starts
+// one (model selection, project seed, spawnTurn), and checks that every turn ends or fails
+// visibly — the window must never be left waiting:
+//   1. REPLY ENDS     — the opening turn streams a reply and ends with `chat-ready`.
+//   2. BAD MODEL      — a model id the provider rejects (forced past the selection check) ends
+//                       its turn with `objective-error` then `chat-ready`, within seconds, and
+//                       leaves no turn running in the session.
+//   3. SELECTION      — the same unknown id sent as the chat's model is refused before any spawn.
+// It reads the project and its task list, creates no task, and spends two model turns per
+// provider. --model picks the model the first check runs (e.g. --provider codex --model
+// gpt-6.1-sol); the live model catalog is warmed first, as the Task App does at boot.
+//
+// Usage: npm run probe:task-chat -- --yes [--provider claude,codex,pi] [--project-chat] [--model ID] [--keep] [--verbose]
+// Exit codes: 0 = every provider that ran passed all its checks · 1 = a check failed ·
 //             2 = refused to run (no --yes / no credentials) · 3 = nothing could run.
 
 const fs = require('node:fs');
@@ -32,14 +44,19 @@ const crypto = require('node:crypto');
 
 const SERVER_ROOT = path.resolve(__dirname, '..');
 const TURN_TIMEOUT_MS = 6 * 60 * 1000;
+// A model the provider rejects must end its turn this fast (--project-chat check 2).
+const BAD_MODEL_LIMIT_MS = 60 * 1000;
+const UNKNOWN_MODEL = 'tipatask-probe-unknown-model';
 
 function parseArgs(argv) {
-  const opts = { yes: false, keep: false, verbose: false, providers: ['claude', 'codex', 'pi'] };
+  const opts = { yes: false, keep: false, verbose: false, projectChat: false, model: '', providers: ['claude', 'codex', 'pi'] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--yes') opts.yes = true;
     else if (a === '--keep') opts.keep = true;
     else if (a === '--verbose') opts.verbose = true;
+    else if (a === '--project-chat') opts.projectChat = true;
+    else if (a === '--model') opts.model = String(argv[++i] || '').trim();
     else if (a === '--provider') opts.providers = String(argv[++i] || '').split(',').map(s => s.trim()).filter(Boolean);
   }
   return opts;
@@ -81,6 +98,106 @@ function fakeWs(onFrame) {
   return { OPEN: 1, readyState: 1, send: raw => onFrame(JSON.parse(raw)), close() {} };
 }
 
+// ── --project-chat: every project-chat turn ends or fails visibly ──
+// Required modules resolve against the scratch project, so this runs after main() set it up.
+async function projectChatProbe({ opts, api, scratch, projectId, config, sessions, results }) {
+  const { createSession } = require('../src/server/session-state');
+  const { spawnTurn, applyModelSelection } = require('../src/server/providers/dispatch');
+  const { TASK_CHAT, buildTaskChatSeed, buildTaskChatSystemPrompt } = require('../src/server/task-chat');
+  const { resolvePiMcpBridge } = require('../src/server/providers/pi-task-tools');
+  const { readPiEntries, readProjectConfig } = require('../src/server/project-config');
+  const [proj, list] = await Promise.all([api('GET', ''), api('GET', '/tasks')]);
+  if (proj.status !== 200) throw new Error(`could not read project ${projectId} (HTTP ${proj.status})`);
+  const row = (proj.json && proj.json.project) || {};
+  const project = { id: String(projectId), name: row.name || `Project ${projectId}`, description: row.description || '' };
+  const tasks = ((list.json && list.json.tasks) || []).map(t => ({ id: t.task_key, title: t.title, status: t.status, priority: t.priority }));
+  // The live model catalog the Task App warms at boot: a live id passed as --model validates here as it does there.
+  await require('../src/server/task-agent').listAllAgentModels(config).catch(() => {});
+  console.log(`Scratch project: ${scratch}`);
+  console.log(`Project:         ${project.name} (${projectId}), ${tasks.length} tasks\n`);
+  const piRows = readPiEntries(readProjectConfig(scratch));
+
+  for (const provider of opts.providers) {
+    const result = { provider, ran: false, replyEnds: null, badModel: null, selectionRefused: null, notes: [] };
+    results.push(result);
+    if (!['claude', 'codex', 'pi'].includes(provider)) { result.notes.push('unknown provider'); continue; }
+    if (provider === 'pi' && piRows.length === 0) { result.notes.push('no PI_MODELS row configured'); continue; }
+    console.log(`── ${provider} ──`);
+
+    // A project chat wired as start-project-chat wires it; run() sends the opening turn and
+    // resolves on its chat-ready, or when limitMs passes without one.
+    const open = () => {
+      const id = `projectChat:${projectId}:${crypto.randomBytes(5).toString('hex')}`;
+      const frames = [];
+      let waiter = null;
+      const ws = fakeWs((frame) => {
+        frames.push({ ...frame, at: Date.now() });
+        if (opts.verbose && frame.type !== 'data' && frame.type !== 'objective-thinking') console.log(`  [${provider}] ${frame.type}${frame.stage ? `:${frame.stage}` : ''}${frame.reason ? ` ${frame.reason}` : ''}`);
+        if (waiter && frame.type === 'chat-ready') waiter();
+      });
+      const session = createSession(ws, false, id, scratch);
+      Object.assign(session, { type: 'taskChat', taskKey: null, chatProjectId: String(projectId), toolProfile: TASK_CHAT,
+        projectPath: scratch, _taskChatProject: project });
+      session.onTaskChatMutation = () => null;
+      sessions.push({ session, id });
+      const run = limitMs => new Promise((resolve) => {
+        const started = Date.now();
+        const timer = setTimeout(() => { waiter = null; resolve({ timedOut: true, started }); }, limitMs);
+        waiter = () => { clearTimeout(timer); waiter = null; resolve({ timedOut: false, started, ms: Date.now() - started }); };
+        const piMcpBridge = session.providerType === 'pi' && !!resolvePiMcpBridge({ projectRoot: scratch, userDataRoot: config.USER_DATA_ROOT });
+        session.systemPrompt = buildTaskChatSystemPrompt({ provider: session.providerType, task: null, project, piMcpBridge });
+        const seed = buildTaskChatSeed({ project, tasks, openingMessage: '' });
+        session.messages.push({ role: 'user', content: seed, seed: true, timestamp: Date.now() });
+        session.firstPrompt = seed;
+        spawnTurn(session, id);
+      });
+      return { id, session, frames, run };
+    };
+    const idle = s => !s.proc && !s._spawning && !s._projectChatStarting;
+
+    // ── 1. The opening turn replies and ends ──
+    const chat = open();
+    if (opts.model) {
+      const sel = await applyModelSelection(chat.session, `${provider}:${opts.model}`, { taskId: chat.id });
+      if (sel.error) { result.notes.push(`--model ${opts.model} refused (${sel.error}${sel.reason ? `: ${sel.reason}` : ''})`); continue; }
+    } else {
+      chat.session.providerType = provider;
+      chat.session.selectedModel = null;
+    }
+    const t1 = await chat.run(TURN_TIMEOUT_MS);
+    result.ran = true;
+    const err1 = chat.frames.find(f => f.type === 'objective-error');
+    const reply = ([...chat.session.messages].reverse().find(m => m.role === 'assistant') || {}).content || '';
+    const streamed = chat.frames.some(f => f.type === 'data');
+    result.replyEnds = !t1.timedOut && !err1 && streamed && !!reply.trim() && idle(chat.session);
+    console.log(`  reply         -> ${t1.timedOut ? 'NO chat-ready' : err1 ? `objective-error ${err1.reason}` : `ended in ${(t1.ms / 1000).toFixed(1)}s`} (model ${chat.session.selectedModel || '(provider default)'})${idle(chat.session) ? '' : ', turn still marked running'}`);
+    if (reply) console.log(`  reply: ${reply.replace(/\s+/g, ' ').slice(0, 200)}`);
+    if (!result.replyEnds) {
+      result.notes.push(t1.timedOut ? 'opening turn never ended' : err1 ? `opening turn failed: ${err1.reason}`
+        : !streamed || !reply.trim() ? 'no reply streamed' : 'turn still marked running after chat-ready');
+    }
+
+    // ── 2. A model the provider rejects fails visibly, fast, and frees the session ──
+    const bad = open();
+    bad.session.providerType = provider;
+    const piPrefix = provider === 'pi' && String(piRows[0].model || '').includes('/') ? `${String(piRows[0].model).split('/')[0]}/` : '';
+    bad.session.selectedModel = `${piPrefix}${UNKNOWN_MODEL}`;
+    const t2 = await bad.run(BAD_MODEL_LIMIT_MS);
+    const err2 = bad.frames.find(f => f.type === 'objective-error');
+    const ready2 = bad.frames.find(f => f.type === 'chat-ready');
+    result.badModel = !t2.timedOut && !!err2 && !!ready2 && err2.at <= ready2.at && idle(bad.session);
+    console.log(`  unknown model -> ${err2 ? `objective-error after ${((err2.at - t2.started) / 1000).toFixed(1)}s (${String(err2.reason).slice(0, 120)})` : 'NO objective-error'}${ready2 ? ', then chat-ready' : `, NO chat-ready within ${BAD_MODEL_LIMIT_MS / 1000}s`}${idle(bad.session) ? '' : ', turn still marked running'}`);
+    if (!result.badModel) result.notes.push('an unknown model did not end its turn visibly');
+
+    // ── 3. The same id sent as the chat's model is refused before anything spawns ──
+    const picked = open();
+    const refused = await applyModelSelection(picked.session, `${provider}:${UNKNOWN_MODEL}`, { taskId: picked.id });
+    result.selectionRefused = refused.error === 'provider-unavailable' && idle(picked.session) && picked.frames.length === 0;
+    console.log(`  unknown pick  -> ${refused.error || 'accepted'}`);
+    if (!result.selectionRefused) result.notes.push('an unknown model selection was not refused');
+  }
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const sourceRoot = findProjectRoot(process.env.TIPATASK_PROJECT_ROOT || process.cwd());
@@ -97,10 +214,10 @@ async function main() {
   }
   if (!opts.yes) {
     console.error([
-      'This probe runs real agent turns and writes to a real API:',
+      opts.projectChat ? 'This probe runs real project-chat turns against a real API:' : 'This probe runs real agent turns and writes to a real API:',
       `  API:      ${base} (project ${projectId})`,
-      `  Creates:  one scratch task, deleted again when the probe ends`,
-      `  Spends:   4 model turns per provider (${opts.providers.join(', ')})`,
+      opts.projectChat ? '  Reads:    the project and its task list (creates nothing)' : '  Creates:  one scratch task, deleted again when the probe ends',
+      `  Spends:   ${opts.projectChat ? 2 : 4} model turns per provider (${opts.providers.join(', ')})`,
       'Re-run with --yes to proceed.',
     ].join('\n'));
     process.exit(2);
@@ -170,6 +287,23 @@ async function main() {
   process.on('SIGINT', () => { cleanup().finally(() => process.exit(130)); });
 
   const results = [];
+  if (opts.projectChat) {
+    try {
+      await projectChatProbe({ opts, api, scratch, projectId, config, sessions, results });
+    } catch (err) {
+      console.error(`\nProbe aborted: ${err.message}`);
+      results.push({ provider: '(setup)', ran: false, notes: [err.message], fatal: true });
+    } finally {
+      await cleanup();
+    }
+    console.log('\nprovider  ran   reply-ends  bad-model   selection  notes');
+    for (const r of results) {
+      console.log([r.provider.padEnd(8), String(r.ran).padEnd(4), String(r.replyEnds ?? null).padEnd(10), String(r.badModel ?? null).padEnd(10), String(r.selectionRefused ?? null).padEnd(10), (r.notes || []).join('; ')].join('  '));
+    }
+    const ran = results.filter(r => r.ran);
+    const allPass = ran.length > 0 && ran.every(r => r.replyEnds === true && r.badModel === true && r.selectionRefused === true);
+    process.exit(ran.length === 0 ? 3 : (allPass && !results.some(r => r.fatal) ? 0 : 1));
+  }
   try {
     const created = await api('POST', '/tasks', {
       title: '[probe] task-chat scratch task (safe to delete)',

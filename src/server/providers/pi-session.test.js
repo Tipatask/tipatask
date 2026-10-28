@@ -174,6 +174,43 @@ test('spawnPiTurn: stopReason error with no text is a hard objective-error, not 
   assert.strictEqual(turn.ofType('objective-result').length, 0);
 });
 
+// TPT9179 — a failed or stopped Pi turn must free its session. Its close handler returns early on
+// an aborted turn, so a session still holding the process would refuse every later message,
+// model switch and reconnect as a turn in progress.
+function startChatTurn(t) {
+  const dir = makeProjectDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const session = { ...makeSession(dir), type: 'taskChat' };
+  const proc = makeFakeProc();
+  const frames = [];
+  spawnPiTurn(session, 'projectChat:2:abcdef1', (f) => frames.push(f), { spawn: () => proc });
+  const out = (...events) => proc.stdout.emit('data', Buffer.from(events.map(e => JSON.stringify(e)).join('\n') + '\n'));
+  return { session, proc, frames, out };
+}
+
+test('spawnPiTurn: a failed chat turn releases its session and ends with chat-ready', (t) => {
+  enableTimers(t);
+  const turn = startChatTurn(t);
+  assert.strictEqual(turn.session.proc, turn.proc);
+  const errorMessage = '400: {"message":"probe-model is not a valid model ID","code":400}';
+  turn.out(SESSION_EVENT, { type: 'turn_end', message: { role: 'assistant', stopReason: 'error', errorMessage } });
+  assert.strictEqual(turn.session.proc, null, 'the failed turn no longer holds the session');
+  assert.deepStrictEqual(turn.frames.filter(f => ['objective-error', 'chat-ready'].includes(f.type)).map(f => f.type),
+    ['objective-error', 'chat-ready']);
+  turn.proc.emit('close', null);
+  assert.strictEqual(turn.session.proc, null);
+  assert.strictEqual(turn.frames.filter(f => f.type === 'objective-error').length, 1);
+});
+
+test('spawnPiTurn: a stopped chat turn releases its session when the process closes', (t) => {
+  enableTimers(t);
+  const turn = startChatTurn(t);
+  turn.session._aborted = true; // set by the abort handler (ws-handlers.js) before it kills the process
+  turn.proc.emit('close', null);
+  assert.strictEqual(turn.session.proc, null);
+  assert.strictEqual(turn.frames.filter(f => f.type === 'objective-error').length, 0, 'a stop is not an error');
+});
+
 test('spawnPiTurn: non-zero exit with no text reports pi-exit with the stderr tail', (t) => {
   enableTimers(t);
   const turn = startTurn(t);

@@ -7,7 +7,7 @@
 // (TPT466) A task's chat is shown on the Chat pane of its workspace modal (task-edit-modal.js),
 // mounted there through mount(); open() routes to that workspace. The project chat (left menu
 // "Start Chat") stays a window of its own.
-import { buildWsUrl, wsSend, WS_SEND_TYPES, WS_RECV_TYPES } from './ws-client.js';
+import { buildWsUrl, wsSend, terminateTaskSession, WS_SEND_TYPES, WS_RECV_TYPES } from './ws-client.js';
 import { renderMarkdown, escapeAttr, autoGrowTextarea, projectHeader, showToast } from './utils.js';
 import { modelLabel, CHAT_BUBBLE_SVG } from './constants.js';
 import state from './state.js';
@@ -163,20 +163,41 @@ function newProjectChatId(projectId) {
   return `${PROJECT_SESSION_PREFIX}${projectId}:${Date.now().toString(36)}${rand}`;
 }
 
+// A started draft whose first turn failed or was stopped before the agent answered: idle, with
+// nothing in it to keep. A row without these fields (an older server) counts as a live draft.
+function failedDraft(row) {
+  return !!row && row.running === false && row.answered === false;
+}
+
 // Which chat Start Chat opens: the remembered draft while it is still untitled, else an untitled
 // chat of this project the server already holds (started in another window or before a reload),
 // else a new one. A titled chat is a conversation of its own and is only opened from its row.
+// A failed draft is never opened again: Start Chat would keep landing on it, and it is in no
+// left-menu row that could end it, so the remembered one is ended here and a new chat opens.
 function pickProjectChatId(projectId) {
   const meta = state.sessionMeta instanceof Map ? state.sessionMeta : new Map();
   const untitled = id => !meta.get(id)?.title;
   const remembered = readDraftChat(projectId);
-  if (remembered && untitled(remembered)) return remembered;
+  if (remembered && untitled(remembered)) {
+    if (!failedDraft(meta.get(remembered))) return remembered;
+    forgetDraftChat(projectId, remembered);
+    endFailedDraft(remembered);
+  }
   const serverDraft = [...meta.entries()]
-    .filter(([id, row]) => projectIdOfChat(id) === projectId && id !== PROJECT_SESSION_PREFIX + projectId && !row?.title)
+    .filter(([id, row]) => projectIdOfChat(id) === projectId && id !== PROJECT_SESSION_PREFIX + projectId
+      && !row?.title && !failedDraft(row))
     .sort((a, b) => (b[1]?.startedAt || 0) - (a[1]?.startedAt || 0))[0];
   const id = serverDraft ? serverDraft[0] : newProjectChatId(projectId);
   writeDraftChat(projectId, id);
   return id;
+}
+
+// The left menu's End control, for a chat that has no row: the server drops the session (its
+// history entry, if any, stays resumable), then the session list is read again.
+function endFailedDraft(id) {
+  Promise.resolve(terminateTaskSession(id, { timeoutMs: 5000 }))
+    .catch(() => {})
+    .finally(() => refreshSessionsNav(true));
 }
 
 function draftChatKey(projectId) {

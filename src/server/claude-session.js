@@ -804,6 +804,10 @@ function emitObjectiveError(session, taskId, reason, attempts, extra) {
     // to spawnObjectiveTurn regardless of providerType, and this file only runs the claude bin.
     // Siblings that must stay in sync: gemini-session.js, pi-session.js, codex-session.js.
     session.ws.send(JSON.stringify({ type: 'objective-error', tabId: session.tabId, reason, attempts, provider: 'claude', ...(extra || {}), ...(droppedUserTurn ? { droppedUserTurn: true } : {}) }));
+    // A task/project chat's failed turn is over: chat-ready ends it, as on Codex and Pi.
+    if (session.type === 'taskChat') {
+      session.ws.send(JSON.stringify({ type: 'chat-ready', tabId: session.tabId, turnIndex: session.messages.length - 1 }));
+    }
   }
 }
 
@@ -1616,6 +1620,9 @@ function spawnObjectiveTurn(session, taskId) {
               if (session.proc === proc) {
                 killObjectiveProc(session, 'SIGTERM');
                 escalateKill(session, taskId, config.OBJECTIVE_EARLY_KILL_GRACE_MS);
+                // A task/project chat sent chat-ready above: the exiting process no longer holds
+                // the chat, so the next message or a reconnect never finds a turn still running.
+                if (session.type === 'taskChat') session.proc = null;
               }
             });
           }

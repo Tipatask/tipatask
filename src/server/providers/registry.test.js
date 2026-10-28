@@ -609,6 +609,21 @@ test('applyModelSelection ignores an invalid selection rather than erroring', as
   assert.equal(session.providerType, 'claude');
 });
 
+// TPT9179 — a task/project chat never answers from a model other than the one it names.
+test('applyModelSelection refuses an unknown model for a task or project chat instead of keeping another one', async () => {
+  for (const raw of ['codex:gpt-not-a-real-model', 'claude:not-a-real-model', 'not-a-real-provider:xyz', 'malformed']) {
+    const session = makeSession({ type: 'taskChat', toolProfile: 'taskChat', providerType: 'codex', selectedModel: 'keep-me', codexSessionId: 'thread-1' });
+    const result = await applyModelSelection(session, raw, { taskId: 'projectChat:2:abcdef1' });
+    assert.deepEqual(result, { error: 'provider-unavailable' }, raw);
+    assert.equal(session.providerType, 'codex');
+    assert.equal(session.selectedModel, 'keep-me');
+    assert.equal(session.codexSessionId, 'thread-1', 'a refused pick leaves the chat as it was');
+  }
+  // A history resume checks the recorded model itself (its default-model fallback for a cold catalog).
+  const resumed = makeSession({ type: 'taskChat', toolProfile: 'taskChat' });
+  assert.deepEqual(await applyModelSelection(resumed, 'codex:gpt-not-a-real-model', { taskId: 'taskChat:TPT1', ignoreUnknown: true }), { changed: false });
+});
+
 test('applyModelSelection rejects when a turn is already spawning (Codex async image-localize window)', async () => {
   const session = makeSession({ _spawning: true });
   const result = await applyModelSelection(session, 'codex:' + config.CODEX_MODELS[0], { taskId: 't1' });
