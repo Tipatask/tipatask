@@ -5,8 +5,9 @@
 // A start request that finds no free slot is not refused — its session is parked here and
 // started, oldest first, as soon as a running session frees its slot (task completed, pty
 // exited, session terminated). A slot is the device-wide cap from process-group.js's
-// resolveAgentLimits() (hardware-derived), plus an optional lower per-project cap when the
-// project's config.json / env sets AGENT_LIMITS_MAX_CONCURRENT_SESSIONS.
+// resolveAgentLimits() (hardware-derived), plus an optional per-project cap when the
+// project's config.json / env sets AGENT_LIMITS_MAX_CONCURRENT_SESSIONS. (TPT9190) A
+// project cap above the device cap also raises the device-wide limit for that project's starts.
 //
 // "Running" means a live terminal task session — chat sessions (objective/spec/task chat, which
 // have their own throttle) never count, and neither does a session whose task already completed
@@ -53,15 +54,21 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
     try { return resolveLimits(projectPath || defaultProject) || {}; } catch { return {}; }
   }
 
+  // The project's own cap when its config/env set one, else null.
+  function explicitCap(limits) {
+    return limits.sessionCapSource && limits.sessionCapSource !== 'device'
+      && Number.isInteger(limits.maxConcurrentSessions) && limits.maxConcurrentSessions > 0
+      ? limits.maxConcurrentSessions : null;
+  }
+
   // Never throws; a broken resolver degrades to "one slot" rather than "unlimited".
   function hasSlot(projectPath) {
     const project = projectPath || defaultProject;
     const limits = limitsFor(project);
     const deviceCap = Number.isInteger(limits.deviceSessionCap) && limits.deviceSessionCap > 0 ? limits.deviceSessionCap : 1;
-    if (countRunning() >= deviceCap) return false;
-    if (limits.sessionCapSource && limits.sessionCapSource !== 'device'
-        && Number.isInteger(limits.maxConcurrentSessions)
-        && countRunning(project) >= limits.maxConcurrentSessions) return false;
+    const projectCap = explicitCap(limits);
+    if (countRunning() >= Math.max(deviceCap, projectCap ?? 0)) return false;
+    if (projectCap !== null && countRunning(project) >= projectCap) return false;
     return true;
   }
 
@@ -91,7 +98,9 @@ function createSessionQueue({ getSessions, resolveLimits, defaultProject = '', o
     });
     const limits = limitsFor(projectPath);
     const diagnostic = admission?.snapshot();
-    return { queued, running: diagnostic?.running ?? countRunning(), cap: diagnostic?.cap ?? limits.deviceSessionCap ?? null,
+    const projectCap = explicitCap(limits);
+    const cap = projectCap === null ? limits.deviceSessionCap ?? null : Math.max(limits.deviceSessionCap || 0, projectCap);
+    return { queued, running: diagnostic?.running ?? countRunning(), cap: diagnostic?.cap ?? cap,
       ...(diagnostic ? { admission: diagnostic } : {}) };
   }
 

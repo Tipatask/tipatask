@@ -14,8 +14,10 @@ const { run } = require('./task-tools');
 
 const CLI = path.join(__dirname, 'task-tools.js');
 
+const SKIPPED = Object.freeze([{ key: 'TPT4', reason: 'deps_open' }, { key: 'TPT5', reason: 'other_assignee' }]);
+
 // A stub of POST /api/tasks/TPT1/cowboy-next that answers `reply` to the run token tok-1.
-async function stubRoute(t, reply = { status: 200, body: { started: ['TPT2', 'TPT3'], reason: 'dependents' } }) {
+async function stubRoute(t, reply = { status: 200, body: { started: ['TPT2', 'TPT3'], reason: 'dependents', skipped: SKIPPED } }) {
   const hits = [];
   const server = http.createServer((req, res) => {
     hits.push({ method: req.method, url: req.url, token: req.headers['x-tipatask-run-token'] });
@@ -45,17 +47,18 @@ function tt(t, args, cowboyEnv) {
   });
 }
 
-test('run(["next", key]) asks the run\'s own route and returns the started keys', async (t) => {
+test('run(["next", key]) asks the run\'s own route and returns the started keys and skips', async (t) => {
   const { hits, env } = await stubRoute(t);
-  assert.deepEqual(await run(['next', 'TPT1'], { env }), { ok: true, status: 200, started: ['TPT2', 'TPT3'], reason: 'dependents' });
+  assert.deepEqual(await run(['next', 'TPT1'], { env }),
+    { ok: true, status: 200, started: ['TPT2', 'TPT3'], reason: 'dependents', skipped: SKIPPED });
   assert.deepEqual(hits, [{ method: 'POST', url: '/api/tasks/TPT1/cowboy-next', token: 'tok-1' }]);
 });
 
-test('tt next <key> prints the started keys and exits 0', async (t) => {
+test('tt next <key> prints the started keys and per-task skip reasons and exits 0', async (t) => {
   const { hits, env } = await stubRoute(t);
   const out = await tt(t, ['next', 'TPT1'], env);
   assert.equal(out.code, 0, out.stderr);
-  assert.deepEqual(JSON.parse(out.stdout), { ok: true, status: 200, started: ['TPT2', 'TPT3'], reason: 'dependents' });
+  assert.deepEqual(JSON.parse(out.stdout), { ok: true, status: 200, started: ['TPT2', 'TPT3'], reason: 'dependents', skipped: SKIPPED });
   assert.equal(hits.length, 1);
   assert.ok(!out.stdout.includes('tok-1') && !out.stderr.includes('tok-1'), 'the token is never printed');
 });
@@ -64,12 +67,12 @@ test('tt next exits 1 with a clear JSON error without the run token or on a refu
   const missing = await tt(t, ['next', 'TPT1'], {});
   assert.equal(missing.code, 1);
   const body = JSON.parse(missing.stdout);
-  assert.deepEqual([body.ok, body.reason, body.started], [false, 'no_token', []]);
+  assert.deepEqual([body.ok, body.reason, body.started, body.skipped], [false, 'no_token', [], []]);
   assert.match(body.error, /TIPATASK_COWBOY_TOKEN is not set/);
 
   const { env } = await stubRoute(t, { status: 409, body: { started: [], reason: 'not_finished' } });
   const refused = await tt(t, ['next', 'TPT1'], env);
   assert.equal(refused.code, 1);
-  assert.deepEqual(JSON.parse(refused.stdout), { ok: false, status: 409, started: [], reason: 'not_finished',
+  assert.deepEqual(JSON.parse(refused.stdout), { ok: false, status: 409, started: [], skipped: [], reason: 'not_finished',
     error: 'Task App does not see this task as complete. Nothing was started.' });
 });

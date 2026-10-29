@@ -17,7 +17,7 @@ const BaseTaskAgent = require('./base-agent');
 const ClaudeAgent = require('./claude-agent');
 const CodexAgent = require('./codex-agent');
 const PiAgent = require('./pi-agent');
-const { AGENT_LIMIT_DEFAULTS, resolveAgentLimits } = require('../process-group');
+const { AGENT_LIMIT_DEFAULTS, resolveAgentLimits, scaleAgentLimitsForConcurrency } = require('../process-group');
 const {
   matchPromptLine,
   CODEX_PROMPT_PATTERNS,
@@ -105,6 +105,21 @@ for (const Agent of [ClaudeAgent, CodexAgent, PiAgent]) {
     assert.ok(noteIdx < threaded.indexOf('KB hygiene:'), 'resource limits precede KB hygiene');
   });
 }
+
+test('every agent kickoff prompt still allows one sub-agent at 20 and at 32 live terminals', (t) => {
+  const projectPath = require('./prompt-contract-assertions').projectFixture(t);
+  const base = resolveAgentLimits('/p', {
+    env: {}, readConfig: () => ({}), hardware: { totalMemBytes: 48 * 2 ** 30, cores: 18 },
+  });
+  for (const activeCount of [20, 32]) {
+    const agentLimits = scaleAgentLimitsForConcurrency(base, activeCount);
+    assert.equal(agentLimits.maxSubagents, 1, `${activeCount} terminals`);
+    for (const Agent of [ClaudeAgent, CodexAgent, PiAgent]) {
+      const agent = new Agent();
+      assert.match(agent.buildPrompt('Do the thing.', { projectPath, agentLimits }), capRe(1), `${agent.id} at ${activeCount} terminals`);
+    }
+  }
+});
 
 test('Claude and Codex get the full wording, Pi the compact one', (t) => {
   const projectPath = require('./prompt-contract-assertions').projectFixture(t);

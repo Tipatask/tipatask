@@ -1,9 +1,10 @@
 'use strict';
 
-// (TPT9163) Cowboy chain hand-off: only a bypass run launched with cowboyChain is told to ask Task
-// App for the next tasks — through start_next_tasks (Claude/Codex), the bridged tool or `tt next`
-// (Pi) — exactly once, after a successful completion, never starting tasks itself. Modeled on
-// follow-up-prompt.test.js — see ai/architecture/tt-task-agent.md § Cowboy Directive.
+// (TPT9163) Cowboy chain hand-off: only a bypass run launched with cowboyChain is told how its chain
+// continues, never starting tasks itself. (TPT9195) Its successful completion starts the chain, and
+// start_next_tasks (Claude/Codex), the bridged tool or `tt next` (Pi) is only the retry of an
+// `unavailable` answer. Modeled on follow-up-prompt.test.js — see ai/architecture/tt-task-agent.md
+// § Cowboy Directive.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -70,7 +71,7 @@ for (const compact of [false, true]) {
     const agent = bareAgent();
     const note = agent.buildCowboyDirective({ cowboyChain: true, permissionPolicy: policy(agent, 'bypass'), compact });
     cowboyChain(note);
-    for (const rule of ['exactly once', 'Never pick, start or work on the next tasks yourself', 'refused', 'retry']) {
+    for (const rule of ['starts the chain itself', 'Never pick, start or work on the next tasks yourself', 'refused', 'unavailable', 'started task keys']) {
       assert.ok(note.includes(rule), rule);
       assert.throws(() => cowboyChain(note.replace(rule, '')), { code: 'ERR_ASSERTION' }, `omitting ${rule} must fail`);
     }
@@ -84,15 +85,21 @@ test('buildCowboyDirective: full wording names complete_task and start_next_task
   const agent = bareAgent();
   const opts = { cowboyChain: true, permissionPolicy: policy(agent, 'bypass') };
   const full = agent.buildCowboyDirective(opts);
-  assert.match(full, /After `complete_task` succeeded/);
-  assert.match(full, /tipatask-local tool `start_next_tasks\(task_key\)` exactly once/);
-  assert.match(full, /its own new agent session with that task's own agent and model/);
+  assert.match(full, /When `complete_task` succeeds \(it returns completed: true\), it starts the chain itself/);
+  assert.match(full, /`cowboyNext` lists the tasks it started, the reason, and `skipped`/);
+  assert.match(full, /tipatask-local tool `start_next_tasks\(task_key\)` only as a retry: once, with this task's key, when `cowboyNext\.reason` is `unavailable`/);
+  assert.match(full, /After any other answer, do not call it\./);
+  assert.match(full, /its own new agent session with this run's agent and model/);
   const compact = agent.buildCowboyDirective({ ...opts, compact: true });
   assert.ok(compact.length < full.length);
-  assert.ok(compact.length < 400, `compact wording is ${compact.length} chars — Pi echoes the whole kickoff`);
+  assert.match(compact, /Completion \(completed:true\) starts the chain itself[^\n]*cowboyNext/);
   for (const name of ['complete_task', 'mcp__']) assert.ok(!compact.includes(name), `compact wording must not name ${name}`);
+  for (const nextCall of [undefined, '`tipatask-local__start_next_tasks(task_key)`', '`tt next "$TIPATASK_TASK_ID"`']) {
+    const note = agent.buildCowboyDirective({ ...opts, compact: true, nextCall });
+    assert.ok(note.length < 400, `compact wording is ${note.length} chars with ${nextCall} — Pi echoes the whole kickoff`);
+  }
   assert.match(agent.buildCowboyDirective({ ...opts, compact: true, nextCall: '`tt next "$TIPATASK_TASK_ID"`' }),
-    /run `tt next "\$TIPATASK_TASK_ID"` exactly once/);
+    /Retry with `tt next "\$TIPATASK_TASK_ID"` once, only if cowboyNext\.reason is unavailable\./);
 });
 
 test('PiAgent#buildCowboyDirective: always compact; bridged tool with the MCP bridge, `tt next` without it', () => {
@@ -100,9 +107,9 @@ test('PiAgent#buildCowboyDirective: always compact; bridged tool with the MCP br
   const opts = { cowboyChain: true, permissionPolicy: policy(pi, 'bypass') };
   const rest = pi.buildCowboyDirective(opts);
   const bridge = pi.buildCowboyDirective({ ...opts, piMcpBridge: true });
-  assert.match(rest, /run `tt next "\$TIPATASK_TASK_ID"` exactly once/);
+  assert.match(rest, /Retry with `tt next "\$TIPATASK_TASK_ID"` once, only if cowboyNext\.reason is unavailable/);
   assert.doesNotMatch(rest, /start_next_tasks/);
-  assert.match(bridge, /run `tipatask-local__start_next_tasks\(task_key\)` exactly once/);
+  assert.match(bridge, /Retry with `tipatask-local__start_next_tasks\(task_key\)` once, only if cowboyNext\.reason is unavailable/);
   assert.doesNotMatch(bridge, /tt next/);
   for (const note of [rest, bridge]) {
     cowboyChain(note);

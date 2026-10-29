@@ -6,6 +6,8 @@
 // PTY env carries the only credential that route takes (withCowboyEnv()): TIPATASK_COWBOY_TOKEN, sent
 // as the x-tipatask-run-token header, and TIPATASK_COWBOY_URL, that route for the run's own task on
 // the local Task App. requestNextTasks() never throws and never puts the token in its result.
+// (TPT9195) complete_task and `tt complete` make the same request themselves once the completion is
+// saved (startChainAfterCompletion()), so the chain never waits on the agent remembering it.
 
 const { RUN_TOKEN_HEADER, LOCAL_HOST } = require('./local-access');
 
@@ -16,6 +18,8 @@ const COWBOY_ENV_VARS = Object.freeze([COWBOY_TOKEN_ENV, COWBOY_URL_ENV]);
 const ROUTE_RE = /^\/api\/tasks\/([^/]+)\/cowboy-next$/;
 // Below Codex's 60 s MCP tool timeout; a decision normally takes a few task reads.
 const REQUEST_TIMEOUT_MS = 45000;
+// The least a completion's chain request waits, however long the completion itself took.
+const CHAIN_MIN_TIMEOUT_MS = 10000;
 
 // The route's 409 refusals (ws-handlers.js): the run or its task does not qualify, nothing started.
 const REFUSALS = Object.freeze({
@@ -26,7 +30,15 @@ const REFUSALS = Object.freeze({
 });
 
 function failure(reason, error, status = null) {
-  return { ok: false, status, started: [], reason, error };
+  return { ok: false, status, started: [], skipped: [], reason, error };
+}
+
+// (TPT9193) The route's per-task skip reasons, [{ key, reason }]: well-formed entries only, and []
+// when the answer carries none (an older Task App).
+function skippedList(value) {
+  return (Array.isArray(value) ? value : [])
+    .filter(entry => entry && typeof entry.key === 'string' && typeof entry.reason === 'string')
+    .map(({ key, reason }) => ({ key, reason }));
 }
 
 function decodeKey(encoded) {
@@ -34,9 +46,10 @@ function decodeKey(encoded) {
 }
 
 // taskKey: the task this run just completed. env: the run's environment (TIPATASK_COWBOY_*).
-// Returns { ok: true, status: 200, started: [keys], reason, previous? } for a decision — a repeat
-// answers reason 'already_launched' with the first decision as `previous` — else
-// { ok: false, status, started: [], reason, error }.
+// Returns { ok: true, status: 200, started: [keys], reason, skipped: [{ key, reason }], previous? }
+// for a decision — `skipped` names each candidate that did not start; a repeat answers reason
+// 'already_launched' with the first decision as `previous` — else
+// { ok: false, status, started: [], skipped: [], reason, error }.
 async function requestNextTasks(taskKey, { env = process.env, fetchImpl = fetch, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
   const key = typeof taskKey === 'string' ? taskKey.trim() : '';
   if (!key) return failure('no_task_key', 'Pass the key of the task this run just completed. Nothing was started.');
@@ -73,7 +86,8 @@ async function requestNextTasks(taskKey, { env = process.env, fetchImpl = fetch,
   try { body = await res.json(); } catch { body = null; }
   const reason = body && typeof body.reason === 'string' ? body.reason : null;
   if (res.status === 200 && body && Array.isArray(body.started)) {
-    return { ok: true, status: 200, started: body.started, reason, ...(body.previous ? { previous: body.previous } : {}) };
+    return { ok: true, status: 200, started: body.started, reason, skipped: skippedList(body.skipped),
+      ...(body.previous ? { previous: body.previous } : {}) };
   }
   if (res.status === 403) {
     return failure('forbidden', 'Task App refused this run\'s token: it opens the route only for this run\'s own task while the run is live. Nothing was started.', 403);
@@ -88,4 +102,32 @@ async function requestNextTasks(taskKey, { env = process.env, fetchImpl = fetch,
   return failure('unexpected', `Task App answered HTTP ${res.status}. Nothing was started.`, res.status);
 }
 
-module.exports = { COWBOY_TOKEN_ENV, COWBOY_URL_ENV, COWBOY_ENV_VARS, REQUEST_TIMEOUT_MS, requestNextTasks };
+// (TPT9195) The chain trigger of complete_task (src/mcp/server.js) and `tt complete`
+// (src/cli/task-tools.js). `completion` is completion-guard.js completeVerifiedTask()'s result for
+// `taskKey`. Once it says completed: true inside a cowboy run (both variables set), this asks Task
+// App for the next tasks and returns the completion with the answer as
+// `cowboyNext: { started, reason, skipped, previous?, error? }`. A refused completion, a run without
+// the variables, or another task than the run's own (wrong_task, refused before any request) gets
+// `completion` back unchanged. A failed request only fills `cowboyNext`; the completion stays as
+// saved. Both share one tool call, so the request waits what is left of REQUEST_TIMEOUT_MS since
+// `since` (when the call began), and at least CHAIN_MIN_TIMEOUT_MS.
+async function startChainAfterCompletion(taskKey, completion, { env = process.env, fetchImpl = fetch, since = Date.now() } = {}) {
+  if (!completion || completion.completed !== true || !env[COWBOY_TOKEN_ENV] || !env[COWBOY_URL_ENV]) return completion;
+  const timeoutMs = Math.max(CHAIN_MIN_TIMEOUT_MS, REQUEST_TIMEOUT_MS - (Date.now() - since));
+  let next;
+  try {
+    next = await requestNextTasks(taskKey, { env, fetchImpl, timeoutMs });
+  } catch (err) {
+    // requestNextTasks() never throws; a saved completion must not turn into a failure if it does.
+    const detail = String(err && err.message).split(env[COWBOY_TOKEN_ENV]).join('[redacted]');
+    next = failure('unexpected', `Could not ask Task App for the next tasks: ${detail}. Nothing was started.`);
+  }
+  if (next.reason === 'wrong_task') return completion;
+  const { started, reason, skipped, previous, error } = next;
+  return { ...completion, cowboyNext: { started, reason, skipped, ...(previous ? { previous } : {}), ...(error ? { error } : {}) } };
+}
+
+module.exports = {
+  COWBOY_TOKEN_ENV, COWBOY_URL_ENV, COWBOY_ENV_VARS, REQUEST_TIMEOUT_MS, CHAIN_MIN_TIMEOUT_MS,
+  requestNextTasks, startChainAfterCompletion,
+};

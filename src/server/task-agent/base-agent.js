@@ -403,25 +403,28 @@ class BaseTaskAgent {
   // (TPT9163) Cowboy chain hand-off (ai/architecture/tt-task-agent.md § Cowboy Directive). Only a run
   // spawned with opts.cowboyChain (terminal-session.js: a bypass run whose task has cowboyMode on, or
   // one launchCowboyChain() started) whose policy is bypass gets it; every other run gets ''. Task App
-  // picks and starts the next tasks (POST /api/tasks/:key/cowboy-next); the agent only asks, once,
-  // after a successful completion. opts.nextCall is how this agent reaches start_next_tasks (Pi passes
-  // its bridged tool or `tt next`). Compact wording is echoed by Pi: no questions or status literals.
+  // picks and starts the next tasks (POST /api/tasks/:key/cowboy-next). (TPT9195) The completion call
+  // (complete_task / `tt complete`) asks for them itself and returns the answer as `cowboyNext`; the
+  // agent calls start_next_tasks only to retry an `unavailable` answer, once. opts.nextCall is how this
+  // agent reaches start_next_tasks (Pi passes its bridged tool or `tt next`). Compact wording is echoed
+  // by Pi and must stay under 400 characters: no questions or status literals.
   buildCowboyDirective(opts = {}) {
     if (opts.cowboyChain !== true || opts.permissionPolicy?.mode !== 'bypass') return '';
     const call = opts.nextCall || '`start_next_tasks(task_key)`';
     if (opts.compact) {
       return [
         'Cowboy chain:',
-        `- After completion succeeds (completed:true), run ${call} exactly once, before your final message; Task App starts the next tasks in new sessions.`,
-        '- Never pick, start or work on the next tasks yourself. Completion refused or blocked: skip it, the chain stops. No retry; list the started task keys (or none) and the reason in your final message.',
+        '- Completion (completed:true) starts the chain itself, each next task in a new session; cowboyNext names them.',
+        `- Never pick, start or work on the next tasks yourself. Retry with ${call} once, only if cowboyNext.reason is unavailable. Completion refused or blocked: the chain stops. Final message: the started task keys (or none) and the reason.`,
       ].join('\n');
     }
     return [
       'Cowboy chain:',
-      `- This Bypass run is part of a cowboy chain. After \`complete_task\` succeeded (it returned completed: true), call the tipatask-local tool ${call} exactly once, with this task's key, before your final message. Task App then picks the next tasks and starts each one in its own new agent session with that task's own agent and model.`,
-      '- Never pick, start or work on the next tasks yourself: no status changes on them, no new terminals, agent sessions or CLI launches. That tool is the only way the chain continues.',
-      '- If `complete_task` refused or this task ends blocked, do not call it: the chain stops here.',
-      '- Do not retry it, even when it reports an error or starts nothing. In your final message, list the task keys it started (or that none started) and the reason it returned.',
+      '- This Bypass run is part of a cowboy chain. When `complete_task` succeeds (it returns completed: true), it starts the chain itself: Task App picks the next tasks and starts each one in its own new agent session with this run\'s agent and model. Its result\'s `cowboyNext` lists the tasks it started, the reason, and `skipped`: each candidate task that did not start, with its reason code.',
+      '- Never pick, start or work on the next tasks yourself: no status changes on them, no new terminals, agent sessions or CLI launches. `complete_task`, with the one retry below, is the only way the chain continues.',
+      `- Call the tipatask-local tool ${call} only as a retry: once, with this task's key, when \`cowboyNext.reason\` is \`unavailable\` (Task App could not read the tasks). After any other answer, do not call it.`,
+      '- If `complete_task` refused or this task ends blocked, the chain stops here.',
+      '- In your final message, list the started task keys from `cowboyNext` (or from the retry), or that none started, and the reason it returned.',
     ].join('\n');
   }
 

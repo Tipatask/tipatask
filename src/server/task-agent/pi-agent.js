@@ -161,7 +161,8 @@ class PiAgent extends BaseTaskAgent {
     return buildTagDescriptionDirective(opts.taskTags, opts.tagDescriptions, { compact: !opts.piMcpBridge });
   }
 
-  // (TPT9163) Cowboy chain hand-off, always compact: bridge mode calls the bridged tool, the REST
+  // (TPT9163) Cowboy chain hand-off, always compact. The completion (bridged complete_task or
+  // `tt complete`) starts the chain; its retry is the bridged tool in bridge mode, the REST
   // fallback `tt next` (src/cli/task-tools.js). Both send this run's TIPATASK_COWBOY_TOKEN.
   buildCowboyDirective(opts = {}) {
     const nextCall = opts.piMcpBridge ? '`tipatask-local__start_next_tasks(task_key)`' : '`tt next "$TIPATASK_TASK_ID"`';

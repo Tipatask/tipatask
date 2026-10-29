@@ -24,6 +24,7 @@ const {
   WATCHDOG_ACTIONS,
   AGENT_LIMIT_DEFAULTS,
   AGENT_LIMIT_KEYS,
+  DEVICE_SESSION_CAP_MIN,
   DEVICE_SESSION_CAP_MAX,
   computeDeviceSessionCap,
   resolveAgentLimits,
@@ -1182,12 +1183,12 @@ test('a resolved tree can be stopped and continued: SIGSTOP then SIGCONT reach t
 
 const K = AGENT_LIMIT_KEYS;
 const GB = 1024 ** 3;
-const HW_48 = { totalMemBytes: 48 * GB, cores: 12 }; // device cap 6 at the default 6144 MB budget
+const HW_48 = { totalMemBytes: 48 * GB, cores: 12 }; // device cap 24: 43 RAM slots, bounded by 2 × 12 CPUs
 const limits = (cfg, env = {}, hardware = HW_48) => resolveAgentLimits('/p', { env, readConfig: () => cfg, hardware });
 
 test('resolveAgentLimits returns the defaults with no config and no env', () => {
   assert.deepEqual(limits(null), {
-    maxConcurrentSessions: 6, deviceSessionCap: 6, sessionCapSource: 'device',
+    maxConcurrentSessions: 24, deviceSessionCap: 24, sessionCapSource: 'device',
     maxSubagents: 3, warnDescendants: 50, maxTreeRssMb: 6144, watchdogAction: 'pause',
     soloMultiplier: 2, minScale: 0.25,
     descendantCeiling: 150, rssActionMb: 12288, rssGrowthMb: 512, rssPressureGrowthMb: 128, rssSamples: 3,
@@ -1230,9 +1231,9 @@ test('resolveAgentLimits reads every config.json key (numbers and numeric string
     [K.soloMultiplier]: '2.5', [K.minScale]: 0.125,
   });
   assert.equal(result.sessionCapSource, 'config');
-  assert.equal(result.deviceSessionCap, 6);
+  assert.equal(result.deviceSessionCap, 24);
   assert.deepEqual({ ...result, deviceSessionCap: undefined, sessionCapSource: undefined }, {
-    maxConcurrentSessions: 6, deviceSessionCap: undefined, sessionCapSource: undefined, projectSessionCap: 8,
+    maxConcurrentSessions: 8, deviceSessionCap: undefined, sessionCapSource: undefined, projectSessionCap: 8,
     maxSubagents: 6, warnDescendants: 90, maxTreeRssMb: 2048, watchdogAction: 'warn',
     soloMultiplier: 2.5, minScale: 0.125,
     descendantCeiling: 270, rssActionMb: 4096, rssGrowthMb: 512, rssPressureGrowthMb: 128, rssSamples: 3,
@@ -1245,7 +1246,7 @@ test('resolveAgentLimits: env beats config per key, other keys still come from c
     { [K.maxSubagents]: '2', [K.watchdogAction]: 'kill' },
   );
   assert.equal(result.maxSubagents, 2);
-  assert.equal(result.maxConcurrentSessions, 6);
+  assert.equal(result.maxConcurrentSessions, 8);
   assert.equal(result.watchdogAction, 'kill');
 });
 
@@ -1282,9 +1283,9 @@ test('resolveAgentLimits never throws: throwing reader, falsy root, non-object c
   assert.equal(resolveAgentLimits('/p', { env: {}, readConfig: boom }).maxSubagents, 3);
   assert.equal(resolveAgentLimits('', { env: {}, readConfig: () => ({ [K.maxSubagents]: 9 }) }).maxSubagents, 3);
   assert.equal(limits('garbage').watchdogAction, 'pause');
-  assert.equal(resolveAgentLimits('/p', { env: null, readConfig: () => null, hardware: HW_48 }).maxConcurrentSessions, 6);
-  // real hardware detection path never throws and yields at least one slot
-  assert.ok(resolveAgentLimits('/p', { env: {}, readConfig: () => null }).maxConcurrentSessions >= 1);
+  assert.equal(resolveAgentLimits('/p', { env: null, readConfig: () => null, hardware: HW_48 }).maxConcurrentSessions, 24);
+  // real hardware detection path never throws and yields at least the four-slot floor
+  assert.ok(resolveAgentLimits('/p', { env: {}, readConfig: () => null }).maxConcurrentSessions >= DEVICE_SESSION_CAP_MIN);
 });
 
 test('resolveAgentLimits returns a fresh object each call', () => {
@@ -1335,7 +1336,10 @@ test('resolveAgentLimits rejects invalid scales and falls through env, config, d
 for (const [activeCount, warnDescendants, maxTreeRssMb, maxSubagents] of [
   [1, 100, 12288, 6],
   [2, 50, 6144, 3],
+  [4, 25, 3072, 2],
+  [5, 20, 2458, 1],
   [8, 13, 1536, 1],
+  [20, 13, 1536, 1],
   [32, 13, 1536, 1],
 ]) {
   test(`scaleAgentLimitsForConcurrency scales default limits for ${activeCount} sessions`, () => {
@@ -1355,6 +1359,18 @@ test('scaleAgentLimitsForConcurrency honors custom scales, rounds and clamps to 
   assert.deepEqual(scaleAgentLimitsForConcurrency(base, 100), {
     ...base, advisoryDescendants: 1, advisoryTreeRssMb: 1, maxSubagents: 1,
   });
+});
+
+test('scaleAgentLimitsForConcurrency keeps every advisory allowance at one or more for any count up to the device maximum', () => {
+  const stingy = Object.freeze({ ...limits(null), maxSubagents: 1, warnDescendants: 1, maxTreeRssMb: 1, minScale: 0.01 });
+  for (const base of [Object.freeze(limits(null)), stingy]) {
+    for (let count = 1; count <= DEVICE_SESSION_CAP_MAX; count++) {
+      const scaled = scaleAgentLimitsForConcurrency(base, count);
+      for (const field of ['maxSubagents', 'advisoryDescendants', 'advisoryTreeRssMb']) {
+        assert.ok(Number.isSafeInteger(scaled[field]) && scaled[field] >= 1, `${field} at ${count} sessions: ${scaled[field]}`);
+      }
+    }
+  }
 });
 
 test('scaleAgentLimitsForConcurrency normalizes zero or invalid counts to one', () => {
@@ -1395,19 +1411,27 @@ test('countActiveAgentSessions counts live PTYs across projects, including pause
 
 // ── computeDeviceSessionCap() / hardware-derived maxConcurrentSessions (TPT444) ──
 
-test('computeDeviceSessionCap follows reserve + per-session budget across machine sizes', () => {
-  const cap = (gb, cores, sessionBudgetMb = 3072) => computeDeviceSessionCap({ totalMemBytes: gb * GB, cores, sessionBudgetMb });
-  assert.equal(cap(8, 4), 1);          // 8GB: reserve 6GB, 2GB left -> 0 slots -> floored to 1
-  assert.equal(cap(16, 8), 3);         // reserve 6GB -> 10GB / 3GB
-  assert.equal(cap(32, 10), 8);        // reserve 6.4GB -> 25.6GB / 3GB
-  assert.equal(cap(48, 12), 12);       // reserve 9.6GB -> 38.4GB / 3GB = 12.8 -> 12
-  assert.equal(cap(64, 16), 16);       // reserve 12.8GB -> 51.2GB / 3GB = 17 RAM slots, CPU-bound at 16
-  assert.equal(cap(128, 64), DEVICE_SESSION_CAP_MAX);
+test('computeDeviceSessionCap follows the 1024 MiB estimate after a max(2048 MiB, 10% RAM) reserve', () => {
+  const cap = (gb, cores) => computeDeviceSessionCap({ totalMemBytes: gb * GB, cores });
+  assert.equal(cap(8, 8), 6);          // reserve 2 GiB -> 6 GiB / 1 GiB
+  assert.equal(cap(16, 8), 14);        // reserve 2 GiB -> 14 GiB / 1 GiB, under 2 × 8 CPUs
+  assert.equal(cap(32, 10), 20);       // reserve 3.2 GiB -> 28 RAM slots, CPU-bound at 2 × 10
+  assert.equal(cap(48, 12), 24);       // reserve 4.8 GiB -> 43 RAM slots, CPU-bound at 2 × 12
+  assert.equal(cap(48, 18), DEVICE_SESSION_CAP_MAX); // 43 RAM slots, 36 CPU slots -> the ceiling
+  assert.equal(cap(256, 64), DEVICE_SESSION_CAP_MAX);
 });
 
-test('computeDeviceSessionCap is CPU-bound on a slow multi-GB machine and floors at one slot', () => {
-  assert.equal(computeDeviceSessionCap({ totalMemBytes: 64 * GB, cores: 4, sessionBudgetMb: 3072 }), 4);
-  assert.equal(computeDeviceSessionCap({ totalMemBytes: 4 * GB, cores: 2, sessionBudgetMb: 3072 }), 1);
+test('TPT9190 acceptance: 16 GiB/8 CPUs and 48 GiB/18 CPUs get many slots, 8 GiB keeps at least four', () => {
+  assert.ok(computeDeviceSessionCap({ totalMemBytes: 16 * GB, cores: 8 }) >= 12);
+  assert.ok(computeDeviceSessionCap({ totalMemBytes: 48 * GB, cores: 18 }) >= 24);
+  for (const cores of [1, 2, 4, 8, 16]) assert.ok(computeDeviceSessionCap({ totalMemBytes: 8 * GB, cores }) >= 4);
+});
+
+test('computeDeviceSessionCap allows two slots per logical CPU and floors at four slots', () => {
+  assert.equal(computeDeviceSessionCap({ totalMemBytes: 64 * GB, cores: 4 }), 8); // 57 RAM slots, 2 × 4 CPUs
+  assert.equal(computeDeviceSessionCap({ totalMemBytes: 4 * GB, cores: 2 }), DEVICE_SESSION_CAP_MIN); // 2 RAM slots
+  assert.equal(computeDeviceSessionCap({ totalMemBytes: 64 * GB, cores: 1 }), DEVICE_SESSION_CAP_MIN); // 2 CPU slots
+  assert.equal(computeDeviceSessionCap({ totalMemBytes: 2 * GB, cores: 8 }), DEVICE_SESSION_CAP_MIN); // reserve takes it all
 });
 
 test('computeDeviceSessionCap uses the budget argument and survives bad hardware numbers', () => {
@@ -1415,24 +1439,32 @@ test('computeDeviceSessionCap uses the budget argument and survives bad hardware
   const small = computeDeviceSessionCap({ totalMemBytes: 48 * GB, cores: 32, sessionBudgetMb: 1536 });
   assert.ok(small > big);
   for (const bad of [{}, undefined, { totalMemBytes: NaN, cores: 8 }, { totalMemBytes: 16 * GB, cores: 0 }, { totalMemBytes: -1, cores: 8 }]) {
-    assert.equal(computeDeviceSessionCap(bad), 1);
+    assert.equal(computeDeviceSessionCap(bad), DEVICE_SESSION_CAP_MIN);
   }
 });
 
 test('resolveAgentLimits derives maxConcurrentSessions independently of the watchdog RSS budget', () => {
-  assert.equal(limits(null, {}, { totalMemBytes: 16 * GB, cores: 8 }).maxConcurrentSessions, 1);
-  assert.equal(limits(null, {}, HW_48).maxConcurrentSessions, 6);
+  assert.equal(limits(null, {}, { totalMemBytes: 16 * GB, cores: 8 }).maxConcurrentSessions, 14);
+  assert.equal(limits(null, {}, HW_48).maxConcurrentSessions, 24);
   // Changing the watchdog budget must not change device admission capacity.
-  assert.equal(limits({ [K.maxTreeRssMb]: 3072 }, {}, HW_48).maxConcurrentSessions, 6);
+  assert.equal(limits({ [K.maxTreeRssMb]: 3072 }, {}, HW_48).maxConcurrentSessions, 24);
 });
 
-test('resolveAgentLimits: an explicit session cap can lower but never raise the device cap', () => {
+test('resolveAgentLimits: an explicit session cap lowers or raises the device cap, up to 32 slots', () => {
   const lowered = limits({ [K.maxConcurrentSessions]: 2 });
   assert.equal(lowered.maxConcurrentSessions, 2);
-  assert.equal(lowered.deviceSessionCap, 6);
+  assert.equal(lowered.deviceSessionCap, 24);
+  assert.equal(lowered.projectSessionCap, 2);
   assert.equal(lowered.sessionCapSource, 'config');
-  const raised = limits({ [K.maxConcurrentSessions]: 100 });
-  assert.equal(raised.maxConcurrentSessions, 6);
+  const host16 = { totalMemBytes: 16 * GB, cores: 8 };
+  const raised = limits({ [K.maxConcurrentSessions]: 20 }, {}, host16);
+  assert.deepEqual([raised.maxConcurrentSessions, raised.deviceSessionCap, raised.projectSessionCap, raised.sessionCapSource],
+    [20, 14, 20, 'config']);
+  const fromEnv = limits(null, { [K.maxConcurrentSessions]: '20' }, host16);
+  assert.deepEqual([fromEnv.maxConcurrentSessions, fromEnv.projectSessionCap, fromEnv.sessionCapSource], [20, 20, 'env']);
+  // Above the 32-slot device maximum the effective cap stops at 32; the explicit value is kept as is.
+  const huge = limits({ [K.maxConcurrentSessions]: 100 });
+  assert.deepEqual([huge.maxConcurrentSessions, huge.projectSessionCap], [DEVICE_SESSION_CAP_MAX, 100]);
   assert.equal(limits({ [K.maxConcurrentSessions]: 5 }, { [K.maxConcurrentSessions]: '1' }).sessionCapSource, 'env');
   assert.equal(limits({ [K.maxConcurrentSessions]: 5 }, { [K.maxConcurrentSessions]: '1' }).maxConcurrentSessions, 1);
   assert.equal(limits({ [K.maxConcurrentSessions]: 'junk' }).sessionCapSource, 'device');

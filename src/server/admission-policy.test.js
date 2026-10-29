@@ -1,11 +1,23 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { GiB, MiB, resolveAdmissionPolicy, estimatePeak, initialPressureState, decideAdmission } = require('./admission-policy');
-const hw = { totalMemBytes: 48 * GiB, cores: 18 };
-const policy = (config = {}, env = {}, hardware = hw) => resolveAdmissionPolicy({ env, hardware, platform: 'darwin',
+const { GiB, MiB, resolveAdmissionPolicy, estimatePeak, initialPressureState, projectCapFloor, decideAdmission } = require('./admission-policy');
+// A RAM-bound host keeps the slot arithmetic small: static cap 6 (8 GiB, 16 CPUs). Host
+// telemetry below models a 48 GiB machine independently of it.
+const hw = { totalMemBytes: 8 * GiB, cores: 16 };
+const host16 = { totalMemBytes: 16 * GiB, cores: 8 }; // static cap 14
+const host48 = { totalMemBytes: 48 * GiB, cores: 18 }; // static cap 32, the device maximum
+const resolve = (config = {}, env = {}, hardware = hw) => resolveAdmissionPolicy({ env, hardware,
   read: () => ({ config, status: 'ok', file: '/scratch/admission.json' }) });
-const pressure = (config = {}) => policy({ AGENT_ADMISSION_MODE: 'pressure', ...config });
+// Mechanics tests pin the thresholds their window and byte arithmetic is written against
+// (five-minute ramp steps up to a ceiling of eight, ten-second spacing, a max(6 GiB, 12.5%)
+// reserve, 1 GiB burst, 2 GiB ordinary and 4 GiB unknown estimates), so tuning a default
+// never moves them. The defaults have tests of their own, through `resolve`.
+const PINNED = { AGENT_ADMISSION_RAMP_STEP_MS: 300000, AGENT_ADMISSION_RAMP_CEILING: 8,
+  AGENT_ADMISSION_START_INTERVAL_MS: 10000, AGENT_ADMISSION_RESERVE_MIB: 6144, AGENT_ADMISSION_RESERVE_FRACTION: 0.125,
+  AGENT_ADMISSION_BURST_MIB: 1024, AGENT_ADMISSION_ORDINARY_MIB: 2048, AGENT_ADMISSION_UNKNOWN_MIB: 4096 };
+const policy = (config = {}, env = {}, hardware = hw) => resolve({ ...PINNED, ...config }, env, hardware);
+const pressure = (config = {}) => policy({ AGENT_ADMISSION_MODE: 'pressure', AGENT_ADMISSION_CEILING: 8, ...config });
 const stat = (config = {}) => policy({ AGENT_ADMISSION_MODE: 'static', ...config });
 function telemetry(at, changes = {}) {
   return { processes: { fresh: true, status: 'ok', sampledAt: at }, host: { status: 'ok', fresh: true, sampledAt: at, pressure: 'normal', physicalBytes: 48 * GiB,
@@ -19,22 +31,31 @@ function harness(p = pressure()) {
   return { state, run, warm };
 }
 
-test('static defaults stay hardware derived; pressure opt-in stages only studied machine at eight', () => {
+test('static defaults stay hardware derived; pressure opt-in alone keeps the static cap, CEILING moves it either way', () => {
+  const opted = (config = {}, hardware = host48) => resolve({ AGENT_ADMISSION_MODE: 'pressure', ...config }, {}, hardware);
   assert.equal(stat().mode, 'static'); assert.equal(stat().ceiling, 6);
-  assert.equal(pressure().ceiling, 8);
-  assert.equal(pressure({ AGENT_ADMISSION_CEILING: 12 }).ceiling, 12);
-  assert.equal(pressure({ AGENT_ADMISSION_CEILING: 32 }).ceiling, 16);
-  assert.equal(policy({ AGENT_ADMISSION_MODE: 'pressure' }, {}, { totalMemBytes: 32 * GiB, cores: 10 }).ceiling, 4);
+  assert.equal(resolve({ AGENT_ADMISSION_MODE: 'static' }, {}, host48).ceiling, 32);
+  assert.equal(opted().ceiling, 32); // opting in never lowers the static cap
+  assert.equal(opted({}, hw).ceiling, 6);
+  assert.equal(opted({}, host16).ceiling, 14);
+  assert.equal(opted({}, { totalMemBytes: 32 * GiB, cores: 10 }).ceiling, 20);
+  assert.equal(opted({ AGENT_ADMISSION_CEILING: 8 }).ceiling, 8); // an explicit pilot stage still can
+  assert.equal(opted({ AGENT_ADMISSION_CEILING: 12 }).ceiling, 12);
+  assert.equal(opted({ AGENT_ADMISSION_CEILING: 32 }, host16).ceiling, 32); // no CPU bound beyond the static cap's own
+  assert.equal(opted({ AGENT_ADMISSION_CEILING: 24 }, hw).ceiling, 24);
+  // The fallback never exceeds the selected ceiling or the static cap.
+  assert.equal(opted({ AGENT_ADMISSION_CEILING: 8, AGENT_ADMISSION_FALLBACK_CAP: 32 }).fallbackCap, 8);
+  assert.equal(opted({ AGENT_ADMISSION_FALLBACK_CAP: 32 }).fallbackCap, 32);
   assert.equal(pressure({ AGENT_ADMISSION_FALLBACK_CAP: 32 }).fallbackCap, 6);
   assert.equal(pressure({ AGENT_ADMISSION_FALLBACK_CAP: 2 }).fallbackCap, 2);
 });
 
 test('env wins per field; invalid controls fall through with sources and never weaken pilot floors', () => {
-  const p = policy({ AGENT_ADMISSION_MODE: 'pressure', AGENT_ADMISSION_CEILING: 12, AGENT_ADMISSION_RESERVE_MIB: 8192 },
+  const p = resolve({ AGENT_ADMISSION_MODE: 'pressure', AGENT_ADMISSION_CEILING: 12, AGENT_ADMISSION_RESERVE_MIB: 8192 },
     { AGENT_ADMISSION_MODE: 'garbage', AGENT_ADMISSION_CEILING: '8', AGENT_ADMISSION_RESERVE_MIB: '1',
       AGENT_ADMISSION_START_INTERVAL_MS: '1', AGENT_ADMISSION_STALE_MS: '60000' });
   assert.equal(p.mode, 'pressure'); assert.equal(p.ceiling, 8); assert.equal(p.reserveMiB, 8192);
-  assert.equal(p.startIntervalMs, 10000); assert.equal(p.staleMs, 15000);
+  assert.equal(p.startIntervalMs, 3000); assert.equal(p.staleMs, 15000);
   assert.equal(p.sources.mode, 'device-config'); assert.equal(p.sources.ceiling, 'env');
   assert.equal(p.rejected.length, 4);
 });
@@ -218,24 +239,52 @@ test('workload classification validates env precedence and preserves unknown/bui
   assert.equal(resolveWorkload({}, {}).admissionClassSource, 'default');
 });
 
-test('ramp is the default: ceiling two above static, bounded by CPUs and never below static, both keys fingerprinted', () => {
-  const p = policy();
-  assert.equal(p.mode, 'ramp'); assert.equal(p.rampStepMs, 300000); assert.equal(p.rampCeiling, 8); assert.equal(p.ceiling, 8);
+test('ramp is the default: one-minute steps up to eight slots above static, at most 32 with no CPU bound, never below static, both keys fingerprinted', () => {
+  const p = resolve();
+  assert.equal(p.mode, 'ramp'); assert.equal(p.rampStepMs, 60000); assert.equal(p.rampCeiling, 14); assert.equal(p.ceiling, 14);
   assert.equal(p.fallbackCap, 6);
-  assert.equal(policy({}, {}, { totalMemBytes: 32 * GiB, cores: 10 }).rampCeiling, 6);
-  assert.equal(policy({}, {}, { totalMemBytes: 256 * GiB, cores: 8 }).rampCeiling, 8);
-  assert.equal(policy({}, { AGENT_ADMISSION_RAMP_CEILING: '32' }).rampCeiling, 16);
-  assert.equal(policy({ AGENT_ADMISSION_RAMP_CEILING: 2 }).rampCeiling, 6);
-  assert.equal(policy({ AGENT_ADMISSION_RAMP_CEILING: 7, AGENT_ADMISSION_RAMP_STEP_MS: 120000 }).fingerprint,
-    policy({}, { AGENT_ADMISSION_RAMP_CEILING: '7', AGENT_ADMISSION_RAMP_STEP_MS: '120000' }).fingerprint);
-  assert.notEqual(policy({ AGENT_ADMISSION_RAMP_STEP_MS: 120000 }).fingerprint, policy().fingerprint);
-  const rejected = policy({ AGENT_ADMISSION_RAMP_STEP_MS: 1000 }, { AGENT_ADMISSION_RAMP_CEILING: '0', AGENT_ADMISSION_MODE: 'burst' });
-  assert.equal(rejected.rampStepMs, 300000); assert.equal(rejected.rampCeiling, 8); assert.equal(rejected.mode, 'ramp');
+  assert.equal(resolve({}, {}, { totalMemBytes: 8 * GiB, cores: 8 }).rampCeiling, 14); // static 6
+  assert.equal(resolve({}, {}, host16).rampCeiling, 22); // static 14
+  assert.equal(resolve({}, {}, { totalMemBytes: 32 * GiB, cores: 10 }).rampCeiling, 28); // static 20, above ten CPUs
+  assert.equal(resolve({}, {}, { totalMemBytes: 48 * GiB, cores: 12 }).rampCeiling, 32); // static 24
+  assert.equal(resolve({}, {}, { totalMemBytes: 256 * GiB, cores: 8 }).rampCeiling, 24); // static 16
+  assert.equal(resolve({}, {}, host48).rampCeiling, 32); // already at the static 32: never steps
+  assert.equal(resolve({}, { AGENT_ADMISSION_RAMP_CEILING: '32' }).rampCeiling, 32);
+  assert.equal(resolve({ AGENT_ADMISSION_RAMP_CEILING: 2 }).rampCeiling, 6);
+  assert.equal(resolve({ AGENT_ADMISSION_RAMP_CEILING: 7, AGENT_ADMISSION_RAMP_STEP_MS: 120000 }).fingerprint,
+    resolve({}, { AGENT_ADMISSION_RAMP_CEILING: '7', AGENT_ADMISSION_RAMP_STEP_MS: '120000' }).fingerprint);
+  assert.notEqual(resolve({ AGENT_ADMISSION_RAMP_STEP_MS: 120000 }).fingerprint, p.fingerprint);
+  const rejected = resolve({ AGENT_ADMISSION_RAMP_STEP_MS: 1000 }, { AGENT_ADMISSION_RAMP_CEILING: '0', AGENT_ADMISSION_MODE: 'burst' });
+  assert.equal(rejected.rampStepMs, 60000); assert.equal(rejected.rampCeiling, 14); assert.equal(rejected.mode, 'ramp');
   assert.deepEqual(rejected.rejected.map(r => r.key).sort(),
     ['AGENT_ADMISSION_MODE', 'AGENT_ADMISSION_RAMP_CEILING', 'AGENT_ADMISSION_RAMP_STEP_MS']);
   assert.equal(stat({ AGENT_ADMISSION_RAMP_CEILING: 12 }).ceiling, 6);
   assert.equal(pressure({ AGENT_ADMISSION_RAMP_CEILING: 12 }).ceiling, 8);
-  for (const key of ['"rampStepMs":300000', '"rampCeiling":8', '"mode":"ramp"']) assert.ok(p.fingerprint.includes(key), key);
+  for (const key of ['"rampStepMs":60000', '"rampCeiling":14', '"mode":"ramp"']) assert.ok(p.fingerprint.includes(key), key);
+});
+
+test('default memory budget: max(2 GiB, 8% RAM) reserve, 512 MiB burst, 1 GiB unknown and 768 MiB ordinary estimates, three-second spacing', () => {
+  const p = resolve();
+  const values = q => [q.reserveMiB, q.reserveFraction, q.burstMiB, q.ordinaryMiB, q.unknownMiB, q.startIntervalMs, q.rampStepMs, q.recoveryExtraMiB];
+  assert.deepEqual(values(p), [2048, 0.08, 512, 768, 1024, 3000, 60000, 2048]);
+  // Each default is also its floor: anything lower falls through to it, while larger values,
+  // the thresholds the mechanics tests pin included, are accepted as configured.
+  const low = resolve({}, { AGENT_ADMISSION_RESERVE_MIB: '2047', AGENT_ADMISSION_RESERVE_FRACTION: '0.07',
+    AGENT_ADMISSION_BURST_MIB: '511', AGENT_ADMISSION_ORDINARY_MIB: '767', AGENT_ADMISSION_UNKNOWN_MIB: '1023',
+    AGENT_ADMISSION_START_INTERVAL_MS: '2999', AGENT_ADMISSION_RAMP_STEP_MS: '59999' });
+  assert.equal(low.rejected.length, 7);
+  assert.deepEqual(values(low), values(p));
+  assert.deepEqual(values(policy()), [6144, 0.125, 1024, 2048, 4096, 10000, 300000, 2048]);
+  assert.deepEqual(policy().rejected, []);
+  // Unknown and build-heavy launches reserve 1 GiB, a comparable ordinary one 768 MiB.
+  assert.equal(estimatePeak(p, { taskAgent: 'codex' }).bytes, GiB);
+  assert.equal(estimatePeak(p, { taskAgent: 'codex', admissionClass: 'ordinary' }).bytes, 768 * MiB);
+  // The reserve is the larger of 2 GiB and 8% of physical RAM, in whole bytes.
+  const required = physicalBytes => decideAdmission({ policy: resolve({ AGENT_ADMISSION_MODE: 'pressure' }),
+    state: initialPressureState(), now: 0, telemetry: telemetry(0, { physicalBytes }), running: 0, estimateBytes: GiB }).requiredBytes;
+  assert.equal(required(16 * GiB), 2 * GiB + 512 * MiB + GiB); // 8% would be 1.28 GiB
+  assert.equal(required(48 * GiB), Math.ceil(48 * GiB * 0.08) + 512 * MiB + GiB); // 3.84 GiB
+  assert.ok(Number.isSafeInteger(required(48 * GiB)));
 });
 
 // Quiet sampling: host telemetry every five seconds from `from` up to and including `to`.
@@ -392,4 +441,93 @@ test('ramp decisions report the ceiling and the next step time; null when no ste
     const decision = other.run(65000);
     assert.deepEqual([decision.rampCap, decision.rampCeiling, decision.rampNextStepAt], [null, null, null]);
   }
+});
+
+// ── Default ramp on a quiet 16 GiB host ──
+
+test('default ramp on a quiet 16 GiB host steps past the static cap one slot a minute to eight above it; a warning sample resets it', () => {
+  const p = resolve({}, {}, host16);
+  assert.deepEqual([p.staticCap, p.rampCeiling, p.rampStepMs, p.startIntervalMs], [14, 22, 60000, 3000]);
+  // 6 of 16 GiB reclaimable covers one more unknown session: 2 GiB reserve + 512 MiB burst
+  // + 1 GiB estimate + 2 GiB recovery margin = 5.5 GiB.
+  const quiet16 = { physicalBytes: 16 * GiB, reclaimableEstimateBytes: 6 * GiB };
+  const estimateBytes = estimatePeak(p, { taskAgent: 'claude' }).bytes;
+  assert.equal(estimateBytes, GiB);
+  const h = harness(p);
+  const run = (at, changes = {}, extra = {}) => h.run(at, { ...quiet16, ...changes }, { running: 14, estimateBytes, ...extra });
+  const caps = [], nextSteps = [];
+  for (let at = 0; at <= 600000; at += 5000) {
+    const d = run(at);
+    assert.equal(h.state.alarm, null, `alarm at ${at}`);
+    assert.equal(d.allowed, d.cap > 14, `allowed at ${at}`);
+    if (caps.at(-1) !== d.cap) { caps.push(d.cap); nextSteps.push(d.rampNextStepAt); }
+  }
+  assert.deepEqual(caps, [14, 15, 16, 17, 18, 19, 20, 21, 22]);
+  assert.deepEqual(nextSteps, [...Array.from({ length: 8 }, (_, n) => (n + 1) * 60000), null]); // null at the ceiling
+  // At the ceiling the full budget applies: 2 GiB reserve + 512 MiB burst + 1 GiB estimate.
+  assert.equal(run(600000, {}, { running: 22 }).requiredBytes, 3.5 * GiB);
+  // A warning sample drops straight back to the static cap; the floor below it never consults memory.
+  const warned = run(605000, { pressure: 'warning' });
+  assert.deepEqual([warned.reason, warned.cap, warned.rampNextStepAt], ['device-cap', 14, null]);
+  assert.deepEqual([h.state.alarm, h.state.rampCap, h.state.normalSince], ['pressure', null, null]);
+  assert.equal(run(605000, { pressure: 'warning' }, { running: 13 }).allowed, true);
+  // Normal again from 610 s: the alarm clears after thirty quiet seconds, the slot returns a
+  // full minute after the window reopened, and starts above the floor are three seconds apart.
+  for (let at = 610000; at < 670000; at += 5000) assert.equal(run(at).cap, 14, `cap at ${at}`);
+  assert.equal(h.state.alarm, null);
+  assert.equal(run(670000).cap, 15);
+  h.state.lastStartAt = 670000;
+  assert.equal(run(672000).reason, 'spacing');
+  assert.equal(run(673000).allowed, true);
+  // The thresholds the mechanics tests pin (13 GiB for one more 4 GiB unknown session) latch a
+  // headroom alarm on the same quiet host, which then never leaves the static cap.
+  const pinned = harness(policy({ AGENT_ADMISSION_RAMP_STEP_MS: 60000, AGENT_ADMISSION_RAMP_CEILING: 22 }, {}, host16));
+  for (let at = 0; at <= 600000; at += 5000) assert.equal(pinned.run(at, quiet16, { running: 14 }).cap, 14);
+  assert.equal(pinned.state.alarm, 'headroom');
+});
+
+// ── Explicit project cap above the static cap (TPT9190) ──
+
+test('an explicit project cap stands in for the static cap in static and ramp mode, never in pressure', () => {
+  assert.equal(projectCapFloor(stat(), 20), 20);
+  assert.equal(projectCapFloor(policy(), 50), 32);
+  assert.equal(projectCapFloor(pressure(), 20), 0);
+  for (const bad of [null, undefined, 0, -1, 1.5, '20', NaN]) assert.equal(projectCapFloor(policy(), bad), 0);
+  const s = harness(policy({ AGENT_ADMISSION_MODE: 'static' }, {}, host16));
+  assert.equal(s.run(0, {}, { running: 14 }).reason, 'device-cap');
+  for (let running = 14; running < 20; running++) {
+    const d = s.run(0, {}, { running, projectCap: 20 });
+    assert.equal(d.allowed, true); assert.deepEqual([d.cap, d.deviceCap], [20, 14]);
+  }
+  assert.equal(s.run(0, {}, { running: 20, projectCap: 20 }).reason, 'device-cap');
+  assert.equal(s.run(0, {}, { running: 1, projectCap: 50 }).cap, 32);
+  const lower = s.run(0, {}, { running: 13, projectCap: 2 }); // a lower cap never lowers the device cap
+  assert.deepEqual([lower.allowed, lower.cap], [true, 14]);
+  assert.equal(s.run(0, {}, { running: 3, projectCap: 20, projectBlocked: true }).reason, 'project-cap');
+  const p = harness(); p.warm();
+  const pressured = p.run(60000, {}, { running: 8, projectCap: 20 });
+  assert.deepEqual([pressured.reason, pressured.cap, pressured.deviceCap], ['device-cap', 8, 8]);
+});
+
+test('ramp: starts below a raised project cap skip memory checks and spacing; the shared ramp keeps the hardware cap', () => {
+  const h = harness(policy()); h.warm();
+  h.state.lastStartAt = 60000;
+  const raised = h.run(65000, { pressure: 'critical' }, { running: 9, projectCap: 10 });
+  assert.equal(raised.allowed, true);
+  assert.deepEqual([raised.cap, raised.deviceCap, raised.rampCap, raised.rampCeiling, raised.rampNextStepAt], [10, 6, 10, 10, null]);
+  assert.deepEqual([h.state.alarm, h.state.rampCap], ['pressure', null]);
+  assert.equal(h.run(65000, { pressure: 'critical' }, { running: 6 }).reason, 'device-cap');
+  assert.equal(h.run(65000, { pressure: 'critical' }, { running: 10, projectCap: 10 }).reason, 'device-cap');
+  // Raised requests never feed the shared ramp: it still steps 6→7 from the hardware cap.
+  const q = harness(policy()); q.warm();
+  for (let at = 65000; at <= 300000; at += 5000) assert.equal(q.run(at, {}, { running: 9, projectCap: 10 }).allowed, true);
+  assert.equal(q.state.rampCap, 7);
+  const shared = q.run(300000, {}, { running: 7 });
+  assert.deepEqual([shared.reason, shared.cap, shared.rampCap], ['device-cap', 7, 7]);
+  // A project cap between the ramp cap and its ceiling: no next-step promise for that request.
+  const mid = q.run(300000, {}, { running: 7, projectCap: 8 });
+  assert.deepEqual([mid.allowed, mid.cap, mid.rampCap, mid.rampCeiling, mid.rampNextStepAt], [true, 8, 8, 8, null]);
+  // A project cap at or below the ramp cap changes nothing.
+  const low = q.run(300000, {}, { running: 7, projectCap: 3 });
+  assert.deepEqual([low.reason, low.cap, low.rampCap, low.rampNextStepAt], ['device-cap', 7, 7, 600000]);
 });

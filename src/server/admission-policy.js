@@ -3,22 +3,24 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { computeDeviceSessionCap } = require('./process-group');
+const { computeDeviceSessionCap, DEVICE_SESSION_CAP_MAX } = require('./process-group');
 const MiB = 1024 ** 2, GiB = 1024 ** 3;
 const DEVICE_DIRECTORY = path.join(os.homedir(), '.tipatask');
 // These are pilot safety floors, not a statement of hardware capacity. Projects
 // cannot override this device file; the existing project session cap still applies.
+// The memory defaults are sized against the 1024 MiB per-session estimate of the static
+// cap (computeDeviceSessionCap), so they block starts when memory runs short, not before.
 const FIELDS = {
   mode: ['MODE', 'ramp', ['static', 'pressure', 'ramp']],
   ceiling: ['CEILING', null, 1, 32],
-  rampStepMs: ['RAMP_STEP_MS', 300000, 60000, 3600000],
+  rampStepMs: ['RAMP_STEP_MS', 60000, 60000, 3600000],
   rampCeiling: ['RAMP_CEILING', null, 1, 32],
-  reserveMiB: ['RESERVE_MIB', 6144, 6144, 1048576],
-  reserveFraction: ['RESERVE_FRACTION', 0.125, 0.125, 0.9],
-  burstMiB: ['BURST_MIB', 1024, 1024, 1048576],
-  ordinaryMiB: ['ORDINARY_MIB', 2048, 2048, 1048576],
-  unknownMiB: ['UNKNOWN_MIB', 4096, 4096, 1048576],
-  startIntervalMs: ['START_INTERVAL_MS', 10000, 10000, 3600000],
+  reserveMiB: ['RESERVE_MIB', 2048, 2048, 1048576],
+  reserveFraction: ['RESERVE_FRACTION', 0.08, 0.08, 0.9],
+  burstMiB: ['BURST_MIB', 512, 512, 1048576],
+  ordinaryMiB: ['ORDINARY_MIB', 768, 768, 1048576],
+  unknownMiB: ['UNKNOWN_MIB', 1024, 1024, 1048576],
+  startIntervalMs: ['START_INTERVAL_MS', 3000, 3000, 3600000],
   recoveryMs: ['RECOVERY_MS', 30000, 30000, 3600000],
   recoveryExtraMiB: ['RECOVERY_EXTRA_MIB', 2048, 2048, 1048576],
   staleMs: ['STALE_MS', 15000, 1000, 15000],
@@ -37,7 +39,7 @@ function readDeviceConfig(directory = DEVICE_DIRECTORY) {
   } catch (err) { return { config: {}, status: err.code === 'ENOENT' ? 'absent' : 'invalid', file }; }
 }
 
-function resolveAdmissionPolicy({ env = process.env, directory, hardware, platform = process.platform, read = readDeviceConfig } = {}) {
+function resolveAdmissionPolicy({ env = process.env, directory, hardware, read = readDeviceConfig } = {}) {
   const hw = hardware || { totalMemBytes: os.totalmem(), cores: os.availableParallelism?.() || os.cpus().length };
   const staticCap = computeDeviceSessionCap(hw);
   const stored = read(directory);
@@ -60,16 +62,14 @@ function resolveAdmissionPolicy({ env = process.env, directory, hardware, platfo
     out[field] = value ?? defaultValue;
     out.sources[field] ||= 'default';
   }
-  const studied = platform === 'darwin' && hw.totalMemBytes === 48 * GiB && hw.cores === 18;
-  // Opting in stages the studied machine at eight; elsewhere opt-in alone never
-  // raises the static ceiling. Expansion beyond twelve is a separate explicit edit.
-  const requested = out.ceiling ?? (studied ? 8 : staticCap);
-  const bound = Math.max(1, Math.min(16, hw.cores || 1));
-  // Ramp steps from the static cap one slot at a time; its ceiling is never below
-  // that cap (a lower value would make the ramp meaningless) and never above the
-  // same CPU bound as pressure. CEILING itself stays a pressure-mode setting.
-  out.rampCeiling = Math.max(staticCap, Math.min(out.rampCeiling ?? staticCap + 2, bound));
-  out.ceiling = out.mode === 'static' ? staticCap : out.mode === 'ramp' ? out.rampCeiling : Math.min(requested, bound);
+  // Ramp steps from the static cap one slot at a time, by default up to eight slots above
+  // it. Its ceiling is never below that cap (a lower value would make the ramp meaningless)
+  // and never above the 32-slot device maximum; the static cap already carries the CPU
+  // bound. CEILING itself stays a pressure-mode setting.
+  out.rampCeiling = Math.max(staticCap, Math.min(out.rampCeiling ?? staticCap + 8, DEVICE_SESSION_CAP_MAX));
+  // Opting into pressure alone keeps the static cap as its ceiling; only an explicit
+  // CEILING moves it, in either direction. Every pressure start still has to fit memory.
+  out.ceiling = out.mode === 'static' ? staticCap : out.mode === 'ramp' ? out.rampCeiling : out.ceiling ?? staticCap;
   out.fallbackCap = Math.min(out.fallbackCap ?? staticCap, staticCap, out.ceiling);
   out.unknownMiB = Math.max(out.unknownMiB, out.ordinaryMiB);
   out.swapReopenMiB = Math.min(out.swapReopenMiB, out.swapCloseMiB);
@@ -103,6 +103,14 @@ function resolveWorkload(config, env = process.env) {
 // stores an instance-local clamped number that another owner could inherit.
 function initialPressureState() { return { alarm: null, normalSince: null, samples: [], lastStartAt: null, rampCap: null }; }
 
+// (TPT9190) An explicit project session cap (AGENT_LIMITS_MAX_CONCURRENT_SESSIONS) stands in
+// for the hardware static cap on that project's own requests in static and ramp mode, up to
+// the 32-slot device maximum. The opt-in pressure ceiling stays device-wide. 0 = none.
+function projectCapFloor(policy, projectCap) {
+  return policy?.mode !== 'pressure' && Number.isSafeInteger(projectCap) && projectCap > 0
+    ? Math.min(projectCap, DEVICE_SESSION_CAP_MAX) : 0;
+}
+
 function observePressure(state, telemetry, policy, now) {
   const host = telemetry?.host;
   const fresh = host?.fresh && host.status === 'ok' && now >= host.sampledAt && now - host.sampledAt <= policy.staleMs;
@@ -131,7 +139,7 @@ function observePressure(state, telemetry, policy, now) {
 }
 
 function decideAdmission({ policy, state, telemetry, now, running, reservedBytes = 0, peakGapBytes = 0,
-  estimateBytes, coordinated = true, projectBlocked = false }) {
+  estimateBytes, coordinated = true, projectBlocked = false, projectCap = null }) {
   const ramp = policy.mode === 'ramp';
   const observation = policy.mode !== 'static' || state.alarm
     ? observePressure(state, telemetry, policy, now) : { fresh: false, swapBytes: null };
@@ -146,7 +154,8 @@ function decideAdmission({ policy, state, telemetry, now, running, reservedBytes
   if (!processFresh || !coordinated) state.normalSince = null;
   const dynamic = policy.mode === 'pressure' && observation.fresh && processFresh && coordinated;
   const host = telemetry?.host;
-  const reserve = Math.max(policy.reserveMiB * MiB, (host?.physicalBytes || 0) * policy.reserveFraction);
+  // Whole bytes, rounded up: a RAM fraction such as 8% of a power-of-two size is fractional.
+  const reserve = Math.max(policy.reserveMiB * MiB, Math.ceil((host?.physicalBytes || 0) * policy.reserveFraction));
   const required = reserve + policy.burstMiB * MiB + peakGapBytes + reservedBytes + estimateBytes;
   const margin = required + policy.recoveryExtraMiB * MiB;
   // A ramp step budgets one more session, not the unspent peaks of every live
@@ -191,18 +200,24 @@ function decideAdmission({ policy, state, telemetry, now, running, reservedBytes
   // past while the rolling-minute swap or the headroom margin still holds the step.
   const rampNextStepAt = ramp && rampCap < policy.rampCeiling && observation.fresh && processFresh && coordinated
     && !state.alarm && state.normalSince !== null ? state.normalSince + policy.rampStepMs : null;
-  const cap = dynamic ? policy.ceiling : ramp ? rampCap : policy.mode === 'static' ? policy.staticCap : policy.fallbackCap;
-  const result = { allowed: false, reason: null, cap, mode: dynamic ? 'pressure' : ramp ? 'ramp' : 'static',
+  const deviceCap = dynamic ? policy.ceiling : ramp ? rampCap : policy.mode === 'static' ? policy.staticCap : policy.fallbackCap;
+  // A project cap standing in for the static cap raises only this request's cap. The shared
+  // ramp state above keeps stepping from the hardware cap, so no other project inherits it,
+  // and its next step is no promise for a request already above it.
+  const floor = projectCapFloor(policy, projectCap);
+  const cap = Math.max(deviceCap, floor);
+  const result = { allowed: false, reason: null, cap, deviceCap, mode: dynamic ? 'pressure' : ramp ? 'ramp' : 'static',
     fallback: policy.mode === 'pressure' && !dynamic, swapBytes: observation.swapBytes,
-    rampCap: ramp ? rampCap : null, rampCeiling: ramp ? policy.rampCeiling : null, rampNextStepAt,
+    rampCap: ramp ? cap : null, rampCeiling: ramp ? Math.max(policy.rampCeiling, cap) : null,
+    rampNextStepAt: cap > deviceCap ? null : rampNextStepAt,
     requiredBytes: required, headroomBytes: host?.reclaimableEstimateBytes ?? null };
   const reject = reason => ({ ...result, reason });
   if (projectBlocked) return reject('project-cap');
   if (running >= cap) return reject('device-cap');
   if (policy.mode === 'static' && !state.alarm) return { ...result, allowed: true };
-  // The static floor never consults memory, exactly as static mode: an alarm
-  // only closes the ramp slots above it.
-  if (ramp && running < policy.staticCap) return { ...result, allowed: true };
+  // The static floor (or a project cap standing in for it) never consults memory, exactly
+  // as static mode: an alarm only closes the ramp slots above it.
+  if (ramp && running < Math.max(policy.staticCap, floor)) return { ...result, allowed: true };
   if (state.alarm) return reject(state.alarm);
   if (dynamic && observation.swapBytes === null) return reject('swap-history');
   if ((policy.mode === 'pressure' || ramp) && state.lastStartAt !== null && now - state.lastStartAt < policy.startIntervalMs) {
@@ -212,4 +227,4 @@ function decideAdmission({ policy, state, telemetry, now, running, reservedBytes
 }
 
 module.exports = { MiB, GiB, DEVICE_DIRECTORY, FIELDS, readDeviceConfig, resolveAdmissionPolicy,
-  estimatePeak, resolveWorkload, initialPressureState, observePressure, decideAdmission };
+  estimatePeak, resolveWorkload, initialPressureState, observePressure, projectCapFloor, decideAdmission };

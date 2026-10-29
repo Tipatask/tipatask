@@ -55,7 +55,8 @@ const PS_TIMEOUT_MS = 5000;
 // legacy TIPATASK_WATCHDOG_KILL=1 opt-in to 'kill'.
 const WATCHDOG_ACTIONS = Object.freeze(['warn', 'pause', 'kill']);
 // `maxConcurrentSessions` has no static default: it is derived from the device's hardware
-// (computeDeviceSessionCap below) unless a config/env value sets a lower per-project cap.
+// (computeDeviceSessionCap below) unless a config/env value sets the project's own cap,
+// which may be lower or higher than the hardware figure (TPT9190).
 const AGENT_LIMIT_DEFAULTS = Object.freeze({
   maxSubagents: 3,
   warnDescendants: DESCENDANT_ALERT_THRESHOLD,
@@ -83,26 +84,31 @@ const AGENT_LIMIT_KEYS = Object.freeze({
 });
 
 // (TPT444) Parallel-session cap derived from the machine, so a 48GB Mac runs many sessions
-// while a small/slow one still stays responsive. Uses a fixed 6144 MiB admission
-// estimate, independent of watchdog defaults or settings. The optional
-// budget argument supports arithmetic callers only; resolveAgentLimits never supplies it.
-//   reserve  = max(6GB, 20% of RAM) kept for the OS, the Task App and the user's other apps
+// while a small/slow one still stays responsive. Uses a fixed 1024 MiB admission
+// estimate per session (TPT9190: a Claude, Codex or Pi terminal tree typically stays well
+// under it), independent of watchdog defaults or settings. The optional budget argument
+// supports arithmetic callers only; resolveAgentLimits never supplies it.
+//   reserve  = max(2048 MiB, 10% of RAM) kept for the OS, the Task App and the user's other apps
 //   ramSlots = floor((RAM - reserve) / budget)
-//   cpuSlots = cores — sessions mostly wait on the model, but build/test bursts are CPU-bound
-// Clamped to [1, DEVICE_SESSION_CAP_MAX]; unreadable hardware numbers fall back to 1 slot.
+//   cpuSlots = 2 × logical CPUs — sessions mostly wait on the model; build/test bursts are CPU-bound
+// Clamped to [DEVICE_SESSION_CAP_MIN, DEVICE_SESSION_CAP_MAX]; unreadable hardware numbers
+// fall back to the floor.
+const DEVICE_SESSION_CAP_MIN = 4;
 const DEVICE_SESSION_CAP_MAX = 32;
-const DEVICE_SESSION_BUDGET_MB = 6144;
-const DEVICE_RESERVE_MIN_MB = 6144;
-const DEVICE_RESERVE_FRACTION = 0.2;
+const DEVICE_SESSION_BUDGET_MB = 1024;
+const DEVICE_RESERVE_MIN_MB = 2048;
+const DEVICE_RESERVE_FRACTION = 0.1;
+const DEVICE_SLOTS_PER_CPU = 2;
 
 function computeDeviceSessionCap({ totalMemBytes, cores, sessionBudgetMb } = {}) {
   const totalMb = Number(totalMemBytes) / (1024 * 1024);
   const budget = Number(sessionBudgetMb) > 0 ? Number(sessionBudgetMb) : DEVICE_SESSION_BUDGET_MB;
-  const cpuSlots = Math.floor(Number(cores));
-  if (!Number.isFinite(totalMb) || totalMb <= 0 || !Number.isFinite(cpuSlots) || cpuSlots < 1) return 1;
+  const cpus = Math.floor(Number(cores));
+  if (!Number.isFinite(totalMb) || totalMb <= 0 || !Number.isFinite(cpus) || cpus < 1) return DEVICE_SESSION_CAP_MIN;
   const reserveMb = Math.max(DEVICE_RESERVE_MIN_MB, totalMb * DEVICE_RESERVE_FRACTION);
   const ramSlots = Math.floor((totalMb - reserveMb) / budget);
-  return Math.max(1, Math.min(DEVICE_SESSION_CAP_MAX, ramSlots, cpuSlots));
+  const cpuSlots = cpus * DEVICE_SLOTS_PER_CPU;
+  return Math.max(DEVICE_SESSION_CAP_MIN, Math.min(DEVICE_SESSION_CAP_MAX, ramSlots, cpuSlots));
 }
 
 function detectHardware() {
@@ -171,7 +177,9 @@ function resolveAgentLimits(projectRoot, { env = process.env, readConfig, hardwa
   const envCap = parseLimitInt(envVars[capKey]);
   const cfgCap = envCap === null ? parseLimitInt(cfg && cfg[capKey]) : null;
   const explicitCap = envCap ?? cfgCap;
-  out.maxConcurrentSessions = explicitCap === null ? deviceSessionCap : Math.min(explicitCap, deviceSessionCap);
+  // (TPT9190) An explicit cap replaces the hardware figure for this project in both directions,
+  // up to the 32-slot device maximum; the start queue lets it raise the device-wide limit too.
+  out.maxConcurrentSessions = explicitCap === null ? deviceSessionCap : Math.min(explicitCap, DEVICE_SESSION_CAP_MAX);
   out.deviceSessionCap = deviceSessionCap;
   out.sessionCapSource = envCap !== null ? 'env' : (cfgCap !== null ? 'config' : 'device');
   if (explicitCap !== null) out.projectSessionCap = explicitCap;
@@ -193,6 +201,8 @@ function scaleAgentLimitsForConcurrency(limits, activeCount) {
   const out = { ...limits };
   // Only advisory budgets and prompt fan-out scale. Enforcement never tightens
   // merely because another terminal starts, including with custom base limits.
+  // Each value stays at one or more for any session count, so every kickoff prompt up
+  // to the 32-slot device maximum (and beyond) still allows one sub-agent.
   for (const [field, source] of [['advisoryDescendants', 'warnDescendants'],
     ['advisoryTreeRssMb', 'maxTreeRssMb'], ['maxSubagents', 'maxSubagents']]) {
     const value = parseLimitInt(limits[source]);
@@ -809,6 +819,7 @@ module.exports = {
   WATCHDOG_ACTIONS,
   AGENT_LIMIT_DEFAULTS,
   AGENT_LIMIT_KEYS,
+  DEVICE_SESSION_CAP_MIN,
   DEVICE_SESSION_CAP_MAX,
   computeDeviceSessionCap,
   resolveAgentLimits,

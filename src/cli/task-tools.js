@@ -4,11 +4,15 @@
 // Credential-safe REST recovery and Pi terminal tools. Bodies/resolutions arrive
 // on stdin; tokens are read internally and never passed through argv or stdout.
 // `next <key>` (TPT9163) is a cowboy chain run's start_next_tasks: it sends only the
-// run's own TIPATASK_COWBOY_TOKEN, never the account token.
+// run's own TIPATASK_COWBOY_TOKEN, never the account token. (TPT9195) In a cowboy run
+// `complete` makes that request itself once the completion is saved, printing the
+// answer as `cowboyNext`, as the complete_task MCP tool does.
 async function run(argv, { input = '', fetchImpl = fetch, env = process.env } = {}) {
+  const since = Date.now();
   const [command, target] = argv;
+  const cowboy = require('../server/cowboy-next-request');
   if (command === 'next') {
-    return require('../server/cowboy-next-request').requestNextTasks(target, { env, fetchImpl });
+    return cowboy.requestNextTasks(target, { env, fetchImpl });
   }
   const { resolveProjectRoot } = require('../server/project-root');
   const root = resolveProjectRoot();
@@ -19,7 +23,8 @@ async function run(argv, { input = '', fetchImpl = fetch, env = process.env } = 
     const backend = createPerProjectBackend({ TASK_BACKEND: 'api' }, root);
     const guard = require('../server/git-merge/completion-guard');
     const opts = { backend, projectRoot: root, taskId: target, resolution: input };
-    return command === 'verify' ? guard.verifyTaskCompletion(opts) : guard.completeVerifiedTask(opts);
+    if (command === 'verify') return guard.verifyTaskCompletion(opts);
+    return cowboy.startChainAfterCompletion(target, await guard.completeVerifiedTask(opts), { env, fetchImpl, since });
   }
   // Share the chat path validator, extending only the terminal's documented KB writes.
   const { resolveTipataskRequest } = require('../server/providers/pi-ext/tipatask-request.cjs');

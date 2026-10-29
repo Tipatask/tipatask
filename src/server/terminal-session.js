@@ -34,7 +34,7 @@ const archCache = require('../mcp/architecture-cache');
 const { getTagsForTask } = require('./tag-cache');
 const { resolveAttachmentDir } = require('./attachment-paths');
 const { openPtyTrace } = require('./pty-trace'); // (TPT9048) TIPATASK_PTY_TRACE kickoff diagnostics
-const { selectNextCowboyTasks, effectivePermissionMode, chainKickoffPrompt, chainLaunchAgent } = require('./cowboy-next'); // (TPT9162)
+const { selectNextCowboyTasks, effectivePermissionMode, chainKickoffPrompt, chainInheritance, chainPickFields, chainLaunchAgent } = require('./cowboy-next'); // (TPT9162)
 const { withProjectLock } = require('./project-mutex');
 const { LOCAL_HOST } = require('./local-access');
 const {
@@ -1726,17 +1726,31 @@ async function readProjectPermissionMode(backend) {
   } catch { return null; }
 }
 
+// (TPT9194) A Pi image task — its own agent pi, its piModel an image-purpose PI_MODELS row (one
+// with broken image settings too) — is no chain pick: an image operation never runs in bypass.
+function isPiImageTask(projectRoot, task) {
+  if (task?.agentAssignee !== 'pi' || !task.piModel) return false;
+  try { return !!require('./image-task').resolveImageEntry(projectRoot, task.piModel, task); }
+  catch (err) { return /^image_/.test(err?.reasonCode || ''); }
+}
+
 // Starts the next tasks of a cowboy chain once the run of `finishedKey` has finished its task —
 // POST /api/tasks/:key/cowboy-next. Refuses (reason, nothing started) unless that run is live,
 // carries cowboyChain and is still confirmed in bypass, and its task — read fresh — is in the
 // complete role with a stored effective mode of bypass. The picks are selectNextCowboyTasks()
-// (cowboy-next.js) over a fresh read; each one starts through deps.startTask() — ws-handlers.js
+// (cowboy-next.js) over a fresh read. (TPT9194) Each pick first takes this run's settings —
+// backend.updateTask() with chainPickFields(): its agent and model, the task override `bypass` and
+// Cowboy-coding mode, never queued offline — then starts through deps.startTask() — ws-handlers.js
 // startChainedTaskSession(): the session setup, start queue and spawnTerminal() a Start uses — with
-// the task's own agent, its Start kickoff, { cowboyChain: true } and its own TIPATASK_COWBOY_TOKEN.
+// that agent and model, its Start kickoff, { cowboyChain: true } and its own TIPATASK_COWBOY_TOKEN.
 // One decision per run: a repeat returns 'already_launched' and starts nothing. Chains of one
 // project run one at a time, so two runs finishing together never start the same task.
-// Returns { started, reason } (+ `previous` on a repeat); a failed task read throws and leaves the
-// run free to ask again. deps: { sessions, backend, startTask, fetchStatusRoles?, websocket? }.
+// Returns { started, reason, skipped } for a decision (+ `previous` on a repeat) — (TPT9193)
+// `skipped` is selectNextCowboyTasks()'s [{ key, reason }] plus each pick that did not start
+// ('update_failed' when its settings were not saved, 'live_session' when startTask() found a
+// session, 'start_failed' when it threw) — and { started: [], reason } for a refusal; a failed
+// task read throws and leaves the run free to ask again.
+// deps: { sessions, backend, startTask, fetchStatusRoles?, websocket? }.
 async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
   const { sessions, backend, startTask } = deps;
   const root = projectRoot || config.PROJECT_ROOT;
@@ -1744,12 +1758,15 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
   if (!run) return { started: [], reason: 'no_session' };
   if (!run.cowboyChain) return { started: [], reason: 'not_cowboy' };
   if (run._cowboyNext) {
-    return run._cowboyNext.pending
-      ? { started: [], reason: 'already_launched' }
-      : { started: [], reason: 'already_launched', previous: { started: run._cowboyNext.started, reason: run._cowboyNext.reason } };
+    const first = run._cowboyNext;
+    return first.pending
+      ? { started: [], reason: 'already_launched', skipped: [] }
+      : { started: [], reason: 'already_launched', skipped: [], previous: { started: first.started, reason: first.reason, skipped: first.skipped } };
   }
   if (run.permissionPolicy?.mode !== 'bypass') return { started: [], reason: 'not_bypass' };
   run._cowboyNext = { pending: true };
+  const inherited = chainInheritance(run); // (TPT9194)
+  const websocket = deps.websocket || require('./websocket');
   let decision = null;
   try {
     decision = await withProjectLock(`cowboy\0${root}`, async () => {
@@ -1766,16 +1783,36 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
       // The task list is cached briefly; the finished row is the fresh read.
       const rows = [finished, ...(tasks || []).filter(t => t && t.id !== finished.id)];
       const picked = selectNextCowboyTasks(finished, rows, {
-        statusRoles, projectMode, currentUserId, liveTaskIds: liveTerminalTaskKeys(sessions, root),
+        statusRoles, currentUserId, liveTaskIds: liveTerminalTaskKeys(sessions, root),
+        isImageTask: task => isPiImageTask(root, task),
       });
       const started = [];
+      const skipped = [...picked.skipped];
+      const fields = chainPickFields(inherited);
       for (const task of picked.tasks) {
-        let ok = false;
+        // (TPT9194) Saved before the start, so launchNewTerminalSession()'s fresh read carries the
+        // bypass override spawnTerminal() requires of a chain launch; a pick without it never starts.
+        let saved = null;
+        try {
+          saved = await backend.updateTask(task.id, fields, { queueOffline: false });
+        } catch (err) {
+          console.warn(`[cowboy] ${finishedKey}: could not update ${task.id}: ${err.message}`);
+        }
+        if (saved?.agentPermissionMode !== 'bypass') {
+          skipped.push({ key: task.id, reason: 'update_failed' });
+          continue;
+        }
+        try { websocket.emitTaskUpdated(saved, null, run.projectPath || ''); } catch (err) {
+          console.warn(`[cowboy] ${finishedKey}: could not broadcast ${task.id}: ${err.message}`);
+        }
+        const pick = { ...task, ...saved };
+        let ok = null;
         try {
           ok = await startTask({
-            task,
-            agent: chainLaunchAgent(task),
-            prompt: chainKickoffPrompt(task),
+            task: pick,
+            agent: chainLaunchAgent(pick, inherited.agent),
+            model: inherited.model,
+            prompt: chainKickoffPrompt(pick),
             cowboyChain: true,
             env: { [COWBOY_TOKEN_ENV]: mintCowboyToken() },
           });
@@ -1783,18 +1820,22 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
           console.warn(`[cowboy] ${finishedKey}: could not start ${task.id}: ${err.message}`);
         }
         if (ok) started.push(task.id);
+        else skipped.push({ key: task.id, reason: ok === false ? 'live_session' : 'start_failed' });
       }
       const reason = started.length || !picked.tasks.length ? picked.reason : 'start_failed';
-      return { started, reason, decided: true };
+      return { started, reason, skipped, decided: true };
     });
   } finally {
-    run._cowboyNext = decision && decision.decided ? { started: decision.started, reason: decision.reason } : null;
+    run._cowboyNext = decision && decision.decided ? { started: decision.started, reason: decision.reason, skipped: decision.skipped } : null;
   }
-  console.log(`[cowboy] ${finishedKey}: ${decision.reason} — started ${decision.started.join(', ') || 'nothing'}`);
+  const skips = (decision.skipped || []).map(s => `${s.key} (${s.reason})`).join(', ');
+  console.log(`[cowboy] ${finishedKey}: ${decision.reason} — started ${decision.started.join(', ') || 'nothing'}${skips ? `; skipped ${skips}` : ''}`);
   if (decision.started.length) {
-    (deps.websocket || require('./websocket')).emitCowboyChainStarted(run.projectPath || '', { taskId: finishedKey, started: decision.started });
+    websocket.emitCowboyChainStarted(run.projectPath || '', { taskId: finishedKey, started: decision.started });
   }
-  return { started: decision.started, reason: decision.reason };
+  return decision.decided
+    ? { started: decision.started, reason: decision.reason, skipped: decision.skipped }
+    : { started: decision.started, reason: decision.reason };
 }
 
 // (C1444) Thin wrapper — flags the session as "starting" for the full duration of

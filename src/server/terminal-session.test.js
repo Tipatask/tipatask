@@ -3258,6 +3258,21 @@ test('terminal kickoff scales the prompt cap against live sessions across projec
   }
 });
 
+test('terminal kickoff beside 19 live terminals still states a sub-agent cap of at least one', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const sessions = new Map(Array.from({ length: 19 }, (_, n) => [`live-${n}`,
+    { type: 'terminal', alive: true, ptyPid: 1000 + n, projectPath: n % 2 ? '/one' : '/two' }]));
+  const captures = [];
+  const kickoff = await startClaudeKickoff(t, { sessions, captureSpawn: (agent, prompt, opts) => captures.push({
+    limits: opts.agentLimits, prompt: agent.buildPrompt(prompt, opts) }) });
+  t.after(() => stopSession(kickoff.session));
+  const { resolveAgentLimits, scaleAgentLimitsForConcurrency } = require('./process-group');
+  assert.deepEqual(captures[0].limits, scaleAgentLimitsForConcurrency(resolveAgentLimits(config.PROJECT_ROOT), 20));
+  const stated = Number(captures[0].prompt.match(/at most (\d+) sub-agents or background commands/)?.[1]);
+  assert.equal(stated, captures[0].limits.maxSubagents);
+  assert.ok(stated >= 1, `the prompt states a cap of ${stated}`);
+});
+
 test('terminal spawn and natural exit notify memory lifetime tracker exactly once', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
   const { setSessionMemoryTracker } = require('./session-memory');

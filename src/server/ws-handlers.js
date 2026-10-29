@@ -66,7 +66,8 @@ let sleepWatchdogSessions = null;
 startSleepWatchdog(() => sleepWatchdogSessions);
 
 // (TPT444) Device-wide FIFO start queue for task terminal sessions (session-queue.js). The
-// limits come from resolveAgentLimits(): a hardware-derived cap, optionally lowered per project.
+// limits come from resolveAgentLimits(): a hardware-derived cap, optionally lowered or raised
+// per project (TPT9190).
 const sessionQueue = createSessionQueue({
   getSessions: () => sleepWatchdogSessions,
   defaultProject: config.PROJECT_ROOT,
@@ -1326,8 +1327,9 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
     // succeeded, asks for its chain: terminal-session.js launchCowboyChain() picks the next tasks
     // (cowboy-next.js selectNextCowboyTasks()) and startChainedTaskSession() starts each one. Only
     // the run's own token reaches here (checked above and in local-access.js). 200 { started,
-    // reason } for a decision (a repeat is a no-op: 'already_launched' + `previous`), 409 for a
-    // refusal, 503 when the tasks could not be read (the run may ask again).
+    // reason, skipped } for a decision (a repeat is a no-op: 'already_launched' + `previous`), 409
+    // for a refusal, 503 when the tasks could not be read (the run may ask again). (TPT9193)
+    // `skipped` names each candidate that did not start, [{ key, reason }], so the agent can say why.
     // Contract: ai/architecture/tt-claude-session-terminal.md § Cowboy chains.
     if (cowboyNextKey !== null) {
       const sendCowboyJson = (status, body) => {
@@ -1341,7 +1343,8 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
           startTask: launch => startChainedTaskSession(launch, { sessions, backend, projectPath, registryOps }),
         });
         const refused = ['no_session', 'not_cowboy', 'not_bypass', 'not_finished'].includes(result.reason);
-        return sendCowboyJson(refused ? 409 : 200, result);
+        if (refused) return sendCowboyJson(409, result);
+        return sendCowboyJson(200, { ...result, skipped: Array.isArray(result.skipped) ? result.skipped : [] });
       } catch (err) {
         console.error(`[cowboy] ${cowboyNextKey}: chain failed: ${err.message}`);
         return sendCowboyJson(503, { started: [], reason: 'unavailable', error: err.message });
@@ -4329,7 +4332,7 @@ function sessKey(id, projectPath) {
 // `session.ws`, and a session whose socket is gone is simply left running unattached, exactly
 // like one minimized after start.
 async function launchNewTerminalSession(ctx) {
-  const { session, prompt, taskId, sessionKey, sessions, backend, projectPath, initialCols, initialRows, _piModelParam, cowboyChain = false, env } = ctx;
+  const { session, prompt, taskId, sessionKey, sessions, backend, projectPath, initialCols, initialRows, _piModelParam, cowboyChain = false, env, launchModel = '' } = ctx;
   detachQueuedClient(session);
   let ws = session.ws && session.ws.readyState === session.ws.OPEN ? session.ws : null;
   try {
@@ -4385,8 +4388,9 @@ async function launchNewTerminalSession(ctx) {
       _task = await claimUnassignedTaskOnStart(backend, taskId, _task, _me, projectPath);
       // C1122 — _piModelParam prefixed so the validated launch-time pick survives even
       // when the getTask() try/catch above swallowed an error before _taskModel was set.
-      // (TPT9162) cowboyChain + env (TIPATASK_COWBOY_TOKEN) come only from startChainedTaskSession().
-      await spawnTerminal(session, prompt, taskId, taskTags, { sessions, initialCols, initialRows, backend, model: _piModelParam || _taskModel, discovery, designMode: _designMode, task: _task, cowboyChain, env });
+      // (TPT9162) cowboyChain + env (TIPATASK_COWBOY_TOKEN) come only from startChainedTaskSession(),
+      // (TPT9194) as does launchModel: the model a chained start inherited, ahead of the row's.
+      await spawnTerminal(session, prompt, taskId, taskTags, { sessions, initialCols, initialRows, backend, model: _piModelParam || launchModel || _taskModel, discovery, designMode: _designMode, task: _task, cowboyChain, env });
       if (session.alive) forgetLostSession(taskId, projectPath || config.PROJECT_ROOT, config.USER_DATA_ROOT);
       if (session._terminated || sessions.get(sessionKey) !== session) {
         try { ws && ws.close(); } catch { /* already closed */ }
@@ -4437,13 +4441,15 @@ function hasLiveTerminal(session) {
 }
 
 // (TPT9162) One cowboy-chain start (terminal-session.js launchCowboyChain()), with no socket: the
-// session setup handleConnection()'s "Spawn new session" branch does for a Start — the task's own
-// agent when it is available (else the project default, as a Start falls back), attention and
-// lifecycle wiring — then the device start queue and launchNewTerminalSession(), whose
-// spawnTerminal() gets { cowboyChain, env }. An exited run's retained session is replaced, as a
-// Start replaces it. Resolves true once the session is admitted or queued, false when the task
-// already has a live, starting or queued session. A failure after that ends the session through
-// the usual `start-failed` session-ended broadcast.
+// session setup handleConnection()'s "Spawn new session" branch does for a Start — launch.agent
+// ((TPT9194) the finished run's agent, else the task's own) when it is available (else the project
+// default, as a Start falls back), attention and lifecycle wiring — then the device start queue and
+// launchNewTerminalSession(), whose spawnTerminal() gets { cowboyChain, env }. (TPT9194)
+// launch.model, the finished run's model, goes ahead of the task row's model while the session runs
+// launch.agent; a Pi model must also be a tool-capable or image row of this project's PI_MODELS. An
+// exited run's retained session is replaced, as a Start replaces it. Resolves true once the session
+// is admitted or queued, false when the task already has a live, starting or queued session. A
+// failure after that ends the session through the usual `start-failed` session-ended broadcast.
 async function startChainedTaskSession(launch, { sessions, backend, projectPath = '', registryOps = null }) {
   const taskId = launch.task.id;
   const sessionKey = sessKey(taskId, projectPath);
@@ -4466,6 +4472,16 @@ async function startChainedTaskSession(launch, { sessions, backend, projectPath 
       console.warn(`[cowboy] ${taskId}: agent ${launch.agent} is unavailable — starting with ${session.taskAgent}`);
     }
   }
+  // (TPT9194) The inherited model goes only with the agent it came from. A Pi model is validated as
+  // a Start's model pick is (handleConnection()): a dropped one leaves the task's own model.
+  let launchModel = '';
+  if (launch.agent && session.taskAgent === launch.agent && typeof launch.model === 'string') {
+    launchModel = launch.model.trim();
+    if (launchModel && launch.agent === 'pi' && !piTaskEntryForModel(readProjectConfig(projectPath || config.PROJECT_ROOT), launchModel).entry) {
+      console.warn(`[cowboy] ${taskId}: pi model ${launchModel} is not a usable row of this project's PI_MODELS — starting with the task's own model`);
+      launchModel = '';
+    }
+  }
   // The availability read awaited: a Start may have claimed the key meanwhile.
   const existing = sessions.get(sessionKey);
   if (hasLiveTerminal(existing)) return false;
@@ -4473,7 +4489,7 @@ async function startChainedTaskSession(launch, { sessions, backend, projectPath 
   sessions.set(sessionKey, session);
   wireSessionLifecycle(session, taskId, backend, { sessions, sessionKey });
   const launchCtx = { session, prompt: launch.prompt, taskId, sessionKey, sessions, backend, projectPath,
-    initialCols: 0, initialRows: 0, _piModelParam: '', cowboyChain: launch.cowboyChain === true, env: launch.env };
+    initialCols: 0, initialRows: 0, _piModelParam: '', cowboyChain: launch.cowboyChain === true, env: launch.env, launchModel };
   const admitted = sessionQueue.submit({ key: sessionKey, session, taskId, start: () => launchNewTerminalSession(launchCtx) });
   if (!admitted.queued) {
     Promise.resolve(admitted.done).catch(err => console.warn(`[cowboy] ${taskId}: start failed: ${err.message}`));

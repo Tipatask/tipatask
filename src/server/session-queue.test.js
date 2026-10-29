@@ -16,7 +16,7 @@ function harness({ cap = 2, projectCaps = {}, defaultProject = '/p' } = {}) {
     resolveLimits: (project) => {
       const own = projectCaps[project];
       return own
-        ? { deviceSessionCap: cap, maxConcurrentSessions: Math.min(own, cap), sessionCapSource: 'config' }
+        ? { deviceSessionCap: cap, maxConcurrentSessions: own, projectSessionCap: own, sessionCapSource: 'config' }
         : { deviceSessionCap: cap, maxConcurrentSessions: cap, sessionCapSource: 'device' };
     },
     onChange: (projectPath, snap) => changes.push({ projectPath, snap }),
@@ -124,6 +124,18 @@ test('the device cap is shared across projects', async () => {
   const h = harness({ cap: 2 });
   h.request('A', '/a'); h.request('B', '/b'); const c = h.request('C', '/c');
   assert.equal(c.result.queued, true);
+});
+
+test('a project cap above the device cap raises the limit for that project only (TPT9190)', async () => {
+  const h = harness({ cap: 2, projectCaps: { '/a': 4 } });
+  const results = ['A1', 'A2', 'A3', 'A4', 'A5'].map(id => h.request(id, '/a').result);
+  await tick();
+  assert.deepEqual(h.started, ['A1', 'A2', 'A3', 'A4']);
+  assert.deepEqual(results.map(r => r.queued), [false, false, false, false, true]);
+  assert.equal(h.queue.snapshot('/a').cap, 4);
+  // The other project keeps the device cap, already exceeded by /a's four.
+  assert.equal(h.request('B1', '/b').result.queued, true);
+  assert.equal(h.queue.snapshot('/b').cap, 2);
 });
 
 test('a failing start never throws out of drain, releases the launch stamp, and later entries still run', async () => {

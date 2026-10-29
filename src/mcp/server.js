@@ -1195,30 +1195,38 @@ async function main() {
     }
   );
 
+  // (TPT9195) In a cowboy chain run (TIPATASK_COWBOY_TOKEN/URL in this server's env) a saved
+  // completion of the run's own task also asks Task App for the chain's next tasks
+  // (cowboy-next-request.js startChainAfterCompletion()) and adds the answer as `cowboyNext`; a
+  // failed or refused request never fails the completion.
   server.tool(
     'complete_task',
-    `Verify live VCS settings, the required task commit and local merges, then post one resolution report and set the project's completion status. Refuses a missing task commit (commits on), unmerged/dirty task branches, conflicts, incorrect gitlinks, and unknown verification. Run relevant checks first. Does not perform git writes. ${projectScopeNote}`,
+    `Verify live VCS settings, the required task commit and local merges, then post one resolution report and set the project's completion status. Refuses a missing task commit (commits on), unmerged/dirty task branches, conflicts, incorrect gitlinks, and unknown verification. Run relevant checks first. Does not perform git writes. In a cowboy chain run it then starts the chain's next tasks itself and reports them as cowboyNext: { started, reason, skipped }. ${projectScopeNote}`,
     { task_key: z.string(), resolution: z.string().min(1).describe('Plain-English report: changes, files, verification results, follow-ups/caveats') },
     async ({ task_key, resolution }) => {
+      const since = Date.now();
       await ensureBackend();
       const taskId = normalizeTaskKey(task_key);
-      const result = await require('../server/git-merge/completion-guard').completeVerifiedTask({
+      const completion = await require('../server/git-merge/completion-guard').completeVerifiedTask({
         backend, projectRoot: config.PROJECT_ROOT, taskId, resolution,
       });
       taskCache.invalidate();
+      const result = await require('../server/cowboy-next-request').startChainAfterCompletion(taskId, completion, { since });
       return { content: [{ type: 'text', text: JSON.stringify({ project_id: projectId, ...result }) }], isError: !result.completed };
     }
   );
 
   // ── start_next_tasks ── (LOCAL_ONLY — always registered; see tt-mcp-server.md)
-  // TPT9163 — a cowboy chain run, once complete_task succeeded, asks Task App to start the chain's
-  // next tasks (POST /api/tasks/:key/cowboy-next with the run's TIPATASK_COWBOY_TOKEN — see
+  // TPT9163 — a cowboy chain run asks Task App to start the chain's next tasks (POST
+  // /api/tasks/:key/cowboy-next with the run's TIPATASK_COWBOY_TOKEN — see
   // ../server/cowboy-next-request.js). Task App picks and starts them; this tool reads no task and
   // needs no backend. Outside a cowboy run (no token in this server's env) it returns isError.
+  // (TPT9195) complete_task already makes this request, so this is the retry for its
+  // `unavailable` answer.
 
   server.tool(
     'start_next_tasks',
-    'Cowboy chain runs only (Bypass, with Cowboy-coding mode on or started by a chain): after complete_task succeeded, ask Task App to start the next tasks of this chain, each in its own new agent session with that task\'s own agent and model. Call once, with the key of the task this run just completed; Task App picks the tasks — never start them yourself. Returns the started task keys and the reason.',
+    'Cowboy chain runs only (Bypass, with Cowboy-coding mode on or started by a chain): complete_task already asks Task App to start the next tasks of this chain, each in its own new agent session with this run\'s agent and model, and reports the answer as cowboyNext. Call this only as a retry, once, when that answer\'s reason is `unavailable`, with the key of the task this run just completed; Task App picks the tasks — never start them yourself. Returns the started task keys, the reason, and `skipped`: each candidate task that did not start, with its reason code.',
     { task_key: z.string().describe('Key of the task this run just completed') },
     async ({ task_key }) => {
       const result = await require('../server/cowboy-next-request').requestNextTasks(normalizeTaskKey(task_key));

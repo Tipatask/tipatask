@@ -1,7 +1,7 @@
 'use strict';
 
 const { randomUUID, createHash } = require('node:crypto');
-const { MiB, resolveAdmissionPolicy, resolveWorkload, estimatePeak, decideAdmission } = require('./admission-policy');
+const { MiB, resolveAdmissionPolicy, resolveWorkload, estimatePeak, projectCapFloor, decideAdmission } = require('./admission-policy');
 const { createAdmissionCoordinator, parseServerCensus } = require('./admission-coordinator');
 const { createCommandRunner } = require('./host-memory');
 const { readProjectConfig } = require('./project-config');
@@ -101,8 +101,12 @@ function createSessionAdmission({ getSessions, getTelemetry, isRunning, resolveP
       if ((unregistered || uncertain) && effective.mode !== 'pressure') {
         effective.staticCap = Math.min(effective.staticCap, effective.fallbackCap);
       }
+      // (TPT9190) A project cap above the static cap raises that project's requests, except
+      // under coordination doubt, which holds every request to the shared fallback above.
+      const floorFor = cap => (unregistered || uncertain ? 0 : projectCapFloor(effective, cap));
       let decision = decideAdmission({ policy: effective, state: state.pressure, telemetry, now: time,
         running, coordinated, projectBlocked: Number.isInteger(projectCap) && sameProject >= projectCap,
+        projectCap: floorFor(projectCap) || null,
         reservedBytes: slots.reduce((sum, s) => sum + s.reservedBytes, 0),
         peakGapBytes: slots.reduce((sum, s) => sum + s.gapBytes, 0) + owners.reduce((sum, o) => sum + (o.extraGapBytes || 0), 0),
         estimateBytes: estimate.bytes });
@@ -117,6 +121,9 @@ function createSessionAdmission({ getSessions, getTelemetry, isRunning, resolveP
         const eligible = earlier.some(e => {
           const count = slots.filter(s => s.running && s.project === e.project).length;
           if (Number.isInteger(e.projectCap) && count >= e.projectCap) return false;
+          // Caps differ per project once one raises its own: an earlier request whose
+          // device-wide cap is already full cannot start either, so it never holds this one.
+          if (running >= Math.max(decision.deviceCap, floorFor(e.projectCap))) return false;
           return decision.mode !== 'pressure' || decision.headroomBytes >= decision.requiredBytes - estimate.bytes + e.estimateBytes;
         });
         if (eligible) decision = { ...decision, allowed: false, reason: 'fifo' };

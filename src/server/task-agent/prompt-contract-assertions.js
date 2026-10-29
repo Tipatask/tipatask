@@ -70,12 +70,13 @@ function followUps(text) {
 
 function cowboyChain(text) {
   once(text, /Cowboy chain:/, 'cowboy chain directive delivered exactly once');
-  once(text, /After[^\n]*(?:complete_task`? succeeded|completion succeeds)[^\n]*(?:start_next_tasks\(task_key\)|tt next)[^\n]*exactly once/,
-    'the next tasks are requested exactly once, only after a successful completion');
+  once(text, /(?:complete_task`? succeeds|Completion \(completed: ?true\))[^\n]*starts the chain itself/,
+    'a successful completion starts the chain itself exactly once');
+  once(text, /(?:start_next_tasks\(task_key\)|tt next)[^\n]*(?:only as a retry|once, only if)[^\n]*unavailable/,
+    'the next-tasks call is only a retry of an unavailable answer exactly once');
   once(text, /Never pick, start or work on the next tasks yourself/, 'the agent never picks or starts tasks itself exactly once');
-  once(text, /refused[^\n]*(?:do not call it|skip it)/, 'a refused or blocked completion starts nothing exactly once');
+  once(text, /refused[^\n]*chain stops/, 'a refused or blocked completion starts nothing exactly once');
   once(text, /(?:task keys it started|started task keys)[^\n]*(?:final message|reason)/, 'the started keys are reported exactly once');
-  assert.match(text, /No retry|Do not retry/, 'the request is never retried');
 }
 
 function tagBackfill(text, id) {

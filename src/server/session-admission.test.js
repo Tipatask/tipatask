@@ -12,12 +12,21 @@ const { createSessionQueue } = require('./session-queue');
 const { resolveAgentLimits } = require('./process-group');
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
-function harness(t, { mode = 'pressure', config = {}, projectConfigs = {} } = {}) {
+// Unless `pinned: false`, a harness pins the thresholds these replays are written against
+// (five-minute ramp steps up to a ceiling of eight, ten-second spacing, a max(6 GiB, 12.5%)
+// reserve, 1 GiB burst, 2 GiB ordinary and 4 GiB unknown estimates), so tuning a default
+// never moves their arithmetic; admission-policy.test.js covers the defaults themselves.
+const PINNED = { AGENT_ADMISSION_RAMP_STEP_MS: 300000, AGENT_ADMISSION_RAMP_CEILING: 8,
+  AGENT_ADMISSION_START_INTERVAL_MS: 10000, AGENT_ADMISSION_RESERVE_MIB: 6144, AGENT_ADMISSION_RESERVE_FRACTION: 0.125,
+  AGENT_ADMISSION_BURST_MIB: 1024, AGENT_ADMISSION_ORDINARY_MIB: 2048, AGENT_ADMISSION_UNKNOWN_MIB: 4096 };
+// The default host is RAM-bound (8 GiB: static cap 6, pinned ramp ceiling 8) so slot counts
+// stay small; pressure mode opts in at a ceiling of eight. Telemetry models a 48 GiB machine.
+function harness(t, { mode = 'pressure', pinned = true, config = {}, projectConfigs = {}, hardware = { totalMemBytes: 8 * GiB, cores: 16 } } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'admission-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const instances = [], alive = new Set(), clock = { at: 0 }, host = {}, processes = { rows: [], fresh: true, status: 'ok' };
-  const cfg = { AGENT_ADMISSION_MODE: mode, ...config };
-  const hardware = { totalMemBytes: 48 * GiB, cores: 18 };
+  const cfg = { ...(pinned ? PINNED : {}), AGENT_ADMISSION_MODE: mode,
+    ...(mode === 'pressure' ? { AGENT_ADMISSION_CEILING: 8 } : {}), ...config };
   let censusOverride;
   const telemetry = () => ({ host: { status: 'ok', fresh: true, pressure: 'normal', sampledAt: clock.at,
     physicalBytes: 48 * GiB, reclaimableEstimateBytes: 40 * GiB, swapOutBytes: 0, pageSizeBytes: 16384, ...host },
@@ -31,7 +40,7 @@ function harness(t, { mode = 'pressure', config = {}, projectConfigs = {} } = {}
     const admission = createSessionAdmission({ getSessions: () => sessions, getTelemetry: telemetry,
       isRunning: queue.isRunning, coordinator, now: () => clock.at,
       readProject: project => projectConfigs[project] || {}, env: {},
-      resolvePolicy: () => resolveAdmissionPolicy({ env: {}, hardware, platform: 'darwin', read: () => ({ config: { ...cfg, ...overrides }, status: 'ok' }) }),
+      resolvePolicy: () => resolveAdmissionPolicy({ env: {}, hardware, read: () => ({ config: { ...cfg, ...overrides }, status: 'ok' }) }),
       runner: { run: async (file, args) => {
         const text = censusOverride === undefined ? [...alive].map(id => `${id} node /app/todo-server.js`).join('\n') : censusOverride;
         if (text === null || !args[1].includes('comm')) return text;
@@ -602,4 +611,98 @@ test('admission state written before ramp loads at the static cap; a malformed r
   const failed = a.admission.snapshot();
   assert.equal(failed.detail, 'state-invalid');
   assert.deepEqual([failed.rampCap, failed.rampCeiling, failed.rampNextStepAt], [null, null, null]);
+});
+
+// ── Explicit project cap above the hardware static cap (TPT9190) ──
+
+const HOST_16 = { totalMemBytes: 16 * GiB, cores: 8 }; // hardware static cap 14
+const RAISED = { '/a': { AGENT_LIMITS_MAX_CONCURRENT_SESSIONS: 20 } };
+
+test('AGENT_LIMITS_MAX_CONCURRENT_SESSIONS=20 admits 20 terminals on a 16 GiB host in static mode', async t => {
+  const h = harness(t, { mode: 'static', hardware: HOST_16, projectConfigs: RAISED });
+  const a = h.instance(1000); await h.advance(0);
+  for (let n = 0; n < 22; n++) a.request(`A${n}`);
+  await tick();
+  assert.equal(a.started.length, 20);
+  assert.equal(a.queue.countRunning(), 20);
+  const own = a.queue.snapshot('/a').queued[0];
+  assert.deepEqual([own.reason, own.cap], ['project-cap', 20]);
+  // A project without its own cap keeps the hardware cap, which the twenty already exceed.
+  a.request('B0', '/b'); await tick();
+  const other = a.queue.snapshot('/b').queued.find(row => row.taskId === 'B0');
+  assert.deepEqual([other.reason, other.cap], ['device-cap', 14]);
+});
+
+test('ramp mode: a raised project cap starts its terminals like the static floor, alarm or not', async t => {
+  const h = harness(t, { mode: 'ramp', hardware: HOST_16, projectConfigs: RAISED });
+  const a = h.instance(1000); await h.advance(0);
+  h.host.pressure = 'warning'; await h.advance(5000);
+  assert.equal(a.admission.snapshot().alarm, 'pressure');
+  for (let n = 0; n < 20; n++) a.request(`A${n}`);
+  await tick();
+  assert.equal(a.started.length, 20);
+  const read = JSON.parse(fs.readFileSync(path.join(h.directory, 'admission-state.json')));
+  assert.equal(read.pressure.rampCap, null); // the shared ramp never inherits a project's cap
+});
+
+test('a request waiting at the device cap does not hold up a later request whose project raised its cap', async t => {
+  const h = harness(t, { mode: 'static', hardware: HOST_16, projectConfigs: RAISED });
+  const a = h.instance(1000); await h.advance(0);
+  for (let n = 0; n < 15; n++) a.request(`B${n}`, '/b');
+  await tick();
+  assert.equal(a.started.length, 14);
+  a.request('A0'); await tick();
+  assert.deepEqual(a.started.slice(14), ['A0']);
+  assert.equal(a.queue.snapshot('/b').queued[0].reason, 'device-cap');
+});
+
+test('coordination doubt holds a raised project cap to the shared fallback count', async t => {
+  const h = harness(t, { mode: 'static', hardware: HOST_16, projectConfigs: RAISED });
+  const a = h.instance(1000);
+  h.census('1000 node /app/todo-server.js\n9999 node /other/todo-server.js');
+  await h.advance(0);
+  for (let n = 0; n < 20; n++) a.request(`A${n}`);
+  await tick();
+  assert.equal(a.started.length, 13); // 13 local + 1 unregistered server = fallback cap 14
+  const row = a.queue.snapshot('/a').queued[0];
+  assert.deepEqual([row.reason, row.cap], ['device-cap', 14]);
+  h.census(undefined); await h.advance(5000);
+  assert.equal(a.started.length, 20);
+});
+
+// ── Default thresholds on a quiet 16 GiB host ──
+
+test('default ramp on a quiet 16 GiB host admits one more terminal a minute past the static cap; a warning sample resets it', async t => {
+  const h = harness(t, { mode: 'ramp', pinned: false, hardware: HOST_16 });
+  // 6 of 16 GiB reclaimable covers one more unknown session: 2 GiB reserve + 512 MiB burst
+  // + 1 GiB estimate + 2 GiB recovery margin.
+  Object.assign(h.host, { physicalBytes: 16 * GiB, reclaimableEstimateBytes: 6 * GiB });
+  const read = () => JSON.parse(fs.readFileSync(path.join(h.directory, 'admission-state.json')));
+  const a = h.instance(1000); await h.advance(0);
+  for (let n = 0; n < 14; n++) a.request(`D${n}`);
+  await tick();
+  assert.equal(a.queue.countRunning(), 14); // the static floor needs neither memory checks nor spacing
+  const first = a.admission.snapshot();
+  assert.deepEqual([first.cap, first.rampCeiling, first.rampNextStepAt], [14, 22, 60000]);
+  for (let at = 5000; at <= 180000; at += 5000) await h.advance(at);
+  const raised = a.admission.snapshot();
+  assert.deepEqual([raised.cap, raised.alarm, raised.rampNextStepAt], [17, null, 240000]);
+  assert.equal(read().pressure.rampCap, 17);
+  // Three slots are open at once: starts above the floor go three seconds apart, so each
+  // waiting one starts at the next five-second poll.
+  for (let n = 14; n < 18; n++) a.request(`D${n}`);
+  await tick();
+  assert.equal(a.queue.countRunning(), 15);
+  assert.equal(a.queue.snapshot('/a').queued[0].reason, 'spacing');
+  await h.advance(185000);
+  assert.equal(a.queue.countRunning(), 16);
+  await h.advance(190000);
+  assert.equal(a.queue.countRunning(), 17);
+  assert.equal(a.queue.snapshot('/a').queued[0].reason, 'device-cap');
+  h.host.pressure = 'warning'; await h.advance(195000);
+  const warned = a.admission.snapshot();
+  assert.deepEqual([warned.cap, warned.alarm, warned.rampNextStepAt], [14, 'pressure', null]);
+  assert.equal(read().pressure.rampCap, null);
+  assert.equal(a.queue.countRunning(), 17); // closing admission never terminates sessions
+  assert.equal(a.queue.snapshot('/a').queued[0].reason, 'device-cap');
 });
