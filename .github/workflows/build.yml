@@ -111,9 +111,9 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -130,7 +130,7 @@ jobs:
       # Electron zip needed for the cross-arch leg. Six paths listed because each OS only has
       # two of them -- actions/cache silently ignores the four that don't exist on a given runner.
       - name: Cache Electron + electron-builder downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/Library/Caches/electron
@@ -152,7 +152,7 @@ jobs:
       # triggers a clean vendor npm ci. Keep CPU architecture in the cache key because npm's
       # optional Pi packages differ between x64 and arm64.
       - name: Cache staged Pi bundle
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: vendor/pi/node_modules
           key: pi-bundle-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/pi/package.json', 'vendor/pi/package-lock.json') }}
@@ -169,7 +169,7 @@ jobs:
       # installed with a stale cached one. Keep this list in sync with PLATFORM_PACKAGES in
       # scripts/stage-sherpa-bundle.js.
       - name: Cache staged sherpa-onnx platform packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             node_modules/sherpa-onnx-darwin-arm64
@@ -297,7 +297,7 @@ jobs:
         run: ls -lh dist-electron/ || true
 
       - name: Upload installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: TipATask-${{ steps.meta.outputs.version }}-${{ matrix.artifact }}
           path: ${{ matrix.globs }}
@@ -329,12 +329,14 @@ jobs:
     steps:
       # First: actions/checkout cleans the workspace, so it must precede the artifact download.
       # Only docs/releases is needed; no token is persisted in the checkout.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
           sparse-checkout: docs/releases
 
-      - uses: actions/download-artifact@v4
+      # v7 is download-artifact's first Node 24 major (its v5 and v6 still run on node20). It reads
+      # what upload-artifact@v6 writes in the build job: both use the same @actions/artifact backend.
+      - uses: actions/download-artifact@v7
         with:
           pattern: TipATask-*
           path: installers
@@ -370,7 +372,7 @@ jobs:
           fi
           echo "path=$out" >> "$GITHUB_OUTPUT"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true
           body_path: ${{ steps.notes.outputs.path }}
