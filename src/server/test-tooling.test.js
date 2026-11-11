@@ -131,6 +131,44 @@ test('runner fails for swallowed guard violations in inherited Node children', t
   assert.match(result.stderr, /Unit test attempted external fetch to example\.invalid/);
 });
 
+test('window notifications keep their Electron stub when the real package has no binary', t => {
+  const fixture = runnerFixture(t);
+  const electronDir = path.join(fixture.dir, 'electron-without-binary');
+  fs.mkdirSync(electronDir);
+  // Exercise the installed package's real entry point, without its path.txt or dist/.
+  fs.copyFileSync(require.resolve('electron'), path.join(electronDir, 'index.js'));
+  const installerMarker = path.join(fixture.dir, 'installer-started');
+  fs.writeFileSync(path.join(electronDir, 'install.js'), `
+    require('node:fs').writeFileSync(${JSON.stringify(installerMarker)}, 'started');
+    fetch('https://example.invalid/electron');
+  `);
+  fixture.write(`
+    const assert = require('node:assert/strict');
+    const Module = require('node:module');
+    const load = Module._load;
+    const sent = [];
+    let importing = true;
+    const electron = {
+      BrowserWindow: { getAllWindows: () => [] },
+      webContents: { fromId: id => ({ send: channel => sent.push({ id, channel }) }) },
+    };
+    Module._load = function(request, ...args) {
+      if (request === 'electron') return importing ? electron : load.call(this, ${JSON.stringify(electronDir)}, ...args);
+      return load.call(this, request, ...args);
+    };
+    const state = require(${JSON.stringify(require.resolve('../../main/window-state'))});
+    importing = false;
+    state.bindWindowToProject(42, null);
+    state.notifyProjectConfigChanged('/fixture');
+    assert.deepEqual(sent, [{ id: 42, channel: 'project:remote-control-changed' }]);
+    state.dropWindow(42);
+  `);
+  const result = fixture.run();
+  assert.equal(fs.existsSync(installerMarker), false, 'no Electron installer child was launched');
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stdout + result.stderr, /Downloading Electron|Unit test attempted/);
+});
+
 test('runner fails when a test or its helper writes the shared account store, not a private one', t => {
   const fixture = runnerFixture(t);
   const seed = "require('node:fs').writeFileSync(require('node:path').join(process.env.TIPATASK_USER_DATA, '.tipatask-account.json'), '{}');";

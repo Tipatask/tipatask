@@ -1,7 +1,7 @@
 'use strict';
 
 const path = require('node:path');
-const { BrowserWindow } = require('electron');
+const { BrowserWindow, webContents } = require('electron');
 const { readProjectConfig, writeProjectConfig, writeProjectMcpConfig, writeProjectSkillsConfig, readProjectMeta, writeProjectMeta } = require('../src/server/project-config');
 const { writeProjectCodexConfig } = require('../src/codex-mcp-config');
 const { createPerProjectBackend } = require('../src/server/task-backend');
@@ -106,7 +106,7 @@ function notifyProjectConfigChanged(projectPath) {
   try { _sendToServer?.({ type: 'project:config-changed', projectPath }); } catch { /* the server also polls local config */ }
   for (const wcId of _windows.keys()) {
     // Reload each window's own scope, including aliases of the same physical checkout.
-    try { require('electron').webContents.fromId(wcId)?.send('project:remote-control-changed'); } catch { /* window closed */ }
+    try { webContents.fromId(wcId)?.send('project:remote-control-changed'); } catch { /* window closed */ }
   }
 }
 

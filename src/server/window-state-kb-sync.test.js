@@ -26,7 +26,11 @@ const Module = require('node:module');
 process.env.TIPATASK_USER_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'tipatask-wsks-userdata-'));
 test.after(() => fs.rmSync(process.env.TIPATASK_USER_DATA, { recursive: true, force: true }));
 
-const fakeElectron = { BrowserWindow: { getAllWindows: () => [] } };
+const remoteControlSent = [];
+const fakeElectron = {
+  BrowserWindow: { getAllWindows: () => [] },
+  webContents: { fromId: id => ({ send: channel => remoteControlSent.push({ id, channel }) }) },
+};
 const fakeTaskBackend = {
   // bindWindowToProject only needs backend.init() to exist and resolve — the real
   // onConnectionStateChange/getConnectionState branches are optional (typeof-guarded).
@@ -112,9 +116,11 @@ test('project binds notify the server immediately; a late messenger replays uniq
     fs.rmSync(root, { recursive: true, force: true });
   });
   const messages = [];
+  remoteControlSent.length = 0;
   setServerMessenger(msg => messages.push(msg));
   bindWindowToProject(ids[0], root);
   assert.deepEqual(messages, [{ type: 'project:config-changed', projectPath: root }]);
+  assert.deepEqual(remoteControlSent, [{ id: ids[0], channel: 'project:remote-control-changed' }]);
   setServerMessenger(null);
   bindWindowToProject(ids[1], root);
   bindWindowToProject(ids[2], null);

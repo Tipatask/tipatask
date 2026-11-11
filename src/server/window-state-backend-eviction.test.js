@@ -14,7 +14,7 @@ const Module = require('node:module');
 const { BACKEND_IDLE_EVICT_MS } = require('./backend-eviction');
 
 const created = [];
-const fakeElectron = { BrowserWindow: { getAllWindows: () => [] } };
+const fakeElectron = { webContents: { fromId: () => null }, BrowserWindow: { getAllWindows: () => [] } };
 const fakeTaskBackend = {
   createPerProjectBackend: (cfg, projectPath) => {
     const b = {

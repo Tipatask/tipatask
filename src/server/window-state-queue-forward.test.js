@@ -19,7 +19,7 @@ const fakeWebContents = {
   isDestroyed: () => false,
   send: (channel, payload) => sent.push({ channel, payload }),
 };
-const fakeElectron = { BrowserWindow: { getAllWindows: () => [{ webContents: fakeWebContents }] } };
+const fakeElectron = { webContents: { fromId: () => null }, BrowserWindow: { getAllWindows: () => [{ webContents: fakeWebContents }] } };
 
 // One stub backend per bind; the test reaches it through `lastBackend`.
 let lastBackend = null;
