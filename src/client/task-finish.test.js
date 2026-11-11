@@ -187,7 +187,7 @@ test('styles: the flagged card keeps its action menu under the ring, reveals Sel
   assert.match(css, /\.card\.needs-attention\.has-left-uncommitted::before \{ display: none; \}/);
   assert.match(css, /\.card\.has-unmerged-worktree \.card-btn-group,\n\s*\.card\.has-left-uncommitted \.card-btn-group,/);
   assert.match(css, /\.merge-attention-dot,\n\s*\.finish-attention-dot \{/);
-  assert.match(css, /\.card-btn-group:focus-within > \.btn-select-card \.finish-attention-dot \{ visibility: hidden; \}/);
+  assert.match(css, /\.card-btn-group:has\(:focus-visible\) > \.btn-select-card \.finish-attention-dot \{ visibility: hidden; \}/);
   assert.match(css, /\.btn-merge-task,\n\s*\.btn-finish-task \{ position: relative; \}/);
 });
 

@@ -13,6 +13,7 @@ const read = name => readFileSync(new URL('./' + name, import.meta.url), 'utf8')
 import { MERGE_DOT, mergeButtonHtml } from './task-merge.js';
 import { FINISH_DOT, finishButtonHtml } from './task-finish.js';
 import { permissionButtonHtml } from './task-permission-mode.js';
+import { discussButtonHtml } from './card-discuss.js';
 
 function extract(text, name) {
   const start = text.indexOf(`function ${name}(`);
@@ -27,7 +28,7 @@ function cardEnv(overrides = {}) {
   const env = {
     state: { childrenByParent: new Map([['TPT179', [{ id: 'TPT180', title: 'Child', status: 'pending' }]]]), selectedCardIds: new Set(['TPT179']), pendingTaskIds: new Set(['TPT179']), tagDescriptions: new Map(), showAiStats: false, deviceId: 'd1' },
     MAX_DESC_LEN: 500,
-    unmetDependencyKeys: () => [], isActiveName: () => true, isStartName: () => false, isInProgressName: () => true,
+    unmetDependencyKeys: () => [], hasTaskSession: () => false, isActiveName: () => true, isStartName: () => false, isInProgressName: () => true,
     isCanceledName: () => false, isCompleteName: () => false, canStartTaskCard: () => true,
     escapeAttr: esc, renderMarkdown: v => esc(v), truncateMarkdownAtParagraph: v => v, renderTagBadge: tag => `<span class="tag-badge">${esc(tag)}</span>`,
     translate: k => k, statusRoleToken: () => 'active', statusColor: () => '#3b82f6', statusLabel: s => `label:${s}`,
@@ -38,11 +39,16 @@ function cardEnv(overrides = {}) {
     formatDueDate: () => '', _WAND_SVG: '<svg/>', _CHAT_SVG: '<svg/>', _SUBTASKS_SVG: '<svg/>',
     isTaskDiscussing: () => false, lockIntentOf: () => null, discussOverlayHtml: () => '<div class="card-discuss-overlay"></div>',
     permissionButtonHtml, // (TPT9063) the real renderer: board cards carry the permission-mode button
+    discussButtonHtml, // (TPT9268) the real renderer: board cards carry the Discuss button
+    // (TPT9216) task-card.js dependencyKeysMarkup()'s shape: each key in its own span, comma-joined.
+    dependencyKeysMarkup: keys => keys.map(k => `<span class="dependency-key" data-dependency-key="${esc(k)}">${esc(k)}</span>`).join(', '),
     Date, JSON, Set, Map, String, Number,
     ...overrides,
   };
   vm.createContext(env);
-  vm.runInContext(extract(read('task-card.js'), 'renderCard'), env);
+  for (const fn of ['startButtonClass', 'startButtonHtml', 'renderCard']) {
+    vm.runInContext(extract(read('task-card.js'), fn), env);
+  }
   return env;
 }
 
@@ -114,7 +120,7 @@ test('renderCard(preview) ends the meta row with the badges; only a board card d
   const html = env.renderCard(task, { preview: true });
   const meta = html.match(/<div class="card-preview-meta">([\s\S]*?)<\/div>/);
   assert.ok(meta, 'preview meta row missing');
-  assert.match(meta[1], /^<span class="status"[^>]*>label:in_progress<\/span><span class="card-preview-deps"[^>]*>Deps: TPT210<\/span><span class="preview-meta-badges"><span class="effort-badge">max<\/span><span class="member-badge">A<\/span><span class="agent-badge"><\/span><\/span>$/);
+  assert.match(meta[1], /^<span class="status"[^>]*>label:in_progress<\/span><span class="card-preview-deps"[^>]*>Deps: <span class="dependency-key" data-dependency-key="TPT210">TPT210<\/span><\/span><span class="preview-meta-badges"><span class="effort-badge">max<\/span><span class="member-badge">A<\/span><span class="agent-badge"><\/span><\/span>$/);
   assert.equal((html.match(/class="(?:effort|member|agent)-badge"/g) || []).length, 3, 'each badge once, inside the meta row');
   assert.doesNotMatch(html, /has-(?:agent|effort|member)-badge/);
   // No badge to show: no empty group either.
@@ -145,7 +151,14 @@ test('renderCard() without preview is unchanged: full board card with lookup att
     'class="card-status-select card-ctl"',
     'class="card-start-btn btn-claude card-ctl"', 'class="btn-open-subtask-board card-ctl"',
     'class="card-permission-btn card-ctl" data-task-id="TPT179"', // (TPT9063)
+    'class="btn-task-discuss card-ctl" data-task-id="TPT179" aria-label="Discuss"', // (TPT9268/TPT9283)
   ]) assert.ok(html.includes(wanted), `board card must still contain "${wanted}"`);
+  // (TPT9283) Discuss sits between the permission shield and Start, before the Subtasks button.
+  const shield = html.indexOf('card-permission-btn card-ctl');
+  const discuss = html.indexOf('btn-task-discuss');
+  const start = html.indexOf('btn-claude card-ctl');
+  assert.ok(shield < discuss && discuss < start && start < html.indexOf('btn-open-subtask-board'),
+    'permission shield, Discuss, Start, Subtasks');
   assert.ok(!html.includes('data-preview-task'));
   assert.ok(!html.includes('card--preview'));
 });
@@ -178,7 +191,7 @@ test('renderCard(proposal) is the board card plus caller slots and the legacy .p
   assert.ok(head < top && top < meta && meta < desc && desc < foot, 'slot order: head, card-top, meta, desc, foot');
   assert.match(html, /tag-badge">feature</);
   // No corner badges (the caller places the agent badge in the meta row) and no board lookups.
-  for (const banned of ['agent-badge', 'member-badge', 'data-id=', 'data-db-id=', 'data-preview-task="TPT179" data-status', 'card-hamburger', 'card-status-select', 'label:in_progress']) {
+  for (const banned of ['agent-badge', 'member-badge', 'data-id=', 'data-db-id=', 'data-preview-task="TPT179" data-status', 'card-hamburger', 'card-status-select', 'label:in_progress', 'btn-task-discuss']) {
     assert.ok(!html.includes(banned), `proposal card must not contain "${banned}"`);
   }
   // (TPT299) Without hideIdBadge the real key shows.

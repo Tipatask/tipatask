@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomBytes, randomUUID } = require('node:crypto');
 const { READ_TASK_TOOLS, READ_LOCAL_TOOLS, gatePolicy, modeSwitchError } = require('./permission-policy');
+const { TOOL_PREFIXES, PLAN_TOOLS } = require('./computer-use');
 
 const READ_TOOLS = new Set(['Read', 'Glob', 'Grep', 'read', 'grep', 'find', 'ls', 'view_image']);
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'edit', 'write', 'apply_patch']);
@@ -74,6 +75,10 @@ function assessAction(mode, name, input, root) {
   // Shell classification is an Auto convenience, not a read-only security boundary.
   // Plan uses native read/search tools so aliases, startup files and interpreter
   // escape flags cannot turn an apparently read-only command into a write.
+  if (name.startsWith(TOOL_PREFIXES.pi)) {
+    if (mode === 'plan') return PLAN_TOOLS.includes(name.slice(TOOL_PREFIXES.pi.length)) ? 'allow' : 'deny';
+    if (mode === 'auto') return 'allow';
+  }
   if (mode === 'plan') return knownReadTool(name) ? 'allow' : 'deny';
   if (mode === 'always_ask') return 'ask';
   if (EDIT_TOOLS.has(name) && workspaceEdit(input, root)) return 'allow';

@@ -195,6 +195,11 @@ const state = {
   // Attention notifications fall back to this when no card is rendered for the task (filtered,
   // collapsed tier, backlog, other tab) — the attention-needed WS payload carries no title.
   taskTitleById: new Map(),
+  // (TPT9201) Category and assignee beside the status map, same build site: the left-nav human
+  // task rows (human-task-rows.js) read all of them. A drill-down render keeps the HUMAN entries
+  // its narrower fetch omits; task events and local writes patch them in place.
+  taskCategoryById: new Map(),
+  taskAssigneeById: new Map(),
   // Task overrides retained for active sessions outside the current board window.
   taskPermissionModeById: new Map(),
 

@@ -111,7 +111,7 @@ try {
   // The title and Remember label follow the project language.
   setLocale('uk');
   modal.openAgentSelectorModal('TPT1', 'Title', 'Desc', 'pending');
-  assert.deepEqual(launchCopy(), ['Виберіть агента для цієї задачі', 'Запам’ятати для цієї сесії']);
+  assert.deepEqual(launchCopy(), ['Виберіть агента для цього завдання', 'Запам’ятати для цієї сесії']);
   escape();
   setLocale('en');
 
@@ -219,8 +219,8 @@ try {
   }
 
   setLocale('uk');
-  assertPinDisplays(ROW0_TOOLLESS, TOOLLESS, `Не може виконувати задачі — запуск на ${CAPABLE}`);
-  assertPinDisplays(ALL_TOOLLESS, TOOLLESS, 'Не може виконувати задачі — виберіть модель із підтримкою інструментів');
+  assertPinDisplays(ROW0_TOOLLESS, TOOLLESS, `Не може виконувати завдання — запуск на ${CAPABLE}`);
+  assertPinDisplays(ALL_TOOLLESS, TOOLLESS, 'Не може виконувати завдання — виберіть модель із підтримкою інструментів');
   setLocale('en');
   document.body.innerHTML = '';
 

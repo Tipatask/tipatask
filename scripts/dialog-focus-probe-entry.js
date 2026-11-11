@@ -2,7 +2,9 @@ import state from '../src/client/state.js';
 import { renderCard, registerCardCallbacks, setupCardInteractions } from '../src/client/task-card.js';
 import { openTaskEditModal, closeTaskEditModal, requestCloseTaskEditModal } from '../src/client/task-board.js';
 import { openAgentsModal, closeAgentsModal } from '../src/client/agents-modal.js';
-import { setLocale } from '../src/client/i18n.js';
+import { setLocale, t } from '../src/client/i18n.js';
+import * as dialogFocus from '../src/client/dialog-focus.js';
+import * as projectOpenFlow from '../src/client/project-open-flow.js';
 
 const task = {
   id: 'TPT335', title: 'Keyboard task', description: 'Original description',
@@ -26,6 +28,7 @@ registerCardCallbacks({
 setupCardInteractions(app);
 
 window.probe = {
+  state, t, dialogFocus, projectOpenFlow,
   saved: null,
   readOnly: false,
   openReadOnly: () => openTaskEditModal(task.id, {

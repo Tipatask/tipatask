@@ -1,4 +1,5 @@
 'use strict';
+const { nativeComputerUse } = require('./computer-use-runtime');
 
 // TPT349 — derived spawn-time MCP config (headersHelper for the remote `tipatask` server) and the
 // helper script it points at.
@@ -251,6 +252,31 @@ test('writeScopedMcpConfig caller=pi: both Tipatask servers, helper-bound auth, 
   assert.equal(remote.headers['X-Tipatask-Session-Task'], '${TIPATASK_TASK_ID:-}');
   assert.match(remote.headersHelper, /auth-header-helper\.js/);
   assert.equal(written.mcpServers['tipatask-local'].env.TIPATASK_MCP_LOCAL_ONLY, '1');
+});
+
+test('writeScopedMcpConfig caller=pi: detected computer use is written separately from unavailable and chat configs', t => {
+  const projectRoot = tmp(t, 'tt-mcp-pi-computer-');
+  const userDataRoot = tmp(t, 'tt-mcp-pi-computer-data-');
+  const original = JSON.stringify(MCP_JSON);
+  fs.writeFileSync(path.join(projectRoot, '.mcp.json'), original);
+  const { resolveComputerUse } = require('./computer-use');
+  const computerUse = nativeComputerUse('pi', '/opt/task-app', '/opt/task-app/dist/computer-use-arm64');
+  const args = { projectRoot, userDataRoot, caller: 'pi', computerUse };
+  const out = writeScopedMcpConfig(args);
+  assert.match(path.basename(out), /^[0-9a-f]{12}\.pi\.json$/);
+  const written = JSON.parse(fs.readFileSync(out, 'utf8')).mcpServers;
+  assert.deepStrictEqual(Object.keys(written), ['tipatask', 'tipatask-local', 'computer-use']);
+  assert.deepStrictEqual(written['computer-use'], computerUse.server);
+  for (const capability of [undefined, resolveComputerUse('pi', 'linux'), resolveComputerUse('pi', 'darwin')]) {
+    const unavailable = writeScopedMcpConfig({ ...args, computerUse: capability });
+    assert.notStrictEqual(unavailable, out);
+    assert.ok(!JSON.parse(fs.readFileSync(unavailable, 'utf8')).mcpServers['computer-use']);
+  }
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(out, 'utf8')).mcpServers['computer-use'], computerUse.server,
+    'a headless turn cannot remove the desktop entry from a launching task');
+  const chat = writeScopedMcpConfig({ ...args, caller: undefined, servers: ['tipatask'], label: 'taskChat' });
+  assert.deepStrictEqual(Object.keys(JSON.parse(fs.readFileSync(chat, 'utf8')).mcpServers), ['tipatask']);
+  assert.strictEqual(fs.readFileSync(path.join(projectRoot, '.mcp.json'), 'utf8'), original);
 });
 
 test('writeScopedMcpConfig caller=pi: the file never carries a token literal', (t) => {

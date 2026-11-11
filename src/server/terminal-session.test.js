@@ -1018,7 +1018,7 @@ function replayAgentKind(chunks, agentId, kind, opts = {}) {
   Object.assign(session, {
     taskAgent: agentId, _attentionTail: '', terminalPhase: 'planning', alive: true,
     buffer: 'x'.repeat(501), tabId: 'replay',
-    ws: { OPEN: 1, readyState: 1, send: msg => messages.push(JSON.parse(msg)) },
+    ws: opts.noLocalViewer ? null : { OPEN: 1, readyState: 1, send: msg => messages.push(JSON.parse(msg)) },
   });
   let saw = false;
   for (const raw of chunks) {
@@ -1041,6 +1041,21 @@ function replayAgentKind(chunks, agentId, kind, opts = {}) {
 function replayPiPlanReady(chunks) {
   return replayAgentKind(chunks, 'pi', 'planReady');
 }
+
+test('a web-only Codex run publishes fresh plan approval without a desktop terminal', t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const { remoteApprovalRequest } = require('./device-relay');
+  const { session, messages } = replayAgentKind(['Proposed implementation.\nPlan ready.\n'], 'codex', 'planReady', {
+    noLocalViewer: true, tick: ms => t.mock.timers.tick(ms), details: true,
+  });
+  assert.equal(session.ws, null);
+  assert.equal(session._planReadySent, true);
+  assert.equal(remoteApprovalRequest(session)?.kind, 'plan');
+  assert.deepEqual(messages, []);
+  session.pty = { write() {} };
+  handleTerminalInput(session, 'Revise step two\r');
+  assert.equal(remoteApprovalRequest(session), null, 'revision feedback invalidates the pending web approval');
+});
 
 test('Codex tail classifier rejects historical readiness after a submission or Working row', () => {
   for (const suffix of ['› Review this task\n', '• Working (15s • esc to interrupt)\n']) {
@@ -2446,7 +2461,7 @@ const CODEX_SPINNER = '• Working (2s • esc to interrupt)\n';
 const CODEX_TURN_OUTPUT = `› Work on task TPT571\n${'.'.repeat(SUBMIT_MARKER_TRAILING_MAX + 100)}\n${CODEX_SPINNER}`;
 
 // One spawn on a fresh session. Returns handles to feed PTY output and inspect PTY input.
-async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, specExtras, sessions, captureSpawn, onDetect, designMode = false, backend = legacyPermissionBackend, task, version } = {}) {
+async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364', kickoffTypedLine, specExtras, sessions, captureSpawn, onDetect, designMode = false, backend = legacyPermissionBackend, task, version, computerUse = null } = {}) {
   const writes = [];
   const sent = [];
   let dataCb = null;
@@ -2464,6 +2479,12 @@ async function startKickoff(t, agentId, { initialPrompt = 'Work on task TPT364',
   t.mock.method(agent, 'cachedDetect', async () => {
     onDetect?.(sent);
     return { id: agentId, label: agent.label, available: true, detail: { version: version || { claude: '2.1.306', codex: '0.163.0', pi: '0.84.1' }[agentId] } };
+  });
+  // (TPT9225) Never the real CLI bundle probe here; `computerUse` is what the adapter would report
+  // (an Error: the probe throws).
+  t.mock.method(agent, 'detectComputerUse', async () => {
+    if (computerUse instanceof Error) throw computerUse;
+    return computerUse;
   });
   t.mock.method(agent, 'getSpawnSpec', async (_config, prompt, taskId, opts) => {
     captureSpawn?.(agent, prompt, opts);
@@ -2590,6 +2611,30 @@ for (const mode of ['plan', 'auto', 'bypass']) test(`Claude ${mode} pastes kicko
   k.reachFirstEnter();
   assert.equal(k.session.alive, true);
   assert.ok(k.sent.filter(m => m.type === 'terminal-state').every(m => m.permissionRequest === null));
+});
+
+// (TPT9225) The adapter's computer-use answer reaches getSpawnSpec() as opts.computerUse, once per
+// spawn; a probe that throws starts the run without computer use. One kickoff per test: a method
+// mocked twice in one test stays mocked after it.
+test('TPT9225 the computer-use answer reaches getSpawnSpec, probed once per spawn', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const { resolveComputerUse } = require('./computer-use');
+  const answer = resolveComputerUse('claude', 'darwin', { command: '/opt/claude/bin/claude', serverSupported: true });
+  const seen = [];
+  const k = await startClaudeKickoff(t, { computerUse: answer, captureSpawn: (_agent, _prompt, opts) => seen.push(opts.computerUse) });
+  t.after(() => stopSession(k.session));
+  assert.deepEqual(seen, [answer]);
+  assert.equal(getTaskAgent('claude').detectComputerUse.mock.callCount(), 1);
+});
+
+test('TPT9225 a failed computer-use probe starts the run without computer use', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  t.mock.method(console, 'warn', () => {});
+  const seen = [];
+  const k = await startClaudeKickoff(t, { computerUse: new Error('scan exploded'), captureSpawn: (_agent, _prompt, opts) => seen.push(opts.computerUse) });
+  t.after(() => stopSession(k.session));
+  assert.deepEqual(seen, [null]);
+  assert.equal(k.session.alive, true);
 });
 
 // (TPT9136) The spawn adopts the agent's launch-resolved policy and native record; PTY output keeps
@@ -4006,21 +4051,21 @@ test('TPT654 Claude (recorded 2.1.296): "No, keep planning" answered inside the 
   }
 
   test('sessionLocale reads the project language from .tipatask/config.json and falls back to en', (t) => {
-    assert.equal(tsMod.sessionLocale({ projectPath: ukProject(t) }), 'uk');
+    for (const locale of ['uk', 'zh', 'es']) assert.equal(tsMod.sessionLocale({ projectPath: ukProject(t, locale) }), locale);
     assert.equal(tsMod.sessionLocale({ projectPath: ukProject(t, 'en') }), 'en');
     assert.equal(tsMod.sessionLocale({ projectPath: ukProject(t, 'xx') }), 'en');
     assert.equal(tsMod.sessionLocale({ projectPath: path.join(os.tmpdir(), 'tt-no-such-project-' + process.pid) }), 'en');
     assert.equal(tsMod.sessionLocale({ projectPath: '' }), 'en');
   });
 
-  test('noticeCopy / warningCopy write the Ukrainian notice for a uk project, with the [Task App] prefix and colours in code', (t) => {
+  for (const locale of ['uk', 'zh', 'es']) test(`noticeCopy / warningCopy use ${locale} with the [Task App] prefix and colours in code`, (t) => {
     const sent = [];
-    const session = { tabId: 'T1', projectPath: ukProject(t), ws: { OPEN: 1, readyState: 1, send: (m) => sent.push(JSON.parse(m)) } };
+    const session = { tabId: 'T1', projectPath: ukProject(t, locale), ws: { OPEN: 1, readyState: 1, send: (m) => sent.push(JSON.parse(m)) } };
     tsMod.noticeCopy(session, 'notice.plan.alreadyApproved');
     tsMod.warningCopy(session, 'notice.token.expiresNotRefreshed', { when: '09:05', error: 'offline' });
     assert.deepEqual(sent.map((f) => f.type), ['data', 'data']);
-    assert.equal(sent[0].data, `\r\n\x1b[90m[Task App] ${COPY.uk['notice.plan.alreadyApproved']}\x1b[0m\r\n`);
-    assert.equal(sent[1].data, `\r\n\x1b[33m[Task App] ${sub(COPY.uk['notice.token.expiresNotRefreshed'], { when: '09:05', error: 'offline' })}\x1b[0m\r\n`);
+    assert.equal(sent[0].data, `\r\n\x1b[90m[Task App] ${COPY[locale]['notice.plan.alreadyApproved']}\x1b[0m\r\n`);
+    assert.equal(sent[1].data, `\r\n\x1b[33m[Task App] ${sub(COPY[locale]['notice.token.expiresNotRefreshed'], { when: '09:05', error: 'offline' })}\x1b[0m\r\n`);
     // An English project keeps the exact wording the server always printed.
     const enSent = [];
     tsMod.noticeCopy({ tabId: 'T2', projectPath: ukProject(t, 'en'), ws: { OPEN: 1, readyState: 1, send: (m) => enSent.push(JSON.parse(m)) } }, 'notice.plan.alreadyApproved');
@@ -4106,7 +4151,7 @@ test('TPT654 Claude (recorded 2.1.296): "No, keep planning" answered inside the 
     assert.equal(uk.warn, false);
     assert.match(uk.text, /^Термін дії API-токена, з яким запущено цю сесію, спливає \(\d{2}:\d{2}\)\. Новий токен збережено — в агенті введіть \/mcp → tipatask → Reconnect/);
     const ukNotSaved = tsMod.buildTokenExpiryNotice({ expMs, now: expMs + 1, saved: false, headersHelper: false, locale: 'uk' });
-    assert.match(ukNotSaved.text, /^Термін дії API-токена, з яким запущено цю сесію, минув \(.*\)\. Автоматично оновити його не вдалося\. Увійдіть знову \(Проєкт ▸ Повторна автентифікація \/ Змінити акаунт\)/);
+    assert.match(ukNotSaved.text, /^Термін дії API-токена, з яким запущено цю сесію, минув \(.*\)\. Автоматично оновити його не вдалося\. Увійдіть знову \(Проєкт ▸ Повторна автентифікація \/ Змінити обліковий запис\)/);
     const en = tsMod.buildTokenExpiryNotice({ expMs, saved: false, headersHelper: false });
     assert.match(en.text, /^The API token this session started with expires at \d{2}:\d{2}\. It could not be refreshed automatically\. Sign in again \(Project ▸ Re-authenticate \/ Change Account\), then in the agent type \/mcp → tipatask → Reconnect\.$/);
   });

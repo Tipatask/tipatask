@@ -180,6 +180,6 @@ test('objective error copy and the Debug Console failure line use the Ukrainian 
       'Pi: потік перервався (exit-code-1); повторних спроб: 2. Модель: m1. Подробиці: boom Натисніть «Повторити» або уточніть запит.');
     assert.equal(pi.providerLabelFor({}, null), 'Модель');
     assert.equal(pi.objectiveRetryBannerText({ _lastErrorProvider: 'pi' }, 'abc'),
-      'Pi: картки задач не створено. Отримано: abc… Натисніть «Повторити» або надішліть уточнені інструкції.');
+      'Pi: картки завдань не створено. Отримано: abc… Натисніть «Повторити» або надішліть уточнені інструкції.');
   } finally { setLocale('en'); }
 });

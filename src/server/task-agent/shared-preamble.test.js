@@ -198,3 +198,26 @@ test('buildPrompt: Claude carries no clarify text; Codex/Pi keep question-before
     assert.ok(contextIdx < prompt.indexOf('Process safety:'), `${agent.id}: directives stay in project context`);
   }
 });
+
+
+test('parent preparation and child continuation reach every provider with their selected policy', t => {
+  const config = require('../config');
+  const previous = config.SIMPLE_MODE;
+  config.SIMPLE_MODE = true;
+  t.after(() => { config.SIMPLE_MODE = previous; });
+  for (const agent of [new ClaudeAgent(), new CodexAgent(), new PiAgent()]) {
+    for (const mode of ['plan', 'auto', 'bypass']) {
+      const permissionPolicy = agent.buildPermissionPolicy({ mode, source: 'task' });
+      const opts = { permissionPolicy, task: { isObjective: true }, objectiveChain: { rootTaskId: 'P1' }, piMcpBridge: true };
+      const text = agent.buildPrompt('Prepare P1', opts);
+      assert.equal(count(text, 'Parent objective preparation:'), 1, agent.id + mode);
+      assert.match(text, /create_task\(parent_key/);
+      assert.match(text, /start_next_tasks/);
+      assert.match(text, /Plan[^\n]*wait[^\n]*approval before (?:any )?task writes/);
+      assert.doesNotMatch(text, /Cowboy chain:/);
+      const child = agent.buildPrompt('Implement C1', { ...opts, task: { isObjective: false } });
+      assert.match(child, /Parent objective execution:/);
+      assert.doesNotMatch(child, /Parent objective preparation:/);
+    }
+  }
+});

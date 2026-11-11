@@ -243,6 +243,31 @@ async function completeVerifiedTask({ backend, projectRoot, taskId, resolution, 
   const statuses = await backend.getStatuses({ refresh: true, strict: true });
   const complete = statuses.find(s => s.is_workflow_complete);
   if (!complete) throw new Error('Completion status unavailable');
+  if (task.isObjective) {
+    let openChildren = null;
+    try {
+      const rows = await backend.getTasksUnfiltered({ refresh: true });
+      if (task.dbId == null || !Array.isArray(rows)) throw new Error('Parent tree unavailable');
+      const closed = new Set(statuses.filter(s => s.is_workflow_complete || s.is_workflow_canceled).map(s => s.name));
+      const pending = [String(task.dbId)], seen = new Set(pending);
+      openChildren = [];
+      while (pending.length) {
+        const parentId = pending.shift();
+        for (const child of rows.filter(t => t.parentDbId != null && String(t.parentDbId) === parentId && !t.isReservation)) {
+          if (!closed.has(child.status)) openChildren.push(child.id);
+          if (child.dbId != null && !seen.has(String(child.dbId))) {
+            seen.add(String(child.dbId)); pending.push(String(child.dbId));
+          }
+        }
+      }
+    } catch { openChildren = null; }
+    if (openChildren === null || openChildren.length) {
+      verification.ready = false;
+      verification.blockers.push({ code: openChildren ? 'PARENT_CHILDREN_OPEN' : 'PARENT_CHILDREN_UNKNOWN',
+        message: openChildren ? `Complete the parent only after its children close: ${openChildren.join(', ')}.` : 'Could not verify the parent objective children. Retry after the task read succeeds.' });
+      return { completed: false, resolutionPosted: false, verification };
+    }
+  }
   // The report is posted even when the task is already complete (a merge hand-off or re-run
   // session must not lose its report); only the status write is skipped then.
   const report = resolution.trim();

@@ -7,6 +7,7 @@
 var path = require('path');
 var fs = require('fs');
 var spawnSync = require('child_process').spawnSync;
+var resolveElectronRebuild = require('./electron-rebuild').resolveElectronRebuild;
 
 var ROOT = path.join(__dirname, '..');
 var isWin = process.platform === 'win32';
@@ -20,11 +21,10 @@ function runNodeScript(scriptName) {
 
 // 1. Rebuild node-pty against the bundled Electron's ABI.
 try {
-  var bin = path.join(ROOT, 'node_modules', '.bin', isWin ? 'electron-rebuild.cmd' : 'electron-rebuild');
-  var rebuild = spawnSync(bin, ['-f', '-w', 'node-pty'], {
+  var cli = path.join(path.dirname(resolveElectronRebuild(ROOT)), 'cli.js');
+  var rebuild = spawnSync(process.execPath, [cli, '-f', '-w', 'node-pty'], {
     cwd: ROOT,
     stdio: 'inherit',
-    shell: isWin, // Node >=20.12 refuses to spawn a .cmd/.bat shim without shell:true
   });
   if (rebuild.error || rebuild.status !== 0) {
     console.warn('[postinstall] electron-rebuild skipped/failed (expected when no Electron binary was downloaded, e.g. ELECTRON_SKIP_BINARY_DOWNLOAD=1)');

@@ -77,13 +77,13 @@ const { EXPORT_MENU_ITEM_ID, focusedProjectWindow, createProjectExporter } = req
 // (TPT9169) Project ▸ Import… — open dialog, archive check, pending imports and the import
 // sequence; the project steps it runs are the closures passed in below (projectImporter).
 const { createProjectImporter } = require('./main/project-import');
-// (TPT9112) Startup macOS permission requests — see os-permissions.js header. No electron
-// import, no module-scope I/O.
+// Startup OS permissions and ensureStartupAppManagementPermission() Settings guidance.
+// os-permissions.js has no electron import or module-scope I/O.
 const { requestStartupPermissions } = require('./main/os-permissions');
 const { resolveAppVersion } = require('./src/server/app-version');
 const { ensureBundleSignatureHealthy } = require('./src/server/bundle-signature');
 // (C1355) Duplicate-LaunchServices-claimant self-heal — see ls-registration.js's header comment.
-const { ensureLaunchServicesHealthy, reregisterBundle } = require('./src/server/ls-registration');
+const { ensureLaunchServicesHealthy, repairRegistrationWithVerification } = require('./src/server/ls-registration');
 // (C1173) registerApiHandlers (./main/ipc/api-router) and fetchLastUsedOpenProjects/
 // patchDeviceOpenProjects (./src/server/api-backend) NOT required here anymore — both
 // drag in src/server/config.js, whose MODULE SCOPE runs migrateFromLegacy() + a sync
@@ -292,7 +292,7 @@ async function refreshBundleSignatureState({ force = false } = {}) {
       checkNotificationCenterRegistration('com.tipatask.app').then((r) => { _ncRegistrationState = r; }),
     ]);
     _bundleSignatureState = sig;
-    _lsRegistrationState = ls;
+    _lsRegistrationState = { ...ls, repair: _lsRegistrationState?.repair ?? null };
   } catch (e) {
     console.warn('[bundle-signature] check failed (non-fatal):', e.message);
     // (C1355) `valid: null` ("unknown"), NOT `false` — a `false` here used to hard-block EVERY
@@ -1096,22 +1096,20 @@ function registerIpcHandlers() {
       registered: _ncRegistrationState,
       conflicts: _lsRegistrationState?.conflicts ?? null,
       installerVolumes: _lsRegistrationState?.installerVolumes ?? [],
+      registrationRepair: _lsRegistrationState?.repair ?? null,
     };
   });
 
-  // (C1355) On-demand repair from the Settings "Repair" button — re-registers the RUNNING
-  // bundle with LaunchServices so it becomes the freshest claimant of com.tipatask.app. Never
-  // rebuilds the whole LaunchServices database (out of scope for an automatic action — see
-  // ai/architecture/tt-notifications.md § C1355's user-run remediation for that). A relaunch is
-  // still required afterward: usernoted only decides Notification Center registration at
-  // process launch, same as the C1318 seal-repair path above.
+  // Settings Repair verifies its own fresh snapshot, bypassing the status TTL and startup
+  // marker. Mounted installers block it; other competing registrations are removed by path.
+  // Cache every outcome so failed repairs and remaining blockers stay visible in Settings.
   ipcMain.handle('notify:repair-registration', async () => {
     if (process.platform !== 'darwin' || !app.isPackaged) return { ok: true, relaunchNeeded: false };
     try {
       _bundlePath = _bundlePath || path.resolve(process.resourcesPath, '..', '..');
-      const result = await reregisterBundle(_bundlePath);
-      if (result.ok) await refreshBundleSignatureState({ force: true });
-      return { ok: result.ok, reason: result.reason, relaunchNeeded: result.ok };
+      const result = await repairRegistrationWithVerification({ bundlePath: _bundlePath, bundleId: 'com.tipatask.app' });
+      _lsRegistrationState = { ...result.registration, repair: result };
+      return result;
     } catch (e) {
       return { ok: false, reason: e.message || 'failed', relaunchNeeded: false };
     }
@@ -2237,6 +2235,8 @@ function createMenu() {
           // (C1388) Renamed from "Open Project…" — this is now the single entry point
           // for both opening a configured project AND starting setup/create for an
           // unconfigured one (renderer's openOrCreateProject(), template.html).
+          // Renderer owns the later Current/New Window chooser and its
+          // ensureOpenProjectDialogForeground() focus layer; this only dispatches.
           label: mt('menu.openOrCreateProject'),
           accelerator: 'CmdOrCtrl+Shift+O',
           click: (mi, window) => { if (window && !window.isDestroyed()) window.webContents.send('project:menu', 'open'); },
@@ -2751,23 +2751,26 @@ async function focusAndStartTask(projectPath, taskKey, { children } = {}) {
 }
 
 // (C1430) Sentinel contract on projectPaths: non-array (null/undefined) → workspace.json
-// fallback below (reachable only from whenReady's missing-session-file branch); [] → the
-// projects.length===0 branch fires → exactly one blank unbound window; non-empty array →
-// one window per path. No live caller passes a non-array after this task — kept as a
-// defensive default, not because anything currently relies on it.
+// fallback below (reachable only from whenReady's missing-session-file branch); [] → nothing
+// opened → exactly one blank unbound window; non-empty array → one window per path (and the
+// blank one when none of them opens). No live caller passes a non-array after this task — kept
+// as a defensive default, not because anything currently relies on it.
+// Resolves the windows it opened, so startup can attach its permission dialogs to the first one
+// even when that is the unbound Get Started window of a first launch.
 async function createInitialWindows(projectPaths = null, opts = {}) {
   const projects = Array.isArray(projectPaths)
     ? projectPaths
     : (workspaceState?.openProjects || []).map(entry => entry.path);
-  if (projects.length === 0) {
-    await createProjectWindow(null, opts);
-  } else {
-    let opened = false;
-    for (const projectPath of projects) {
-      if (await createProjectWindow(projectPath, opts)) opened = true;
-    }
-    if (!opened) await createProjectWindow(null, opts);
+  const opened = [];
+  for (const projectPath of projects) {
+    const win = await createProjectWindow(projectPath, opts);
+    if (win) opened.push(win);
   }
+  if (opened.length === 0) {
+    const win = await createProjectWindow(null, opts);
+    if (win) opened.push(win);
+  }
+  return opened;
 }
 
 function registerSystemResumeHandlers() {
@@ -2877,18 +2880,22 @@ app.whenReady()
     // loadWindowSession()'s contract comment and window-session.js.
     const sessionPaths = loadWindowSession();
     const restoredPaths = shouldRestoreFromDevice(sessionPaths) ? await restoreFromLastUsedDevice() : [];
-    await createInitialWindows(resolveStartupProjectPaths(sessionPaths, restoredPaths), { deferShow: true });
+    const startupWindows = await createInitialWindows(resolveStartupProjectPaths(sessionPaths, restoredPaths), { deferShow: true });
     _initialWindowsCreated = true; // C1006: real windows exist; quit guards released
-    // (TPT9112) Ask macOS once, up front, for every permission an agent run can need, so a
-    // first task never stalls on a system prompt. Fire-and-forget: the explanation (a sheet on
-    // the first project window once it is shown) and the prompts never hold up this chain.
+    // Once per launch: request supported macOS permissions, offer ensureStartupAppManagementPermission()
+    // guidance for the Settings-only App Management grant, and check Screen Recording and
+    // Accessibility for computer use (one prompt for the ones that are off). Fire-and-forget:
+    // the dialogs open as sheets once the startup window is on screen (startup windows stay
+    // hidden until the board loads, C1006) and never hold up startup. Other platforms skip
+    // without elevation.
     const startupProjects = openProjectPaths();
     requestStartupPermissions({
       projectPaths: startupProjects,
       userDataPath: app.getPath('userData'),
-      parentWindow: (startupProjects[0] && ownerOf(startupProjects[0])) || openProjectWindows()[0] || null,
+      parentWindow: (startupProjects[0] && ownerOf(startupProjects[0])) || openProjectWindows()[0]
+        || startupWindows.find((win) => !win.isDestroyed()) || null,
       localeFor: (dir) => require('./src/server/project-config').readProjectLanguage(dir),
-      systemPreferences, Notification, dialog,
+      systemPreferences, Notification, dialog, shell,
       appVersion: app.getVersion(),
     }).then((outcome) => {
       if (!outcome.skipped) console.log('[os-permissions] startup check:', JSON.stringify(outcome.results));

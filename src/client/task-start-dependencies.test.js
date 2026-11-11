@@ -135,9 +135,9 @@ test('resume controls stay enabled after on_fire + follow-up tasks start in the 
 
 test('card, board repaint and edit modal all exempt an existing session from the dependency gate', () => {
   const card = readSource('task-card.js');
-  assert.match(card, /const startGated = depsBlocked && !hasTaskSession\(t\.id\);/);
-  assert.match(card, /card-start-btn btn-claude card-ctl\$\{startGated \? ' deps-blocked'/);
-  assert.match(card, /\$\{startGated \? ` disabled title="Waiting for:/);
+  assert.match(card, /const gated = blocking\.length > 0 && !hasTaskSession\(t\.id\);/);
+  assert.match(card, /card-start-btn \$\{kind\} card-ctl\$\{gated \? ' deps-blocked'/);
+  assert.match(card, /\$\{gated \? ` disabled title="Waiting for:/);
   assert.match(card, /dataset\.depsBlocked === '1' && !hasTaskSession\(taskId\)\) return;/);
 
   const board = readSource('task-board.js');

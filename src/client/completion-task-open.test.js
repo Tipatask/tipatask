@@ -56,8 +56,8 @@ test('missing and inaccessible task messages are localized', () => {
     assert.equal(t('modal.errOpen', { msg: 'API 500: boom' }), 'Could not open task: API 500: boom'); // (TPT665)
     setLocale('uk');
     assert.match(t('modal.errTaskNotFound', { id: 'C1' }), /C1.*не знайдено/);
-    assert.match(t('modal.errTaskUnavailable', { id: 'C1' }), /C1.*недоступна/);
-    assert.match(t('modal.errOpen', { msg: 'API 500: boom' }), /^Не вдалося відкрити задачу: API 500: boom$/);
+    assert.match(t('modal.errTaskUnavailable', { id: 'C1' }), /C1.*недоступне/);
+    assert.match(t('modal.errOpen', { msg: 'API 500: boom' }), /^Не вдалося відкрити завдання: API 500: boom$/);
   } finally {
     setLocale('en');
   }

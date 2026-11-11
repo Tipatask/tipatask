@@ -126,13 +126,16 @@ function ensurePiInstalled({ serverRoot = SERVER_ROOT, platform = process.platfo
   // --ignore-scripts: pi has no install scripts of its own, and this tree is never rebuilt
   // against Electron's ABI (it ships plain JS/ESM, not native modules) — unlike the top-level
   // `npm install` in this package, whose postinstall (electron-rebuild for node-pty) IS wanted.
+  // npm no longer accepts Python as npm config; keep legacy callers working for node-gyp.
+  const { npm_config_python, ...env } = process.env;
+  if (npm_config_python) env.PYTHON = npm_config_python;
   const result = spawn(
     hostPlatform === 'win32' ? 'npm.cmd' : 'npm',
     // shell:true on Windows is required (Node >=20.12 refuses to spawn a .cmd shim without it,
     // spawnSync EINVAL), and it joins args unquoted, so quote the path that may hold spaces.
-    ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', `--os=${platform}`, `--cpu=${arch}`,
+    ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error', `--os=${platform}`, `--cpu=${arch}`,
       '--prefix', hostPlatform === 'win32' ? `"${vendorDir}"` : vendorDir],
-    { stdio: 'inherit', cwd: serverRoot, shell: hostPlatform === 'win32' }
+    { stdio: 'inherit', cwd: serverRoot, shell: hostPlatform === 'win32', env }
   );
   if (result.error || result.status !== 0) throw new Error(`npm ci failed${result.error ? `: ${result.error.message}` : ` (exit ${result.status})`}`);
   pruneForeignOptional(vendorDir, lock, platform, arch, log);

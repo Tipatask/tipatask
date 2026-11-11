@@ -4,28 +4,57 @@
 // permission lazily: notifications on the first native alert, the microphone on the first
 // voice input, Desktop/Documents/Downloads on an agent's first read there. The first task on
 // a fresh install could then stall mid-run on a system prompt. requestStartupPermissions()
-// asks for all of them once, right after the startup windows exist, behind a one-time
-// explanation (the `permissions.*` strings in menu-i18n.js).
+// requests supported permissions right after the startup windows exist, behind a one-time
+// explanation (the `permissions.*` strings in permissions-i18n.js, en/uk/zh/es). App Management
+// has no public Electron authorization API: ensureStartupAppManagementPermission() offers
+// Settings guidance. Computer use needs Screen Recording and Accessibility, which have no
+// request API either: ensureComputerUsePermissions() reads both on every launch and shows one
+// prompt naming the ones that are off, with a button to their System Settings pane.
 //
 // main.js passes the Electron objects in and the unit test (src/server/os-permissions.test.js)
 // replaces every other dependency, so this module never requires electron and does no I/O at
 // load (C1173). Outcomes are kept in <userData>/os-permissions.json:
 //   { version, explainedAt, permissions: { <id>: { status, appVersion, execPath, checkedAt } } }
-// id: 'notifications' | 'microphone' | 'folder:<absolute path>'.
-// status: granted | denied | restricted (microphone blocked by device policy) | not-granted
-// (notifications not allowed within the probe window: macOS reports a refusal and an
-// unanswered request the same way) | missing (no such folder) | unsupported | unknown (no
-// answer in time, or an unexpected error).
-// A granted entry is skipped on later launches (stillGranted()). The explanation shows only
+// id: 'notifications' | 'microphone' | 'folder:<absolute path>' | 'app-management' |
+// 'screen-recording' | 'accessibility'.
+// status: granted | denied | restricted (blocked by device policy) | not-granted (notifications
+// not allowed within the probe window, or Screen Recording/Accessibility off: macOS reports a
+// refusal and an unanswered request the same way) | missing (no such folder) | unsupported |
+// unknown (no answer in time, or an unexpected error) | settings-guidance (App Management
+// guidance was shown, NOT an OS authorization result) | skipped (the user chose Don't Ask Again
+// for a computer-use item). settings-guidance and skipped are kept across app updates and
+// executable moves. A granted entry is skipped on later launches (stillGranted()); Screen
+// Recording and Accessibility are read live every launch instead. The explanation shows only
 // while the file does not exist.
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { LOCALES } = require('./menu-i18n');
+const { normalizeLocale, permissionStrings } = require('./permissions-i18n');
 
 const MARKER_FILE = 'os-permissions.json';
 const MARKER_VERSION = 1;
+const APP_MANAGEMENT_ID = 'app-management';
+const APP_MANAGEMENT_SETTINGS = 'x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles';
+const PRIVACY_SETTINGS = 'x-apple.systempreferences:com.apple.preference.security';
+// The macOS permissions computer use needs: agents take screenshots (Screen Recording) and click
+// and type in apps (Accessibility). TCC attributes both to TipATask, the responsible app of every
+// agent it spawns. Order matters: Open System Settings shows the first missing item's pane.
+const COMPUTER_USE = [
+  {
+    id: 'screen-recording', name: 'permissions.screenRecording', line: 'permissions.screenRecordingItem',
+    settings: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+    status: screenRecordingStatus,
+  },
+  {
+    id: 'accessibility', name: 'permissions.accessibility', line: 'permissions.accessibilityItem',
+    settings: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+    status: accessibilityStatus,
+  },
+];
+// computerUseDialog() button indexes.
+const OPEN_SETTINGS = 0;
+const DONT_ASK_AGAIN = 2;
 // Protected folders agents commonly read. The open project folders are added per launch.
 const STANDARD_FOLDERS = ['Desktop', 'Documents', 'Downloads'];
 // Notification authorization belongs to the bundle id, so it survives app updates. TCC ties an
@@ -56,7 +85,21 @@ function within(promise, ms, fallback) {
 }
 
 function stringsFor(locale) {
-  return LOCALES[locale] || LOCALES.en;
+  return permissionStrings(locale);
+}
+
+// Substitutes {name} placeholders; an unknown one stays as written.
+function fill(template, params) {
+  return template.replace(/\{(\w+)\}/g, (match, key) => (Object.hasOwn(params, key) ? params[key] : match));
+}
+
+// "A and B" in the dialog's language; a plain comma list where Intl.ListFormat is unavailable.
+function listNames(names, locale) {
+  try {
+    return new Intl.ListFormat(normalizeLocale(locale), { style: 'long', type: 'conjunction' }).format(names);
+  } catch {
+    return names.join(', ');
+  }
 }
 
 // dialog.showMessageBox() options for the one-time explanation, in the given locale.
@@ -70,6 +113,40 @@ function permissionDialog(locale) {
     buttons: [strings['permissions.continue']],
     defaultId: 0,
     cancelId: 0,
+  };
+}
+
+function appManagementDialog(locale) {
+  const strings = stringsFor(locale);
+  return {
+    type: 'info',
+    title: strings['permissions.title'],
+    message: strings['permissions.appManagementMessage'],
+    detail: strings['permissions.appManagementDetail'],
+    buttons: [strings['permissions.openSettings'], strings['permissions.later']],
+    defaultId: 1,
+    cancelId: 1,
+  };
+}
+
+// dialog.showMessageBox() options for the computer-use prompt, naming only the given ids, in
+// COMPUTER_USE order. Enter opens System Settings and Escape is Later; only an explicit
+// Don't Ask Again stops the named items from being asked about again.
+function computerUseDialog(locale, ids) {
+  const strings = stringsFor(locale);
+  const items = COMPUTER_USE.filter((item) => ids.includes(item.id));
+  return {
+    type: 'info',
+    title: strings['permissions.title'],
+    message: fill(strings['permissions.computerUseMessage'], {
+      names: listNames(items.map((item) => strings[item.name]), locale),
+    }),
+    detail: fill(strings['permissions.computerUseDetail'], {
+      list: items.map((item) => strings[item.line]).join('\n'),
+    }),
+    buttons: [strings['permissions.openSettings'], strings['permissions.later'], strings['permissions.dontAskAgain']],
+    defaultId: OPEN_SETTINGS,
+    cancelId: 1,
   };
 }
 
@@ -134,6 +211,115 @@ async function explain({ dialog, parentWindow, locale, timing, log }) {
   } catch (err) {
     log.warn('[os-permissions] explanation dialog failed (non-fatal):', err?.message || err);
   }
+}
+
+// App Management (SystemPolicyAppBundles, macOS 13 / Darwin 22+) controls changes to other
+// apps' bundles. It is distinct from Accessibility, Automation and Full Disk Access. Electron
+// cannot query/request it. Never probe by modifying an installed app or reading the TCC DB.
+// Fresh, granted and denied OS states are all unobservable here: offer the same optional
+// guidance once and never label opening Settings as a grant. Windows UAC and Linux polkit
+// authorize specific privileged operations; there is no startup grant to acquire there.
+async function ensureStartupAppManagementPermission({
+  platform = process.platform, release = os.release(), previous = null,
+  dialog = null, shell = null, parentWindow = null, locale = 'en', record = () => {},
+  timing: waits = {}, log = console,
+} = {}) {
+  const darwinMajor = Number(/^(\d+)\./.exec(release)?.[1]);
+  if (platform !== 'darwin' || !Number.isFinite(darwinMajor) || darwinMajor < 22) return 'unsupported';
+  if (previous?.status === 'settings-guidance') return 'settings-guidance';
+  if (typeof dialog?.showMessageBox !== 'function') return 'unsupported';
+  let guidanceShown = false;
+  try {
+    const parent = await whenShown(parentWindow, { ...TIMING, ...waits }.windowShowMs);
+    const options = appManagementDialog(locale);
+    const answer = parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options);
+    // Persist before waiting: quitting with the dialog open must not repeat it next launch.
+    record(APP_MANAGEMENT_ID, 'settings-guidance');
+    guidanceShown = true;
+    const { response } = await answer;
+    if (response === 0 && typeof shell?.openExternal === 'function') {
+      try {
+        await shell.openExternal(APP_MANAGEMENT_SETTINGS);
+      } catch {
+        // Settings anchors vary by OS release; the dialog also gives the manual path.
+        await shell.openExternal(PRIVACY_SETTINGS);
+      }
+    }
+    return 'settings-guidance';
+  } catch (err) {
+    log.warn('[os-permissions] App Management guidance failed (non-fatal):', err?.message || err);
+    return guidanceShown ? 'settings-guidance' : 'unknown';
+  }
+}
+
+// getMediaAccessStatus('screen') reads CGPreflightScreenCaptureAccess(): 'granted', or 'denied'
+// for a refusal and a never-asked app alike. It never prompts.
+function screenRecordingStatus(systemPreferences) {
+  if (typeof systemPreferences?.getMediaAccessStatus !== 'function') return 'unsupported';
+  try {
+    const status = systemPreferences.getMediaAccessStatus('screen');
+    if (status === 'granted' || status === 'restricted') return status;
+    return status === 'denied' || status === 'not-determined' ? 'not-granted' : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+// isTrustedAccessibilityClient(false) only checks; true would raise macOS's own alert.
+function accessibilityStatus(systemPreferences) {
+  if (typeof systemPreferences?.isTrustedAccessibilityClient !== 'function') return 'unsupported';
+  try {
+    return systemPreferences.isTrustedAccessibilityClient(false) ? 'granted' : 'not-granted';
+  } catch {
+    return 'unknown';
+  }
+}
+
+// Screen Recording and Accessibility for computer use. Both are read live on every launch,
+// without an OS prompt, and recorded; then at most one dialog names the items that are off
+// (computerUseDialog()). Open System Settings opens the first one's pane, falling back to
+// Privacy & Security. Don't Ask Again records the named items as skipped: a skipped item is
+// never read or named again, across app updates and executable moves. Later, Escape, Open
+// System Settings or a failed dialog leave the items to the next launch's check. Resolves
+// { <id>: status } and never rejects; outside macOS every item is unsupported and no
+// dependency is touched.
+async function ensureComputerUsePermissions({
+  platform = process.platform, systemPreferences = null, previous = {},
+  dialog = null, shell = null, parentWindow = null, locale = 'en', record = () => {},
+  timing: waits = {}, log = console,
+} = {}) {
+  const statuses = {};
+  if (platform !== 'darwin') {
+    for (const { id } of COMPUTER_USE) statuses[id] = 'unsupported';
+    return statuses;
+  }
+  for (const item of COMPUTER_USE) {
+    statuses[item.id] = previous?.[item.id]?.status === 'skipped' ? 'skipped' : item.status(systemPreferences);
+    record(item.id, statuses[item.id]);
+  }
+  const missing = COMPUTER_USE.filter((item) => statuses[item.id] === 'not-granted');
+  if (!missing.length || typeof dialog?.showMessageBox !== 'function') return statuses;
+  try {
+    const parent = await whenShown(parentWindow, { ...TIMING, ...waits }.windowShowMs);
+    const options = computerUseDialog(locale, missing.map((item) => item.id));
+    const { response } = await (parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options));
+    if (response === DONT_ASK_AGAIN) {
+      for (const item of missing) {
+        statuses[item.id] = 'skipped';
+        record(item.id, 'skipped');
+      }
+    } else if (response === OPEN_SETTINGS && typeof shell?.openExternal === 'function') {
+      try {
+        await shell.openExternal(missing[0].settings);
+      } catch {
+        // Settings anchors vary by OS release; the dialog also gives each item's path.
+        await shell.openExternal(PRIVACY_SETTINGS);
+      }
+    }
+  } catch (err) {
+    log.warn('[os-permissions] computer use prompt failed (non-fatal):', err?.message || err);
+  }
+  return statuses;
 }
 
 // Live TCC status, read on every launch: only 'not-determined' can still raise a prompt.
@@ -212,13 +398,15 @@ async function probeFolder(dir, opendir) {
   }
 }
 
-// Asks macOS for every permission an agent run can need, once. Never rejects for a refused or
-// failed request; resolves { skipped: true } off macOS, else { skipped: false, explained,
-// results: { <id>: status } } for the entries checked this launch.
+// Requests supported macOS permissions, offers App Management Settings guidance and asks once for
+// the computer-use permissions that are off. main.js calls it once per launch. Never rejects for a
+// refused or failed request; resolves { skipped: true } off macOS, else { skipped: false,
+// explained, results: { <id>: status } } for the entries checked this launch.
 async function requestStartupPermissions({
   projectPaths = [], userDataPath, parentWindow = null, localeFor = null,
-  systemPreferences = null, Notification = null, dialog = null,
+  systemPreferences = null, Notification = null, dialog = null, shell = null,
   appVersion = '', execPath = process.execPath, platform = process.platform, home = os.homedir(),
+  release = os.release(),
   fsApi = fs, opendir = (dir) => fs.promises.opendir(dir, { bufferSize: 1 }),
   timing: waits = {}, log = console, now = () => new Date().toISOString(),
 } = {}) {
@@ -252,6 +440,16 @@ async function requestStartupPermissions({
     state.explainedAt = now();
     save();
   }
+  record(APP_MANAGEMENT_ID, await ensureStartupAppManagementPermission({
+    platform, release, previous: state.permissions[APP_MANAGEMENT_ID],
+    dialog, shell, parentWindow, locale, record, timing, log,
+  }));
+  // Our own dialogs come first and the system prompts after them: the computer-use prompt is
+  // answered before notifications, the microphone and folders start asking.
+  await ensureComputerUsePermissions({
+    platform, systemPreferences, previous: state.permissions,
+    dialog, shell, parentWindow, locale, record, timing, log,
+  });
   // The notification alert is answered on the user's own time, so it is probed beside the TCC
   // prompts rather than ahead of them.
   const notifications = pending('notifications')
@@ -271,4 +469,7 @@ async function requestStartupPermissions({
   return { skipped: false, explained: !marker, results };
 }
 
-module.exports = { requestStartupPermissions, permissionDialog, MARKER_FILE };
+module.exports = {
+  requestStartupPermissions, ensureStartupAppManagementPermission, ensureComputerUsePermissions,
+  permissionDialog, appManagementDialog, computerUseDialog, MARKER_FILE,
+};

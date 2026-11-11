@@ -108,7 +108,8 @@ test('a promoted split origin follows the project objective-grouping toggle', ()
   ];
   const tasks = [origin, ...children];
   assert.deepEqual(tasksVisibleUnderGrouping(tasks, { objectiveGrouping: true, drilldown: false }).map(t => t.id), ['TPT42']);
-  assert.deepEqual(tasksVisibleUnderGrouping(tasks, { objectiveGrouping: false, drilldown: false }).map(t => t.id), ['TPT43', 'TPT44']);
+  // (TPT9233) Ungrouped keeps the origin on the board beside its subtasks.
+  assert.deepEqual(tasksVisibleUnderGrouping(tasks, { objectiveGrouping: false, drilldown: false }).map(t => t.id), ['TPT42', 'TPT43', 'TPT44']);
 });
 
 test('grouping ON: an orphan child (parent not in this fetch) stays visible', () => {
@@ -135,11 +136,22 @@ test('grouping ON: a nested objective (child that is itself a parent) hides alon
   assert.deepEqual(out.map(t => t.id), ['A']);
 });
 
-test('grouping OFF: an objective parent WITH children is hidden, the children render as plain tasks', () => {
+test('grouping OFF (TPT9233): an objective parent WITH children stays, and its children render as plain tasks', () => {
+  // C1554-shaped: the parent of an objective planned before grouping was turned off must stay
+  // reachable from the root board — its Subtasks N/M drill-in is on its own card.
   const parent = { id: 'C1', dbId: 1, isObjective: true, hasChildren: true };
   const child = { id: 'C2', dbId: 2, parentDbId: 1 };
   const out = tasksVisibleUnderGrouping([parent, child], { objectiveGrouping: false, drilldown: false });
-  assert.deepEqual(out.map(t => t.id), ['C2']);
+  assert.deepEqual(out.map(t => t.id), ['C1', 'C2']);
+  assert.equal(taskHiddenByGrouping(parent, { objectiveGrouping: false, presentDbIds: new Set([1, 2]) }), false);
+  assert.equal(taskHiddenByGrouping(child, { objectiveGrouping: false, presentDbIds: new Set([1, 2]) }), false);
+});
+
+test('grouping OFF (TPT9233): nested objectives — every level is its own root card', () => {
+  const a = { id: 'A', dbId: 1, isObjective: true, hasChildren: true };
+  const b = { id: 'B', dbId: 2, parentDbId: 1, isObjective: true, hasChildren: true };
+  const c = { id: 'C', dbId: 3, parentDbId: 2 };
+  assert.deepEqual(tasksVisibleUnderGrouping([a, b, c], { objectiveGrouping: false, drilldown: false }).map(t => t.id), ['A', 'B', 'C']);
 });
 
 test('grouping OFF: a CHILDLESS objective row stays visible (C1559 — web-created, subtasks not generated yet)', () => {

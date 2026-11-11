@@ -204,3 +204,25 @@ test('completeVerifiedTask: a refused completion writes nothing and reports reso
   assert.equal(refused.verification.ready, false);
   assert.deepEqual(b.calls, []);
 });
+
+
+test('parent completion refuses open or unreadable descendants and succeeds after they close', async () => {
+  const b = guardBackend({ ...COMMIT_ON, vcs_commit_enabled: 0 });
+  await b.updateTask('TPT1', { dbId: 1, isObjective: true });
+  b.calls.length = 0;
+  b.getTasksUnfiltered = async () => [{ id: 'TPT2', dbId: 2, parentDbId: 1, status: 'in_progress' }];
+  const args = { backend: b, projectRoot: '/missing', taskId: 'TPT1', resolution: 'Verified parent. Follow-ups: none.' };
+  let result = await completeVerifiedTask(args);
+  assert.equal(result.completed, false);
+  assert.ok(codes(result.verification).includes('PARENT_CHILDREN_OPEN'));
+  assert.deepEqual(b.calls, []);
+  b.getTasksUnfiltered = async () => { throw new Error('offline'); };
+  result = await completeVerifiedTask(args);
+  assert.equal(result.completed, false);
+  assert.ok(codes(result.verification).includes('PARENT_CHILDREN_UNKNOWN'));
+  b.getTasksUnfiltered = async () => [{ id: 'TPT2', dbId: 2, parentDbId: 1, status: 'completed' },
+    { id: 'TPT3', dbId: 3, parentDbId: 2, status: 'in_progress' }];
+  assert.equal((await completeVerifiedTask(args)).completed, false, 'open grandchildren also block completion');
+  b.getTasksUnfiltered = async () => [{ id: 'TPT2', dbId: 2, parentDbId: 1, status: 'completed' }];
+  assert.equal((await completeVerifiedTask(args)).completed, true);
+});

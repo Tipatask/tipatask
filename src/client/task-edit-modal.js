@@ -4,7 +4,7 @@ import state from './state.js';
 import { t, tc } from './i18n.js';
 import { queueReasonText } from './queue-reason.js';
 import { agentModelOptions, ensureAgentModels, EFFORT_LEVELS, EFFORT_LABELS } from './constants.js';
-import { statusNames, statusLabel, statusColor, isInProgressName, startName } from './status-registry.js';
+import { statusNames, statusLabel, statusColor, isActiveName, isInProgressName, startName } from './status-registry.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { hasTaskSession } from './dependency-status.js';
 import { escapeAttr, insertAtCursor, renderMarkdown, renderSprintCombobox, initSprintCombobox, showToast, showBoardLoader, hideBoardLoader, showActionBanner, hideActionBanner, taskOpenErrorLabel, sprintRecordMax } from './utils.js';
@@ -22,7 +22,7 @@ import { groupNoun, groupTitle, getSprintsEnabled, projectPermissionMode } from 
 import { perfStart, perfEnd } from './perf-log.js';
 import { tagDescription, filterTagOptions } from './tag-match.js';
 import { showActionConfirm } from './action-confirm.js';
-import { buildTaskModeOptions, normalizePermissionMode, effectivePermissionMode } from './permission-mode.js';
+import { buildTaskModeOptions, normalizePermissionMode, effectivePermissionMode, normalizeCowboyScope, cowboyModeOptions } from './permission-mode.js';
 import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
 import { activateDialogFocus } from './dialog-focus.js';
 
@@ -144,7 +144,14 @@ function _depTitleFor(key) {
 // below): the New Task form in task-board.js renders and repaints through the same builders.
 export function _renderDepChip(key) {
   const title = _depTitleFor(key);
-  return `<span class="dep-chip modal-dep-chip" data-dep="${escapeAttr(key)}"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeAttr(key)}<button class="chip-remove" type="button" data-dep="${escapeAttr(key)}">&times;</button></span>`;
+  return `<span class="dep-chip modal-dep-chip" data-dep="${escapeAttr(key)}"${title ? ` title="${escapeAttr(title)}"` : ''}>${_depKeyHtml(key)}<button class="chip-remove" type="button" data-dep="${escapeAttr(key)}">&times;</button></span>`;
+}
+
+// (TPT9216) The chip's key through the board's dependencyKeyMarkup() (task-card.js): a key whose
+// task holds the complete or canceled role is struck through; the remove button stays outside it.
+// A bare key when no board supplied the command.
+function _depKeyHtml(key) {
+  return typeof commands?.dependencyKeyMarkup === 'function' ? commands.dependencyKeyMarkup(key) : escapeAttr(key);
 }
 
 function _commentSeenKey(taskId) {
@@ -777,6 +784,8 @@ async function _openTaskEditModalImpl(taskId, callbacks = {}) {
   // callbacks.initialPane: optional 'edit' | 'terminal' | 'chat' (TPT466) — the workspace pane
   //   shown on open. callbacks.terminalLaunch: optional { title, desc, status, opts } — the
   //   openTerminal() arguments of the launch that opened this workspace on its terminal pane.
+  //   callbacks.chatLaunch: optional { model } (TPT9268/TPT9271) — the model the Chat pane
+  //   preselects on its start gate (task-chat.js mount()'s `launch`); it never starts the chat.
   // (TPT272/TPT283) A task locked by an open Rehash → Discuss/Split tab can't be edited from the
   // board or the terminal bridge until the chat is saved or closed. The chat's own read-only view
   // and in-memory proposals (preloadedTask) stay openable. The toast names the lock's mode.
@@ -902,9 +911,12 @@ async function _openTaskEditModalImpl(taskId, callbacks = {}) {
     pane: _paneTabsEnabled(callbacks) && _PANES.includes(callbacks.initialPane) ? callbacks.initialPane : 'edit',
     panes: { terminal: null, chat: null },
     pendingTerminal: callbacks.terminalLaunch || null,
+    // (TPT9268/TPT9271) A model ({ model }) the Chat pane preselects on its next show.
+    pendingChat: callbacks.chatLaunch || null,
     terminalStatus: null,
   };
   _renderTaskEditModal();
+  document.addEventListener('keydown', _onSaveShortcut, true); // (TPT9224) Cmd/Ctrl+S; deduped across reopen
   commands.syncActiveSessionsNav?.(); // (TPT485) this workspace's rail row is the open one now
   const modalRoot = document.getElementById('task-edit-modal');
   _modalDialogFocus = activateDialogFocus({
@@ -1063,6 +1075,7 @@ function _openImageLightbox(src, alt) {
 // paints the rail itself once its state is in place — no in-between repaint with nothing open.
 export function closeTaskEditModal(force = false, { keepRail = false } = {}) {
   if (!_modalState) return;
+  document.removeEventListener('keydown', _onSaveShortcut, true); // (TPT9224)
   // (TPT466) Detach the terminal and chat before the DOM goes: their server-side session and
   // chat keep running, only this window's xterm and socket are released.
   _disposePanes();
@@ -1090,6 +1103,38 @@ export function closeTaskEditModal(force = false, { keepRail = false } = {}) {
   _modalDialogFocus?.close();
   _modalDialogFocus = null;
   if (!keepRail) commands?.syncActiveSessionsNav?.(); // the workspace's row is no longer the open one
+}
+
+// (TPT9224) Cmd+S / Ctrl+S while the modal holds focus: the Save button's own path (validation,
+// error toasts, onSavePreview for proposal and diff cards), then close once the save succeeds.
+// Capture phase on document, added on open and removed on close. Once the modal is the top focus
+// layer the key is always swallowed (no browser/Electron Save Page), but it saves nothing when:
+// a higher layer is open (discard confirm, image lightbox, Settings — the event is left alone for
+// that layer), the modal is read-only, Save is missing or disabled (nothing to save), a save is
+// already running, or the tabbed workspace shows anything other than Edit ▸ General (Comments,
+// Notifications, Agent Terminal, Chat). A failed save leaves the modal open.
+function _onSaveShortcut(e) {
+  if (!(e.metaKey || e.ctrlKey) || typeof e.key !== 'string' || e.key.toLowerCase() !== 's') return;
+  const st = _modalState;
+  if (!st || e.isComposing) return;
+  if (!_modalDialogFocus?.isTop()) return;
+  e.preventDefault();
+  const modal = document.getElementById('task-edit-modal');
+  if (!modal || modal.hidden) return;
+  if (st.tabs) {
+    const subTab = modal.querySelector('.modal-tab-btn.active')?.dataset.tab || 'general';
+    if (st.pane !== 'edit' || subTab !== 'general') return;
+  }
+  if (st._savesRunning > 0 || _isModalReadOnly(st.draft) || typeof st._runSave !== 'function') return;
+  const saveBtn = modal.querySelector('.btn-modal-save');
+  if (!saveBtn || saveBtn.disabled || saveBtn.closest('[hidden]')) return;
+  void st._runSave().then((ok) => {
+    if (!ok || _modalState !== st) return;
+    // An open description editor commits on blur and reads _modalState: let it run first.
+    const focused = document.activeElement;
+    if (focused && focused !== document.body && modal.contains(focused)) focused.blur();
+    if (_modalState === st) closeTaskEditModal(true);
+  });
 }
 
 // (C1392) Interactive close path (Esc key, backdrop click) — replaces the native
@@ -1200,29 +1245,28 @@ export function _agentModelControlHtml(assignee, draft, projectConfig, { hidden 
 
 // (TPT9161) Cowboy-coding mode is offered only while the draft starts in Bypass — its own override,
 // else the cached project default (effectivePermissionMode()). In every other mode the row is
-// hidden and the box unchecked; the permission select's handler clears the draft flag to match.
+// hidden and the select shows Disabled; permission changes clear the draft scope.
 function _draftStartsInBypass(draft) {
   return effectivePermissionMode(draft, projectPermissionMode()).mode === 'bypass';
 }
 
 // Sits right after the Permission mode row. The hint rides title (like Design mode) and the
-// box's accessible description. Disabled only in read-only mode, like the permission select:
+// select's accessible description. Disabled only in read-only mode, like the permission select:
 // both configure what happens when a run ends, so they stay editable while one is active.
 function _cowboyModeRowHtml(draft, disabled) {
   const bypass = _draftStartsInBypass(draft);
   const hint = escapeAttr(t('cowboyMode.hint'));
-  return `<div class="modal-field-row modal-cowboy-mode-row"${bypass ? '' : ' hidden'}><label for="modal-cowboy-mode">${t('field.cowboyMode')}</label><input type="checkbox" id="modal-cowboy-mode" class="modal-cowboy-mode"${bypass && draft.cowboyMode ? ' checked' : ''}${disabled ? ' disabled' : ''} title="${hint}" aria-describedby="modal-cowboy-mode-hint"><span id="modal-cowboy-mode-hint" hidden>${hint}</span></div>`;
+  return `<div class="modal-field-row modal-cowboy-mode-row"${bypass ? '' : ' hidden'}><label for="modal-cowboy-mode">${t('field.cowboyMode')}</label><select id="modal-cowboy-mode" class="modal-cowboy-mode"${disabled ? ' disabled' : ''} title="${hint}" aria-describedby="modal-cowboy-mode-hint">${cowboyModeOptions(bypass ? draft.cowboyMode : 'disabled', t).map(option => `<option value="${option.value}"${option.selected ? ' selected' : ''}>${option.label}</option>`).join('')}</select><span id="modal-cowboy-mode-hint" hidden>${hint}</span></div>`;
 }
 
-// Re-derives the row from the draft after a permission change: shown only in Bypass, checked only
-// when the draft flag is on there.
+// Re-derive visibility and selected scope after permission changes.
 function _syncCowboyModeRow(modal, draft) {
   const row = modal.querySelector('.modal-cowboy-mode-row');
   const box = row?.querySelector('.modal-cowboy-mode');
   if (!row || !box) return;
   const bypass = _draftStartsInBypass(draft);
   row.hidden = !bypass;
-  box.checked = bypass && !!draft.cowboyMode;
+  box.value = bypass ? normalizeCowboyScope(draft.cowboyMode) : 'disabled';
 }
 
 function _renderTaskEditModal() {
@@ -1809,9 +1853,8 @@ function _attachModalHandlers(modal) {
       const draft = _modalState.draft;
       const wasBypass = _draftStartsInBypass(draft);
       draft.agentPermissionMode = value || null;
-      // (TPT9161) Hidden means unchecked: leaving Bypass clears the Cowboy-coding flag, and a
-      // return to Bypass starts unchecked. Bypass to Bypass (override ⇄ an inherited Bypass) keeps it.
-      if (draft.cowboyMode && (!wasBypass || !_draftStartsInBypass(draft))) draft.cowboyMode = false;
+      // Leaving Bypass clears the scope; returning to Bypass starts Disabled. Bypass to Bypass (override ⇄ an inherited Bypass) keeps it.
+      if (draft.cowboyMode && (!wasBypass || !_draftStartsInBypass(draft))) draft.cowboyMode = 'disabled';
       _syncCowboyModeRow(modal, draft);
       upd();
     });
@@ -2106,9 +2149,10 @@ function _attachModalHandlers(modal) {
   const designModeCb = modal.querySelector('.modal-claude-design-mode');
   if (designModeCb) designModeCb.addEventListener('change', () => { _modalState.draft.claudeDesignMode = designModeCb.checked; upd(); });
 
-  // (TPT9161) Cowboy-coding mode checkbox — only reachable while the draft starts in Bypass.
-  const cowboyModeCb = modal.querySelector('.modal-cowboy-mode');
-  if (cowboyModeCb) cowboyModeCb.addEventListener('change', () => { _modalState.draft.cowboyMode = cowboyModeCb.checked; upd(); });
+  // Cowboy scope select — only reachable while the draft starts in Bypass.
+  _syncCowboyModeRow(modal, _modalState.draft);
+  const cowboyModeSelect = modal.querySelector('.modal-cowboy-mode');
+  if (cowboyModeSelect) cowboyModeSelect.addEventListener('change', () => { _modalState.draft.cowboyMode = cowboyModeSelect.value; upd(); });
 
   // (TPT285) Per-task effort — blank option = null (inherit the agent default).
   const effortSel = modal.querySelector('.modal-effort-select');
@@ -2175,10 +2219,10 @@ function _attachModalHandlers(modal) {
     if (!!draft.claudeDesignMode !== !!original.claudeDesignMode) patch.claude_design_mode = !!draft.claudeDesignMode;
     // (TPT9161) Cowboy-coding mode, `!!` on both sides like design mode. The permission select's
     // handler clears the draft flag whenever the draft leaves Bypass, so a stored flag the hidden
-    // box no longer shows is saved as an explicit false. An untouched flag stored under a Bypass the
+    // select no longer shows is saved as Disabled. An untouched flag stored under a Bypass the
     // project default no longer gives is left alone: the cached default may lag the server's, and
     // the API clears the flag itself whenever this patch moves the override off Bypass.
-    if (!!draft.cowboyMode !== !!original.cowboyMode) patch.cowboy_mode = !!draft.cowboyMode;
+    if (normalizeCowboyScope(draft.cowboyMode) !== normalizeCowboyScope(original.cowboyMode)) patch.cowboy_mode = normalizeCowboyScope(draft.cowboyMode);
     if (!Object.keys(patch).length) return true;
     // In-memory proposal save: delegate to caller, skip all DB/board-DOM operations.
     if (callbacks.onSavePreview) {
@@ -2255,8 +2299,15 @@ function _attachModalHandlers(modal) {
     } catch (err) { console.error('[modal] Save failed:', err); _toastSaveFailure(err); return false; }
   };
 
-  // Save
-  saveBtn.addEventListener('click', () => { persistDraft(); });
+  // Save. (TPT9224) `runSave` counts in-flight saves on this modal's state so the Cmd/Ctrl+S
+  // shortcut (_onSaveShortcut) never starts a second save while one is still running.
+  const runSave = async () => {
+    const st = _modalState;
+    if (st) st._savesRunning = (st._savesRunning || 0) + 1;
+    try { return await persistDraft(); } finally { if (st) st._savesRunning -= 1; }
+  };
+  _modalState._runSave = runSave;
+  saveBtn.addEventListener('click', () => { void runSave(); });
 
   // (TPT466) Workspace tabs. A switch only hides the form, so an unsaved draft rides along
   // untouched — the Edit tab carries a dot meanwhile. Arrow keys move between tabs.
@@ -2707,12 +2758,14 @@ function _attachModalDepsInput(modal, onUpdate) {
   });
 }
 
-// Footer Start is offered only for a startable task: CODING, not handed to a human, startable by
-// this member, in a live editable modal. Shared by the render and the post-save sync below.
+// Active HUMAN tasks assigned to an agent use the same execution flow as CODING tasks.
+// Shared by the render and post-save sync; drafts alone never change Start visibility.
 function _shouldShowModalStart(task) {
   const callbacks = _modalState?.callbacks || {};
   return !!task && !callbacks.preloadedTask && !callbacks.hideActions && !_isModalReadOnly(task)
-    && task.category === 'CODING' && task.agentAssignee !== 'human' && commands.canStartTaskCard(task);
+    && (task.category === 'CODING' || (task.category === 'HUMAN' && isActiveName(task.status)
+      && ['claude', 'codex', 'pi'].includes(task.agentAssignee)))
+    && task.agentAssignee !== 'human' && commands.canStartTaskCard(task);
 }
 
 // (TPT568) The footer is painted once per render, so a saved agent change (Human → Claude, or
@@ -2969,6 +3022,10 @@ function _syncTerminalEmpty(modal) {
 function _showChatPane(modal, { focus = true } = {}) {
   const pane = modal.querySelector('.task-modal-pane--chat');
   if (!pane) return;
+  // (TPT9268/TPT9271) A preselected model: the chat mounted below shows it on its start gate, or
+  // the chat already mounted here takes it. Neither starts a chat.
+  const launch = _modalState.pendingChat;
+  _modalState.pendingChat = null;
   let handle = _modalState.panes.chat;
   if (!handle) {
     const mount = window.TipTask?.taskChat?.mount;
@@ -2985,6 +3042,7 @@ function _showChatPane(modal, { focus = true } = {}) {
           if (_modalState?.taskId === key) _switchPane('edit');
           else void openTaskWorkspace(key, { pane: 'edit' });
         },
+        ...(launch ? { launch } : {}),
       });
       mounted = handle;
     } catch (err) {
@@ -2993,6 +3051,8 @@ function _showChatPane(modal, { focus = true } = {}) {
     }
     if (!handle) return;
     _modalState.panes.chat = handle;
+  } else if (launch) {
+    handle.launch?.(launch);
   }
   handle.show({ focus });
 }
@@ -3018,11 +3078,13 @@ export function getOpenWorkspaceTaskId() {
 // One entry point for "show this task's workspace on that pane" — the terminal and chat
 // launchers route here (console-modal.js openTerminal, task-chat.js open). An open workspace
 // on the same task just switches pane; another task's goes through the dirty-close confirm.
-export async function openTaskWorkspace(taskId, { pane = 'edit', terminal = null, trigger, focusField } = {}) {
+// (TPT9268) `chat` = { model } is a card Discuss pick for the Chat pane (task-chat.js open()).
+export async function openTaskWorkspace(taskId, { pane = 'edit', terminal = null, chat = null, trigger, focusField } = {}) {
   if (!taskId) return;
   const target = _PANES.includes(pane) ? pane : 'edit';
   if (_modalState && _modalState.taskId === taskId && _modalState.tabs) {
     if (terminal) _modalState.pendingTerminal = terminal;
+    if (chat) _modalState.pendingChat = chat;
     _switchPane(target);
     if (focusField) document.getElementById(focusField)?.focus();
     return;
@@ -3034,7 +3096,7 @@ export async function openTaskWorkspace(taskId, { pane = 'edit', terminal = null
   // (TPT485) The rail stays live during that fetch (the board loader starts at its edge,
   // styles.css), so a second rail click can overtake this one: the latest open wins.
   if (_modalState && !(await _confirmDiscardIfDirty())) return;
-  const opts = { initialPane: target, terminalLaunch: terminal, trigger, focusField };
+  const opts = { initialPane: target, terminalLaunch: terminal, chatLaunch: chat, trigger, focusField };
   if (_taskWorkspaceOpener) return _taskWorkspaceOpener(taskId, opts);
   return openTaskEditModal(taskId, opts);
 }

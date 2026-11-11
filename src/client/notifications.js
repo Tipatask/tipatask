@@ -256,6 +256,7 @@ export function getNotificationStatus() {
     // itself, since 'not-registered' is already correctly ranked below unsigned/seal-broken.
     conflicts: _lsConflicts.conflicts,
     installerVolumes: _lsConflicts.installerVolumes,
+    registrationRepair: _lsConflicts.registrationRepair,
   };
 }
 
@@ -276,6 +277,7 @@ function _foldSignatureStatus(status) {
   _lsConflicts = {
     conflicts: status && status.conflicts !== undefined ? status.conflicts : null,
     installerVolumes: (status && status.installerVolumes) || [],
+    registrationRepair: status?.registrationRepair || null,
   };
 }
 
@@ -291,12 +293,25 @@ export async function refreshNotificationStatus() {
   } catch (_) { /* leave prior state — a failed refresh must not blank out a known-good read */ }
 }
 
-// (C1355) Settings-modal "Repair" button (shown only when lastError === 'not-registered' and
-// conflicts > 0) — re-registers the running bundle with LaunchServices via main.js's
-// notify:repair-registration, then refreshes status so the UI reflects the new state. No-op
-// (resolves `{ok:true, relaunchNeeded:false}`) outside Electron — there is nothing to repair on
-// the web transport. `relaunchNeeded:true` on success: usernoted only decides Notification
-// Center registration at process launch, same as the C1318 seal-repair path.
+// Shared by the persistent Settings notice and the Repair toast. The result verifies
+// LaunchServices claims only; Notification Center delivery still needs an app relaunch.
+export function registrationRepairMessage(result, translate) {
+  if (result?.ok) return translate('settings.notifRepairSucceeded');
+  const registration = result?.registration;
+  if (result?.outcome === 'blocked-installer') {
+    const volumes = [...new Set((registration?.installerVolumes || []).map(p => p.split('/').slice(0, 3).join('/')))];
+    return translate('settings.notifRepairEject', { volumes: volumes.join(', ') });
+  }
+  if (result?.outcome === 'verification-failed') {
+    const paths = [...(registration?.conflictPaths || []), ...(registration?.stalePaths || [])];
+    return paths.length
+      ? translate('settings.notifRepairRemaining', { paths: paths.join(', ') })
+      : translate('settings.notifRepairUnverified', { reason: result.reason || '' });
+  }
+  return translate('settings.notifRepairFailed', { reason: result?.reason || '' });
+}
+
+// On-demand verified repair; refresh on failures too so new blockers are not hidden.
 export async function repairNotificationRegistration() {
   if (typeof window === 'undefined' || typeof window.electronAPI?.notifyRepairRegistration !== 'function') {
     return { ok: true, relaunchNeeded: false };

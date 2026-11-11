@@ -130,3 +130,60 @@ test('defaultAccountServer returns the most recently signed-in server, or blank 
   }));
   assert.strictEqual(defaultAccountServer(opts), 'https://new.test');
 });
+
+test('all store writers publish synchronous server-only hints; renewal preserves consent and replacement rotates it', t => {
+  const opts = scratch(t); const changes = [];
+  const { onAccountChange } = require('./account-store');
+  const stop = onAccountChange(change => {
+    changes.push({ change, account: readAccount(change.baseUrl, opts) });
+  }, opts);
+  t.after(stop);
+  const original = saveAccountForServer('https://A.test/', { token: jwt({ id: 1, exp: 1 }) }, opts);
+  assert.equal(changes.length, 1);
+  assert.deepStrictEqual(changes[0].change, { baseUrl: 'https://a.test' });
+  assert.equal(changes[0].account.token, original.token, 'new state is readable before the writer returns');
+  writeAccountToken('https://a.test', jwt({ id: 1, exp: 2 }), opts);
+  assert.equal(changes.length, 2);
+  assert.equal(changes[1].account.consentEpoch, original.consentEpoch);
+  writeAccountToken('https://b.test', jwt({ id: 1 }), opts);
+  assert.equal(changes.length, 3);
+  assert.equal(changes[2].change.baseUrl, 'https://b.test');
+  saveAccountForServer('https://a.test', { token: jwt({ id: 2 }) }, opts);
+  assert.notEqual(changes[3].account.consentEpoch, original.consentEpoch);
+  clearAccountToken('https://a.test', opts);
+  assert.equal(changes.length, 5);
+  assert.equal(changes[4].account, null);
+  clearAccountToken('https://a.test', opts);
+  assert.equal(changes.length, 5);
+  stop();
+  writeAccountToken('https://a.test', jwt({ id: 1 }), opts);
+  assert.equal(changes.length, 5, 'unsubscribe removes the listener and watch');
+});
+
+test('directory watch observes cross-process atomic replacement, corruption and removal without polling', async t => {
+  const opts = scratch(t); const changes = [];
+  const { onAccountChange } = require('./account-store');
+  writeAccountToken('https://a.test', jwt({ id: 1 }), opts);
+  const stop = onAccountChange(change => changes.push(change), opts); t.after(stop);
+  const waitFor = async count => {
+    const end = Date.now() + 3000;
+    while (changes.length < count) {
+      assert.ok(Date.now() < end, 'account change notification timeout');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  };
+  require('node:child_process').execFileSync(process.execPath, ['-e',
+    "require(process.argv[1]).writeAccountToken('https://a.test', process.argv[3], {userDataRoot:process.argv[2]})",
+    require.resolve('./account-store'), opts.userDataRoot, jwt({ id: 2 })]);
+  await waitFor(1);
+  assert.equal(readAccount('https://a.test', opts).userId, 2);
+  fs.writeFileSync(accountStorePath(opts), '{corrupt');
+  await waitFor(2);
+  assert.equal(readAccount('https://a.test', opts), null);
+  writeAccountToken('https://a.test', jwt({ id: 1 }), opts);
+  assert.equal(changes.length, 3);
+  fs.unlinkSync(accountStorePath(opts));
+  await waitFor(4);
+  assert.equal(readAccount('https://a.test', opts), null);
+  assert.ok(changes.every(change => JSON.stringify(change) === '{"baseUrl":"https://a.test"}'));
+});

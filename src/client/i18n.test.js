@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-const { LOCALES } = await import('./i18n.js');
+const { LOCALES, setLocale, getLocale, t: translate, tc } = await import('./i18n.js');
 
 // (C1202) Cheap parity guard — this project's convention (CLAUDE.md: "i18n: FE + BE for
 // user-visible strings") is every en key gets a uk translation, but nothing enforced that
@@ -386,4 +386,38 @@ test('objective chat, Debug Console and api-status banner keys keep their placeh
     }
   }
   assert.ok(LOCALES.uk['console.turnFailedTries.few']?.includes('{reason}'), 'uk.console.turnFailedTries.few must contain {reason}');
+});
+
+
+test('four supported locales have complete, non-empty copy and preserve every interpolation parameter', () => {
+  assert.deepEqual(Object.keys(LOCALES), ['en', 'uk', 'zh', 'es']);
+  const placeholders = value => [...value.matchAll(/\{(\w+)\}/g)].map(match => match[1]).sort();
+  for (const locale of ['zh', 'es']) {
+    assert.deepEqual(Object.keys(LOCALES[locale]).sort(), Object.keys(LOCALES.en).sort());
+    for (const [key, english] of Object.entries(LOCALES.en)) {
+      assert.ok(LOCALES[locale][key]?.trim(), `${locale}.${key} is not empty`);
+      assert.deepEqual(placeholders(LOCALES[locale][key]), placeholders(english), `${locale}.${key}`);
+    }
+  }
+});
+
+test('Chinese and Spanish use their own strings and count forms; unsupported locales fall back safely', () => {
+  try {
+    setLocale('zh');
+    assert.equal(getLocale(), 'zh');
+    assert.equal(translate('btn.createSubtasks'), '创建子任务');
+    for (const n of [0, 1, 2, 21]) assert.equal(tc('common.tasksSaved', n), `已保存 ${n} 个任务`);
+    setLocale('es');
+    assert.equal(getLocale(), 'es');
+    assert.equal(translate('btn.createSubtasks'), 'Crear subtareas');
+    assert.equal(tc('common.tasksSaved', 1), '1 tarea guardada');
+    for (const n of [0, 2, 21]) assert.equal(tc('common.tasksSaved', n), `${n} tareas guardadas`);
+    assert.equal(translate('terminal.permission.failed', { mode: 'Auto', reason: 'offline' }), 'No se pudo cambiar a Auto: offline');
+    assert.equal(translate('unknown.key'), 'unknown.key');
+    for (const locale of ['xx', 'constructor', '__proto__', null, undefined]) {
+      setLocale(locale);
+      assert.equal(getLocale(), 'en');
+      assert.equal(translate('btn.createSubtasks'), 'Create Subtasks');
+    }
+  } finally { setLocale('en'); }
 });

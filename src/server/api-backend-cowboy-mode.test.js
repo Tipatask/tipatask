@@ -69,41 +69,41 @@ async function fixture(t) {
 test('reads expose cowboyMode as a real boolean, off when the API predates the column', async t => {
   const { backend, state } = await fixture(t);
   const [listed] = await backend.getTasksUnfiltered();
-  assert.equal(listed.cowboyMode, true);
-  for (const [stored, expected] of [[1, true], [true, true], [0, false], [false, false], [null, false]]) {
+  assert.equal(listed.cowboyMode, 'project');
+  for (const [stored, expected] of [[1, 'project'], [true, 'project'], [0, 'disabled'], [false, 'disabled'], [null, 'disabled'], ['related', 'related'], ['project', 'project'], ['disabled', 'disabled']]) {
     state.rows[0].cowboy_mode = stored;
     assert.equal((await backend.getTask('TST1')).cowboyMode, expected);
   }
   delete state.rows[0].cowboy_mode;
-  assert.equal((await backend.getTask('TST1')).cowboyMode, false);
+  assert.equal((await backend.getTask('TST1')).cowboyMode, 'disabled');
 });
 
 test('creates send cowboy_mode only when the task carries it', async t => {
   const { backend, state } = await fixture(t);
   const plain = await backend.createTask({ title: 'Plain' });
   assert.equal(Object.hasOwn(state.writes.at(-1).body, 'cowboy_mode'), false);
-  assert.equal(plain.cowboyMode, false);
+  assert.equal(plain.cowboyMode, 'disabled');
   const on = await backend.createTask({ title: 'Cowboy', agentPermissionMode: 'bypass', cowboyMode: true });
-  assert.equal(state.writes.at(-1).body.cowboy_mode, true);
-  assert.equal(on.cowboyMode, true);
+  assert.equal(state.writes.at(-1).body.cowboy_mode, 'project');
+  assert.equal(on.cowboyMode, 'project');
   await backend.createTask({ title: 'Snake', cowboy_mode: 0 });
-  assert.equal(state.writes.at(-1).body.cowboy_mode, false);
+  assert.equal(state.writes.at(-1).body.cowboy_mode, 'disabled');
 });
 
 test('updates forward both casings, leave an omitted flag alone and round-trip', async t => {
   const { backend, state } = await fixture(t);
-  assert.equal((await backend.getTask('TST1')).cowboyMode, true);
+  assert.equal((await backend.getTask('TST1')).cowboyMode, 'project');
   const off = await backend.updateTask('TST1', { cowboy_mode: false });
-  assert.deepEqual(state.writes.at(-1).body, { cowboy_mode: false });
-  assert.equal(off.cowboyMode, false);
-  assert.equal((await backend.getTask('TST1')).cowboyMode, false, 'a fetched task reads the saved value back');
+  assert.deepEqual(state.writes.at(-1).body, { cowboy_mode: 'disabled' });
+  assert.equal(off.cowboyMode, 'disabled');
+  assert.equal((await backend.getTask('TST1')).cowboyMode, 'disabled', 'a fetched task reads the saved value back');
   const on = await backend.updateTask('TST1', { cowboyMode: true });
-  assert.deepEqual(state.writes.at(-1).body, { cowboy_mode: true });
-  assert.equal(on.cowboyMode, true);
+  assert.deepEqual(state.writes.at(-1).body, { cowboy_mode: 'project' });
+  assert.equal(on.cowboyMode, 'project');
   const renamed = await backend.updateTask('TST1', { title: 'Renamed' });
   assert.deepEqual(state.writes.at(-1).body, { title: 'Renamed' });
-  assert.equal(renamed.cowboyMode, true);
-  assert.equal((await backend.getTask('TST1')).cowboyMode, true);
+  assert.equal(renamed.cowboyMode, 'project');
+  assert.equal((await backend.getTask('TST1')).cowboyMode, 'project');
 });
 
 test('bulk saves send the flag a row carries and omit it for a row without the field', async t => {
@@ -115,14 +115,14 @@ test('bulk saves send the flag a row carries and omit it for a row without the f
     { id: 'TST4', title: 'Snake', cowboy_mode: 1 },
   ]);
   const [on, off, old, snake] = state.writes.at(-1).body.tasks;
-  assert.equal(on.cowboy_mode, true);
-  assert.equal(off.cowboy_mode, false);
+  assert.equal(on.cowboy_mode, 'project');
+  assert.equal(off.cowboy_mode, 'disabled');
   assert.equal(Object.hasOwn(old, 'cowboy_mode'), false, 'the API keeps the stored flag for an omitted field');
-  assert.equal(snake.cowboy_mode, true);
+  assert.equal(snake.cowboy_mode, 'project');
   // A fetched row saved back unchanged keeps its value.
   const [fetched] = await backend.getTasksUnfiltered();
   await backend.saveTasks([fetched]);
-  assert.equal(state.writes.at(-1).body.tasks[0].cowboy_mode, true);
+  assert.equal(state.writes.at(-1).body.tasks[0].cowboy_mode, 'project');
 });
 
 test('snapshot saves detect a flag-only edit and never clear an untouched flag', async t => {
@@ -135,12 +135,12 @@ test('snapshot saves detect a flag-only edit and never clear an untouched flag',
   await save([{ ...task }]);
   assert.equal(state.writes.length, 0, 'an unchanged flag alone is not an edit');
   await save([{ ...task, cowboyMode: false }]);
-  assert.deepEqual(state.writes.at(-1).body, { cowboy_mode: false });
-  assert.equal(state.rows[0].cowboy_mode, false);
+  assert.deepEqual(state.writes.at(-1).body, { cowboy_mode: 'disabled' });
+  assert.equal(state.rows[0].cowboy_mode, 'disabled');
   [task] = await backend.getTasksUnfiltered();
   const { cowboyMode: _off, ...snake } = task;
   await save([{ ...snake, cowboy_mode: true }]);
-  assert.deepEqual(state.writes.at(-1).body, { cowboy_mode: true }, 'snake_case edits are detected too');
+  assert.deepEqual(state.writes.at(-1).body, { cowboy_mode: 'project' }, 'snake_case edits are detected too');
   const count = state.writes.length;
   [task] = await backend.getTasksUnfiltered();
   const { cowboyMode: _on, ...bare } = task;
@@ -149,21 +149,32 @@ test('snapshot saves detect a flag-only edit and never clear an untouched flag',
   await save([{ ...bare, title: 'Again', cowboyMode: false }], [bare]);
   assert.deepEqual(state.writes.at(-1).body, { title: 'Again' }, 'a base without the field counts as off');
   assert.equal(state.writes.length, count + 2);
-  assert.equal(state.rows[0].cowboy_mode, true);
+  assert.equal(state.rows[0].cowboy_mode, 'project');
 });
 
 test('offline optimistic updates mirror the flag and replay it', async t => {
   const { backend, state } = await fixture(t);
   await backend.getTasksUnfiltered();
   state.dropWrites = true;
-  assert.equal((await backend.updateTask('TST1', { cowboy_mode: false })).cowboyMode, false);
-  assert.equal((await backend.updateTask('TST1', { title: 'Offline' })).cowboyMode, false);
-  assert.equal((await backend.updateTask('TST9', { cowboyMode: 1 })).cowboyMode, true, 'an uncached row returns the camelCase boolean');
+  assert.equal((await backend.updateTask('TST1', { cowboy_mode: false })).cowboyMode, 'disabled');
+  assert.equal((await backend.updateTask('TST1', { title: 'Offline' })).cowboyMode, 'disabled');
+  assert.equal((await backend.updateTask('TST9', { cowboyMode: 1 })).cowboyMode, 'project', 'an uncached row returns the camelCase boolean');
   state.dropWrites = false;
   state.rows.push({ id: 9, project_id: 1, task_key: 'TST9', title: 'Nine', status: 'pending', cowboy_mode: false });
   await backend._drainPendingMutationsForTest();
   assert.equal(backend.getPendingMutationCount(), 0);
-  assert.equal(state.rows[0].cowboy_mode, false);
-  assert.equal(state.rows[1].cowboy_mode, true);
-  assert.deepEqual(state.writes.map(w => w.body), [{ cowboy_mode: false }, { title: 'Offline' }, { cowboy_mode: true }]);
+  assert.equal(state.rows[0].cowboy_mode, 'disabled');
+  assert.equal(state.rows[1].cowboy_mode, 'project');
+  assert.deepEqual(state.writes.map(w => w.body), [{ cowboy_mode: 'disabled' }, { title: 'Offline' }, { cowboy_mode: 'project' }]);
+});
+
+
+test('fresh chain reads bypass cached rows and scope-only related edits survive snapshots', async t => {
+  const { backend, state } = await fixture(t);
+  await backend.getTasksUnfiltered();
+  state.rows[0].cowboy_mode = 'related';
+  assert.equal((await backend.getTasksUnfiltered({ refresh: true }))[0].cowboyMode, 'related');
+  const saved = await backend.updateTask('TST1', { cowboyMode: 'related' });
+  assert.equal(saved.cowboyMode, 'related');
+  assert.equal((await backend.getTask('TST1')).cowboyMode, 'related');
 });

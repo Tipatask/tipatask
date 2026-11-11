@@ -79,6 +79,7 @@ const htmlPlugin = {
 
 async function main() {
   fs.mkdirSync(DIST, { recursive: true });
+  if (process.platform === 'darwin') await require('./src/server/computer-use-runtime').buildNative(__dirname);
   await bundlePiExt();
   const buildOptions = {
     entryPoints: [path.join(SRC, 'index.js')],

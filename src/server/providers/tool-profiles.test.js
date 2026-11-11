@@ -80,7 +80,7 @@ test('codex task chat: read-only sandbox on fresh and resumed turns, MCP narrowe
   for (const args of [fresh, resume]) {
     const overrides = configOverrides(args);
     assert.ok(overrides.includes('mcp_servers.tipatask-local.enabled_tools=["batch_grep_tags"]'));
-    assert.ok(overrides.includes('mcp_servers.tipatask.disabled_tools=["purge_stale_reservations","reserve_task_keys"]'));
+    assert.ok(overrides.includes('mcp_servers.tipatask.disabled_tools=["purge_stale_reservations","reserve_task_keys","add_task_dev_link"]'));
     assert.ok(overrides.includes('mcp_servers.playwright.enabled=false'));
     assert.ok(overrides.includes('mcp_servers.chrome-devtools.enabled=false'));
     assert.ok(!overrides.some(o => /^mcp_servers\.tipatask(-local)?\.enabled=false$/.test(o)), 'the tipatask servers stay on');

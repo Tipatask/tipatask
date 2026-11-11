@@ -141,7 +141,7 @@ function assertPackagedVersions({ resources, sourceRoot, electronVersion }) {
 
   const piDir = path.join(resources, 'pi', 'node_modules');
   expect(`Pi bundle ${PI_PACKAGE}`, readJsonFile(path.join(piDir, PI_PACKAGE, 'package.json'))?.version,
-    String(pkg.dependencies?.[PI_PACKAGE]).replace(/^[\^~]/, ''));
+    String(pkg.devDependencies?.[PI_PACKAGE]).replace(/^[\^~]/, ''));
   // stage-pi-bundle.js copies the audited root ws over Pi's own nested copy (PI_WS_REL there).
   expect('Pi bundle ws', readJsonFile(path.join(piDir, PI_PACKAGE, 'node_modules', 'ws', 'package.json'))?.version,
     lockVersion('ws'));

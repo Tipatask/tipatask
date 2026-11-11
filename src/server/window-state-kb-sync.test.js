@@ -100,6 +100,29 @@ function nextWcId() { return _wcId++; } // monotonic — avoids cross-test _wind
 
 function flush() { return new Promise((r) => setImmediate(r)); }
 
+test('project binds notify the server immediately; a late messenger replays unique configured windows', t => {
+  const root = mkroot('tipatask-relay-window-');
+  writeConfig(root, { TASK_BACKEND: 'api', REMOTE_CONTROL_ENABLED: true });
+  const ids = [nextWcId(), nextWcId(), nextWcId()];
+  setKbSyncScheduler(() => {});
+  t.after(() => {
+    ids.forEach(dropWindow);
+    setServerMessenger(null);
+    setKbSyncScheduler(null);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const messages = [];
+  setServerMessenger(msg => messages.push(msg));
+  bindWindowToProject(ids[0], root);
+  assert.deepEqual(messages, [{ type: 'project:config-changed', projectPath: root }]);
+  setServerMessenger(null);
+  bindWindowToProject(ids[1], root);
+  bindWindowToProject(ids[2], null);
+  messages.length = 0;
+  setServerMessenger(msg => messages.push(msg));
+  assert.deepEqual(messages, [{ type: 'project:config-changed', projectPath: root }]);
+});
+
 // syncProjectKb's real-network path (fetchRemoteVersions -> a real loopback socket) needs
 // more than a couple setImmediate ticks — the response lands in libuv's poll phase, which
 // runs before the check phase setImmediate callbacks fire in. Poll instead of guessing a
@@ -223,7 +246,7 @@ test('_fireKbSync: a project with an unrecognized backend never delegates to the
   withEnv(t, 'TASK_BACKEND', undefined); // a stray exported TASK_BACKEND=api must not win over config.json
 
   const messages = [];
-  setServerMessenger((msg) => messages.push(msg));
+  setServerMessenger((msg) => { if (msg.type === 'kb:auto-reindex') messages.push(msg); });
   t.after(() => setServerMessenger(null));
 
   const wcId = nextWcId();
@@ -247,7 +270,7 @@ test('_fireKbSync: a synced api-backend project delegates exactly one kb:auto-re
   withEnv(t, 'TASK_BACKEND', undefined);
 
   const messages = [];
-  setServerMessenger((msg) => messages.push(msg));
+  setServerMessenger((msg) => { if (msg.type === 'kb:auto-reindex') messages.push(msg); });
   t.after(() => setServerMessenger(null));
 
   const wcId = nextWcId();

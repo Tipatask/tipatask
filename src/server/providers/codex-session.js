@@ -8,7 +8,7 @@ const { spawn: cpSpawn } = require('node:child_process');
 const config = require('../config');
 const { cliSpawnSpec } = require('../spawn-utils');
 const { killWindowsChildTree } = require('../process-group');
-const { buildCodexEnv, codexEffortArgs, toCodexEffort } = require('../codex-env');
+const { buildCodexEnv, codexEffortArgs, servedCodexModelOverride, toCodexEffort } = require('../codex-env');
 const { normalizeProposals } = require('../claude-session');
 const { buildTurnPrompt, buildNudgeMessage } = require('./transcript');
 const { localizeAttachments } = require('../task-agent/attachments');
@@ -436,7 +436,9 @@ function spawnCodexTurn(session, taskId) {
     }
 
     // Read after buildCodexEnv(): it has just refreshed the project's .codex/config.toml.
-    const args = buildCodexArgs(session, { cwd, model, imagePaths });
+    // (TPT9215) A blank model would run that config's (possibly no longer served) model.
+    const turnModel = model || servedCodexModelOverride(env.CODEX_HOME).model;
+    const args = buildCodexArgs(session, { cwd, model: turnModel, imagePaths });
     args.splice(-1, 0, '-c', mcpOverride);
     let proc;
     try {
@@ -462,7 +464,7 @@ function spawnCodexTurn(session, taskId) {
 
     if (config.OBJECTIVE_TIMING_ENABLED) session.timingMilestones.procSpawnedAt = Date.now();
     emit({ type: 'objective-progress', stage: 'spawned' });
-    console.log(`[codex] Spawn task=${taskId} model=${model || '(default)'} first=${!hasProviderSession} images=${imagePaths.length} mode=exec reason=per-turn-effort-and-tool-policy`);
+    console.log(`[codex] Spawn task=${taskId} model=${turnModel || '(default)'} first=${!hasProviderSession} images=${imagePaths.length} mode=exec reason=per-turn-effort-and-tool-policy`);
 
     try {
       proc.stdin.write(finalPrompt);
@@ -624,7 +626,9 @@ function codexOneShotSpec({ projectRoot, model, toolless = false, cwd } = {}) {
   const root = projectRoot || config.PROJECT_ROOT;
   const runCwd = cwd || root;
   const { env } = buildCodexEnv({ projectRoot: root });
-  return { command: config.CODEX_BIN, args: buildCodexOneShotArgs({ model, toolless, cwd: runCwd }), env, cwd: runCwd };
+  // (TPT9215) Same served-model rule as chat turns and task terminals.
+  const runModel = model || servedCodexModelOverride(env.CODEX_HOME).model;
+  return { command: config.CODEX_BIN, args: buildCodexOneShotArgs({ model: runModel, toolless, cwd: runCwd }), env, cwd: runCwd };
 }
 
 module.exports = { spawnCodexTurn, finishFailedTaskChatTurn, resolveCodexModel, buildCodexArgs, extractLocalImagePaths, codexOneShotSpec, buildCodexOneShotArgs };

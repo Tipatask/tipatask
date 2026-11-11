@@ -81,7 +81,7 @@ test('groupEmpty resolves per-stem sentence in both locales', () => {
   setGroupLabel('Jars');
   assert.equal(groupEmpty(), 'No tasks in this jar.');
   setLocale('uk');
-  assert.equal(groupEmpty(), 'У цій банці немає задач.');
+  assert.equal(groupEmpty(), 'У цій банці немає завдань.');
   setLocale('en');
   resetGroupLabel();
 });

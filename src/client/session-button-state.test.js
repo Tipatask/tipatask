@@ -103,17 +103,6 @@ test('task-edit-modal.js resolves the footer button from _modalSessionButton()/s
   assert.match(src, /const savedStatus = _modalState\?\.lastSaved\?\.status \?\? task\?\.status;/);
 });
 
-test('task-card.js refreshCard() repaints the console-control button on a status change', () => {
-  const src = readSource('task-card.js');
-  assert.match(src, /import \{[^}]*\bupdateClaudeButtons\b[^}]*\} from '\.\/task-board\.js';/);
-  const start = src.indexOf('export function refreshCard(');
-  const end = src.indexOf('\n// ── Sprint regroup', start);
-  const body = src.slice(start, end);
-  assert.match(body, /const prevStatus = card\.dataset\.status;/);
-  assert.match(body, /const statusChanged = prevStatus !== t\.status;/);
-  assert.match(body, /if \(statusChanged && card\.querySelector\('\.btn-claude, \.btn-start-discussion'\)\) updateClaudeButtons\(\);/);
-});
-
 test('styles.css defines .session-spinner reusing the shared spin keyframe', () => {
   const css = readSource('styles.css');
   assert.match(css, /\.session-spinner\s*\{[^}]*animation:\s*spin\s/);

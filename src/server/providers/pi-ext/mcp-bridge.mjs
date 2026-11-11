@@ -206,8 +206,16 @@ export function registerMcpTools(pi, servers) {
         parameters: toolParameters(tool.inputSchema),
         async execute(_toolCallId, params, signal) {
           try {
-            const result = await client.callTool({ name: tool.name, arguments: params || {} }, undefined, { signal });
-            return text(flattenToolResult(result));
+            const result = await client.callTool({ name: tool.name, arguments: params || {} }, undefined,
+              { signal, ...(server === 'computer-use' && tool.name === 'request_access' ? { timeout: 150000 } : {}) });
+            const output = text(flattenToolResult(result));
+            // Pi accepts native image blocks. Keep screenshot pixels for vision-capable models.
+            for (const item of Array.isArray(result.content) ? result.content : []) {
+              if (item?.type === "image" && typeof item.data === "string" && typeof item.mimeType === "string") {
+                output.content.push({ type: "image", data: item.data, mimeType: item.mimeType });
+              }
+            }
+            return output;
           } catch (err) {
             return text(`MCP call failed: ${(err && err.message) || String(err)}`);
           }

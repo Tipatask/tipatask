@@ -77,6 +77,8 @@
             <select id="settings-language-select">
               <option value="en">English</option>
               <option value="uk">Українська (Ukrainian)</option>
+              <option value="zh">简体中文 (Simplified Chinese)</option>
+              <option value="es">Español (Spanish)</option>
             </select>
           </div>
         </div>
@@ -130,6 +132,20 @@
           <div class="settings-row-control">
             <button type="button" class="settings-row-btn" id="settings-agents-edit"></button>
           </div>
+        </div>
+      </section>
+      <section class="settings-section">
+        <h3 class="settings-section-title" id="settings-remote-control-title"></h3>
+        <div class="settings-row" id="settings-remote-control-row">
+          <div class="settings-row-label">
+            <label for="settings-remote-control-toggle" id="settings-remote-control-label"></label>
+            <small class="settings-row-note" id="settings-remote-control-scope"></small>
+            <p class="settings-row-hint" id="settings-remote-control-hint"></p>
+          </div>
+          <div class="settings-row-control">
+            <input type="checkbox" role="switch" id="settings-remote-control-toggle" aria-describedby="settings-remote-control-scope settings-remote-control-hint" disabled>
+          </div>
+          <div class="settings-notice" id="settings-remote-control-notice" role="status" hidden></div>
         </div>
       </section>
       <!-- (C1058) Delivery status badge + Test/Enable button. Both notices ship hidden;
@@ -379,7 +395,7 @@
      _showChooseModal / _showProjectRenameModal in the script below), not baked into
      this static markup — this file is server-rendered once, so a live locale switch
      would otherwise never reach it. Same pattern as applyNavLabel() (C1239). -->
-<div id="project-open-modal" style="display:none;position:fixed;inset:0;z-index:9999;align-items:center;justify-content:center;background:rgba(0,0,0,0.55)">
+<div id="project-open-modal" role="dialog" aria-modal="true" aria-labelledby="project-modal-title" aria-describedby="project-modal-path" style="display:none;position:fixed;inset:0;z-index:9999;align-items:center;justify-content:center;background:rgba(0,0,0,0.55)">
   <div style="background:var(--c-bg-card,#fbf9f3);border:1px solid var(--c-border,#e9e4d8);color:var(--c-text,#1a1a19);border-radius:10px;padding:28px 32px;min-width:380px;max-width:520px;box-shadow:0 8px 32px rgba(0,0,0,0.4)">
     <div id="project-modal-title" style="font-size:15px;font-weight:600;margin-bottom:6px"></div>
     <div id="project-modal-path" style="font-size:12px;color:var(--c-text-muted,#6b6b64);word-break:break-all;margin-bottom:22px;font-family:monospace"></div>
@@ -474,6 +490,7 @@ const {
   clearHighlights, clearChainHighlights,
   applyChainHighlight, applyObjectiveHighlight, applyRelatedHighlight, setupCardInteractions, registerCardCallbacks,
   isDragging, isDropInProgress, shouldDeferForDrag, markDropRenderCommitted, applyTaskPatch, removeCardFromDom, applyDiscussLock,
+  dependencyKeysMarkup,
 } = taskCard;
 
 const {
@@ -627,6 +644,7 @@ const _showAllViews = new URLSearchParams(location.search).get('views') === 'all
 // that task's title/description on load, then is stripped from the URL (see init() below)
 // so a reload doesn't re-seed. Same read-only query-param pattern as ?views=all above.
 const _objectiveTaskKey = new URLSearchParams(location.search).get('objectiveTask');
+const _startTaskKey = new URLSearchParams(location.search).get('startTask');
 // (C1559) ?objectivePlan=1 — sibling flag, only ever set by the no-Electron /start-task
 // 302 fallback (ws-handlers.js), which has no way to check whether the clicked task has
 // children and so always degrades to the planning branch. Also stripped in init() below.
@@ -694,6 +712,8 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
         </button>
         <div class="sidebar-divider" id="active-sessions-divider" hidden></div>
         <div id="active-sessions-list" class="active-sessions-list" role="group" aria-label="Active agent sessions" hidden></div>
+        <div id="active-human-tasks-heading" class="active-human-tasks-heading" hidden>${escapeAttr(t('nav.humanTasks'))}</div>
+        <div id="active-human-tasks-list" class="active-sessions-list active-human-tasks-list" role="group" aria-labelledby="active-human-tasks-heading" hidden></div>
       </div>
       <section id="agent-quota-sidebar" class="agent-quota-sidebar quota-bars agent-quota-sidebar--loading"aria-labelledby="agent-quota-sidebar-title" aria-busy="true">
         <div class="agent-quota-sidebar-head">
@@ -806,6 +826,8 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
   const newBtn = panel.querySelector('[data-section="new"]');
   applyNavLabel(newBtn, 'nav.create');
   applyNavLabel(panel.querySelector('[data-action="start-chat"]'), 'nav.startChat');
+  const humanHeading = panel.querySelector('#active-human-tasks-heading');
+  if (humanHeading) humanHeading.textContent = t('nav.humanTasks');
   newBtn?.classList.toggle('active', isNewSection);
   newBtn?.classList.toggle('loading', isStreaming);
   newBtn?.classList.toggle('ready', isReady);
@@ -1088,6 +1110,10 @@ function patchCachedBoardTasks(updates) {
     if (task.agentPermissionMode !== undefined || task.agent_permission_mode !== undefined) {
       state.taskPermissionModeById.set(id, task.agentPermissionMode ?? task.agent_permission_mode ?? null);
     }
+    // (TPT9201) Every path that learns a task's fields runs through here, so the left-nav human
+    // rows follow a category or assignee change as well as a status change.
+    if (task.category !== undefined) state.taskCategoryById.set(id, task.category);
+    if (task.assignee !== undefined) state.taskAssigneeById.set(id, task.assignee ?? null);
   }
   // Reject background snapshots that began before these authoritative task patches.
   _boardTaskCacheGeneration++;
@@ -1117,6 +1143,22 @@ function staleBoardTaskCache() {
   _boardTaskCacheGeneration++;
   _boardTaskRefreshes.clear();
   for (const entry of _boardTaskCache.values()) entry.storedAt = 0;
+}
+
+// A board read can finish after an independent status reconciliation. Preserve observations
+// made since that read began, in both the rows being rendered and every cached board.
+function reconcileBoardTaskStatuses(tasks, statusesAtReadStart) {
+  const updates = new Map();
+  const reconciled = tasks.map(task => {
+    const id = String(task.id);
+    const status = state.taskStatusById.get(id);
+    if (status === undefined || status === statusesAtReadStart.get(id) || status === task.status) return task;
+    const patch = { id, status };
+    updates.set(id, patch);
+    return { ...task, status };
+  });
+  patchCachedBoardTasks(updates);
+  return reconciled;
 }
 
 // (C1282) Granular task events are authoritative immediately, but a Create-section render is
@@ -1179,6 +1221,22 @@ function applyObjectiveTaskUpdate(task) {
   return applyObjectiveTaskState(task ? [task] : []);
 }
 
+// (TPT9201) A status change made in this window, with no event to carry it to the left-nav human
+// rows: the desktop app gets no echo of its own writes (api-client.js) and the next task-change
+// poll can be 30s away. Merged into the caches too, or a cache-hit render would drop the row
+// again. HUMAN tasks only: they have no session, so the agent rail's timing stays as it was.
+function applyHumanTaskWrite(task) {
+  const patch = window.TipTask.humanTaskRows.humanTaskWritePatch(task, state.taskCategoryById);
+  if (!patch) return;
+  applyObjectiveTaskState([patch]);
+  if (syncObjectiveTabsState()) repaintObjectiveNavTabs();
+}
+
+document.addEventListener('tiptask:task-saved', (e) => applyHumanTaskWrite(e.detail?.task));
+document.addEventListener('tiptask:task-removed', (e) => {
+  if (state.taskCategoryById.get(String(e.detail?.id)) === 'HUMAN') applyTaskDeletedEvent(e.detail.id);
+});
+
 async function fetchObjectiveTaskState() {
   if (window.electronAPI?.api?.tasks?.listAll) {
     const result = await window.electronAPI.api.tasks.listAll();
@@ -1199,9 +1257,10 @@ async function fetchObjectiveTaskState() {
 let _syncNavStatusesInFlight = null;
 let _syncNavStatusesPending = false;
 function syncNavStatusesFromServer() {
-  const liveIds = [...new Set([...state.activeSessions, ...state.exitedSessions])].filter((id) =>
+  const liveIds = [...new Set([...state.activeSessions, ...state.exitedSessions, ...(state.lostSessions?.keys() || [])])].filter((id) =>
     (state.sessionMeta.get(id)?.type || 'terminal') === 'terminal');
-  if (liveIds.length === 0) return Promise.resolve();
+  const humanIds = window.TipTask.humanTaskRows.knownHumanTaskIds(state.taskCategoryById);
+  if (liveIds.length === 0 && humanIds.length === 0) return Promise.resolve();
   if (_syncNavStatusesInFlight) {
     _syncNavStatusesPending = true;
     return _syncNavStatusesInFlight;
@@ -1220,6 +1279,17 @@ function syncNavStatusesFromServer() {
         // Status poll can catch a completion with no task:updated frame. An absent previous
         // status is only a baseline, so it must not raise a completion notification.
         if (t.status !== undefined) window.TipTask.completionNotifications.observeTaskStatusForCompletion(state.taskStatusById, id, t.status, t.title);
+        if (t.title !== undefined) state.taskTitleById.set(id, t.title || '');
+        updates.set(String(id), t);
+      }
+      // (TPT9201) Off the board, or drilled into an objective, this read is the only way a move
+      // made elsewhere reaches a human row. It records the status without
+      // observeTaskStatusForCompletion(): that notification's click reopens a session, and a
+      // human task has none.
+      for (const id of humanIds) {
+        const t = byId.get(String(id));
+        if (!t || updates.has(String(id))) continue;
+        if (t.status !== undefined) state.taskStatusById.set(id, t.status);
         if (t.title !== undefined) state.taskTitleById.set(id, t.title || '');
         updates.set(String(id), t);
       }
@@ -1482,13 +1552,15 @@ function refreshBoardSnapshotInBackground(cacheKey, previousFingerprint, context
 // ── Board-path task edit modal opener — real DB fetch, agent Start/Stop wiring.
 // Shared by the board dblclick callback and, for a `modified` proposal, the
 // diff-mode "Open live task" escape hatch (C1095). ──
-// (TPT466) `workspace` = { initialPane, terminalLaunch } when the task workspace opens on its
-// Agent Terminal or Chat pane (see registerTaskWorkspaceOpener below).
+// (TPT466) `workspace` = { initialPane, terminalLaunch, chatLaunch } when the task workspace
+// opens on its Agent Terminal or Chat pane (see registerTaskWorkspaceOpener below);
+// (TPT9268/TPT9271) `chatLaunch` is a model ({ model }) the Chat pane preselects on its start gate.
 function openBoardTaskEditModal(taskId, trigger, workspace = {}) {
   return openTaskEditModal(taskId, {
     trigger,
     initialPane: workspace.initialPane,
     terminalLaunch: workspace.terminalLaunch,
+    chatLaunch: workspace.chatLaunch,
     // The modal calls onStart only after saving successfully (or with a clean draft).
     // Use that snapshot so the shared launcher preserves its agent and full Pi model id.
     onStart: (task) => window.TipTask.taskCard.startTaskById(task.id, {}, task),
@@ -1517,8 +1589,8 @@ registerTaskEditNavigation(async (taskId) => {
 // (TPT466) Terminal and chat launchers (openTerminal / taskChat.open, via openTaskWorkspace)
 // open the same live-task modal as a card double-click, on their own pane — so a Start from
 // the Edit pane, the agent picker or a confirm all lead back through the same Start ladder.
-registerTaskWorkspaceOpener((taskId, { initialPane, terminalLaunch, trigger } = {}) =>
-  openBoardTaskEditModal(taskId, trigger, { initialPane, terminalLaunch }));
+registerTaskWorkspaceOpener((taskId, { initialPane, terminalLaunch, chatLaunch, trigger } = {}) =>
+  openBoardTaskEditModal(taskId, trigger, { initialPane, terminalLaunch, chatLaunch }));
 
 // Register callbacks that link card/board modules to functions defined in this inline script
 registerCardCallbacks({
@@ -1695,7 +1767,7 @@ registerCardCallbacks({
           // the card.
           if (titleEl && draft.title !== undefined) titleEl.innerText = draft.title;
           if (descEl) descEl.dataset.raw = draft.description || '';
-          if (depsEl) depsEl.textContent = proposal.task.dependencies.length ? `Deps: ${proposal.task.dependencies.join(', ')}` : '';
+          if (depsEl) depsEl.innerHTML = proposal.task.dependencies.length ? `Deps: ${dependencyKeysMarkup(proposal.task.dependencies)}` : '';
         }
         closeTaskEditModal(true);
         await loadAndRender();
@@ -1771,26 +1843,20 @@ function handleObjectiveTaskStateEvent(msg) {
   if (msg?.type === 'task:updated' && msg.task?.id) {
     if (!isDropInProgress()) invalidateLoadAndRender();
     patchCachedBoardTasks(new Map([[String(msg.task.id), msg.task]]));
+    // (TPT9216) Dependency keys outside the board's window read their status from this list.
+    window.TipTask?.taskBoard?.patchProjectTaskList?.(msg.task);
   }
-  // (C1329) This function is Electron's ONLY route for every task-state event — no board WS.
-  // The `if (!isTasksSectionTab()) return;` below used to gate the left-nav refresh too, so a
-  // session's completion tick never reached the nav while Objective or Create was the open tab.
-  // Reconcile the nav here, before any tab branch, so it always runs. Objective is excluded —
-  // its own branch just below does an equivalent (and for `tasks-updated`, identical-cost)
-  // reconcile via applyObjectiveTaskState/applyObjectiveTaskUpdate; doing it twice would just
-  // duplicate work, not add correctness.
-  if (state.activeTab !== 'objective') {
-    if (msg?.type === 'task:updated' && msg.task?.id) {
-      const taskId = String(msg.task.id);
-      const prevStatusForNotify = window.TipTask.completionNotifications.observeTaskStatusForCompletion(
-        state.taskStatusById, taskId, msg.task.status, msg.task.title);
-      state.taskTitleById.set(taskId, msg.task.title || '');
-      window.TipTask?.taskBoard?.syncActiveSessionsNav?.();
-      // (C1462) Cross-window signal — see syncObjectiveTabsState()'s own doc comment.
-      if (syncObjectiveTabsState({ task: msg.task, prevStatus: prevStatusForNotify })) repaintObjectiveNavTabs();
-    } else if (msg?.type === 'tasks-updated') {
-      syncNavStatusesFromServer();
-    }
+  // Repaint the rail before any view-specific render, including a deferred Objective pane.
+  if (msg?.type === 'task:updated' && msg.task?.id) {
+    const taskId = String(msg.task.id);
+    const prevStatusForNotify = window.TipTask.completionNotifications.observeTaskStatusForCompletion(
+      state.taskStatusById, taskId, msg.task.status, msg.task.title);
+    if (msg.task.title !== undefined) state.taskTitleById.set(taskId, msg.task.title || '');
+    window.TipTask?.taskBoard?.syncActiveSessionsNav?.();
+    if (syncObjectiveTabsState({ task: msg.task, prevStatus: prevStatusForNotify })) repaintObjectiveNavTabs();
+  } else if (msg?.type === 'tasks-updated' && state.activeTab !== 'objective') {
+    // The Objective aggregate path below already reads the same unfiltered task list.
+    syncNavStatusesFromServer();
   }
 
   if (state.activeTab === 'objective') {
@@ -2186,10 +2252,11 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     return;
   }
   if (options.objectiveTasksUpdated && state.activeTab === 'objective') {
+    const statusesAtReadStart = new Map(state.taskStatusById);
     try {
       const objectiveTasks = await fetchObjectiveTaskState();
       if (!isCurrentLoadAndRender(renderGeneration)) return;
-      applyObjectiveTaskState(objectiveTasks);
+      applyObjectiveTaskState(reconcileBoardTaskStatuses(objectiveTasks, statusesAtReadStart));
     } catch {
       // Aggregate refresh is opportunistic. Keep the mounted Objective and composer intact
       // when the status-only fetch is temporarily unavailable; the next event retries it.
@@ -2229,6 +2296,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   const boardRenderState = {
     revision: state._boardRenderRevision || 0,
     statusFilter: new Set(state.statusFilter),
+    statusesAtReadStart: new Map(state.taskStatusById),
   };
   const cachedEntry = (!options.forceFresh && cacheKey) ? _boardTaskCache.get(cacheKey) : null;
   let tasks = [];
@@ -2278,6 +2346,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     perfEnd(_larData, { source: _larDataSource, stale: true });
     return;
   }
+  tasks = reconcileBoardTaskStatuses(tasks, boardRenderState.statusesAtReadStart);
   perfEnd(_larData, { source: _larDataSource });
   state.lastLoadedTaskCount = tasks.length;
 
@@ -2325,7 +2394,9 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   const taskStatusById = new Map(tasks.map(t => [t.id, t.status]));
   const taskTitleById = new Map(tasks.map(t => [t.id, t.title || '']));
   const taskPermissionModeById = new Map(tasks.map(t => [t.id, t.agentPermissionMode ?? t.agent_permission_mode ?? null]));
-  for (const id of state.activeSessions) {
+  const taskCategoryById = new Map(visibleTasks.map(t => [t.id, t.category]));
+  const taskAssigneeById = new Map(visibleTasks.map(t => [t.id, t.assignee ?? null]));
+  for (const id of new Set([...state.activeSessions, ...state.exitedSessions, ...(state.lostSessions?.keys() || [])])) {
     if (!taskStatusById.has(id) && _prevTaskStatusById.has(id)) {
       taskStatusById.set(id, _prevTaskStatusById.get(id));
     }
@@ -2336,11 +2407,19 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       taskPermissionModeById.set(id, prevPermissionModes.get(id));
     }
   }
+  // (TPT9201) `state` still holds the outgoing maps here. Only a drill-down, whose fetch is one
+  // objective's children: the root board's own fetch is the authority on who has a row.
+  if (cacheContext.parentKey) {
+    window.TipTask.humanTaskRows.keepHumanTaskEntries(
+      { taskCategoryById, taskAssigneeById, taskStatusById, taskTitleById }, state);
+  }
   state.taskStatusById = taskStatusById; // shared with renderCard for dep-blocking
   // (C1058) Attention notifications fall back to this when no card is rendered for the task
   // (filtered out, collapsed tier, backlog, other tab) — the attention-needed WS payload
   // carries no title. See src/client/attention-notifications.js#notifyTaskNeedsAttention.
   state.taskTitleById = taskTitleById;
+  state.taskCategoryById = taskCategoryById;
+  state.taskAssigneeById = taskAssigneeById;
   state.taskPermissionModeById = taskPermissionModeById;
   // (C1387) Guarded — never prunes a task with a still-live terminal session, see
   // attention-state.js#pruneClosedAttention. This is the render-time counterpart of the same
@@ -2634,6 +2713,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
           if (titleEl) titleEl.classList.toggle('done', isCompleteName(next));
         }
         state.taskStatusById.set(id, next);
+        applyHumanTaskWrite({ id, status: next });
       } catch (err) { showToast(t('common.error', { msg: err.message }), 'error'); }
     });
   });
@@ -3895,7 +3975,7 @@ function openTodoDrawer(task) {
     return `<span class="tag-badge"${desc ? ` title="${escapeAttr(desc)}"` : ''}>${escapeAttr(tag)}</span>`;
   }).join('');
   const depsHtml = (task.dependencies || []).length
-    ? `<div class="drawer-deps"><strong>Depends on:</strong> ${task.dependencies.map(d => escapeAttr(d)).join(', ')}</div>`
+    ? `<div class="drawer-deps"><strong>Depends on:</strong> ${dependencyKeysMarkup(task.dependencies)}</div>`
     : '';
   const statusOpts = statusNames().map(s =>
     `<option value="${s}"${s === task.status ? ' selected' : ''}>${statusLabel(s)}</option>`
@@ -3945,6 +4025,7 @@ function openTodoDrawer(task) {
         if (titleEl) titleEl.classList.toggle('done', isCompleteName(next));
       }
       state.taskStatusById.set(task.id, next);
+      applyHumanTaskWrite({ id: task.id, status: next });
     } catch (err) { showToast(t('common.error', { msg: err.message }), 'error'); }
   });
 }
@@ -4104,6 +4185,12 @@ function connectBoardWs() {
       TipTask.attentionWs.handleAttentionMessage(msg);
       return;
     }
+    if (msg.type === 'remote-session-state') {
+      // (TPT9239) A web-started run on this device changed state — same handler as Electron's
+      // __attention__ channel (a /api/sessions refetch, so a second delivery only refetches again).
+      TipTask.attentionWs.handleAttentionMessage(msg);
+      return;
+    }
     if (msg.type === 'newly-assigned') {
       applyNewlyAssigned(msg.taskId);
       return;
@@ -4200,6 +4287,10 @@ function applyTaskDeletedEvent(id) {
   // card+tier removal showDeleteConfirmModal() now also shares.
   removeCardFromDom(id);
   state.pendingTaskIds.delete(id);
+  // (TPT9201) A deleted human task loses its left-nav row now, not on the next fetch.
+  state.taskCategoryById.delete(String(id));
+  state.taskAssigneeById.delete(String(id));
+  window.TipTask?.taskBoard?.syncActiveSessionsNav?.();
   // Clean stale selection
   if (state.selectedCardIds.has(id)) {
     state.selectedCardIds.delete(id);
@@ -4299,6 +4390,9 @@ async function init() {
       state.availableAgents = Array.isArray(c.availableAgents) ? c.availableAgents : [];
       if (Array.isArray(c.agentStatuses)) state.agentStatuses = c.agentStatuses;
       state.currentUserId = c.currentUserId ?? null;
+      // (TPT9220) This machine's device: its own runs carry no device badge (task-card.js). The
+      // only source in Electron, where the board WS config frame never arrives.
+      if (c.deviceId) state.deviceId = c.deviceId;
     }
   } catch { /* board WS / terminal config will still populate later in browser mode */ }
   await ensureProjectMembers();
@@ -4344,6 +4438,13 @@ async function init() {
   // task fetch/seed can't delay first paint. Strip the param via replaceState (preserving
   // ?projectPath=, same rewrite technique as the onProjectChanged handler below) so a
   // reload doesn't re-seed the same tab.
+  if (_startTaskKey) {
+    const params = new URLSearchParams(location.search);
+    params.delete('startTask');
+    const qs = params.toString();
+    history.replaceState(null, '', location.pathname + (qs ? '?' + qs : ''));
+    window.TipTask.taskCard.startTaskById(_startTaskKey);
+  }
   if (_objectiveTaskKey) {
     const params = new URLSearchParams(location.search);
     params.delete('objectiveTask');
@@ -4382,6 +4483,28 @@ if (window.electronAPI) {
   const _renameInput = document.getElementById('project-rename-input');
   const _btnRename = document.getElementById('btn-project-rename');
   const _btnRenameCancel = document.getElementById('btn-project-rename-cancel');
+  let _projectModalFocus = null;
+
+  // This renderer owns the Current/New Window chooser. Its z-index clears the task
+  // workspace, but only a dialog-focus layer releases its inert state and takes input.
+  function ensureOpenProjectDialogForeground() {
+    _projModal.style.display = 'flex';
+    if (!_projectModalFocus) {
+      _projectModalFocus = window.TipTask.dialogFocus.activateDialogFocus({
+        root: _projModal,
+        initialFocus: '#btn-project-cancel',
+      });
+    } else {
+      _projectModalFocus.focusFirst();
+    }
+  }
+
+  function _hideProjectModal() {
+    _projModal.style.display = 'none';
+    _pendingProjectDir = null;
+    _projectModalFocus?.close();
+    _projectModalFocus = null;
+  }
 
   function _showProjectModal(dir) {
     _pendingProjectDir = dir;
@@ -4403,7 +4526,7 @@ if (window.electronAPI) {
     _btnCurrent.style.opacity = blockCurrent ? '0.4' : '1';
     _btnCurrent.style.cursor = blockCurrent ? 'not-allowed' : '';
     _btnCurrent.title = blockReason;
-    _projModal.style.display = 'flex';
+    ensureOpenProjectDialogForeground();
   }
 
   // (C1388) Renders the first-run "Get Started" state — one primary action running the
@@ -4764,28 +4887,16 @@ if (window.electronAPI) {
       if (taskKey) seedObjectiveFromTask(taskKey, { warning, originTaskKey, title, description });
     });
   }
-  // (C1559) Web→Task App handoff, the other 2 /start-task dispatch branches — pushed by
-  // main.js's focusAndStartTask(). `children` (an is_objective task's fetched child list,
-  // [] for a regular task) is picked from HERE, not server-side — this renderer alone
-  // holds the live board status map pickFirstStartableChild()/isDepsBlocked() needs.
+  // Web handoff uses the parent's own settings and preparation terminal.
   if (window.electronAPI.onStartTask) {
-    window.electronAPI.onStartTask(({ taskKey, children }) => {
-      if (!taskKey) return;
-      const list = Array.isArray(children) ? children : [];
-      const target = list.length > 0 ? window.TipTask.taskCard.pickFirstStartableChild(list) : null;
-      if (list.length > 0 && !target) {
-        // Every child is already closed/in-progress/blocked/not-mine — nothing to start.
-        showToast(t('handoff.noStartableChild', { taskKey }), 'info');
-        return;
-      }
-      window.TipTask.taskCard.startTaskById(target ? target.id : taskKey);
+    window.electronAPI.onStartTask(({ taskKey }) => {
+      if (taskKey) window.TipTask.taskCard.startTaskById(taskKey);
     });
   }
   _btnCurrent.addEventListener('click', () => {
     if (!_pendingProjectDir || _btnCurrent.disabled) return;
     window.electronAPI.openProject(_pendingProjectDir, 'current');
-    _projModal.style.display = 'none';
-    _pendingProjectDir = null;
+    _hideProjectModal();
   });
 
   // (TPT564) New Window / Cancel / Escape on the Current-or-New chooser leave THIS window as it
@@ -4793,14 +4904,12 @@ if (window.electronAPI) {
   _btnNew.addEventListener('click', () => {
     if (!_pendingProjectDir) return;
     window.electronAPI.openProject(_pendingProjectDir, 'new');
-    _projModal.style.display = 'none';
-    _pendingProjectDir = null;
+    _hideProjectModal();
     if (_isUnboundWindowSync()) _showChooseModal();
   });
 
   _btnCancel.addEventListener('click', () => {
-    _projModal.style.display = 'none';
-    _pendingProjectDir = null;
+    _hideProjectModal();
     if (_isUnboundWindowSync()) _showChooseModal();
   });
 
@@ -4850,7 +4959,12 @@ if (window.electronAPI) {
     // (C1235) Same reasoning — don't let project A's group noun leak into project B's
     // first frame while loadGroupLabel() below is still in flight.
     resetGroupLabel();
+    // (TPT9216) Project A's task list must not answer project B's dependency keys.
+    window.TipTask.taskBoard?.resetProjectTaskList?.();
     state.taskPermissionModeById.clear();
+    // (TPT9201) Project A's human tasks must not hold a left-nav row in project B.
+    state.taskCategoryById.clear();
+    state.taskAssigneeById.clear();
     // IPC mode: backend already switched in main process via bindWindowToProject.
     // Browser mode: call project-switch endpoint.
     if (!window.electronAPI?.api) {
@@ -4862,6 +4976,7 @@ if (window.electronAPI) {
     await applyProjectLanguage();
     await loadStatuses();
     await loadGroupLabel();
+    if (document.getElementById('settings-modal')?.classList.contains('open')) openSettingsModal();
     // Restore the NEW project's own saved filters (search/human/status/tags) — without this,
     // the previous project's in-memory state.statusFilter/activeTagFilters/etc. leak straight
     // into this project's board (project switch never used to reset them).
@@ -4909,14 +5024,19 @@ if (window.electronAPI) {
     if (action === 'reindex-kb') { reindexKb(); return; }
   });
 
-  // Close modals on Escape
+  // Capture Escape before the task workspace's document listener. Closing this
+  // layer restores task focus, so letting the same event continue would close both.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !_projectModalFocus?.isTop()) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    _hideProjectModal();
+    if (_isUnboundWindowSync()) _showChooseModal();
+  }, { capture: true });
+
+  // Close unlocked Get Started on Escape.
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-      if (_projModal.style.display === 'flex') {
-        _projModal.style.display = 'none';
-        _pendingProjectDir = null;
-        if (_isUnboundWindowSync()) { _showChooseModal(); return; }
-      }
       // (TPT564) Locked Get Started (unbound window) ignores Escape.
       if (_chooseModal?.style.display === 'flex' && !_chooseLocked) {
         _chooseModal.style.display = 'none';

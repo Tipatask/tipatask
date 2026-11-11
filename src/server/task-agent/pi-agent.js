@@ -56,11 +56,13 @@ function buildTipataskRestRecipe(opts = {}) {
 // With the MCP bridge loaded (getSpawnSpec() sets opts.piMcpBridge), Pi has the same Tipatask
 // tools Claude and Codex have, under bridged names. One naming rule plus the names AGENTS.md /
 // CLAUDE.md lean on most replaces the REST recipe. Same echo-safety rules as the recipe above.
-function buildPiMcpToolMap() {
+function buildPiMcpToolMap(computerUse) {
   return [
     'You are running inside Pi Coding Agent with the Task App MCP bridge loaded: the `tipatask` and `tipatask-local` MCP servers are native Pi tools named <server>__<tool>. Wherever AGENTS.md / CLAUDE.md or the "MCP Tool Schemas" section of your system prompt names an MCP tool, call the bridged name and drop any `mcp__` prefix: get_task, list_tasks, update_task, create_task, create_task_comment, list_system_tags, get_tag_architecture, get_tag_architectures, create_system_tag, ensure_project_tag, get_project_tags and list_task_resolutions become tipatask__<name>; git_worktree_status, complete_task, push_knowledge and batch_grep_tags become tipatask-local__<name>. Read architecture docs with those tools or straight off disk (ai/architecture/*.md).',
     'Never read or edit `.mcp.json`. If a bridged tool is missing, the bridge could not reach that server: mention it once in your final report and continue with Pi built-in tools; never investigate MCP setup.',
-  ].join('\n');
+    computerUse?.available === true
+      ? 'Desktop tools use computer-use__<name>, e.g. computer-use__screenshot, computer-use__left_click, computer-use__type. Plan permits only screenshot observation and its access helpers; Auto/Bypass permit desktop actions.' : '',
+  ].filter(Boolean).join('\n');
 }
 
 // ── (C1134/C1217, migrated onto the shared helper by C1528) Ask-and-stop mechanism — every
@@ -169,6 +171,16 @@ class PiAgent extends BaseTaskAgent {
     return super.buildCowboyDirective({ ...opts, compact: true, nextCall });
   }
 
+  buildParentPreparationDirective(opts = {}) {
+    const nextCall = opts.piMcpBridge ? '`tipatask-local__start_next_tasks(task_key)`' : '`tt next "$TIPATASK_TASK_ID"`';
+    return super.buildParentPreparationDirective({ ...opts, nextCall });
+  }
+
+  buildObjectiveContinuationDirective(opts = {}) {
+    const nextCall = opts.piMcpBridge ? '`tipatask-local__start_next_tasks(task_key)`' : '`tt next "$TIPATASK_TASK_ID"`';
+    return super.buildObjectiveContinuationDirective({ ...opts, nextCall });
+  }
+
   // Compact wording for every shared directive — Pi's kickoff prompt is echoed verbatim into
   // its own TUI under a hard size budget, and the REST fallback has no MCP tools to name. Text clarifying
   // questions stay on: Pi has no question tool.
@@ -190,7 +202,7 @@ class PiAgent extends BaseTaskAgent {
     // (C1575) SIMPLE_MODE is a bare debug path with no surrounding framing to budget the
     // parent block against — thread it through uncapped, same discipline SIMPLE_MODE gives
     // every other opt in this method.
-    if (runtimeConfig.SIMPLE_MODE && !opts.permissionPolicy?.enforced && opts.permissionPolicy?.mode !== 'plan') return BaseTaskAgent.prependParentTask(promptWithComments, opts);
+    if (runtimeConfig.SIMPLE_MODE && !(opts.parentPreparation ?? opts.task?.isObjective) && !opts.objectiveChain && !opts.permissionPolicy?.enforced && opts.permissionPolicy?.mode !== 'plan') return BaseTaskAgent.prependParentTask(promptWithComments, opts);
 
     const ttTags = (opts.taskTags || []).filter(t => t.startsWith('tt-'));
     const cachedTags = (opts.cachedTags || []).filter(t => t.startsWith('tt-') && !ttTags.includes(t));
@@ -218,7 +230,7 @@ class PiAgent extends BaseTaskAgent {
     const hasOnFire = this.resolveStatusNames(opts).includes('on_fire');
     // Without the bridge (bundle not built, no .mcp.json, no project target), Pi gets the
     // no-MCP framing and the credential-safe `tt` REST recipe instead.
-    const intro = bridge ? [buildPiMcpToolMap()] : [
+    const intro = bridge ? [buildPiMcpToolMap(opts.computerUse)] : [
       'You are running inside Pi Coding Agent. Pi has NO MCP support at all — by design, not a broken setup. A missing `tipatask` MCP server is expected and is NOT a bug: never report or investigate it, never read or edit `.mcp.json`, never stop work over it. Use Pi built-in shell/read/edit tools only.',
       'Pi auto-loads this repo\'s AGENTS.md / CLAUDE.md, written for MCP-capable agents. Their `tipatask` MCP tool calls — list_system_tags, get_project_tags, get_tag_architecture, get_tag_architectures, create_system_tag, batch_grep_tags, list_tasks, get_task, create_task, update_task, create_task_comment, push_knowledge — do NOT apply to you, nor does the "MCP Tool Schemas" section of your system prompt. Use the REST command below for task operations and verified completion.',
     ];
@@ -354,9 +366,16 @@ class PiAgent extends BaseTaskAgent {
 
     // MCP bridge: Pi loads mcp-bridge.mjs with -e and reads the derived config named by
     // TIPATASK_PI_MCP_CONFIG. Empty when unavailable, so an inherited value never applies.
-    const bridge = this._resolveMcpBridge(config, projectRoot);
+    // Without the blocking extension an older Pi cannot enforce screenshot-only Plan mode.
+    const computerUse = opts.computerUse?.available && !opts.permissionGate
+      ? { available: false, provider: 'pi', reason: 'Computer use requires a live blocking permission gate. Update Pi to 0.84.1 or newer and restart this task from the updated Task App.' }
+      : opts.computerUse;
+    Object.assign(env, require('../computer-use-runtime').desktopEnv(opts.permissionGate));
+    const bridge = this._resolveMcpBridge(config, projectRoot, computerUse);
     env.TIPATASK_PI_MCP_CONFIG = bridge ? bridge.configPath : '';
-    opts = { ...opts, piMcpBridge: !!bridge };
+    opts = { ...opts, piMcpBridge: !!bridge, computerUse: !bridge && computerUse?.available
+      ? { available: false, provider: 'pi', reason: 'Desktop MCP bridge unavailable. Update/reinstall Task App; source checkouts must run node build.js, then restart the task.' }
+      : computerUse };
     // (C1117) Logged so a model-specific misbehavior (e.g. Kimi K3 leaking a bare `<|sep|>`
     // chat-template token on plan approval — see tt-pi-session.md § Plan approval PTY protocol)
     // doesn't require a follow-up round-trip just to find out which model was running.
@@ -418,8 +437,12 @@ class PiAgent extends BaseTaskAgent {
 
   // Derived `.mcp.json` first (null when the project has none or no API target), then the
   // staged bundle; null when either is missing, and the prompt falls back to the REST recipe.
-  _resolveMcpBridge(config, projectRoot) {
-    return resolvePiMcpBridge({ projectRoot, userDataRoot: config.USER_DATA_ROOT });
+  _resolveMcpBridge(config, projectRoot, computerUse) {
+    return resolvePiMcpBridge({ projectRoot, userDataRoot: config.USER_DATA_ROOT, computerUse });
+  }
+
+  async detectComputerUse(config, opts = {}) {
+    return require('../computer-use-runtime').detectDesktop(this.id, config, opts);
   }
 
   // ── Plan-approval submission (C1117) ──

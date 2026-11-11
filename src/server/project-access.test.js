@@ -167,11 +167,29 @@ test('unconfigured folders continue to setup without an access probe', async () 
 
 test('canceling every restored project creates an unbound welcome window', async () => {
   const h = harness({ prompt: async () => false });
-  await h.context.createInitialWindows(['/a', '/b'], { deferShow: true });
+  const opened = await h.context.createInitialWindows(['/a', '/b'], { deferShow: true });
   assert.equal(h.windows.length, 1);
+  // Startup attaches its permission dialogs to the windows createInitialWindows() opened.
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0], h.windows[0]);
   assert.deepEqual(h.events.filter(e => e[0] === 'bind'), [['bind', null]]);
   assert.match(h.events.find(e => e[0] === 'load')[1], /todo\.html$/);
   assert.deepEqual(h.windowCalls, [['trackOnScreen', 1]]);
+});
+
+test('createInitialWindows resolves every window it opened, an unbound one when given no project', async () => {
+  const h = harness();
+  const opened = await h.context.createInitialWindows(['/a', '/b'], { deferShow: true });
+  assert.equal(opened.length, 2);
+  assert.equal(opened[0], h.windows[0]);
+  assert.equal(opened[1], h.windows[1]);
+  assert.deepEqual(h.events.filter(e => e[0] === 'bind'), [['bind', '/a'], ['bind', '/b']]);
+
+  const blank = harness();
+  const welcome = await blank.context.createInitialWindows([], { deferShow: true });
+  assert.equal(welcome.length, 1);
+  assert.equal(welcome[0], blank.windows[0]);
+  assert.deepEqual(blank.events.filter(e => e[0] === 'bind'), [['bind', null]]);
 });
 
 function ipcHandler(channel, context) {

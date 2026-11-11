@@ -85,7 +85,7 @@ async function main() {
   // arch cache is lazy — listSystemTags/getTagArchitecture self-bootstrap on first call
   const archCacheLog = process.env.MCP_ARCH_CACHE_LOG === '1';
 
-  // C1382 — remote HTTP transport (api/src/routes/mcp.js) now carries 18 of these 22
+  // C1382 — remote HTTP transport (api/src/routes/mcp.js) now carries 19 of these 25
   // tools (C1541 adds list_task_resolutions to both) with the API's own MySQL directly,
   // retiring this stdio server as the primary registration. TIPATASK_MCP_LOCAL_ONLY (set
   // to "1" by every config writer as of C1382 — see .mcp.json / codex-mcp-config.js)
@@ -93,10 +93,10 @@ async function main() {
   // (batch_grep_tags), an API round-trip this process happens to already be set up for
   // (push_knowledge/pull_knowledge, git_worktree_status, complete_task) or the local Task App
   // (start_next_tasks, TPT9163). Registered under the server name
-  // 'tipatask-local' — see the McpServer name below. Defaults to full 22-tool mode
+  // 'tipatask-local' — see the McpServer name below. Defaults to full 25-tool mode
   // (LOCAL_ONLY=false) so a stale .mcp.json/config.toml predating C1382, or a bare
   // `node server.js` invocation, keeps working exactly as before rather than silently
-  // losing 18 tools.
+  // losing 19 tools.
   const LOCAL_ONLY = process.env.TIPATASK_MCP_LOCAL_ONLY === '1';
 
   const server = new McpServer({
@@ -106,7 +106,7 @@ async function main() {
   const projectId = config.API_PROJECT_ID ?? null;
   const projectScopeNote = `Scoped to project ${projectId ?? 'none'} (API_PROJECT_ID from .tipatask/config.json).`;
 
-  // ── The 18 tools now also served remotely (api/src/routes/mcp.js) — skipped when
+  // ── The 19 tools now also served remotely (api/src/routes/mcp.js) — skipped when
   // TIPATASK_MCP_LOCAL_ONLY=1 so a client registering both 'tipatask' (remote) and
   // 'tipatask-local' (this process) never gets two divergent implementations of the
   // same tool name space. See tt-mcp-server.md § Remote HTTP Transport. ──
@@ -165,6 +165,7 @@ async function main() {
       status: t.status,
       category: t.category,
       priority: t.priority,
+      urgency: t.urgency ?? 0,
       order: t.order,
       tags: t.tags,
       assignee: t.assignee,
@@ -257,6 +258,8 @@ async function main() {
       let task;
       try {
         task = await taskCache.getTask(backend, normalized);
+        // List snapshots omit development links; explicit detail reads must include them.
+        if (task && !Object.hasOwn(task, 'dev_links')) task = await backend.getTask(normalized);
       } catch (err) {
         return { content: [{ type: 'text', text: `Lookup failed for ${normalized}: ${err.message}` }], isError: true };
       }
@@ -283,6 +286,7 @@ async function main() {
       title: z.string().optional().describe('New title'),
       description: z.string().optional().describe('New description'),
       priority: z.number().optional().describe("Priority (higher = more important). Normally OMIT means \"leave unchanged\" — EXCEPT when finalizing a reserve_task_keys placeholder (title being set for the first time): then priority is defaulted the same way create_task does (session task → in_progress CODING task → max(active)+1), never silently left at the reservation's priority 0/backlog (C1049)."),
+      urgency: z.number().int().min(0).max(4).optional().describe('Urgency independent of sprint priority: 0 none, 1 low, 2 medium, 3 high, 4 urgent. Omit to preserve on update; new tasks default to 0.'),
       tags: z.array(z.string()).optional().describe('Replace tags'),
       dependencies: z.array(z.string()).optional().describe("Replace the dependency list (task keys). Priority is auto-healed (C1053): if this task's sprint is at or below a dep's sprint it is bumped above it, and any active task depending on this one cascades upward too. Backlog (priority 0) tasks and backlog deps are exempt."),
       // assignee intentionally omitted — Task App tasks are owned by their creator and
@@ -423,12 +427,14 @@ async function main() {
       task_key: z.string().optional().describe('OMIT (preferred): the API allocates the next key in this project\'s sequence. Pass a key ONLY if this session got it from reserve_task_keys; any other key is refused.'),
       title: z.string().describe('Task title'),
       description: z.string().describe('Task description'),
+      parent_key: z.string().optional().describe('Existing parent task key in this project. Creates a linked subtask under that parent.'),
       category: z.enum(['CODING', 'HUMAN']).default('CODING').describe('Category'),
       // C1184: no fixed default — resolved in the handler to this project's
       // is_workflow_start status name (legacy projects: 'pending').
       status: z.string().optional().describe("Initial status — one of this project's configured status names. OMIT to use this project's workflow-start status (legacy projects: 'pending'). An invalid value returns an error listing the valid names."),
       priority: z.number().optional().describe("Priority (higher = more important). OMIT to inherit the current task's priority — resolved from the session's TIPATASK_OBJECTIVE_TASK_ID/TIPATASK_TASK_ID, else the in_progress CODING task's priority (C874), else max(active priority)+1 — keeps deferred follow-up tasks in the same sprint as their parent (C956). Explicit 0 = backlog. NOTE: if `dependencies` is non-empty, this is a floor, not a fixed value — it is raised above every active dependency's sprint (C1052)."),
       dependencies: z.array(z.string()).default([]).describe('Task keys this depends on. Adding a dependency on an active task (not complete/canceled by this project\'s own workflow roles, C1187) moves this task into a LATER sprint than that dependency (C1052) — only list deps this task genuinely cannot start without.'),
+      urgency: z.number().int().min(0).max(4).optional().describe('Urgency independent of sprint priority: 0 none, 1 low, 2 medium, 3 high, 4 urgent. Omit to preserve on update; new tasks default to 0.'),
       tags: z.array(z.string()).default([]).describe('Tag names'),
     },
     async (args) => {
@@ -555,10 +561,19 @@ async function main() {
         category: args.category,
         status,
         priority,
+        urgency: args.urgency,
         order,
         dependencies: normalizedDeps,
         tags: args.tags,
       };
+      if (args.parent_key !== undefined) {
+        const parentKey = normalizeTaskKey(args.parent_key);
+        const parent = parentKey && await backend.getTask(parentKey);
+        if (!parent || parent.id === normalizedTaskKey || isReservationPlaceholder(parent)) {
+          return { content: [{ type: 'text', text: 'parent_key must name an existing non-reservation parent in this project, different from the child.' }], isError: true };
+        }
+        fields.parentId = parentKey;
+      }
       let result;
       if (normalizedTaskKey) {
         // A reserved key: its placeholder row must still be the untouched reservation
@@ -709,6 +724,31 @@ async function main() {
       return {
         content: [{ type: 'text', text: JSON.stringify({ project_id: projectId, comment }, null, 2) }],
       };
+    }
+  );
+
+  server.tool(
+    'add_task_dev_link',
+    `Record a branch, commit or pull request on a task after publishing it. Use an HTTPS URL; duplicate kind+URL returns the existing link without changing its metadata. ${projectScopeNote}`,
+    {
+      task_key: z.string(),
+      kind: z.enum(['branch', 'commit', 'pr']),
+      url: z.string().max(2048),
+      label: z.string().max(255).optional(),
+      repo: z.string().max(512).optional(),
+      external_id: z.string().max(255).optional(),
+      state: z.string().max(32).optional(),
+    },
+    async ({ task_key, ...link }) => {
+      const normalized = normalizeTaskKey(task_key);
+      if (!normalized) return { content: [{ type: 'text', text: `Invalid task_key: ${JSON.stringify(task_key)}` }], isError: true };
+      try {
+        await ensureBackend();
+        const result = await backend.addTaskDevLink(normalized, link);
+        if (!result) return { content: [{ type: 'text', text: `Task ${normalized} not found` }], isError: true };
+        taskCache.invalidate();
+        return { content: [{ type: 'text', text: JSON.stringify({ project_id: projectId, ...result }, null, 2) }] };
+      } catch (err) { return { content: [{ type: 'text', text: err.message }], isError: true }; }
     }
   );
 
@@ -1226,7 +1266,7 @@ async function main() {
 
   server.tool(
     'start_next_tasks',
-    'Cowboy chain runs only (Bypass, with Cowboy-coding mode on or started by a chain): complete_task already asks Task App to start the next tasks of this chain, each in its own new agent session with this run\'s agent and model, and reports the answer as cowboyNext. Call this only as a retry, once, when that answer\'s reason is `unavailable`, with the key of the task this run just completed; Task App picks the tasks — never start them yourself. Returns the started task keys, the reason, and `skipped`: each candidate task that did not start, with its reason code.',
+    'Parent-objective preparation: call with this parent task key after saving children to start the first ready child. Child complete_task continues one child at a time with selected permissions. In Cowboy runs complete_task starts successors. Retry once only when cowboyNext.reason is unavailable. Requires this live run token; never choose or launch sessions yourself.',
     { task_key: z.string().describe('Key of the task this run just completed') },
     async ({ task_key }) => {
       const result = await require('../server/cowboy-next-request').requestNextTasks(normalizeTaskKey(task_key));

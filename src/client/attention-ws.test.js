@@ -357,6 +357,31 @@ test('cowboy-chain-started refetches sessions and repaints without raising atten
   globalThis.window.TipTask.fetchActiveSessions = async () => {};
 });
 
+// (TPT9239) A run the web app started on this device: no socket of this window opened it.
+test('remote-session-state refetches sessions; an exited web run leaves activeSessions first, no attention or notification', async () => {
+  let fetched = 0;
+  let activeAtFetch = null;
+  globalThis.window.TipTask.fetchActiveSessions = async () => { fetched++; activeAtFetch = state.activeSessions.has('W1'); };
+  const frame = st => ({ type: 'remote-session-state', projectPath: '', taskId: 'W1', tabId: 'W1', state: st, origin: 'web', agent: 'claude', startedAt: 1 });
+  assert.equal(handleAttentionMessage(frame('starting')), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fetched, 1);
+  assert.equal(updateClaudeButtonsCount, 1);
+  state.activeSessions.add('W1'); // what the refetch listed
+  handleAttentionMessage(frame('running'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fetched, 2);
+  assert.equal(state.activeSessions.has('W1'), true, 'a running frame never drops the row');
+  handleAttentionMessage(frame('exited'));
+  assert.equal(state.activeSessions.has('W1'), false);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fetched, 3);
+  assert.equal(activeAtFetch, false, 'gone before the snapshot that may no longer list it');
+  assert.equal(state.attentionSessions.has('W1'), false);
+  assert.equal(constructorCount, 0);
+  globalThis.window.TipTask.fetchActiveSessions = async () => {};
+});
+
 // ── Exit backstop frame (TPT613) ──
 const leftFrame = (taskId, exitId) => ({
   type: 'task-left-uncommitted', projectPath: '', taskId, exitId, status: 'on_fire', nudgeCount: 1, agent: 'claude',

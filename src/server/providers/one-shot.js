@@ -195,7 +195,11 @@ async function runOneShotPrompt(prompt, opts = {}) {
     selection = { providerId: opts.selection.providerId, model: opts.selection.model || '' };
   } else {
     try { selection = resolveDefaultSelection(projectRoot); }
-    catch (err) { console.warn(`[one-shot] provider resolution failed: ${err.message}`); selection = { providerId: 'claude', model: '' }; }
+    catch (err) {
+      console.warn(`[one-shot] provider resolution failed: ${err.message}`);
+      if (!fallbackToClaude) return null;
+      selection = { providerId: 'claude', model: '' };
+    }
   }
 
   if (selection.providerId !== 'claude') {
@@ -211,7 +215,7 @@ async function runOneShotPrompt(prompt, opts = {}) {
     }
     if (result != null) return result;
     if (!fallbackToClaude) {
-      console.warn(`[one-shot] ${selection.providerId} gave no usable answer — no Claude fallback for an explicit provider`);
+      console.warn(`[one-shot] ${selection.providerId} gave no usable answer — Claude fallback disabled`);
       return null;
     }
     console.warn(`[one-shot] ${selection.providerId} gave no usable answer — falling back to claude`);

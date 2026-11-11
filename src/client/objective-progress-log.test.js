@@ -159,7 +159,7 @@ test('stageLogText, the turn divider and the elapsed prefix follow the project l
   setLocale('uk');
   try {
     assert.equal(stageLogText('spawned'), 'запущено');
-    assert.equal(stageLogText('pi-retry', null, '429'), 'повтор запиту до провайдера: 429');
+    assert.equal(stageLogText('pi-retry', null, '429'), 'повтор запиту до постачальника: 429');
     assert.equal(stageLogText('some-new-stage'), 'some-new-stage');
     assert.equal(stageLogText('tool', 'mcp__tipatask__get_task'), 'get_task', 'tool names stay verbatim');
     assert.match(formatProgressLine({ kind: 'turn', turnIndex: 3 }), /═══ хід 3 ═══/);

@@ -69,9 +69,9 @@ test('sync updates shields after override/default edits, preserves omitted field
 // (TPT9161) The cowboy marker joins the tip only while the flag is on in an effective Bypass.
 test('cowboy marker shows on a Bypass task with the flag on, survives omitted patches and follows the default', tc => {
   const { env, app, store } = harness(tc);
-  const marker = 'Permission mode: Bypass · 🤠 Cowboy-coding mode';
-  assert.ok(env.permissionButtonHtml({ id: 'TPT1', agentPermissionMode: 'bypass', cowboyMode: true }).includes(`data-cowboy-mode="1" data-tip="${escapeAttr(marker)}"`));
-  assert.doesNotMatch(env.permissionButtonHtml({ id: 'TPT1', agentPermissionMode: 'bypass', cowboyMode: false }), /data-cowboy-mode|🤠/);
+  const marker = 'Permission mode: Bypass · 🤠 Cowboy-coding mode (Whole Project)';
+  assert.ok(env.permissionButtonHtml({ id: 'TPT1', agentPermissionMode: 'bypass', cowboyMode: true }).includes(`data-cowboy-mode="project" data-tip="${escapeAttr(marker)}"`));
+  assert.doesNotMatch(env.permissionButtonHtml({ id: 'TPT1', agentPermissionMode: 'bypass', cowboyMode: false }), /🤠/);
   const card = app.querySelector('.card');
   const button = card.querySelector('button');
   env.syncPermissionModeButton(card, { agentPermissionMode: 'bypass' });
@@ -79,23 +79,23 @@ test('cowboy marker shows on a Bypass task with the flag on, survives omitted pa
   env.syncPermissionModeButton(card, { cowboyMode: true });
   assert.equal(button.dataset.tip, marker, 'the tooltip text changes once the flag is on');
   assert.equal(button.getAttribute('aria-label'), marker);
-  assert.equal(button.dataset.cowboyMode, '1');
+  assert.equal(button.dataset.cowboyMode, 'project');
   env.syncPermissionModeButton(card, { title: 'changed' });
   assert.equal(button.dataset.tip, marker, 'a payload without the flag keeps it');
   env.syncPermissionModeButton(card, { agentPermissionMode: 'auto' });
   assert.equal(button.dataset.tip, 'Permission mode: Auto mode', 'a stored flag outside Bypass shows no marker');
-  assert.equal(button.dataset.cowboyMode, '1');
+  assert.equal(button.dataset.cowboyMode, 'project');
   env.syncPermissionModeButton(card, { agentPermissionMode: null });
   store.projectMode = 'bypass';
   env.syncAllPermissionButtons(app);
-  assert.equal(button.dataset.tip, 'Permission mode: Project Default (Bypass) · 🤠 Cowboy-coding mode');
+  assert.equal(button.dataset.tip, 'Permission mode: Project Default (Bypass) · 🤠 Cowboy-coding mode (Whole Project)');
   setLocale('uk');
   env.syncAllPermissionButtons(app);
-  assert.equal(button.dataset.tip, 'Режим дозволів: Типовий для проєкту (Без підтверджень) · 🤠 Ковбойський режим');
+  assert.equal(button.dataset.tip, 'Режим дозволів: Типовий для проєкту (Без підтверджень) · 🤠 Ковбойський режим (Увесь проєкт)');
   setLocale('en');
   env.syncPermissionModeButton(card, { cowboy_mode: false });
   assert.equal(button.dataset.tip, 'Permission mode: Project Default (Bypass)');
-  assert.equal(button.dataset.cowboyMode, undefined);
+  assert.equal(button.dataset.cowboyMode, 'disabled');
 });
 
 test('delegated shield click opens task settings once and skips disabled, discussing and preview cards', tc => {

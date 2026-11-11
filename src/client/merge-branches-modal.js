@@ -511,6 +511,7 @@ function _renderPublishResult() {
     if (r.pushed) parts.push(escapeAttr(t('merge.pushed')));
     if (r.prUrl) parts.push(`<a href="${escapeAttr(r.prUrl)}" target="_blank" rel="noopener">${escapeAttr(t('merge.prOpened'))}</a>`);
     if (r.error) parts.push(`<span class="merge-result-error">${escapeAttr(t('merge.publishError', { msg: r.error }))}</span>${r.suggested ? `<pre class="merge-commands">${escapeAttr(r.suggested)}</pre>` : ''}`);
+    for (const failure of r.devLinkErrors || []) parts.push(`<span class="merge-result-error">${escapeAttr(t('merge.devLinkError', { task: failure.taskKey || '', msg: failure.error }))}</span>`);
     if (r.skipped) parts.push(escapeAttr(String(r.skipped)));
     html += `<li><strong>${escapeAttr(repo ? _repoLabel(repo) : r.repoId)}</strong>: ${parts.join(' · ')}</li>`;
   }

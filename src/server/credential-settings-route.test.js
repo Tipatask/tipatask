@@ -33,6 +33,11 @@ test('browser settings routes return no stored secret and resolve saves within p
     });
   }
   const handler = createHttpHandler(new Map(), () => ({}), {});
+  let relaySyncs = 0;
+  const { terminalEvents } = require('./device-relay');
+  const onConfig = () => { relaySyncs++; };
+  terminalEvents.on('config', onConfig);
+  t.after(() => terminalEvents.off('config', onConfig));
   const call = async (method, url, root, body) => {
     const res = response();
     await handler(req(method, url, root, body), res);
@@ -66,4 +71,12 @@ test('browser settings routes return no stored secret and resolve saves within p
   assert.equal(cleared.status, 200);
   assert.equal(readProjectConfig(roots[0]).ASSEMBLYAI_API_KEY, '');
   assert.equal(readProjectConfig(roots[1]).ASSEMBLYAI_API_KEY, 'sentinel-voice-1');
+  for (const enabled of [true, false, 'true']) {
+    const remote = await call('POST', '/api/project-config', roots[0], { REMOTE_CONTROL_ENABLED: enabled });
+    assert.equal(remote.status, 403);
+    assert.match(remote.data.error, /local desktop consent/);
+    assert.equal(readProjectConfig(roots[0]).REMOTE_CONTROL_ENABLED, undefined);
+  }
+  assert.equal(relaySyncs, 0);
+  assert.equal((await call('GET', '/api/project-config', roots[0])).data.remoteControl.available, false);
 });

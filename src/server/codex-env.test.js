@@ -260,7 +260,7 @@ test('terminal agent and objective provider both delegate Codex environment setu
   const terminalSource = fs.readFileSync(path.join(__dirname, 'task-agent', 'codex-agent.js'), 'utf8');
   const objectiveSource = fs.readFileSync(path.join(__dirname, 'providers', 'codex-session.js'), 'utf8');
 
-  assert.match(terminalSource, /buildCodexEnv\(\{ projectRoot, taskId, term: 'xterm-256color' \}\)/);
+  assert.match(terminalSource, /buildCodexEnv\(\{ projectRoot, taskId, term: 'xterm-256color'[, }]/);
   assert.match(objectiveSource, /buildCodexEnv\(\{ projectRoot: session\.projectPath \|\| config\.PROJECT_ROOT, taskId[:, }]/);
 });
 
@@ -564,4 +564,36 @@ test('existing-project upgrade reaches both Codex launch environments with new g
   assert.equal(objective.TIPATASK_API_TOKEN, terminal.TIPATASK_API_TOKEN);
   assert.equal(objective.CODEX_HOME, terminal.CODEX_HOME);
   assert.doesNotMatch(afterTerminal, /first-token|rotated-token/);
+});
+
+// (TPT9215) The served-model rule shared by task terminals, headless chat turns and one-shots.
+test('servedCodexModelOverride: judges the CODEX_HOME config model against the cached live catalog', (t) => {
+  const { servedCodexModelOverride } = require('./codex-env');
+  const registry = require('./task-agent/model-registry');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-codex-served-'));
+  t.after(() => { registry._resetForTest(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const cfg = { USER_DATA_ROOT: dir };
+  const home = path.join(dir, 'home');
+  fs.mkdirSync(home);
+  const write = (text) => fs.writeFileSync(path.join(home, 'config.toml'), text, 'utf8');
+  const seed = (entry) => {
+    fs.writeFileSync(path.join(dir, 'model-registry.json'), JSON.stringify(entry ? { codex: entry } : {}), 'utf8');
+    registry._resetForTest();
+  };
+  const live = { source: 'probe', probedAt: Date.now(), key: 'k', models: [
+    { id: 'gpt-6.1-sol', isLatest: true }, { id: 'gpt-6-luna', isLatest: false },
+  ] };
+
+  write('model = "gpt-5.5"\n');
+  seed(live);
+  assert.deepEqual(servedCodexModelOverride(home, cfg), { model: 'gpt-6.1-sol', configModel: 'gpt-5.5' });
+  write('model = "gpt-6-luna"\n');
+  assert.equal(servedCodexModelOverride(home, cfg).model, '');
+  write('model = "qwen"\nmodel_provider = "ollama"\n');
+  assert.equal(servedCodexModelOverride(home, cfg).model, '', 'a non-OpenAI provider is left alone');
+  write('model = "gpt-5.5"\n');
+  seed(null);
+  assert.equal(servedCodexModelOverride(home, cfg).model, '', 'no cached catalog');
+  seed({ ...live, source: 'fallback' });
+  assert.equal(servedCodexModelOverride(home, cfg).model, '', 'a fallback list is not a live catalog');
 });

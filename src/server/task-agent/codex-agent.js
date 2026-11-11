@@ -8,7 +8,7 @@ const BaseTaskAgent = require('./base-agent');
 const config = require('../config');
 const { getStaticBundle, getTaskStartupGrepBundle } = require('../static-context');
 const { resolveBin, resolveBinAsync, augmentPathEnv, prependPathEnv, resolveNvmBinDir, resolveSpawnModel, winExecSpec, writeSpawnArgFile } = require('../spawn-utils');
-const { buildCodexEnv, codexTerminalLaunchOptions, toCodexEffort } = require('../codex-env');
+const { buildCodexEnv, codexTerminalLaunchOptions, servedCodexModelOverride, toCodexEffort } = require('../codex-env');
 const { matchPromptLine, CODEX_PROMPT_PATTERNS, CODEX_PENDING_PASTE_RE, CODEX_EMPTY_COMPOSER_RE, CODEX_STARTUP_WAIT_RE, CODEX_COMPOSER_READY_RE, buildComposerEchoRe } = require('./prompt-detect');
 const { parseCodexCatalog } = require('./model-registry');
 
@@ -45,6 +45,10 @@ class CodexAgent extends BaseTaskAgent {
   constructor() {
     super('codex', 'Codex');
     this.approvalCommand = null;
+  }
+
+  async detectComputerUse(config, opts = {}) {
+    return require('../computer-use-runtime').detectDesktop(this.id, config, opts);
   }
 
   wrapPty(native, options) {
@@ -147,8 +151,10 @@ class CodexAgent extends BaseTaskAgent {
     const promptWithComments = BaseTaskAgent.prependParentTask(
       BaseTaskAgent.prependTaskComments(prompt, opts), opts);
 
-    // SIMPLE_MODE: skip static bundle + preamble, return bare task prompt
-    if (config.SIMPLE_MODE && !opts.permissionPolicy?.enforced && opts.permissionPolicy?.mode !== 'plan') return promptWithComments;
+    // SIMPLE_MODE skips static context but retains desktop-use instructions.
+    if (config.SIMPLE_MODE && !(opts.parentPreparation ?? opts.task?.isObjective) && !opts.objectiveChain && !opts.permissionPolicy?.enforced && opts.permissionPolicy?.mode !== 'plan') {
+      return [this.buildComputerUseDirective(opts), promptWithComments].filter(Boolean).join('\n\n');
+    }
 
     const ttTags = (opts.taskTags || []).filter(t => t.startsWith('tt-'));
     const projectRoot = opts.projectPath || config.PROJECT_ROOT;
@@ -210,7 +216,10 @@ class CodexAgent extends BaseTaskAgent {
   async getSpawnSpec(config, prompt, taskId, opts = {}) {
     const localized = await this.localizeSpawnPrompt(config, prompt, taskId, opts);
     prompt = localized.prompt;
-    opts = localized.opts;
+    opts = { ...localized.opts, computerUse: localized.opts.computerUse?.provider === 'codex' ? localized.opts.computerUse : null };
+    if (opts.computerUse?.available && !opts.permissionGate) {
+      opts = { ...opts, computerUse: { available: false, provider: 'codex', reason: 'Computer use requires a live Task App session. Restart this task from the updated Task App.' } };
+    }
     // Resolve project root from the window's bound project (opts.projectPath),
     // falling back to global config. In a packaged GUI launch config.PROJECT_ROOT
     // points inside the .app bundle — cwd, Codex MCP config, and the .codex home
@@ -226,10 +235,9 @@ class CodexAgent extends BaseTaskAgent {
     // Live-read config.json for the model (not the frozen startup config.CODEX_MODEL
     // snapshot) so a settings-page edit applies on the next spawn without a server
     // restart, and a stale exported CODEX_MODEL env var can never shadow it (C953).
-    // Fallback '' preserves "blank = Codex's own default" (no --model flag).
-    const _codexModel = resolveSpawnModel(opts.model, projectRoot, 'CODEX_MODEL', '');
-    if (_codexModel) args.push('--model', _codexModel);
-    args.push('--no-alt-screen');
+    // Fallback '' means "no task/project model": the launch home's config.toml model then
+    // runs, unless the cached live catalog no longer lists it (see below, after launch prep).
+    let _codexModel = resolveSpawnModel(opts.model, projectRoot, 'CODEX_MODEL', '');
     // (TPT571) The kickoff is NOT a positional argument any more — see getInteractiveReadyMs()
     // above. terminal-session.js pastes spec.initialPrompt once the TUI is interactive.
     const kickoff = this.prepareKickoff(config, this.buildPrompt(prompt, opts), taskId);
@@ -239,15 +247,29 @@ class CodexAgent extends BaseTaskAgent {
     let env;
     let codexSwitch;
     try {
-      ({ env } = buildCodexEnv({ projectRoot, taskId, term: 'xterm-256color' }));
-      codexSwitch = { baseHome: env.CODEX_HOME, effort: effort ? toCodexEffort(effort) : undefined };
-      const launch = codexTerminalLaunchOptions(projectRoot, env.CODEX_HOME, effort ? toCodexEffort(effort) : undefined, env, opts.permissionPolicy);
+      ({ env } = buildCodexEnv({ projectRoot, taskId, term: 'xterm-256color', computerUse: opts.computerUse }));
+      Object.assign(env, require('../computer-use-runtime').desktopEnv(opts.permissionGate));
+      codexSwitch = { baseHome: env.CODEX_HOME, effort: effort ? toCodexEffort(effort) : undefined, computerUse: opts.computerUse };
+      const launch = codexTerminalLaunchOptions(projectRoot, env.CODEX_HOME, effort ? toCodexEffort(effort) : undefined, env, opts.permissionPolicy, opts.computerUse);
       env.CODEX_HOME = launch.codexHome;
-      args.unshift(...launch.args);
+      args.push(...launch.args);
       console.log(`[codex:launch] task=${taskId || '(none)'} mode=${launch.mode} reason=${launch.reason}`);
     } catch (err) {
       throw new Error(`Unable to prepare project-local Codex MCP config: ${err.message}`);
     }
+    // (TPT9215) No task/project model: Codex would run the launch home's config.toml model,
+    // inherited from the user's global config and possibly no longer served. Pass the cached
+    // live catalog's top model instead when the catalog does not list it (cache-only, never
+    // probes; no live catalog → unchanged launch).
+    if (!_codexModel) {
+      const served = servedCodexModelOverride(env.CODEX_HOME, config);
+      if (served.model) {
+        console.log(`[codex:launch] task=${taskId || '(none)'} config model=${served.configModel || '(none)'} not in live catalog — using ${served.model}`);
+        _codexModel = served.model;
+      }
+    }
+    if (_codexModel) args.push('--model', _codexModel);
+    args.push('--no-alt-screen');
     return {
       command: config.CODEX_BIN,
       args,

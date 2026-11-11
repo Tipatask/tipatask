@@ -79,6 +79,19 @@ function cowboyChain(text) {
   once(text, /(?:task keys it started|started task keys)[^\n]*(?:final message|reason)/, 'the started keys are reported exactly once');
 }
 
+// (TPT9225) A run with computer use: check UI changes in the running app, leave the live TipATask
+// app alone, say when the tools are missing. `planning` adds the screenshots-only Plan rule.
+function computerUse(text, { planning = false } = {}) {
+  once(text, /Computer use:/, 'computer-use directive delivered exactly once');
+  once(text, /check UI changes in the running app/, 'UI changes are checked in the running app exactly once');
+  once(text, /Never quit, restart or close the live TipATask app/, 'the live TipATask app is never quit exactly once');
+  assert.match(text, /kill its processes/, 'its processes are never killed');
+  assert.match(text, /click or type in its windows/, 'its windows are never driven');
+  once(text, /(?:computer-use tools are missing|If the tools are missing)/, 'missing tools are reported exactly once');
+  if (planning) once(text, /Plan mode[^\n]*screenshots[^\n]*(?:approved)/, 'Plan allows screenshots only, until approval, exactly once');
+  else assert.doesNotMatch(text, /Plan mode[^\n]*screenshots/, 'no Plan rule outside planning');
+}
+
 function tagBackfill(text, id) {
   once(text, /Blank tag description\(s\) on this task: tt-fixture/, 'blank registered tag needs backfill exactly once');
   assert.match(text, /[Ss]tudy the module/);
@@ -96,4 +109,4 @@ function vcsOff(text) {
   assert.match(text, /Never[^\n]*(?:attribution|Co-Authored-By)/);
 }
 
-module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, cowboyChain, tagBackfill, vcsOff };
+module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, cowboyChain, computerUse, tagBackfill, vcsOff };

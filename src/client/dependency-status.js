@@ -14,6 +14,16 @@ function _dependencyStatus(taskIndex, key) {
 }
 
 /**
+ * (TPT9216) One task's status from any index shape the dependency gate reads below —
+ * Map<taskKey, status|task>, a task array or a keyed object. undefined when the index
+ * does not hold the key. task-card.js dependencyKeyStatus() resolves dependency keys
+ * through it.
+ */
+export function taskIndexStatus(taskIndex, key) {
+  return _dependencyStatus(taskIndex, key);
+}
+
+/**
  * Return dependency keys whose loaded task status is not completed/canceled.
  * Unknown dependencies deliberately fail open, matching the board's historical
  * behavior when its current task snapshot does not contain a dependency.

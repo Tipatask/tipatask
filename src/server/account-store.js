@@ -16,6 +16,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 
 const STORE_FILE = '.tipatask-account.json';
 const STORE_VERSION = 1;
@@ -70,6 +71,56 @@ function decodeTokenPayload(token) {
 // path -> { mtimeMs, value }. getApiCredentials() runs on every request, so avoid a
 // read+parse unless the file actually changed (same discipline as readProjectConfig()).
 const _cache = new Map();
+const _observers = new Map(); // store path -> shared watcher and subscribers
+
+// Observe every persisted writer, including Electron main, CLI and the forked server.
+// Local writes notify synchronously after rename; the directory watch catches atomic
+// replacements/removal in other processes. Hints contain no credentials. Consumers
+// must still read live credentials at each authority boundary, before watch delivery.
+function onAccountChange(listener, opts) {
+  const file = accountStorePath(opts);
+  let observer = _observers.get(file);
+  if (!observer) {
+    observer = { listeners: new Set(), accounts: readStore(opts).accounts, watcher: null };
+    observer.check = () => {
+      _cache.delete(file);
+      const next = readStore(opts).accounts;
+      const previous = observer.accounts;
+      observer.accounts = next;
+      const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
+      for (const baseUrl of keys) {
+        const before = previous[baseUrl]; const after = next[baseUrl];
+        if (before?.token === after?.token && before?.userId === after?.userId
+          && before?.consentEpoch === after?.consentEpoch) continue;
+        for (const notify of [...observer.listeners]) {
+          try { notify({ baseUrl }); }
+          catch { console.warn('[account-store] change listener failed'); }
+        }
+      }
+    };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    observer.watcher = fs.watch(path.dirname(file), { persistent: false }, (_event, filename) => {
+      if (!filename || String(filename) === STORE_FILE) observer.check();
+    });
+    observer.watcher.on('error', () => {
+      // Boundary reads remain authoritative even if the OS stops delivering hints.
+      observer.check();
+      console.warn('[account-store] change watch unavailable');
+    });
+    _observers.set(file, observer);
+  }
+  observer.listeners.add(listener);
+  let active = true;
+  return () => {
+    if (!active) return;
+    active = false;
+    observer.listeners.delete(listener);
+    if (!observer.listeners.size) {
+      observer.watcher.close();
+      if (_observers.get(file) === observer) _observers.delete(file);
+    }
+  };
+}
 
 function readStore(opts) {
   const file = accountStorePath(opts);
@@ -82,7 +133,8 @@ function readStore(opts) {
     return { version: STORE_VERSION, accounts: {} };
   }
   const cached = _cache.get(file);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.value;
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.ctimeMs === stat.ctimeMs
+    && cached.ino === stat.ino && cached.size === stat.size) return cached.value;
   let value = { version: STORE_VERSION, accounts: {} };
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -93,7 +145,7 @@ function readStore(opts) {
     // JSON parse errors can quote the input, including a bearer token.
     console.warn('[account-store] unreadable account store — sign in again or repair the user-data path');
   }
-  _cache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+  _cache.set(file, { mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, ino: stat.ino, size: stat.size, value });
   return value;
 }
 
@@ -105,6 +157,7 @@ function writeStore(store, opts) {
   fs.writeFileSync(tmp, JSON.stringify(store, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tmp, file);
   _cache.delete(file);
+  _observers.get(file)?.check();
 }
 
 // -> { token, userId, email, apiBaseUrl, updatedAt } or null
@@ -144,6 +197,12 @@ function saveAccountForServer(baseUrl, { token, userId, email } = {}, opts) {
   const id = userId != null ? userId : payload.id;
   const mail = typeof email === 'string' && email ? email : payload.email;
   const store = readStore(opts);
+  const previous = store.accounts[key];
+  const previousId = previous?.userId ?? decodeTokenPayload(previous?.token)?.id;
+  // Renewal preserves local consent. A different account or a new sign-in after
+  // sign-out can never revive an earlier account's consent records.
+  const consentEpoch = id != null && previousId != null && String(id) === String(previousId)
+    ? previous.consentEpoch || null : randomUUID();
   const next = {
     version: STORE_VERSION,
     accounts: {
@@ -154,6 +213,7 @@ function saveAccountForServer(baseUrl, { token, userId, email } = {}, opts) {
         email: typeof mail === 'string' ? mail : '',
         apiBaseUrl: key,
         updatedAt: new Date().toISOString(),
+        consentEpoch,
       },
     },
   };
@@ -201,4 +261,5 @@ module.exports = {
   saveAccountForServer,
   writeAccountToken,
   clearAccountToken,
+  onAccountChange,
 };

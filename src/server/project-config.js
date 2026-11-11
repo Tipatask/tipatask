@@ -315,6 +315,9 @@ function resolvePiModelWrites(existing, rows) {
 function mergeRendererProjectConfig(existing, patch = {}, { allowApiToken = false } = {}) {
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('Invalid project config patch');
   const merged = { ...(existing || {}) };
+  if (Object.hasOwn(patch, 'REMOTE_CONTROL_ENABLED')) {
+    throw new Error('Remote control requires local desktop consent');
+  }
   for (const key of [
     'TASK_BACKEND', 'API_BASE_URL', 'API_PROJECT_ID', 'projectName', 'DEVICE_ID',
     'DEVICE_NAME', 'TASK_AGENT', 'LAST_AGENT', 'AVAILABLE_AGENTS', 'CLAUDE_MODEL',

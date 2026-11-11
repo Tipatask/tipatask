@@ -1491,3 +1491,51 @@ test('voice recording widget text and graphics clear contrast on the card in eve
     assert.ok(glyph >= 3, `${id} Stop glyph is ${glyph.toFixed(2)}:1 on its button; expected at least 3:1`);
   }
 });
+
+// (TPT9268/TPT9271/TPT9283) The icon-only card Discuss button, in every palette. Its glyph clears
+// 4.5:1 (above the 3:1 an icon needs) and its edge 3:1 on the open and both closed card grounds,
+// at rest (transparent) and on its hover fill — the tint over the open card's own ground,
+// whatever card it is on. It opens the task's chat; the card has no model menu any more.
+test('card Discuss button clears contrast on every ground in every palette', () => {
+  const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
+  assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
+  const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+  const BTN = '.task-card-hover-controls .btn-task-discuss';
+  const edgeExpr = /var\(--[\w-]+\)/.exec(ruleValue(BTN, 'border') ?? '')?.[0];
+  assert.ok(edgeExpr, 'the Discuss button draws its edge from a palette token');
+  for (const { id, values: own } of themePalettes()) {
+    const dark = darkIds.has(id);
+    const v = layeredPalette(id, own, darkIds);
+    const value = (sel, prop) => (dark && ruleValue(`.theme-dark ${sel}`, prop)) || ruleValue(sel, prop);
+    const label = resolveColor(value(BTN, 'color'), v);
+    const edge = resolveColor(edgeExpr, v);
+    assert.equal(value(BTN, 'background'), 'transparent', `${id} Discuss at rest shows its card's ground`);
+    const fillExpr = value(`${BTN}:hover`, 'background');
+    const fill = /^linear-gradient\((.+), \1\), (var\(--[\w-]+\))$/.exec(fillExpr ?? '');
+    assert.ok(fill, `${id} the hover fill is one tint layered over an opaque ground: ${fillExpr}`);
+    const hoverFill = compositeOver(resolveTintExpr(fill[1], v), resolveColor(fill[2], v));
+    const grounds = {
+      open: resolveColor('var(--c-bg-card)', v),
+      complete: resolveColor(value('.card[data-status-role="complete"]', 'background'), v),
+      canceled: resolveColor(value('.card[data-status-role="canceled"]', 'background'), v),
+    };
+    for (const [name, ground] of Object.entries(grounds)) {
+      const line = contrastRatio(edge, ground);
+      assert.ok(line >= 3, `${id} Discuss edge on the ${name} card is ${line.toFixed(2)}:1; expected at least 3:1`);
+      for (const [state, bg] of [['at rest', ground], ['hovered', hoverFill]]) {
+        const text = contrastRatio(label, bg);
+        assert.ok(text >= 4.5, `${id} Discuss glyph ${state} on the ${name} card is ${text.toFixed(2)}:1; expected at least 4.5:1`);
+      }
+    }
+  }
+});
+
+// The hover tint is an rgba() token (or a var() naming one).
+function resolveTintExpr(expr, values) {
+  let e = String(expr || '').trim();
+  for (let guard = 0; /^var\(/.test(e) && guard < 5; guard++) {
+    const [name, fallback] = splitArgs(/^var\((.*)\)$/.exec(e)[1]);
+    e = (values[name] ?? fallback ?? '').trim();
+  }
+  return e;
+}

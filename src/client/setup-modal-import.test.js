@@ -332,7 +332,7 @@ test('import: the wizard renders in Ukrainian too', async () => {
         'Вхід': 'setup.stepSignIn', 'Назва': 'import.stepName', 'Папка': 'import.stepFolder', 'Агент': 'setup.stepAgent', 'Підтвердження': 'setup.stepConfirm',
       }[label]]));
     assert.deepEqual([...overlay().querySelectorAll('.setup-modal-archive-count')].map((el) => el.textContent),
-      ['12 задач', '3 спринти', '5 файлів бази знань']);
+      ['12 завдань', '3 спринти', '5 файлів бази знань']);
     assert.match($('.setup-modal-archive-meta').textContent, /^Експортовано з «Acme» 28/);
     assert.equal($('#setup-next-btn').textContent, i18n.LOCALES.uk['common.next']);
     $('#setup-next-btn').click();

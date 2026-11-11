@@ -252,7 +252,7 @@ class CodexLivePty {
     // Prepare all configuration before stopping the old TUI. No shared config writes.
     const policy = agent.buildPermissionPolicy({ mode, source: 'session', inherited: false });
     const launch = codexTerminalLaunchOptions(this.spec.cwd, this.spec.codexSwitch.baseHome,
-      this.spec.codexSwitch.effort, this.spec.env, policy);
+      this.spec.codexSwitch.effort, this.spec.env, policy, this.spec.codexSwitch.computerUse);
     const next = { ...this.spec, args: [...launch.args, '--no-alt-screen',
       ...(this.spec.model ? ['--model', this.spec.model] : [])],
       env: { ...this.spec.env, CODEX_HOME: launch.codexHome } };

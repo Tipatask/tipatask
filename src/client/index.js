@@ -23,6 +23,7 @@ import * as setupModal from './setup-modal.js';
 import * as notifications from './notifications.js';
 import * as attentionNotifications from './attention-notifications.js';
 import * as completionNotifications from './completion-notifications.js';
+import * as humanTaskRows from './human-task-rows.js'; // (TPT9201) template.html's task-state paths feed the left-nav human rows through it
 import * as attentionWs from './attention-ws.js';
 import * as attentionState from './attention-state.js';
 import * as taskActivity from './task-activity.js';
@@ -32,6 +33,7 @@ import './desktop-notification-panel.js'; // (TPT480) Electron-only full desktop
 import * as projectCreationWizard from './project-creation-wizard.js';
 import { buildPresetSeedReport } from './preset-seed-report.js'; // (TPT203) wizard partial-seed report
 import * as projectOpenFlow from './project-open-flow.js';
+import * as dialogFocus from './dialog-focus.js';
 import * as audioRecorder from './audio-recorder.js';
 import { initApiConnection } from './api-connection.js';
 import * as apiConnection from './api-connection.js'; // (TPT662) template.html needs handleMutationsDropped()
@@ -54,7 +56,7 @@ notificationCenter.installNotificationSurface();
 window.electronAPI?.onProjectExport?.((msg) => handleProjectExportStatus(msg));
 
 // Expose modules globally so the inline <script> in template.html can access them.
-window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, ...consoleModal, ...recipeSidebar, chatUI, chatTaskPreview, specChat, taskChat, setupModal, notifications, attentionNotifications, completionNotifications, attentionWs, attentionState, taskActivity, activityNotifications, notificationCenter, apiConnection, projectCreationWizard, projectOpenFlow, audioRecorder, perfLog, tagMatch, statusFilterSelect, newTaskSprint, agentQuota, mergeBranchesModal, taskFetch };
+window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, ...consoleModal, ...recipeSidebar, chatUI, chatTaskPreview, specChat, taskChat, setupModal, notifications, attentionNotifications, completionNotifications, humanTaskRows, attentionWs, attentionState, taskActivity, activityNotifications, notificationCenter, apiConnection, projectCreationWizard, projectOpenFlow, dialogFocus, audioRecorder, perfLog, tagMatch, statusFilterSelect, newTaskSprint, agentQuota, mergeBranchesModal, taskFetch };
 window.TipTask.agentAssignee = agentAssignee;
 // Terminal task-title links need a page-level bridge: task-board.js owns the modal,
 // while template.html owns loadAndRender() and can select Project Board first.

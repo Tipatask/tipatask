@@ -11,7 +11,7 @@ const leftUncommittedRegistry = require('./left-uncommitted'); // (TPT664) exit-
 const { normalizeProposals, applyRehashIntent, spawnObjectiveTurn, killObjectiveProc, escalateKill, clearRetryTimers, clearTurnDeadline, prewarmObjective, killPrewarm, teardownObjectiveSession, trackHelperProc, clearHeartbeat, prewarmObjectiveCold, killColdPrewarm, startSleepWatchdog, objectiveCacheActivity, ensureSessionStartName, computeTurnSpans } = require('./claude-session');
 const { spawnTurn, providerSessionId, clearProviderSessionId, applyModelSelection } = require('./providers/dispatch');
 const { listObjectiveProviders, listVisibleObjectiveProviders, clampSelectionToProviders, formatSelection, currentSelection, configForProject, getProviderSessionId, getProviderDefaultModel, PROVIDER_META } = require('./providers/registry');
-const { createSession, isAgentChatType, isAgentChatId } = require('./session-state');
+const { createSession, isAgentChatType, isAgentChatId, WEB_ORIGIN } = require('./session-state');
 const { TASK_CHAT, isTaskChatId, taskKeyFromChatId, isProjectChatId, projectIdFromChatId, buildProjectChatTitle, buildTaskChatSeed, buildTaskChatSystemPrompt } = require('./task-chat');
 const { resolvePiMcpBridge } = require('./providers/pi-task-tools');
 const { providerSupportsProfile } = require('./providers/tool-profiles');
@@ -58,6 +58,40 @@ const { VOICE_MODEL_IDS, VOICE_MODEL_ERRORS, listVoiceModels, getVoiceModelStatu
 const { modeSwitchError } = require('./permission-policy');
 const { contentSecurityPolicy } = require('./content-security-policy');
 const { decodeRequestComponent, wrapHttpHandler } = require('./http-request-boundary');
+const { terminalEvents, runId, captureSessionOwner, isTerminalReport } = require('./device-relay');
+
+// (TPT9220) Run attribution and the board's own-device check name this machine's device the way
+// the device relay does: index.js hands over the one device identity (device-identity.js) it
+// builds for the relay, so all three share one GET /api/devices per account. Until then, and in
+// tests that never hand one over, no device is known: no run is claimed and the board's own-device
+// id stays null.
+// (TPT9223) With it comes this machine's claim registry (device-claim-registry.js), which lets the
+// lifecycle release claims runs left open when their server exited. Without one nothing is
+// released.
+let deviceIdentity = null;
+let deviceClaims = null;
+function setDeviceIdentity(identity, claims = null) {
+  deviceIdentity = identity || null;
+  deviceClaims = claims || null;
+}
+const { postDeviceSession, deleteDeviceSession, releaseStaleClaims } = require('./device-session-lifecycle').createDeviceSessionLifecycle({
+  resolveDeviceId: credentials => (deviceIdentity ? deviceIdentity.deviceIdForAccount(credentials) : null),
+  getClaimRegistry: () => deviceClaims,
+});
+
+// (TPT9220) This machine's device id for `backend`'s account. The board compares a card's
+// activeDevice/recentDevice with it, so this machine's own runs carry no device badge
+// (task-card.js). Null when unknown, and after BOARD_DEVICE_ID_WAIT_MS of a slow lookup, so the
+// board's config is never held up for long.
+const BOARD_DEVICE_ID_WAIT_MS = 2000;
+async function boardDeviceId(backend) {
+  if (!deviceIdentity) return null;
+  let credentials;
+  try { credentials = backend.getCredentials(); } catch { return null; }
+  let timer;
+  const late = new Promise(resolve => { timer = setTimeout(resolve, BOARD_DEVICE_ID_WAIT_MS, null); });
+  try { return await Promise.race([deviceIdentity.deviceIdForAccount(credentials), late]); } catch { return null; } finally { clearTimeout(timer); }
+}
 
 // One process-level watchdog observes the one production sessions Map. The source is assigned
 // when HTTP/WS handlers receive that Map; starting here keeps duplicate handlers from creating
@@ -250,6 +284,8 @@ function replayExitedTerminal(ws, session) {
 function sessionMetaRow(s) {
   return { agent: s.taskAgent || null, label: s.taskAgentLabel || '', type: s.type || 'terminal', alive: !!s.alive,
     paused: pausedSummary(s),
+    // (TPT9239) A run the web app started: the left-nav row and the terminal header show a globe.
+    ...(s.startOrigin ? { origin: s.startOrigin } : {}),
     // Chats never carry a permission mode. A pending chat still has the default terminal type
     // until its start-* message, so its id is what keeps the fields off.
     ...(!isAgentChatId(s.tabId) && (s.permissionPolicy || (s.type === 'terminal' && s.permissionMode))
@@ -270,7 +306,8 @@ function sessionMetaRow(s) {
         answered: !!s._resumedHistory || (s.messages || []).some(m => m.role === 'assistant') } : {}) };
 }
 
-// Blocks starting a task assigned to someone else. Replaces the guard that used to sit
+// Local-start policy: blocks a task confirmed assigned to someone else. Remote starts
+// use remote-start-guard.js and never inherit this offline fallback. Replaces the guard that used to sit
 // inline at the top of spawnTerminal() (terminal-session.js) — moved here so both spawn
 // call sites can pass the task row they already fetched instead of paying a second,
 // uncached GET /tasks/:key (api-backend.js's getTask() has no cache). `task` may be the
@@ -709,31 +746,6 @@ async function handleAssemblyAiTranscribe(res, body, apiKey) {
   }
 }
 
-function postDeviceSession(taskId, backend) {
-  if (config.DEVICE_ID <= 0 || !backend || typeof backend.getCredentials !== 'function') return;
-  let credentials;
-  try { credentials = backend.getCredentials(); } catch { return; }
-  const url = `${credentials.baseUrl}/api/projects/${encodeURIComponent(credentials.projectId)}/tasks/${encodeURIComponent(taskId)}/device-sessions`;
-  httpRequest(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${credentials.token}` },
-    body: { device_id: config.DEVICE_ID },
-    timeoutMs: 5000,
-  }).catch(err => console.warn(`[device-session] claim failed for ${taskId}: ${err.message}`));
-}
-
-function deleteDeviceSession(taskId, backend) {
-  if (config.DEVICE_ID <= 0 || !backend || typeof backend.getCredentials !== 'function') return;
-  let credentials;
-  try { credentials = backend.getCredentials(); } catch { return; }
-  const url = `${credentials.baseUrl}/api/projects/${encodeURIComponent(credentials.projectId)}/tasks/${encodeURIComponent(taskId)}/device-sessions/${config.DEVICE_ID}`;
-  httpRequest(url, {
-    method: 'DELETE',
-    headers: { Authorization: `Bearer ${credentials.token}` },
-    timeoutMs: 5000,
-  }).catch(err => console.warn(`[device-session] release failed for ${taskId}: ${err.message}`));
-}
-
 // (TPT9014) `error` — a start refused with no socket attached (a queued start drained after its
 // headless Play All / bulk Start socket closed): the `error` frame startFailureFrame() built, so
 // the board can toast the same text the terminal's red line would show. Absent otherwise.
@@ -757,6 +769,28 @@ function broadcastSessionEnded(taskId, session, reason = 'terminated', error = n
   // project-bound board watcher both react to session-ended, and task keys can collide
   // across two open Electron project windows.
   websocket.broadcastToProject(session?.projectPath, 'session-ended', sessionEndedPayload(taskId, session, reason, error));
+}
+
+// (TPT9239) A run the web app started (handleRemoteSessionCommand()) was opened by no socket of
+// any Task App window, so its windows learn of it the way they learn of a cowboy chain's runs: a
+// project-scoped frame tells them to re-read GET /api/sessions. `state`: 'starting' (in the session
+// map, waiting for a start slot or its spawn), 'running' (pty up), 'exited' (the process ended, or
+// the start failed). A Terminate sends nothing here: terminateTerminalSession() broadcasts
+// session-ended for it. Runs started in Task App never send this frame, and a state is sent once.
+function broadcastWebSessionState(session, state) {
+  if (!session || session.startOrigin !== WEB_ORIGIN || !session.taskId) return;
+  if (state === 'exited' && session._terminated) return;
+  if (session._webStateSent === state) return;
+  session._webStateSent = state;
+  websocket.broadcastToProject(session.projectPath || '', 'remote-session-state', {
+    projectPath: session.projectPath || '',
+    taskId: session.taskId,
+    tabId: session.tabId || session.taskId,
+    state,
+    origin: WEB_ORIGIN,
+    agent: session.taskAgent || null,
+    startedAt: session.startedAt || null,
+  });
 }
 
 // Objective/spec chat is over (finalize, kill, ws close/detach): teardownObjectiveSession() leaves
@@ -827,6 +861,9 @@ function terminateTerminalSession(session, taskId, sessionKey, sessions, reason 
     attachedWs = session.ws;
     const ptyProcess = session.pty;
     session.alive = false;
+    session.onProcessExited?.();
+    terminalEvents.emit('state', session, 'exited');
+    session._relayEnded = true;
     session.pending = false;
     session._queued = false;
     session._launching = false;
@@ -850,7 +887,6 @@ function terminateTerminalSession(session, taskId, sessionKey, sessions, reason 
     session.ptyPid = null;
   }
   sessions.delete(sessionKey);
-  deleteDeviceSession(taskId, opts.backend);
   sendSessionEnded(opts.ackWs, taskId, session, reason);
   broadcastSessionEnded(taskId, session, reason);
   drainSessionQueue(); // (TPT444) the freed slot goes to the oldest queued start
@@ -1461,10 +1497,15 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       // agentStatuses stays global — machine-level CLI detection, not a per-project choice.
       const projectRoot = req.headers['x-tipatask-project'] || config.PROJECT_ROOT;
       const ta = getTaskAgentInfo(resolveTaskAgentId(projectRoot, null));
+      const ownDevice = boardDeviceId(backend); // (TPT9220) looked up alongside the user id
+      // (TPT9223) A board opening its project releases the claims runs on this machine left open
+      // (once per project and account per process). Never awaited.
+      releaseStaleClaims(backend);
       let currentUserId = null;
       if (config.TASK_BACKEND === 'api') {
         try { currentUserId = (await backend.getCurrentUserId()) ?? null; } catch { currentUserId = null; }
       }
+      const deviceId = await ownDevice;
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       return res.end(JSON.stringify({
         taskAgent: ta.id,
@@ -1478,6 +1519,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         availableAgents: getAvailableAgentsPeek(configForProject(projectRoot)),
         agentStatuses: listTaskAgentStatusesPeek(config),
         currentUserId,
+        deviceId, // (TPT9220) this machine's device for the project's account, or null
       }));
     }
 
@@ -1881,7 +1923,8 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       const cfg = readProjectConfig(projectRoot) || {};
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       const { rendererProjectConfig } = require('./project-config');
-      return res.end(JSON.stringify({ projectPath: projectRoot, config: rendererProjectConfig(cfg) }));
+      return res.end(JSON.stringify({ projectPath: projectRoot, config: rendererProjectConfig(cfg),
+        remoteControl: { ...require('./remote-control-consent').read(projectRoot), available: false, context: null, grant: null } }));
     }
 
     // POST /api/project-config — saves updated project config (browser-mode reauth)
@@ -1900,6 +1943,10 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       try {
         const projectRoot = req.headers['x-tipatask-project'] || config.PROJECT_ROOT;
         const { writeProjectConfig, mergeRendererProjectConfig } = require('./project-config');
+        if (Object.hasOwn(parsed, 'REMOTE_CONTROL_ENABLED')) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'Remote control requires local desktop consent' }));
+        }
         // (TPT95) Never let a raw client array reach the TOML writer as-is — it becomes
         // Codex section content verbatim (readBrowserToolSelection() re-validates too,
         // this is defense-in-depth against a malformed/crafted value getting persisted
@@ -2151,14 +2198,18 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
     }
 
     // GET /api/config — returns current CLAUDE_MODEL, CODEX_MODEL, and TASK_AGENT (project config wins over hard default)
+    // (TPT9212) A model the project never set reports the hard default its task launches fall
+    // back to (resolveSpawnModel(): 'opusplan', and '' = no --model flag for Codex), not the
+    // in-memory singleton: that holds the startup project's value and whatever any window last
+    // POSTed, so a new project would show another project's default as its own.
     if (req.method === 'GET' && urlPath === '/api/config') {
       // C1124 — header-scoped root, see POST /api/project-config above.
       const projectRoot = req.headers['x-tipatask-project'] || config.PROJECT_ROOT;
       const cfg = readProjectConfig(projectRoot) || {};
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       return res.end(JSON.stringify({
-        CLAUDE_MODEL: cfg.CLAUDE_MODEL !== undefined ? cfg.CLAUDE_MODEL : (config.CLAUDE_MODEL || 'opusplan'),
-        CODEX_MODEL: cfg.CODEX_MODEL !== undefined ? cfg.CODEX_MODEL : (config.CODEX_MODEL || ''),
+        CLAUDE_MODEL: cfg.CLAUDE_MODEL !== undefined ? cfg.CLAUDE_MODEL : 'opusplan',
+        CODEX_MODEL: cfg.CODEX_MODEL !== undefined ? cfg.CODEX_MODEL : '',
         TASK_AGENT: cfg.TASK_AGENT || config.TASK_AGENT || 'claude',
       }));
     }
@@ -3324,9 +3375,9 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
 
       // (TPT9161) Cowboy-coding mode — same boolean shape as claude_design_mode. The API keeps it
       // only while the task's effective permission mode is bypass and stores false otherwise.
-      if (cowboy_mode !== undefined && cowboy_mode !== null && typeof cowboy_mode !== 'boolean') {
+      if (!require('../cowboy-mode.mjs').isCowboyScopeInput(cowboy_mode)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'cowboy_mode must be a boolean' }));
+        return res.end(JSON.stringify({ error: 'cowboy_mode must be disabled, related, or project' }));
       }
 
       // C1165: chat-driven-edit opt-in flag — not a field to persist, so it does NOT
@@ -3358,8 +3409,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         // C1165: objective-chat's absent-target PATCH fallback (buildModifiedTaskPatch)
         // sets this flag instead of a status when the proposal carried none — reopen a
         // completed/canceled target to in_progress. Runs before updateTask so the reopen
-        // persists in the same PATCH; postDeviceSession below keys off the request's own
-        // `status` const (still undefined here), so a reopen never claims a device session.
+        // persists in the same PATCH. Device attribution belongs only to a live PTY.
         if (reopen_if_closed === true) await applyReopenToPatch(backend, id, updateFields, 'chat-patch');
         // TPT623: client-only directive from the Task App edit modal — register unknown tags
         // with an LLM-written description instead of failing. Never a task field.
@@ -3368,7 +3418,6 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
           res.writeHead(404, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ error: `Task ${id} not found` }));
         }
-        if (status === statusRoles.in_progress) postDeviceSession(id, backend); // C1184
         // (C1259) The online path (api-backend.js's _rawUpdateTask) already returns the
         // full, freshly-joined row — a second GET here
         // was a second serial WAN round-trip for data the PATCH response already had,
@@ -4174,11 +4223,9 @@ h1{font-size:1.15rem;margin:0 0 12px}p{margin:0 0 8px;color:#4c4f69}ul{padding-l
       // No Electron parent (standalone `node todo-server.js`) — best-effort only, no
       // project-id/account verification possible since this process can't ask main for a
       // path. Redirect into whatever project THIS server instance is already bound to.
-      // (C1559) objectivePlan=1 always — the standalone fallback has no way to tell
-      // whether the clicked task has children, so it degrades to the planning branch
-      // unconditionally (same "dev-only, best-effort" scope this fallback has always had).
+      // The standalone development fallback starts the task in its own terminal too.
       if (!process.send || !registryOps || typeof registryOps.resolveProjectPathViaMain !== 'function') {
-        res.writeHead(302, { Location: `/todo.html?objectiveTask=${encodeURIComponent(taskKey)}&objectivePlan=1` });
+        res.writeHead(302, { Location: `/todo.html?startTask=${encodeURIComponent(taskKey)}` });
         return res.end();
       }
 
@@ -4228,32 +4275,8 @@ h1{font-size:1.15rem;margin:0 0 12px}p{margin:0 0 8px;color:#4c4f69}ul{padding-l
         // not a hard stop. Unassigned tasks (assignee == null) never warn.
         const warning = task.assignee != null && String(task.assignee) !== String(userId);
 
-        // (C1559) Dispatch on the task's shape — getTask() carries no children_count (only
-        // the list route's rollup does, see api-backend.js _mapRawTasks), so a real
-        // getChildren() call is the only way to know. unscoped:true so a teammate-owned
-        // child still counts (this is a cross-account handoff, not a board render).
-        const children = await targetBackend.getChildren(taskKey, { unscoped: true }).catch(() => []);
-
-        if (task.isObjective && children.length === 0) {
-          // Branch 1: childless objective → origin-linked planning chat. title/description
-          // (TPT16) forward the task this route already fetched above so the renderer's
-          // seedObjectiveFromTask() can build the composer seed without a second
-          // GET /api/tasks/:id round trip.
-          const sent = registryOps.sendOpenObjective(projectPath, taskKey, { warning, originTaskKey: taskKey, title: task.title, description: task.description });
-          if (!sent) {
-            return noticePage('TipΔTask is not running',
-              '<p>Could not reach the TipΔTask desktop app on this machine. Make sure it is running, then try again.</p>');
-          }
-          return noticePage('Opened in TipΔTask',
-            `<p>${escapeHtml(task.title || taskKey)} is now open in the TipΔTask desktop app. You can close this tab.</p>${warning ? '<p><em>Note: this task is not assigned to you.</em></p>' : ''}`);
-        }
-
-        // Branch 2 (is_objective WITH children) and branch 3 (regular task): start a
-        // terminal session. Both go through sendStartTask — branch 2 carries the fetched
-        // children so the renderer (which alone holds the live board status map
-        // isDepsBlocked() needs) can pick the first startable one; branch 3 carries none,
-        // which the 'start-task' IPC listener reads as "start taskKey itself".
-        const sent = registryOps.sendStartTask(projectPath, taskKey, { children: task.isObjective ? children : [] });
+        // Every task, including a parent objective, starts its own configured terminal.
+        const sent = registryOps.sendStartTask(projectPath, taskKey, { children: [] });
         if (!sent) {
           return noticePage('TipΔTask is not running',
             '<p>Could not reach the TipΔTask desktop app on this machine. Make sure it is running, then try again.</p>');
@@ -4332,7 +4355,7 @@ function sessKey(id, projectPath) {
 // `session.ws`, and a session whose socket is gone is simply left running unattached, exactly
 // like one minimized after start.
 async function launchNewTerminalSession(ctx) {
-  const { session, prompt, taskId, sessionKey, sessions, backend, projectPath, initialCols, initialRows, _piModelParam, cowboyChain = false, env, launchModel = '' } = ctx;
+  const { session, prompt, taskId, sessionKey, sessions, backend, projectPath, initialCols, initialRows, _piModelParam, cowboyChain = false, cowboyScope, cowboyContext, objectiveChain, env, launchModel = '', beforeSpawn, remoteStart } = ctx;
   detachQueuedClient(session);
   let ws = session.ws && session.ws.readyState === session.ws.OPEN ? session.ws : null;
   try {
@@ -4384,19 +4407,28 @@ async function launchNewTerminalSession(ctx) {
         } catch { /* ignore — tags, discovery, and model fall back to empty/false/config default */ }
       }
       // C1408 — must start blocking; a caught EASSIGNEE below cancels the whole start.
-      const _me = await assertTaskStartable(backend, taskId, _task);
-      _task = await claimUnassignedTaskOnStart(backend, taskId, _task, _me, projectPath);
+      beforeSpawn?.();
+      if (!remoteStart) {
+        // Local starts retain their deliberate offline policy. Remote admission uses
+        // a fresh identity and task check, then an atomic claim at the final PTY gate.
+        const _me = await assertTaskStartable(backend, taskId, _task);
+        _task = await claimUnassignedTaskOnStart(backend, taskId, _task, _me, projectPath);
+      }
       // C1122 — _piModelParam prefixed so the validated launch-time pick survives even
       // when the getTask() try/catch above swallowed an error before _taskModel was set.
       // (TPT9162) cowboyChain + env (TIPATASK_COWBOY_TOKEN) come only from startChainedTaskSession(),
       // (TPT9194) as does launchModel: the model a chained start inherited, ahead of the row's.
-      await spawnTerminal(session, prompt, taskId, taskTags, { sessions, initialCols, initialRows, backend, model: _piModelParam || launchModel || _taskModel, discovery, designMode: _designMode, task: _task, cowboyChain, env });
+      await spawnTerminal(session, prompt, taskId, taskTags, { sessions, initialCols, initialRows, backend, model: _piModelParam || launchModel || _taskModel, discovery, designMode: _designMode, task: _task, cowboyChain, cowboyScope, cowboyContext, objectiveChain, env, beforeSpawn,
+        authorizeRemoteStart: remoteStart && (async spec => {
+          const current = await remoteStart.check({ claim: true, spawnEnv: spec.env });
+          websocket.emitTaskUpdated(current, { assigneeChanged: true }, projectPath);
+          return remoteStart.authorizeLaunch();
+        }) });
       if (session.alive) forgetLostSession(taskId, projectPath || config.PROJECT_ROOT, config.USER_DATA_ROOT);
       if (session._terminated || sessions.get(sessionKey) !== session) {
         try { ws && ws.close(); } catch { /* already closed */ }
         return;
       }
-      postDeviceSession(taskId, backend);
       await _syncAgentAssignee(backend, taskId, session.taskAgent);
       _recordLastUsedAgent(session);
       if (session._terminated || sessions.get(sessionKey) !== session) {
@@ -4406,7 +4438,7 @@ async function launchNewTerminalSession(ctx) {
     } catch (err) {
       if (err.code === 'ETERMINATED') {
         try { ws && ws.close(); } catch { /* already closed */ }
-        sessions.delete(sessionKey);
+        if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
         if (!ws) broadcastSessionEnded(taskId, session, 'start-failed');
         return;
       }
@@ -4414,10 +4446,12 @@ async function launchNewTerminalSession(ctx) {
       // invalid API_TOKEN) and ESTART all end the same way. (TPT9014) With no socket attached —
       // a queued start drained after its headless Play All / bulk Start socket closed — the
       // frame rides the session-ended broadcast instead, so the board can still report it.
+      session._startError = err;
+      terminalEvents.emit('state', session, 'exited');
       const frame = startFailureFrame(err, session);
       _sendIfOpen(ws, frame);
       try { ws && ws.close(); } catch { /* already closed */ }
-      sessions.delete(sessionKey);
+      if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
       if (!ws) {
         console.warn(`[terminal] Queued start of ${taskId} failed: ${err.message}`);
         broadcastSessionEnded(taskId, session, 'start-failed', frame);
@@ -4440,6 +4474,119 @@ function hasLiveTerminal(session) {
   return !!session && (session.alive || session._starting || session._launching || session._queued);
 }
 
+// Relay ownership checks complement the normal start queue, assignee, credential,
+// permission-mode, agent and live VCS gates. Remote clients never supply a path or prompt.
+async function handleRemoteSessionCommand(command, context, { sessions, registryOps = null,
+  availableAgents = getAvailableAgents, launch = launchNewTerminalSession } = {}) {
+  const { session, isCurrent } = context;
+  if (!isCurrent()) return { ok: false, code: 'remote_control_disabled' };
+  if (command.action === 'attach') return context.attach();
+  if (command.action === 'detach') { context.detach(); return; }
+  if (command.action === 'input') { handleTerminalInput(session, command.data); return; }
+  if (command.action === 'approve') {
+    const request = require('./device-relay').remoteApprovalRequest(session);
+    if (!request || request.id !== command.request_id || typeof command.allow !== 'boolean') return { ok: false, code: 'approval_stale' };
+    if (request.kind === 'tool') {
+      return session._permissionGate.answer(request.id, command.allow) ? { ok: true } : { ok: false, code: 'approval_stale' };
+    }
+    if (!command.allow) return { ok: false, code: 'approval_stale' };
+    approvePlan(session);
+    return session.terminalPhase === 'executing' ? { ok: true } : { ok: false, code: 'approval_stale' };
+  }
+  if (command.action === 'resize') {
+    if (session.alive && session.pty) {
+      session.cols = command.cols; session.rows = command.rows;
+      session.pty.resize(command.cols, command.rows);
+    }
+    return;
+  }
+  if (command.action === 'stop') {
+    const entry = [...sessions].find(([, candidate]) => candidate === session);
+    if (!entry) return { ok: false, code: 'session_not_found' };
+    terminateTerminalSession(session, session.taskId, entry[0], sessions, 'remote-stop', { backend: session.backend });
+    return { ok: true, local_id: command.local_id };
+  }
+  if (command.action !== 'start') return { ok: false, code: 'invalid_command' };
+  const { project } = context;
+  if (!isValidTaskKey(command.task_key)) return { ok: false, code: 'task_not_found' };
+  const taskId = command.task_key;
+  const projectPath = project.projectPath;
+  const backend = project.backend;
+  const sessionKey = sessKey(taskId, projectPath);
+  // Reserve before the first await. Task dedupe survives an API relay restart.
+  const existing = [...sessions.values()].find(s => s.taskId === taskId && hasLiveTerminal(s)
+    && (s.projectPath === projectPath || (() => {
+      try { const c = s.backend.getCredentials(); return c.baseUrl === project.baseUrl && Number(c.projectId) === project.projectId; }
+      catch { return false; }
+    })()));
+  if (existing) return { ok: false, code: 'already_running', local_id: runId(existing) };
+  const next = createSession(null, false, taskId, projectPath);
+  next.projectPath = projectPath;
+  next.taskId = taskId;
+  next.startOrigin = WEB_ORIGIN; // (TPT9239) shown as a web run in this device's Task App
+  next._starting = true;
+  runId(next);
+  sessions.set(sessionKey, next);
+  wireSessionLifecycle(next, taskId, backend, { sessions, sessionKey });
+  const beforeSpawn = () => {
+    if (!isCurrent() || next._terminated || sessions.get(sessionKey) !== next) {
+      throw Object.assign(new Error('Remote control authorization ended'), { code: 'remote_control_disabled' });
+    }
+  };
+  try {
+    if (typeof context.authorizeStart !== 'function') throw Object.assign(new Error('Remote start authorization unavailable'), { code: 'EAUTH' });
+    context.onCancel?.(() => {
+      if (!next.alive && sessions.get(sessionKey) === next) {
+        terminateTerminalSession(next, taskId, sessionKey, sessions, 'remote-start-cancelled', { backend });
+      }
+    });
+    const remoteStart = require('./remote-start-guard').createRemoteStartGuard({ backend, project, taskId, isCurrent: beforeSpawn });
+    remoteStart.authorizeLaunch = context.authorizeStart;
+    const task = await remoteStart.check();
+    const agent = command.agent || task.agentAssignee || next.taskAgent;
+    if (!['claude', 'codex', 'pi'].includes(agent) || !(await availableAgents(configForProject(projectPath))).includes(agent)) {
+      throw Object.assign(new Error('Agent unavailable'), { code: 'agent_unavailable' });
+    }
+    beforeSpawn();
+    if (agent === 'pi' && require('./image-task').resolveImageEntry(projectPath, task.piModel, task)) {
+      throw Object.assign(new Error('Image task requires desktop'), { code: 'task_not_startable' });
+    }
+    const chosen = getTaskAgentInfo(agent);
+    next.taskAgent = chosen.id; next.taskAgentLabel = chosen.label; next.planApprovalCommand = chosen.approvalCommand;
+    if (registryOps?.broadcastAttentionFor) next.onAttentionNeeded = detail => registryOps.broadcastAttentionFor(sessionKey, detail);
+    if (registryOps?.broadcastAttentionCleared) next.onAttentionCleared = () => registryOps.broadcastAttentionCleared(sessionKey);
+    context.report(next);
+    // (TPT9239) The run is in the session map now: this device's Task App windows list it.
+    broadcastWebSessionState(next, 'starting');
+    const prompt = `Work on task ${taskId}: ${task.title}. ${task.description || ''}`;
+    const admitted = sessionQueue.submit({ key: sessionKey, session: next, taskId,
+      start: async () => {
+        await launch({ session: next, prompt, taskId, sessionKey, sessions, backend, projectPath,
+          initialCols: 120, initialRows: 40, _piModelParam: '', remoteStart, beforeSpawn: remoteStart.assertCurrent });
+        context.finish?.(next.alive ? { ok: true, local_id: runId(next) }
+          : remoteStartFailure(next._startError));
+      } });
+    if (admitted.queued) next._starting = false;
+    else {
+      await admitted.done;
+      if (next._startError) throw next._startError;
+      if (!next.alive) throw Object.assign(new Error('Terminal did not start'), { code: 'start_failed' });
+    }
+    return { ok: true, local_id: runId(next), ...(admitted.queued ? { code: 'queued' } : {}) };
+  } catch (err) {
+    if (sessions.get(sessionKey) === next && !next.alive) sessions.delete(sessionKey);
+    next._starting = false;
+    terminalEvents.emit('state', next, 'exited');
+    broadcastWebSessionState(next, 'exited');
+    return remoteStartFailure(err);
+  }
+}
+
+function remoteStartFailure(err) {
+  const codes = { EASSIGNEE: 'task_assigned_to_other_member', ECLAIM: 'task_claim_failed', EAUTH: 'authentication_required' };
+  return { ok: false, code: codes[err?.code] || (/^[a-z0-9_]{1,64}$/.test(err?.code || '') ? err.code : 'start_failed') };
+}
+
 // (TPT9162) One cowboy-chain start (terminal-session.js launchCowboyChain()), with no socket: the
 // session setup handleConnection()'s "Spawn new session" branch does for a Start — launch.agent
 // ((TPT9194) the finished run's agent, else the task's own) when it is available (else the project
@@ -4455,6 +4602,11 @@ async function startChainedTaskSession(launch, { sessions, backend, projectPath 
   const sessionKey = sessKey(taskId, projectPath);
   if (hasLiveTerminal(sessions.get(sessionKey))) return false;
   const session = createSession(null, false, taskId, projectPath);
+  // Keep the chain identity while admission queues this fresh session.
+  session.cowboyScope = require('../cowboy-mode.mjs').normalizeCowboyScope(launch.objectiveChain ? 'disabled' : launch.cowboyScope ?? true);
+  session.cowboyChain = session.cowboyScope !== 'disabled';
+  session.cowboyContext = launch.cowboyContext ? { ...launch.cowboyContext } : null;
+  session.objectiveChain = launch.objectiveChain ? { ...launch.objectiveChain } : null;
   if (projectPath) session.projectPath = projectPath;
   if (typeof registryOps?.broadcastAttentionFor === 'function') {
     session.onAttentionNeeded = (detail) => registryOps.broadcastAttentionFor(sessionKey, detail);
@@ -4489,7 +4641,7 @@ async function startChainedTaskSession(launch, { sessions, backend, projectPath 
   sessions.set(sessionKey, session);
   wireSessionLifecycle(session, taskId, backend, { sessions, sessionKey });
   const launchCtx = { session, prompt: launch.prompt, taskId, sessionKey, sessions, backend, projectPath,
-    initialCols: 0, initialRows: 0, _piModelParam: '', cowboyChain: launch.cowboyChain === true, env: launch.env, launchModel };
+    initialCols: 0, initialRows: 0, _piModelParam: '', cowboyChain: launch.cowboyChain === true, cowboyScope: launch.cowboyScope, cowboyContext: launch.cowboyContext, objectiveChain: launch.objectiveChain, env: launch.env, launchModel };
   const admitted = sessionQueue.submit({ key: sessionKey, session, taskId, start: () => launchNewTerminalSession(launchCtx) });
   if (!admitted.queued) {
     Promise.resolve(admitted.done).catch(err => console.warn(`[cowboy] ${taskId}: start failed: ${err.message}`));
@@ -4683,10 +4835,13 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     const _boardSel = _boardVisibleProviders.length
       ? clampSelectionToProviders(currentSelection(null, _boardCfg), _boardVisibleProviders)
       : null;
+    const _boardOwnDevice = boardDeviceId(backend); // (TPT9220) looked up alongside the user id
+    releaseStaleClaims(backend); // (TPT9223) as GET /api/agent-config does; never awaited
     let currentUserId = null;
     if (config.TASK_BACKEND === 'api') {
       try { currentUserId = (await backend.getCurrentUserId()) ?? null; } catch { currentUserId = null; }
     }
+    const _boardDeviceId = await _boardOwnDevice;
     // (C1137) Per-connection, not process-global config.projectName — a second Electron window
     // on the same forked server serves a different projectPath (same lesson as C1124).
     const _boardProjectName = (projectPath ? (readProjectConfig(projectPath) || {}).projectName : config.projectName) || '';
@@ -4705,7 +4860,8 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
       // negative. See base-agent.js peekDetect().
       availableAgents: getAvailableAgentsPeek(_boardCfg),
       agentStatuses: listTaskAgentStatusesPeek(config),
-      deviceId: config.DEVICE_ID,
+      // (TPT9220) The device this machine's runs are attributed to, not the legacy DEVICE_ID.
+      deviceId: _boardDeviceId,
       deviceName: config.DEVICE_NAME,
       avatarUrl: config.USER_AVATAR_URL,
       projectName: _boardProjectName,
@@ -5549,7 +5705,21 @@ function wireSessionLifecycle(session, taskId, backend, { sessions, sessionKey, 
   // and per-project (Electron multi-window) sessions need their own backend.
   session.taskId = taskId;
   session.backend = backend;
+  // Reattaching after an account switch must never transfer ownership of a live run.
+  if (session._relayOwner === undefined) captureSessionOwner(session, backend);
   session.onSlotFreed = drainSessionQueue; // (TPT444) pty exit frees a start slot
+  // (TPT9239) A web-started run also tells this device's Task App windows (no-op for other runs).
+  session.onProcessStarted = () => {
+    const claim = postDeviceSession(session, taskId, backend);
+    broadcastWebSessionState(session, 'running');
+    return claim;
+  };
+  session.onProcessExited = () => {
+    const release = deleteDeviceSession(session);
+    broadcastWebSessionState(session, 'exited');
+    return release;
+  };
+  session.onLocalViewerChanged = () => terminalEvents.emit('local', session);
   session.onTokensReady = (tokens) => {
     backend.addTokenUsage(taskId, tokens).catch(err =>
       console.error(`[ws] Failed to persist tokens for ${taskId}:`, err.message));
@@ -5653,6 +5823,8 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
     showAiStats: config.SHOW_AI_STATS,
     taskAgent: taskAgent.id,
     taskAgentLabel: taskAgent.label,
+    // (TPT9239) Present only for a run the web app started; the terminal header shows a globe.
+    ...(session.startOrigin ? { origin: session.startOrigin } : {}),
     agentLabels: _agentLabels(),
     planApprovalCommand: taskAgent.approvalCommand,
     supportsPlanMode: session._imageOperation ? false : taskAgent.supportsPlanMode,
@@ -5672,6 +5844,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
     emitPermissionModeState(session);
   }
   wireSessionLifecycle(session, taskId, backend, { sessions, sessionKey });
+  session.onLocalViewerChanged?.();
   ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
@@ -5901,7 +6074,6 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
                 try { ws.close(); } catch { /* already closed */ }
                 return;
               }
-              postDeviceSession(taskId, backend);
               await _syncAgentAssignee(backend, taskId, session.taskAgent);
               _recordLastUsedAgent(session);
               if (session._terminated || sessions.get(sessionKey) !== session) {
@@ -6372,9 +6544,15 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       }
 
     } else if (msg.type === 'data' && typeof msg.data === 'string') {
-      handleTerminalInput(session, msg.data);
+      if (session.ws === ws) {
+        // (TPT9273) Keys and pastes take keyboard control back from a web viewer; what the
+        // terminal sends by itself (focus, mouse and query reports) still reaches the agent but
+        // never moves control.
+        if (!isTerminalReport(msg.data)) terminalEvents.emit('local', session);
+        handleTerminalInput(session, msg.data);
+      }
     } else if (msg.type === 'resize' && msg.cols && msg.rows) {
-      if (session.type !== 'objective' && session.alive && session.pty) {
+      if (session.ws === ws && session.type !== 'objective' && session.alive && session.pty) {
         session.cols = Math.max(1, msg.cols);
         session.rows = Math.max(1, msg.rows);
         session.pty.resize(session.cols, session.rows);
@@ -6537,9 +6715,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
     console.log(`[terminal] Client detached from task ${taskId}`);
     const isCurrentWs = session.ws === ws;
     if (session.ws === ws) session.ws = null;
-    if (isCurrentWs && !isAgentChatType(session.type) && !isAgentChatId(taskId)) {
-      deleteDeviceSession(taskId, backend);
-    }
+    if (isCurrentWs) session.onLocalViewerChanged?.();
     if (session.pending) {
       // Only its own entry: a newer connect may already have replaced this pending session, and
       // deleting that one would leave its Start with no session to run in.
@@ -6603,4 +6779,6 @@ module.exports = {
   terminateTerminalSession,
   // (TPT9162) Exported for unit testing — see cowboy-chain-route.test.js.
   startChainedTaskSession,
+  handleRemoteSessionCommand,
+  setDeviceIdentity, // (TPT9220) index.js hands over the relay's device identity
 };

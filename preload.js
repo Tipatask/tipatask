@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectFolder: () => inv('dialog:selectFolder'),
   getCurrentProject: () => inv('project:get-current'),
   onProjectChanged: (cb) => ipcRenderer.on('project:changed', (_, dir, name, contextChanged) => cb(dir, name, contextChanged)),
+  onRemoteControlChanged: (cb) => ipcRenderer.on('project:remote-control-changed', () => cb()),
   // (C1389, payload widened C1559/TPT16) Web→Task App handoff, planning branch — main.js's
   // focusAndSeedObjective() pushes this after /start-task (server child) has fully
   // validated project+account+task and main has focused/created the window. Payload:
@@ -245,7 +246,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
     project: {
       config: () => inv('api:project.config'),
-      mergeConfig: (partial) => inv('api:project.mergeConfig', { partial }),
+      mergeConfig: (partial, expectedProjectPath) => inv('api:project.mergeConfig', { partial, expectedProjectPath }),
+      setRemoteControl: (enabled, context, expectedProjectPath) => inv('api:project.setRemoteControl', { enabled, context, expectedProjectPath }),
       // (C1124) One atomic TASK_AGENT/AVAILABLE_AGENTS/PI_MODELS/CLAUDE_MODEL/CODEX_MODEL
       // write from the Settings "Edit Agents" modal — see agents-modal.js.
       saveAgents: (selection) => inv('api:project.saveAgents', { selection }),

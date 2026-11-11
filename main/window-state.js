@@ -96,6 +96,18 @@ function _getOrCreateBackend(projectPath, projectCfg) {
 let _sendToServer = null;
 function setServerMessenger(fn) {
   _sendToServer = fn;
+  // A restored window may already be bound when the server becomes available.
+  for (const projectPath of new Set([..._windows.values()].map(entry => entry.projectPath).filter(Boolean))) {
+    notifyProjectConfigChanged(projectPath);
+  }
+}
+
+function notifyProjectConfigChanged(projectPath) {
+  try { _sendToServer?.({ type: 'project:config-changed', projectPath }); } catch { /* the server also polls local config */ }
+  for (const wcId of _windows.keys()) {
+    // Reload each window's own scope, including aliases of the same physical checkout.
+    try { require('electron').webContents.fromId(wcId)?.send('project:remote-control-changed'); } catch { /* window closed */ }
+  }
 }
 
 // TEST SEAM (C1323) — lets src/server/window-state-kb-sync.test.js observe *that* a bind
@@ -223,6 +235,9 @@ function bindWindowToProject(webContentsId, projectPath) {
     : null;
 
   _windows.set(webContentsId, { projectPath, config: cfg, backend, unsubscribe });
+  // Electron reads tasks through IPC and never calls the browser's /api/project-switch.
+  // Tell the fork about this project even before it opens a board or terminal socket.
+  notifyProjectConfigChanged(projectPath);
   (_kbSyncScheduler || _fireKbSync)(projectPath);
 }
 
@@ -316,4 +331,4 @@ function _cachedBackendPathsForTest() {
   return [..._backendCache.keys()];
 }
 
-module.exports = { bindWindowToProject, getWindowState, dropWindow, reconfigureWindowBackend, setServerMessenger, setKbSyncScheduler, _sweepBackendsForTest, _cachedBackendPathsForTest };
+module.exports = { bindWindowToProject, getWindowState, dropWindow, reconfigureWindowBackend, setServerMessenger, notifyProjectConfigChanged, setKbSyncScheduler, _sweepBackendsForTest, _cachedBackendPathsForTest };

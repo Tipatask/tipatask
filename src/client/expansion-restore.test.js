@@ -415,7 +415,47 @@ test('an open card moved into a folded sprint unfolds it at once; a plain move s
   assert.equal(tier(2).classList.contains('no-transition'), false);
 });
 
-test('an open card patched off the board closes cleanly: no placeholder, backdrop or scroll lock', () => {
+for (const hoverFirst of [false, true]) {
+  test(`board focus keeps page scrolling through selection, switching and clearing (hover first: ${hoverFirst})`, () => {
+    render([task('A1', { dependencies: ['A2'] }), task('A2'), task('A3')]);
+    if (hoverFirst) api.cards.expandCard(card('A1'), 'hover');
+    card('A1').querySelector('.card-title').click();
+    assert.equal(api.state.selectedCardId, 'A1');
+    assert.equal(api.state.expandedCardMode, 'pinned');
+    assert.deepEqual([...app.querySelectorAll('.chain-hl')].map(el => el.dataset.id), ['A1', 'A2']);
+    assert.equal(document.documentElement.style.overflowY, '', 'highlighted predecessors stay reachable');
+    assert.equal(document.body.style.paddingRight, '', 'board scrollbar keeps its gutter');
+
+    card('A2').querySelector('.card-title').click();
+    assert.equal(api.state.selectedCardId, 'A2');
+    assert.deepEqual([...app.querySelectorAll('.chain-hl')].map(el => el.dataset.id), ['A2']);
+    assert.equal(document.documentElement.style.overflowY, '', 'a task with no predecessors also keeps scrolling');
+    assert.equal(document.body.style.paddingRight, '');
+
+    document.querySelector('.card-overlay-backdrop').click();
+    assert.equal(api.state.selectedCardId, null);
+    assert.equal(app.querySelector('.chain-hl'), null);
+    assert.equal(app.querySelector('.card-expanded'), null);
+    assert.equal(document.documentElement.style.overflowY, '');
+  });
+}
+
+for (const proposal of [null, {}]) for (const hoverFirst of [false, true]) {
+  test(`preview focus still locks page scrolling (proposal: ${!!proposal}, hover first: ${hoverFirst})`, () => {
+    app.innerHTML = api.cards.renderCard(task('A1'), { preview: true, proposal });
+    api.cards.setupCardInteractions(app);
+    const preview = app.querySelector('.card--preview');
+    if (hoverFirst) api.cards.expandCard(preview, 'hover');
+    preview.querySelector('.card-title').click();
+    assert.equal(api.state.expandedCardMode, 'pinned');
+    assert.equal(document.documentElement.style.overflowY, 'hidden');
+    document.querySelector('.card-overlay-backdrop').click();
+    assert.equal(document.documentElement.style.overflowY, '');
+    assert.equal(document.body.style.paddingRight, '');
+  });
+}
+
+test('an open card patched off the board closes cleanly: no placeholder or backdrop', () => {
   const leaves = {
     'backlog move': () => assert.equal(api.cards.applyTaskPatch(task('A1', { priority: 0 })), 'removed'),
     'task:deleted': () => assert.equal(api.cards.removeCardFromDom('A1'), true),
@@ -424,7 +464,7 @@ test('an open card patched off the board closes cleanly: no placeholder, backdro
     mountBoard({ 1: [task('A1'), task('A2')] });
     api.cards.expandCard(card('A1'), 'pinned');
     api.state.selectedCardId = 'A1';
-    assert.equal(document.documentElement.style.overflowY, 'hidden');
+    assert.equal(document.documentElement.style.overflowY, '', 'board focus leaves page scrolling enabled');
     leave();
     assert.ok(!card('A1'), `${name}: off the board`);
     assert.equal(document.querySelectorAll('.card-placeholder').length, 0, `${name}: placeholder`);

@@ -71,8 +71,9 @@ function mockStartPath(t, { defaultAgent = 'codex', available = ['claude', 'code
     const agent = getTaskAgent(id);
     t.mock.method(agent, 'cachedDetect', async () => ({ id, available: available.includes(id) }));
     t.mock.method(agent, 'getPermissionVersion', async () => versions[id]);
+    t.mock.method(agent, 'detectComputerUse', async () => null); // (TPT9225) never the real CLI bundle probe
     t.mock.method(agent, 'getSpawnSpec', async (cfg, prompt, taskId, opts) => {
-      specs.push({ agent: id, taskId, prompt, model: opts.model, cowboyChain: opts.cowboyChain });
+      specs.push({ agent: id, taskId, prompt, model: opts.model, cowboyChain: opts.cowboyChain, agentSessionId: opts.agentSessionId });
       return { command: id, args: [], cwd: root, env: { PATH: process.env.PATH }, model: opts.model || '' };
     });
   }
@@ -199,7 +200,7 @@ test('a none answer lists each dependent and sprint candidate with its reason', 
     row('TPT4', { assignee: 2 }),
     row('TPT5', { status: 'completed' }), // closed: no candidate
     row('TPT6', { agentAssignee: 'human' }),
-    row('TPT7', { priority: 6 }), // another sprint
+    row('TPT7', { priority: 6, status: 'completed' }), // another sprint
     row('TPT9', { status: 'in_progress', priority: 4 }),
   ]);
   const handler = createHttpHandler(sessions, () => backend, { getBackendForPath: () => backend });
@@ -224,15 +225,15 @@ test('a none answer lists each dependent and sprint candidate with its reason', 
 
 // (TPT9194) A Claude run chains into Claude sessions on its own model, even for a task with no
 // agent of its own in a project whose default agent is Codex; each task is saved with those settings.
-test('a decision starts each task through the Start path with the finished run\'s agent and model', async t => {
+for (const scope of ['related', 'project']) test('a decision starts each task through the Start path with the finished run\'s agent and model: ' + scope, async t => {
   const { root, specs, envs, settle } = mockStartPath(t, { defaultAgent: 'codex' });
   const tasks = [
-    row('TPT1', { status: 'completed' }),
+    row('TPT1', { status: 'completed', cowboyMode: scope }),
     row('TPT2', { dependencies: ['TPT1'], agentAssignee: null, claudeModel: null, order: 1 }),
     row('TPT3', { dependencies: ['TPT1'], agentAssignee: 'codex', codexModel: 'gpt-5.5-codex', claudeModel: 'unused', order: 2 }),
   ];
   const backend = backendFor(tasks);
-  const sessions = new Map([[`TPT1\0${root}`, finishedRun('TPT1', root, 'tok', { taskAgent: 'claude', taskAgentModel: 'claude-opus-5-5' })]]);
+  const sessions = new Map([[`TPT1\0${root}`, finishedRun('TPT1', root, 'tok', { taskAgent: 'claude', taskAgentModel: 'claude-opus-5-5', cowboyScope: scope, cowboyContext: { originTaskId: 'TPT1', originSprint: 5, sprint: 5, order: 0 } })]]);
   const handler = createHttpHandler(sessions, () => backend, { getBackendForPath: () => backend });
   const call = async () => {
     const req = { method: 'POST', url: '/api/tasks/TPT1/cowboy-next', headers: { host: '127.0.0.1:4455', 'x-tipatask-project': root },
@@ -249,16 +250,21 @@ test('a decision starts each task through the Start path with the finished run\'
   await settle(2);
   assert.deepEqual(specs.map(s => [s.taskId, s.agent, s.model, s.cowboyChain]).sort(),
     [['TPT2', 'claude', 'claude-opus-5-5', true], ['TPT3', 'claude', 'claude-opus-5-5', true]]);
+  assert.equal(new Set(specs.map(s => s.agentSessionId)).size, 2, 'fresh native session id per successor');
+  assert.ok(specs.every(s => s.agentSessionId));
   assert.equal(specs.find(s => s.taskId === 'TPT3').prompt.endsWith('Work on task TPT3: Task TPT3. Do TPT3.'), true);
   for (const key of ['TPT2', 'TPT3']) {
     const session = sessions.get(`${key}\0${root}`);
     assert.equal(session.taskAgent, 'claude');
     assert.equal(session.cowboyChain, true);
+    assert.equal(session.cowboyScope, scope);
+    assert.equal(session.cowboyContext.originTaskId, 'TPT1');
+    assert.equal(session.cowboyContext.originSprint, 5);
     assert.equal(session.alive, true);
     assert.equal(session.permissionPolicy.mode, 'bypass');
     const saved = await backend.getTask(key);
     assert.deepEqual([saved.agentAssignee, saved.claudeModel, saved.agentPermissionMode, saved.cowboyMode],
-      ['claude', 'claude-opus-5-5', 'bypass', true], `get_task ${key} after the chain step`);
+      ['claude', 'claude-opus-5-5', 'bypass', scope], `get_task ${key} after the chain step`);
   }
   assert.equal((await backend.getTask('TPT3')).codexModel, 'gpt-5.5-codex', 'another agent\'s model stays');
   assert.match(envs.get('claude')[COWBOY_URL_ENV], /\/api\/tasks\/TPT[23]\/cowboy-next$/);

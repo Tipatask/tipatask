@@ -154,6 +154,21 @@ test('ensureBundleSignatureHealthy: already-healthy bundle — no cleanup, no re
   assert.equal(result.relaunchNeeded, false);
 });
 
+test('ensureBundleSignatureHealthy preserves a valid Developer ID signature without re-signing', async t => {
+  const bundlePath = await makeBundle();
+  const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tt-developer-id-marker-'));
+  t.after(() => Promise.all([bundlePath, markerDir].map(dir => fs.rm(dir, { recursive: true, force: true }))));
+  const exec = mockExec([{ code: 0, stderr: `${bundlePath}: valid on disk\n${bundlePath}: satisfies its Designated Requirement\n` }]);
+
+  const result = await ensureBundleSignatureHealthy({ bundlePath, version: '1.0.0', markerDir, deps: { exec } });
+
+  assert.deepEqual(result, {
+    valid: true, reason: null, cleaned: [], rescued: [], repaired: false, relaunchNeeded: false,
+  });
+  assert.deepEqual(exec.calls, [{ cmd: 'codesign', args: ['--verify', bundlePath] }]);
+  assert.deepEqual(await fs.readdir(markerDir), [], 'no repair attempt should be recorded');
+});
+
 test('ensureBundleSignatureHealthy: cleanup insufficient (different corruption) — falls through to repair, re-verifies', async () => {
   const bundlePath = await makeBundle({ withStrayFiles: false }); // nothing to clean
   const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tt-c1141-marker-'));

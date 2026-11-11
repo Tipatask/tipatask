@@ -1,33 +1,35 @@
 // ── Task Board rendering, search, and modals ──
 import state from './state.js';
+import { syncTierSelectAll } from './sprint-selection.js';
 import { t, tc, setLocale } from './i18n.js';
 import { queueReasonText } from './queue-reason.js';
 import { startFailureText, refusedStartTasks } from './terminal-frame-text.js';
 import { trackQueuedStart } from './queued-start-rollback.js';
 import { isTaskDiscussing } from './discuss-lock.js';
-import { DRAFT_KEY_TASK, ensureAgentModels, CHAT_BUBBLE_SVG } from './constants.js';
+import { DRAFT_KEY_TASK, ensureAgentModels, agentModelOptions, CHAT_BUBBLE_SVG } from './constants.js';
 import {
   statusNames, statusLabel, statusColor, statusRoleToken, WORKFLOW_COLOR_SWATCHES,
   isActiveName, isClosedName, isInProgressName, isCompleteName, isCanceledName, isStartName,
   startName, inProgressName,
   seedStatuses,
 } from './status-registry.js';
-import { escapeAttr, insertAtCursor, markTruncatedCards, loadDraft, saveDraft, clearDraft, getObjectiveDraftKey, renderMarkdown, renderSprintCombobox, initSprintCombobox, refreshSprintComboboxItems, showToast, showProgressToast, sprintRecordMax, showSavingIndicator, hideSavingIndicator, shortModelName, pushSubtaskCrumb, renderTagBadge } from './utils.js';
+import { escapeAttr, insertAtCursor, setValueKeepingCaret, markTruncatedCards, loadDraft, saveDraft, clearDraft, getObjectiveDraftKey, renderMarkdown, renderSprintCombobox, initSprintCombobox, refreshSprintComboboxItems, showToast, showProgressToast, sprintRecordMax, showSavingIndicator, hideSavingIndicator, shortModelName, pushSubtaskCrumb, renderTagBadge } from './utils.js';
 import { computeTierWindow, HIDE_CLASS } from './sprint-tier-visibility.js';
 import { isStatusRowChecked } from './status-filter-select.js';
 import { buildWsUrl, terminateTaskSession, resumePausedTaskSession } from './ws-client.js';
-import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, renderEffortBadge, renderMemberBadge, renderSprintBadgeLabel, renderCard, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys, hasTaskSession, deferUntilDragEnds, syncExpandedOverlay } from './task-card.js';
+import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, renderEffortBadge, renderMemberBadge, renderSprintBadgeLabel, renderCard, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys, hasTaskSession, deferUntilDragEnds, syncExpandedOverlay, dependencyKeyMarkup, dependencyKeysMarkup, syncDependencyKeys } from './task-card.js';
 import { buildSubtasksLabel, closedDelta, applyChildStatusDelta, countChildProgress } from './subtask-count.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { createMemberCache } from './member-cache.js';
 import { api, isTransportError, errorDetail } from './api-client.js';
-import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration, dismissTaskNotifications } from './notifications.js';
+import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration, registrationRepairMessage, dismissTaskNotifications } from './notifications.js';
 import { buildDepGraph, collectCycleBlocked } from './dep-graph.js';
 import { tagName } from './tag-match.js';
 import { unregisteredTagNames } from './tag-registration.js';
 import { serializeBoardFilters, sanitizeBoardFilters } from './board-filter-prefs.js';
 import { openAgentsModal } from './agents-modal.js';
 import { activateDialogFocus } from './dialog-focus.js';
+import { initRemoteControlSettings, populateRemoteControlSettings } from './remote-control-settings.js';
 import { voiceModelBadge, applyVoiceModelProgress, voiceModelAction, voiceModelStateLabelKey, voiceModelNeedsDownload, isVoiceInputReady } from './voice-model-state.js';
 import { setVoiceInputAvailability, setVoiceInputDeviceId, isAnyVoiceCaptureActive, attachAudioRecorder, setVoiceShortcut, setVoiceMode, getVoiceMode } from './audio-recorder.js';
 import { filterAudioInputs, labelsUnlocked, buildInputDeviceOptions } from './voice-devices.js';
@@ -37,18 +39,20 @@ import { groupNoun, groupTitle, groupShowMore, groupLoadMore, groupEmpty, groupP
 // The Create header is shared by Objective chat and New Task without a board/chat import cycle.
 import { renderComposerHeader } from './composer-header.js';
 import { showActionConfirm } from './action-confirm.js';
+import { humanInProgressRows } from './human-task-rows.js';
 export { showActionConfirm };
 import { clearAttention, dismissLostSession, mergeSessionsSnapshot, syncAttentionClasses } from './attention-state.js';
 import { syncAllFinishCards } from './task-finish.js';
 import { syncActivityChips } from './task-activity.js';
+import { SESSION_ORIGIN_BADGE } from './session-origin.js';
 import { taskHasNullSprint, tasksForActiveTab, taskHiddenByGrouping, tasksVisibleUnderGrouping } from './board-count-domain.js';
 import { formSprintValue } from './new-task-sprint.js';
 import { VCS_TYPES, VCS_GIT_FLAGS, buildVcsPatchBody } from './vcs-form.js';
 import { shouldTypeToFilter } from './type-to-filter.js';
 import { piTaskModelIds, piOnlyToolLess, piTaskPinHint } from './pi-task-models.js';
-import { hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkDesignMode, bulkPatchBody } from './bulk-changes.js';
+import { hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkModel, stageBulkDesignMode, resolveBulkAgentModel, bulkPatchBody, bulkCowboyBlockedTaskIds } from './bulk-changes.js';
 import { projectPermissionMode, setProjectPermissionMode } from './group-label.js';
-import { buildProjectModeOptions, effectivePermissionMode, permissionModeIcon, permissionModeTip, isAgentPermissionMode } from './permission-mode.js';
+import { buildProjectModeOptions, effectivePermissionMode, permissionModeIcon, permissionModeTip, isAgentPermissionMode, cowboyModeOptions, normalizeCowboyScope } from './permission-mode.js';
 import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
 import { syncAllPermissionButtons } from './task-permission-mode.js';
 import {
@@ -524,7 +528,7 @@ export function renderNewTaskPreviewCard(pt) {
   const status = `<span class="status card-ctl" style="--status-color:${statusColor(task.status)}" data-status-role="${statusRoleToken(task.status)}">${escapeAttr(statusLabel(task.status))}</span>`;
   const sprint = getSprintsEnabled() ? `<span class="step-label card-ctl">${escapeAttr(renderSprintBadgeLabel(task))}</span>` : '';
   const depList = escapeAttr(task.dependencies.join(', '));
-  const deps = task.dependencies.length ? `<span class="preview-deps" title="Deps: ${depList}">Deps: ${depList}</span>` : '';
+  const deps = task.dependencies.length ? `<span class="preview-deps" title="Deps: ${depList}">Deps: ${dependencyKeysMarkup(task.dependencies)}</span>` : '';
   const badges = `${renderEffortBadge(task)}${renderMemberBadge(task)}${renderAgentBadge(task)}`;
   const footHtml = task._sprintMove ? `<div class="preview-sprint-move" role="note">${escapeAttr(t('form.sprintMovedForDep', {
     from: groupTitle(task._sprintMove.from), to: groupTitle(task._sprintMove.to),
@@ -709,11 +713,24 @@ export function renderBoardContent(tierKeys, tiers, sortTierFn, renderCardFn, re
       t => isActiveName(t.status) && !isInProgressName(t.status) && t.category === 'CODING' && !isDepsBlocked(t)
         && canStartTaskCard(t)
     ).length;
-    const playBtn = playableCount > 0 ? `<button class="btn-sprint-play" data-priority="${p}" title="${escapeAttr(tc('board.startTasks', playableCount))}" aria-label="${escapeAttr(t('board.startAllAria', { label: groupTitle(p) }))}"><svg viewBox="0 0 12 12" width="10" height="10" fill="currentColor"><polygon points="3,2 10,6 3,10"/></svg><span class="btn-sprint-play-label">${t('btn.start')}</span></button>` : '';
+    const playBtn = playableCount > 0 ? `<button type="button" class="btn-sprint-play" data-priority="${p}" title="${escapeAttr(tc('board.startTasks', playableCount))}" aria-label="${escapeAttr(t('board.startAllAria', { label: groupTitle(p) }))}"><svg viewBox="0 0 12 12" width="10" height="10" fill="currentColor" aria-hidden="true"><polygon points="3,2 10,6 3,10"/></svg><span class="btn-sprint-play-label">${t('btn.start')}</span></button>` : '';
+    // (TPT9208) Sprint context actions, shaped like a card's .card-btn-group: the round
+    // select-all pill anchors a tray that opens on hover/keyboard focus to reveal Start.
+    // Every nonempty sprint gets the pill, even one with nothing startable (no tray then).
+    // Render-time checked state is a first guess; syncTierSelectAll() (sprint-selection.js)
+    // re-derives it from the filtered DOM after each filter pass and selection change.
+    const tierActions = isEmpty ? '' : (() => {
+      const label = groupTitle(p);
+      const checked = sorted.every(task => state.selectedCardIds.has(task.id));
+      return `<div class="tier-actions" role="group" aria-label="${escapeAttr(t('board.tierActionsMenu', { label }))}">`
+        + `<button type="button" class="btn-tier-select${checked ? ' checked' : ''}" data-priority="${p}" aria-pressed="${checked}" title="${escapeAttr(t('board.selectAll'))}" aria-label="${escapeAttr(t('board.selectAllAria', { label }))}"><span class="select-dot" aria-hidden="true"></span></button>`
+        + (playBtn ? `<div class="tier-action-menu">${playBtn}</div>` : '')
+        + '</div>';
+    })();
     const _tierTitle = _tierTitleFor(p);
     return `
       <div class="tier${isEmpty ? ` ${HIDE_CLASS}` : ''}${isCollapsed ? ' collapsed' : ''}" data-priority="${p}">
-        <div class="tier-label" data-priority="${p}">${_tierTitle}${badge}${doneCheck}${playBtn}</div>
+        <div class="tier-label" data-priority="${p}">${_tierTitle}${badge}${doneCheck}${tierActions}</div>
         <div class="tier-cards">
           ${sorted.map(renderCardFn).join('')}
           <div class="tier-drop-sentinel" aria-hidden="true"></div>
@@ -1068,6 +1085,8 @@ export function applySearchFilter() {
     // it exactly once per render (after this function returns), covering both branches of this
     // function. This branch used to call it AGAIN, a second forced-layout pass over every
     // .card/.preview-card on every render with no active search query.
+    // (TPT9208) Filters change which cards a sprint's select-all covers.
+    syncTierSelectAll();
     // (TPT9024) Last: this pass folds, hides and shows tiers — re-anchor or close an open card.
     syncExpandedOverlay();
     return;
@@ -1108,6 +1127,7 @@ export function applySearchFilter() {
   syncEmptyTierVisibility({ reveal: true }); // (C1578) search/tag path also un-collapses matches
   updateBacklogEmptyState();
   updateShowMoreButton();
+  syncTierSelectAll(); // (TPT9208) same as the no-search branch above
   syncExpandedOverlay(); // (TPT9024) same as the no-search branch above
 }
 
@@ -2555,16 +2575,6 @@ export function updateClaudeButtons() {
   document.querySelectorAll('.btn-claude').forEach(btn => {
     const taskId = btn.dataset.taskId;
     const card = btn.closest('.card');
-    // (C1340) An objective/parent container task never runs in a terminal — same
-    // defensive removal as the human-assignee branch below, for the same reason:
-    // applyTaskPatch()/refreshCard() don't rebuild .controls-row, so a stale
-    // .btn-claude can still be mounted right after an isObjective flip until the
-    // 'reload' it now triggers finishes.
-    if (card?.dataset.objective === '1') {
-      card.querySelector('.btn-terminate')?.remove();
-      btn.remove();
-      return;
-    }
     if (card?.dataset.agentAssignee === 'human') {
       card.querySelector('.btn-terminate')?.remove();
       btn.remove();
@@ -2697,11 +2707,6 @@ export function updateClaudeButtons() {
   document.querySelectorAll('.btn-start-discussion').forEach(btn => {
     const taskId = btn.dataset.taskId;
     const card = btn.closest('.card');
-    // (C1340) Same defensive removal as the .btn-claude loop above.
-    if (card?.dataset.objective === '1') {
-      btn.remove();
-      return;
-    }
     const isActive = state.activeSessions.has(taskId);
     const isExited = state.exitedSessions.has(taskId);
 
@@ -2788,6 +2793,7 @@ export function renderActiveSessionsList(sessions, collapsed) {
       + (s.lost ? ' session-lost' : s.paused ? '' : s.needsAttention ? ' needs-attention' : '')
       + (done ? ' session-completed' : '')
       + (s.paused ? ' session-paused' : '')
+      + (s.webOrigin ? ' session-web-origin' : '')
       + (collapsed ? ' collapsed' : '');
     // Falls back to the bare task key when title is unknown (session's task fell outside the
     // current fetch — subtask drill-in / assignee scoping) so the tooltip never dangles a
@@ -2796,7 +2802,9 @@ export function renderActiveSessionsList(sessions, collapsed) {
     const sessionTip = s.lost ? t('nav.sessionLost', { label: base })
       : s.paused ? t('nav.sessionPaused', { label: base })
         : s.needsAttention ? t('nav.sessionNeedsAttention', { label: base }) : base;
-    const tip = escapeAttr(s.permissionTip ? `${sessionTip}\n${s.permissionTip}` : sessionTip);
+    // (TPT9239) A run the web app started says so on its own line, under the task.
+    const originTip = s.webOrigin ? `\n${t('terminal.webOrigin')}` : '';
+    const tip = escapeAttr(`${sessionTip}${originTip}${s.permissionTip ? `\n${s.permissionTip}` : ''}`);
     // (C1152) Close control — nested <span role="button"> since .active-session-item is
     // itself a <button> (nested <button> invalid HTML). Mirrors .chat-tab-close (chat-ui.js),
     // plus keyboard support that precedent lacks.
@@ -2811,10 +2819,29 @@ export function renderActiveSessionsList(sessions, collapsed) {
     // has a ~1s delay and is reset by every rail repaint.
     return `<button type="button" class="${cls}" data-task-id="${key}" data-tooltip="${tip}" aria-label="${tip}">`
       + (s.permissionIcon ? `<span class="active-session-permission" title="${escapeAttr(s.permissionTip)}">${s.permissionIcon}</span>` : '')
-      + `<span class="active-session-icon">${_sessionAgentIcon(s.agent)}${done ? SESSION_DONE_BADGE : ''}</span>`
+      + `<span class="active-session-icon">${_sessionAgentIcon(s.agent)}${done ? SESSION_DONE_BADGE : ''}${s.webOrigin ? SESSION_ORIGIN_BADGE : ''}</span>`
       + `<span class="active-session-key">${key}</span>`
       + `<span class="active-session-title">${title}</span>`
       + closeBtn
+      + `</button>`;
+  }).join('');
+}
+
+// (TPT9201) One row per in-progress HUMAN task, from humanInProgressRows(): person icon, key and
+// title. No ✕: the row leaves when the task's status does. `collapsed` works as it does in
+// renderActiveSessionsList() above.
+export function renderHumanTaskRows(rows, collapsed) {
+  const list = Array.isArray(rows) ? rows : [];
+  return list.map((row) => {
+    const key = escapeAttr(row.taskId);
+    const tip = escapeAttr(row.title ? t('nav.sessionTooltip', { key: row.taskId, title: row.title }) : String(row.taskId));
+    const cls = 'active-session-item'
+      + (row.isOpen ? ' active' : '')
+      + (collapsed ? ' collapsed' : '');
+    return `<button type="button" class="${cls}" data-task-id="${key}" data-tooltip="${tip}" aria-label="${tip}">`
+      + `<span class="active-session-icon">${HUMAN_BADGE_SVG}</span>`
+      + `<span class="active-session-key">${key}</span>`
+      + `<span class="active-session-title">${escapeAttr(row.title || '')}</span>`
       + `</button>`;
   }).join('');
 }
@@ -2876,17 +2903,20 @@ function sessionRowId(row) {
 
 // Body-appended `position: fixed` tooltip (same pattern as task-card.js's C1568 button tip):
 // a ::after inside the rail would be clipped by #left-nav-panel / .left-nav-main overflow.
-// Listeners are bound once on the stable list host so they survive innerHTML repaints.
+// Listeners are bound once per stable list host so they survive innerHTML repaints; the rail has
+// two hosts (TPT9201), and one tip shown at a time across them.
 let _sessTip = null;
 let _sessTipTimer = null;
 let _sessTipRowId = null;
-let _sessTipBound = false;
+let _sessTipHost = null;
+const _sessTipHosts = new WeakSet();
 const SESSION_TIP_DELAY_MS = 150;
 
 function hideSessionTip() {
   clearTimeout(_sessTipTimer);
   _sessTipTimer = null;
   _sessTipRowId = null;
+  _sessTipHost = null;
   if (_sessTip) { _sessTip.remove(); _sessTip = null; }
 }
 
@@ -2908,11 +2938,12 @@ function showSessionTip(row) {
   tip.style.top = top + 'px';
   _sessTip = tip;
   _sessTipRowId = sessionRowId(row) || null;
+  _sessTipHost = row.parentElement;
 }
 
 function ensureSessionTooltips(host) {
-  if (_sessTipBound) return;
-  _sessTipBound = true;
+  if (_sessTipHosts.has(host)) return;
+  _sessTipHosts.add(host);
   const schedule = (row) => {
     if (_sessTipRowId && _sessTipRowId === sessionRowId(row) && _sessTip) return;
     hideSessionTip();
@@ -2933,17 +2964,38 @@ function ensureSessionTooltips(host) {
   host.addEventListener('focusout', hideSessionTip);
   host.addEventListener('mousedown', hideSessionTip, true);
   host.addEventListener('scroll', hideSessionTip);
-  window.addEventListener('scroll', hideSessionTip, true);
+  window.addEventListener('scroll', hideSessionTip, true); // same listener: one per window
 }
 
 // After a repaint replaced the row nodes: keep the tip only if its row still exists and is
-// still under the pointer / focused; otherwise drop it so it never strands.
+// still under the pointer / focused; otherwise drop it so it never strands. A repaint of the
+// other list has no say over this tip.
 function resyncSessionTip(host) {
-  if (!_sessTip) return;
+  if (!_sessTip || _sessTipHost !== host) return;
   const row = [...host.querySelectorAll('.active-session-item')]
     .find((r) => sessionRowId(r) === _sessTipRowId);
   if (row && (row.matches(':hover') || row.matches(':focus-within'))) showSessionTip(row);
   else hideSessionTip();
+}
+
+// (TPT9201) The human section under the session rows: list and heading stay hidden while there is
+// nothing to show. Unchanged rows keep their nodes, for the same reason as the session list below
+// (TPT360). A click opens the task's edit workspace, never a terminal.
+function paintHumanTaskRows(rows, collapsed) {
+  const listHost = document.getElementById('active-human-tasks-list');
+  if (!listHost) return;
+  const heading = document.getElementById('active-human-tasks-heading');
+  listHost.hidden = rows.length === 0;
+  if (heading) heading.hidden = rows.length === 0;
+  const html = renderHumanTaskRows(rows, collapsed);
+  if (listHost._humanRowsHtml === html) return;
+  listHost._humanRowsHtml = html;
+  listHost.innerHTML = html;
+  ensureSessionTooltips(listHost);
+  resyncSessionTip(listHost);
+  listHost.querySelectorAll('.active-session-item').forEach((btn) => {
+    btn.addEventListener('click', () => { void openTaskWorkspace(btn.dataset.taskId, { pane: 'edit' }); });
+  });
 }
 
 // Builds the session row list from state, paints it into the left nav, and (re)wires clicks.
@@ -2989,13 +3041,18 @@ export function syncActiveSessionsNav() {
       needsAttention: state.attentionSessions.has(id) && !state.lostSessions.has(id),
       paused: state.sessionMeta.get(id)?.paused || null,
       lost: state.lostSessions.has(id),
+      // (TPT9239) Started from the web app on this device (session-origin.js WEB_ORIGIN): a globe
+      // on the agent icon.
+      webOrigin: state.sessionMeta.get(id)?.origin === 'web',
     }));
   const openChatId = window.TipTask?.taskChat?.currentChatId?.() || '';
   rows.push(...taskChatRows(openChatId), ...projectChatRows(openChatId));
   const html = renderActiveSessionsList(rows, collapsed);
   host.hidden = rows.length === 0;
+  const humanRows = humanInProgressRows(state, getOpenWorkspaceTaskId());
   const divider = document.getElementById('active-sessions-divider');
-  if (divider) divider.hidden = rows.length === 0;
+  if (divider) divider.hidden = rows.length === 0 && humanRows.length === 0;
+  paintHumanTaskRows(humanRows, collapsed);
   // (TPT360) The rail stays reachable while a terminal is open, and session/attention events
   // repaint it often — rewriting identical markup would replace the very row under the pointer
   // between mousedown and click, so that click would be lost. Row listeners wired on the prior
@@ -3115,6 +3172,43 @@ let _bulkFetchActiveSessions = null;
 let _bulkChanges = {};
 let _bulkApplying = false;
 
+// (TPT9212) What the bulk Model select offers for one agent: its available models as option rows,
+// and the project's configured default for it. Claude and Codex list the model registry
+// (agentModelOptions(): the live list once GET /api/agent-models has answered, the static one
+// before) and take CLAUDE_MODEL / CODEX_MODEL from GET /api/config — 'opusplan' when Claude's is
+// unset, the model its launches fall back to; an unset Codex default ('') names none. Pi lists the
+// rows a task can start on, and its default is the first: the row a start without a model runs.
+function _bulkModelSource(agent) {
+  if (agent === 'claude' || agent === 'codex') {
+    const cfg = _cachedProjectConfig || {};
+    return {
+      models: agentModelOptions(agent).map(m => ({ value: m.value, label: m.label, title: m.description || '', isLatest: m.isLatest === true })),
+      configuredDefault: agent === 'claude' ? (cfg.CLAUDE_MODEL || 'opusplan') : (cfg.CODEX_MODEL || ''),
+    };
+  }
+  if (agent === 'pi') {
+    const rows = piTaskModelIds(state.objectiveProviders);
+    return { models: rows.map(id => ({ value: id, label: shortModelName(id), title: id })), configuredDefault: rows[0] || '' };
+  }
+  return { models: [], configuredDefault: '' };
+}
+
+// (TPT9212) The model the staged agent is saved with — what the Model select shows and Apply writes.
+function _bulkAgentModel(changes) {
+  const { models, configuredDefault } = _bulkModelSource(changes?.agent);
+  return resolveBulkAgentModel(changes?.agent, { picked: changes?.model, models, configuredDefault });
+}
+
+// (TPT9212) Fresh copies of what _bulkModelSource() reads: Settings ▸ Agents can change a project
+// default after _ensureProjectConfig() filled its module-lifetime cache, and the model registry
+// can have been reprobed. A failed read keeps the cached copy.
+async function _refreshBulkModelSources() {
+  const config = fetch('/api/config', { cache: 'no-store' })
+    .then(async (res) => { if (res.ok) _cachedProjectConfig = (await res.json()) || {}; })
+    .catch(() => {});
+  await Promise.all([config, ensureAgentModels()]);
+}
+
 function _bulkCardStatus(id) {
   const card = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
   return card ? card.dataset.status : startName();
@@ -3214,6 +3308,8 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // for-bound label instead, the custom agent picker gets aria-labelledby.
   // (TPT9159) The fields only stage changes; Reset/Apply close the edit group. The Design
   // mode toggle's <label> wraps just its own checkbox, never the agent picker.
+  // (TPT9212) The Model select sits between the agent picker and Design mode, inside the Agent
+  // field: it is part of the agent change. Its <label for> is a sibling, never a wrapper.
   bar.innerHTML = `
     <div class="bulk-group bulk-group--selection">
       <span class="bulk-count"></span>
@@ -3222,8 +3318,9 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     <div class="bulk-group bulk-group--edit">
       <div class="bulk-field bulk-move-label bulk-move-priority-label" data-bulk-field="priority"><label class="bulk-field-label bulk-move-text" for="bulk-move-input">${t('bulk.moveTo')}</label><div class="sprint-combo sprint-combo--plain bulk-priority-combo" data-id="__bulk__" data-current=""><input id="bulk-move-input" class="sprint-combo-input" type="text" readonly placeholder="${escapeAttr(t('bulk.moveToPlaceholder'))}"><div class="sprint-combo-dropdown" hidden></div></div></div>
       <div class="bulk-field bulk-move-label" data-bulk-field="status"><label class="bulk-field-label bulk-status-text" for="bulk-status-select">${t('bulk.status')}</label><select id="bulk-status-select" class="bulk-status-select" aria-label="${escapeAttr(t('bulk.status'))}"></select></div>
-      <div class="bulk-field bulk-move-label" data-bulk-field="agent"><span class="bulk-field-label bulk-agent-text" id="bulk-agent-label">${t('bulk.agent')}</span><span class="bulk-agent-picker-slot"></span><label class="bulk-design-mode" hidden title="${escapeAttr(t('bulk.designModeHint'))}"><input type="checkbox" class="bulk-design-mode-input"><span class="bulk-design-mode-text">${t('bulk.designMode')}</span></label></div>
+      <div class="bulk-field bulk-move-label" data-bulk-field="agent"><span class="bulk-field-label bulk-agent-text" id="bulk-agent-label">${t('bulk.agent')}</span><span class="bulk-agent-picker-slot"></span><span class="bulk-model" hidden><label class="bulk-field-label bulk-model-text" for="bulk-model-select">${t('bulk.model')}</label><select id="bulk-model-select" class="bulk-model-select" aria-describedby="bulk-model-hint" title="${escapeAttr(t('bulk.modelHint'))}"></select><span id="bulk-model-hint" hidden>${escapeAttr(t('bulk.modelHint'))}</span></span><label class="bulk-design-mode" hidden title="${escapeAttr(t('bulk.designModeHint'))}"><input type="checkbox" class="bulk-design-mode-input"><span class="bulk-design-mode-text">${t('bulk.designMode')}</span></label></div>
       <div class="bulk-field bulk-move-label bulk-assignee-label" data-bulk-field="assignee"><label class="bulk-field-label bulk-assignee-text" for="bulk-assignee-input">${t('bulk.assignee')}</label><span class="bulk-assignee-picker-slot"></span></div>
+      <div class="bulk-field bulk-move-label" data-bulk-field="cowboyScope"><label class="bulk-field-label bulk-cowboy-text" for="bulk-cowboy-select">${t('field.cowboyMode')}</label><select id="bulk-cowboy-select" class="bulk-cowboy-select" aria-describedby="bulk-cowboy-hint"></select><span id="bulk-cowboy-hint" hidden></span></div>
       <div class="bulk-apply-actions">
         <button type="button" class="btn-bulk-reset bulk-btn bulk-btn--ghost" hidden title="${escapeAttr(t('bulk.resetHint'))}">${t('bulk.reset')}</button>
         <button type="button" class="btn-bulk-apply bulk-btn bulk-btn--primary" disabled title="${escapeAttr(t('bulk.applyIdle'))}">${t('bulk.apply')}</button>
@@ -3270,6 +3367,10 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     syncBulkChanges();
   });
   _syncBulkStatusOptions(bar);
+  bar.querySelector('.bulk-cowboy-select').addEventListener('change', (event) => {
+    _bulkChanges = stageBulkField(_bulkChanges, 'cowboyScope', event.currentTarget.value);
+    syncBulkChanges();
+  });
   bar.querySelector('.btn-bulk-start').addEventListener('click', async () => {
     // (TPT9159) Starting would run on the saved agent and then drop the staged edits with
     // the selection — the button reads unavailable until they are applied or reset.
@@ -3394,6 +3495,12 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     const changes = { ..._bulkChanges };
     if (!ids.length || !hasBulkChanges(changes)) return;
 
+    const needsBypass = bulkCowboyBlockedTaskIds(changes, ids.map(_findTaskForBulkStart), projectPermissionMode());
+    if (needsBypass.length) {
+      showToast(t('bulk.cowboyRequiresBypass', { ids: needsBypass.join(', ') }), 'error');
+      return;
+    }
+
     let reassignable = new Set(ids);
     if (changes.agent) {
       const locked = ids.filter(id => isAgentLocked(_bulkCardStatus(id)));
@@ -3424,6 +3531,10 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
       : isBacklog ? 0
       : Number(changes.priority);
 
+    // (TPT9212) The model the Model select shows — the explicit pick or the agent's resolved
+    // default — rides with the agent on every task that takes the agent change.
+    const model = changes.agent ? _bulkAgentModel(changes) : null;
+
     _bulkApplying = true;
     syncBulkChanges();
     showSavingIndicator();
@@ -3434,10 +3545,17 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
       const results = [];
       const saved = [];
       for (const id of ids) {
-        const body = bulkPatchBody(changes, { priority: newPriority, reassign: reassignable.has(id) });
+        const body = bulkPatchBody(changes, { priority: newPriority, reassign: reassignable.has(id), model });
         if (!Object.keys(body).length) continue;
         try {
-          results.push(await api.tasks.update(id, body));
+          const result = await api.tasks.update(id, body);
+          // The API can normalize an enabled scope to Disabled if permissions changed since
+          // the board snapshot. Keep that refusal visible, like a rejected PATCH.
+          if (changes.cowboyScope !== undefined && normalizeCowboyScope(result?.cowboyMode ?? result?.cowboy_mode) !== body.cowboy_mode) {
+            failed.push(id);
+            continue;
+          }
+          results.push(result);
           saved.push(id);
         } catch {
           failed.push(id);
@@ -3487,6 +3605,8 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // (TPT9159) Picking an agent only stages it; the "Change agent…" option unstages it. A
   // selection where no task can change agent (all in progress or canceled) is refused at once,
   // as before; Apply checks again against the selection it then has.
+  // (TPT9212) Another agent drops the Model pick (stageBulkAgent()), so the Model select starts
+  // on the new agent's default, then repaints once fresh project defaults and models arrive.
   function stageAgent(agentId, { piModel = null } = {}, picker = null) {
     const ids = [...state.selectedCardIds];
     if (agentId && ids.length && ids.every(id => isAgentLocked(_bulkCardStatus(id)))) {
@@ -3498,6 +3618,9 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     // A re-render while its dropdown was open replaced this picker; show the pick on the new one.
     if (picker && !picker.isConnected) rebuildAgentOptions();
     syncBulkChanges();
+    if (agentId && agentId !== 'human') {
+      void _refreshBulkModelSources().then(() => { if (bar.isConnected) syncBulkChanges(); });
+    }
   }
 
   function rebuildAgentOptions() {
@@ -3506,11 +3629,39 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     const ids = _taskStartAgentIds();
     // A staged agent the project can no longer run is dropped, like a deleted status.
     if (_bulkChanges.agent && !ids.includes(_bulkChanges.agent)) _bulkChanges = stageBulkAgent(_bulkChanges, '');
-    slot.innerHTML = renderAgentPicker('bulkAgent', _bulkChanges.agent || '', false, ids, _bulkChanges.piModel || null, { emptyLabel: t('bulk.agentPlaceholder') });
+    // (TPT9212) The picker names the agent only; a Pi row is picked in the Model select beside it.
+    slot.innerHTML = renderAgentPicker('bulkAgent', _bulkChanges.agent || '', false, ids, null, { emptyLabel: t('bulk.agentPlaceholder') });
     const picker = slot.querySelector('.agent-picker');
     if (picker) initAgentPicker(picker, { onChange: (agentId, opts) => stageAgent(agentId, opts, picker) });
     slot.querySelector('.agent-picker-trigger')?.setAttribute('aria-labelledby', 'bulk-agent-label');
   }
+
+  // (TPT9212) The Model select lists the staged agent's available models (_bulkModelSource())
+  // and shows the one Apply will save. It is hidden for Human, with no agent staged, and for Pi
+  // until its rows are known. A pick the agent no longer offers is dropped, like a deleted
+  // status. While the select has focus its options are left alone, so a repaint never swaps
+  // them under an open dropdown.
+  function syncBulkModelOptions() {
+    const wrap = bar.querySelector('.bulk-model');
+    const select = wrap?.querySelector('.bulk-model-select');
+    if (!select) return;
+    const hint = t('bulk.modelHint');
+    wrap.querySelector('.bulk-model-text').textContent = t('bulk.model');
+    select.title = hint;
+    wrap.querySelector('#bulk-model-hint').textContent = hint;
+    const { models } = _bulkModelSource(_bulkChanges.agent);
+    if (_bulkChanges.model && !models.some(m => m.value === _bulkChanges.model)) _bulkChanges = stageBulkModel(_bulkChanges, '');
+    const model = _bulkAgentModel(_bulkChanges);
+    wrap.hidden = !model;
+    if (!model || document.activeElement === select) return;
+    select.innerHTML = models.map(m => `<option value="${escapeAttr(m.value)}"${m.title ? ` title="${escapeAttr(m.title)}"` : ''}>${escapeAttr(m.label || m.value)}</option>`).join('');
+    select.value = model;
+  }
+
+  bar.querySelector('.bulk-model-select').addEventListener('change', (event) => {
+    _bulkChanges = stageBulkModel(_bulkChanges, event.currentTarget.value);
+    syncBulkChanges();
+  });
 
   bar.querySelector('.bulk-design-mode-input').addEventListener('change', (event) => {
     _bulkChanges = stageBulkDesignMode(_bulkChanges, event.currentTarget.checked);
@@ -3616,7 +3767,9 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // shows only beside a staged Claude, Apply and Reset wake up, and Start and Deps wait —
   // Start would run on the saved agent, and both clear the selection the edits are staged on.
   function syncBulkChanges() {
+    syncBulkModelOptions();
     const staged = stagedBulkFields(_bulkChanges);
+    _syncBulkCowboyOptions(bar);
     const dirty = staged.length > 0;
     bar.classList.toggle('bulk-action-bar--staged', dirty);
     bar.querySelectorAll('[data-bulk-field]').forEach(el => el.classList.toggle('is-staged', staged.includes(el.dataset.bulkField)));
@@ -3673,6 +3826,11 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   void ensureProjectMembers().then(() => {
     if (bar.isConnected) bar._refreshBulkAssigneePicker?.();
   });
+  // (TPT9212) Warm the project defaults and the model registry, so the first agent pick already
+  // offers the live model list.
+  void Promise.all([_ensureProjectConfig(), ensureAgentModels()]).then(() => {
+    if (bar.isConnected) syncBulkChanges();
+  });
 }
 
 // Clears the bulk-selection Set + its DOM markers (card ring, select-button dot) and
@@ -3705,6 +3863,16 @@ function _syncBulkStatusOptions(bar) {
   select.value = _bulkChanges.status || '';
 }
 
+function _syncBulkCowboyOptions(bar) {
+  const select = bar.querySelector('.bulk-cowboy-select');
+  select.innerHTML = `<option value="">${escapeAttr(t('bulk.cowboyPlaceholder'))}</option>`
+    + cowboyModeOptions(_bulkChanges.cowboyScope, t).map(option => `<option value="${option.value}">${escapeAttr(option.label)}</option>`).join('');
+  select.value = _bulkChanges.cowboyScope ?? '';
+  select.title = t('bulk.cowboyHint');
+  bar.querySelector('.bulk-cowboy-text').textContent = t('field.cowboyMode');
+  bar.querySelector('#bulk-cowboy-hint').textContent = t('bulk.cowboyHint');
+}
+
 // (TPT9159) Puts the staged sprint back into the rebuilt Move to combo — label from its
 // dropdown item, else the sprint's own title. Left alone while its dropdown is open, so a
 // re-render never overwrites what the user is typing.
@@ -3719,6 +3887,9 @@ function _syncBulkSprintCombo(combo) {
 }
 
 export function updateBulkActionBar() {
+  // (TPT9208) Every selection change reaches this function, so it keeps each sprint's
+  // select-all pill in step — before the early returns below.
+  syncTierSelectAll();
   const bar = document.getElementById('bulk-action-bar');
   if (!bar) return;
   // (TPT9159) A hidden bar is a closed one: whatever was staged is discarded.
@@ -4290,6 +4461,7 @@ let _cachedProjectTags = null;
 let _projectTagsPromise = null;
 let _cachedProjectTaskList = null;
 let _projectTaskListPromise = null;
+let _projectTaskListGeneration = 0; // (TPT9216) bumped by resetProjectTaskList() on project switch
 // (C1245) New Task form's own project-config cache — mirrors _cachedProjectTags
 // (module-lifetime, not reset per open like the task list, since defaults rarely
 // change). The edit modal fetches this per modal-open into _modalState.projectConfig
@@ -4690,18 +4862,28 @@ export function invalidateProjectTags() {
 async function _ensureProjectTaskList() {
   if (Array.isArray(_cachedProjectTaskList)) return _cachedProjectTaskList;
   if (_projectTaskListPromise) return _projectTaskListPromise;
+  // (TPT9216) A fetch that started before a project switch (resetProjectTaskList()) is dropped.
+  const generation = _projectTaskListGeneration;
+  const current = () => generation === _projectTaskListGeneration;
   _projectTaskListPromise = api.tasks.listAll()
     .then(tasks => {
+      if (!current()) return tasks || [];
       _cachedProjectTaskList = tasks || [];
       return _cachedProjectTaskList;
     })
     .catch(() => {
+      if (!current()) return [];
       _cachedProjectTaskList = [];
       return _cachedProjectTaskList;
     })
     .finally(() => {
-      _projectTaskListPromise = null;
+      if (current()) _projectTaskListPromise = null;
     });
+  // (TPT9216) Dependency keys the board snapshot lacks resolve from the list once it lands —
+  // outside the chain above, so a restyling error can never empty a fetched list.
+  void _projectTaskListPromise.then(list => {
+    if (current() && list.length && typeof document !== 'undefined') syncDependencyKeys(document);
+  }).catch(() => {});
   return _projectTaskListPromise;
 }
 
@@ -4712,6 +4894,44 @@ export function getProjectTaskList() {
 }
 export function ensureProjectTaskList() {
   return _ensureProjectTaskList();
+}
+
+// (TPT9216) The cached list's row for one task key — task-card.js dependencyKeyStatus() reads a
+// key's status here when the board snapshot lacks it. The by-key map is built once per fetched
+// list and kept current by patchProjectTaskList().
+let _projectTaskRowsById = null; // { list, rows: Map<taskKey, row> }
+export function projectTaskRow(key) {
+  if (!Array.isArray(_cachedProjectTaskList)) return undefined;
+  if (_projectTaskRowsById?.list !== _cachedProjectTaskList) {
+    const rows = new Map();
+    for (const row of _cachedProjectTaskList) if (row?.id) rows.set(String(row.id), row);
+    _projectTaskRowsById = { list: _cachedProjectTaskList, rows };
+  }
+  return _projectTaskRowsById.rows.get(String(key));
+}
+
+// (TPT9216) Fold a task event or a local single-task write into the cached list, so a dependency
+// the board snapshot lacks keeps a live status between list fetches. Existing rows only — a task
+// the list has not seen waits for the next fetch — and only the fields the payload carries. The
+// row is replaced, never mutated: the fetched objects may be shared with their source.
+export function patchProjectTaskList(task) {
+  if (!Array.isArray(_cachedProjectTaskList) || !task?.id) return;
+  const index = _cachedProjectTaskList.findIndex(entry => entry?.id === task.id);
+  if (index === -1) return;
+  const row = { ..._cachedProjectTaskList[index] };
+  for (const field of ['title', 'status', 'dependencies', 'priority']) {
+    if (task[field] !== undefined) row[field] = task[field];
+  }
+  _cachedProjectTaskList[index] = row;
+  if (_projectTaskRowsById?.list === _cachedProjectTaskList) _projectTaskRowsById.rows.set(String(task.id), row);
+}
+
+// (TPT9216) Project switch: another project's list, or a fetch it started, must not answer this
+// project's keys. The Task Edit modal's per-open refetch keeps its own lighter reset.
+export function resetProjectTaskList() {
+  _cachedProjectTaskList = null;
+  _projectTaskListPromise = null;
+  _projectTaskListGeneration++;
 }
 
 // (TPT111) Dependency index for the modal, before/without a resolved project task list.
@@ -4819,7 +5039,9 @@ function _replaceImageBlobUrl(blobUrl, url) {
   const target = _imagePasteTargets.get(blobUrl);
   let replaced = false;
   if (target?.textarea?.isConnected && target.textarea.value.includes(blobUrl)) {
-    target.textarea.value = target.textarea.value.split(blobUrl).join(url);
+    // Keep the caret where the user left it: the next paste or Embed goes in at the caret, not
+    // at the end of the text.
+    setValueKeepingCaret(target.textarea, target.textarea.value.split(blobUrl).join(url));
     target.textarea.dispatchEvent(new Event('input', { bubbles: true }));
     replaced = true;
   }
@@ -5068,7 +5290,9 @@ function _createDepsChipInput(root, opts) {
       span.dataset.dep = key;
       const title = _depTitleFor(key, getCandidates());
       if (title) span.title = title;
-      span.innerHTML = `${escapeAttr(key)}<button class="chip-remove" type="button" data-dep="${escapeAttr(key)}">&times;</button>`;
+      // (TPT9216) Same chip body as task-edit-modal.js _renderDepChip(): the struck-through key
+      // span, then the undecorated remove button.
+      span.innerHTML = `${dependencyKeyMarkup(key)}<button class="chip-remove" type="button" data-dep="${escapeAttr(key)}">&times;</button>`;
       frag.appendChild(span);
     });
     depsDiv.insertBefore(frag, input);
@@ -5390,6 +5614,10 @@ const _SETTINGS_TEXT = [
   ['settings-agents-label', 'settings.agentsSetup'],
   ['settings-agents-hint', 'settings.agentsSetupHint'],
   ['settings-agents-edit', 'settings.agentsEdit'],
+  ['settings-remote-control-title', 'settings.remoteControl.title'],
+  ['settings-remote-control-label', 'settings.remoteControl.label'],
+  ['settings-remote-control-scope', 'settings.remoteControl.scope'],
+  ['settings-remote-control-hint', 'settings.remoteControl.hint'],
   ['settings-notifications-title', 'settings.notifications'],
   ['settings-notifications-label', 'settings.notifDesktop'],
   ['settings-notifications-row-hint', 'settings.notifDesktopHint'],
@@ -5447,6 +5675,7 @@ export function openSettingsModal() {
   _populateSettingsLanguageSelect();
   _populateSettingsNotificationsRows();
   _populateSettingsDebugRow();
+  populateRemoteControlSettings();
   _populateSettingsVoiceTab();
   _populateSettingsWorkflowTab();
   _populateSettingsMemoryTab();
@@ -7253,9 +7482,11 @@ async function _populateSettingsNotificationsRows() {
   }
 
   if (hintEl) {
+    const repairFailed = status.delivery !== 'desktop' && status.registrationRepair && !status.registrationRepair.ok;
     const blocked = status.transport === 'unsupported'
       || status.permission === 'denied'
-      || (status.transport === 'electron' && status.lastError);
+      || (status.transport === 'electron' && status.lastError)
+      || repairFailed;
     // (C1125) 'unsigned' gets its own hint — "notifications blocked, go check System
     // Settings" sends the user chasing a permission that was never the problem.
     // (C1141) 'seal-broken' likewise — the bundle WAS signed, but its seal broke at runtime
@@ -7270,13 +7501,14 @@ async function _populateSettingsNotificationsRows() {
     const mountedVolume = status.installerVolumes?.[0];
     const notRegisteredHint = status.conflicts
       ? (mountedVolume
-        ? t('settings.notifHintDuplicateBundlesWithVolume', { count: status.conflicts, volume: mountedVolume.split('/').pop() })
+        ? t('settings.notifHintDuplicateBundlesWithVolume', { count: status.conflicts, volume: mountedVolume.split('/')[2] })
         : t('settings.notifHintDuplicateBundles', { count: status.conflicts }))
       : t('settings.notifHintNotRegistered');
     if (hintTextEl) {
       hintTextEl.textContent = status.transport === 'unsupported' ? t('settings.notifHintUnsupported')
         : status.lastError === 'unsigned' ? t('settings.notifHintUnsigned')
         : status.lastError === 'seal-broken' ? t('settings.notifHintSealBroken')
+        : repairFailed ? registrationRepairMessage(status.registrationRepair, t)
         : status.lastError === 'not-registered' ? notRegisteredHint
         : (blocked ? t('settings.notifHintBlocked') : '');
     }
@@ -7286,7 +7518,7 @@ async function _populateSettingsNotificationsRows() {
     // to fix — for every other blocked reason (unsigned, seal-broken, denied, unsupported) it
     // would just fail with nothing to repair.
     if (repairBtn) {
-      repairBtn.hidden = !(status.lastError === 'not-registered' && status.conflicts > 0);
+      repairBtn.hidden = !(status.delivery !== 'desktop' && (repairFailed || (status.lastError === 'not-registered' && status.conflicts > 0)));
       repairBtn.textContent = t('settings.notifRepairBtn');
     }
   }
@@ -7364,6 +7596,7 @@ export function initSettingsModal() {
   // (C1155) Hamburger trigger removed — Settings now opens only via the Electron
   // Project menu (Project → Settings…, ⌘,), wired through onProjectMenu() in template.html.
   modal.querySelector('.settings-close')?.addEventListener('click', closeSettingsModal);
+  initRemoteControlSettings();
   // (C1178) General/Voice tab switching — same pattern as the task-edit modal's
   // switchTab() (~line 3379), simplified: no per-tab side effects needed here. Panels are
   // `.settings-body.modal-tab-panel` siblings of `.modal-tabs`, not nested inside a shared
@@ -7578,18 +7811,15 @@ export function initSettingsModal() {
       window.electronAPI?.openNotificationSettings?.();
     });
   }
-  // (C1355) Repair: re-registers the running bundle with LaunchServices so it becomes the
-  // freshest claimant of com.tipatask.app — wired once, shown/hidden per open by
-  // _populateSettingsNotificationsRows() above. Still needs a relaunch afterward (usernoted only
-  // decides Notification Center registration at process launch), same as the C1318 seal-repair
-  // path — the toast says so instead of silently leaving the row in a stale "fixed" state.
+  // Repair verifies the current claims. Only a verified repair earns a success toast;
+  // mounted installers, command errors and remaining claims stay visible for retry.
   const notifRepairBtn = modal.querySelector('#settings-notifications-repair');
   if (notifRepairBtn) {
     notifRepairBtn.addEventListener('click', async () => {
       notifRepairBtn.disabled = true;
       const res = await repairNotificationRegistration();
       notifRepairBtn.disabled = false;
-      showToast(res.ok ? t('settings.notifRepairSucceeded') : t('settings.notifRepairFailed', { reason: res.reason || '' }), res.ok ? 'success' : 'error');
+      showToast(registrationRepairMessage(res, t), res.ok ? 'success' : 'error');
       _populateSettingsNotificationsRows();
     });
   }
@@ -7603,7 +7833,7 @@ configureTaskEditModal({
   _createMemberCombobox, _memberLabelFor, _renderMemberCombobox,
   refreshProjectMembers, _ensureProjectTags, _ensureProjectTaskList,
   unregisteredProjectTags, invalidateProjectTags,
-  _projectTaskIndex, _projectTagName, _depTitleFor, _createDepsChipInput,
+  _projectTaskIndex, _projectTagName, _depTitleFor, _createDepsChipInput, dependencyKeyMarkup,
   renderAgentPicker, initAgentPicker, _taskAgentPickerOptions,
   _applyAgentPickerSelection, isAgentLocked,
   showReiterateModal, showDeleteConfirmModal, terminateSessionFromCard,

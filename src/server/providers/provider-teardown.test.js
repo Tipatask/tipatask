@@ -28,7 +28,7 @@ function loadProvider(file, { localize } = {}) {
     },
     '../claude-session': { normalizeProposals: x => x },
     '../../codex-mcp-config': { buildScopedCodexMcpOverride: () => 'mcp_servers={}' },
-    '../codex-env': { buildCodexEnv: () => ({ env: {} }), codexEffortArgs: () => [], toCodexEffort: level => level },
+    '../codex-env': { buildCodexEnv: () => ({ env: {} }), codexEffortArgs: () => [], servedCodexModelOverride: () => ({ model: '', configModel: '' }), toCodexEffort: level => level },
     '../context-manager': { shouldTrimContext: () => false, trimContext() {} },
     '../task-agent/attachments': {
       localizeAttachments: localize || (async ({ prompt }) => ({ prompt })),

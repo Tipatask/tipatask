@@ -92,8 +92,9 @@ function buildGitDirective(v, opts = {}) {
   }
   if (v.pr) {
     lines.push(compact
-      ? '- Open a pull/merge request: `gh pr create`, else `git push -u origin task/<TASK_KEY>` + compare URL; never guess forge host.'
+      ? '- Open a pull/merge request: gh pr create, else push + compare URL. Never guess host. Record HTTPS URLs: add_task_dev_link.'
       : '- Open a pull/merge request for the task branch: use `gh pr create` if the `gh` CLI is available. If it is not, push the branch (`git push -u origin task/<TASK_KEY>`) and report the compare URL in your resolution comment for the user to open manually — do not guess a forge host or hand-construct a PR URL.');
+    if (!compact) lines.push('- After publishing, record verified HTTPS branch, commit and PR URLs with tipatask add_task_dev_link (task_key, kind: branch/commit/pr, url, optional label/repo/external_id/state), or POST /tasks/:taskKey/dev-links through the project task tools. Never record a local-only branch as published.');
   }
   if (v.commit) lines.push(buildDefinitionOfDone(v, compact));
   return lines.join('\n');

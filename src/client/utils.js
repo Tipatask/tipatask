@@ -361,6 +361,31 @@ export function insertAtCursor(el, text) {
   el.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
+// Give a text field a new value without moving its caret off the text it was on — assigning
+// `.value` alone puts the caret at the end, so the next insertAtCursor() would append. Only the
+// span between the old and new value's common head and tail changed: an edge before that span
+// stays, one after it moves by the length change, one inside it lands at the span's new end.
+// Fires no event. Returns whether the value changed.
+export function setValueKeepingCaret(el, value) {
+  const prev = String(el.value ?? '');
+  const next = String(value ?? '');
+  if (prev === next) return false;
+  const { selectionStart: start, selectionEnd: end, selectionDirection: direction } = el;
+  const limit = Math.min(prev.length, next.length);
+  let head = 0;
+  while (head < limit && prev[head] === next[head]) head++;
+  let tail = 0;
+  while (tail < limit - head && prev[prev.length - 1 - tail] === next[next.length - 1 - tail]) tail++;
+  const map = (pos) => {
+    if (pos <= head) return pos;
+    if (pos >= prev.length - tail) return pos + next.length - prev.length;
+    return next.length - tail;
+  };
+  el.value = next;
+  if (Number.isInteger(start) && Number.isInteger(end)) el.setSelectionRange(map(start), map(end), direction || 'none');
+  return true;
+}
+
 // Update partial transcripts in place and dispatch input events. Replace the
 // owned span only while its text and cursor still match; user edits or focus
 // changes must not be overwritten. Final segments freeze.

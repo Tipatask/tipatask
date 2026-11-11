@@ -5,9 +5,42 @@ const fs = require('node:fs');
 const path = require('node:path');
 const fx = require('./test-fixture');
 const { scanProject, detectMainBranch } = require('./repo-discovery');
-const { publishProject, buildPrBody, buildPrTitle, createPr } = require('./publish');
+const { publishProject, buildPrBody, buildPrTitle, createPr, forgeRepository } = require('./publish');
 
 fx.applyFixtureEnvToProcess();
+
+test('forge URLs: SSH/HTTPS remotes, credentials stripped, local and unsupported remotes excluded', () => {
+  assert.deepEqual(forgeRepository('git@github.com:team/repo.git'), { url: 'https://github.com/team/repo', host: 'github.com' });
+  assert.equal(forgeRepository('https://user:secret@gitlab.com/group/sub/repo.git').url, 'https://gitlab.com/group/sub/repo');
+  assert.equal(forgeRepository('ssh://git@bitbucket.org/team/repo.git').url, 'https://bitbucket.org/team/repo');
+  for (const remote of ['/tmp/repo.git', 'file:///tmp/repo.git', 'https://forge.example/team/repo', 'https://github.com:999/team/repo']) assert.equal(forgeRepository(remote), null);
+});
+
+test('publishing records links only after success; metadata failures preserve push/PR results', async () => {
+  const calls = [];
+  const backend = { async addTaskDevLink(key, link) { calls.push({ key, ...link }); return { dev_link: link }; } };
+  const repo = { id: 'root', kind: 'root', path: '/fixture', currentBranch: 'task/TPT1', mainBranch: 'main' };
+  const git = async args => {
+    if (args[0] === 'push') calls.push({ push: true });
+    return { status: 0, stdout: args[0] === 'remote' ? 'git@github.com:team/repo.git' : '', stderr: '' };
+  };
+  const exec = (_cmd, _args, _opts, cb) => { cb(null, 'https://github.com/team/repo/pull/9\n', ''); return { stdin: { end() {} } }; };
+  const options = { repos: [repo], merged: { root: ['TPT1', 'TPT2'] }, backend, git, exec };
+  const published = await publishProject(options);
+  assert.deepEqual(calls[0], { push: true });
+  for (const key of ['TPT1', 'TPT2']) {
+    assert.ok(calls.some(row => row.key === key && row.kind === 'branch' && row.url === 'https://github.com/team/repo/tree/task%2FTPT1'));
+    assert.ok(calls.some(row => row.key === key && row.kind === 'pr' && row.url === published.repos[0].prUrl));
+  }
+  assert.deepEqual(published.repos[0].devLinkErrors, []);
+  const failed = await publishProject({ ...options, backend: { async addTaskDevLink() { throw new Error('API offline'); } } });
+  assert.equal(failed.repos[0].pushed, true);
+  assert.equal(failed.repos[0].prUrl, 'https://github.com/team/repo/pull/9');
+  assert.ok(failed.repos[0].devLinkErrors.every(row => row.error === 'API offline'));
+  calls.length = 0;
+  await publishProject({ ...options, git: async () => ({ status: 1, stderr: 'push failed' }) });
+  assert.deepEqual(calls, []);
+});
 
 function withBareOrigins(f) {
   const bareRoot = path.join(f.home, 'origin-root.git'); const bareNested = path.join(f.home, 'origin-nested.git');

@@ -76,10 +76,10 @@ function stagePiMcpBridge(userDataRoot, { bridgeSource = BRIDGE_SOURCE } = {}) {
 // bridge bundle. Returns { extensionPath, configPath }, or null when either is missing — the
 // caller then falls back to the REST tool / prompt recipe. Shared by the Pi task terminal and
 // the headless Pi objective and task-chat turns, so all three agree on bridge availability.
-function resolvePiMcpBridge({ projectRoot, userDataRoot, bridgeSource = BRIDGE_SOURCE } = {}) {
+function resolvePiMcpBridge({ projectRoot, userDataRoot, bridgeSource = BRIDGE_SOURCE, computerUse } = {}) {
   if (!projectRoot || !userDataRoot) return null;
   const { writeScopedMcpConfig } = require('../mcp-spawn-config');
-  const configPath = writeScopedMcpConfig({ projectRoot, userDataRoot, caller: 'pi' });
+  const configPath = writeScopedMcpConfig({ projectRoot, userDataRoot, caller: 'pi', computerUse });
   if (!configPath) return null;
   const extensionPath = stagePiMcpBridge(userDataRoot, { bridgeSource });
   return extensionPath ? { extensionPath, configPath } : null;

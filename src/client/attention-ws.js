@@ -80,6 +80,16 @@ export function handleAttentionMessage(msg) {
     Promise.resolve(window.TipTask?.fetchActiveSessions?.()).then(repaint).catch(() => {});
     return true;
   }
+  // (TPT9239) A run the web app started on this device changed state (starting, running,
+  // exited) — no socket of ours opened it either, so the same pickup lists it with its web globe.
+  // An ended run leaves activeSessions first: a start that failed is gone from the next snapshot
+  // altogether, which would otherwise read as a lost session.
+  if (msg.type === 'remote-session-state') {
+    if (msg.state === 'exited' && msg.taskId) state.activeSessions.delete(msg.taskId);
+    const repaint = () => window.TipTask?.taskBoard?.updateClaudeButtons?.();
+    Promise.resolve(window.TipTask?.fetchActiveSessions?.()).then(repaint).catch(() => {});
+    return true;
+  }
   if (msg.type === 'session-ended') {
     if (msg.taskId) {
       // (TPT613) Same as the browser __board__ handler (template.html): the session is gone, not

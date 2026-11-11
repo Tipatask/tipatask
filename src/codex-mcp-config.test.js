@@ -1,4 +1,5 @@
 'use strict';
+const { nativeComputerUse } = require('./server/computer-use-runtime');
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -31,6 +32,50 @@ const {
 } = require('./codex-mcp-config');
 
 const toml = require('toml');
+const { resolveComputerUse } = require('./server/computer-use');
+
+test('computer-use TOML follows the resolver, replaces stale subtrees and drops unavailable servers', t => {
+  const projectRoot = makeTempDir();
+  t.after(() => fs.rmSync(projectRoot, { recursive: true, force: true }));
+  const targetPath = path.join(projectRoot, '.codex', 'config.toml');
+  fs.mkdirSync(path.dirname(targetPath));
+  fs.writeFileSync(targetPath, '[mcp_servers."computer-use"] # legacy\ncommand="stale"\n'
+    + '[mcp_servers."computer-use".env]\nSTALE="yes"\n[mcp_servers.custom]\ncommand="keep"\ndefault_tools_approval_mode="approve"\n\n');
+  const computerUse = nativeComputerUse('codex', '/opt/task-app', '/opt/task-app/dist/computer-use-arm64');
+  const write = answer => writeCodexMcpConfig({ targetPath, projectRoot, computerUse: answer, browserTools: [] });
+  write(computerUse);
+  const first = fs.readFileSync(targetPath, 'utf8');
+  const parsed = toml.parse(first);
+  assert.deepEqual({ ...parsed.mcp_servers['computer-use'] }, {
+    command: computerUse.server.command, args: computerUse.server.args, env_vars: computerUse.server.env_vars, tool_timeout_sec: 150, default_tools_approval_mode: 'approve',
+  });
+  assert.ok(parsed.mcp_servers.tipatask && parsed.mcp_servers['tipatask-local']);
+  assert.equal(parsed.mcp_servers.custom.command, 'keep');
+  write(computerUse);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), first, 'unchanged answer is idempotent');
+  for (const answer of [resolveComputerUse('codex', 'win32'), resolveComputerUse('codex', 'darwin'), null]) {
+    write(computerUse);
+    write(answer);
+    const out = toml.parse(fs.readFileSync(targetPath, 'utf8'));
+    assert.equal(out.mcp_servers['computer-use'], undefined);
+    assert.equal(out.mcp_servers.custom.command, 'keep');
+  }
+});
+
+test('unavailable computer use removes an inherited quoted server and nested tables', t => {
+  const projectRoot = makeTempDir();
+  t.after(() => fs.rmSync(projectRoot, { recursive: true, force: true }));
+  const seedPath = path.join(projectRoot, 'global.toml');
+  const targetPath = path.join(projectRoot, '.codex', 'config.toml');
+  fs.writeFileSync(seedPath, '[mcp_servers."computer-use"]\ncommand="stale"\n'
+    + '[mcp_servers."computer-use".env]\nSTALE="yes"\n[mcp_servers.custom]\ncommand="keep"\n');
+  for (let i = 0; i < 2; i++) {
+    writeCodexMcpConfig({ targetPath, projectRoot, seedPath, computerUse: resolveComputerUse('codex', 'linux') });
+    const parsed = toml.parse(fs.readFileSync(targetPath, 'utf8'));
+    assert.equal(parsed.mcp_servers['computer-use'], undefined);
+    assert.equal(parsed.mcp_servers.custom.command, 'keep');
+  }
+});
 
 function authFixture(t) {
   const root = makeTempDir();

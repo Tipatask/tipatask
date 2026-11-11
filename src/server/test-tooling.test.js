@@ -264,7 +264,7 @@ function packagedFixture(t) {
   }
   const piModules = path.join(resources, 'pi', 'node_modules');
   writeJson(path.join(piModules, afterPack.PI_PACKAGE, 'package.json'),
-    { name: afterPack.PI_PACKAGE, version: pkg.dependencies[afterPack.PI_PACKAGE].replace(/^[\^~]/, '') });
+    { name: afterPack.PI_PACKAGE, version: pkg.devDependencies[afterPack.PI_PACKAGE].replace(/^[\^~]/, '') });
   writeJson(path.join(piModules, afterPack.PI_PACKAGE, 'node_modules', 'ws', 'package.json'), { name: 'ws', version: lockVersion('ws') });
   // @electron/asar caches each archive's header by path, so a rebuilt archive must be dropped from it.
   const repack = async () => {

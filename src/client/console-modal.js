@@ -26,6 +26,7 @@ import { liveModeState } from './permission-mode.js';
 import { renderImageTask } from './image-task-view.js';
 import { clearAttention, markSessionLost, dismissLostSession, mergeSessionsSnapshot } from './attention-state.js';
 import { _isPinnedToBottom, createTerminalOutputWriter } from './terminal-output.js';
+import { sessionOrigin, terminalOriginBadge } from './session-origin.js';
 
 const CONSOLE_STATUS_TICK_MS = 500;
 // (TPT19) How long cleanupChat() blocks state.cleanupInProgress (below) and, separately, how
@@ -202,16 +203,21 @@ function applyTaskAgentConfig(msg) {
 // converges on the agent actually running, without waiting for the next /api/sessions refetch.
 // Never seeds from the global state.taskAgent: applyTaskAgentConfig() overwrites that global on
 // every session frame, so it names whichever terminal was opened last, not this task's agent.
+// (TPT9239) The same frames say whether the web app started the run (`origin: 'web'`): the row's
+// globe follows the session actually attached, so a Start that reattached to a web run gains it and
+// a fresh local run never inherits one.
 function adoptSessionAgent(taskId, msg) {
   if (!taskId || !msg || typeof msg.taskAgent !== 'string' || !msg.taskAgent) return false;
-  const prev = state.sessionMeta.get(taskId) || {};
-  const changed = prev.agent !== msg.taskAgent;
+  const { origin: prevOrigin, ...prev } = state.sessionMeta.get(taskId) || {};
+  const origin = sessionOrigin(msg);
+  const changed = prev.agent !== msg.taskAgent || (prevOrigin || null) !== origin;
   state.sessionMeta.set(taskId, {
     ...prev,
     agent: msg.taskAgent,
     label: msg.taskAgentLabel || prev.label || '',
     type: prev.type || 'terminal',
     alive: true,
+    ...(origin ? { origin } : {}),
   });
   if (changed) updateClaudeButtons(); // nav repaint is a no-op on identical markup (TPT360)
   return changed;
@@ -693,6 +699,9 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // a model the project/task overrides).
   const initialAgentId = opts.agent || state.taskAgent;
   const initialAgentLabel = state.taskAgentLabel || 'Claude Code';
+  // (TPT9239) A reopened web run shows its globe at once; the session's config / terminal-state
+  // frames confirm it (updateTaskLabel). A fresh launch is a local run until a frame says otherwise.
+  let sessionOriginShown = isResume ? sessionOrigin(state.sessionMeta.get(taskId)) : null;
   // Pi: the picked row, else the first row a task can start on — a row 0 that sets
   // `tools: false` is never what a task runs.
   const initialModel = initialAgentId === 'pi' ? (opts.model || _piTaskModels()[0] || _providerDefaultModel('pi')) : '';
@@ -709,7 +718,8 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     const dotAgent = ['claude', 'codex', 'pi'].includes(agentId) ? agentId : 'human';
     const discussionSuffix = opts.discussionMode ? ` · ${t('terminal.discussion')}` : '';
     const safeCaption = escapeAttr(`${caption}${discussionSuffix}`);
-    return `<span class="terminal-task-key">${safeTaskId}</span><span class="terminal-task-title" title="${safeTitle}">${safeTitle}</span><span class="terminal-task-caption" title="${safeCaption}"><span class="terminal-agent-dot agent-badge--${dotAgent}" aria-hidden="true">${_agentSelectorIcon(dotAgent)}</span><span class="terminal-task-caption-text">${safeCaption}</span></span>`;
+    const originBadge = sessionOriginShown ? terminalOriginBadge(escapeAttr(t('terminal.webOrigin'))) : '';
+    return `<span class="terminal-task-key">${safeTaskId}</span><span class="terminal-task-title" title="${safeTitle}">${safeTitle}</span><span class="terminal-task-caption" title="${safeCaption}"><span class="terminal-agent-dot agent-badge--${dotAgent}" aria-hidden="true">${_agentSelectorIcon(dotAgent)}</span>${originBadge}<span class="terminal-task-caption-text">${safeCaption}</span></span>`;
   }
 
   // Build DOM
@@ -799,9 +809,10 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   // frame (agent/label only) can't clobber a caption already populated by `terminal-state`.
   let lastKnownAgentId = initialAgentId;
   let lastKnownModel = initialModel;
-  function updateTaskLabel({ agent, label, model } = {}) {
+  function updateTaskLabel({ agent, label, model, origin } = {}) {
     if (agent) lastKnownAgentId = agent;
     if (model !== undefined) lastKnownModel = model || '';
+    if (origin !== undefined) sessionOriginShown = origin; // (TPT9239) from the session's own frame
     const safeAgentLabel = label || state.taskAgentLabel || 'Claude Code';
     const html = renderTaskLabel(lastKnownAgentId, _agentCaption(lastKnownAgentId, safeAgentLabel, lastKnownModel));
     if (html === renderedTaskLabel) return; // most frames change nothing here
@@ -1316,7 +1327,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
           terminalPlanApprovalCommand = msg.planApprovalCommand;
           terminalPlanApprovalCommandKnown = true;
         }
-        updateTaskLabel({ label: state.taskAgentLabel });
+        updateTaskLabel({ label: state.taskAgentLabel, origin: sessionOrigin(msg) });
         maybeSendCodexResumeRedraw();
       } else if (msg.type === 'terminal-state') {
         applyTaskAgentConfig(msg);
@@ -1360,7 +1371,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
             scheduleTerminalRefresh({ send: true });
           }
         }
-        updateTaskLabel({ agent: msg.taskAgent, label: msg.taskAgentLabel || state.taskAgentLabel, model: msg.taskAgentModel });
+        updateTaskLabel({ agent: msg.taskAgent, label: msg.taskAgentLabel || state.taskAgentLabel, model: msg.taskAgentModel, origin: sessionOrigin(msg) });
         setStatus(undefined, terminalPhase === 'planning'
           ? (state.planApprovalCommand
               ? t('terminal.status.planningCommand', { command: state.planApprovalCommand })

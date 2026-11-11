@@ -5,6 +5,14 @@ import { escapeAttr, showToast, projectHeader } from './utils.js';
 import { openMergeBranchesModal } from './merge-branches-modal.js';
 
 export const MERGE_DOT = '<span class="merge-attention-dot" aria-hidden="true"></span>';
+// Shortest gap between two non-forced reads (board re-render, the visible-window interval)
+// while the project has the manual merge UI.
+const SCAN_THROTTLE_MS = 10000;
+// (TPT9211) The same gap while it has none. Such a read only re-checks the project settings, and
+// the backend answering api.project.settings() and the one behind the merge routes (one and the
+// same in browser mode) each cache them for 30 s, so a sooner re-check could not see a change
+// made elsewhere. A Version Control save in this window forces a read anyway.
+const RECHECK_THROTTLE_MS = 30000;
 const roots = new WeakSet();
 let initialized = false;
 let pending = null;
@@ -12,9 +20,32 @@ let refreshAgain = false;
 let lastRead = 0;
 let project = null;
 let submitting = false;
-// True while the last read said this project has no manual-merge UI to show (svn/off, or
-// auto-merge on). Only forced reads (focus, settings save, merge frames) look again.
+// True while the last read found no manual-merge UI for this project: its settings say VCS off,
+// svn or automatic merge (no status request was sent), or the server answered VCS_NOT_GIT.
+// Non-forced reads then wait RECHECK_THROTTLE_MS; forced reads (focus, settings save, merge
+// frames) always look again.
 let inapplicable = false;
+
+// (TPT9211) The per-card merge UI exists only on git with automatic worktree merge off. With it
+// on, the agent merges at completion and POST …/task answers 409 AUTO_MERGE_ENABLED.
+function manualMergeApplies(vcs) {
+  return vcs?.type === 'git' && vcs.merge === false;
+}
+
+// (TPT9211) Whether a merge-status scan applies to this project now, from its live settings
+// bundle (api.project.settings(): vcsType + vcsMergeEnabled, the backend.getProjectSettings() row
+// the merge routes gate on). VCS off, svn, automatic merge and an unreadable bundle answer false,
+// so those projects never send GET /api/project/merge/status, which the server refuses with
+// 409 VCS_NOT_GIT for anything but git. A request gate only: every merge route still checks the
+// setting itself.
+export async function shouldFetchMergeStatus() {
+  try {
+    const settings = await api.project.settings();
+    return manualMergeApplies({ type: settings?.vcsType, merge: !!settings?.vcsMergeEnabled });
+  } catch {
+    return false;
+  }
+}
 
 export function mergeButtonHtml(key) {
   const label = escapeAttr(t('card.mergeTask'));
@@ -24,7 +55,9 @@ export function mergeButtonHtml(key) {
 export function syncTaskMergeCard(card) {
   if (!card.matches('.card[data-id]:not(.card--preview)')) return;
   const snapshot = state.taskMergeStatus;
-  const show = snapshot?.vcs?.type === 'git' && snapshot.vcs.merge === false && snapshot.tasks?.[card.dataset.id]?.unmerged === true;
+  // A null snapshot (VCS switched off or to svn, automatic merge, project switch, failed read)
+  // removes every marker this function adds.
+  const show = manualMergeApplies(snapshot?.vcs) && snapshot.tasks?.[card.dataset.id]?.unmerged === true;
   card.classList.toggle('has-unmerged-worktree', !!show);
   const select = card.querySelector('.btn-select-card');
   const menu = card.querySelector('.card-action-menu');
@@ -56,6 +89,10 @@ function repaint() {
 
 // One scan per window, never one per card. A forced refresh arriving during a scan
 // schedules a second read so a completion cannot be overwritten by an older snapshot.
+// (TPT9211) Every read asks shouldFetchMergeStatus() first. A project without the manual merge
+// UI sends no status request and drops any earlier snapshot, so switching Git off clears the
+// dots and Merge buttons at once; switching it back on is seen by the next forced read or by a
+// non-forced one after RECHECK_THROTTLE_MS.
 export async function refreshTaskMergeStatus(force = false) {
   const scope = JSON.stringify(projectHeader());
   if (scope !== project) {
@@ -66,13 +103,21 @@ export async function refreshTaskMergeStatus(force = false) {
     repaint();
   }
   if (pending) { refreshAgain ||= force; return pending; }
-  if (!force && (inapplicable || Date.now() - lastRead < 10000)) return;
+  if (!force && Date.now() - lastRead < (inapplicable ? RECHECK_THROTTLE_MS : SCAN_THROTTLE_MS)) return;
   pending = (async () => {
     try {
+      const applies = await shouldFetchMergeStatus();
+      // Settings of a project this window has since left: the re-read below serves the new one.
+      if (scope !== project) return;
+      if (!applies) {
+        state.taskMergeStatus = null;
+        inapplicable = true;
+        return;
+      }
       const snapshot = await api.merge.status();
       if (scope === project) {
         state.taskMergeStatus = snapshot;
-        inapplicable = snapshot?.vcs?.merge === true;
+        inapplicable = !manualMergeApplies(snapshot?.vcs);
       }
     } catch (err) {
       // Unknown/failed status must not advertise a merge action based on stale data.

@@ -105,6 +105,15 @@ function buildTaskChatSeed({ task, comments, project, tasks, openingMessage } = 
   return parts.join('\n\n');
 }
 
+function architectureToolsSection(prefix = '') {
+  return [
+    `- Architecture discovery: call \`${prefix}list_system_tags\` with {} and select an exact returned \`tag\` by its description before looking up a module. \`${prefix}get_project_tags\` lists task tags, not the architecture catalog.`,
+    `- Single architecture lookup: call \`${prefix}get_tag_architecture\` with {"tag_name":"<exact discovered tag>"}. The argument is \`tag_name\`, never \`tag\`.`,
+    `- Batch architecture lookup: call \`${prefix}get_tag_architectures\` with {"tag_names":["<exact discovered tag>"]}. Both lookup tools accept an optional \`section\` for an exact heading. Follow the advertised tool schema.`,
+    '- If a suggested tag is absent or its documentation is missing, refresh the architecture catalog and use an existing matching tag only when its description fits. Otherwise report the missing documentation. Never invent a tag name or create a system tag just to make a read succeed.',
+  ].join('\n');
+}
+
 function mcpToolsSection(provider) {
   const read = provider === 'codex'
     ? '- Source and KB files: read them with your shell. The sandbox is read-only — any write fails.'
@@ -114,6 +123,7 @@ function mcpToolsSection(provider) {
     read,
     '- Code search across architecture tags: `batch_grep_tags` on the `tipatask-local` MCP server (pass `symbols` for extra patterns).',
     '- Knowledge base: `list_system_tags`, `get_tag_architecture`, `get_tag_architectures`, `get_project_tags`, `list_task_resolutions` on the `tipatask` MCP server.',
+    architectureToolsSection(),
     '- Tasks: `list_tasks`, `get_task`, `create_task`, `update_task`, `delete_task`, `create_task_comment` on the `tipatask` MCP server.',
     '- Tags: `ensure_project_tag` (plain tags) and `create_system_tag` (`tt-*` tags) — register a tag with a real description before putting it on a task.',
   ].join('\n');
@@ -135,6 +145,7 @@ function piToolsSection(projectChat = false) {
     '  - tag table: GET /tags — register tags before using them: POST /tags with {"tags":[{"name":"...","description":"..."}]}',
     '  - statuses, members, sprints: GET /statuses, GET /members, GET /sprints',
     '  - shared KB files: GET /knowledge (list), GET /knowledge/<file_key>',
+    '  Discover architecture docs from GET /knowledge or ai/architecture/_index.json and use exact listed file keys or tags. If a suggested tag is absent, choose an existing match by its description or report missing documentation; never invent or register a tag just to read it.',
     '  Never invent an endpoint that is not listed here; the tool rejects everything else.',
   ].join('\n');
 }
@@ -148,6 +159,7 @@ function piBridgedToolsSection(projectChat = false) {
     '- The Tipatask MCP servers, bridged as native tools named `<server>__<tool>`. Wherever shared context names `mcp__tipatask__<tool>` or `mcp__tipatask-local__<tool>`, call `tipatask__<tool>` / `tipatask-local__<tool>`.',
     '- Code search across architecture tags: `tipatask-local__batch_grep_tags` (pass `symbols` for extra patterns).',
     '- Knowledge base: `tipatask__list_system_tags`, `tipatask__get_tag_architecture`, `tipatask__get_tag_architectures`, `tipatask__get_project_tags`, `tipatask__list_task_resolutions`.',
+    architectureToolsSection('tipatask__'),
     '- Tasks: `tipatask__list_tasks`, `tipatask__get_task`, `tipatask__create_task`, `tipatask__update_task`, `tipatask__delete_task`, `tipatask__create_task_comment`.',
     projectChat
       ? '  - `tipatask__create_task` needs a deliberate `priority`: the chosen sprint, or 0 for the backlog.'

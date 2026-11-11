@@ -128,3 +128,23 @@ test('fallbackModels: ids from config, label=id, first entry isLatest', () => {
   assert.strictEqual(codex[0].isLatest, true);
   assert.deepStrictEqual(fallbackModels('pi', config), []);
 });
+
+// (TPT9215) pickServedModel(): the explicit model a launch with none of its own should pass.
+test('pickServedModel: live catalog without the config model → catalog top model', () => {
+  const { pickServedModel } = require('./model-registry');
+  const entry = { source: 'probe', models: [
+    { id: 'gpt-6-astra', isLatest: false }, { id: 'gpt-6.1-sol', isLatest: true },
+  ] };
+  assert.equal(pickServedModel(entry, 'gpt-5.5'), 'gpt-6.1-sol');
+  assert.equal(pickServedModel(entry, ''), 'gpt-6.1-sol', 'no config model at all');
+  assert.equal(pickServedModel(entry, 'gpt-6-astra'), '', 'a listed config model is kept');
+  assert.equal(pickServedModel({ source: 'probe', models: [{ id: 'only', isLatest: false }] }, 'x'), 'only',
+    'no isLatest flag → first entry');
+});
+
+test('pickServedModel: no live catalog → no override', () => {
+  const { pickServedModel } = require('./model-registry');
+  assert.equal(pickServedModel(null, 'gpt-5.5'), '');
+  assert.equal(pickServedModel({ source: 'fallback', models: [{ id: 'gpt-6.1-sol', isLatest: true }] }, 'gpt-5.5'), '');
+  assert.equal(pickServedModel({ source: 'probe', models: [] }, 'gpt-5.5'), '');
+});

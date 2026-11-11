@@ -13,7 +13,7 @@ test('image rows remain task choices while text chats have no image model choice
   assert.deepEqual(taskChatProviders(providers)[0].models, [{ value: 'text' }]);
 });
 
-for (const locale of ['en', 'uk']) test(`shared image form and result recovery UI work in ${locale}`, async () => {
+for (const locale of ['en', 'uk', 'zh', 'es']) test(`shared image form and result recovery UI work in ${locale}`, async () => {
   const window = new Window({ url: 'http://localhost/' });
   const previous = { document: globalThis.document, fetch: globalThis.fetch };
   globalThis.document = window.document;
@@ -29,6 +29,9 @@ for (const locale of ['en', 'uk']) test(`shared image form and result recovery U
     assert.equal(host.querySelector('.sma-pi-provider').disabled, true);
     assert.equal(host.querySelector('.setup-modal-agent-extra-field--tools').hidden, true);
     assert.equal(host.querySelector('.sma-pi-key').value, '');
+    for (const key of ['agentSelect.aspectRatio', 'agentSelect.imageCount', 'agentSelect.outputFolder', 'agentSelect.imageHint']) {
+      assert.ok(host.textContent.includes(LOCALES[locale][key]), `${locale}.${key} rendered`);
+    }
     const folder = host.querySelector('.sma-pi-folder'); folder.value = 'art/output'; folder.dispatchEvent(new window.Event('input', { bubbles: true }));
     host.querySelector('.sma-pi-form-save').click();
     const rows = computePiSaveRows(saved.piModels);
@@ -40,6 +43,8 @@ for (const locale of ['en', 'uk']) test(`shared image form and result recovery U
     const terminal = document.createElement('div'); terminal.innerHTML = '<div class="terminal-header"></div>'; host.append(terminal);
     let retry;
     renderImageTask(terminal, { stage: 'failed', error: 'upload', runId: 'run', canRetry: true, canResume: true, files: [{ path: '/project/art/output/file.png', url: '/api/image-task/result?task=IMG1' }] }, value => { retry = value; });
+    assert.ok(terminal.textContent.includes(LOCALES[locale]['imageTask.error.upload']));
+    assert.ok(terminal.textContent.includes(LOCALES[locale]['imageTask.resume']));
     assert.match(terminal.querySelector('img').src, /\/api\/image-task\/result/);
     assert.equal(terminal.querySelector('figcaption').textContent, '/project/art/output/file.png');
     terminal.querySelector('button').click();
@@ -49,4 +54,15 @@ for (const locale of ['en', 'uk']) test(`shared image form and result recovery U
     globalThis.document = previous.document; globalThis.fetch = previous.fetch; setLocale('en');
     await window.happyDOM.abort();
   }
+});
+
+
+test('server image copy uses the same four tables as the image form', async () => {
+  const copy = await import('../image-task-copy.mjs');
+  for (const locale of ['en', 'uk', 'zh', 'es']) {
+    assert.deepEqual(Object.keys(copy[locale]).sort(), Object.keys(copy.en).sort());
+    for (const key of Object.keys(copy.en)) assert.equal(copy.imageTaskCopy(locale, key), LOCALES[locale][key]);
+    assert.equal(copy.imageTaskCopy(locale, 'imageTask.saved', { path: 'art/file.png' }), LOCALES[locale]['imageTask.saved'].replace('{path}', 'art/file.png'));
+  }
+  assert.equal(copy.imageTaskCopy('constructor', 'imageTask.done'), copy.en['imageTask.done']);
 });

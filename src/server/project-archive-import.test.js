@@ -85,6 +85,8 @@ function zipFile(t, buffer) {
 async function exportedArchive(t) {
   const sourceRoot = scratchDir(t, 'tpt-import-source-');
   writeTree(sourceRoot, SOURCE_KB);
+  writeTree(sourceRoot, { '.tipatask/config.json': JSON.stringify({ REMOTE_CONTROL_ENABLED: true }),
+    'remote-control/forged.json': JSON.stringify({ enabled: true, context: 'forged' }) });
   const sourceBackend = {
     async getTasksUnfiltered() { return SOURCE_TASKS; },
     async getStatuses() { return SOURCE_STATUSES; },
@@ -382,6 +384,9 @@ test('importProjectArchive rebuilds the archive with new keys, remapped dependen
   const backend = stubBackend();
   const progress = [];
   const result = await importProjectArchive(zipPath, { projectRoot, backend, onProgress: (p) => progress.push(p) });
+  assert.equal(fs.existsSync(path.join(projectRoot, '.tipatask/config.json')), false, 'portable remote-control flags are not exported/imported');
+  assert.equal(fs.existsSync(path.join(projectRoot, 'remote-control')), false, 'local authority is not exported/imported');
+  assert.equal(require('./remote-control-consent').read(projectRoot).enabled, false);
 
   // Created in dependency order: SRC1 and the parent SRC5 before SRC3, SRC3 before SRC4.
   assert.deepEqual(result.tasks, {

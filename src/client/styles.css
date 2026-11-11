@@ -866,6 +866,7 @@
   .sidebar-toggle {
     width: 28px;
     height: 28px;
+    flex-shrink: 0; /* stays round when the rows overflow .left-nav-main */
     margin: auto 0 0.75rem 0.75rem;
     border: 1px solid var(--c-border);
     border-radius: 50%;
@@ -1150,17 +1151,43 @@
     flex-shrink: 0;
   }
 
+  /* (TPT9201) Agent and human rows are two of these: each sizes to its rows, so no free space
+     opens between them, and they share a shortage in proportion. min-height is one row, which a
+     visible list always has: neither can squeeze the other out of the rail. */
   .active-sessions-list {
     display: flex;
     flex-direction: column;
     gap: 0.15rem;
     overflow-y: auto;
     overflow-x: hidden;
-    min-height: 0;
-    flex: 1 1 auto;
+    min-height: 32px;
+    flex: 0 1 auto;
     /* (TPT171) was `scrollbar-width: thin` — collapsed panel is only 56px, so a classic bar would
        eat a quarter of it. The global 10px webkit bar is already thinner than Chromium's stock thin
        (11px), and setting scrollbar-width here would opt this list out of the themed thumb. */
+  }
+
+  /* The flex display and the row floor above outrank the UA [hidden] rule. */
+  .active-sessions-list[hidden] { display: none; }
+
+  /* (TPT9201) Label over the human rows, on their icon column (.active-session-item padding plus
+     its 1px border). No label in the icon-only rail: the person glyph tells the rows apart. */
+  .active-human-tasks-heading {
+    flex-shrink: 0;
+    padding: 0.5rem calc(0.5rem + 1px) 0.1rem;
+    overflow: hidden;
+    color: var(--c-text-muted);
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    line-height: 1.3;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  body.left-nav-collapsed .active-human-tasks-heading { display: none; }
+  @media (max-width: 768px) {
+    .active-human-tasks-heading { display: none; }
   }
 
   .active-session-item {
@@ -1324,6 +1351,30 @@
     stroke-width: 2.4;
   }
 
+  /* (TPT9239) A run the web app started: a globe on the agent icon's bottom-right corner. The
+     .needs-attention dot owns the top-right corner and the completed tick the centre, so all three
+     can show at once. Nested in the icon span like the tick: zero row width, and the 48px collapsed
+     rail shows it too. The card-coloured disc and ring keep it legible over the agent glyph. */
+  .session-origin-badge {
+    position: absolute;
+    right: -4px;
+    bottom: -3px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: var(--c-bg-card);
+    box-shadow: 0 0 0 1px var(--c-bg-card);
+    color: var(--c-primary-text);
+    pointer-events: none;
+  }
+  .session-origin-badge svg {
+    width: 11px;
+    height: 11px;
+  }
+
   /* (C1152) Per-row terminate control — hover/focus-revealed so idle rows stay clean.
      opacity (not display:none) reserves the 16px so hovering never reflows/re-ellipsizes
      .active-session-title. Modeled on .chat-tab-close + .tag-chip-close's hover-reveal. */
@@ -1415,7 +1466,9 @@
     font-size: 0.8rem;
     font-weight: 500;
     line-height: 1.35;
-    white-space: normal;
+    /* (TPT9239) Wraps like normal, and keeps the row text's line breaks: the task, then the web
+       origin and permission-mode lines under it. */
+    white-space: pre-line;
     overflow-wrap: anywhere;
     pointer-events: none;
   }
@@ -2367,6 +2420,8 @@
       margin-top: 0;
       margin-left: 6px;
     }
+    /* (TPT9208) .tier prefix: outranks the later base .tier-actions counter-rotation. */
+    .tier .tier-actions { transform: none; }
     /* (C1580) .tier-cards is a flex row now — grid-column: span 2 doesn't apply anymore, so
        every card variant is forced to the container's full width the same way instead.
        !important: the unconditional adaptive-width rule below (.tier-cards > .card.card--wide
@@ -2765,24 +2820,13 @@
     position: relative;
   }
 
+  /* (TPT9288) The title always starts at its first letter and a long one ends in an ellipsis — at
+     rest, on hover and when expanded; there is no marquee. The full title is the hover pill
+     below. The inner span stays inline: an inline-block is an atomic inline, which text-overflow
+     clips at the edge instead of ellipsizing, and which a canceled card's line-through on
+     .card-title never reaches. */
   .card-title-inner {
-    display: inline-block;
-  }
-
-  /* Marquee scrolls when card is hovered or expanded */
-  .card:hover .card-title.is-overflowing,
-  .card-expanded .card-title.is-overflowing {
-    text-overflow: clip;
-  }
-
-  .card:hover .card-title.is-overflowing .card-title-inner,
-  .card-expanded .card-title.is-overflowing .card-title-inner {
-    animation: marquee-scroll 12s linear infinite;
-  }
-
-  /* Pause marquee on direct title hover (tooltip shown via JS) */
-  .card-title.is-overflowing:hover .card-title-inner {
-    animation-play-state: paused;
+    display: inline;
   }
 
   /* Title tooltip (appended to body via JS). (C1568) .card-btn-tooltip — the four
@@ -2824,15 +2868,10 @@
     left: auto;
   }
 
-  @keyframes marquee-scroll {
-    0%   { transform: translateX(0); }
-    100% { transform: translateX(-100%); }
-  }
-
   /* ── Card actions: Select + drop-down action menu (TPT306) ──
      .card-btn-group sits at the right end of .card-top. At rest it is invisible but keeps its
-     slot (opacity, never display:none), so the title width never changes on hover and
-     refreshTitleOverflow() can measure as-is. Card hover, pin-expand, selection or keyboard
+     slot (opacity, never display:none), so the title width and its ellipsis point never change
+     on hover. Card hover, pin-expand, selection or keyboard
      focus reveals only the Select pill; hovering / focusing the group opens the narrow
      .card-action-menu tray around Select, which grows down to reveal Highlight Related,
      Rehash and Delete. The negative block
@@ -2855,7 +2894,7 @@
   .card.has-left-uncommitted .card-btn-group,
   .card.card-expanded .card-btn-group,
   .card.selected .card-btn-group,
-  .card-btn-group:focus-within {
+  .card-btn-group:has(:focus-visible) {
     opacity: 1;
     pointer-events: auto;
   }
@@ -2868,7 +2907,8 @@
      Opening is two-step: the box fades in around Select, then height grows to auto
      (interpolate-size) to reveal the actions; closing reverses it. visibility (not just
      opacity) keeps the hidden items out of the Tab order: Tab onto Select opens it via
-     :focus-within, the next Tab steps into it. */
+     :has(:focus-visible), the next Tab steps into it. Pointer focus does not count: a clicked
+     button keeps focus after the cursor leaves, and that must not hold the tray open. */
   .card-btn-group .btn-select-card {
     position: relative;
     z-index: 1;
@@ -2889,9 +2929,9 @@
     pointer-events: none;
   }
   .card-btn-group:hover > .btn-select-card .merge-attention-dot,
-  .card-btn-group:focus-within > .btn-select-card .merge-attention-dot,
+  .card-btn-group:has(:focus-visible) > .btn-select-card .merge-attention-dot,
   .card-btn-group:hover > .btn-select-card .finish-attention-dot,
-  .card-btn-group:focus-within > .btn-select-card .finish-attention-dot { visibility: hidden; }
+  .card-btn-group:has(:focus-visible) > .btn-select-card .finish-attention-dot { visibility: hidden; }
   .card-action-menu {
     position: absolute;
     top: -5px;
@@ -2920,7 +2960,7 @@
     flex: 0 0 32px;
   }
   .card-btn-group:hover .card-action-menu,
-  .card-btn-group:focus-within .card-action-menu {
+  .card-btn-group:has(:focus-visible) .card-action-menu {
     height: auto;
     opacity: 1;
     visibility: visible;
@@ -3007,8 +3047,10 @@
   .card { overflow: clip; }
   /* (TPT306) Let the open .card-action-menu escape a short card's clip. Truncated cards are
      ≥500px tall, so the menu always fits inside them and they keep their clip. z-index lifts a
-     resting card's menu over its neighbours; an expanded card's inline 101 still wins. */
-  .card:not(.is-truncated):has(.card-btn-group:is(:hover, :focus-within)) {
+     resting card's menu over its neighbours; an expanded card's inline 101 still wins.
+     :has() cannot nest, so keyboard focus is a descendant branch here rather than
+     .card-btn-group:has(:focus-visible). */
+  .card:not(.is-truncated):has(.card-btn-group:hover, .card-btn-group :focus-visible) {
     overflow: visible !important;
     z-index: 102;
   }
@@ -3158,9 +3200,6 @@
     min-width: 100px;
     cursor: text;
   }
-  .card-title.editing .card-title-inner {
-    animation: none !important;
-  }
 
   /* Markdown elements inside .card-desc */
   .card-desc p, .modal-desc-display p { margin-bottom: 0.4em; }
@@ -3208,6 +3247,11 @@
     gap: 6px;
     overflow: hidden;
     min-height: 0;
+    /* (TPT9283) The clip above would cut the controls' focus rings (2px outline, 1px offset) on
+       every edge of the row; a 3px pad keeps them inside it, given back by an equal negative
+       margin so the row's size and position stay put. */
+    padding: 3px;
+    margin: -3px;
   }
 
   .task-card-hover-controls .controls-row {
@@ -3341,6 +3385,32 @@
   .task-card-hover-controls .card-permission-btn:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 1px; }
   .task-card-hover-controls .card-permission-btn--override { border-color: var(--c-primary-border); color: var(--c-primary-text); }
 
+  /* (TPT9268/TPT9271/TPT9283) Discuss, just left of Start (card-discuss.js): a plain action that
+     opens the task's chat, not a menu button. An icon-only square the permission shield's size
+     (height from the shared .card-ctl rule above, width the same token; placed later, so its
+     width and zero padding win), drawn as the outlined secondary control next to the filled
+     Start: transparent fill, --c-primary-border edge, --c-primary-text glyph (the AA accent
+     tokens, as on a closed card's Start). On hover it fills with the --c-primary-lighter tint
+     over the open card's own ground, opaque: a bare tint over a closed card's darker or
+     danger-tinted ground drops the glyph under AA in some palettes. */
+  .task-card-hover-controls .btn-task-discuss {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--card-ctrl-h);
+    padding-inline: 0;
+    border: 1.5px solid var(--c-primary-border);
+    background: transparent;
+    color: var(--c-primary-text);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .task-card-hover-controls .btn-task-discuss svg { width: 15px; height: 15px; flex-shrink: 0; }
+  .task-card-hover-controls .btn-task-discuss:hover {
+    background: linear-gradient(var(--c-primary-lighter), var(--c-primary-lighter)), var(--c-bg-card);
+  }
+  .task-card-hover-controls .btn-task-discuss:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 1px; }
   /* Status select dropdown styled as pill */
   .status-select,
   .card-status-select {
@@ -4377,31 +4447,135 @@
     border-color: #047857;
   }
 
-  /* ── Sprint play-all button (in .tier-label vertical sidebar) ── */
-  .btn-sprint-play {
+  /* ── Sprint context actions (TPT9208) ──
+     Same pattern as a card's .card-btn-group: the round select-all pill (.btn-tier-select)
+     anchors a .tier-action-menu tray that frames it and, on hover or keyboard focus, grows
+     sideways to reveal Start (.btn-sprint-play). The group is upright text inside the rotated
+     vertical sidebar (writing-mode reset + counter-rotation, as the old lone Start did), so the
+     tray always opens to the right — over the cards in the expanded sidebar, along the header
+     when the sprint is collapsed. visibility (not just opacity) keeps a closed tray's Start out
+     of the Tab order: Tab onto the pill opens it via :has(:focus-visible), the next Tab steps in.
+     .is-dismissed (Escape, task-card.js) closes it until pointer and focus leave the group. */
+  .tier-actions {
     writing-mode: horizontal-tb;
     transform: rotate(180deg);
+    position: relative;
+    z-index: 1; /* above the label's transformed ::after chevron, which an open tray covers */
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    letter-spacing: normal;
+    text-transform: none;
+    cursor: default;
+  }
+  .tier.collapsed .tier-actions { transform: none; }
+  /* The open tray overlaps the first cards — lift the label above them while it is open. */
+  .tier-label:has(.tier-actions:hover:not(.is-dismissed)),
+  .tier-label:has(.tier-actions:not(.is-dismissed) :focus-visible) { z-index: 3; }
+  .tier-actions button {
+    box-sizing: border-box;
+    height: 28px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    flex-shrink: 0;
+    border-radius: 6px;
+    cursor: pointer;
+    font: inherit;
+    transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
+  }
+  .btn-tier-select {
+    position: relative;
+    z-index: 1; /* paints above its own tray frame */
+    width: 28px;
+    padding: 0;
+    background: var(--c-bg-card);
+    border: 1px solid var(--c-border);
+    box-shadow: 0 1px 2px var(--c-shadow);
+  }
+  .btn-tier-select .select-dot {
+    box-sizing: border-box;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--c-text-muted);
+    background: transparent;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .btn-tier-select:hover:not(:disabled) {
+    border-color: #22c55e;
+    background: var(--c-bg-card);
+  }
+  .btn-tier-select:hover:not(:disabled) .select-dot { border-color: #22c55e; }
+  .btn-tier-select.checked { border-color: #22c55e; }
+  .btn-tier-select.checked .select-dot {
+    border-color: #22c55e;
+    background: #22c55e;
+    box-shadow: inset 0 0 0 2px var(--c-bg-card);
+  }
+  .btn-tier-select:disabled { opacity: 0.4; cursor: default; }
+  .tier-actions button:focus-visible {
+    outline: 2px solid var(--c-primary-border);
+    outline-offset: 2px;
+  }
+  .tier-action-menu {
+    position: absolute;
+    top: -5px;
+    left: -5px;
+    z-index: 0;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
     gap: 4px;
-    padding: 2px 5px;
-    border-radius: 4px;
-    border: 1.5px solid var(--c-primary);
+    padding: 4px;
+    width: 38px;
+    height: 38px;
+    overflow: clip;
+    interpolate-size: allow-keywords;
+    background: var(--c-bg-card);
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    box-shadow: 0 4px 12px var(--c-shadow);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: width 150ms ease, opacity 120ms ease 120ms, visibility 0s linear 240ms;
+  }
+  /* The select pill's slot inside the tray — pushes Start to its right. */
+  .tier-action-menu::before {
+    content: '';
+    flex: 0 0 28px;
+  }
+  .tier-actions:not(.is-dismissed):hover .tier-action-menu,
+  .tier-actions:not(.is-dismissed):has(:focus-visible) .tier-action-menu {
+    width: auto;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition: opacity 120ms ease, width 180ms ease 100ms, visibility 0s;
+  }
+  /* Start keeps the old play button's primary fill, now a labelled pill inside the tray. */
+  .btn-sprint-play {
+    gap: 5px;
+    padding: 0 10px;
+    border: 1px solid var(--c-primary);
     background: var(--c-primary);
     color: var(--c-on-primary);
-    cursor: pointer;
-    transition: background 0.15s, border-color 0.15s;
-    flex-shrink: 0;
-    font-size: 0.72rem;
+    font-size: 0.75rem;
     font-weight: 600;
-    letter-spacing: 0.02em;
+    white-space: nowrap;
   }
   .btn-sprint-play:hover { background: var(--c-primary-hover); border-color: var(--c-primary-hover); }
   .btn-sprint-play:disabled { opacity: 0.5; cursor: wait; }
-  .btn-sprint-play-label { display: none; }
-  .tier.collapsed .btn-sprint-play { transform: none; padding: 2px 6px; }
-  .tier.collapsed .btn-sprint-play-label { display: inline; }
+  .theme-dark .btn-tier-select { border-color: rgba(255,255,255,0.18); box-shadow: 0 1px 2px rgba(0,0,0,0.4); }
+  .theme-dark .btn-tier-select.checked,
+  .theme-dark .btn-tier-select:hover:not(:disabled) { border-color: #22c55e; }
+  @media (prefers-reduced-motion: reduce) {
+    .tier-action-menu,
+    .tier-actions:not(.is-dismissed):hover .tier-action-menu,
+    .tier-actions:not(.is-dismissed):has(:focus-visible) .tier-action-menu { transition: none; }
+  }
 
   /* ── Terminate session button (next to Resume on completed cards) ── */
   .btn-terminate {
@@ -5157,6 +5331,8 @@
   /* Shared control metric */
   .bulk-action-bar .bulk-btn,
   .bulk-action-bar .bulk-status-select,
+  .bulk-action-bar .bulk-cowboy-select,
+  .bulk-action-bar .bulk-model-select,
   .bulk-action-bar .bulk-priority-combo .sprint-combo-input,
   .bulk-action-bar .bulk-assignee-input,
   .bulk-action-bar .agent-picker-trigger {
@@ -5175,13 +5351,19 @@
     transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
   }
   .bulk-action-bar .bulk-status-select,
+  .bulk-action-bar .bulk-cowboy-select,
+  .bulk-action-bar .bulk-model-select,
   .bulk-action-bar .bulk-priority-combo .sprint-combo-input,
   .bulk-action-bar .agent-picker-trigger { cursor: pointer; }
   .bulk-action-bar .bulk-status-select:hover,
+  .bulk-action-bar .bulk-cowboy-select:hover,
+  .bulk-action-bar .bulk-model-select:hover,
   .bulk-action-bar .bulk-priority-combo .sprint-combo-input:hover,
   .bulk-action-bar .bulk-assignee-input:hover,
   .bulk-action-bar .agent-picker-trigger:hover { border-color: var(--c-primary); }
   .bulk-action-bar .bulk-status-select:focus-visible,
+  .bulk-action-bar .bulk-cowboy-select:focus-visible,
+  .bulk-action-bar .bulk-model-select:focus-visible,
   .bulk-action-bar .bulk-priority-combo .sprint-combo-input:focus,
   .bulk-action-bar .bulk-assignee-input:focus,
   .bulk-action-bar .agent-picker-trigger:focus-visible,
@@ -5190,6 +5372,15 @@
     box-shadow: 0 0 0 2px var(--c-primary-light, rgba(139,92,246,0.25));
   }
   .bulk-action-bar .bulk-status-select { width: 140px; }
+  .bulk-action-bar .bulk-cowboy-select { width: 180px; }
+  /* (TPT9212) Model select beside the agent picker, shown while the staged agent has models. */
+  .bulk-model {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .bulk-model[hidden] { display: none; }
+  .bulk-action-bar .bulk-model-select { width: 160px; text-overflow: ellipsis; }
   .bulk-action-bar .bulk-priority-combo .sprint-combo-input { width: 110px; }
   .bulk-action-bar .bulk-assignee-input { width: 160px; cursor: text; }
   .bulk-action-bar .agent-picker-trigger { min-width: 130px; }
@@ -5255,6 +5446,8 @@
   /* .bulk-btn's inline-flex would otherwise beat the UA [hidden] rule (Reset at rest). */
   .bulk-action-bar .bulk-btn[hidden] { display: none; }
   .bulk-action-bar .bulk-field.is-staged .bulk-status-select,
+  .bulk-action-bar .bulk-field.is-staged .bulk-cowboy-select,
+  .bulk-action-bar .bulk-field.is-staged .bulk-model-select,
   .bulk-action-bar .bulk-field.is-staged .bulk-priority-combo .sprint-combo-input,
   .bulk-action-bar .bulk-field.is-staged .bulk-assignee-input,
   .bulk-action-bar .bulk-field.is-staged .agent-picker-trigger {
@@ -5573,6 +5766,22 @@
     color: #fff;
   }
   .terminal-agent-dot svg { width: 12px; height: 12px; display: block; }
+
+  /* (TPT9239) Web-started run: a globe right after the agent dot, inside the caption chip, so it
+     stays when narrow widths hide the caption text. Named by its own aria-label/title. */
+  .terminal-origin-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 18px;
+    height: 18px;
+    margin-left: -2px;
+    border-radius: 50%;
+    color: var(--c-primary-text);
+    background: color-mix(in srgb, var(--c-primary) 14%, transparent);
+  }
+  .terminal-origin-badge svg { width: 12px; height: 12px; display: block; }
 
   /* Connection dot — console-modal.js overwrites className wholesale ('status-dot exited' …),
      so never hang extra classes or per-element state on it. */
@@ -7147,8 +7356,8 @@
   /* (TPT299) An unsaved proposal's id badge is rendered `hidden` (the NEW label is the only
      badge); .id-badge's inline-flex would otherwise beat the UA [hidden] rule. */
   .card.preview-card .id-badge[hidden] { display: none; }
-  /* (TPT299) Title takes its own full-width line and wraps — never clipped, never the
-     is-overflowing marquee (specificity 0,4,0, after the marquee rules). */
+  /* (TPT299) Title takes its own full-width line and wraps — never clipped or ellipsized. Its
+     .card-title-inner is the base inline span, so the text wraps inside it. */
   .card.preview-card .card-top--proposal {
     flex-wrap: wrap;
     row-gap: 4px;
@@ -7162,10 +7371,6 @@
     overflow: visible;
     text-overflow: clip;
     overflow-wrap: anywhere;
-  }
-  .card.preview-card .card-top--proposal .card-title .card-title-inner {
-    display: inline;
-    animation: none;
   }
   /* (TPT346) A proposal title wraps in full, so its hover pill (task-card.js, only shown when the
      card clips the title) must wrap the same way instead of the base one-line nowrap pill, which
@@ -9869,7 +10074,7 @@
   .task-chat-resumed-note { font-size: 0.78rem; color: var(--c-warning); }
 
   /* Attachments (TPT473): the shared Embed control (embed-menu.js) in the composer, the
-     upload status, file drop on the panel, and thumbnails / chips in user turns. */
+     upload status, file drop on the panel, and a user turn's inline images and file chips. */
   .task-chat-embed-slot { display: inline-flex; flex-shrink: 0; }
   .task-chat-embed-slot .embed-menu-trigger { min-height: 30px; padding: 0 10px; font-size: 0.76rem; }
 
@@ -9904,6 +10109,35 @@
   .task-chat-msg--user .task-chat-user-text { white-space: pre-wrap; }
   .task-chat-msg--user .task-chat-user-text + .task-chat-attachments { margin-top: 0.45rem; }
 
+  /* A user turn's attachment links are .file-attachment-link (C1246, further down): an inline-flex
+     box with a paperclip ::before, for links in rendered markdown. The turn draws its own markers
+     — an image's frame, a chip's file icon — so these rules out-rank that one rather than follow
+     it, and the paperclip stays off. */
+  .task-chat-msg--user .file-attachment-link::before { content: none; }
+
+  /* An image of a user turn sits in its text, where its reference was inserted: a thumbnail on
+     the text line, bottom-aligned with it, that wraps like a word. The width bound is fixed on
+     the link (a percentage would not cap the bubble's own sizing); a bubble narrower than it
+     shrinks the link, and the image follows through its 100%. */
+  .task-chat-user-text .task-chat-inline-image {
+    display: inline-block;
+    max-width: 240px;
+    margin: 0.2rem 0.15rem;
+    vertical-align: bottom;
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    background: var(--c-bg-card);
+    overflow: hidden;
+  }
+  .task-chat-user-text .task-chat-inline-image:hover { border-color: var(--c-primary); }
+  .task-chat-user-text .task-chat-inline-image:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
+
+  .task-chat-user-text .task-chat-inline-image img {
+    display: block;
+    max-width: 100%;
+    max-height: 160px;
+  }
+
   .task-chat-attachments {
     display: flex;
     flex-wrap: wrap;
@@ -9927,13 +10161,6 @@
   }
   .task-chat-attach:hover { border-color: var(--c-primary); }
   .task-chat-attach:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
-
-  .task-chat-attach--image img {
-    display: block;
-    max-width: 160px;
-    max-height: 120px;
-    object-fit: cover;
-  }
 
   .task-chat-attach--file {
     gap: 0.4rem;
@@ -9970,7 +10197,8 @@
     .task-chat-hint { display: none; }
     .task-chat-selector-slot { flex: 1; }
     .task-chat-embed-slot .embed-menu-label { display: none; }
-    .task-chat-attach--image img { max-width: 120px; max-height: 90px; }
+    .task-chat-user-text .task-chat-inline-image { max-width: 180px; }
+    .task-chat-user-text .task-chat-inline-image img { max-height: 120px; }
     .task-chat-widget--dialog { padding: 0.6rem 0.65rem; }
     .task-chat-dialog-actions { flex-direction: column; align-items: stretch; }
     .task-chat-dialog-submit { margin-left: 0; }
@@ -12041,6 +12269,12 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   background: var(--c-primary-light); color: var(--c-primary-text);
   border-radius: 12px; padding: 2px 8px; font-size: 0.78rem; font-weight: 700;
 }
+/* (TPT9216) A dependency key whose task holds the complete or canceled role, wherever keys are
+   listed: dependency chips, the card's "Deps:" labels, the New Task Preview, chat proposal cards
+   and the to-do drawer. dependencyKeyMarkup() (task-card.js) wraps only the key text, so a chip's
+   .chip-remove button, the "Deps:" prefix and the separators stay undecorated. The line is drawn
+   in the key's own colour; nothing else about the key changes. */
+.dependency-key-closed { text-decoration: line-through; }
 .modal-dep-input {
   border: none; outline: none; background: transparent;
   font-size: 0.85rem; font-family: inherit; color: var(--c-text);

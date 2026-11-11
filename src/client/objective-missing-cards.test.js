@@ -163,6 +163,6 @@ test('objectiveMissingCards: provider errors remain actionable and empty notices
   assert.match(h.cs.messages.at(-1).content, /Codex stream failed/);
   setLocale('uk');
   try {
-    assert.match(h.env.objectiveProposalNotice({ proposalResult: { status: 'empty', reason: 'TPT9036' } }), /Змін задач.*\nTPT9036/);
+    assert.match(h.env.objectiveProposalNotice({ proposalResult: { status: 'empty', reason: 'TPT9036' } }), /Змін завдань.*\nTPT9036/);
   } finally { setLocale('en'); }
 });

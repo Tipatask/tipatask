@@ -8,7 +8,7 @@
 // mounted there through mount(); open() routes to that workspace. The project chat (left menu
 // "Start Chat") stays a window of its own.
 import { buildWsUrl, wsSend, terminateTaskSession, WS_SEND_TYPES, WS_RECV_TYPES } from './ws-client.js';
-import { renderMarkdown, escapeAttr, autoGrowTextarea, projectHeader, showToast } from './utils.js';
+import { renderMarkdown, escapeAttr, autoGrowTextarea, projectHeader, showToast, setValueKeepingCaret } from './utils.js';
 import { modelLabel, CHAT_BUBBLE_SVG } from './constants.js';
 import state from './state.js';
 import { activateDialogFocus } from './dialog-focus.js';
@@ -19,19 +19,19 @@ import { attachImagePaste } from './task-board.js';
 import { attachAudioRecorder } from './audio-recorder.js';
 import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu } from './embed-menu.js';
 import {
-  taskChatProviders, pickSelection, buildModelOptionsHtml, stripAskUserFence,
+  taskChatProviders, pickSelection, isSelectable, buildModelOptionsHtml, stripAskUserFence,
   visibleHistory, upsertById, shortToolName, hasWidgets, collapseTaskEvents,
   dialogSubmission, localAnswer, dialogWidgetHtml, toolChipHtml,
   userMessageHtml, stripPendingImageRefs, messageCopyText,
   dialogState, lastTurnMessage, isDialogAnswerTurn, answeredDialog,
   resumedIndicator, providerName, historyQuery, historyRowHtml, historyFocusIndex,
+  TASK_CHAT_MODEL_STORAGE_KEY,
 } from './task-chat-model.js';
 
 const SESSION_PREFIX = 'taskChat:';
 const PROJECT_SESSION_PREFIX = 'projectChat:';
-// Sticky model choice for this window. Deliberately not the objective chat's key: the two
-// chats offer different provider sets and a pick here must not move the planner's default.
-const MODEL_STORAGE_KEY = 'tipatask-task-chat-model';
+// Sticky model choice: the start gate's and the composer's default on the next open.
+const MODEL_STORAGE_KEY = TASK_CHAT_MODEL_STORAGE_KEY;
 const DRAFT_STORAGE_PREFIX = 'tipatask-task-chat-draft:';
 const STICK_THRESHOLD_PX = 64;
 const FRESH_START_TIMEOUT_MS = 3000;
@@ -67,6 +67,7 @@ let awaitingStart = false;  // the start gate is up: connected, no session, noth
 let starting = false;       // Start was pressed on this socket — a second press sends nothing
 let resuming = false;       // a start frame with a historyId went out; waiting for resumed / refused
 let listOnTurn = false;     // (TPT9116) a task chat was just started here: list it in the left menu on its first turn frame
+let launchMissed = '';      // (TPT9268/TPT9271) a preselected model the server no longer offers — named on the start gate
 // (TPT539) History picker at the start gate: earlier chats of this task (or project chats).
 let historyRows = [];
 let historyStatus = 'idle'; // 'idle' | 'loading' | 'ready' | 'error'
@@ -99,26 +100,40 @@ const projectDraftChats = new Map();
 // storage is blocked; localStorage carries them across a renderer reload.
 const composerDrafts = new Map();
 
-export async function open(taskId) {
+// Opens a task's chat. With no chat yet it lands on the start gate: its model selector lists the
+// task chat's own models (the `config` frame's providers, taskChatProviders()) with the saved or
+// default choice selected (pickSelection()), and nothing runs until Start chat. An existing chat
+// comes back with its transcript. (TPT9271) The card Discuss button opens it exactly like this.
+// `opts.model` ("provider:model") only preselects that model — on the gate, or for an existing
+// chat's next message; it never starts a chat by itself.
+export async function open(taskId, opts = {}) {
   const key = String(taskId || '').trim();
   if (!key) return;
+  const launch = launchOf(opts);
   const openWorkspace = window.TipTask?.openTaskWorkspace;
-  if (typeof openWorkspace === 'function') return openWorkspace(key, { pane: 'chat' });
+  if (typeof openWorkspace === 'function') return openWorkspace(key, launch ? { pane: 'chat', chat: launch } : { pane: 'chat' });
   openSeq++;
-  openChat({ kind: 'task', key, sessionId: SESSION_PREFIX + key, title: '' });
+  openChat({ kind: 'task', key, sessionId: SESSION_PREFIX + key, title: '', launch });
+}
+
+// (TPT9268) A launch request: `{ model }` when `opts.model` is a "provider:model" string, else null.
+function launchOf(opts) {
+  const model = opts && typeof opts.model === 'string' ? opts.model.trim() : '';
+  return model.indexOf(':') > 0 ? { model } : null;
 }
 
 // (TPT466) The task's chat inside `host` — a workspace pane — rather than a window of its own.
 // The pane's modal owns the backdrop, focus layer, Escape and heading; this fills the rest.
 // The returned handle: show()/hide() for pane switches (transcript, scroll and typed text stay
 // as they are), dispose() to detach (the server chat keeps running), taskEdited(key) to tell
-// the agent about a save made in the Edit pane. `onOpenTask(key)` handles a task card click;
-// `onClosed()` fires if the chat closes on its own (another window took it over).
-export function mount(host, taskId, { onOpenTask, onClosed } = {}) {
+// the agent about a save made in the Edit pane, launch({ model }) to preselect a model later
+// (TPT9268/TPT9271). `onOpenTask(key)` handles a task card click; `onClosed()` fires if the chat
+// closes on its own (another window took it over). `launch` is the model this pane opened with.
+export function mount(host, taskId, { onOpenTask, onClosed, launch } = {}) {
   const key = String(taskId || '').trim();
   if (!host || !key) return null;
   openSeq++;
-  openChat({ kind: 'task', key, sessionId: SESSION_PREFIX + key, title: '' }, { host, onOpenTask, onClosed });
+  openChat({ kind: 'task', key, sessionId: SESSION_PREFIX + key, title: '', launch: launchOf(launch) }, { host, onOpenTask, onClosed });
   const target = chat;
   const live = () => chat === target && !!root;
   return {
@@ -143,6 +158,9 @@ export function mount(host, taskId, { onOpenTask, onClosed } = {}) {
     },
     taskEdited(editedKey) {
       if (live() && connected && ws) wsSend(ws, WS_SEND_TYPES.TASK_CHAT_TASK_EDITED, { taskKey: editedKey || key });
+    },
+    launch(next) {
+      if (live()) applyLaunch(launchOf(next));
     },
   };
 }
@@ -283,8 +301,11 @@ export async function openProjectChat({ chatId = '' } = {}) {
 function openChat(target, embedOpts = null) {
   if (chat) close();
   const projectPath = projectHeader()['x-tipatask-project'] || '';
-  chat = { ...target, draftKey: DRAFT_STORAGE_PREFIX + JSON.stringify([projectPath, target.sessionId]) };
+  // (TPT9268/TPT9271) `launch` is a preselected model waiting for the first `config` frame,
+  // which tells whether this chat already exists.
+  chat = { ...target, launch: target.launch || null, draftKey: DRAFT_STORAGE_PREFIX + JSON.stringify([projectPath, target.sessionId]) };
   embedded = embedOpts;
+  launchMissed = '';
   messages = [];
   providers = taskChatProviders(state.objectiveProviders);
   selection = pickSelection({ providers, stored: readStoredSelection(), fallback: state.objectiveModel });
@@ -346,6 +367,7 @@ export function close() {
   starting = false;
   resuming = false;
   listOnTurn = false;
+  launchMissed = '';
   pendingAnswer = null;
   clearTimeout(historyTimer);
   historyTimer = null;
@@ -468,6 +490,11 @@ function renderWindow() {
     stickToBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= STICK_THRESHOLD_PX;
     if (stickToBottom) root.querySelector('.task-chat-jump').hidden = true;
   });
+  // An image in the transcript takes its height only once it has loaded: a transcript that was at
+  // its end stays there.
+  scroller.addEventListener('load', (e) => {
+    if (e.target && e.target.tagName === 'IMG' && stickToBottom) scrollToBottom(false);
+  }, true);
 
   if (!host) {
     // Capture phase, and only while this window is the top dialog layer: with the Task Edit Modal
@@ -647,6 +674,8 @@ function renderSelector() {
     slot.innerHTML = `<div class="chat-model-selector"><label for="${id}">${escapeAttr(t('field.model'))}</label>`
       + `<select id="${id}"${running ? ' disabled' : ''}>${options}</select></div>`;
     const select = slot.querySelector('select');
+    // Set the value outright as well as through `selected`, which some DOMs drop from innerHTML.
+    if (selection && [...select.options].some(o => o.value === selection)) select.value = selection;
     // Nothing matched `selection` (model no longer offered): adopt what the select fell back to.
     if (select.value && select.value !== selection) selection = select.value;
     select.addEventListener('change', () => setSelection(select.value));
@@ -654,9 +683,16 @@ function renderSelector() {
   syncStartGate();
 }
 
-function setSelection(value) {
-  selection = value;
+// The sticky choice, read back by pickSelection() on the next open.
+function rememberSelection() {
+  if (!selection) return;
   try { localStorage.setItem(MODEL_STORAGE_KEY, selection); } catch { /* private mode */ }
+}
+
+function setSelection(value, { remember = true } = {}) {
+  selection = value;
+  launchMissed = ''; // a model is chosen now; the missed preselection no longer applies
+  if (remember) rememberSelection();
   for (const [, id] of SELECTOR_SLOTS) {
     const select = root && root.querySelector(`#${id}`);
     if (select && select.value !== value) select.value = value;
@@ -692,8 +728,11 @@ function syncStartGate() {
   go.textContent = t(starting ? 'taskChat.start.starting' : (hasHistory ? 'taskChat.history.newChat' : 'taskChat.start.button'));
   go.disabled = !awaitingStart || starting || !connected || noUsableModel();
   const note = gate.querySelector('.task-chat-start-note');
-  note.hidden = !noUsableModel();
-  note.textContent = noUsableModel() ? t('taskChat.start.noModels') : '';
+  // Looked up when drawn, so a language switch rewrites it.
+  const noteText = noUsableModel() ? t('taskChat.start.noModels')
+    : launchMissed ? t('taskChat.start.launchUnavailable', { model: launchModelName(launchMissed) }) : '';
+  note.hidden = !noteText;
+  note.textContent = noteText;
   const error = gate.querySelector('.task-chat-history-error');
   error.hidden = !historyError;
   error.textContent = historyError;
@@ -710,6 +749,8 @@ function beginChat() {
   starting = true;
   awaitingStart = false;
   historyError = '';
+  launchMissed = '';
+  rememberSelection(); // the model Start chat ran on is the next open's default (a preselection was not saved yet)
   // The server lists a task chat once its start is accepted, before the CLI reports a session.
   listOnTurn = chat.kind === 'task';
   syncStartGate();
@@ -727,6 +768,48 @@ function focusComposer() {
   if (!active || active === document.body || !root.contains(active) || active.closest('.task-chat-start, .task-chat-header')) {
     input.focus({ preventScroll: true });
   }
+}
+
+// ── Model preselection (TPT9268/TPT9271) ──
+// A chat opened with `{ model }` (open(), mount(), the handle's launch()) gets that model as its
+// selection once the socket's `config` frame says whether the chat exists. It never starts a
+// chat: a new chat shows the start gate with the model selected, and only Start chat runs it; an
+// existing one keeps its transcript and sends its next message with that model. A model the server
+// does not offer now is never selected: the gate names it above the chat's own default.
+
+function applyLaunch(launch) {
+  if (!launch || !chat) return;
+  if (!connected) {
+    chat.launch = launch; // the next `config` frame applies it
+    // A dead socket or an ended chat sends no more frames: connect afresh, as their notice's Retry does.
+    if (!ws || ended) reconnect();
+    return;
+  }
+  if (awaitingStart) { gateFromLaunch(launch); return; }
+  adoptLaunchModel(launch);
+  focusComposer();
+}
+
+// Called with the gate state for this socket: connected, no session, nothing sent yet. The gate
+// shows with the model selected; it is saved as the sticky choice only once Start chat runs it.
+function gateFromLaunch(launch) {
+  if (isSelectable(providers, launch.model)) setSelection(launch.model, { remember: false });
+  else launchMissed = launch.model;
+  showStartGate();
+}
+
+function adoptLaunchModel(launch) {
+  if (!isSelectable(providers, launch.model)) {
+    showToast(t('taskChat.start.launchUnavailable', { model: launchModelName(launch.model) }), 'error');
+    return;
+  }
+  if (launch.model !== selection) setSelection(launch.model);
+}
+
+// "provider:model" → the model's display label.
+function launchModelName(raw) {
+  const i = String(raw || '').indexOf(':');
+  return i > 0 ? modelLabel(raw.slice(0, i), raw.slice(i + 1)) : String(raw || '');
 }
 
 // A history pick continues that saved session: its historyId goes instead of the model.
@@ -954,7 +1037,8 @@ function buildMessageEl(m) {
   } else {
     el.innerHTML = '<div class="task-chat-body"></div>';
     const body = el.querySelector('.task-chat-body');
-    // A user turn shows its attachments as thumbnails and chips; a notice is plain text.
+    // A user turn shows its images inline, where they were inserted, and its files as chips; a
+    // notice is plain text.
     if (m.role === 'user') body.innerHTML = userMessageHtml(m.content, { t });
     else body.textContent = m.content;
     if (m.retry) {
@@ -1416,9 +1500,11 @@ function applyEditedTask(task) {
 // ── Attachments ──
 // The objective chat's Embed control (embed-menu.js), clipboard image paste (task-board.js
 // attachImagePaste) and file drop, all inserting their markdown reference into the composer
-// textarea — so the reference is part of the `task-chat-message` content. The Embed control lives
-// in the composer only, never on the start gate; the drop target is the whole panel, so a file
-// dropped before Start waits in the composer draft for the first message.
+// textarea at the caret (insertAtCursor()) — so the reference is part of the `task-chat-message`
+// content, and an image shows in the sent turn where it was inserted. Swapping an uploaded
+// image's `blob:` placeholder for its URL keeps the caret (setValueKeepingCaret()). The Embed
+// control lives in the composer only, never on the start gate; the drop target is the whole
+// panel, so a file dropped before Start waits in the composer draft for the first message.
 
 function wireAttachments(input) {
   const gen = ++uploadGen;
@@ -1432,9 +1518,9 @@ function wireAttachments(input) {
     if (!live()) return;
     uploadsPending = Math.max(0, uploadsPending - 1);
     if (!uploadsPending) {
-      // A failed image upload leaves its blob placeholder behind.
-      const cleaned = stripPendingImageRefs(input.value);
-      if (cleaned !== input.value) { input.value = cleaned; rememberDraft(); growInput(); }
+      // A failed image upload leaves its blob placeholder behind. The caret stays where it was,
+      // so the next paste or Embed still goes in at the caret.
+      if (setValueKeepingCaret(input, stripPendingImageRefs(input.value))) { rememberDraft(); growInput(); }
     }
     syncComposer();
   };
@@ -1689,12 +1775,17 @@ function handleFrame(msg) {
       }
       syncEmptyState();
       syncComposer();
+      // (TPT9268/TPT9271) A preselected model is applied once, here, where it is known whether a chat exists.
+      const launch = chat && chat.launch;
+      if (chat) chat.launch = null;
       if (!sawReset) {
-        // No session behind this socket: wait for the user's model choice and Start.
+        // No session behind this socket: wait for the user's model choice and Start chat.
         wantFresh = false;
         clearTimeout(freshTimer);
-        showStartGate();
+        if (launch) gateFromLaunch(launch);
+        else showStartGate();
       } else {
+        if (launch) adoptLaunchModel(launch);
         focusComposer();
       }
       break;

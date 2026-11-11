@@ -18,6 +18,8 @@ const {
   classifyClaimants,
   reregisterBundle,
   ensureLaunchServicesHealthy,
+  inspectRegistration,
+  repairRegistrationWithVerification,
 } = require('./ls-registration');
 
 // Verbatim from bundle-signature.test.js — scriptedCalls: array of {code, stdout, stderr}
@@ -210,4 +212,133 @@ version:                    0.8.32 ({length = 32})
   });
   assert.equal(result2.repaired, false);
   assert.equal(exec2.calls.length, 1); // only -dump, no -f
+});
+
+const SELF = '/Applications/TipATask.app';
+const COPY = '/tmp/build/TipATask.app';
+const INSTALLER = '/Volumes/TipATask installer/TipATask.app';
+const STALE = '/Volumes/Old installer/TipATask.app';
+const records = (...paths) => paths.map(p => `\n--------------------------------------------------------------------------------\npath: ${p}\nidentifier: com.tipatask.app\nversion: 0.9.19\n`).join('');
+const existing = { access: async p => { if (p === STALE) throw new Error('ENOENT'); } };
+const options = exec => ({ bundlePath: SELF, bundleId: 'com.tipatask.app', deps: { exec, fs: existing } });
+
+test('inspection deduplicates paths and reads version after identifier', async () => {
+  const exec = mockExec([{ code: 0, stdout: records(SELF, COPY, COPY) }]);
+  const snapshot = await inspectRegistration(options(exec));
+  assert.equal(snapshot.conflicts, 1);
+  assert.deepEqual(snapshot.conflictPaths, [COPY]);
+  const claims = await listBundleClaimants('com.tipatask.app', { exec });
+  assert.equal(claims[0].version, '0.9.19');
+});
+
+test('canonical paths identify self across symlinks and macOS /var aliases', async () => {
+  const runningPath = '/var/tmp/TipATask.app';
+  const registeredPath = '/private/var/tmp/TipATask.app';
+  const result = await classifyClaimants({
+    claimants: [{ path: registeredPath }], runningPath,
+    fs: { realpath: async () => registeredPath, access: async () => {} },
+  });
+  assert.equal(result.self.path, registeredPath);
+  assert.deepEqual(result.liveConflicts, []);
+});
+
+test('mounted installer blocks repair without unregistering, ejecting or re-registering anything', async () => {
+  const exec = mockExec([{ code: 0, stdout: records(SELF, INSTALLER, COPY) }]);
+  const result = await repairRegistrationWithVerification(options(exec));
+  assert.equal(result.ok, false);
+  assert.equal(result.outcome, 'blocked-installer');
+  assert.equal(result.relaunchNeeded, false);
+  assert.deepEqual(result.registration.installerVolumes, [INSTALLER]);
+  assert.deepEqual(exec.calls.map(c => c.args), [['-dump']]);
+});
+
+test('running from the installer itself also blocks repair', async () => {
+  const exec = mockExec([{ code: 0, stdout: records(INSTALLER) }]);
+  const result = await repairRegistrationWithVerification({ ...options(exec), bundlePath: INSTALLER });
+  assert.equal(result.outcome, 'blocked-installer');
+  assert.deepEqual(exec.calls.map(c => c.args), [['-dump']]);
+});
+
+test('after ejection, repair removes duplicate/stale claims by path and verifies own registration', async () => {
+  const exec = mockExec([
+    { code: 0, stdout: records(SELF, COPY, STALE) },
+    { code: 0 }, { code: 0 }, { code: 0 },
+    { code: 0, stdout: records(SELF) },
+  ]);
+  const result = await repairRegistrationWithVerification(options(exec));
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'verified');
+  assert.equal(result.relaunchNeeded, true);
+  assert.deepEqual(exec.calls.map(c => c.args), [['-dump'], ['-u', COPY], ['-u', STALE], ['-f', SELF], ['-dump']]);
+  // A fresh process/open sees the same clean snapshot, independent of the startup marker.
+  const reopened = await inspectRegistration(options(exec));
+  assert.equal(reopened.registered, true);
+  assert.equal(reopened.conflicts, 0);
+  assert.equal(reopened.staleCount, 0);
+});
+
+test('command success cannot conceal remaining duplicates, stale claims or missing self', async () => {
+  for (const after of [records(SELF, COPY), records(SELF, STALE), records(COPY)]) {
+    const exec = mockExec([{ code: 0, stdout: records(SELF) }, { code: 0 }, { code: 0, stdout: after }]);
+    const result = await repairRegistrationWithVerification(options(exec));
+    assert.equal(result.ok, false);
+    assert.equal(result.outcome, 'verification-failed');
+    assert.equal(result.relaunchNeeded, false);
+  }
+});
+
+test('clean registration is re-registered and verified without unregistering self', async () => {
+  const exec = mockExec([{ code: 0, stdout: records(SELF) }, { code: 0 }, { code: 0, stdout: records(SELF) }]);
+  assert.equal((await repairRegistrationWithVerification(options(exec))).ok, true);
+  assert.deepEqual(exec.calls.map(c => c.args), [['-dump'], ['-f', SELF], ['-dump']]);
+});
+
+test('repair surfaces unregister/register errors even if the final dump looks clean', async () => {
+  for (const unregisterFails of [false, true]) {
+    const exec = mockExec([
+      { code: 0, stdout: records(SELF, COPY) },
+      { code: unregisterFails ? 1 : 0, stderr: 'unregister denied' },
+      { code: unregisterFails ? 0 : 1, stderr: 'register denied' },
+      { code: 0, stdout: records(SELF) },
+    ]);
+    const result = await repairRegistrationWithVerification(options(exec));
+    assert.equal(result.outcome, 'repair-error');
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /denied/);
+    assert.equal(result.registration.conflicts, 0);
+  }
+});
+
+test('unknown/empty registration checks never report clean or mutate before inspection succeeds', async () => {
+  for (const failure of [{ code: 1, stderr: 'timed out' }, { code: 0, stdout: '' }]) {
+    const exec = mockExec([failure]);
+    const result = await repairRegistrationWithVerification(options(exec));
+    assert.equal(result.outcome, 'verification-failed');
+    assert.equal(result.registration.checked, false);
+    assert.equal(result.registration.conflicts, null);
+    assert.deepEqual(exec.calls.map(c => c.args), [['-dump']]);
+  }
+  const throwing = () => { throw new Error('spawn failed'); };
+  const result = await repairRegistrationWithVerification(options(throwing));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'spawn failed');
+});
+
+test('failed post-repair dump cannot report verified success', async () => {
+  const exec = mockExec([{ code: 0, stdout: records(SELF) }, { code: 0 }, { code: 1, stderr: 'dump failed' }]);
+  const result = await repairRegistrationWithVerification(options(exec));
+  assert.equal(result.outcome, 'verification-failed');
+  assert.equal(result.ok, false);
+});
+
+test('read-only diagnostic validates mounted, duplicate, stale, clean and unknown outcomes', () => {
+  const { parseArgs, registrationOutcome } = require('../../scripts/probe-notif-registration');
+  assert.equal(parseArgs(['--after-repair']).afterRepair, true);
+  const clean = { checked: true, registered: true, conflicts: 0, staleCount: 0, installerVolumes: [] };
+  assert.match(registrationOutcome(clean), /^VERIFIED/);
+  assert.match(registrationOutcome({ ...clean, conflicts: 1 }), /^INCOMPLETE/);
+  assert.match(registrationOutcome({ ...clean, staleCount: 1 }), /^INCOMPLETE/);
+  assert.match(registrationOutcome({ ...clean, registered: false }), /^INCOMPLETE/);
+  assert.match(registrationOutcome({ ...clean, installerVolumes: [INSTALLER] }), /^BLOCKED/);
+  assert.match(registrationOutcome({ ...clean, checked: false, reason: 'timeout' }), /^UNKNOWN/);
 });

@@ -10,7 +10,7 @@ const { LOCALES, normalizeLocale, terminalCopy } = require('./terminal-copy');
 
 const placeholders = (s) => [...String(s).matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort();
 
-test('every locale defines exactly the keys en defines, non-empty, and uk never repeats the English text', () => {
+test('every locale defines exactly the keys en defines, non-empty, and translations never repeat the English text', () => {
   const enKeys = Object.keys(LOCALES.en);
   assert.ok(enKeys.length > 50, 'the table covers every server notice');
   for (const [locale, table] of Object.entries(LOCALES)) {
@@ -22,18 +22,18 @@ test('every locale defines exactly the keys en defines, non-empty, and uk never 
     for (const [locale, table] of Object.entries(LOCALES)) {
       assert.ok(table[key].trim(), `${locale}.${key} must be a non-empty string`);
     }
-    assert.notEqual(LOCALES.uk[key], LOCALES.en[key], `uk.${key} must not be the English text`);
+    for (const locale of ['uk', 'zh', 'es']) assert.notEqual(LOCALES[locale][key], LOCALES.en[key], `${locale}.${key} must not be the English text`);
   }
 });
 
 test('every translation keeps exactly the placeholders its English template uses', () => {
   for (const key of Object.keys(LOCALES.en)) {
-    assert.deepEqual(placeholders(LOCALES.uk[key]), placeholders(LOCALES.en[key]), `uk.${key} placeholders`);
+    for (const locale of ['uk', 'zh', 'es']) assert.deepEqual(placeholders(LOCALES[locale][key]), placeholders(LOCALES.en[key]), `${locale}.${key} placeholders`);
   }
 });
 
 test('normalizeLocale: known locales pass through, anything else is en', () => {
-  assert.equal(normalizeLocale('uk'), 'uk');
+  for (const locale of ['uk', 'zh', 'es']) assert.equal(normalizeLocale(locale), locale);
   assert.equal(normalizeLocale('en'), 'en');
   for (const bad of ['xx', '', null, undefined, 42, 'UK', 'constructor']) assert.equal(normalizeLocale(bad), 'en');
 });

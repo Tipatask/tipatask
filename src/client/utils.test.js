@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { JSDOM } from 'jsdom';
 
-const { parseObjectiveResult, buildUsedIds, upsertTaskEntry, buildObjectivePrompt, isPristineObjectiveTab, captureSubtaskCtx, tabSubtaskContext, subtaskCtxFromChatState, pushSubtaskCrumb, createLiveInserter, isSubmitShortcut, submitShortcutLabel, canSubmitObjective, renderMarkdown, truncateMarkdownAtParagraph, computeTooltipAnchor, isRectClipped, loadErrorGuidance, taskOpenErrorLabel, TODO_SERVER_CMD, TODO_SERVER_URL } = await import('./utils.js');
+const { parseObjectiveResult, buildUsedIds, upsertTaskEntry, buildObjectivePrompt, isPristineObjectiveTab, captureSubtaskCtx, tabSubtaskContext, subtaskCtxFromChatState, pushSubtaskCrumb, createLiveInserter, insertAtCursor, setValueKeepingCaret, isSubmitShortcut, submitShortcutLabel, canSubmitObjective, renderMarkdown, truncateMarkdownAtParagraph, computeTooltipAnchor, isRectClipped, loadErrorGuidance, taskOpenErrorLabel, TODO_SERVER_CMD, TODO_SERVER_URL } = await import('./utils.js');
 
 function installRendererWindow() {
   const prior = globalThis.window;
@@ -833,4 +833,63 @@ test('live insertion: shortening and empty partials replace only the owned span'
   assert.equal(el.value, 'before  after');
   live.commit('hello.');
   assert.equal(el.value, 'before hello.  after');
+});
+
+// (TPT9279) A real <textarea>: assigning .value moves its caret to the end, which is what the
+// helper exists to avoid.
+function textarea(value, start, end = start, direction = 'none') {
+  const dom = new JSDOM('<textarea></textarea>');
+  const el = dom.window.document.querySelector('textarea');
+  el.value = value;
+  el.setSelectionRange(start, end, direction);
+  return el;
+}
+
+test('(TPT9279) setValueKeepingCaret: an upload swap keeps the caret on the text it was on', () => {
+  const before = 'see ![img](blob:x/1) now';
+  const after = 'see ![img](http://h/api/projects/2/images/5) now';
+  const delta = after.length - before.length;
+  const caretAfterRef = before.indexOf(' now');
+  let el = textarea(before, caretAfterRef);
+  assert.equal(setValueKeepingCaret(el, after), true);
+  assert.equal(el.value, after);
+  assert.deepEqual([el.selectionStart, el.selectionEnd], [caretAfterRef + delta, caretAfterRef + delta], 'after the swap: moved by its length change');
+  el = textarea(before, 2);
+  setValueKeepingCaret(el, after);
+  assert.deepEqual([el.selectionStart, el.selectionEnd], [2, 2], 'before the swap: unmoved');
+  el = textarea(before, before.indexOf('x/1'));
+  setValueKeepingCaret(el, after);
+  assert.deepEqual([el.selectionStart, el.selectionEnd], Array(2).fill(after.indexOf(') now')), 'inside the swapped span: at its new end');
+  el = textarea(before, 1, before.length - 1, 'backward');
+  setValueKeepingCaret(el, after);
+  assert.deepEqual([el.selectionStart, el.selectionEnd, el.selectionDirection], [1, after.length - 1, 'backward'], 'a selection around it grows with it');
+});
+
+test('(TPT9279) setValueKeepingCaret: removed placeholders keep the caret between its letters; an unchanged value is left alone', () => {
+  let el = textarea('ab![img](blob:x/2)cd', 'ab![img](blob:x/2)c'.length);
+  assert.equal(setValueKeepingCaret(el, 'abcd'), true);
+  assert.deepEqual([el.selectionStart, el.selectionEnd], [3, 3]);
+  el = textarea('a![img](blob:1)b![img](blob:2)c', 'a![img](blob:1)b'.length);
+  setValueKeepingCaret(el, 'abc');
+  assert.deepEqual([el.selectionStart, el.selectionEnd], [2, 2], 'two removals around the caret: still after b');
+  el = textarea('same', 1, 3);
+  assert.equal(setValueKeepingCaret(el, 'same'), false);
+  assert.deepEqual([el.selectionStart, el.selectionEnd], [1, 3]);
+});
+
+test('(TPT9279) after a swap the next insertAtCursor() lands at the caret, not at the end', (t) => {
+  const el = textarea('Look at this and tell me', 'Look at this '.length);
+  // insertAtCursor() fires its input event with the global Event: use the textarea's own.
+  const prior = Object.getOwnPropertyDescriptor(globalThis, 'Event');
+  Object.defineProperty(globalThis, 'Event', { value: el.ownerDocument.defaultView.Event, configurable: true, writable: true });
+  t.after(() => Object.defineProperty(globalThis, 'Event', prior));
+  insertAtCursor(el, '![img](blob:x/1)');
+  setValueKeepingCaret(el, el.value.replace('blob:x/1', '/api/projects/2/images/5'));
+  insertAtCursor(el, '![img](blob:x/2)');
+  assert.equal(el.value, 'Look at this ![img](/api/projects/2/images/5)![img](blob:x/2)and tell me');
+  // Assigning the value directly would have sent the second image to the end.
+  const plain = textarea('Look at this ![img](blob:x/1)and tell me', 'Look at this ![img](blob:x/1)'.length);
+  plain.value = plain.value.replace('blob:x/1', '/api/projects/2/images/5');
+  insertAtCursor(plain, '![img](blob:x/2)');
+  assert.ok(plain.value.endsWith('and tell me![img](blob:x/2)'));
 });

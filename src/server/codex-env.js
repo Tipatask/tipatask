@@ -13,6 +13,7 @@ const config = require('./config');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir } = require('./spawn-utils');
 const { ensureProjectCodexHome, prepareCodexTerminalHome, tomlValue } = require('../codex-mcp-config');
 const { permissionError } = require('./permission-policy');
+const { SERVER_NAME: COMPUTER_USE_SERVER, PLAN_TOOLS } = require('./computer-use');
 
 function policyToCodexConfig(mode) {
   // Plan retains the user's sandbox; planning itself is the existing prompt gate.
@@ -22,13 +23,29 @@ function policyToCodexConfig(mode) {
   throw permissionError('invalid');
 }
 
-function codexPermissionOverrides(policy, parsed) {
+function codexPermissionOverrides(policy, parsed, computerUse) {
+  const desktop = {};
+  const resolved = computerUse?.available && computerUse.provider === 'codex';
+  const prefix = `mcp_servers.${JSON.stringify(COMPUTER_USE_SERVER)}`;
+  if (resolved || parsed.mcp_servers?.[COMPUTER_USE_SERVER]) {
+    if (resolved) {
+      desktop[`${prefix}.command`] = computerUse.server.command;
+      desktop[`${prefix}.args`] = computerUse.server.args;
+      desktop[`${prefix}.env_vars`] = computerUse.server.env_vars || [];
+      desktop[`${prefix}.tool_timeout_sec`] = computerUse.server.tool_timeout_sec || 150;
+      desktop[`${prefix}.enabled`] = true;
+    }
+    desktop[`${prefix}.default_tools_approval_mode`] = 'approve';
+    if (policy?.mode !== 'auto' && policy?.mode !== 'bypass') {
+      desktop[`${prefix}.enabled_tools`] = [...PLAN_TOOLS];
+    }
+  }
   // Planning is a prompt gate; execution continues with native user approvals.
   if (policy?.mode === 'plan') {
     const { sandbox_mode, ...overrides } = policyToCodexConfig('plan');
-    return overrides;
+    return { ...overrides, ...desktop };
   }
-  if (!policy?.enforced) return {};
+  if (!policy?.enforced) return desktop;
   if (parsed.default_permissions) throw permissionError('unsupported', {
     mode: policy.mode, agent: 'codex', supportReason: 'codexProfiles',
   });
@@ -54,12 +71,13 @@ function codexPermissionOverrides(policy, parsed) {
   }
   for (const [id, server] of Object.entries(parsed.mcp_servers || {})) {
     const prefix = `mcp_servers.${JSON.stringify(id)}`;
-    result[`${prefix}.default_tools_approval_mode`] = auto ? 'prompt' : 'approve';
+    const approval = id === COMPUTER_USE_SERVER ? 'approve' : auto ? 'prompt' : 'approve';
+    result[`${prefix}.default_tools_approval_mode`] = approval;
     for (const tool of Object.keys(server.tools || {})) {
-      result[`${prefix}.tools.${JSON.stringify(tool)}.approval_mode`] = auto ? 'prompt' : 'approve';
+      result[`${prefix}.tools.${JSON.stringify(tool)}.approval_mode`] = approval;
     }
   }
-  return result;
+  return { ...result, ...desktop };
 }
 
 const CODEX_REASONING_EFFORT = 'high';
@@ -176,11 +194,11 @@ function codexEffortArgs(level = CODEX_REASONING_EFFORT) {
 
 // Legacy interactive consoles share immutable native homes without CLI overrides.
 // Enforced permission modes use embedded sessions and authoritative CLI overrides.
-function codexTerminalLaunchOptions(projectRoot, codexHome, level = CODEX_REASONING_EFFORT, env = null, policy = null) {
+function codexTerminalLaunchOptions(projectRoot, codexHome, level = CODEX_REASONING_EFFORT, env = null, policy = null, computerUse = null) {
   const base = toml.parse(fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8'));
-  const overrides = codexPermissionOverrides(policy, base);
+  const overrides = codexPermissionOverrides(policy, base, computerUse);
   const home = prepareCodexTerminalHome({ projectRoot, codexHome, effort: level, env: env || {}, overrides });
-  if (policy?.enforced && policy.mode !== 'plan') {
+  if ((policy?.enforced && policy.mode !== 'plan') || Object.keys(overrides).some(key => key.startsWith('mcp_servers.'))) {
     // An explicit embedded launch gives these overrides precedence over project-layer
     // config. Legacy shared-daemon launches retain their zero-override contract.
     const args = ['--no-daemon'];
@@ -190,7 +208,7 @@ function codexTerminalLaunchOptions(projectRoot, codexHome, level = CODEX_REASON
     for (const key of new Set(Object.keys(overrides).map(key => key.split('.')[0]))) {
       args.push('-c', `${key}=${tomlValue(effective[key])}`);
     }
-    return { args, mode: 'embedded', reason: `permission-${policy.mode}`, codexHome: home };
+    return { args, mode: 'embedded', reason: `permission-${policy?.mode || 'plan'}`, codexHome: home };
   }
   const terminalEnv = env && { ...env, CODEX_HOME: home };
   const parsed = toml.parse(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'));
@@ -199,6 +217,34 @@ function codexTerminalLaunchOptions(projectRoot, codexHome, level = CODEX_REASON
   // isolation: use the native explicit mode switch and report the actual cause.
   if (reason) return { args: ['--no-daemon'], mode: 'embedded', reason, codexHome: home };
   return { args: [], mode: 'shared', reason: 'compatible-project-config', codexHome: home };
+}
+
+/**
+ * The model to pass with --model / -m when a Codex launch resolved none of its own (no task
+ * or project model). Codex would then run the `model` its CODEX_HOME config.toml names —
+ * inherited from the user's global config, and possibly one the CLI no longer serves. When
+ * the cached live catalog (model-registry.js, never probed here) does not list that model,
+ * this returns the catalog's top model; otherwise ''. A config that routes to a non-OpenAI
+ * `model_provider` is left alone: the catalog only describes OpenAI-served models. Never
+ * throws — an unreadable config or cache means no override.
+ * @returns {{ model: string, configModel: string }}
+ */
+function servedCodexModelOverride(codexHome, cfg = config) {
+  let configModel = '';
+  try {
+    const parsed = toml.parse(fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8'));
+    configModel = typeof parsed.model === 'string' ? parsed.model.trim() : '';
+    const provider = typeof parsed.model_provider === 'string' ? parsed.model_provider.trim() : '';
+    if (provider && provider !== 'openai') return { model: '', configModel };
+  } catch {
+    // Missing or unparsable config: Codex runs its built-in default, which the catalog judges.
+  }
+  try {
+    const { peekModelEntry, pickServedModel } = require('./task-agent/model-registry');
+    return { model: pickServedModel(peekModelEntry('codex', cfg), configModel), configModel };
+  } catch {
+    return { model: '', configModel };
+  }
 }
 
 function codexTerminalEffortArgs(...args) {
@@ -213,7 +259,7 @@ function codexTerminalEffortArgs(...args) {
  *   'xterm-256color' (interactive PTY terminal task spawns).
  * @returns {{ env: object }}
  */
-function buildCodexEnv({ projectRoot, taskId, term = 'dumb' } = {}) {
+function buildCodexEnv({ projectRoot, taskId, term = 'dumb', computerUse } = {}) {
   const root = projectRoot || config.PROJECT_ROOT;
   const serverRoot = config.SERVER_ROOT;
   const wrapperName = process.platform === 'win32' ? 'mcp-node.cmd' : 'mcp-node';
@@ -246,10 +292,11 @@ function buildCodexEnv({ projectRoot, taskId, term = 'dumb' } = {}) {
     projectRoot: root,
     mcpServerPath: path.join(serverRoot, 'src', 'mcp', 'server.js'),
     nodePath: path.join(serverRoot, 'bin', wrapperName),
+    computerUse,
   });
   env.CODEX_HOME = prepared.projectCodexDir;
   env.TIPATASK_CODEX_GLOBAL_HOME = prepared.globalCodexDir;
   return { env };
 }
 
-module.exports = { CODEX_REASONING_EFFORT, buildCodexEnv, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, terminalDaemonFallback, toCodexEffort, codexPermissionOverrides, policyToCodexConfig };
+module.exports = { CODEX_REASONING_EFFORT, buildCodexEnv, servedCodexModelOverride, codexEffortArgs, codexTerminalEffortArgs, codexTerminalLaunchOptions, terminalDaemonFallback, toCodexEffort, codexPermissionOverrides, policyToCodexConfig };

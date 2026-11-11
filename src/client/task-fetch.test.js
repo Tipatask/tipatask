@@ -76,8 +76,8 @@ test('start and hand-off load-failure keys exist in en and uk', () => {
     assert.equal(t('card.errStartLoad', { id: 'C1', msg: 'boom' }), 'Could not load task C1 to start it: boom');
     assert.equal(t('handoff.errLoad', { id: 'C1', msg: 'boom' }), 'Could not load C1 for Objective chat: boom');
     setLocale('uk');
-    assert.match(t('card.errStartLoad', { id: 'C1', msg: 'boom' }), /^Не вдалося завантажити задачу C1 для запуску: boom$/);
-    assert.match(t('handoff.errLoad', { id: 'C1', msg: 'boom' }), /^Не вдалося завантажити C1 для чату цілі: boom$/);
+    assert.match(t('card.errStartLoad', { id: 'C1', msg: 'boom' }), /^Не вдалося завантажити завдання C1 для запуску: boom$/);
+    assert.match(t('handoff.errLoad', { id: 'C1', msg: 'boom' }), /^Не вдалося завантажити C1 для чату мети: boom$/);
   } finally {
     setLocale('en');
   }

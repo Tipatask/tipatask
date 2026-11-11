@@ -65,7 +65,40 @@ test('.active-session-tooltip is a fixed, wrapping, non-interactive, capped box'
   assert.ok(m, '.active-session-tooltip rule not found');
   assert.match(m[1], /position:\s*fixed/);
   assert.match(m[1], /pointer-events:\s*none/);
-  assert.match(m[1], /white-space:\s*normal/);
+  // (TPT9239) pre-line still wraps, and keeps the task / web origin / permission lines apart.
+  assert.match(m[1], /white-space:\s*pre-line/);
   assert.match(m[1], /max-width:\s*320px/);
   assert.match(m[1], /var\(--c-bg-card/);
+});
+
+// (TPT9239) A run the web app started: a globe badge inside the agent icon span (zero row width,
+// so the collapsed rail shows it too) and a tooltip / aria-label line naming the web origin.
+test('a web-started row carries the globe badge on its agent icon and names the web origin', async () => {
+  const { SESSION_ORIGIN_BADGE } = await import('./session-origin.js');
+  const words = { 'terminal.webOrigin': 'Started from the web app' };
+  const context = vm.createContext({
+    isCompleteName: () => false, escapeAttr: value => String(value).replace(/"/g, '&quot;'),
+    t: (key, params) => (key === 'nav.sessionTooltip' ? `${params.key} — ${params.title}` : words[key] || key),
+    _sessionAgentIcon: () => '<svg class="agent"></svg>', SESSION_DONE_BADGE: '<span class="session-check"></span>', SESSION_ORIGIN_BADGE,
+  });
+  vm.runInContext(renderFn.replace('export ', ''), context);
+  const html = context.renderActiveSessionsList([{ taskId: 'TPT1', title: 'Fix', webOrigin: true, permissionTip: 'Permission mode: Auto' }], false);
+  assert.match(html, /class="active-session-item session-web-origin"/);
+  assert.match(html, /<span class="active-session-icon"><svg class="agent"><\/svg><span class="session-origin-badge" aria-hidden="true"><svg /);
+  assert.match(html, /data-tooltip="TPT1 — Fix\nStarted from the web app\nPermission mode: Auto"/);
+  assert.match(html, /aria-label="TPT1 — Fix\nStarted from the web app\nPermission mode: Auto"/);
+  const collapsed = context.renderActiveSessionsList([{ taskId: 'TPT1', title: 'Fix', webOrigin: true }], true);
+  assert.match(collapsed, /session-origin-badge/, 'the icon-only rail keeps the globe');
+  const local = context.renderActiveSessionsList([{ taskId: 'TPT2', title: 'Other', permissionTip: 'Permission mode: Auto' }], false);
+  assert.doesNotMatch(local, /session-origin-badge|session-web-origin|Started from the web app/);
+  assert.match(local, /data-tooltip="TPT2 — Other\nPermission mode: Auto"/, 'a local row reads as before');
+});
+
+test('the row globe sits on the icon corner the attention dot and completed tick leave free', () => {
+  const badge = css.match(/\.session-origin-badge\s*\{([^}]*)\}/)?.[1] || '';
+  assert.match(badge, /position:\s*absolute/);
+  assert.match(badge, /right:\s*-4px/);
+  assert.match(badge, /bottom:\s*-3px/);
+  assert.match(badge, /pointer-events:\s*none/);
+  assert.match(badge, /color:\s*var\(--c-primary-text\)/, 'the AA accent text token, as theme-default.test.js requires');
 });

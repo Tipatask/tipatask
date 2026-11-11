@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test, after } from 'node:test';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import {
   AGENT_PERMISSION_MODES, PERMISSION_MODE_LABEL_KEYS, PERMISSION_MODE_HINT_KEYS,
   PERMISSION_MODE_ICONS, permissionModeIcon,
@@ -94,12 +94,12 @@ test('cowboyModeOn needs the flag and an effective Bypass; the tip carries the m
     assert.equal(cowboyModeOn({ agentPermissionMode: mode, cowboyMode: true }, mode === null ? 'auto' : 'bypass'), false, `a stored flag under ${mode ?? 'inherited Auto'} is off`);
   }
   assert.equal(cowboyModeOn(null, 'bypass'), false);
-  assert.equal(permissionModeTip({ agentPermissionMode: 'bypass', cowboyMode: true }, 'auto', t), 'Permission mode: Bypass · 🤠 Cowboy-coding mode');
-  assert.equal(permissionModeTip({ agentPermissionMode: null, cowboyMode: true }, 'bypass', t), 'Permission mode: Project Default (Bypass) · 🤠 Cowboy-coding mode');
+  assert.equal(permissionModeTip({ agentPermissionMode: 'bypass', cowboyMode: true }, 'auto', t), 'Permission mode: Bypass · 🤠 Cowboy-coding mode (Whole Project)');
+  assert.equal(permissionModeTip({ agentPermissionMode: null, cowboyMode: true }, 'bypass', t), 'Permission mode: Project Default (Bypass) · 🤠 Cowboy-coding mode (Whole Project)');
   assert.equal(permissionModeTip({ agentPermissionMode: 'auto', cowboyMode: true }, 'bypass', t), 'Permission mode: Auto mode', 'no marker outside Bypass');
   assert.equal(permissionModeTip({ agentPermissionMode: 'bypass', cowboyMode: false }, 'auto', t), 'Permission mode: Bypass');
   setLocale('uk');
-  assert.equal(permissionModeTip({ agentPermissionMode: 'bypass', cowboyMode: true }, 'auto', t), 'Режим дозволів: Без підтверджень · 🤠 Ковбойський режим');
+  assert.equal(permissionModeTip({ agentPermissionMode: 'bypass', cowboyMode: true }, 'auto', t), 'Режим дозволів: Без підтверджень · 🤠 Ковбойський режим (Увесь проєкт)');
   setLocale('en');
 });
 
@@ -232,4 +232,25 @@ test('liveModeErrorText names the target, a localized reason (server text for un
   setLocale('uk');
   assert.equal(failed('unsupported'), 'Не вдалося перемкнути на «Без підтверджень»: цей агент не може змінити режим дозволів під час роботи. У цьому запуску й далі діє «Автоматичний режим».');
   setLocale('en');
+});
+
+
+test('Cowboy scope normalization matches API and server, with translated labels in every locale', async () => {
+  const ui = await import('./permission-mode.js');
+  const server = await import('../cowboy-mode.mjs');
+  const apiPath = new URL('../../../../../api/src/lib/cowboy-mode.js', import.meta.url);
+  const api = existsSync(apiPath) ? await import(apiPath.href) : null;
+  for (const value of [true, false, 1, 0, '1', null, undefined, 'disabled', 'related', 'project', '', 'bad']) {
+    assert.equal(ui.normalizeCowboyScope(value), server.normalizeCowboyScope(value));
+    if (api) assert.equal(ui.normalizeCowboyScope(value), api.normalizeCowboyScope(value));
+  }
+  for (const locale of ['en', 'uk', 'zh', 'es']) {
+    setLocale(locale);
+    const options = ui.cowboyModeOptions('related', t);
+    assert.deepEqual(options.map(o => o.value), ['disabled', 'related', 'project']);
+    assert.deepEqual(options.map(o => o.selected), [false, true, false]);
+    for (const mode of ui.COWBOY_MODES) assert.ok(LOCALES[locale][`cowboyMode.${mode}`]);
+  }
+  setLocale('en');
+  assert.equal(cowboyModeOn({ cowboyMode: 'disabled', agentPermissionMode: 'bypass' }, 'bypass'), false);
 });

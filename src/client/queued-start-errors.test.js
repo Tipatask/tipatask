@@ -38,7 +38,7 @@ const COPY = {
     ESTART: 'Failed to start Claude Code: spawn claude ENOENT',
   },
   uk: {
-    EASSIGNEE: 'Не можна запустити задачу, призначену іншому учаснику.',
+    EASSIGNEE: 'Не можна запустити завдання, призначене іншому учаснику.',
     ESTART: 'Не вдалося запустити Claude Code: spawn claude ENOENT',
   },
 };

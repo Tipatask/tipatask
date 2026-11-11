@@ -36,10 +36,10 @@ async function stubGate(t, mode) {
   return { state, url: `http://127.0.0.1:${server.address().port}/check` };
 }
 
-function loadExtension(t, url) {
+function loadExtension(t, url, token = TOKEN) {
   const saved = { url: process.env.TIPATASK_PERMISSION_URL, token: process.env.TIPATASK_PERMISSION_TOKEN };
   process.env.TIPATASK_PERMISSION_URL = url;
-  process.env.TIPATASK_PERMISSION_TOKEN = TOKEN;
+  process.env.TIPATASK_PERMISSION_TOKEN = token;
   t.after(() => {
     for (const [key, value] of [['TIPATASK_PERMISSION_URL', saved.url], ['TIPATASK_PERMISSION_TOKEN', saved.token]]) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -70,6 +70,32 @@ test('session start confirms the gate and enables the native search tools', asyn
   await pi.handlers.session_start({}, {});
   assert.deepEqual(gate.state.events, [{ hook_event_name: 'SessionStart' }]);
   assert.deepEqual(pi.tools(), ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls']);
+});
+
+test('bridged computer use follows the real gate: observation only in Plan, desktop actions in Auto/Bypass', async t => {
+  const { createPermissionGate } = require('../../permission-gate');
+  const { buildPermissionPolicy } = require('../../permission-policy');
+  const { PLAN_TOOLS } = require('../../computer-use');
+  const session = { permissionPolicy: buildPermissionPolicy({ mode: 'plan' }, 'pi') };
+  const gate = await createPermissionGate(session, { timeoutMs: 1000 });
+  t.after(() => gate.close());
+  const pi = loadExtension(t, gate.url, gate.token);
+  await pi.handlers.session_start({}, {});
+  const actions = ['left_click', 'type', 'key', 'scroll', 'open_application', 'computer_batch', 'write_clipboard', 'future_tool'];
+  for (const mode of [null, 'plan', 'auto', 'bypass']) {
+    session.permissionPolicy = buildPermissionPolicy({ mode }, 'pi');
+    for (const tool of PLAN_TOOLS) assert.equal(await pi.call(`computer-use__${tool}`), undefined, `${mode}: ${tool}`);
+    for (const tool of actions) {
+      const result = await pi.call(`computer-use__${tool}`, { text: 'screenshot' });
+      if (mode === null || mode === 'plan') {
+        assert.equal(result.block, true, tool);
+        assert.match(result.reason, /Plan mode/);
+      } else assert.equal(result, undefined, `${mode}: ${tool}`);
+    }
+    assert.equal(gate.snapshot(), null, 'desktop tools never enter the approval queue');
+  }
+  session.permissionPolicy = buildPermissionPolicy({ mode: 'plan' }, 'pi');
+  assert.equal((await pi.call('other__screenshot')).block, true, 'another server cannot borrow the observation grant');
 });
 
 test('each tool call follows the live decision: Plan blocks writes, Auto prompts for non-edit tools, Bypass allows', async t => {

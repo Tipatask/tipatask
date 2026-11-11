@@ -174,6 +174,43 @@ test('GET /api/config and POST /api/config remain header-scoped (pre-existing C1
   }
 });
 
+// (TPT9212) The bulk agent Model select and the Task Edit modal's "Project default (…)" read a
+// project's defaults here. One project's save must not show up as another project's default:
+// a project without its own setting reports the hard default its task launches fall back to.
+test('GET /api/config reports a new project\'s unset models as the launch defaults, never another project\'s save', async () => {
+  const saved = { claude: config.CLAUDE_MODEL, codex: config.CODEX_MODEL };
+  const other = makeProjectDir({ projectName: 'Other' });
+  const fresh = makeProjectDir({ projectName: 'Fresh' });
+  const blank = makeProjectDir({ projectName: 'Blank', CLAUDE_MODEL: '', CODEX_MODEL: '' });
+  try {
+    const post = fakeRes();
+    await handler(fakeReq('POST', '/api/config', {
+      headers: { 'x-tipatask-project': other },
+      body: JSON.stringify({ CLAUDE_MODEL: 'claude-opus-5', CODEX_MODEL: 'gpt-5.5' }),
+    }), post);
+    assert.strictEqual(post.statusCode, 200, post.body);
+    assert.strictEqual(config.CODEX_MODEL, 'gpt-5.5', 'sanity: the save still refreshes the in-memory default');
+
+    const read = async (proj) => {
+      const res = fakeRes();
+      await handler(fakeReq('GET', '/api/config', { headers: { 'x-tipatask-project': proj } }), res);
+      assert.strictEqual(res.statusCode, 200, res.body);
+      return json(res);
+    };
+    assert.deepEqual(await read(other), { CLAUDE_MODEL: 'claude-opus-5', CODEX_MODEL: 'gpt-5.5', TASK_AGENT: config.TASK_AGENT || 'claude' });
+    const freshCfg = await read(fresh);
+    assert.strictEqual(freshCfg.CLAUDE_MODEL, 'opusplan');
+    assert.strictEqual(freshCfg.CODEX_MODEL, '', 'no CODEX_MODEL of its own: no --model flag at launch');
+    const blankCfg = await read(blank);
+    assert.strictEqual(blankCfg.CLAUDE_MODEL, '', 'an explicitly blank value still round-trips (C952)');
+    assert.strictEqual(blankCfg.CODEX_MODEL, '');
+  } finally {
+    config.CLAUDE_MODEL = saved.claude;
+    config.CODEX_MODEL = saved.codex;
+    for (const dir of [other, fresh, blank]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('POST /api/config with TASK_AGENT does not throw when the project has no AVAILABLE_AGENTS on disk and the global fallback is an array (C1132 AVAILABLE_AGENTS.split TypeError fix)', async () => {
   // No AVAILABLE_AGENTS key at all. The handler builds the allowlist from the project's own
   // disk value only, so the array-shaped global must be neither split nor persisted. Pinned

@@ -11,10 +11,10 @@
 // Coverage: every explicit label in createMenu()'s Project/Edit/View/Window/Help
 // menus, the three folder-picker dialog titles, the Export save dialog (TPT9167),
 // the Import open dialog and its invalid-archive error dialog (TPT9169, main/project-import.js),
-// the quit/close confirm dialogs, the `about.*` strings pushed into the
-// About/Third-Party Licenses windows (main/about-window.js, C1532), and the
-// `permissions.*` startup explanation +
-// probe notification (main/os-permissions.js, TPT9112).
+// the quit/close confirm dialogs, and the `about.*` strings pushed into the
+// About/Third-Party Licenses windows (main/about-window.js, C1532). The startup
+// permission dialogs (main/os-permissions.js) speak all four project languages, so
+// their `permissions.*` strings live in main/permissions-i18n.js instead.
 // NOT covered, by design (documented in tt-electron-app.md, not silently skipped):
 //   - Electron's role: menu items (Edit/View/Window roles) — those render from
 //     Electron's own OS-locale-driven built-in labels, not from this table.
@@ -64,15 +64,6 @@ const en = {
   'about.credit': 'Includes Pi Coding Agent (MIT License)',
   'about.noticesNotFound': 'THIRD-PARTY-NOTICES.md could not be found in this build.',
 
-  // (TPT9112) One-time explanation shown before the macOS permission prompts at startup, and
-  // the silent probe notification that confirms notification access (closed as soon as shown).
-  'permissions.title': 'Permissions',
-  'permissions.message': 'TipΔTask needs a few macOS permissions',
-  'permissions.detail': 'TipΔTask asks for them now, once, so agents never stop mid-task waiting on a system prompt.\n\n• Notifications: tells you when an agent needs your input or finishes a task.\n• Microphone: voice input in task forms and chats.\n• Folders: Desktop, Documents, Downloads and your project folders, so agents can read and change files there.\n\nmacOS asks about each permission you have not answered yet. You can change them later in System Settings.',
-  'permissions.continue': 'Continue',
-  'permissions.probeTitle': 'TipΔTask notifications are on',
-  'permissions.probeBody': 'This is how TipΔTask tells you an agent needs you.',
-
   'dialog.openProjectDirectory': 'Open Project Directory',
   'dialog.selectProjectDirectory': 'Select Project Directory',
   'dialog.selectOrCreateProjectFolder': 'Select or Create Project Folder',
@@ -110,9 +101,9 @@ const en = {
 const uk = {
   // Project access dialog, shared with the native/renderer translation table.
   "projectAccess.title": "Не вдалося відкрити проєкт",
-  "projectAccess.denied": "Цей проєкт недоступний для поточного акаунта.",
+  "projectAccess.denied": "Цей проєкт недоступний для поточного облікового запису.",
   "projectAccess.signin": "Увійдіть знову, щоб відкрити цей проєкт.",
-  "projectAccess.detail": "Проєкт може належати іншому акаунту або більше не існувати. Повторно автентифікуйтеся через акаунт із доступом, і TipATask знову спробує відкрити проєкт.",
+  "projectAccess.detail": "Проєкт може належати іншому обліковому запису або більше не існувати. Повторно автентифікуйтеся через обліковий запис із доступом, і TipATask знову спробує відкрити проєкт.",
   "projectAccess.retryDetail": "Проєкт не відкрито. Спробуйте відкрити його ще раз.",
   "projectAccess.reauthenticate": "Повторна автентифікація",
   "projectAccess.cancel": "Скасувати",
@@ -126,13 +117,13 @@ const uk = {
   'menu.closeProject': 'Закрити проєкт',
   'menu.renameProject': 'Перейменувати проєкт…',
   'menu.settings': 'Налаштування…',
-  'menu.mergeTaskBranches': 'Злити гілки задач…',
+  'menu.mergeTaskBranches': 'Злити гілки завдань…',
   'menu.exportProject': 'Експортувати…',
   'menu.importProject': 'Імпортувати…',
   'menu.knowledgeBase': 'База знань',
   'menu.kbSync': 'Синхронізувати',
   'menu.kbReindex': 'Переіндексувати',
-  'menu.reauthenticate': 'Повторна автентифікація / Змінити акаунт',
+  'menu.reauthenticate': 'Повторна автентифікація / Змінити обліковий запис',
   'menu.quit': 'Вийти з TipΔTask',
   'menu.project': 'Проєкт',
   'menu.startStopVoice': 'Почати / Зупинити голосове введення',
@@ -146,13 +137,6 @@ const uk = {
   'about.version': 'Версія',
   'about.credit': 'Включає Pi Coding Agent (ліцензія MIT)',
   'about.noticesNotFound': 'Файл THIRD-PARTY-NOTICES.md не знайдено в цій збірці.',
-
-  'permissions.title': 'Дозволи',
-  'permissions.message': 'TipΔTask потребує кількох дозволів macOS',
-  'permissions.detail': 'TipΔTask просить їх зараз, один раз, щоб агенти не зупинялися посеред задачі в очікуванні системного запиту.\n\n• Сповіщення: повідомляють, коли агенту потрібна ваша відповідь або задачу завершено.\n• Мікрофон: голосове введення у формах задач і чатах.\n• Папки: Робочий стіл, Документи, Завантаження та папки ваших проєктів, щоб агенти могли читати й змінювати там файли.\n\nmacOS запитає про кожен дозвіл, на який ви ще не відповіли. Змінити їх можна пізніше в Системних параметрах.',
-  'permissions.continue': 'Продовжити',
-  'permissions.probeTitle': 'Сповіщення TipΔTask увімкнено',
-  'permissions.probeBody': 'Так TipΔTask повідомлятиме, що агенту потрібна ваша увага.',
 
   'dialog.openProjectDirectory': 'Відкрити каталог проєкту',
   'dialog.selectProjectDirectory': 'Виберіть каталог проєкту',

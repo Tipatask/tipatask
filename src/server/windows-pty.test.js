@@ -131,7 +131,7 @@ test('POSIX packaging keeps sequential Electron rebuild with target CPU', async 
     const calls = [];
     await beforePack({ arch: Arch.x64, electronPlatformName: platform,
       packager: { projectDir: '/fixture', info: { framework: { version: '43.7.6' } } } }, {
-      stage: async () => calls.push('stage'), rebuild: async opts => calls.push(opts),
+      desktop: async () => {}, signing: async () => {}, stage: async () => calls.push('stage'), rebuild: async opts => calls.push(opts),
     });
     assert.equal(calls[0], 'stage');
     assert.deepEqual(calls[1], { buildPath: '/fixture', projectRootPath: '/fixture', electronVersion: '43.7.6',

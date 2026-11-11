@@ -7,6 +7,9 @@ const _factories = {
 };
 
 const _cache = {};
+// Advisory, normalized quota readings only. Forecasts never trigger auth/CLI probes.
+const _forecastQuotas = new Map();
+const FORECAST_CONTEXT_TTL_MS = 60000;
 
 // Quota lookup must never use normalizeAgentId's unknown -> Claude fallback.
 async function getAgentQuotaStatus(agentId, config, opts = {}) {
@@ -16,10 +19,36 @@ async function getAgentQuotaStatus(agentId, config, opts = {}) {
     return normalizeQuota(agentId, projectRoot, { connectionState: 'unsupported', unavailableReason: 'unsupported_provider' });
   }
   try {
-    return normalizeQuota(agentId, projectRoot, await getTaskAgent(agentId).getQuotaStatus(config, { ...opts, projectRoot }));
+    const quota = normalizeQuota(agentId, projectRoot, await getTaskAgent(agentId).getQuotaStatus(config, { ...opts, projectRoot }));
+    const key = JSON.stringify([projectRoot, agentId]);
+    _forecastQuotas.delete(key);
+    _forecastQuotas.set(key, { quota, at: Date.now() });
+    if (_forecastQuotas.size > 64) _forecastQuotas.delete(_forecastQuotas.keys().next().value);
+    return quota;
   } catch (err) {
+    _forecastQuotas.delete(JSON.stringify([projectRoot, agentId]));
     return normalizeQuota(agentId, projectRoot, { unavailableReason: reasonFor(err) });
   }
+}
+
+// Unlike peekDetect(), this read must not warm a cold cache or refresh a negative.
+// Unknown detection returns null; unknown quota stays null on an available agent.
+function getAgentForecastSummary(config = {}) {
+  const now = Date.now();
+  const known = Object.keys(_factories).filter(id => _cache[id]?._detectResult
+    && now - _cache[id]._detectTs < 300000);
+  if (!known.length) return null;
+  const available = known.filter(id => _cache[id]._detectResult.available);
+  const allowed = config.AVAILABLE_AGENTS;
+  const selected = Array.isArray(allowed) && allowed.length ? available.filter(id => allowed.includes(id)) : available;
+  return selected.map(id => {
+    const entry = _forecastQuotas.get(JSON.stringify([config.PROJECT_ROOT, id]));
+    const q = entry && now - entry.at < FORECAST_CONTEXT_TTL_MS ? entry.quota : null;
+    return { id, plan: q?.plan || null, usage: q ? {
+      status: q.status, stale: q.stale, checkedAt: q.checkedAt,
+      windows: q.windows.map(w => ({ ...w })),
+    } : null };
+  });
 }
 
 function normalizeAgentId(agentId) {
@@ -70,6 +99,7 @@ function listTaskAgentStatusesPeek(config) {
 // per-window server hold separate copies of these caches — refreshing one never refreshes
 // the other, so whichever process serves the read must be the one that calls this.
 async function refreshAgentDetection(config) {
+  _forecastQuotas.clear();
   try { require('../spawn-utils').clearBinCache(); } catch { /* best-effort */ }
   return listTaskAgentStatuses(config, { force: true });
 }
@@ -174,6 +204,7 @@ async function listAllAgentModels(config, opts = {}) {
 }
 
 module.exports = {
+  getAgentForecastSummary,
   getAgentQuotaStatus,
   getTaskAgent,
   getTaskAgentInfo,

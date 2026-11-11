@@ -1,7 +1,7 @@
 'use strict';
 
 const { ipcMain, app } = require('electron');
-const { getWindowState, reconfigureWindowBackend } = require('../window-state');
+const { getWindowState, reconfigureWindowBackend, notifyProjectConfigChanged } = require('../window-state');
 const serverConfig = require('../../src/server/config');
 const { applyReopenToPatch } = require('../../src/server/reopen-closed-task');
 const { resolveCodingPrefix } = require('../../src/server/task-key-format');
@@ -537,15 +537,25 @@ function registerApiHandlers() {
     const fresh = readProjectConfig(st.projectPath);
     if (fresh) st.config = fresh;
     const config = fresh || st.config || {};
-    return { projectPath: st.projectPath, config: rendererProjectConfig(config), agents: summarizeAgents(config, _agentLabels()) };
+    return { projectPath: st.projectPath, config: rendererProjectConfig(config), agents: summarizeAgents(config, _agentLabels()),
+      remoteControl: require('../../src/server/remote-control-consent').read(st.projectPath) };
+  });
+
+  ipcMain.handle('api:project.setRemoteControl', (event, { enabled, context, expectedProjectPath } = {}) => {
+    const st = getWindowState(event.sender.id);
+    if (!st?.projectPath || st.projectPath !== expectedProjectPath) throw new Error('Project changed before settings were saved');
+    const remoteControl = require('../../src/server/remote-control-consent').write(st.projectPath, enabled, context);
+    notifyProjectConfigChanged?.(st.projectPath);
+    return { ok: true, remoteControl };
   });
 
   // ── Lightweight partial settings write ──────────────────────────────────────
   // Does not rebind the backend. Credential changes here use explicit key actions.
-  ipcMain.handle('api:project.mergeConfig', async (event, { partial }) => {
+  ipcMain.handle('api:project.mergeConfig', async (event, { partial, expectedProjectPath }) => {
     const { readProjectConfig, writeProjectConfig, mergeRendererProjectConfig } = require('../../src/server/project-config');
     const st = getWindowState(event.sender.id);
     if (!st.projectPath) return { ok: false, error: 'no project' };
+    if (expectedProjectPath && st.projectPath !== expectedProjectPath) throw new Error('Project changed before settings were saved');
     const existing = readProjectConfig(st.projectPath) || st.config || {};
     const merged = mergeRendererProjectConfig(existing, partial);
     if (merged.API_BASE_URL && merged.API_PROJECT_ID) {

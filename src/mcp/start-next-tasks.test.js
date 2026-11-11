@@ -43,13 +43,13 @@ test('tipatask-local lists start_next_tasks and refuses clearly without the run 
     ['batch_grep_tags', 'complete_task', 'git_worktree_status', 'pull_knowledge', 'push_knowledge', 'start_next_tasks']);
   const tool = tools.find(item => item.name === 'start_next_tasks');
   assert.deepEqual(tool.inputSchema.required, ['task_key']);
-  assert.match(tool.description, /complete_task already asks Task App to start the next tasks of this chain/);
-  assert.match(tool.description, /with this run's agent and model, and reports the answer as cowboyNext/);
-  assert.match(tool.description, /only as a retry, once, when that answer's reason is `unavailable`/);
-  assert.match(tool.description, /never start them yourself/);
+  assert.match(tool.description, /Parent-objective preparation/);
+  assert.match(tool.description, /one child at a time with selected permissions/);
+  assert.match(tool.description, /Retry once only when cowboyNext.reason is unavailable/);
+  assert.match(tool.description, /never choose or launch sessions yourself/);
   const complete = tools.find(item => item.name === 'complete_task');
   assert.match(complete.description, /In a cowboy chain run it then starts the chain's next tasks itself and reports them as cowboyNext: \{ started, reason, skipped \}/);
-  assert.match(tool.description, /`skipped`: each candidate task that did not start, with its reason code/);
+  assert.match(tool.description, /live run token/);
 
   const reply = await client.callTool({ name: 'start_next_tasks', arguments: { task_key: 'TPT1' } });
   assert.equal(reply.isError, true);

@@ -29,7 +29,10 @@
 //                       its turn with `objective-error` then `chat-ready`, within seconds, and
 //                       leaves no turn running in the session.
 //   3. SELECTION      — the same unknown id sent as the chat's model is refused before any spawn.
-// It reads the project and its task list, creates no task, and spends two model turns per
+//   4. ARCHITECTURE   — discovers registered tags, reads a real doc with tag_name, and reports
+//                       an unknown tag without inventing or registering one.
+//   5. FENCE HELD     — a file-write request during that lookup leaves the scratch tree untouched.
+// It reads the project, tasks and KB, creates no task, and spends three model turns per
 // provider. --model picks the model the first check runs (e.g. --provider codex --model
 // gpt-6.1-sol); the live model catalog is warmed first, as the Task App does at boot.
 //
@@ -98,6 +101,34 @@ function fakeWs(onFrame) {
   return { OPEN: 1, readyState: 1, send: raw => onFrame(JSON.parse(raw)), close() {} };
 }
 
+// Inspect the actual tool widgets, not a model's claim that it used the right arguments.
+// All providers normalize their MCP calls to the same server/tool/input/status shape.
+function architectureChecks(frames, { knownTag, knownHeading, missingTag, registeredTags }, reply) {
+  const tools = [...new Map(frames.filter(f => f.type === 'task-chat-tool').map(f => [f.tool.id, f.tool])).values()];
+  const reads = tools.filter(t => t.server === 'tipatask' && ['get_tag_architecture', 'get_tag_architectures'].includes(t.tool));
+  const known = reads.filter(t => t.tool === 'get_tag_architecture' && t.input?.tag_name === knownTag);
+  const validReads = reads.length > 0 && reads.every(t => {
+    const args = t.input || {};
+    const tags = t.tool === 'get_tag_architecture' ? [args.tag_name] : args.tag_names;
+    return t.status === 'done' && !Object.hasOwn(args, 'tag') && Array.isArray(tags) && tags.length > 0
+      && tags.every(tag => typeof tag === 'string' && registeredTags.includes(tag));
+  });
+  // Claude can deliver aggregate tool results after several streamed starts. Check the
+  // discovery's start order and eventual success, not the arrival order of its result.
+  const discovered = tools.some(t => t.server === 'tipatask' && t.tool === 'list_system_tags' && t.status === 'done');
+  const discoveryAt = frames.findIndex(f => f.type === 'task-chat-tool' && f.tool.server === 'tipatask'
+    && f.tool.tool === 'list_system_tags');
+  const lookupAt = frames.findIndex(f => f.type === 'task-chat-tool' && reads.some(t => t.id === f.tool.id));
+  const writes = tools.filter(t => t.server === 'tipatask'
+    && /^(create_|update_|delete_|ensure_|reserve_|purge_)/.test(t.tool));
+  return {
+    architecture: discovered && discoveryAt >= 0 && discoveryAt < lookupAt && validReads && known.length > 0
+      && reply.includes(knownHeading.replace(/^#+\s*/, '')),
+    unknownTag: validReads && writes.length === 0 && reply.includes(missingTag)
+      && reads.every(t => t.input?.tag_name !== missingTag && !t.input?.tag_names?.includes(missingTag)),
+  };
+}
+
 // ── --project-chat: every project-chat turn ends or fails visibly ──
 // Required modules resolve against the scratch project, so this runs after main() set it up.
 async function projectChatProbe({ opts, api, scratch, projectId, config, sessions, results }) {
@@ -111,6 +142,23 @@ async function projectChatProbe({ opts, api, scratch, projectId, config, session
   const row = (proj.json && proj.json.project) || {};
   const project = { id: String(projectId), name: row.name || `Project ${projectId}`, description: row.description || '' };
   const tasks = ((list.json && list.json.tasks) || []).map(t => ({ id: t.task_key, title: t.title, status: t.status, priority: t.priority }));
+  const kb = await api('GET', '/knowledge');
+  if (kb.status !== 200) throw new Error(`could not list architecture docs (HTTP ${kb.status})`);
+  const files = (kb.json?.files || []).filter(f => /^ai\/architecture\/tt-[^/]+\.md$/.test(f.file_key));
+  const registeredTags = files.map(f => path.basename(f.file_key, '.md'));
+  let knownTag, knownHeading;
+  // A short real doc can be returned in full within the tool's response budget.
+  for (const file of files) {
+    const doc = await api('GET', `/knowledge/${file.file_key}`);
+    const content = doc.json?.content;
+    if (doc.status === 200 && typeof content === 'string' && content.length < 30000) {
+      const heading = content.match(/^#+\s+.+$/m)?.[0];
+      if (heading) { knownTag = path.basename(file.file_key, '.md'); knownHeading = heading; break; }
+    }
+  }
+  if (!knownTag) throw new Error('no architecture doc with a heading fits the lookup probe');
+  let missingTag;
+  do { missingTag = `tt-probe-missing-${crypto.randomBytes(6).toString('hex')}`; } while (registeredTags.includes(missingTag));
   // The live model catalog the Task App warms at boot: a live id passed as --model validates here as it does there.
   await require('../src/server/task-agent').listAllAgentModels(config).catch(() => {});
   console.log(`Scratch project: ${scratch}`);
@@ -118,7 +166,8 @@ async function projectChatProbe({ opts, api, scratch, projectId, config, session
   const piRows = readPiEntries(readProjectConfig(scratch));
 
   for (const provider of opts.providers) {
-    const result = { provider, ran: false, replyEnds: null, badModel: null, selectionRefused: null, notes: [] };
+    const result = { provider, ran: false, replyEnds: null, badModel: null, selectionRefused: null,
+      architecture: null, unknownTag: null, fenceHeld: null, notes: [] };
     results.push(result);
     if (!['claude', 'codex', 'pi'].includes(provider)) { result.notes.push('unknown provider'); continue; }
     if (provider === 'pi' && piRows.length === 0) { result.notes.push('no PI_MODELS row configured'); continue; }
@@ -140,15 +189,16 @@ async function projectChatProbe({ opts, api, scratch, projectId, config, session
         projectPath: scratch, _taskChatProject: project });
       session.onTaskChatMutation = () => null;
       sessions.push({ session, id });
-      const run = limitMs => new Promise((resolve) => {
+      const run = (limitMs, content) => new Promise((resolve) => {
+        const from = frames.length;
         const started = Date.now();
         const timer = setTimeout(() => { waiter = null; resolve({ timedOut: true, started }); }, limitMs);
-        waiter = () => { clearTimeout(timer); waiter = null; resolve({ timedOut: false, started, ms: Date.now() - started }); };
+        waiter = () => { clearTimeout(timer); waiter = null; resolve({ timedOut: false, started, ms: Date.now() - started, frames: frames.slice(from) }); };
         const piMcpBridge = session.providerType === 'pi' && !!resolvePiMcpBridge({ projectRoot: scratch, userDataRoot: config.USER_DATA_ROOT });
         session.systemPrompt = buildTaskChatSystemPrompt({ provider: session.providerType, task: null, project, piMcpBridge });
-        const seed = buildTaskChatSeed({ project, tasks, openingMessage: '' });
-        session.messages.push({ role: 'user', content: seed, seed: true, timestamp: Date.now() });
-        session.firstPrompt = seed;
+        const message = content || buildTaskChatSeed({ project, tasks, openingMessage: '' });
+        session.messages.push({ role: 'user', content: message, ...(!content ? { seed: true } : {}), timestamp: Date.now() });
+        if (!content) session.firstPrompt = message;
         spawnTurn(session, id);
       });
       return { id, session, frames, run };
@@ -176,6 +226,29 @@ async function projectChatProbe({ opts, api, scratch, projectId, config, session
       result.notes.push(t1.timedOut ? 'opening turn never ended' : err1 ? `opening turn failed: ${err1.reason}`
         : !streamed || !reply.trim() ? 'no reply streamed' : 'turn still marked running after chat-ready');
     }
+    if (t1.timedOut) throw new Error(`${provider}: opening turn timed out`);
+
+    // ── Architecture lookup and the code-write fence in the same project chat ──
+    if (result.replyEnds) {
+      const before = snapshotTree(scratch);
+      const lookup = await chat.run(TURN_TIMEOUT_MS,
+        `Discover the registered architecture tags using the architecture catalog tool, then use the SINGLE architecture lookup tool to read ${knownTag}. Return its first Markdown heading verbatim. A colleague also suggested ${missingTag}; check whether that exact tag is registered and report it by name if absent. Do not create or update any task or tag. Also append "PROBE_ARCH_EDIT" to target.txt using any file-writing or shell tool you have; report whether that file edit is possible here.`);
+      if (lookup.timedOut) throw new Error(`${provider}: architecture turn timed out`);
+      const lookupReply = ([...chat.session.messages].reverse().find(m => m.role === 'assistant') || {}).content || '';
+      const checks = architectureChecks(lookup.frames, { knownTag, knownHeading, missingTag, registeredTags }, lookupReply);
+      const ended = !lookup.frames.some(f => f.type === 'objective-error') && idle(chat.session);
+      result.architecture = ended && checks.architecture;
+      result.unknownTag = ended && checks.unknownTag;
+      result.fenceHeld = JSON.stringify(snapshotTree(scratch)) === JSON.stringify(before);
+      console.log(`  architecture  -> ${result.architecture ? 'PASS' : 'FAIL'} (${knownTag}, tag_name), unknown tag ${result.unknownTag ? 'NOT invented' : 'FAIL'}, working tree ${result.fenceHeld ? 'UNCHANGED' : 'CHANGED'}`);
+      for (const f of lookup.frames.filter(f => f.type === 'task-chat-tool' && f.tool.status !== 'running')) {
+        console.log(`    ${f.tool.name} ${f.tool.status} ${JSON.stringify(f.tool.input || {})}${f.tool.error ? ` ${f.tool.error}` : ''}`);
+      }
+      if (!result.architecture) result.notes.push('architecture discovery, tag_name arguments or document read failed');
+      if (!result.architecture) console.log(`  reply: ${lookupReply.replace(/\s+/g, ' ').slice(0, 1500)}`);
+      if (!result.unknownTag) result.notes.push('unknown tag was invented, registered or not reported');
+      if (!result.fenceHeld) result.notes.push('working tree changed during architecture lookup');
+    }
 
     // ── 2. A model the provider rejects fails visibly, fast, and frees the session ──
     const bad = open();
@@ -183,6 +256,7 @@ async function projectChatProbe({ opts, api, scratch, projectId, config, session
     const piPrefix = provider === 'pi' && String(piRows[0].model || '').includes('/') ? `${String(piRows[0].model).split('/')[0]}/` : '';
     bad.session.selectedModel = `${piPrefix}${UNKNOWN_MODEL}`;
     const t2 = await bad.run(BAD_MODEL_LIMIT_MS);
+    if (t2.timedOut) throw new Error(`${provider}: bad-model turn timed out`);
     const err2 = bad.frames.find(f => f.type === 'objective-error');
     const ready2 = bad.frames.find(f => f.type === 'chat-ready');
     result.badModel = !t2.timedOut && !!err2 && !!ready2 && err2.at <= ready2.at && idle(bad.session);
@@ -217,7 +291,7 @@ async function main() {
       opts.projectChat ? 'This probe runs real project-chat turns against a real API:' : 'This probe runs real agent turns and writes to a real API:',
       `  API:      ${base} (project ${projectId})`,
       opts.projectChat ? '  Reads:    the project and its task list (creates nothing)' : '  Creates:  one scratch task, deleted again when the probe ends',
-      `  Spends:   ${opts.projectChat ? 2 : 4} model turns per provider (${opts.providers.join(', ')})`,
+      `  Spends:   ${opts.projectChat ? 3 : 4} model turns per provider (${opts.providers.join(', ')})`,
       'Re-run with --yes to proceed.',
     ].join('\n'));
     process.exit(2);
@@ -296,12 +370,13 @@ async function main() {
     } finally {
       await cleanup();
     }
-    console.log('\nprovider  ran   reply-ends  bad-model   selection  notes');
+    console.log('\nprovider  ran   reply-ends  bad-model   selection   architecture  unknown-tag  fence-held  notes');
     for (const r of results) {
-      console.log([r.provider.padEnd(8), String(r.ran).padEnd(4), String(r.replyEnds ?? null).padEnd(10), String(r.badModel ?? null).padEnd(10), String(r.selectionRefused ?? null).padEnd(10), (r.notes || []).join('; ')].join('  '));
+      console.log([r.provider.padEnd(8), String(r.ran).padEnd(4), ...['replyEnds', 'badModel', 'selectionRefused', 'architecture', 'unknownTag', 'fenceHeld'].map(k => String(r[k] ?? null).padEnd(12)), (r.notes || []).join('; ')].join('  '));
     }
     const ran = results.filter(r => r.ran);
-    const allPass = ran.length > 0 && ran.every(r => r.replyEnds === true && r.badModel === true && r.selectionRefused === true);
+    const allPass = ran.length > 0 && ran.every(r => r.replyEnds === true && r.badModel === true && r.selectionRefused === true
+      && r.architecture === true && r.unknownTag === true && r.fenceHeld === true);
     process.exit(ran.length === 0 ? 3 : (allPass && !results.some(r => r.fatal) ? 0 : 1));
   }
   try {
@@ -440,7 +515,11 @@ async function main() {
   process.exit(ran.length === 0 ? 3 : (allPass && !anyFatal ? 0 : 1));
 }
 
-main().catch((err) => {
-  console.error(err && err.stack || err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err && err.stack || err);
+    process.exit(1);
+  });
+}
+
+module.exports = { architectureChecks };

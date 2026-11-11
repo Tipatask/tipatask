@@ -96,6 +96,33 @@ test('connectMcpServers + registerMcpTools: registers stub__echo, forwards args,
   }
 });
 
+test('computer-use screenshots retain native image content for Pi vision', async t => {
+  const { connectMcpServers, registerMcpTools } = await loadBridge();
+  const dir = scratch();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'computer.mjs');
+  const data = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9XcAAAAASUVORK5CYII=';
+  fs.writeFileSync(file, `
+import { McpServer } from ${JSON.stringify(SDK_SERVER)};
+import { StdioServerTransport } from ${JSON.stringify(SDK_STDIO)};
+const server = new McpServer({ name: 'computer-use', version: '1.0.0' });
+server.registerTool('screenshot', { inputSchema: {} }, async () => ({ content: [
+  { type: 'text', text: 'Screen captured' },
+  { type: 'image', mimeType: 'image/png', data: ${JSON.stringify(data)} },
+] }));
+await server.connect(new StdioServerTransport());
+`);
+  const conn = await connectMcpServers(writeConfig(dir, { 'computer-use': { command: process.execPath, args: [file] } }));
+  try {
+    assert.deepEqual(conn.errors, []);
+    const pi = fakePi();
+    assert.deepEqual(registerMcpTools(pi, conn.servers), ['computer-use__screenshot']);
+    const out = await pi.tools.get('computer-use__screenshot').execute('screenshot-1', {}, undefined);
+    assert.match(out.content[0].text, /Screen captured/);
+    assert.deepEqual(out.content[1], { type: 'image', mimeType: 'image/png', data });
+  } finally { await conn.close(); }
+});
+
 test('default export: unreachable servers are skipped with a warning, the reachable one still registers', async (t) => {
   const { default: bridge, CONFIG_ENV } = await loadBridge();
   const dir = scratch();

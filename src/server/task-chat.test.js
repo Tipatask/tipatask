@@ -181,3 +181,76 @@ test('the codex fence permits task tools and forbids file writes', () => {
   assert.match(CODEX_TASK_CHAT_FENCE, /may call the tipatask MCP task/);
   assert.match(CODEX_TASK_CHAT_FENCE, /never modify, create or delete any file/);
 });
+
+test('task and project chat architecture examples match the advertised MCP schemas and read a discovered tag', async t => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
+  const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-chat-architecture-'));
+  const tag = 'tt-schema-fixture';
+  fs.mkdirSync(path.join(root, 'ai/architecture'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.tipatask'));
+  fs.writeFileSync(path.join(root, '.tipatask/config.json'), '{}');
+  fs.writeFileSync(path.join(root, `ai/architecture/${tag}.md`), '# Architecture fixture\n\n## Contract\nFixture content.\n');
+  const client = new Client({ name: 'task-chat-architecture-test', version: '1.0.0' });
+  t.after(async () => { await client.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const env = { ...process.env, TIPATASK_PROJECT_ROOT: root, TIPATASK_USER_DATA: root,
+    TIPATASK_MCP_LOCAL_ONLY: '', OBJECTIVE_TIMING_ENABLED: 'false' };
+  for (const key of Object.keys(env)) if (key.startsWith('API_')) delete env[key];
+  await client.connect(new StdioClientTransport({ command: process.execPath,
+    args: [path.join(__dirname, '../mcp/server.js')], cwd: root, env, stderr: 'ignore' }));
+  const { tools } = await client.listTools();
+  const discovered = await client.callTool({ name: 'list_system_tags', arguments: {} });
+  assert.ok(JSON.parse(discovered.content[0].text).some(row => row.tag === tag));
+  for (const provider of ['claude', 'codex', 'pi']) {
+    for (const scope of [{ task: TASK }, { project: { id: 2, name: 'P' } }]) {
+      const prompt = buildTaskChatSystemPrompt({ provider, ...scope, piMcpBridge: true });
+      assert.match(prompt, /exact returned `tag` by its description before looking up/);
+      assert.match(prompt, /never `tag`/);
+      assert.match(prompt, /Never invent a tag name or create a system tag just to make a read succeed/);
+      const prefix = provider === 'pi' ? 'tipatask__' : '';
+      for (const name of ['get_tag_architecture', 'get_tag_architectures']) {
+        const line = prompt.split('\n').find(line => line.includes(`call \`${prefix}${name}\` with `));
+        const args = JSON.parse(line.match(/with (\{.*?\})/)[1].replaceAll('<exact discovered tag>', tag));
+        const schema = tools.find(tool => tool.name === name).inputSchema;
+        for (const key of schema.required) assert.ok(Object.hasOwn(args, key), `${provider} ${name}: ${key}`);
+        for (const key of Object.keys(args)) assert.ok(Object.hasOwn(schema.properties, key), `${provider} ${name}: ${key}`);
+        const result = await client.callTool({ name, arguments: args });
+        assert.notEqual(result.isError, true);
+        assert.match(result.content[0].text, /Architecture fixture/);
+      }
+    }
+  }
+  const wrong = await client.callTool({ name: 'get_tag_architecture', arguments: { tag } }).catch(error => error);
+  assert.ok(wrong.isError || /tag_name/.test(wrong.message), 'the reported tag alias does not satisfy the schema');
+  const absent = await client.callTool({ name: 'get_tag_architecture', arguments: { tag_name: 'tt-missing-fixture' } });
+  assert.equal(absent.isError, true);
+  assert.equal(fs.existsSync(path.join(root, 'ai/architecture/tt-missing-fixture.md')), false);
+});
+
+test('project-chat probe rejects wrong arguments, invented tags, failed reads and missing discovery', () => {
+  const { architectureChecks } = require('../../scripts/probe-task-chat');
+  const context = { knownTag: 'tt-known', knownHeading: '# Known architecture', missingTag: 'tt-missing', registeredTags: ['tt-known'] };
+  const frame = (id, tool, input = {}, status = 'done') => ({ type: 'task-chat-tool', tool: { id, server: 'tipatask', tool, input, status } });
+  const discovery = frame('1', 'list_system_tags');
+  const read = frame('2', 'get_tag_architecture', { tag_name: context.knownTag });
+  const reply = 'Known architecture. tt-missing is not registered.';
+  assert.deepEqual(architectureChecks([discovery, read], context, reply), { architecture: true, unknownTag: true });
+  assert.equal(architectureChecks([
+    frame('1', 'list_system_tags', {}, 'running'),
+    frame('2', 'get_tag_architecture', { tag_name: context.knownTag }, 'running'),
+    discovery, read,
+  ], context, reply).architecture, true, 'Claude may aggregate results after streamed starts');
+  for (const bad of [
+    frame('2', 'get_tag_architecture', { tag: context.knownTag }),
+    frame('2', 'get_tag_architecture', { tag_name: 'tt-invented' }),
+    frame('2', 'get_tag_architecture', { tag_name: context.knownTag }, 'error'),
+  ]) assert.deepEqual(architectureChecks([discovery, bad], context, reply), { architecture: false, unknownTag: false });
+  assert.equal(architectureChecks([read], context, reply).architecture, false);
+  assert.equal(architectureChecks([read, discovery], context, reply).architecture, false);
+  assert.equal(architectureChecks([discovery, read], context, 'No document read.').architecture, false);
+  assert.equal(architectureChecks([discovery, read, frame('3', 'create_system_tag', { tag_name: context.missingTag })], context, reply).unknownTag, false);
+  assert.equal(architectureChecks([discovery, read, frame('3', 'get_tag_architectures', { tag_names: [context.missingTag] })], context, reply).unknownTag, false);
+});

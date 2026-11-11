@@ -226,7 +226,7 @@ async function publish({ projectRoot, backend, sessions, repoIds, pr = true, bas
   const job = getJob(projectRoot);
   return withProjectLock(projectRoot, async () => {
     const scan = await scanAndPreflight({ projectRoot, ctx, targets: tg, git, exec });
-    const res = await publishProject({ repos: scan.repos, merged: job ? job.merged : {}, tasksByKey: ctx.tasksByKey, pr, bases: bases || {}, repoIds: Array.isArray(repoIds) && repoIds.length ? repoIds : null, git: git || runGit, exec });
+    const res = await publishProject({ repos: scan.repos, merged: job ? job.merged : {}, tasksByKey: ctx.tasksByKey, backend, pr, bases: bases || {}, repoIds: Array.isArray(repoIds) && repoIds.length ? repoIds : null, git: git || runGit, exec });
     return { ok: true, ...res };
   });
 }

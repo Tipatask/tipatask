@@ -38,6 +38,7 @@ function fixture(targetStatus, { type = 'modified', confirmed = false, origin = 
     renderAgentBadge: empty, renderEffortBadge: empty, renderMemberBadge: empty,
     renderMarkdown: esc, truncateMarkdownAtParagraph: v => v, MAX_DESC_LEN: 500,
     unmetDependencyKeys: () => [], cardVariant: () => 'narrow', cardMaxWidthPx: () => 300,
+    dependencyKeysMarkup: keys => keys.map(esc).join(', '), // (TPT9216) renderCard + proposal "Deps:" labels
     _measureTitle: () => 10, _CHAT_SVG: '', _WAND_SVG: '', getSprintsEnabled: () => true,
     renderSprintBadgeLabel: empty, buildSubtasksLabel: empty,
     projectHeader: () => ({}), captureCardEdits() {},

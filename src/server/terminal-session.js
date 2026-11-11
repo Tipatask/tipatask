@@ -23,6 +23,7 @@ const { assertCredentialsUsable, tokenExpiryMs, formatTokenExpiry } = require('.
 const { terminalCopy, normalizeLocale, refreshErrorCopy } = require('./terminal-copy'); // (TPT9002) project-language notices
 const { refreshProjectToken } = require('./token-refresh');
 const { getApiCredentials } = require('./api-credentials');
+const { connectDeviceRelay, terminalEvents, captureSessionOwner, remoteApprovalRequest } = require('./device-relay');
 const { getTaskAgent } = require('./task-agent');
 const BaseTaskAgent = require('./task-agent/base-agent');
 const { buildLegacyPatternTable, sanitizePromptText, isClaudeReplReady, matchClaudeBgAgentsLine, CODEX_COMPOSER_PLACEHOLDERS, CODEX_EMPTY_COMPOSER_RE } = require('./task-agent/prompt-detect');
@@ -34,7 +35,9 @@ const archCache = require('../mcp/architecture-cache');
 const { getTagsForTask } = require('./tag-cache');
 const { resolveAttachmentDir } = require('./attachment-paths');
 const { openPtyTrace } = require('./pty-trace'); // (TPT9048) TIPATASK_PTY_TRACE kickoff diagnostics
+const { normalizeCowboyScope } = require('../cowboy-mode.mjs');
 const { selectNextCowboyTasks, effectivePermissionMode, chainKickoffPrompt, chainInheritance, chainPickFields, chainLaunchAgent } = require('./cowboy-next'); // (TPT9162)
+const { selectNextObjectiveTask } = require('./objective-chain');
 const { withProjectLock } = require('./project-mutex');
 const { LOCAL_HOST } = require('./local-access');
 const {
@@ -343,10 +346,11 @@ function feedCodexPlan(session, agent, lines, carry, hit) {
       session.onAttentionNeeded?.({ ...state.candidate, agent: agent.id });
     }
     if (session.terminalPhase === 'planning' && !session._planReadySent
-        && (session.buffer || '').length > planReadyMinBufferLength(session)
-        && session.ws && session.ws.readyState === session.ws.OPEN) {
+        && (session.buffer || '').length > planReadyMinBufferLength(session)) {
       session._planReadySent = true;
-      session.ws.send(JSON.stringify({ type: 'plan-ready', tabId: session.tabId, codexPlanReady: true }));
+      if (session.ws && session.ws.readyState === session.ws.OPEN) {
+        session.ws.send(JSON.stringify({ type: 'plan-ready', tabId: session.tabId, codexPlanReady: true }));
+      }
     }
     // Publish the rising edge as well as invalidateCodexPlan's falling edge.
     // A resize repaint of an announced plan keeps the same client dialog.
@@ -789,6 +793,8 @@ async function fetchParentTaskBlock(backend, task) {
 }
 
 function emitTerminalState(session) {
+  remoteApprovalRequest(session);
+  terminalEvents.emit('approval', session);
   if (session.ws && session.ws.readyState === session.ws.OPEN) {
     session.ws.send(JSON.stringify({
       type: 'terminal-state',
@@ -803,6 +809,8 @@ function emitTerminalState(session) {
       taskAgent: session.taskAgent,
       taskAgentLabel: session.taskAgentLabel,
       taskAgentModel: session.taskAgentModel || '', // (C1118) resolved model for the header caption
+      // (TPT9239) Present only for a run the web app started; the terminal header shows a globe.
+      ...(session.startOrigin ? { origin: session.startOrigin } : {}),
       planApprovalCommand: session.planApprovalCommand,
       // An incomplete repaint is unknown, not a rejection of the displayed plan.
       // Reconnect replay remains gated by codexPlanReadyIsFresh().
@@ -1670,7 +1678,7 @@ function withCowboyEnv(env, session, taskId) {
   const out = { ...(env || {}) };
   delete out[COWBOY_TOKEN_ENV];
   delete out[COWBOY_URL_ENV];
-  if (session.cowboyChain && session._cowboyToken) {
+  if ((session.cowboyChain || session.objectiveChain) && session._cowboyToken) {
     out[COWBOY_TOKEN_ENV] = session._cowboyToken;
     out[COWBOY_URL_ENV] = cowboyNextUrl(taskId);
   }
@@ -1711,7 +1719,7 @@ function liveTerminalTaskKeys(sessions, projectRoot) {
 function cowboyRunTokens(sessions, taskKey) {
   const runs = [];
   for (const session of sessions?.values() || []) {
-    if (session && session.type === 'terminal' && session.alive && session.cowboyChain
+    if (session && session.type === 'terminal' && session.alive && (session.cowboyChain || session.objectiveChain)
       && session._cowboyToken && sessionTaskKey(session) === taskKey) {
       runs.push({ token: session._cowboyToken, projectPath: session.projectPath || '' });
     }
@@ -1756,14 +1764,14 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
   const root = projectRoot || config.PROJECT_ROOT;
   const run = findCowboyRun(sessions, root, finishedKey);
   if (!run) return { started: [], reason: 'no_session' };
-  if (!run.cowboyChain) return { started: [], reason: 'not_cowboy' };
+  if (!run.cowboyChain && !run.objectiveChain) return { started: [], reason: 'not_cowboy' };
   if (run._cowboyNext) {
     const first = run._cowboyNext;
     return first.pending
       ? { started: [], reason: 'already_launched', skipped: [] }
       : { started: [], reason: 'already_launched', skipped: [], previous: { started: first.started, reason: first.reason, skipped: first.skipped } };
   }
-  if (run.permissionPolicy?.mode !== 'bypass') return { started: [], reason: 'not_bypass' };
+  if (!run.objectiveChain && run.permissionPolicy?.mode !== 'bypass') return { started: [], reason: 'not_bypass' };
   run._cowboyNext = { pending: true };
   const inherited = chainInheritance(run); // (TPT9194)
   const websocket = deps.websocket || require('./websocket');
@@ -1772,23 +1780,34 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
     decision = await withProjectLock(`cowboy\0${root}`, async () => {
       const fetchRoles = deps.fetchStatusRoles || BaseTaskAgent.fetchStatusRoles;
       const [tasks, statusRoles, projectMode, currentUserId, finished] = await Promise.all([
-        backend.getTasksUnfiltered(),
+        backend.getTasksUnfiltered({ refresh: true }),
         fetchRoles(backend),
         readProjectPermissionMode(backend),
         Promise.resolve(typeof backend.getCurrentUserId === 'function' ? backend.getCurrentUserId() : null).catch(() => null),
         backend.getTask(finishedKey),
       ]);
+      if (run.objectiveChain) {
+        return launchObjectiveChild({ root, run, finished, tasks, statusRoles, currentUserId, sessions, backend, startTask, websocket, inherited });
+      }
       if (!finished || finished.status !== statusRoles.complete) return { started: [], reason: 'not_finished' };
       if (effectivePermissionMode(finished, projectMode) !== 'bypass') return { started: [], reason: 'not_bypass' };
+      const scope = normalizeCowboyScope(run.cowboyScope ?? finished.cowboyMode ?? finished.cowboy_mode ?? true);
+      if (scope === 'disabled' || normalizeCowboyScope(finished.cowboyMode ?? finished.cowboy_mode ?? scope) === 'disabled') return { started: [], reason: 'not_cowboy' };
+      const context = run.cowboyContext || { originTaskId: finished.id, originSprint: finished.priority, sprint: finished.priority, order: finished.order };
+      // Wait for sibling dependency branches before starting unrelated work. Completed runs
+      // can still be wrapping up their terminal output and do not hold the waterfall open.
+      const chainBusy = Array.from(sessions.values()).some(s => s !== run && s.type === 'terminal' && sessionRoot(s) === root
+        && s.cowboyContext?.originTaskId === context.originTaskId && (s.alive || s._starting || s._launching || s._queued)
+        && !require('./status-roles').isClosedName(tasks.find(t => t.id === sessionTaskKey(s))?.status, statusRoles));
       // The task list is cached briefly; the finished row is the fresh read.
       const rows = [finished, ...(tasks || []).filter(t => t && t.id !== finished.id)];
       const picked = selectNextCowboyTasks(finished, rows, {
-        statusRoles, currentUserId, liveTaskIds: liveTerminalTaskKeys(sessions, root),
+        scope, context, chainBusy, statusRoles, currentUserId, liveTaskIds: liveTerminalTaskKeys(sessions, root),
         isImageTask: task => isPiImageTask(root, task),
       });
       const started = [];
       const skipped = [...picked.skipped];
-      const fields = chainPickFields(inherited);
+      const fields = chainPickFields({ ...inherited, scope });
       for (const task of picked.tasks) {
         // (TPT9194) Saved before the start, so launchNewTerminalSession()'s fresh read carries the
         // bypass override spawnTerminal() requires of a chain launch; a pick without it never starts.
@@ -1798,7 +1817,7 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
         } catch (err) {
           console.warn(`[cowboy] ${finishedKey}: could not update ${task.id}: ${err.message}`);
         }
-        if (saved?.agentPermissionMode !== 'bypass') {
+        if (saved?.agentPermissionMode !== 'bypass' || normalizeCowboyScope(saved.cowboyMode) !== scope) {
           skipped.push({ key: task.id, reason: 'update_failed' });
           continue;
         }
@@ -1814,6 +1833,8 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
             model: inherited.model,
             prompt: chainKickoffPrompt(pick),
             cowboyChain: true,
+            cowboyScope: scope,
+            cowboyContext: picked.reason === 'dependents' ? { ...context } : { ...context, sprint: pick.priority, order: pick.order },
             env: { [COWBOY_TOKEN_ENV]: mintCowboyToken() },
           });
         } catch (err) {
@@ -1838,6 +1859,40 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
     : { started: decision.started, reason: decision.reason };
 }
 
+async function launchObjectiveChild({ root, run, finished, tasks, statusRoles, currentUserId, sessions, backend, startTask, websocket, inherited }) {
+  const empty = reason => ({ started: [], skipped: [], reason });
+  if (!run.alive || run._terminated || run.permissionMode?.pending) return empty('objective_stopped');
+  // Plan and legacy planning policies may hand off only after approval in the same run.
+  if (run.permissionPolicy?.planning && run.terminalPhase !== 'executing') return empty('not_approved');
+  const parent = await backend.getTask(run.objectiveChain.rootTaskId);
+  if (!parent || !finished) return empty('objective_stopped');
+  const preparing = run.parentPreparation && finished.isObjective;
+  if (!preparing && finished.status !== statusRoles.complete) return empty('not_finished');
+  const rows = [parent, finished, ...tasks.filter(t => t.id !== parent.id && t.id !== finished.id)];
+  const picked = selectNextObjectiveTask(parent, rows.filter((t, i, a) => a.findIndex(x => x.id === t.id) === i), {
+    statusRoles, currentUserId, liveTaskIds: liveTerminalTaskKeys(sessions, root), isImageTask: task => isPiImageTask(root, task),
+  });
+  if (!picked.tasks.length) return { ...empty(picked.reason), skipped: picked.skipped, decided: picked.reason !== 'no_children' };
+  const task = picked.tasks[0];
+  const fields = { ...chainPickFields(inherited), agentPermissionMode: run.permissionPolicy?.mode ?? 'plan', cowboyMode: 'disabled' };
+  let saved;
+  try { saved = await backend.updateTask(task.id, fields, { queueOffline: false }); } catch { /* report below */ }
+  if (!saved || Object.entries(fields).some(([key, value]) => saved[key] !== value)) {
+    return { ...empty('start_failed'), skipped: [{ key: task.id, reason: 'update_failed' }], decided: true };
+  }
+  // Re-check after the write: termination must not create a successor.
+  if (!run.alive || run._terminated) return { ...empty('objective_stopped'), decided: true };
+  try { websocket.emitTaskUpdated(saved, null, run.projectPath || ''); } catch { /* optional viewer */ }
+  let ok;
+  try {
+    ok = await startTask({ task: { ...task, ...saved }, agent: chainLaunchAgent(saved, inherited.agent), model: inherited.model,
+      prompt: chainKickoffPrompt({ ...task, ...saved }), objectiveChain: { ...run.objectiveChain },
+      env: { [COWBOY_TOKEN_ENV]: mintCowboyToken() } });
+  } catch { /* report below */ }
+  return { started: ok ? [task.id] : [], reason: ok ? picked.reason : 'start_failed',
+    skipped: ok ? picked.skipped : [...picked.skipped, { key: task.id, reason: ok === false ? 'live_session' : 'start_failed' }], decided: true };
+}
+
 // (C1444) Thin wrapper — flags the session as "starting" for the full duration of
 // _spawnTerminal()'s awaited remote round-trips (KB pull, task comments, status/VCS
 // settings) before pty.spawn() flips `alive`. GET /api/sessions (ws-handlers.js
@@ -1845,6 +1900,9 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
 // during that window. `finally` covers every throw path so a failed/canceled spawn
 // never leaves the flag stuck true.
 async function spawnTerminal(session, prompt, taskId, taskTags = [], opts = {}) {
+  captureSessionOwner(session, opts.backend);
+  session._relayRunId = session._relayEnded ? crypto.randomUUID() : (session._relayRunId || crypto.randomUUID());
+  session._relayEnded = false;
   session._starting = true;
   // (TPT664) A new run of the task supersedes the exit-backstop flag everywhere — drop the server
   // registry entry and broadcast the cleared frame so every window's Finish button goes too. The
@@ -1862,6 +1920,8 @@ async function spawnTerminal(session, prompt, taskId, taskTags = [], opts = {}) 
   } catch (err) {
     session._permissionGate?.close();
     session._permissionGate = null;
+    terminalEvents.emit('state', session, 'exited');
+    session._relayEnded = true;
     throw err;
   } finally {
     session._starting = false;
@@ -1878,8 +1938,14 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   if (opts.cowboyChain === true && resolved.mode !== 'bypass') {
     throw new Error('Cowboy chain launches run only in Bypass mode.');
   }
-  session.cowboyChain = resolved.mode === 'bypass' && (opts.cowboyChain === true || opts.task?.cowboyMode === true);
-  session._cowboyToken = session.cowboyChain ? (opts.env?.[COWBOY_TOKEN_ENV] || mintCowboyToken()) : null;
+  session.cowboyScope = resolved.mode === 'bypass' ? normalizeCowboyScope(opts.cowboyScope ?? (opts.cowboyChain === true ? 'project' : opts.task?.cowboyMode ?? opts.task?.cowboy_mode)) : 'disabled';
+  session.cowboyChain = session.cowboyScope !== 'disabled';
+  session.cowboyContext = session.cowboyChain ? { ...(opts.cowboyContext || { originTaskId: taskId, originSprint: opts.task?.priority, sprint: opts.task?.priority, order: opts.task?.order }) } : null;
+  session.parentPreparation = !!opts.task?.isObjective && !session.planOnly && !session.discussionMode;
+  session.objectiveChain = !session.planOnly && !session.discussionMode
+    ? opts.objectiveChain || (session.parentPreparation ? { rootTaskId: taskId } : null) : null;
+  if (session.objectiveChain) { session.cowboyChain = false; session.cowboyScope = 'disabled'; session.cowboyContext = null; }
+  session._cowboyToken = (session.cowboyChain || session.objectiveChain) ? (opts.env?.[COWBOY_TOKEN_ENV] || mintCowboyToken()) : null;
   session._cowboyNext = null;
   // Only a fresh spawn resolves stored preferences. Live switches replace this
   // snapshot after the provider confirms enforcement and behavioral instructions.
@@ -1893,6 +1959,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     const images = require('./image-task');
     const entry = images.resolveImageEntry(projectRoot, opts.model, opts.task);
     if (entry) {
+      if (opts.authorizeRemoteStart) throw Object.assign(new Error('Remote image start is not supported'), { code: 'task_not_startable' });
       if (session.permissionPolicy.enforced) throw permissionError('unsupported', { mode: resolved.mode, agent: 'pi', supportReason: 'images' });
       if (session.planOnly || session.discussionMode) {
         const { imageTaskCopy } = require('../image-task-copy.mjs');
@@ -1905,10 +1972,11 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       return;
     }
   }
-  // C1408 — the start-time assignee guard/auto-claim used to live inline here. Moved to
+  // Local-start assignee guard/auto-claim used to live inline here. Moved to
   // ws-handlers.js's assertTaskStartable()/claimUnassignedTaskOnStart(), called by both
   // spawn call sites before spawnTerminal() — they already have the task row fetched, so
-  // the guard no longer pays a second, uncached GET /tasks/:key per start.
+  // the local guard no longer pays a second, uncached GET /tasks/:key per start.
+  // Remote starts instead run authorizeRemoteStart at the final PTY boundary below.
   const agent = getTaskAgent(session.taskAgent || config.TASK_AGENT);
   let status = await agent.cachedDetect(config);
   if (!status.available) {
@@ -2029,19 +2097,48 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   const agentLimits = scaleAgentLimitsForConcurrency(
     resolveAgentLimits(session.projectPath || config.PROJECT_ROOT), activeCount,
   );
+  // (TPT9225) Desktop control for this run, from an adapter that wires it
+  // (BaseTaskAgent#detectComputerUse(), computer-use.js). Optional: a failed probe starts the run
+  // without it.
+  let computerUse = null;
+  if (typeof agent.detectComputerUse === 'function') {
+    try { computerUse = await agent.detectComputerUse(config); }
+    catch (err) { console.warn(`[computer-use] ${taskId}: probe failed (${err.message}); starting without computer use`); }
+    if (computerUse) console.log(`[computer-use] ${taskId}: ${computerUse.available ? 'available' : `unavailable (${computerUse.reasonCode})`}`);
+  }
+  throwIfTerminated(session);
   // (TPT9138) Pi loads the gate in every mode, so a live switch takes effect at the next tool call.
   // Auto already required this CLI version (assertPermissionSupport); an older Pi keeps launching
   // Plan and Bypass without the gate and offers no live switch.
-  if (agent.id === 'pi' && versionAtLeast(cliVersion, PI_GATE_VERSION)) {
+  if ((agent.id === 'pi' && versionAtLeast(cliVersion, PI_GATE_VERSION))
+    || (agent.id === 'codex' && computerUse?.available)) {
     session._permissionGate = await createPermissionGate(session, {
       root: session.projectPath || config.PROJECT_ROOT, changed: () => emitTerminalState(session),
       attentionText: terminalCopy(sessionLocale(session), 'notice.permission.approval'),
     });
+    session._permissionGate.locale = sessionLocale(session);
   }
-  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate, backend: opts.backend, cowboyChain: session.cowboyChain });
+  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode && !session.parentPreparation, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate, backend: opts.backend, cowboyChain: session.cowboyChain, objectiveChain: session.objectiveChain, parentPreparation: session.parentPreparation, computerUse });
+  if (session.objectiveChain && !session.parentPreparation) {
+    // Admission can queue a child for some time. Recheck its tree after all launch gates.
+    const parent = await opts.backend.getTask(session.objectiveChain.rootTaskId);
+    const rows = await opts.backend.getTasksUnfiltered({ refresh: true });
+    if (!parent) throw new Error(terminalCopy(sessionLocale(session), 'notice.objectiveStartBlocked'));
+    const others = new Map([...(opts.sessions || new Map())].filter(([, value]) => value !== session));
+    const picked = selectNextObjectiveTask(parent, [parent, ...rows.filter(t => t.id !== parent.id)], {
+      statusRoles, liveTaskIds: liveTerminalTaskKeys(others, sessionRoot(session)),
+    });
+    if (picked.tasks[0]?.id !== taskId) throw new Error(terminalCopy(sessionLocale(session), 'notice.objectiveStartBlocked'));
+  }
   throwIfTerminated(session);
+  // Strict remote identity/task authorization runs after all asynchronous launch
+  // preparation. Local starts keep their separate offline assignment policy.
+  const consumeRemoteStart = opts.authorizeRemoteStart ? await opts.authorizeRemoteStart(spec) : null;
+  throwIfTerminated(session);
+  opts.beforeSpawn?.(); // Remote starts recheck opt-in/account/project after asynchronous launch gates.
   spec.env = withCowboyEnv(spec.env, session, taskId); // (TPT9162)
   const spawnedAt = Date.now(); // (TPT354) lower bound for locating this run's transcript file
+  if (opts.authorizeRemoteStart) consumeRemoteStart(); // Single-use, time-bounded; no await before process creation.
   const nativePty = pty.spawn(spec.command, spec.args, {
     name: 'xterm-256color',
     cols: opts.initialCols || 120,
@@ -2117,6 +2214,8 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   session.cols = opts.initialCols || 120;
   session.rows = opts.initialRows || 40;
   session.alive = true;
+  session.onProcessStarted?.();
+  terminalEvents.emit('state', session, 'running');
   session.pending = false;
   session.terminalPhase = session.permissionPolicy.planning ? 'planning' : 'executing';
   session.lastOutputAt = Date.now();
@@ -2361,7 +2460,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     armSubmitCheck(SUBMIT_VERIFY_MS);
   }
   function onInjectSilence() {
-    if (session._permissionGate && !session._permissionGate.ready) {
+    if (agent.id === 'pi' && session._permissionGate && !session._permissionGate.ready) {
       if (Date.now() - spawnedAt > 30000) {
         clearInjectTimer();
         noticeCopy(session, 'notice.permission.unavailable');
@@ -2708,6 +2807,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       }
     }
     session.buffer += data;
+    terminalEvents.emit('output', session, data);
     if (session.buffer.length > config.MAX_SCROLLBACK) {
       session.buffer = truncateBufferSafely(session.buffer, config.MAX_SCROLLBACK);
     }
@@ -2743,19 +2843,19 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
       const delay = Math.max(0, Math.min(2000, 10000 - elapsed));
       session._planIdleTimer = setTimeout(() => {
         if (session.alive && session.terminalPhase === 'planning' && !session._planReadySent
-            && piPlanReadyIsFresh(session)
-            && session.ws && session.ws.readyState === session.ws.OPEN) {
+            && piPlanReadyIsFresh(session)) {
           session._planReadySent = true;
           if (!session._attentionState) {
             session._attentionState = { kind: 'planReady', promptText: '', agent: agent.id, at: Date.now() };
             session._patternAttentionNeeded = true;
             session.onAttentionNeeded?.({ kind: 'planReady', promptText: '', agent: agent.id });
           }
-          session.ws.send(JSON.stringify({
+          if (session.ws && session.ws.readyState === session.ws.OPEN) session.ws.send(JSON.stringify({
             type: 'plan-ready',
             tabId: session.tabId,
             codexPlanReady: session.codexPlanReady === true,
           }));
+          emitTerminalState(session);
         }
       }, delay);
     }
@@ -2776,6 +2876,9 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     if (session._terminated) return;
     session.alive = false;
     session.exitCode = exitCode;
+    session.onProcessExited?.();
+    terminalEvents.emit('state', session, 'exited');
+    session._relayEnded = true;
     session.codexPlanReady = false;
     session.agentPlanReady = false;
     // (C1565) A dead pid can be recycled by the OS — the watchdog must never resume
@@ -2989,6 +3092,7 @@ function injectPastedImage(session, mimeType, dataB64) {
 }
 
 module.exports = {
+  connectDeviceRelay,
   stripAnsi,
   stripOscChunk,
   ATTENTION_PROMPT_TEXT_MIN,

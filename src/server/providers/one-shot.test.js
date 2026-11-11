@@ -194,3 +194,28 @@ test('buildCodexOneShotArgs: tool-less run replaces the whole MCP map before --j
   assert.deepEqual(buildCodexOneShotArgs({ toolless: true, cwd: '/w' }),
     ['exec', '-c', 'mcp_servers={}', '--json', '-s', 'read-only', '--skip-git-repo-check', '-C', '/w', '-']);
 });
+
+test('default-provider forecast call suppresses MCP and never retries with Claude', async () => {
+  await withProvider('codex', async () => {
+    const result = await runOneShotPrompt('forecast', { toolless: true, fallbackToClaude: false, timeoutMs: 60000,
+      deps: {
+        specBuilders: { codex: opts => ({ command: 'codex', args: buildCodexOneShotArgs(opts), env: {}, cwd: '/tmp' }) },
+        spawn: (command, args) => {
+          assert.ok(args.includes('mcp_servers={}'));
+          assert.ok(!args.includes('--tools') && !args.includes('--mcp-config') && !args.includes('--enable'));
+          assert.ok(args.includes('read-only'));
+          return fakeSpawn('', 1)();
+        },
+        runHeadlessClaude: () => assert.fail('forecast must use only the default provider'),
+      },
+    });
+    assert.equal(result, null);
+  });
+});
+
+test('disabled Claude fallback also covers failed default-provider resolution', async t => {
+  t.mock.method(require('./registry'), 'configForProject', () => { throw Error('unreadable project'); });
+  assert.equal(await runOneShotPrompt('forecast', { toolless: true, fallbackToClaude: false,
+    deps: { runHeadlessClaude: () => assert.fail('must not substitute a provider') },
+  }), null);
+});

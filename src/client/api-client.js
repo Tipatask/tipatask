@@ -7,6 +7,13 @@ import { floatTo16LE } from './pcm.js';
 
 const ipc = (typeof window !== 'undefined') ? window.electronAPI?.api : null;
 
+// (TPT9201) Main sends a window no echo of its own task writes (main/ipc/api-router.js
+// handleTaskUpdate()), so the page shell hears about them here, the door every IPC write goes
+// through. Browser mode needs none of this: its writes come back as WS frames.
+function _announceTaskWrite(type, detail) {
+  if (typeof document !== 'undefined') document.dispatchEvent(new CustomEvent(type, { detail }));
+}
+
 // (C1186) POST /api/transcribe answers 415 NEEDS_PCM16 when the project's Voice preset is
 // 'local' — that branch decodes raw PCM16LE mono 16kHz directly (sherpa-onnx has no container
 // demuxer), not a multipart MediaRecorder blob (webm/opus). Converting client-side avoids a
@@ -38,13 +45,13 @@ async function _blobToPcm16Mono16k(blob) {
   return floatTo16LE(rendered.getChannelData(0));
 }
 
-async function _http(method, path, body) {
+async function _http(method, path, body, headers = {}) {
   // (C1392) Was headers: {} — this is the root cause of the C1391 browser-mode task-open
   // freeze: a header-less request against a multi-project server resolves the unbound
   // default backend instead of this window's project, so GET /api/tasks/:id 500s and the
   // (now non-blocking, see task-board.js) error path fires. See
   // ai/architecture/tt-task-board.md § Browser-mode task open (C1391).
-  const opts = { method, headers: { ...projectHeader() } };
+  const opts = { method, headers: { ...projectHeader(), ...headers } };
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
@@ -137,11 +144,19 @@ export const api = {
       return _http('GET', `/api/tasks/${encodeURIComponent(id)}`);
     },
     async update(id, patch) {
-      if (ipc) return _rethrowIpcError(await ipc.tasks.update(id, patch, { errorAsValue: true }));
+      if (ipc) {
+        const saved = _rethrowIpcError(await ipc.tasks.update(id, patch, { errorAsValue: true }));
+        _announceTaskWrite('tiptask:task-saved', { task: saved });
+        return saved;
+      }
       return _http('PATCH', `/api/tasks/${encodeURIComponent(id)}`, patch);
     },
     async delete(id) {
-      if (ipc) return _rethrowIpcError(await ipc.tasks.delete(id, { errorAsValue: true }));
+      if (ipc) {
+        const result = _rethrowIpcError(await ipc.tasks.delete(id, { errorAsValue: true }));
+        _announceTaskWrite('tiptask:task-removed', { id });
+        return result;
+      }
       return _http('DELETE', `/api/tasks/${encodeURIComponent(id)}`);
     },
     async listAll() {
@@ -230,6 +245,23 @@ export const api = {
   // (C1235) Project scalars from the remote API row — today just taskGroupLabel. Same
   // IPC-first/HTTP-fallback idiom as statuses.list() below; consumed by group-label.js.
   project: {
+    async setRemoteControl(enabled, context, expectedProjectPath) {
+      if (!ipc?.project.setRemoteControl) throw new Error('Remote control requires local desktop consent');
+      const result = await ipc.project.setRemoteControl(enabled, context, expectedProjectPath);
+      if (!result?.ok) throw new Error(result?.error || 'Remote control was not saved');
+      return result;
+    },
+    async config() {
+      if (ipc) return ipc.project.config();
+      return _http('GET', '/api/project-config');
+    },
+    async mergeConfig(partial, expectedProjectPath) {
+      const result = ipc
+        ? await ipc.project.mergeConfig(partial, expectedProjectPath)
+        : await _http('POST', '/api/project-config', partial, expectedProjectPath ? { 'x-tipatask-project': expectedProjectPath } : {});
+      if (!result?.ok) throw new Error(result?.error || 'Project settings were not saved');
+      return result;
+    },
     async settings() {
       if (ipc) return ipc.project.settings();
       return _http('GET', '/api/project/settings');

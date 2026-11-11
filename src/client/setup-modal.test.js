@@ -173,7 +173,7 @@ test('import summary texts render in both locales, with Ukrainian plural forms',
     assert.equal(archiveOriginText({ projectName: 'Acme' }), 'Exported from “Acme”');
     assert.equal(archiveOriginText({ exportedAt: 'not a date' }), null);
     setLocale('uk');
-    assert.deepEqual(archiveCountTexts({ taskCount: 1, sprintCount: 3, kbFileCount: 11 }), ['1 задача', '3 спринти', '11 файлів бази знань']);
+    assert.deepEqual(archiveCountTexts({ taskCount: 1, sprintCount: 3, kbFileCount: 11 }), ['1 завдання', '3 спринти', '11 файлів бази знань']);
     assert.match(archiveOriginText({ projectName: 'Acme', exportedAt: '2026-10-28T09:00:00.000Z' }), /^Експортовано з «Acme» 28 жовт\.? 2026/);
   } finally {
     setLocale('en');

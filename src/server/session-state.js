@@ -3,6 +3,11 @@
 const config = require('./config');
 const { getTaskAgentInfo, resolveTaskAgentId } = require('./task-agent');
 
+// (TPT9239) session.startOrigin of a task run the web app started through the device relay
+// (ws-handlers.js handleRemoteSessionCommand()). GET /api/sessions and the run's own `config` /
+// `terminal-state` frames ship it as `origin`; a run started in Task App has startOrigin null.
+const WEB_ORIGIN = 'web';
+
 // C1131 — projectPath, when known at connect time, resolves the session's initial
 // taskAgent against that PROJECT's config.json (LAST_AGENT/TASK_AGENT) instead of the
 // server-global config.TASK_AGENT startup snapshot. session.taskAgent is always truthy
@@ -15,6 +20,8 @@ function createSession(ws, pending, tabId, projectPath) {
   return {
     tabId: tabId || null,
     startedAt: Date.now(), // stable across reattachments; server clock, epoch milliseconds
+    startOrigin: null,     // (TPT9239) WEB_ORIGIN for a web-app start; fixed for the session's life
+    _webStateSent: null,   // (TPT9239) last remote-session-state broadcast for that run (ws-handlers.js)
     pty: null,
     ptyPid: null,             // (C1565) pty leader pid == pgid (forkpty implies setsid) —
                                // stashed separately because terminateTerminalSession() nulls
@@ -74,6 +81,10 @@ function createSession(ws, pending, tabId, projectPath) {
     // cowboyMode on or that launchCowboyChain() started; its per-run token (TIPATASK_COWBOY_TOKEN,
     // never sent to a client); and the one chain decision it made ({ started, reason } once made).
     cowboyChain: false,
+    objectiveChain: null,             // Parent-scoped sequential child execution
+    parentPreparation: false,
+    cowboyScope: 'disabled',
+    cowboyContext: null,
     _cowboyToken: null,
     _cowboyNext: null,
     planApprovalCommand: taskAgent.approvalCommand,
@@ -184,4 +195,4 @@ function isAgentChatId(id) {
   return typeof id === 'string' && AGENT_CHAT_ID_PREFIXES.some(prefix => id.startsWith(prefix));
 }
 
-module.exports = { createSession, isAgentChatType, isAgentChatId, AGENT_CHAT_TYPES, AGENT_CHAT_ID_PREFIXES };
+module.exports = { createSession, isAgentChatType, isAgentChatId, AGENT_CHAT_TYPES, AGENT_CHAT_ID_PREFIXES, WEB_ORIGIN };

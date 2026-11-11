@@ -8,6 +8,20 @@
 // purpose: `t` is passed in, so this stays importable under bare `node --test` and inside the
 // vm harnesses. The screenshot's order is the canonical order everywhere.
 
+// Canonical Cowboy scopes. Legacy booleans preserve the old whole-project behavior.
+export const COWBOY_MODES = Object.freeze(['disabled', 'related', 'project']);
+export function normalizeCowboyScope(value) {
+  if (value === true || value === 1 || value === '1') return 'project';
+  return COWBOY_MODES.includes(value) ? value : 'disabled';
+}
+export function isCowboyScopeInput(value) {
+  return value == null || typeof value === 'boolean' || value === 0 || value === 1 || COWBOY_MODES.includes(value);
+}
+
+export function cowboyModeOptions(value, t) {
+  return COWBOY_MODES.map(mode => ({ value: mode, label: t(`cowboyMode.${mode}`), selected: normalizeCowboyScope(value) === mode }));
+}
+
 export const AGENT_PERMISSION_MODES = Object.freeze(['plan', 'auto', 'bypass']);
 
 function shieldIcon(mode, detail) {
@@ -74,7 +88,7 @@ export function effectivePermissionMode(task, projectDefault) {
 // The API stores the flag only under bypass, but a project-default change never rewrites task
 // rows, so a stored flag can outlive the bypass it was set under — never trust it alone.
 export function cowboyModeOn(task, projectDefault) {
-  return !!(task?.cowboyMode ?? task?.cowboy_mode) && effectivePermissionMode(task, projectDefault).mode === 'bypass';
+  return normalizeCowboyScope(task?.cowboyMode ?? task?.cowboy_mode) !== 'disabled' && effectivePermissionMode(task, projectDefault).mode === 'bypass';
 }
 
 // Card button tip: "Permission mode: Project Default (Auto mode)" / "Permission mode: Plan mode",
@@ -82,7 +96,7 @@ export function cowboyModeOn(task, projectDefault) {
 export function permissionModeTip(task, projectDefault, t) {
   const { mode, inherited } = effectivePermissionMode(task, projectDefault);
   const tip = t('permissionMode.tip', { mode: inherited ? projectDefaultLabel(projectDefault, t) : permissionModeLabel(mode, t) });
-  return cowboyModeOn(task, projectDefault) ? `${tip} · ${t('cowboyMode.marker')}` : tip;
+  return cowboyModeOn(task, projectDefault) ? `${tip} · ${t('cowboyMode.marker')} (${t(`cowboyMode.${normalizeCowboyScope(task?.cowboyMode ?? task?.cowboy_mode)}`)})` : tip;
 }
 
 function inheritedHint(projectDefault, t) {

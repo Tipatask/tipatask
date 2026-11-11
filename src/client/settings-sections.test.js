@@ -131,7 +131,7 @@ test('openSettingsModal() localizes the dialog before the tab populators run', (
   assert.ok(at < body.indexOf('_populateSettingsAgentsRow()'), 'before the first populator');
 });
 
-for (const locale of ['en', 'uk']) {
+for (const locale of ['en', 'uk', 'zh', 'es']) {
   test(`_localizeSettingsModal() fills the title, every tab and section title and the fixed labels (${locale})`, async () => {
     await withModal((document) => {
       setLocale(locale);
@@ -241,4 +241,18 @@ test('the per-tab one-off layout rules are gone', () => {
     assert.ok(!css.includes(legacy), `${legacy} has no rule`);
     if (legacy.startsWith('.')) assert.ok(!classTokens.has(legacy.slice(1)), `${legacy} is not used in template.html`);
   }
+});
+
+
+test('project language selector offers and restores all four supported locales', async () => {
+  await withModal(async document => {
+    const select = document.getElementById('settings-language-select');
+    assert.deepEqual([...select.options].map(option => option.value), ['en', 'uk', 'zh', 'es']);
+    for (const locale of ['zh', 'es']) {
+      const context = vm.createContext({ document, readProjectLanguage: async () => locale });
+      vm.runInContext(`${productionFunction('_populateSettingsLanguageSelect')}\nthis.populate = _populateSettingsLanguageSelect;`, context);
+      await context.populate();
+      assert.equal(select.value, locale);
+    }
+  });
 });

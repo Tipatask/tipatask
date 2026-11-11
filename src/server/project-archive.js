@@ -762,7 +762,7 @@ function taskFields(task, { status, dependencies, parentId, tags }) {
   if (task.agentPermissionMode === null || typeof task.agentPermissionMode === 'string') {
     fields.agentPermissionMode = task.agentPermissionMode;
   }
-  if (typeof task.cowboyMode === 'boolean') fields.cowboyMode = task.cowboyMode;
+  if (task.cowboyMode !== undefined) fields.cowboyMode = require('../cowboy-mode.mjs').normalizeCowboyScope(task.cowboyMode);
   return fields;
 }
 

@@ -1,4 +1,5 @@
 'use strict';
+const { nativeComputerUse } = require('../computer-use-runtime');
 
 // (TPT571) Codex kickoff is paste-injected, not a positional argv entry. Codex 0.160 boots to an
 // empty composer and never consumes a positional prompt, so the spawn spec must hand the built
@@ -16,6 +17,9 @@ const CodexAgent = require('./codex-agent');
 const BaseTaskAgent = require('./base-agent');
 const { CODEX_PENDING_PASTE_RE, CODEX_EMPTY_COMPOSER_RE, CODEX_STARTUP_WAIT_RE, CODEX_COMPOSER_READY_RE } = require('./prompt-detect');
 const { clearBinCache } = require('../spawn-utils');
+const toml = require('toml');
+const { resolveComputerUse, PLAN_TOOLS } = require('../computer-use');
+const { codexTerminalLaunchOptions } = require('../codex-env');
 
 function scratchProject(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-codex-kickoff-'));
@@ -40,6 +44,66 @@ function scratchProject(t) {
 // taskId stays '' (as in effort-spawn.test.js): a real key makes localizeSpawnPrompt() look up
 // attachments against the API, which is not what these tests are about.
 const KICKOFF = 'Work on task TPT571: make the kickoff land.';
+
+test('Codex detection uses the native runtime, never the standalone Claude server', async t => {
+  const runtime = require('../computer-use-runtime');
+  const capability = nativeComputerUse('codex', '/opt/task-app', '/opt/helper');
+  t.mock.method(runtime, 'detectDesktop', async () => capability);
+  assert.equal(await new CodexAgent().detectComputerUse({}), capability);
+});
+
+test('Codex desktop launch: Auto/Bypass approve controls; Plan and legacy expose only observation tools', async t => {
+  const { cfg, projectRoot } = scratchProject(t);
+  const agent = new CodexAgent();
+  const computerUse = nativeComputerUse('codex', '/opt/task-app', '/opt/task-app/dist/computer-use-arm64');
+  for (const mode of ['auto', 'bypass', 'plan', null]) {
+    const permissionPolicy = mode ? agent.buildPermissionPolicy({ mode, source: 'task' }) : null;
+    const spec = await agent.getSpawnSpec(cfg, KICKOFF, '', { projectPath: projectRoot, computerUse, permissionPolicy, permissionGate: { url: 'http://127.0.0.1:1/check', token: 'test' } });
+    const parsed = toml.parse(fs.readFileSync(path.join(spec.env.CODEX_HOME, 'config.toml'), 'utf8'));
+    const desktop = parsed.mcp_servers['computer-use'];
+    assert.equal(desktop.command, computerUse.server.command);
+    assert.deepEqual(desktop.args, computerUse.server.args);
+    assert.equal(spec.env.TIPATASK_DESKTOP_TOKEN, 'test');
+    assert.deepEqual(desktop.env_vars, computerUse.server.env_vars);
+    assert.equal(desktop.default_tools_approval_mode, 'approve');
+    const planning = !mode || mode === 'plan';
+    assert.deepEqual(desktop.enabled_tools, planning ? [...PLAN_TOOLS] : undefined);
+    if (mode === 'auto') assert.equal(parsed.mcp_servers.tipatask.default_tools_approval_mode, 'prompt');
+    const cliTables = spec.args.flatMap((arg, i) => arg === '-c' && spec.args[i + 1].startsWith('mcp_servers=')
+      ? [toml.parse(spec.args[i + 1]).mcp_servers] : []);
+    assert.equal(cliTables.length, 1, 'authoritative whole-table override');
+    assert.deepEqual(cliTables[0]['computer-use'], desktop);
+    assert.ok(spec.args.includes('--no-daemon'));
+    const text = spec.kickoffFile ? fs.readFileSync(spec.kickoffFile, 'utf8') : spec.initialPrompt;
+    assert.equal(text.split('Computer use:').length - 1, 1);
+    assert.match(text, /Never quit, restart or close the live TipATask app/);
+    assert.equal(text.includes('Plan mode the computer-use tools only look'), planning);
+    assert.equal(spec.codexSwitch.computerUse, computerUse);
+
+    // Shared config may be refreshed by a headless chat or another run.
+    fs.writeFileSync(path.join(spec.codexSwitch.baseHome, 'config.toml'), '[features]\nguardian_approval=false\n');
+    const resumed = codexTerminalLaunchOptions(projectRoot, spec.codexSwitch.baseHome, 'high', spec.env,
+      agent.buildPermissionPolicy({ mode: planning ? 'auto' : 'plan' }), spec.codexSwitch.computerUse);
+    const nextDesktop = toml.parse(fs.readFileSync(path.join(resumed.codexHome, 'config.toml'), 'utf8')).mcp_servers['computer-use'];
+    assert.equal(nextDesktop.command, computerUse.server.command);
+    assert.deepEqual(nextDesktop.enabled_tools, planning ? undefined : [...PLAN_TOOLS]);
+  }
+});
+
+test('Codex unavailable computer use removes prior config and omits the kickoff directive', async t => {
+  const { cfg, projectRoot } = scratchProject(t);
+  const agent = new CodexAgent();
+  const spawn = computerUse => agent.getSpawnSpec(cfg, KICKOFF, '', { projectPath: projectRoot, computerUse,
+    permissionPolicy: agent.buildPermissionPolicy({ mode: 'auto' }) });
+  await spawn(nativeComputerUse('codex', '/opt/task-app', '/opt/task-app/dist/computer-use-arm64'));
+  for (const answer of [resolveComputerUse('codex', 'linux'), resolveComputerUse('codex', 'darwin'), null,
+    resolveComputerUse('claude', 'darwin', { command: '/opt/claude', serverSupported: true })]) {
+    const spec = await spawn(answer);
+    const parsed = toml.parse(fs.readFileSync(path.join(spec.env.CODEX_HOME, 'config.toml'), 'utf8'));
+    assert.equal(parsed.mcp_servers['computer-use'], undefined);
+    assert.doesNotMatch(spec.kickoffFile ? fs.readFileSync(spec.kickoffFile, 'utf8') : spec.initialPrompt, /Computer use:/);
+  }
+});
 
 test('CodexAgent.getSpawnSpec: the kickoff is spec.initialPrompt, never a positional argv entry', async (t) => {
   const { cfg, projectRoot } = scratchProject(t);
@@ -76,6 +140,21 @@ test('CodexAgent.getSpawnSpec: SIMPLE_MODE — bare prompt in initialPrompt, sti
   assert.equal(out.initialPrompt, KICKOFF, 'SIMPLE_MODE: no preamble, just the task prompt');
   assert.ok(out.args.every((a) => !a.includes('Work on task')), `kickoff leaked into argv: ${JSON.stringify(out.args)}`);
   assert.equal(out.typed, process.platform === 'win32' ? ' Begin.' : undefined);
+});
+
+test('Codex SIMPLE_MODE retains the computer-use directive in legacy kickoffs', () => {
+  const script = [
+    "process.env.SIMPLE_MODE = 'true';",
+    "const CodexAgent = require('./src/server/task-agent/codex-agent');",
+    "const { resolveComputerUse } = require('./src/server/computer-use');",
+    "const { nativeComputerUse } = require('./src/server/computer-use-runtime');",
+    "const computerUse = nativeComputerUse('codex', '/opt/task-app', '/opt/task-app/dist/computer-use-arm64');",
+    "process.stdout.write(new CodexAgent().buildPrompt('Check changed UI.', { computerUse }));",
+  ].join('\n');
+  const text = execFileSync(process.execPath, ['-e', script], { cwd: path.resolve(__dirname, '../../..'), encoding: 'utf8' });
+  assert.equal(text.split('Computer use:').length - 1, 1);
+  assert.match(text, /Plan mode the computer-use tools only look/);
+  assert.match(text, /Check changed UI\.$/);
 });
 
 test('Windows Codex kickoff preserves a large multilingual prompt in a file and sends one short line', async t => {
@@ -259,3 +338,76 @@ if (process.platform === 'win32') {
     assert.deepEqual(res.detail, { bin, version: null });
   });
 }
+
+// (TPT9215) A launch with no task/project model must not run a config model the live catalog
+// no longer serves. The catalog is the model registry's cache (written here as its disk mirror
+// under cfg.USER_DATA_ROOT); getSpawnSpec() only peeks it, never probes.
+function seedCodexCatalog(t, cfg, entry) {
+  const registry = require('./model-registry');
+  if (entry) fs.writeFileSync(path.join(cfg.USER_DATA_ROOT, 'model-registry.json'), JSON.stringify({ codex: entry }), 'utf8');
+  registry._resetForTest();
+  t.after(() => registry._resetForTest());
+}
+const LIVE_CODEX_CATALOG = {
+  source: 'probe', probedAt: Date.now(), key: 'day',
+  models: [
+    { id: 'gpt-6.1-sol', label: 'gpt-6.1-sol', isLatest: true },
+    { id: 'gpt-6-astra', label: 'gpt-6-astra', isLatest: false },
+    { id: 'gpt-5.6-luna', label: 'gpt-5.6-luna', isLatest: false },
+  ],
+};
+function modelArg(spec) {
+  const i = spec.args.indexOf('--model');
+  return i < 0 ? null : spec.args[i + 1];
+}
+function writeGlobalCodexModel(model) {
+  fs.writeFileSync(path.join(process.env.CODEX_HOME, 'config.toml'), `model = "${model}"\n`, 'utf8');
+}
+
+test('CodexAgent.getSpawnSpec: an unserved inherited config model is replaced by the live catalog\'s top model', async (t) => {
+  const { cfg, projectRoot } = scratchProject(t);
+  writeGlobalCodexModel('gpt-5.5');
+  seedCodexCatalog(t, cfg, LIVE_CODEX_CATALOG);
+  const spec = await new CodexAgent().getSpawnSpec(cfg, KICKOFF, '', { projectPath: projectRoot });
+  const homeConfig = fs.readFileSync(path.join(spec.env.CODEX_HOME, 'config.toml'), 'utf8');
+  assert.match(homeConfig, /^model = "gpt-5\.5"$/m, 'the launch home inherits the global model');
+  assert.equal(modelArg(spec), 'gpt-6.1-sol');
+  assert.equal(spec.model, 'gpt-6.1-sol', 'the header caption names the model that runs');
+  assert.ok(spec.args.indexOf('--model') < spec.args.indexOf('--no-alt-screen'));
+});
+
+test('CodexAgent.getSpawnSpec: a config model the live catalog lists runs unchanged', async (t) => {
+  const { cfg, projectRoot } = scratchProject(t);
+  writeGlobalCodexModel('gpt-6-astra');
+  seedCodexCatalog(t, cfg, LIVE_CODEX_CATALOG);
+  const spec = await new CodexAgent().getSpawnSpec(cfg, KICKOFF, '', { projectPath: projectRoot });
+  assert.equal(modelArg(spec), null);
+  assert.equal(spec.model, '');
+});
+
+test('CodexAgent.getSpawnSpec: no live catalog cached leaves a model-less launch unchanged', async (t) => {
+  const { cfg, projectRoot } = scratchProject(t);
+  writeGlobalCodexModel('gpt-5.5');
+  seedCodexCatalog(t, cfg, null);
+  const none = await new CodexAgent().getSpawnSpec(cfg, KICKOFF, '', { projectPath: projectRoot });
+  assert.equal(modelArg(none), null);
+  assert.equal(none.model, '');
+  // A static fallback list is not a live catalog and never overrides the config choice.
+  seedCodexCatalog(t, cfg, { ...LIVE_CODEX_CATALOG, source: 'fallback' });
+  const fallback = await new CodexAgent().getSpawnSpec(cfg, KICKOFF, '', { projectPath: projectRoot });
+  assert.equal(modelArg(fallback), null);
+});
+
+test('CodexAgent.getSpawnSpec: an explicit task model and a non-OpenAI provider are never overridden', async (t) => {
+  const { cfg, projectRoot } = scratchProject(t);
+  writeGlobalCodexModel('gpt-5.5');
+  seedCodexCatalog(t, cfg, LIVE_CODEX_CATALOG);
+  const explicit = await new CodexAgent().getSpawnSpec(cfg, KICKOFF, '', { projectPath: projectRoot, model: 'gpt-5.6-luna' });
+  assert.equal(modelArg(explicit), 'gpt-5.6-luna');
+  assert.equal(explicit.model, 'gpt-5.6-luna');
+  const { cfg: cfg2, projectRoot: root2 } = scratchProject(t);
+  fs.writeFileSync(path.join(process.env.CODEX_HOME, 'config.toml'), 'model = "llama3"\nmodel_provider = "ollama"\n', 'utf8');
+  seedCodexCatalog(t, cfg2, LIVE_CODEX_CATALOG);
+  const custom = await new CodexAgent().getSpawnSpec(cfg2, KICKOFF, '', { projectPath: root2 });
+  assert.equal(modelArg(custom), null);
+});

@@ -55,6 +55,13 @@ const SERVER_ROOT = path.resolve(__dirname, '..');
 const TASK_KEY = 'PROBE-1';
 const KICKOFF = `Work on task ${TASK_KEY}: Kickoff delivery probe. An automated check of how Codex receives a `
   + 'pasted task prompt, not a real task: do not read files, run commands or call tools. Reply with the single word READY.';
+const desktopIndex = process.argv.indexOf('--desktop-app');
+const desktopApp = desktopIndex >= 0 ? process.argv[desktopIndex + 1] : null;
+const desktopKickoff = desktopApp ? `Work on task ${TASK_KEY}: This is an isolated desktop integration probe, not a project task. `
+  + `Use ONLY the computer-use MCP tools. Request access ONLY to ${desktopApp}, explaining this disposable app verifies native screenshots and benign input. `
+  + 'If denied or any tool errors, report the exact error and stop. List grants, open/activate the approved app, take an app-window screenshot, click the input field, call type with DESKTOP_OK exactly once, '
+  + 'take another screenshot to confirm DESKTOP_OK is visible, then click Record check. Never use shell, filesystem tools, task tools or any other application. '
+  + 'After successful MCP screenshot, typing and click, reply exactly NATIVE_DESKTOP_COMPLETE.' : null;
 const SILENCE_MS = 20_000;   // this long without PTY output = Codex sits idle (a running turn animates)
 const TIMEOUT_MS = process.platform === 'win32' ? 240_000 : 180_000;  // ceiling when neither signal ever settles (Windows: cold MCP starts)
 const POLL_MS = 500;
@@ -324,6 +331,7 @@ async function main() {
 
   async function run() {
     const agent = getTaskAgent('codex');
+    if (desktopApp) agent.buildPrompt = prompt => prompt;
     if (opts.fileKickoff) {
       const prepare = agent.prepareKickoff.bind(agent);
       agent.prepareKickoff = (cfg, prompt, taskId) => prepare(cfg, prompt, taskId, { isWin: true });
@@ -451,6 +459,14 @@ async function main() {
     agent.getSpawnSpec = async (...args) => (spec = await getSpawnSpec(...args));
     const receivedKickoff = rollout => {
       if (!rollout) return false;
+      if (desktopApp) {
+        try {
+          const rows = fs.readFileSync(rollout, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+          return rows.some(row => row.type === 'event_msg'
+            && ((row.payload?.type === 'agent_message' && row.payload.message?.trim() === 'NATIVE_DESKTOP_COMPLETE')
+              || (row.payload?.type === 'task_complete' && row.payload.last_agent_message?.trim() === 'NATIVE_DESKTOP_COMPLETE')));
+        } catch { return false; }
+      }
       if (!opts.fileKickoff) return true;
       try { return fs.readFileSync(rollout, 'utf8').includes(KICKOFF); }
       catch { return false; }
@@ -462,9 +478,9 @@ async function main() {
       session.taskAgent = 'codex';
       session.projectPath = projectRoot;
       try {
-        await spawnTerminal(session, KICKOFF, TASK_KEY, [], { sessions: [], initialCols: 120, initialRows: 40,
-          task: { id: TASK_KEY, agentPermissionMode: null },
-          backend: { getEffectiveProjectSettings: async () => ({ settings: { agent_permission_mode: null } }) },
+        await spawnTerminal(session, desktopKickoff || KICKOFF, TASK_KEY, [], { sessions: [], initialCols: 120, initialRows: 40,
+          task: { id: TASK_KEY, agentPermissionMode: desktopApp ? 'bypass' : null },
+          backend: { getEffectiveProjectSettings: async () => ({ settings: { agent_permission_mode: desktopApp ? 'bypass' : null } }) },
         });
       } finally {
         if (session.ptyPid) ptyPids.push(session.ptyPid);
@@ -486,7 +502,7 @@ async function main() {
         };
       }
       if (ptyPids.length === 1) {
-        console.log(`argv:            ${spec.command} ${spec.args.join(' ')}`);
+        console.log(desktopApp ? `argv:            ${spec.command} [${spec.args.length} arguments; MCP/policy values omitted]` : `argv:            ${spec.command} ${spec.args.join(' ')}`);
         console.log(`CODEX_HOME:      ${codexHome}`);
         console.log(`Kickoff:         ${(spec.initialPrompt || '').length} chars, pasted once the TUI is ready\n`);
       }
@@ -523,7 +539,8 @@ async function main() {
         if (receivedKickoff(rollout)) { rolloutAt = Date.now(); stop = opts.fileKickoff ? 'full kickoff read from file' : 'rollout found'; break; }
         if (!session.alive) { stop = `codex exited (code ${session.exitCode})`; break; }
         if (emptyComposerSilent()) { stop = `empty composer, PTY silent for ${SILENCE_MS / 1000}s`; break; }
-        if (Date.now() - spawnedAt >= TIMEOUT_MS) { stop = `no verdict after ${TIMEOUT_MS / 1000}s`; break; }
+        const timeout = desktopApp ? 300000 : TIMEOUT_MS;
+        if (Date.now() - spawnedAt >= timeout) { stop = `no verdict after ${timeout / 1000}s`; break; }
       }
       if (!rollout) {
         rollout = locateCodexRollout(session._transcriptHint);
@@ -554,6 +571,35 @@ async function main() {
     const tail = session._attentionTail || '';
     checks.composer = !emptyComposer;
     checks.rollout = receivedKickoff(rollout);
+    if (desktopApp && checks.rollout) {
+      console.log('PASS — real Codex returned NATIVE_DESKTOP_COMPLETE after native MCP calls.');
+      const counts = {};
+      const rows = fs.readFileSync(rollout, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      for (const row of rows) {
+        if (row.type !== 'response_item' || !['function_call', 'custom_tool_call'].includes(row.payload?.type)) continue;
+        const code = String(row.payload.arguments || row.payload.input || '');
+        for (const name of ['request_access', 'list_granted_applications', 'open_application', 'screenshot', 'left_click', 'type']) {
+          const count = (code.match(new RegExp(`computer_use__${name}\\b`, 'g')) || []).length;
+          if (count) counts[name] = (counts[name] || 0) + count;
+        }
+      }
+      console.log('Native action counts:', JSON.stringify(counts));
+      const saveImage = value => {
+        if (!value || typeof value !== 'object') return;
+        if (typeof value.image_url === 'string' && value.image_url.startsWith('data:image/png;base64,')) {
+          const target = path.join(os.tmpdir(), 'TPT9269-codex-desktop.png');
+          fs.writeFileSync(target, Buffer.from(value.image_url.split(',')[1], 'base64'));
+          console.log('Native Codex screenshot:', target);
+        }
+        for (const item of Object.values(value)) {
+          if (typeof item === 'object') saveImage(item);
+          else if (typeof item === 'string' && item.startsWith('[{')) { try { saveImage(JSON.parse(item)); } catch { /* text result */ } }
+        }
+      };
+      for (const row of rows) {
+        if (row.type === 'response_item' && /call_output$/.test(row.payload?.type || '')) saveImage(row.payload.output);
+      }
+    }
     if (result.handoffReadApproved) notes.push('the handoff file read was approved by the probe (--approve-handoff-read)');
     // (TPT9048) A re-sent Enter must never have produced a second kickoff turn.
     const turns = rollout ? countKickoffTurns(rollout) : 0;

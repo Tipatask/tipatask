@@ -1,4 +1,5 @@
 'use strict';
+const { nativeComputerUse } = require('../computer-use-runtime');
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -1160,6 +1161,64 @@ function stageBridgeBundle(userData) {
   fs.writeFileSync(staged, fs.existsSync(BRIDGE_SOURCE) ? fs.readFileSync(BRIDGE_SOURCE, 'utf8') : 'export default function () {}\n');
   return staged;
 }
+
+test('Pi computer use reaches the written bridge config, prompt and gate in every mode', async t => {
+  const dir = makeBridgeProject();
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-pi-computer-'));
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(userData, { recursive: true, force: true });
+  });
+  const staged = stageBridgeBundle(userData);
+  t.mock.method(PiAgent.prototype, 'localizeSpawnPrompt', async (_c, prompt, _id, opts) => ({ prompt, opts }));
+  const { resolveComputerUse } = require('../computer-use');
+  const computerUse = nativeComputerUse('pi', '/opt/task-app', '/opt/task-app/dist/computer-use-arm64');
+  const agent = new PiAgent();
+  const config = { ...FAKE_CONFIG, SIMPLE_MODE: false, USER_DATA_ROOT: userData };
+  const permissionGate = { url: 'http://127.0.0.1:1/check', token: 'a'.repeat(64) };
+  for (const mode of [null, 'plan', 'auto', 'bypass']) {
+    const spec = await agent.getSpawnSpec(config, 'Check changed app.', 'C1', {
+      projectPath: dir, computerUse, permissionGate, permissionPolicy: agent.buildPermissionPolicy({ mode }),
+    });
+    assert.deepEqual(JSON.parse(fs.readFileSync(spec.env.TIPATASK_PI_MCP_CONFIG, 'utf8')).mcpServers['computer-use'], computerUse.server);
+    assert.ok(spec.args.includes(staged));
+    assert.ok(spec.args.includes(path.join(userData, 'pi-ext', 'permission-gate.mjs')));
+    assert.ok(spec.args.includes('--no-extensions'));
+    assert.ok(!spec.args.includes('--tools'));
+    for (const name of ['computer-use__screenshot', 'computer-use__left_click', 'computer-use__type']) {
+      assert.ok(spec.initialPrompt.includes(name), name);
+    }
+    assert.equal(spec.initialPrompt.split('Computer use:').length - 1, 1, 'shared directive exactly once');
+    assert.match(spec.initialPrompt, /Never quit, restart or close the live TipATask app/);
+    assert.equal(spec.initialPrompt.includes('Plan mode: screenshots only until the plan is approved.'), mode === null || mode === 'plan');
+  }
+  for (const mode of [null, 'plan', 'auto', 'bypass']) {
+    const spec = await agent.getSpawnSpec(config, 'Check changed app.', 'C1', {
+      projectPath: dir, computerUse, permissionPolicy: agent.buildPermissionPolicy({ mode }),
+    });
+    const expected = false;
+    assert.equal(!!JSON.parse(fs.readFileSync(spec.env.TIPATASK_PI_MCP_CONFIG, 'utf8')).mcpServers['computer-use'], expected,
+      'without a live gate no mode can use the desktop');
+    assert.equal(kickoffText(spec).includes('Computer use:'), expected);
+    assert.match(kickoffText(spec), /Computer use unavailable:.*live blocking permission gate/);
+  }
+  t.mock.method(agent, '_resolveMcpBridge', () => null);
+  const fallback = await agent.getSpawnSpec(config, 'Check changed app.', 'C1', {
+    projectPath: dir, computerUse, permissionGate, permissionPolicy: agent.buildPermissionPolicy({ mode: 'bypass' }),
+  });
+  assert.equal(fallback.env.TIPATASK_PI_MCP_CONFIG, '');
+  assert.doesNotMatch(fallback.initialPrompt, /Computer use:|computer-use__/);
+});
+
+test('Pi architecture documents computer-use bridge names and gate rules', t => {
+  const file = path.resolve(__dirname, '../../../../../../ai/architecture/tt-pi-session.md');
+  // The standalone Task App checkout has no parent project's private KB.
+  if (!fs.existsSync(file)) return t.skip('architecture KB lives in the parent repository');
+  const doc = fs.readFileSync(file, 'utf8');
+  for (const name of ['computer-use__screenshot', 'computer-use__left_click', 'computer-use__type']) assert.ok(doc.includes(name), name);
+  assert.match(doc, /Auto and Bypass allow desktop tools/);
+  assert.match(doc, /Plan and legacy[\s\S]*?planning runs, only/);
+});
 
 // The argv order and the derived config are what Pi actually loads: one -e before the system
 // prompt and the positional kickoff, and a config whose `tipatask` entry is bound to the account

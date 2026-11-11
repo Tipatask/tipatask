@@ -199,8 +199,8 @@ try {
   document.body.appendChild(cowboyCard);
   const cowboyRow = () => modal().querySelector('.modal-cowboy-mode-row');
   const cowboyBox = () => modal().querySelector('#modal-cowboy-mode');
-  const setCowboy = checked => {
-    cowboyBox().checked = checked;
+  const setCowboy = value => {
+    cowboyBox().value = value;
     cowboyBox().dispatchEvent(new Event('change', { bubbles: true }));
   };
   const save = async () => { modal().querySelector('.btn-modal-save').click(); await tick(); };
@@ -208,33 +208,41 @@ try {
   setProjectPermissionMode('auto');
   await board.openTaskEditModal('COW');
   assert.equal(cowboyRow().hidden, true, 'Project Default (Auto) hides the checkbox');
-  assert.equal(cowboyBox().checked, false);
-  assert.equal(modal().querySelector('label[for="modal-cowboy-mode"]').textContent, 'Cowboy-coding mode');
+  assert.equal(cowboyBox().value, 'disabled');
+  assert.equal(modal().querySelector('label[for="modal-cowboy-mode"]').textContent, 'Cowboy-Coding mode');
   assert.equal(cowboyBox().title, 'Starts sessions for the next startable tasks when this one finishes. Bypass only.');
   assert.equal(cowboyRow().previousElementSibling.querySelector('#modal-permission-mode') !== null, true, 'sits right after the permission select');
   choosePermission('bypass');
   assert.equal(cowboyRow().hidden, false, 'Bypass shows it');
-  assert.equal(cowboyBox().checked, false);
+  assert.equal(cowboyBox().value, 'disabled');
   assert.equal(cowboyBox().disabled, false);
-  setCowboy(true);
+  setCowboy('project');
   await save();
-  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { agent_permission_mode: 'bypass', cowboy_mode: true } });
-  assert.equal(cowboyTip(), 'Permission mode: Bypass · 🤠 Cowboy-coding mode', 'the card tip gains the marker');
+  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { agent_permission_mode: 'bypass', cowboy_mode: 'project' } });
+  assert.equal(cowboyTip(), 'Permission mode: Bypass · 🤠 Cowboy-coding mode (Whole Project)', 'the card tip gains the marker');
   board.closeTaskEditModal(true);
   await board.openTaskEditModal('COW');
   assert.equal(cowboyRow().hidden, false);
-  assert.equal(cowboyBox().checked, true, 'reopening reads the saved flag');
+  assert.equal(cowboyBox().value, 'project', 'reopening reads the saved flag');
+  setCowboy('related');
+  await save();
+  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { cowboy_mode: 'related' } });
+  board.closeTaskEditModal(true);
+  await board.openTaskEditModal('COW');
+  assert.equal(cowboyBox().value, 'related');
+  setCowboy('project');
+  await save();
   choosePermission('');
   assert.equal(cowboyRow().hidden, true, 'back to Project Default (Auto) hides it');
-  assert.equal(cowboyBox().checked, false);
+  assert.equal(cowboyBox().value, 'disabled');
   choosePermission('bypass');
-  assert.equal(cowboyBox().checked, false, 'a return to Bypass starts unchecked');
+  assert.equal(cowboyBox().value, 'disabled', 'a return to Bypass starts unchecked');
   modal().querySelector('.btn-modal-reset').click();
   assert.equal(cowboyRow().hidden, false);
-  assert.equal(cowboyBox().checked, true, 'Reset restores the saved flag');
+  assert.equal(cowboyBox().value, 'project', 'Reset restores the saved flag');
   choosePermission('plan');
   await save();
-  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { agent_permission_mode: 'plan', cowboy_mode: false } }, 'leaving Bypass saves false');
+  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { agent_permission_mode: 'plan', cowboy_mode: 'disabled' } }, 'leaving Bypass saves false');
   assert.equal(cowboyTip(), 'Permission mode: Plan mode');
   board.closeTaskEditModal(true);
 
@@ -243,24 +251,24 @@ try {
   tasks.get('COW').agentPermissionMode = null;
   await board.openTaskEditModal('COW');
   assert.equal(cowboyRow().hidden, false, 'an inherited Bypass shows it');
-  setCowboy(true);
+  setCowboy('project');
   await save();
-  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { cowboy_mode: true } });
+  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { cowboy_mode: 'project' } });
   choosePermission('bypass');
-  assert.equal(cowboyBox().checked, true, 'inherited Bypass to explicit Bypass keeps it');
+  assert.equal(cowboyBox().value, 'project', 'inherited Bypass to explicit Bypass keeps it');
   choosePermission('');
-  assert.equal(cowboyBox().checked, true);
+  assert.equal(cowboyBox().value, 'project');
   assert.equal(modal().querySelector('.btn-modal-save').disabled, true, 'a round trip back to the saved mode is clean');
   choosePermission('auto');
   assert.equal(cowboyRow().hidden, true);
   await save();
-  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { agent_permission_mode: 'auto', cowboy_mode: false } });
+  assert.deepEqual(writes.at(-1), { id: 'COW', patch: { agent_permission_mode: 'auto', cowboy_mode: 'disabled' } });
   board.closeTaskEditModal(true);
 
   // A flag stored under a Bypass the task no longer starts in stays hidden and untouched.
   await board.openTaskEditModal('STALE');
   assert.equal(cowboyRow().hidden, true);
-  assert.equal(cowboyBox().checked, false);
+  assert.equal(cowboyBox().value, 'disabled');
   const staleTitle = modal().querySelector('.modal-title-input');
   staleTitle.value = 'Stale edited';
   staleTitle.dispatchEvent(new Event('input', { bubbles: true }));
@@ -268,15 +276,15 @@ try {
   assert.deepEqual(writes.at(-1), { id: 'STALE', patch: { title: 'Stale edited' } });
   choosePermission('bypass');
   assert.equal(cowboyRow().hidden, false);
-  assert.equal(cowboyBox().checked, false, 'a stale flag never reappears checked');
+  assert.equal(cowboyBox().value, 'disabled', 'a stale flag never reappears checked');
   await save();
-  assert.deepEqual(writes.at(-1), { id: 'STALE', patch: { agent_permission_mode: 'bypass', cowboy_mode: false } });
+  assert.deepEqual(writes.at(-1), { id: 'STALE', patch: { agent_permission_mode: 'bypass', cowboy_mode: 'disabled' } });
   board.closeTaskEditModal(true);
 
   // Read-only tasks show the saved state but lock it; proposals never render it; Ukrainian copy.
   await board.openTaskEditModal('OTHERCOW');
   assert.equal(cowboyRow().hidden, false);
-  assert.equal(cowboyBox().checked, true);
+  assert.equal(cowboyBox().value, 'project');
   assert.equal(cowboyBox().disabled, true);
   board.closeTaskEditModal(true);
   await board.openTaskEditModal('new-cow', { preloadedTask: task('new-cow', { agentPermissionMode: 'bypass' }), onSavePreview: async () => {} });
@@ -401,9 +409,10 @@ try {
     taskChat: {
       mount(host, id, opts) {
         const handle = {
-          id, host, opts, shown: 0, hidden: 0, disposed: 0, edited: [],
+          id, host, opts, shown: 0, hidden: 0, disposed: 0, edited: [], launches: [],
           show() { this.shown++; }, hide() { this.hidden++; }, dispose() { this.disposed++; },
           taskEdited(key) { this.edited.push(key); },
+          launch(pick) { this.launches.push(pick); },
         };
         host.insertAdjacentHTML('beforeend', '<textarea class="fake-chat-input"></textarea>');
         mounts.chat.push(handle);
@@ -434,6 +443,7 @@ try {
   assert.equal(mounts.chat.length, 1);
   assert.equal(mounts.chat[0].host, paneEl('chat'));
   assert.equal(mounts.chat[0].id, 'TPT1');
+  assert.equal('launch' in mounts.chat[0].opts, false, 'a tab visit carries no Discuss pick');
   assert.equal(tab('edit').querySelector('.task-modal-tab-dot').hidden, false);
   assert.ok(modal().querySelector('.task-edit-overlay--rail'), 'rail stays live beside the chat pane');
   mounts.chat[0].host.querySelector('.fake-chat-input').value = 'typed in chat';
@@ -517,6 +527,26 @@ try {
   await board.openTaskWorkspace('TPT2', { pane: 'edit' });
   assert.equal(modal().dataset.pane, 'edit');
 
+  // (TPT9268) A card Discuss pick rides the route into the Chat pane: the chat already mounted
+  // in the open workspace takes it through launch(), once; a fresh workspace mounts with it.
+  const chatMounts = mounts.chat.length;
+  await board.openTaskWorkspace('TPT2', { pane: 'chat', chat: { model: 'codex:gpt-5.1' } });
+  assert.equal(modal().dataset.pane, 'chat');
+  assert.equal(mounts.chat.length, chatMounts, 'the mounted chat is reused');
+  assert.deepEqual(mounts.chat.at(-1).launches, [{ model: 'codex:gpt-5.1' }]);
+  tab('edit').click();
+  tab('chat').click();
+  assert.deepEqual(mounts.chat.at(-1).launches, [{ model: 'codex:gpt-5.1' }], 'a pick is applied once');
+  board.closeTaskEditModal(true);
+  await board.openTaskWorkspace('TPT2', { pane: 'chat', chat: { model: 'claude:opus' } });
+  await tick();
+  assert.equal(modal().dataset.pane, 'chat');
+  assert.equal(mounts.chat.length, chatMounts + 1);
+  assert.deepEqual(mounts.chat.at(-1).opts.launch, { model: 'claude:opus' }, 'the first mount starts with the pick');
+  assert.deepEqual(mounts.chat.at(-1).launches, []);
+  await board.openTaskWorkspace('TPT2', { pane: 'edit' });
+  assert.equal(modal().dataset.pane, 'edit');
+
   // (TPT479) Another task's workspace replaces this one in a single step: the open modal stays
   // up (rail and all) until the next task has loaded, and it opens straight onto its pane.
   const switching = board.openTaskWorkspace('TPT1', { pane: 'chat' });
@@ -582,6 +612,32 @@ try {
   assert.equal(activeRow(), undefined, 'closing the workspace releases its row');
   state.activeSessions.delete('TPT1');
   state.activeSessions.delete('TPT2');
+
+  // (TPT9201) A human row opens the task's Edit pane, never a terminal, and the open workspace
+  // owns its highlight the way it owns a session row's.
+  const humanHost = document.createElement('div');
+  humanHost.id = 'active-human-tasks-list';
+  document.body.appendChild(humanHost);
+  state.taskCategoryById.set('TPT2', 'HUMAN');
+  state.taskStatusById.set('TPT2', 'in_progress');
+  state.taskTitleById.set('TPT2', 'Human work');
+  board.syncActiveSessionsNav();
+  const humanRow = () => humanHost.querySelector('.active-session-item');
+  assert.equal(humanRow().dataset.taskId, 'TPT2');
+  assert.equal(humanRow().classList.contains('active'), false);
+  humanRow().click();
+  await tick();
+  assert.equal(modal().dataset.taskId, 'TPT2', 'a human row opens its task');
+  assert.equal(modal().dataset.pane, 'edit', 'on the Edit pane');
+  assert.ok(humanRow().classList.contains('active'), 'the open workspace highlights its human row');
+  assert.equal(activeRow(), undefined, 'no session row takes the highlight');
+  board.closeTaskEditModal(true);
+  assert.equal(humanRow().classList.contains('active'), false, 'closing the workspace releases the human row');
+  state.taskCategoryById.delete('TPT2');
+  state.taskStatusById.delete('TPT2');
+  state.taskTitleById.delete('TPT2');
+  humanHost.remove();
+
   globalThis.fetch = realFetch;
   navHost.remove();
 

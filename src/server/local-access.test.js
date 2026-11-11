@@ -127,6 +127,56 @@ test('browser bootstrap issues a one-time, same-site session', async t => {
   assert.equal(await f.socket('/?taskId=__attention__', { origin: 'http://evil.example', headers: { Cookie: cookie } }), 403);
 });
 
+test('login form preserves its Origin without allowing opaque or foreign submissions', async t => {
+  const f = await fixture(t);
+  const origin = `http://127.0.0.1:${f.port}`;
+  const page = await f.request('/login');
+  assert.equal(page.status, 200);
+  // Native form navigations under no-referrer send Origin: null, even to the same origin.
+  assert.equal(page.headers['referrer-policy'], 'same-origin');
+  assert.equal(page.headers['cache-control'], 'no-store');
+  assert.match(page.text, /<form method="post" action="\/api\/local-auth">/);
+
+  const formHeaders = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Dest': 'document',
+  };
+  const body = new URLSearchParams({ code: f.access.loginCode }).toString();
+  for (const headers of [
+    { Origin: 'null' }, // Observed browser request with no-referrer.
+    {},
+    { Origin: 'null', Referer: `${origin}/login` },
+    { Referer: `${origin}/login` },
+    { Origin: 'http://evil.example' },
+    { Origin: `http://localhost:${f.port}` },
+    { Origin: `${origin}0` },
+    { Origin: origin.replace('http:', 'https:') },
+    { Origin: [origin, origin] },
+    { Host: 'evil.example', Origin: 'http://evil.example' },
+    { Host: `localhost:${f.port}`, Origin: `http://localhost:${f.port}` },
+  ]) {
+    const rejected = await f.request('/api/local-auth', {
+      method: 'POST', headers: { ...formHeaders, ...headers }, body,
+    });
+    assert.equal(rejected.status, 403, JSON.stringify(headers));
+    assert.equal(rejected.headers['set-cookie'], undefined);
+  }
+  assert.equal(f.httpCalls, 0);
+  // Rejections must not consume the code; the actual same-origin form can still use it.
+  const login = await f.request('/api/local-auth', {
+    method: 'POST', headers: { ...formHeaders, Origin: origin, Referer: `${origin}/login` }, body,
+  });
+  assert.equal(login.status, 303);
+  assert.equal(login.headers.location, '/todo.html');
+  assert.equal(login.headers['referrer-policy'], 'no-referrer');
+  assert.equal(login.headers['cache-control'], 'no-store');
+  assert.match(login.headers['set-cookie'][0], /; HttpOnly; SameSite=Strict; Path=\/$/);
+  const cookie = login.headers['set-cookie'][0].split(';')[0];
+  assert.equal((await f.request(login.headers.location, { headers: { Cookie: cookie } })).status, 200);
+});
+
 // (TPT9162) A live cowboy run's token opens POST /api/tasks/<its key>/cowboy-next and nothing else;
 // the run, never a request selector, names the project.
 test('a run token opens only its own task\'s cowboy-next route, scoped to the run\'s project', async t => {

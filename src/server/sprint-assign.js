@@ -209,15 +209,14 @@ function computeSprintAssignments(groups, newChanges, pinnedIds, existingSprints
  *
  * @param {Array} changes
  * @param {object} backend - must have getSprints, createSprint, getTasks
- * @param {object} config - unused since C1353 (the file task backend's branch here was removed
- *   with the retired backend, C1352) — kept as a positional parameter so existing call sites
- *   (ws-handlers.js, api-backend.js) don't need to shift pinnedIds/prefetchedTasks over
+ * @param {object} config - runtime fallback for project-scoped forecast inputs
  * @param {Set<string>} [pinnedIds]
  * @param {Array|null} [prefetchedTasks] - already-fetched task list; skips backend.getTasks() when provided
  */
 async function resolveAndAssign(changes, backend, config, pinnedIds = new Set(), prefetchedTasks = null) {
   const newChanges = changes.filter(c => c.type === 'new');
-  if (newChanges.length === 0) return;
+  const movedChanges = changes.filter(c => c.type === 'modified' && c.task.priority > 0);
+  if (newChanges.length === 0 && movedChanges.length === 0) return;
 
   const backlogOnlyIds = new Set();
   const effectivePinnedIds = new Set(pinnedIds);
@@ -251,7 +250,7 @@ async function resolveAndAssign(changes, backend, config, pinnedIds = new Set(),
   const resolvable = newChanges.filter(c => !backlogOnlyIds.has(c.task.id));
 
   const groups = topoSortGroups(resolvable);
-  if (groups.length === 0) return;
+  if (groups.length === 0 && movedChanges.length === 0) return;
 
   // C1187 — this project's active status names, resolved once and threaded into both
   // branches below. fetchStatusContext is fail-open (never throws, degrades to the
@@ -266,13 +265,38 @@ async function resolveAndAssign(changes, backend, config, pinnedIds = new Set(),
   const { assignments, newSprints } = computeSprintAssignments(
     groups, resolvable, effectivePinnedIds, existingSprints, existingTasks, statusCtx.active
   );
+  for (const c of movedChanges) {
+    const existing = existingTasks.find(t => t.id === c.task.id);
+    if (!existing || existing.priority === c.task.priority) continue;
+    assignments.set(c.task.id, c.task.priority);
+    if (![...existingSprints, ...newSprints].some(s => s.number === c.task.priority)) {
+      newSprints.push({ name: `Sprint ${c.task.priority}`, number: c.task.priority });
+    }
+  }
 
-  for (const { name, number } of newSprints) {
+  const forecasts = await forecastAssignments({ changes, assignments, newSprints, existingSprints, existingTasks, statusCtx, backend, config });
+  const targets = [...newSprints, ...existingSprints.filter(s => forecasts.has(s.number))].sort((a, b) => a.number - b.number);
+  const newNumbers = new Set(newSprints.map(s => s.number));
+  for (const { id, name, number } of targets) {
     try {
-      await backend.createSprint(name, number);
+      if (!newNumbers.has(number)) {
+        await backend.applySprintForecast(id, forecasts.get(number));
+        continue;
+      }
+      let dates = forecasts.get(number);
+      if (dates) {
+        const { fitsSprintDates } = require('./sprint-forecast');
+        // Earlier rejected forecasts may now have API-allocated ranges instead.
+        try {
+          const fresh = await backend.getSprints();
+          if (!fitsSprintDates(number, dates, fresh, new Date().toISOString().slice(0, 10))) dates = null;
+        } catch { dates = null; }
+      }
+      if (dates) await backend.createSprint(name, number, dates);
+      else await backend.createSprint(name, number);
       console.log(`[sprint-assign] Created sprint "${name}" (number ${number})`);
     } catch (err) {
-      console.warn(`[sprint-assign] Failed to create sprint ${number}: ${err.message}`);
+      console.warn(`[sprint-assign] Failed to save sprint ${number}: ${err.message}`);
     }
   }
 
@@ -285,6 +309,54 @@ async function resolveAndAssign(changes, backend, config, pinnedIds = new Set(),
         console.log(`[sprint-assign] Coerced proposed priority for ${c.task.id}: ${from === undefined ? '<missing>' : from} -> ${c.task.priority}`);
       }
     }
+  }
+}
+
+async function forecastAssignments({ changes, assignments, newSprints, existingSprints, existingTasks, statusCtx, backend, config }) {
+  try {
+    // Older/test backends without metadata support retain deterministic allocation.
+    if (typeof backend.getProjectSettings !== 'function') return new Map();
+    const { forecastSprintDates, isUndatedSprint, fitsSprintDates } = require('./sprint-forecast');
+    const receiving = new Set(assignments.values());
+    const undated = existingSprints.filter(s => receiving.has(s.number) && isUndatedSprint(s));
+    const targetSprints = [...newSprints, ...undated];
+    if (!targetSprints.length) return new Map();
+    const [project, members] = await Promise.all([
+      backend.getProjectSettings(),
+      Promise.resolve().then(() => backend.getProjectMembers()).catch(() => null),
+    ]);
+    if (!project) return new Map();
+    const projectRoot = backend.getProjectRoot?.() || config?.PROJECT_ROOT;
+    const cfg = { ...config, PROJECT_ROOT: projectRoot };
+    const agents = require('./task-agent').getAgentForecastSummary(cfg);
+    const tasks = new Map(existingTasks.map(t => [t.id, t]));
+    for (const c of changes) {
+      if (c.type === 'deleted') { tasks.delete(c.task.id); continue; }
+      tasks.set(c.task.id, { ...tasks.get(c.task.id), ...c.task,
+        priority: assignments.get(c.task.id) ?? c.task.priority ?? tasks.get(c.task.id)?.priority });
+    }
+    const tasksBySprint = new Map(targetSprints.map(s => [s.number, []]));
+    for (const t of tasks.values()) {
+      if (t.isReservation || t.is_reservation || statusCtx.closed.has(t.status)) continue;
+      tasksBySprint.get(t.priority)?.push(t);
+    }
+    const previousSprint = existingSprints.filter(s => s.end_date).sort((a, b) => b.number - a.number)[0] || null;
+    const today = new Date().toISOString().slice(0, 10);
+    const forecasts = await forecastSprintDates({ targetSprints, tasksBySprint, previousSprint,
+      datedSprints: existingSprints, durationDays: project.sprint_duration_days ?? 14,
+      memberCount: Array.isArray(members) ? members.length : null, agents, today }, { projectRoot });
+    // Dates may have changed during the model call. Validate against fresh fixed
+    // anchors before any creation, then re-read each undated row just before PATCH.
+    if (!forecasts.size) return forecasts;
+    const fresh = await backend.getSprints();
+    for (const [number, dates] of forecasts) {
+      const current = fresh.find(s => s.number === number);
+      if ((current && !isUndatedSprint(current)) || !fitsSprintDates(number, dates, fresh, today)) forecasts.delete(number);
+    }
+    return forecasts;
+  } catch (err) {
+    console.warn(`[sprint-assign] Forecast unavailable: ${err.message}`);
+    return new Map();
   }
 }
 

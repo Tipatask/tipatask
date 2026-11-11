@@ -45,7 +45,7 @@ function harness(tc, initial = null) {
     syncAllPermissionButtons() {}, syncAttentionClasses() {}, syncActivityChips() {},
     getOpenWorkspaceTaskId: () => null, taskChatRows: () => [], projectChatRows: () => [],
     _sessionAgentIcon: () => '<svg class="agent-icon"></svg>', isCompleteName: () => false,
-    ensureSessionTooltips() {}, resyncSessionTip() {},
+    ensureSessionTooltips() {}, resyncSessionTip() {}, humanInProgressRows: () => [], paintHumanTaskRows() {},
     _populateSettingsWorkflowAddForm() {}, _populateSettingsGroupLabelRow() {},
     _populateSettingsSprintsRow() {}, _populateSettingsObjectiveGroupingRow() {},
     seedStatuses() {}, _renderWorkflowRows() {},

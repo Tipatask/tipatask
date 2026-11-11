@@ -11,6 +11,7 @@ const { matchPromptLine, CLAUDE_PROMPT_PATTERNS, CLAUDE_PENDING_PASTE_RE } = req
 const { buildClaudeModelList } = require('./model-registry');
 const { buildHeadersHelperCommand, writeSpawnMcpConfig } = require('../mcp-spawn-config');
 const { writeProjectClaudeTrust } = require('../project-config');
+const { resolveComputerUse, claudeComputerUseLaunch } = require('../computer-use');
 const claudeLive = require('./claude-live-mode');
 
 // ── Model probe (C1504) ──
@@ -56,15 +57,18 @@ const DESIGN_BRIEF_MAX_CHARS = 4000;
 const CLI_HELP_TIMEOUT_MS = 10_000;
 const _cliHelpCache = new Map(); // fingerprint -> Promise<string|null>
 
-// ── headersHelper probe (TPT349) ──
-// `headersHelper` on an http MCP server entry (a shell command whose JSON stdout supplies
-// request headers, re-run on every connect/reconnect) is not listed in `claude --help` or any
-// documented CLI surface, so support is detected the same way the model table is: by scanning
-// the CLI's own bundle for the literal. Memoized per binary fingerprint (changes on every
-// `claude update`); any failure resolves false and the spawn keeps the project's .mcp.json.
-const HEADERS_HELPER_NEEDLE = 'headersHelper';
-const HEADERS_HELPER_SCAN_TIMEOUT_MS = 10_000;
-const _headersHelperCache = new Map(); // fingerprint -> Promise<boolean>
+// ── CLI bundle probe (TPT349, TPT9225) ──
+// Two capabilities appear in no `claude --help` line or other documented CLI surface, so they are
+// detected the way the model table is: by scanning the CLI's own bundle for a literal.
+// `headersHelper` on an http MCP server entry (a shell command whose JSON stdout supplies request
+// headers, re-run on every connect/reconnect), and `--computer-use-mcp`, the entry point of the
+// CLI's computer-use server (computer-use.js). One streamed scan looks for both and stops once
+// both are seen; memoized per binary fingerprint (changes on every `claude update`). A failed
+// scan is not cached and reads as neither: the spawn keeps the project's .mcp.json and starts
+// without computer use.
+const BUNDLE_NEEDLES = Object.freeze({ headersHelper: 'headersHelper', computerUse: '--computer-use-mcp' });
+const BUNDLE_SCAN_TIMEOUT_MS = 10_000;
+const _bundleFeatureCache = new Map(); // fingerprint -> Promise<{ headersHelper, computerUse }>
 
 function claudeBinFingerprint(bin) {
   try {
@@ -156,7 +160,7 @@ class ClaudeAgent extends BaseTaskAgent {
     // Design mode sends /design and the task brief in one PTY submission; bare
     // /design opens a question menu. Check opt-in before SIMPLE_MODE. Put recent
     // comments first so brief truncation preserves task intent.
-    if (opts.designMode) {
+    if (opts.designMode && !(opts.parentPreparation ?? opts.task?.isObjective)) {
       const rawBrief = [prompt, opts.taskCommentsBlock].filter(Boolean).join(' ');
       const reserve = DESIGN_NO_ASK_SUFFIX.length + 1; // +1 for the joining space
       const brief = ClaudeAgent.flattenDesignBrief(rawBrief, DESIGN_BRIEF_MAX_CHARS - reserve);
@@ -164,7 +168,7 @@ class ClaudeAgent extends BaseTaskAgent {
     }
 
     // SIMPLE_MODE: skip all KB/cache preamble, return bare task prompt
-    if (config.SIMPLE_MODE && !opts.permissionPolicy?.enforced) return promptWithComments;
+    if (config.SIMPLE_MODE && !(opts.parentPreparation ?? opts.task?.isObjective) && !opts.objectiveChain && !opts.permissionPolicy?.enforced) return promptWithComments;
 
     const ttTags = (opts.taskTags || []).filter(t => t.startsWith('tt-'));
     const cachedTags = (opts.cachedTags || []).filter(t => t.startsWith('tt-') && !ttTags.includes(t));
@@ -244,6 +248,15 @@ class ClaudeAgent extends BaseTaskAgent {
     console.log(`[claude-agent] permission mode=${mode || 'legacy'} native=${native.launch}`
       + ` auto=${native.auto}${native.autoReason ? ` (fallback: ${native.autoReason})` : ''}`
       + ` bypass=${native.preEnableBypass ? 'pre-enabled' : native.bypass ? 'launch' : `off (${native.bypassReason})`}`);
+    // (TPT9225) Computer use (opts.computerUse, resolved by terminal-session.js): the CLI's own
+    // server switched on for this project, its tools allowed for the launch mode, and the hook
+    // that holds Plan to screenshots — computer-use.js claudeComputerUseLaunch(). After the trust
+    // write: hooks only run in a trusted folder. The kickoff sees what was applied.
+    const computerUse = claudeComputerUseLaunch(opts.computerUse, { mode, projectRoot });
+    if (opts.computerUse) {
+      opts = { ...opts, computerUse: computerUse.computerUse };
+      console.log(`[claude-agent] computer use: ${computerUse.computerUse.available ? 'on' : `off (${computerUse.computerUse.reasonCode})`}`);
+    }
     const env = augmentPathEnv({ TERM: 'xterm-256color', ...projectEnvExtras(opts.projectPath) });
     if (taskId) {
       env.TIPATASK_TASK_ID = taskId;
@@ -285,6 +298,10 @@ class ClaudeAgent extends BaseTaskAgent {
       }
     }
     args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config');
+    // (TPT9225) The CLI registers its computer-use server after --strict-mcp-config, so only the
+    // tool rules and the plan hook travel here; the server never goes in the MCP config above.
+    args.push(...computerUse.args);
+    if (computerUse.settings) args.push('--settings', JSON.stringify(computerUse.settings));
     // (C1057) Deterministic, wording-independent attention signal: with this channel
     // selected, Claude Code writes a BEL (\x07) to the PTY on agent_needs_input /
     // worker_permission_prompt / idle_prompt — terminal-session.js's feedAttentionChunk()
@@ -407,28 +424,44 @@ class ClaudeAgent extends BaseTaskAgent {
     return claudeLive.resolveNativePermissions({ policy, projectRoot, backend, capabilities });
   }
 
-  // (TPT349) Resolves true when the CLI bundle contains `headersHelper`. Streamed with an early
-  // exit — the ~200MB bundle is never read whole — and a short tail carried across chunks so
-  // a match split over a chunk boundary is not lost.
-  static _cliSupportsHeadersHelper(config) {
+  // (TPT349, TPT9225) { headersHelper, computerUse } for the installed CLI — see BUNDLE_NEEDLES.
+  // Streamed with an early exit (the ~300MB bundle is never read whole) and a short tail carried
+  // across chunks, so a match split over a chunk boundary is not lost.
+  static _cliBundleFeatures(config) {
+    const none = { headersHelper: false, computerUse: false };
     const bin = config.CLAUDE_BIN || resolveBin('claude');
-    if (!bin) return Promise.resolve(false);
+    if (!bin) return Promise.resolve(none);
     const abs = path.isAbsolute(bin) ? bin : (resolveBin('claude') || bin);
     const key = claudeBinFingerprint(abs);
-    if (!_headersHelperCache.has(key)) {
+    if (!_bundleFeatureCache.has(key)) {
       let real = abs;
       try { real = fs.realpathSync(abs); } catch { /* scan the path as given */ }
-      _headersHelperCache.set(key, ClaudeAgent._scanFileForString(real, HEADERS_HELPER_NEEDLE).catch((err) => {
-        console.log(`[claude-agent] headersHelper probe failed: ${err.message}`);
-        _headersHelperCache.delete(key); // retry on the next spawn
-        return false;
-      }));
+      _bundleFeatureCache.set(key, ClaudeAgent._scanFileForStrings(real, Object.values(BUNDLE_NEEDLES)).then(
+        (found) => Object.fromEntries(Object.entries(BUNDLE_NEEDLES).map(([feature, needle]) => [feature, found.has(needle)])),
+        (err) => {
+          console.log(`[claude-agent] CLI bundle probe failed: ${err.message}`);
+          _bundleFeatureCache.delete(key); // retry on the next spawn
+          return none;
+        }));
     }
-    return _headersHelperCache.get(key);
+    return _bundleFeatureCache.get(key);
   }
 
-  static _scanFileForString(filePath, needle) {
+  static async _cliSupportsHeadersHelper(config) {
+    return (await ClaudeAgent._cliBundleFeatures(config)).headersHelper;
+  }
+
+  // (TPT9225) The CLI carries its computer-use server (`claude --computer-use-mcp`).
+  static async _cliSupportsComputerUse(config) {
+    return (await ClaudeAgent._cliBundleFeatures(config)).computerUse;
+  }
+
+  // Resolves the set of `needles` found in the file; stops reading once every one has been seen.
+  static _scanFileForStrings(filePath, needles) {
     return new Promise((resolve, reject) => {
+      const found = new Set();
+      const wanted = new Set(needles).size;
+      const keep = Math.max(1, ...needles.map((n) => n.length)) - 1;
       let tail = '';
       let settled = false;
       const stream = fs.createReadStream(filePath, { encoding: 'latin1', highWaterMark: MODEL_SCAN_CHUNK_BYTES });
@@ -439,15 +472,29 @@ class ClaudeAgent extends BaseTaskAgent {
         stream.destroy();
         fn(value);
       };
-      const timer = setTimeout(() => finish(reject, new Error('scan timed out')), HEADERS_HELPER_SCAN_TIMEOUT_MS);
+      const timer = setTimeout(() => finish(reject, new Error('scan timed out')), BUNDLE_SCAN_TIMEOUT_MS);
       stream.on('data', (chunk) => {
         const buf = tail + chunk;
-        if (buf.includes(needle)) return finish(resolve, true);
-        tail = buf.slice(-(needle.length - 1));
+        for (const needle of needles) if (!found.has(needle) && buf.includes(needle)) found.add(needle);
+        if (found.size === wanted) return finish(resolve, found);
+        tail = keep > 0 ? buf.slice(-keep) : '';
       });
-      stream.on('end', () => finish(resolve, false));
+      stream.on('end', () => finish(resolve, found));
       stream.on('error', (err) => finish(reject, err));
     });
+  }
+
+  static async _scanFileForString(filePath, needle) {
+    return (await ClaudeAgent._scanFileForStrings(filePath, [needle])).has(needle);
+  }
+
+  // (TPT9225) See BaseTaskAgent#detectComputerUse(): the CLI's computer-use server for this run.
+  // The bundle is only scanned on macOS, the one platform the server runs on.
+  async detectComputerUse(config, { platform = process.platform } = {}) {
+    const bin = config.CLAUDE_BIN || resolveBin('claude');
+    const command = bin && path.isAbsolute(bin) ? bin : resolveBin('claude');
+    const serverSupported = platform === 'darwin' && !!command && await ClaudeAgent._cliSupportsComputerUse(config);
+    return resolveComputerUse(this.id, platform, { command, serverSupported });
   }
 
   // (TPT354) See BaseTaskAgent#readFinalMessage. Reads the pinned-uuid transcript (--session-id above).
@@ -568,8 +615,9 @@ class ClaudeAgent extends BaseTaskAgent {
     }
     const status = parseClaudeAuthStatus(probe.output);
     if (status.loggedIn) {
-      // Warm the headersHelper probe off the spawn path (memoized; failures resolve false).
-      void ClaudeAgent._cliSupportsHeadersHelper(config);
+      // Warm the bundle probe (headersHelper + computer use) off the spawn path (memoized;
+      // failures resolve false).
+      void ClaudeAgent._cliBundleFeatures(config);
       return { id: this.id, label: this.label, available: true };
     }
     // Server-log the raw probe result — a false negative here (keychain locked at

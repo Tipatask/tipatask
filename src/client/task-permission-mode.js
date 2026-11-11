@@ -1,3 +1,4 @@
+import { normalizeCowboyScope } from '../cowboy-mode.mjs';
 // Card permission indicator. Editing belongs to the Task Edit modal.
 import { t } from './i18n.js';
 import { escapeAttr } from './utils.js';
@@ -14,7 +15,7 @@ function overrideOf(task) {
 // marks it only while the effective mode is Bypass (cowboyModeOn() inside permissionModeTip()),
 // so a project-default change re-tips every card without a fresh task payload.
 function cowboyOf(task) {
-  return !!(task?.cowboyMode ?? task?.cowboy_mode);
+  return normalizeCowboyScope(task?.cowboyMode ?? task?.cowboy_mode);
 }
 
 function tipFor(override, cowboy = false) {
@@ -26,7 +27,7 @@ export function permissionButtonHtml(task) {
   const override = overrideOf(task);
   const cowboy = cowboyOf(task);
   const tip = escapeAttr(tipFor(override, cowboy));
-  return `<button type="button" class="card-permission-btn card-ctl${override ? ' card-permission-btn--override' : ''}" data-task-id="${escapeAttr(task.id)}" data-permission-mode="${escapeAttr(override || '')}"${cowboy ? ' data-cowboy-mode="1"' : ''} data-tip="${tip}" aria-label="${tip}">${permissionModeIcon(effectivePermissionMode(task, projectPermissionMode()).mode)}</button>`;
+  return `<button type="button" class="card-permission-btn card-ctl${override ? ' card-permission-btn--override' : ''}" data-task-id="${escapeAttr(task.id)}" data-permission-mode="${escapeAttr(override || '')}" data-cowboy-mode="${cowboy}" data-tip="${tip}" aria-label="${tip}">${permissionModeIcon(effectivePermissionMode(task, projectPermissionMode()).mode)}</button>`;
 }
 
 // Re-tips one board card's button from the task's override and Cowboy-coding flag — a payload
@@ -39,10 +40,9 @@ export function syncPermissionModeButton(card, task = null) {
   const hasField = !!task && (task.agentPermissionMode !== undefined || task.agent_permission_mode !== undefined);
   const override = hasField ? overrideOf(task) : (button.dataset.permissionMode || null);
   const hasCowboy = !!task && (task.cowboyMode !== undefined || task.cowboy_mode !== undefined);
-  const cowboy = hasCowboy ? cowboyOf(task) : button.dataset.cowboyMode === '1';
+  const cowboy = hasCowboy ? cowboyOf(task) : normalizeCowboyScope(button.dataset.cowboyMode);
   button.dataset.permissionMode = override || '';
-  if (cowboy) button.dataset.cowboyMode = '1';
-  else delete button.dataset.cowboyMode;
+  button.dataset.cowboyMode = cowboy;
   button.classList.toggle('card-permission-btn--override', !!override);
   const tip = tipFor(override, cowboy);
   button.innerHTML = permissionModeIcon(effectivePermissionMode({ agentPermissionMode: override }, projectPermissionMode()).mode);

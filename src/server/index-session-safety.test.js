@@ -17,7 +17,7 @@ const pauseRunawaySession = () => null;
 // credentials, running agents, or touching the user's process tree.
 // The task-change poll runs on TIPATASK_TASK_POLL_MS (default 30000, the watchdog's own delay);
 // the harness keys timers by delay, so it defaults the poll to a distinct one.
-async function harness(killEnv, failStartup = false, validationEnabled = false, { platform = 'darwin', claudeBin = '/usr/local/bin/claude', taskPollMs = '20000' } = {}) {
+async function harness(killEnv, failStartup = false, validationEnabled = false, { platform = 'darwin', claudeBin = '/usr/local/bin/claude', taskPollMs = '20000', projectConfig = null } = {}) {
   const timers = new Map();
   const exits = [];
   const lines = [];
@@ -27,6 +27,10 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
   const validation = { samples: [], lifecycle: [], watchdog: [], stops: 0, trackerOptions: null };
   const flagLoads = [];
   const quotaLoads = [];
+  const deviceRelay = { starts: 0, closes: 0, syncs: 0, options: null };
+  const deviceIdentity = { options: null, calls: [], id: null, instance: null, handedTo: [], claimsHandedTo: [] };
+  const deviceClaims = { created: 0, closes: 0, instance: null };
+  const modelReport = { options: null, schedules: 0, starts: 0, stops: 0, listeners: [] };
   let shutdownOptions, listenCallback, onTaskUpdated;
   const frames = [];
   const nudges = [];
@@ -45,10 +49,12 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
     './config': { USER_NAME: 'test', USER_DATA_ROOT: '/scratch', SERVER_ROOT: '/scratch',
       PROJECT_ROOT: '/project-a', TASK_BACKEND: 'api', CLAUDE_BIN: claudeBin },
     './spawn-utils': { augmentPathEnv: () => ({}), isAsarPath: () => false, cliSpawnSpec: require('./spawn-utils').cliSpawnSpec },
-    './task-backend': { createBackend: () => backend, coerceBackendType: () => 'api' },
+    './task-backend': { createBackend: () => backend, coerceBackendType: () => 'api',
+      createPerProjectBackend: (_cfg, projectPath) => ({ init: async () => {}, projectPath }) },
     './backend-broadcasts': require('./backend-broadcasts'),
     './backend-eviction': require('./backend-eviction'),
-    './ws-handlers': { createHttpHandler: () => () => {}, drainSessionQueue() {}, sessionQueue: { setAdmission() {}, isRunning: () => false } },
+    './ws-handlers': { createHttpHandler: () => () => {}, drainSessionQueue() {}, sessionQueue: { setAdmission() {}, isRunning: () => false },
+      setDeviceIdentity: (identity, claims) => { deviceIdentity.handedTo.push(identity); deviceIdentity.claimsHandedTo.push(claims); } },
     './session-admission': { createSessionAdmission: () => ({ start() {}, stop() {}, snapshot: () => ({ cap: 6 }) }) },
     './session-validation': { createSessionValidationRecorder: () => ({
       status: () => ({ enabled: validationEnabled }),
@@ -64,6 +70,10 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
     './git-merge/completion-guard': { guardCompletionTransition: async () => ({ allowed: true }), warnIfCompletedWorktreeDirty: async () => {} },
     './task-change-poll': { createTaskChangePoll: () => ({ tick: async () => { throw new TypeError('poll failed'); } }) },
     './terminal-session': { killRunawaySession, pauseRunawaySession, bgAgentsBusy: () => false,
+      connectDeviceRelay(options) {
+        deviceRelay.starts++; deviceRelay.options = options;
+        return { sync() { deviceRelay.syncs++; }, close() { deviceRelay.closes++; } };
+      },
       maybeNudgeIdleSession: async s => nudges.push(s) },
     './process-group': { snapshotProcesses: async () => ({}), resolveAgentLimits,
       sweepDescendantWatchdog: (...args) => sweeps.push(args) },
@@ -76,10 +86,26 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
       endSessionMemory(...args) { memory.ended.push(args); } },
     './crash-guard': { installCrashGuard: opts => installCrashGuard({ ...opts,
       proc, exit: proc.exit, log, recordExit() {} }) },
-    './project-config': {},
+    './remote-control-consent': { read: p => ({ enabled: (typeof projectConfig === 'function' ? projectConfig(p) : projectConfig)?.localConsent === true, grant: 'local-grant' }), watch: () => () => {} },
+    './project-config': { readProjectConfig: p => typeof projectConfig === 'function' ? projectConfig(p) : projectConfig },
+    './device-identity': { createDeviceIdentity(opts) {
+      deviceIdentity.options = opts;
+      deviceIdentity.instance = { deviceIdFor: args => { deviceIdentity.calls.push(args); return deviceIdentity.id; } };
+      return deviceIdentity.instance;
+    } },
+    './device-claim-registry': { createDeviceClaimRegistry() {
+      deviceClaims.created++;
+      deviceClaims.instance = { close() { deviceClaims.closes++; } };
+      return deviceClaims.instance;
+    } },
     './local-access': { createLocalAccess: () => ({}), LOCAL_HOST: '127.0.0.1' },
     './left-uncommitted': { load: opts => { flagLoads.push({ ...opts, listening: listenCallback !== undefined }); return { restored: 0, dropped: 0 }; } },
     './task-agent/quota-status': { loadQuotaSnapshots: opts => { quotaLoads.push({ ...opts, listening: listenCallback !== undefined }); return { restored: 0, dropped: 0 }; } },
+    './agent-model-report': { createAgentModelReporter(opts) {
+      modelReport.options = opts;
+      return { schedule() { modelReport.schedules++; }, start() { modelReport.starts++; }, stop() { modelReport.stops++; } };
+    } },
+    './task-agent/model-registry': { onModelsResolved(listener) { modelReport.listeners.push(listener); return () => {}; } },
   };
   const module = { exports: {} };
   const filename = path.join(__dirname, 'index.js');
@@ -99,7 +125,8 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
   if (!failStartup) assert.ok(timers.has(10000));
   if (!failStartup && taskPollMs === '20000') assert.ok(timers.has(20000));
   return { sessions: module.exports.sessions, timers, proc, exits, lines, sweeps, memory, validation, execCalls,
-    server, shutdownOptions, flagLoads, quotaLoads, backend, frames, nudges, clients, onTaskUpdated,
+    server, shutdownOptions, flagLoads, quotaLoads, backend, frames, nudges, clients, onTaskUpdated, deviceRelay, deviceIdentity,
+    deviceClaims, modelReport, projectRegistry: module.exports.projectRegistry,
     ready: () => listenCallback(), getMemoryTelemetry: module.exports.getMemoryTelemetry };
 }
 
@@ -274,9 +301,107 @@ test('bootstrap starts telemetry on listen and wires close, exit, reaper and sta
   h.proc.emit('exit');
   h.shutdownOptions.beforeShutdown();
   assert.equal(h.memory.stops, 3);
+  assert.equal(h.deviceRelay.starts, 1);
+  assert.equal(h.deviceRelay.options.getSessions(), h.sessions);
+  assert.equal(h.deviceRelay.closes, 3, 'server close, exit and reaper close the outbound relay');
   const failed = await harness(undefined, true);
   assert.equal(failed.memory.starts, 0);
   assert.equal(failed.memory.stops, 1);
+});
+
+// (TPT9217) The relay's device is this machine's own device row (device-identity.js), never a
+// config.json DEVICE_ID, and nothing is asked about a project that has not opted in.
+test('the relay asks device identity only for opted-in projects and resyncs when it answers', async () => {
+  const off = await harness(undefined, false, false, { projectConfig: { REMOTE_CONTROL_ENABLED: 'true', DEVICE_ID: '9' } });
+  // getProjects() runs inside the bootstrap's vm context, so its arrays are compared by value.
+  assert.equal(off.deviceRelay.options.getProjects().length, 0, 'portable flags cannot opt in');
+  assert.equal(off.deviceIdentity.calls.length, 0, 'a disabled project makes no identity request');
+
+  const on = await harness(undefined, false, false, { projectConfig: { REMOTE_CONTROL_ENABLED: true, localConsent: true, DEVICE_ID: '9' } });
+  assert.equal(JSON.stringify(on.deviceRelay.options.getProjects().map(p => p.deviceId)), '[null]', 'unknown until resolved');
+  on.deviceIdentity.id = 1;
+  const [project] = on.deviceRelay.options.getProjects();
+  assert.equal(project.deviceId, 1, 'machine identity, not the DEVICE_ID config.json carries');
+  assert.equal(project.enabled, true);
+  assert.equal(project.projectPath, '/project-a');
+  assert.equal(project.backend, on.backend);
+  assert.equal(on.deviceIdentity.calls.at(-1).backend, on.backend);
+  const before = on.deviceRelay.syncs;
+  on.deviceIdentity.options.onChange();
+  assert.equal(on.deviceRelay.syncs, before + 1, 'a resolved device connects without waiting for the poll');
+});
+
+test('Electron config notification registers a window project before relay sync, without switching the singleton', async () => {
+  const config = { REMOTE_CONTROL_ENABLED: true, localConsent: true };
+  const h = await harness(undefined, false, false, { projectConfig: p => p === '/window-project' ? config : null });
+  assert.equal(h.deviceRelay.options.getProjects().length, 0, 'rootless startup has no relay projects');
+  h.proc.emit('message', { type: 'project:config-changed', projectPath: '/window-project' });
+  await new Promise(resolve => setImmediate(resolve));
+  h.deviceIdentity.id = 7;
+  const [project] = h.deviceRelay.options.getProjects();
+  assert.ok(project, 'IPC-only Electron window must become a relay candidate');
+  assert.equal(project.projectPath, '/window-project');
+  assert.equal(project.backend.projectPath, '/window-project');
+  assert.notEqual(project.backend, h.backend, 'the startup singleton is never rebound');
+  const syncs = h.deviceRelay.syncs;
+  config.localConsent = false;
+  h.proc.emit('message', { type: 'project:config-changed', projectPath: '/window-project' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(h.deviceRelay.syncs > syncs, 'a known project must also resync on opt-out');
+  assert.equal(h.deviceRelay.options.getProjects().length, 0);
+  for (const projectPath of [undefined, {}, 'relative', '/missing']) {
+    h.proc.emit('message', { type: 'project:config-changed', projectPath });
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.projectRegistry.size, 2, 'invalid or unconfigured paths are not registered');
+});
+
+// (TPT9235) The device's model report: built over the project registry and the one device identity,
+// triggered by every resolved registry probe and every registered project, started only once the
+// server listens, stopped on exit.
+test('bootstrap wires the agent model report to the registry, project registration, listen and exit', async () => {
+  const h = await harness(undefined, false, false, { projectConfig: p => (p === '/window-project' ? {} : null) });
+  const opts = h.modelReport.options;
+  assert.equal(opts.deviceIdentity, h.deviceIdentity.instance, 'the device identity the relay and run attribution use');
+  assert.equal(opts.config.USER_DATA_ROOT, '/scratch');
+  assert.deepEqual([...opts.getProjectPaths()], ['/project-a']);
+  assert.equal(h.modelReport.listeners.length, 1, 'one registry listener');
+  assert.equal(h.modelReport.starts, 0, 'nothing reported before the server listens');
+  h.ready();
+  assert.equal(h.modelReport.starts, 1);
+
+  const before = h.modelReport.schedules;
+  h.modelReport.listeners[0]('claude', { source: 'probe', models: [] });
+  assert.equal(h.modelReport.schedules, before + 1, 'a resolved probe schedules a report');
+  h.proc.emit('message', { type: 'project:config-changed', projectPath: '/window-project' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.modelReport.schedules, before + 2, 'a registered window project schedules a report');
+  assert.deepEqual([...opts.getProjectPaths()], ['/project-a', '/window-project']);
+
+  h.proc.emit('exit', 0);
+  assert.equal(h.modelReport.stops, 1);
+});
+
+// (TPT9220) Run attribution and the board name the relay's device: ws-handlers.js gets the very
+// instance the relay reads, whatever a project's remote-control setting.
+test('ws-handlers gets the one device identity the relay uses, for every project', async () => {
+  for (const projectConfig of [null, { REMOTE_CONTROL_ENABLED: true }]) {
+    const h = await harness(undefined, false, false, { projectConfig });
+    assert.equal(h.deviceIdentity.handedTo.length, 1);
+    assert.equal(h.deviceIdentity.handedTo[0], h.deviceIdentity.instance);
+  }
+});
+
+// (TPT9223) The lifecycle releases claims runs left open only through this machine's claim
+// registry; the server's own entries go when it exits, since its runs end with it.
+test('ws-handlers gets one claim registry, which the server clears on exit', async () => {
+  const h = await harness();
+  assert.equal(h.deviceClaims.created, 1);
+  assert.equal(h.deviceIdentity.claimsHandedTo.length, 1);
+  assert.equal(h.deviceIdentity.claimsHandedTo[0], h.deviceClaims.instance);
+  assert.equal(h.deviceClaims.closes, 0);
+  h.proc.emit('exit');
+  assert.equal(h.deviceClaims.closes, 1);
 });
 
 test('completion sweep freezes task memory history even while terminal remains alive', async () => {

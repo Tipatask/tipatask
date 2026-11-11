@@ -92,7 +92,7 @@ function writeSpawnMcpConfig({ projectRoot, userDataRoot, helperCommand }) {
 // `caller: 'pi'` defaults servers/label for a Pi task terminal and fails closed unless the
 // `tipatask` entry was bound to the account-store headersHelper: the bridge expands `${VAR}` from
 // Pi's env, which carries API_TOKEN, so an unbound `Bearer ${API_TOKEN}` header must never reach it.
-function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label, caller }) {
+function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label, caller, computerUse }) {
   const pi = caller === 'pi';
   if (pi) {
     servers = servers || PI_MCP_SERVERS;
@@ -127,10 +127,16 @@ function writeScopedMcpConfig({ projectRoot, userDataRoot, servers, label, calle
   for (const name of servers) {
     if (all[name] && typeof all[name] === 'object') mcpServers[name] = all[name];
   }
+  // Only task terminals pass a detected capability. Headless Pi chats keep their scoped tools.
+  if (pi && computerUse?.available === true && computerUse.provider === 'pi') {
+    mcpServers[computerUse.serverName] = computerUse.server;
+  }
   if (Object.keys(mcpServers).length === 0) return null;
 
   const dir = path.join(userDataRoot, 'mcp-spawn');
-  const id = crypto.createHash('sha1').update(path.resolve(projectRoot)).digest('hex').slice(0, 12);
+  // Concurrent headless turns must not overwrite a task's desktop server before Pi connects.
+  const capabilityKey = pi && mcpServers['computer-use'] ? JSON.stringify(mcpServers['computer-use']) : '';
+  const id = crypto.createHash('sha1').update(path.resolve(projectRoot)).update(capabilityKey).digest('hex').slice(0, 12);
   const outPath = path.join(dir, `${id}.${String(label).replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
   const content = JSON.stringify({ mcpServers }, null, 2) + '\n';
   try {

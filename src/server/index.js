@@ -17,7 +17,7 @@ const { augmentPathEnv, isAsarPath, cliSpawnSpec } = require('./spawn-utils');
 const { createBackend, createPerProjectBackend, coerceBackendType } = require('./task-backend');
 const { attachBackendBroadcasts, detachBackendBroadcasts } = require('./backend-broadcasts');
 const { createBackendEvictor, BACKEND_EVICT_SWEEP_MS } = require('./backend-eviction');
-const { createHttpHandler, handleConnection, drainSessionQueue, sessionQueue } = require('./ws-handlers');
+const { createHttpHandler, handleConnection, handleRemoteSessionCommand, drainSessionQueue, sessionQueue, setDeviceIdentity } = require('./ws-handlers');
 const websocket = require('./websocket');
 const { preloadAgentDetection, listAllAgentModels } = require('./task-agent');
 const { fetchStatusRoles, isClosedName } = require('./status-roles');
@@ -264,10 +264,13 @@ function setActiveProject(projectPath) {
 }
 
 async function getOrCreateBackend(projectPath) {
-  if (projectRegistry.has(projectPath)) return backend;
-  const projectConfig = readProjectConfig(projectPath);
-  if (!projectConfig) throw new Error(`No .tipatask/config.json found at ${projectPath}`);
-  projectRegistry.set(projectPath, { config: projectConfig });
+  if (!projectRegistry.has(projectPath)) {
+    const projectConfig = readProjectConfig(projectPath);
+    if (!projectConfig) throw new Error(`No .tipatask/config.json found at ${projectPath}`);
+    projectRegistry.set(projectPath, { config: projectConfig });
+  }
+  deviceRelay.sync();
+  agentModelReporter.schedule();
   return backend;
 }
 
@@ -378,6 +381,56 @@ const _registryOps = {
   resolveProjectPathViaMain, sendOpenObjective, sendStartTask, confirmHandoffViaMain,
 };
 
+// (TPT9217) The device a relay socket names is this machine's own device row for the signed-in
+// account, found by machine id and linked to each opted-in project (device-identity.js), never a
+// config.json DEVICE_ID. The relay asks only for opted-in projects, so a disabled project still
+// makes no relay request at all. A link's completion re-runs the relay's sync; it is never
+// synchronous.
+// (TPT9220) The same instance names the device every API project's terminal runs are attributed
+// to, and the board's own device (ws-handlers.js), so they share its one lookup per account.
+const deviceIdentity = require('./device-identity').createDeviceIdentity({ onChange: () => deviceRelay.sync() });
+// (TPT9223) The claims this server's runs hold, kept where every Task App server of this OS user
+// (one device to the API) can see them, so a claim left open by a server that exited mid-run is
+// released and a live one never is. This server's runs end with it, so its entries go on exit.
+const deviceClaims = require('./device-claim-registry').createDeviceClaimRegistry();
+setDeviceIdentity(deviceIdentity, deviceClaims);
+process.once('exit', () => deviceClaims.close());
+const remoteControlConsent = require('./remote-control-consent');
+const deviceRelay = require('./terminal-session').connectDeviceRelay({
+  getSessions: () => sessions,
+  getProjects: () => [...projectRegistry.keys()].flatMap(projectPath => {
+    const consent = remoteControlConsent.read(projectPath);
+    if (!consent.enabled) return [];
+    const backend = getBackendForPath(projectPath);
+    return [{ projectPath, enabled: true, consentGrant: consent.grant, deviceId: deviceIdentity.deviceIdFor({ backend }), backend }];
+  }),
+  handleCommand: (command, context) => handleRemoteSessionCommand(command, context, { sessions, registryOps: _registryOps }),
+});
+process.once('exit', () => deviceRelay.close());
+const stopConsentWatch = remoteControlConsent.watch(() => deviceRelay.sync());
+process.once('exit', stopConsentWatch);
+// (TPT9235) This device's agent model lists — the live model registry's Claude/Codex lists and
+// each project's Pi task rows — reported to the API per registered project, so the web task
+// forms' Model field suggests what this Task App offers. A finished probe, a newly registered
+// project and the periodic poll (started once the server listens) trigger a report; one goes
+// out only when its content changed or for the heartbeat. See agent-model-report.js.
+const agentModelReporter = require('./agent-model-report').createAgentModelReporter({
+  getProjectPaths: () => projectRegistry.keys(),
+  deviceIdentity,
+  config,
+});
+require('./task-agent/model-registry').onModelsResolved(() => agentModelReporter.schedule());
+process.once('exit', () => agentModelReporter.stop());
+process.on('message', msg => {
+  if (msg?.type !== 'project:config-changed' || typeof msg.projectPath !== 'string' || !path.isAbsolute(msg.projectPath)) return;
+  deviceRelay.sync(); // Withdraw consent before asynchronous backend registration.
+  // Window binds and settings saves arrive over trusted parent IPC. Register first: a
+  // Finder launch starts without a project, and Electron never switches the singleton.
+  getOrCreateBackend(msg.projectPath).catch(() => {
+    console.warn('[device-relay] could not register the window project; remote control requires a readable project config');
+  });
+});
+
 // C1218 — Electron main delegates its window-bind auto-reindex trigger to THIS process
 // over the fork's own IPC channel (main/window-state.js's setServerMessenger/_fireKbSync)
 // instead of running the Opus reindex in main itself — main lacks a correct
@@ -471,8 +524,8 @@ installCrashGuard({
 // groups — so the SIGTERM that stops this server (Electron quit → serverChild.kill()), a Ctrl+C
 // SIGINT, or Electron main going away never reaches them. Reap them, then exit. Installed at module
 // load, not in the boot chain below, so a quit during boot is covered too.
-installShutdownReaper({ sessions, beforeShutdown: stopMemoryAdmission });
-server.once('close', stopMemoryAdmission);
+installShutdownReaper({ sessions, beforeShutdown: () => { deviceRelay.close(); stopMemoryAdmission(); } });
+server.once('close', () => { deviceRelay.close(); stopMemoryAdmission(); });
 
 const wss = createWebSocketGate(server, (ws, req) => {
   Promise.resolve(handleConnection(ws, req, sessions, getActiveBackend, broadcastAttentionFor, broadcastAttentionCleared, _registryOps.getBackendForPath)).catch(err => {
@@ -858,6 +911,7 @@ ensureCavemanPlugin()
   server.listen(config.PORT, LOCAL_HOST, () => {
     memoryTelemetry.start();
     admission.start();
+    agentModelReporter.start();
     if (process.send) process.send('ready');
     console.log(`TODO board: http://127.0.0.1:${config.PORT}/todo.html`);
     if (localAccess.loginCode) console.log(`Task App launch code: ${localAccess.loginCode} (enter at http://127.0.0.1:${config.PORT}/login)`);
@@ -939,6 +993,7 @@ ensureCavemanPlugin()
   }
   })
   .catch((err) => {
+    deviceRelay.close();
     stopMemoryAdmission();
     console.error(err);
     sendFatal({ code: err && err.code || 'ERR_STARTUP', port: config.PORT, message: err && err.message || String(err) });

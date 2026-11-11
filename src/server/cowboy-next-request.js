@@ -55,7 +55,7 @@ async function requestNextTasks(taskKey, { env = process.env, fetchImpl = fetch,
   if (!key) return failure('no_task_key', 'Pass the key of the task this run just completed. Nothing was started.');
   const token = env[COWBOY_TOKEN_ENV];
   if (!token) {
-    return failure('no_token', `${COWBOY_TOKEN_ENV} is not set: start_next_tasks works only inside a cowboy chain run (a Bypass task run with Cowboy-coding mode on, or one a chain started). Nothing was started.`);
+    return failure('no_token', `${COWBOY_TOKEN_ENV} is not set: start_next_tasks works only inside a cowboy chain run or parent-objective chain run. Nothing was started.`);
   }
   let url = null;
   try { url = new URL(env[COWBOY_URL_ENV]); } catch { url = null; }

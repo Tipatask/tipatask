@@ -175,28 +175,17 @@ test('ws-handlers.js: the multi-candidate picker page and the no-Electron 302 fa
       'here would lose the route on the second hop (easy to miss, called out explicitly in the plan)'
   );
   assert.match(
-    src, /Location: `\/todo\.html\?objectiveTask=\$\{encodeURIComponent\(taskKey\)\}&objectivePlan=1`/,
-    'the no-Electron 302 fallback must append &objectivePlan=1 — it cannot tell whether the ' +
-      'clicked task has children, so it always degrades to the planning branch'
+    src, /Location: `\/todo\.html\?startTask=\$\{encodeURIComponent\(taskKey\)\}`/,
+    'the development fallback must start the task itself'
   );
 });
 
-test('ws-handlers.js: the dispatch checks is_objective+no-children BEFORE falling through to sendStartTask', () => {
+test('web handoff starts parent objectives in their own terminal', () => {
   const src = readServerSource('ws-handlers.js');
-  const objIdx = src.indexOf('if (task.isObjective && children.length === 0)');
-  const startIdx = src.indexOf('registryOps.sendStartTask(projectPath, taskKey');
-  assert.ok(objIdx !== -1, 'the childless-objective planning branch condition not found');
-  assert.ok(startIdx !== -1, 'sendStartTask( call not found');
-  assert.ok(
-    objIdx < startIdx,
-    'the planning-branch check must run BEFORE the sendStartTask fallback, or a childless ' +
-      'objective would be routed into the wrong branch'
-  );
-  assert.match(
-    src, /getChildren\(taskKey, \{ unscoped: true \}\)/,
-    'the route must fetch children with unscoped:true — this is a cross-account handoff, ' +
-      "not a board render, so a teammate-owned child must still count toward the dispatch decision"
-  );
+  const start = src.indexOf('const sent = registryOps.sendStartTask(projectPath, taskKey');
+  assert.ok(start !== -1);
+  assert.doesNotMatch(src, /if \(task\.isObjective && children\.length === 0\)/);
+  assert.match(src.slice(start, start + 100), /children: \[\]/);
 });
 
 test('index.js: sendOpenObjective and sendStartTask are both threaded into _registryOps', () => {
@@ -250,14 +239,11 @@ test('template.html: objectivePlan is deleted before history.replaceState, same 
   assert.ok(replaceIdx !== -1 && replaceIdx > deleteIdx, 'history.replaceState must run AFTER objectivePlan is deleted, or a reload would re-seed with a stale plan flag');
 });
 
-test('template.html: the start-task IPC listener picks the child client-side before calling startTaskById', () => {
+test('template.html: the start-task IPC listener starts the requested task itself', () => {
   const html = readSource('template.html');
-  assert.match(
-    html,
-    /window\.TipTask\.taskCard\.pickFirstStartableChild\(list\)/,
-    'the child must be picked in the renderer (which holds the live board status map), not server-side'
-  );
-  assert.match(html, /window\.TipTask\.taskCard\.startTaskById\(/, 'startTaskById must be called for both the picked-child and regular-task cases');
+  assert.match(html, /onStartTask\(\(\{ taskKey \}\) =>/);
+  assert.match(html, /startTaskById\(taskKey\)/);
+  assert.doesNotMatch(html, /pickFirstStartableChild\(list\)/);
 });
 
 test('task-card.js: startTaskById and pickFirstStartableChild are exported (reachable via window.TipTask.taskCard)', () => {
@@ -431,12 +417,9 @@ test('template.html: seedObjectiveFromTask skips its own task fetch when the cal
   );
 });
 
-test('ws-handlers.js: /start-task forwards the already-fetched task\'s title/description into sendOpenObjective', () => {
+test('ws-handlers.js: /start-task never seeds New Objective for a parent', () => {
   const src = readServerSource('ws-handlers.js');
-  assert.match(
-    src,
-    /sendOpenObjective\(projectPath, taskKey, \{ warning, originTaskKey: taskKey, title: task\.title, description: task\.description \}\)/,
-    'the childless-objective branch must forward title/description from its own getTask() fetch, ' +
-      'not leave the renderer to re-fetch the same task (TPT16)'
-  );
+  const route = src.slice(src.indexOf("urlPath === '/start-task'"), src.indexOf('// Only these build outputs are public.'));
+  assert.match(route, /sendStartTask\(projectPath, taskKey/);
+  assert.doesNotMatch(route, /sendOpenObjective\(/);
 });

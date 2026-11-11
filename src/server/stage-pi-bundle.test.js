@@ -7,6 +7,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { test } = require('node:test');
+const { isDeepStrictEqual } = require('node:util');
 const { ensurePiInstalled, stagePiBundle, stageWindowsNode, stageTargetWindowsNode, beforePack,
   stageNotices, readExpectedState, validateTree, pruneForeignOptional } = require('../../scripts/stage-pi-bundle');
 
@@ -160,6 +161,32 @@ test('exact cache hit skips npm ci and still refreshes license and notices', (t)
   assert.equal(f.calls.filter((call) => call.args[0] !== 'ci').length, 2);
   assert.match(fs.readFileSync(path.join(f.vendor, PI, 'LICENSE'), 'utf8'), /Mario Zechner/);
   assert.equal(fs.readFileSync(path.join(f.vendor, 'node_modules', 'THIRD-PARTY-NOTICES.md'), 'utf8'), 'generated notices');
+});
+
+test('Pi npm child accepts legacy Python without npm warnings or parent environment changes', t => {
+  const original = { npm_config_python: process.env.npm_config_python, PYTHON: process.env.PYTHON };
+  t.after(() => {
+    for (const [key, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  for (const legacy of ['/legacy/python3.10', '', undefined]) {
+    if (legacy === undefined) delete process.env.npm_config_python;
+    else process.env.npm_config_python = legacy;
+    process.env.PYTHON = '/explicit/python3.11';
+    const parentEnv = { ...process.env };
+    const f = fixture(t);
+    const lines = [];
+    assert.equal(f.run('arm64', { log: line => lines.push(line) }), true);
+    const install = f.calls[0];
+    assert.ok(install.args.includes('--loglevel=error'));
+    const expected = { ...parentEnv, PYTHON: legacy || parentEnv.PYTHON };
+    delete expected.npm_config_python;
+    assert.ok(isDeepStrictEqual(install.options.env, expected), 'only Python entries change in the child env');
+    assert.ok(isDeepStrictEqual({ ...process.env }, parentEnv), 'parent env stays intact');
+    assert.ok(lines.some(line => /pi-coding-agent@1\.0\.0 staged$/.test(line)));
+  }
 });
 
 test('prefix cache hit with changed transitive lock rebuilds matching dependency versions', (t) => {

@@ -32,11 +32,17 @@ export function tasksForActiveTab(tasks, { tab, sprintsEnabled } = {}) {
   return src; // new_task/objective/etc — no board render, no domain narrowing to apply
 }
 
-// ── Objective grouping filter (C1460) ──
-// project.use_objective_grouping (C1556) decides whether an objective's subtasks or its
-// is_objective parent container is what the root board draws — never both. Invariant: a row
-// is hidden only when a row present in this SAME fetch leads to it (the visible row is the
-// door to it via the drill-in / Subtasks button). That one rule buys two things for free:
+// ── Objective grouping filter (C1460, TPT9233) ──
+// project.use_objective_grouping (C1556) — the viewer's saved setting — decides whether the root
+// board groups subtasks into their parent:
+//   - ON (grouped): a subtask is drawn only inside its parent — the parent card's Subtasks N/M
+//     drill-in — so the root board hides it.
+//   - OFF (ungrouped): every subtask is its own root card AND the parent stays on the board, so
+//     its progress and drill-in stay reachable (TPT9233; C1460 used to hide a parent once it had
+//     subtasks, which left the parent of an older objective unreachable from the root board).
+// The web board's lib/objective-hierarchy.js applies the same rule. Invariant: a row is hidden
+// only when a row present in this SAME fetch leads to it (the visible row is the door to it via
+// the drill-in / Subtasks button). That one rule buys two things for free:
 //   - Orphan children stay visible. A child whose parent didn't make it into this fetch —
 //     assignee-scoped fetch with a teammate-owned parent (api-backend.js
 //     filterToOwnOrUnassigned), or the sprint window's floor rising past the parent's
@@ -52,17 +58,17 @@ export function taskHiddenByGrouping(t, { objectiveGrouping, drilldown, presentD
     // read path today — kept as defence-in-depth in case that ever changes.
     return (t?.parentDbId != null && !!presentDbIds?.has(t.parentDbId)) || !!t?.parentId;
   }
-  // Grouping off: hide the parent container once it actually has subtasks; a childless
-  // is_objective row (e.g. a web-created objective, C1559, before its subtasks are
-  // generated) stays visible — hiding it would strand its only "Create Subtasks" entry point.
-  return t?.isObjective === true && t?.hasChildren === true;
+  // Grouping off: nothing is hidden — the subtasks render as plain root cards and their parent
+  // keeps its own card (objective highlight, Subtasks N/M). Childless objectives (a web-created
+  // objective before its subtasks are generated, C1559) were never hidden either.
+  return false;
 }
 
 // tasks: fetched rows (root-board fetch OR a drill-down's getChildren() rows).
 // opts.objectiveGrouping: getObjectiveGroupingEnabled(). opts.drilldown: state.subtaskStack.length > 0.
 export function tasksVisibleUnderGrouping(tasks, { objectiveGrouping, drilldown } = {}) {
   const src = Array.isArray(tasks) ? tasks : [];
-  if (drilldown) return src;
+  if (drilldown || !objectiveGrouping) return src; // nothing is hidden ungrouped (TPT9233)
   const presentDbIds = new Set(src.map(t => t?.dbId).filter(v => v != null));
   return src.filter(t => !taskHiddenByGrouping(t, { objectiveGrouping, drilldown, presentDbIds }));
 }

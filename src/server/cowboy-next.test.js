@@ -29,7 +29,7 @@ function task(id, fields = {}) {
   };
 }
 
-const FINISHED = task('T1', { status: 'Done', agentPermissionMode: 'bypass' });
+const FINISHED = task('T1', { status: 'Done', agentPermissionMode: 'bypass', cowboyMode: 'project' });
 const select = (tasks, opts = {}) => selectNextCowboyTasks(FINISHED, [FINISHED, ...tasks], { statusRoles: ROLES, currentUserId: 1, ...opts });
 const keys = result => result.tasks.map(t => t.id);
 
@@ -198,7 +198,7 @@ test('a none answer names every dependent and every open task of the sprint; clo
     task('T5', { status: 'Done', order: 3 }),
     task('T6', { status: 'Dropped', order: 4 }),
     task('T7', { assignee: 2, order: 5 }),
-    task('T9', { priority: 8 }), // another sprint
+    task('T9', { priority: 8, status: 'Done' }), // closed later sprint
     task('T10', { priority: 0 }), // backlog
   ]);
   assert.deepEqual(result, {
@@ -245,13 +245,49 @@ test('a pick inherits the finished run\'s agent and model, Bypass and Cowboy-cod
   assert.deepEqual(chainInheritance(null), { agent: null, model: '' });
 
   assert.deepEqual(chainPickFields({ agent: 'claude', model: 'claude-opus-5-5' }),
-    { agentPermissionMode: 'bypass', cowboyMode: true, agentAssignee: 'claude', claudeModel: 'claude-opus-5-5' });
+    { agentPermissionMode: 'bypass', cowboyMode: 'project', agentAssignee: 'claude', claudeModel: 'claude-opus-5-5' });
   assert.deepEqual(chainPickFields({ agent: 'codex', model: 'gpt-5.5-codex' }),
-    { agentPermissionMode: 'bypass', cowboyMode: true, agentAssignee: 'codex', codexModel: 'gpt-5.5-codex' });
+    { agentPermissionMode: 'bypass', cowboyMode: 'project', agentAssignee: 'codex', codexModel: 'gpt-5.5-codex' });
   assert.deepEqual(chainPickFields({ agent: 'pi', model: 'deepseek/deepseek-v4' }),
-    { agentPermissionMode: 'bypass', cowboyMode: true, agentAssignee: 'pi', piModel: 'deepseek/deepseek-v4' });
+    { agentPermissionMode: 'bypass', cowboyMode: 'project', agentAssignee: 'pi', piModel: 'deepseek/deepseek-v4' });
   assert.deepEqual(chainPickFields({ agent: 'codex', model: '' }),
-    { agentPermissionMode: 'bypass', cowboyMode: true, agentAssignee: 'codex' }, 'no model reported: the model fields stay');
-  assert.deepEqual(chainPickFields({ agent: null, model: '' }), { agentPermissionMode: 'bypass', cowboyMode: true });
-  assert.deepEqual(chainPickFields(), { agentPermissionMode: 'bypass', cowboyMode: true });
+    { agentPermissionMode: 'bypass', cowboyMode: 'project', agentAssignee: 'codex' }, 'no model reported: the model fields stay');
+  assert.deepEqual(chainPickFields({ agent: null, model: '' }), { agentPermissionMode: 'bypass', cowboyMode: 'project' });
+  assert.deepEqual(chainPickFields(), { agentPermissionMode: 'bypass', cowboyMode: 'project' });
+});
+
+
+test('Disabled stops; Related follows dependencies only, across sprints', () => {
+  const dependent = task('T2', { priority: 10, dependencies: ['T1'] });
+  assert.deepEqual(keys(select([dependent], { scope: 'disabled' })), []);
+  assert.deepEqual(keys(select([dependent], { scope: 'related' })), ['T2']);
+  assert.deepEqual(keys(select([task('T3'), task('T4', { priority: 20 })], { scope: 'related' })), []);
+});
+
+test('Whole Project resumes the original sprint after a distant dependency branch', () => {
+  const leaf = task('T9', { status: 'Done', priority: 12 });
+  const result = selectNextCowboyTasks(leaf, [leaf, task('T2', { priority: 7, order: 11 }), task('T3', { priority: 12 })],
+    { scope: 'project', context: { originTaskId: 'T1', originSprint: 7, sprint: 7, order: 10 }, statusRoles: ROLES });
+  assert.deepEqual(keys(result), ['T2']);
+  assert.equal(result.reason, 'sprint');
+});
+
+test('Whole Project skips empty, human, blocked, image and busy sprints and chooses the next higher startable sprint', () => {
+  const result = select([
+    task('T2', { priority: 8, category: 'HUMAN' }),
+    task('T3', { priority: 9, dependencies: ['missing'] }),
+    task('T4', { priority: 11, agentAssignee: 'human' }),
+    task('T5', { priority: 12 }),
+    task('T6', { priority: 13, isImage: true }),
+    task('T7', { priority: 15, order: 2 }), task('T8', { priority: 15, order: 1 }),
+    task('T0', { priority: 0 }), task('T10', { priority: 6 }),
+  ], { scope: 'project', liveTaskIds: ['T5'], isImageTask: t => t.isImage });
+  assert.deepEqual(keys(result), ['T8']);
+  assert.equal(result.reason, 'next_sprint');
+  assert.deepEqual(result.skipped.map(t => t.reason), ['category', 'deps_open', 'human', 'live_session', 'image_task']);
+});
+
+test('a live sibling holds unrelated fallback until the dependency waterfall finishes', () => {
+  assert.deepEqual(keys(select([task('T2')], { scope: 'project', chainBusy: true })), []);
+  assert.deepEqual(keys(select([task('T2', { dependencies: ['T1'] })], { scope: 'project', chainBusy: true })), ['T2']);
 });

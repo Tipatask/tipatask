@@ -175,7 +175,9 @@ function createLocalAccess({ port, secret = crypto.randomBytes(32).toString('bas
     if (!loginCode) return writeError(res, 404, 'Not found');
     if (req.method === 'GET' && req.url.split('?')[0] === '/login') {
       const next = safeReturnPath(new URL(req.url, `http://${req.headers.host}`).searchParams.get('next'));
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+      // Native POST forms also use this policy for Origin: no-referrer makes it "null".
+      // Preserve the same-origin submission header while suppressing cross-origin referrers.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'same-origin' });
       return res.end(`<!doctype html><meta charset="utf-8"><title>TipATask sign in</title><p><a href="${escapeHtml(next)}">Continue with existing session</a></p><form method="post" action="/api/local-auth"><input type="hidden" name="next" value="${escapeHtml(next)}"><label>Launch code <input name="code" autocomplete="off" autofocus></label><button>Open Task App</button></form>`);
     }
     if (req.method !== 'POST' || req.url.split('?')[0] !== '/api/local-auth') return false;

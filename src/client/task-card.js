@@ -13,7 +13,7 @@ import { escapeAttr, renderMarkdown, truncateMarkdownAtParagraph, renderTagBadge
 import { t as translate } from './i18n.js';
 import { startTerminalSession } from './ws-client.js';
 import { trackQueuedStart } from './queued-start-rollback.js';
-import { showBulkAgentStartModal, terminateSessionFromCard, refreshParentSubtaskLabel, updateClaudeButtons, toastStartFailures, revertRefusedStarts } from './task-board.js';
+import { showBulkAgentStartModal, terminateSessionFromCard, refreshParentSubtaskLabel, updateClaudeButtons, toastStartFailures, revertRefusedStarts, getProjectTaskList, ensureProjectTaskList, patchProjectTaskList, projectTaskRow } from './task-board.js';
 import { agentNotice } from './console-modal.js';
 import { groupTitle, getSprintsEnabled } from './group-label.js';
 import { perfStart, perfEnd } from './perf-log.js';
@@ -24,11 +24,13 @@ import { MERGE_DOT, mergeButtonHtml, syncTaskMergeCard, initializeTaskMerge } fr
 import { FINISH_DOT, finishButtonHtml, syncTaskFinishCard, initializeTaskFinish } from './task-finish.js';
 import { openTaskWorkspace } from './task-edit-modal.js';
 import { permissionButtonHtml, syncPermissionModeButton, initializeTaskPermissionMode } from './task-permission-mode.js';
+import { discussButtonHtml, bindDiscussButton } from './card-discuss.js';
 import { isDragStateStale, resolveDropTier, shouldDeferForDrag } from './drag-state.js';
 import { collectFamilyIds } from './related-cards.js';
 import { HIDE_CLASS } from './sprint-tier-visibility.js';
+import { applyTierSelectAll, syncTierSelectAll } from './sprint-selection.js';
 import { cardVariant, cardMaxWidthPx, estimateTextWidth, TITLE_CHAR_PX } from './card-width.js';
-import { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps } from './dependency-status.js';
+import { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps, taskIndexStatus } from './dependency-status.js';
 import { expandedCardMaxHeight, clampExpandedTop, resolveAnchorTop, shouldRestoreExpansion } from './card-placement.js';
 export { isDragStateStale, resolveDropTier, shouldDeferForDrag };
 export { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps };
@@ -43,6 +45,74 @@ export function openPermissionModeSettings(taskId) {
 import { isTaskKeyLike } from '../server/task-key-format.js';
 import { loadTaskForAction } from './task-fetch.js';
 import { piTaskPinHint } from './pi-task-models.js';
+
+// ── (TPT9216) Dependency keys ──
+// Every list of a task's dependency keys — the card's hover "Deps:" label and preview meta row,
+// the Task Edit / New Task / bulk dependency chips, the New Task Preview, chat proposal cards and
+// the to-do drawer — renders each key through dependencyKeyMarkup(), which strikes through a key
+// whose task holds the project's complete or canceled role (status-registry.js isClosedName(), so
+// a renamed or reassigned closing status still counts).
+
+// The status a dependency key shows. `taskIndex` (any dependency-status.js index shape) answers
+// first; then the board snapshot state.taskStatusById, which the card's dependency Start gate
+// reads; then the project task list task-board.js caches — the only source for a dependency
+// outside the board's sprint window or assignee scope, where most long-closed dependencies sit.
+// undefined when no loaded source knows the key.
+export function dependencyKeyStatus(key, taskIndex) {
+  const id = String(key ?? '');
+  if (!id) return undefined;
+  const given = taskIndex ? taskIndexStatus(taskIndex, id) : undefined;
+  if (given !== undefined) return given;
+  const live = state.taskStatusById?.get?.(id);
+  if (live !== undefined) return live;
+  return projectTaskRow(id)?.status;
+}
+
+export function isDependencyKeyClosed(key, taskIndex) {
+  return isClosedName(dependencyKeyStatus(key, taskIndex));
+}
+
+// One dependency key: the escaped key in its own .dependency-key span, plus .dependency-key-closed
+// (strike-through, styles.css) for a closed task. Only the key is wrapped, never a chip, its remove
+// button, the "Deps:" prefix or a separator. data-dependency-key lets syncDependencyKeys() restyle
+// the key in place.
+export function dependencyKeyMarkup(key, taskIndex) {
+  const id = String(key ?? '');
+  const closed = isDependencyKeyClosed(id, taskIndex);
+  return `<span class="dependency-key${closed ? ' dependency-key-closed' : ''}" data-dependency-key="${escapeAttr(id)}">${escapeAttr(id)}</span>`;
+}
+
+// A "Deps:" label's key list: comma-separated like the plain-text list it replaces, so the
+// label's textContent is unchanged.
+export function dependencyKeysMarkup(keys, taskIndex) {
+  return (Array.isArray(keys) ? keys : []).map(key => dependencyKeyMarkup(key, taskIndex)).join(', ');
+}
+
+// Restyles every rendered key under `root` from the current statuses, for a status that changes
+// without the surface re-rendering: an in-place card patch, the project task list landing after
+// first paint, a board render behind an open Task Edit modal. A key no source knows keeps its
+// state: the task list is dropped and refetched on every Task Edit open, and that gap must not
+// un-strike keys.
+export function syncDependencyKeys(root = document, taskIndex) {
+  if (!root?.querySelectorAll) return;
+  for (const el of root.querySelectorAll('.dependency-key[data-dependency-key]')) {
+    const status = dependencyKeyStatus(el.dataset.dependencyKey, taskIndex);
+    if (status !== undefined) el.classList.toggle('dependency-key-closed', isClosedName(status));
+  }
+}
+
+// A rendered key no loaded source knows (a closed dependency in an older sprint, a teammate's
+// task) loads the project task list once — TPT642's sync peek, fetch only when cold.
+// task-board.js restyles every rendered key when the list lands.
+export function warmDependencyKeyStatuses(root = document) {
+  if (!root?.querySelectorAll || Array.isArray(getProjectTaskList())) return;
+  for (const el of root.querySelectorAll('.dependency-key[data-dependency-key]')) {
+    if (dependencyKeyStatus(el.dataset.dependencyKey) === undefined) {
+      void ensureProjectTaskList();
+      return;
+    }
+  }
+}
 
 // ── Callback references (set once via registerCardCallbacks) ──
 let _onLoadAndRender = null;
@@ -80,6 +150,8 @@ function hideBtnTip() {
 function showBtnTip(btn) {
   const text = btn.getAttribute('data-tip');
   if (!text) return;
+  // (TPT9268) An open menu button's tip would sit over its own menu.
+  if (btn.getAttribute('aria-expanded') === 'true') return;
   const tip = document.createElement('div');
   tip.className = 'card-btn-tooltip';
   tip.textContent = text;
@@ -137,12 +209,9 @@ function ensureButtonTooltips(appEl) {
  * moved out of terminal-session.js's spawnTerminal()) — is the authoritative
  * backstop and blocks a genuine cross-member spawn. Unassigned = always startable
  * (claimUnassignedTaskOnStart() assigns it to the starting user before spawn).
- * (C1340) An objective/parent container task never runs in a terminal — no
- * assignee check even applies. Checked first so all four call sites (card
- * render, sprint Play-All filter, bulk-start bar, edit modal) get this for free.
+ * Objective preparation uses the same terminal and assignee checks as other tasks.
  */
 export function canStartTaskCard(t) {
-  if (t.isObjective) return false;                // objective tasks never run in a terminal
   if (isTaskDiscussing(state, t.id)) return false; // (TPT272/TPT283) locked by an open Rehash → Discuss/Split tab
   if (t.assignee == null) return true;           // unassigned — anyone can start
   if (state.currentUserId == null) return true;  // current user unknown → fail OPEN
@@ -507,6 +576,60 @@ function discussOverlayHtml(intent) {
   return `<div class="card-discuss-overlay" title="${tip}" aria-label="${tip}" role="img">${HOURGLASS_SVG}</div>`;
 }
 
+// Rendering and saved-card refresh share eligibility. HUMAN tasks pinned to an agent
+// execute normally; an unpinned active HUMAN task keeps its discussion flow.
+function startButtonClass(t) {
+  if (t.agentAssignee === 'human' || !canStartTaskCard(t)) return null;
+  if (t.category === 'HUMAN' && !isActiveName(t.status)) return null;
+  if (t.category === 'CODING' || ['claude', 'codex', 'pi'].includes(t.agentAssignee)) return 'btn-claude';
+  return t.category === 'HUMAN' ? 'btn-start-discussion' : null;
+}
+
+function startButtonHtml(t) {
+  const kind = startButtonClass(t);
+  if (!kind) return '';
+  const blocking = kind === 'btn-claude' ? unmetDependencyKeys(t) : [];
+  const gated = blocking.length > 0 && !hasTaskSession(t.id);
+  return `<button class="card-start-btn ${kind} card-ctl${gated ? ' deps-blocked' : ''}" data-task-id="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" data-task-desc="${escapeAttr(truncateMarkdownAtParagraph(t.description, MAX_DESC_LEN))}" data-task-status="${t.status}"${gated ? ` disabled title="Waiting for: ${escapeAttr(blocking.join(', '))}"` : ''}>Start</button>`;
+}
+
+function bindCardStartButton(btn) {
+  btn.addEventListener('click', () => {
+    const card = btn.closest('.card');
+    const { taskId, taskTitle, taskDesc, taskStatus } = btn.dataset;
+    const discussion = btn.classList.contains('btn-start-discussion');
+    if (!discussion && card?.dataset.depsBlocked === '1' && !hasTaskSession(taskId)) return;
+    if (card) card.classList.remove('needs-attention');
+    _startTaskSessionCore(taskId, taskTitle, taskDesc, taskStatus, {
+      agentAssignee: card?.dataset.agentAssignee,
+      piModel: card?.dataset.piModel,
+    }, discussion ? { discussionMode: true } : undefined);
+  });
+}
+
+function refreshStartButton(card, t) {
+  const kind = startButtonClass(t);
+  let btn = card.querySelector('.btn-claude, .btn-start-discussion');
+  if (btn && (!kind || !btn.classList.contains(kind))) {
+    btn.remove();
+    btn = null;
+    card.querySelector('.btn-terminate')?.remove();
+  }
+  if (!kind) return;
+  if (!btn) {
+    // Start goes right after Discuss (TPT9283), which follows the permission shield.
+    const anchor = card.querySelector('.controls-row .btn-task-discuss') || card.querySelector('.card-permission-btn');
+    anchor?.insertAdjacentHTML('afterend', startButtonHtml(t));
+    btn = card.querySelector('.btn-claude, .btn-start-discussion');
+    if (btn) bindCardStartButton(btn);
+  }
+  if (btn) {
+    btn.dataset.taskTitle = t.title;
+    btn.dataset.taskDesc = truncateMarkdownAtParagraph(t.description, MAX_DESC_LEN);
+    btn.dataset.taskStatus = t.status;
+  }
+}
+
 // (TPT272) In-place sync of a mounted board card with state.discussingTaskKeys: toggles
 // card--discussing + the overlay and strips Start while locked. Reads only the card's own
 // dataset, never a (possibly stale) task object. Returns true when the card is unlocked but is
@@ -527,24 +650,18 @@ export function applyDiscussLock(card) {
   }
   overlay?.remove();
   delete card.dataset.lockIntent;
-  if (card.dataset.objective === '1' || card.querySelector('.btn-claude, .btn-start-discussion')) return false;
+  if (card.querySelector('.btn-claude, .btn-start-discussion')) return false;
   const idBadge = card.querySelector('.id-badge');
   const category = idBadge?.classList.contains('coding') ? 'CODING' : 'HUMAN';
-  const t = { id: card.dataset.id, isObjective: false, assignee: card.dataset.assignee === '' ? null : card.dataset.assignee };
-  if (!canStartTaskCard(t)) return false;
-  if (category === 'CODING') return card.dataset.agentAssignee !== 'human';
-  return isActiveName(card.dataset.status);
+  return !!startButtonClass({ id: card.dataset.id, category, status: card.dataset.status,
+    agentAssignee: card.dataset.agentAssignee, assignee: card.dataset.assignee === '' ? null : card.dataset.assignee });
 }
 
 export function renderCard(t, { preview = false, proposal = null } = {}) {
   if (proposal) preview = true;
   const blocking = unmetDependencyKeys(t);
   const depsBlocked = blocking.length > 0;
-  // (TPT552) data-deps-blocked keeps the raw dependency fact; the button itself is only gated
-  // for a fresh launch. A task with a session (e.g. pending follow-ups were added as its deps
-  // after it ran) stays resumable — updateClaudeButtons() re-applies this as sessions change.
-  const startGated = depsBlocked && !hasTaskSession(t.id);
-
+  // data-deps-blocked keeps the raw dependency fact; session repaint gates fresh starts only.
   const deps = t.dependencies.length
     ? `<div class="deps">Depends on: ${t.dependencies.map(d => `<span class="dep-badge">${d}</span>`).join(' ')}</div>`
     : '';
@@ -608,9 +725,12 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
   // matches isLeftUncommitted() (closed = complete or canceled role).
   const leftUncommitted = !preview && !!state.leftUncommitted?.has?.(t.id) && !isCompleteName(t.status) && !isCanceledName(t.status);
   const finishBtn = leftUncommitted ? finishButtonHtml(t.id) : '';
-  // (TPT9063) Permission-mode button (task-permission-mode.js) — board cards only; objectives never
-  // run an agent terminal, so their controls-row slot keeps the Subtasks button alone.
-  const permissionBtn = (preview || t.isObjective) ? '' : permissionButtonHtml(t);
+  const permissionBtn = preview ? '' : permissionButtonHtml(t);
+  // (TPT9268/TPT9271) Discuss: opens this task's chat pane, whose start gate picks the model (card-discuss.js).
+  // Every saved board card has one, whether or not it can be started. (TPT9283) An icon-only square
+  // between the permission shield and Start: from about a 320px card the row fits one line.
+  // Previews and proposals have no row.
+  const discussBtn = preview ? '' : discussButtonHtml(t.id);
   const selectBtn = `<button class="btn-select-card${isSelected ? ' checked' : ''}" data-task-id="${escapeAttr(t.id)}" data-tip="${escapeAttr(translate('tooltip.selectCard'))}" aria-label="${escapeAttr(translate('tooltip.selectCard'))}"><span class="select-dot"></span>${manualMerge ? MERGE_DOT : ''}${leftUncommitted ? FINISH_DOT : ''}</button>`;
   // (TPT9149/TPT9153) Only a board card draws these as absolute corner badges, over the bottom
   // band its has-*-badge root classes reserve. A preview ends its meta row with them instead
@@ -645,7 +765,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
     : `data-id="${escapeAttr(t.id)}" data-status="${t.status}" data-status-role="${statusRoleToken(t.status)}" data-priority="${t.priority ?? ''}" data-sprint-label="${escapeAttr(sprintBadgeLabel)}" data-assignee="${t.assignee ?? ''}" data-agent-assignee="${escapeAttr(t.agentAssignee || '')}" data-pi-model="${escapeAttr(t.piModel || '')}" data-objective="${t.isObjective ? '1' : ''}" data-db-id="${escapeAttr(t.dbId ?? '')}" data-parent-db-id="${escapeAttr(t.parentDbId ?? '')}" data-deps='${JSON.stringify(t.dependencies)}' data-tags='${JSON.stringify(t.tags || [])}'${depsBlocked ? ' data-deps-blocked="1"' : ''}${lockIntent ? ` data-lock-intent="${lockIntent}"` : ''}`;
   const previewMetaHtml = proposal
     ? `<div class="card-preview-meta">${proposal.metaHtml || ''}</div>`
-    : `<div class="card-preview-meta"><span class="status" style="--status-color:${statusColor(t.status)}" data-status-role="${statusRoleToken(t.status)}">${escapeAttr(statusLabel(t.status))}</span>${t.dependencies.length ? `<span class="card-preview-deps" title="Deps: ${escapeAttr(t.dependencies.join(', '))}">Deps: ${escapeAttr(t.dependencies.join(', '))}</span>` : ''}${previewBadges ? `<span class="preview-meta-badges">${previewBadges}</span>` : ''}</div>`;
+    : `<div class="card-preview-meta"><span class="status" style="--status-color:${statusColor(t.status)}" data-status-role="${statusRoleToken(t.status)}">${escapeAttr(statusLabel(t.status))}</span>${t.dependencies.length ? `<span class="card-preview-deps" title="Deps: ${escapeAttr(t.dependencies.join(', '))}">Deps: ${dependencyKeysMarkup(t.dependencies)}</span>` : ''}${previewBadges ? `<span class="preview-meta-badges">${previewBadges}</span>` : ''}</div>`;
   // (C1387) needs-attention is intrinsic to the card markup, not applied post-render only —
   // a full board re-render used to permanently drop the ring for any card without a Start
   // button (objective/human-assigned cards). syncAttentionClasses() (attention-state.js) is
@@ -666,19 +786,12 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
               <select class="card-status-select card-ctl" style="--status-color:${statusColor(t.status)}" data-task-id="${escapeAttr(t.id)}" data-current="${t.status}">
                 ${statusNames().map(s => `<option value="${s}" ${s === t.status ? 'selected' : ''}>${statusLabel(s)}</option>`).join('')}
               </select>
-              ${deviceBadge}${permissionBtn}
-              ${t.isObjective
-                ? (t.hasChildren
-                    ? `<button class="btn-open-subtask-board btn-subtasks-show card-ctl" data-task-key="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" title="${escapeAttr(subtasksLabel)}">${_SUBTASKS_SVG}<span>${escapeAttr(subtasksLabel)}</span></button>`
-                    : `<button class="btn-create-subtasks card-ctl" data-task-key="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" data-tip="${escapeAttr(translate('tooltip.createSubtasks'))}" aria-label="${escapeAttr(translate('tooltip.createSubtasks'))}">${_SUBTASKS_SVG}<span>${escapeAttr(translate('btn.startObjective'))}</span></button>`)
-                : `${(t.category === 'CODING' && t.agentAssignee !== 'human' && canStartTaskCard(t))
-                  ? `<button class="card-start-btn btn-claude card-ctl${startGated ? ' deps-blocked' : ''}" data-task-id="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" data-task-desc="${escapeAttr(truncatedDesc)}" data-task-status="${t.status}"${startGated ? ` disabled title="Waiting for: ${escapeAttr(blocking.join(', '))}"` : ''}>Start</button>`
-                  : (t.category === 'HUMAN' && isActiveName(t.status) && canStartTaskCard(t))
-                    ? `<button class="card-start-btn btn-start-discussion card-ctl" data-task-id="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" data-task-desc="${escapeAttr(truncatedDesc)}" data-task-status="${t.status}">Start</button>`
-                    : ''}${t.hasChildren ? `<button class="btn-open-subtask-board card-ctl" data-task-key="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}">${translate('btn.subtasks')}</button>` : ''}`}
+              ${deviceBadge}${permissionBtn}${discussBtn}
+              ${startButtonHtml(t)}
+              ${t.hasChildren ? `<button class="btn-open-subtask-board${t.isObjective ? ' btn-subtasks-show' : ''} card-ctl" data-task-key="${escapeAttr(t.id)}" data-task-title="${escapeAttr(t.title)}" title="${escapeAttr(subtasksLabel)}">${_SUBTASKS_SVG}<span>${escapeAttr(subtasksLabel)}</span></button>` : ''}
             </div>
             ${t.dependencies.length
-              ? `<span class="card-deps-label" title="Deps: ${t.dependencies.join(', ')}">Deps: ${t.dependencies.join(', ')}</span>`
+              ? `<span class="card-deps-label" title="Deps: ${escapeAttr(t.dependencies.join(', '))}">Deps: ${dependencyKeysMarkup(t.dependencies)}</span>`
               : ''}
           </div>
         </div>`}
@@ -766,7 +879,8 @@ export function expandCard(card, mode = 'pinned', { instant = false } = {}) {
       clearFocusActive();
       collapseCard();
     });
-    lockBodyScroll();
+    // Board focus keeps the page scrollable; only a chat preview locks it.
+    if (isPreviewOverlay) lockBodyScroll();
   }
   card.classList.add('card-expanded');
   card.style.position = 'fixed';
@@ -782,7 +896,7 @@ export function expandCard(card, mode = 'pinned', { instant = false } = {}) {
   if (isPreviewOverlay) card.style.overflowY = 'auto';
 
   // (TPT456) Placement is re-run whenever the card's real height can change — its own size
-  // (late images, the title marquee, anything still settling), a window resize, or a window
+  // (late images, anything still settling), a window resize, or a window
   // scroll — instead of being estimated once at expand time. Measuring the laid-out
   // offsetHeight (already capped by max-height) means the overlay is never left hanging off
   // the bottom of the viewport; ResizeObserver callbacks run after layout and before paint,
@@ -1613,12 +1727,43 @@ function _onDragKeydown(e) {
 
 // ── In-place card refresh (called after modal Save; avoids full board reload) ──
 
+// Recompute the raw dependency gate rendered by renderCard() for the saved task and its
+// mounted dependents. Session repaint owns disabled/Resume state; never create a Start
+// control here, since assignee, human-agent and discussion locks may exclude it.
+function refreshDependencyAvailability(taskId) {
+  let syncButtons = false;
+  for (const card of document.querySelectorAll('.card[data-id][data-deps]')) {
+    let dependencies;
+    try { dependencies = JSON.parse(card.dataset.deps || '[]'); } catch { continue; }
+    if (!Array.isArray(dependencies)) continue;
+    if (card.dataset.id !== taskId && !dependencies.includes(taskId)) continue;
+    const blocked = hasUnmetDeps({ dependencies });
+    if (blocked) card.dataset.depsBlocked = '1';
+    else delete card.dataset.depsBlocked;
+    const button = card.querySelector('.btn-claude');
+    // updateClaudeButtons() sets a waiting title while blocked, but its plain Start branch
+    // retains the previous title. Drop that dependency hint when the gate clears.
+    if (!blocked && button?.classList.contains('deps-blocked')) button.removeAttribute('title');
+    if (button || card.querySelector('.btn-start-discussion')) syncButtons = true;
+  }
+  if (syncButtons) updateClaudeButtons();
+}
+
 // (TPT9024) Patches the node in place, never swaps it: an open overlay (.card-expanded, its
 // placeholder, backdrop and placement listeners) lives on this node and survives the patch.
 export function refreshCard(t) {
   if (!t || !t.id) return;
+  // (TPT9216) Keep the cached project task list current for dependency keys the board snapshot
+  // lacks — mounted card or not.
+  patchProjectTaskList(t);
+  // A successful local modal save may have no task:updated echo (Electron). Publish the
+  // saved status before either renderCard() or a dependent's Start gate reads the map.
+  if (t.status !== undefined) state.taskStatusById.set(t.id, t.status);
   const card = document.querySelector(`.card[data-id="${CSS.escape(t.id)}"]`);
-  if (!card) return; // card detached (e.g. sprint move pending reload) — no-op
+  if (!card) {
+    refreshDependencyAvailability(t.id);
+    return; // the prerequisite can be detached while its dependents stay mounted
+  }
   if (state.taskMergeStatus) syncTaskMergeCard(card);
   syncTaskFinishCard(card); // (TPT614) the Finish button follows the flag + the card's live status
   syncPermissionModeButton(card, t); // (TPT9063) override + cached project default → tip/dataset
@@ -1654,6 +1799,7 @@ export function refreshCard(t) {
   applyDiscussLock(card);
   card.dataset.deps = JSON.stringify(t.dependencies || []);
   card.dataset.tags = JSON.stringify(t.tags || []);
+  refreshStartButton(card, t);
 
   // agent badge — mirror renderCard() so task:updated patches immediately show
   // the selected agent after Start, reassignment, or unassignment.
@@ -1721,27 +1867,30 @@ export function refreshCard(t) {
   // deps hover label (C1076) — kept in sync with renderCard's .card-deps-label;
   // data-deps above was already updated, this just mirrors it into the visible
   // (hover-only) text so a deps-only save doesn't leave stale text until reload.
+  // (TPT9216) Keys through dependencyKeysMarkup(), as renderCard() draws them.
   const depsLabel = card.querySelector('.card-deps-label');
-  const depsText = (t.dependencies || []).join(', ');
-  if (depsText) {
-    const label = `Deps: ${depsText}`;
+  const depKeys = t.dependencies || [];
+  if (depKeys.length) {
+    const label = `Deps: ${depKeys.join(', ')}`;
+    const html = `Deps: ${dependencyKeysMarkup(depKeys)}`;
     if (depsLabel) {
-      depsLabel.textContent = label;
+      depsLabel.innerHTML = html;
       depsLabel.title = label;
     } else {
       card.querySelector('.hover-controls-inner')?.insertAdjacentHTML('beforeend',
-        `<span class="card-deps-label" title="${escapeAttr(label)}">${escapeAttr(label)}</span>`);
+        `<span class="card-deps-label" title="${escapeAttr(label)}">${html}</span>`);
     }
   } else if (depsLabel) {
     depsLabel.remove();
   }
 
-  // (TPT374) A status-only patch (WS task:updated, the board's own status <select>, or the
-  // edit modal's Save) never used to repaint the console-control button — stale play/spinner
-  // until the next unrelated session/attention event happened to call updateClaudeButtons().
-  // Scoped to cards that actually carry the button, since updateClaudeButtons() repaints every
-  // mounted .btn-claude/.btn-start-discussion on the page, not just this one.
-  if (statusChanged && card.querySelector('.btn-claude, .btn-start-discussion')) updateClaudeButtons();
+  // (TPT9216) This task can be a dependency of other rendered cards and chips: restyle their keys
+  // with its saved status, which is already published to the shared status map.
+  if (statusChanged) syncDependencyKeys(document, new Map([[String(t.id), t.status]]));
+
+  // Keep this card's console state and every dependent's Start gate current, even when
+  // the prerequisite itself has no Start control. Also covers edits to its own deps.
+  refreshDependencyAvailability(t.id);
 }
 
 // ── Sprint regroup: instantly moves an existing card to a new sprint tier ──
@@ -1935,36 +2084,49 @@ export function removeCardFromDom(taskId) {
   return true;
 }
 
-// ── Card title overflow measurement (marquee + tooltip trigger) ──
-// Adds/removes 'is-overflowing' per current measurement — safe to call repeatedly on the same
-// live elements (unlike the pre-C1580 version, which only ever added the class once per render).
-export function refreshTitleOverflow(appEl) {
-  const root = appEl || document;
-  // (TPT306) Select's slot in .card-top is always reserved (hidden by opacity, never
-  // display:none), so the title has the same width at rest and on hover — measure as-is. (C1259) Read ALL titles, then write
-  // all classes: a per-title read→write would force a layout recalc per card.
-  // (TPT299) Proposal titles wrap on their own line — never marquee candidates.
-  const _cardTitles = root.querySelectorAll('.card-title:not(.preview-title)');
-  const _overflowFlags = Array.from(_cardTitles, el => el.scrollWidth > el.clientWidth);
-  _cardTitles.forEach((el, i) => el.classList.toggle('is-overflowing', _overflowFlags[i]));
-}
-
 // (C1580) Adaptive widths reflow on window resize (fixed grid-column spans never did, outside
-// the 768px breakpoint), so title-overflow/description-truncation state needs a resize-time
-// re-measure. Bound once per appEl (the #app node persists across renders — only its innerHTML
-// is rebuilt), debounced since resize fires continuously while dragging the window edge.
-const _titleOverflowResizeBound = new WeakSet();
-function _ensureTitleOverflowResizeListener(appEl) {
-  if (!appEl || _titleOverflowResizeBound.has(appEl)) return;
-  _titleOverflowResizeBound.add(appEl);
+// the 768px breakpoint), so description-truncation state needs a resize-time re-measure. A long
+// title needs none: CSS ellipsizes it at whatever width the card gets (TPT9288 — no marquee, so
+// no per-title overflow flag). Bound once per appEl (the #app node persists across renders — only
+// its innerHTML is rebuilt), debounced since resize fires continuously while dragging the window edge.
+const _truncationResizeBound = new WeakSet();
+function _ensureTruncationResizeListener(appEl) {
+  if (!appEl || _truncationResizeBound.has(appEl)) return;
+  _truncationResizeBound.add(appEl);
   let timer = null;
   window.addEventListener('resize', () => {
     clearTimeout(timer);
-    timer = setTimeout(() => {
-      refreshTitleOverflow(appEl);
-      markTruncatedCards();
-    }, 150);
+    timer = setTimeout(markTruncatedCards, 150);
   }, { passive: true });
+}
+
+// (TPT9203) Whether focus keeps the status/Start row open with no cursor on the card. A clicked
+// button keeps DOM focus, so focus left in `.card-btn-group` by the pointer does not count, the same
+// rule the group's CSS follows with :focus-visible. Keyboard focus there still counts, and so does
+// focus anywhere else in the card: a native status dropdown takes the cursor off the card while open.
+function focusHoldsControlsRow(card) {
+  const active = document.activeElement;
+  if (!active || !card.contains(active)) return false;
+  return !active.closest('.card-btn-group') || active.matches(':focus-visible');
+}
+
+// ── (TPT9268/TPT9271) Card Discuss button ──
+// The same guards as the hover tray's chat button: a card locked by Rehash → Discuss/Split is
+// refused with the lock toast, a .pending-sync card has no server task yet. Otherwise it collapses
+// the card and opens the task's chat, where the start gate's selector picks the model; it never
+// starts an agent or a terminal, and never changes the task.
+function openCardDiscuss(btn) {
+  const card = btn.closest('.card');
+  const taskId = btn.dataset.taskId;
+  if (!card || !taskId || isDragging()) return;
+  if (isTaskDiscussing(state, taskId)) {
+    showToast(translate(lockMessageKey(lockIntentOf(state, taskId))));
+    return;
+  }
+  if (card.classList.contains('pending-sync')) return;
+  hideBtnTip();
+  collapseCard();
+  window.TipTask?.taskChat?.open(taskId);
 }
 
 // ── Post-render setup: attaches all event listeners ──
@@ -1983,6 +2145,10 @@ export function setupCardInteractions(appEl) {
   initializeTaskMerge(appEl);
   initializeTaskFinish(appEl);
   initializeTaskPermissionMode(appEl, openPermissionModeSettings); // (TPT9063)
+  // (TPT9216) The render's own keys are current; an open Task Edit modal's chips were not rebuilt.
+  // Keys no loaded source knows warm the project task list.
+  syncDependencyKeys(document);
+  warmDependencyKeyStatuses(appEl);
 
   // ── Status select change handlers ──
   appEl.querySelectorAll('.status-select').forEach(sel => {
@@ -2010,40 +2176,8 @@ export function setupCardInteractions(appEl) {
     });
   });
 
-  // ── Shared session-start helper (used by Start and Discussion buttons) ──
-  // Thin wrapper — reads the card's pinned agent/model from its DOM dataset, then
-  // delegates the actual ladder to the card-independent _startTaskSessionCore() below
-  // (C1559 — extracted so startTaskById() can reuse the exact same ladder for a task
-  // with no rendered card).
-  function _startTaskSession(taskId, taskTitle, taskDesc, taskStatus, card, extraOpts) {
-    if (card) card.classList.remove('needs-attention');
-    const cardAgentAssignee = card?.dataset.agentAssignee;
-    const pinnedAgent = (cardAgentAssignee === 'claude' || cardAgentAssignee === 'codex' || cardAgentAssignee === 'pi') ? cardAgentAssignee : null;
-    // (C1133) saved per-task Pi model pin, carried alongside pinnedAgent — undefined for
-    // claude/codex (their per-task model resolves server-side from the task record) and
-    // for a pi card with no model saved (server falls back to the project default row).
-    const pinnedModel = (pinnedAgent === 'pi' && card?.dataset.piModel) ? card.dataset.piModel : undefined;
-    _startTaskSessionCore(taskId, taskTitle, taskDesc, taskStatus, { agentAssignee: pinnedAgent, piModel: pinnedModel }, extraOpts);
-  }
-
-  // ── Claude button handlers ──
-  appEl.querySelectorAll('.btn-claude').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const card = btn.closest('.card');
-      const { taskId, taskTitle, taskDesc, taskStatus } = btn.dataset;
-      // Blocked by an incomplete dependency — a fresh launch only; an existing session reopens (TPT552).
-      if (card?.dataset.depsBlocked === '1' && !hasTaskSession(taskId)) return;
-      _startTaskSession(taskId, taskTitle, taskDesc, taskStatus, card);
-    });
-  });
-
-  // ── Discussion button handlers (HUMAN tasks) ──
-  appEl.querySelectorAll('.btn-start-discussion').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const { taskId, taskTitle, taskDesc, taskStatus } = btn.dataset;
-      _startTaskSession(taskId, taskTitle, taskDesc, taskStatus, btn.closest('.card'), { discussionMode: true });
-    });
-  });
+  // Newly eligible controls use this same binding from refreshCard().
+  appEl.querySelectorAll('.btn-claude, .btn-start-discussion').forEach(bindCardStartButton);
 
   // ── Reiterate button handlers ──
   appEl.querySelectorAll('.btn-reiterate').forEach(btn => {
@@ -2154,6 +2288,7 @@ export function setupCardInteractions(appEl) {
         if (card) card.classList.add('selected');
       }
       if (_onUpdateBulkBar) _onUpdateBulkBar();
+      else syncTierSelectAll(); // (TPT9208) sprint pill follows a single-card toggle
     });
   });
 
@@ -2239,7 +2374,7 @@ export function setupCardInteractions(appEl) {
       if (!isPreviewCard) {
         clearTimeout(cardPeekTimer);
         clearTimeout(cardExpandTimer);
-        if (!card.contains(document.activeElement)) {
+        if (!focusHoldsControlsRow(card)) {
           card.classList.remove('card-peek', 'card-hover-expanded');
         }
       }
@@ -2306,7 +2441,7 @@ export function setupCardInteractions(appEl) {
           clearFocusActive();
           collapseCard();
         });
-        lockBodyScroll();
+        if (card.matches('.card--preview, .preview-card')) lockBodyScroll();
         if (!isPreviewCard) {
           clearFocusActive();
           state.selectedCardId = id;
@@ -2360,6 +2495,8 @@ export function setupCardInteractions(appEl) {
     if (!isPreviewCard) {
       card.addEventListener('focusin', () => {
         if (state.expandedCardMode === 'pinned') return;
+        // (TPT9203) Returning to the window re-focuses the clicked button with the cursor elsewhere.
+        if (!card.matches(':hover') && !focusHoldsControlsRow(card)) return;
         clearTimeout(cardPeekTimer);
         clearTimeout(cardExpandTimer);
         card.classList.add('card-peek', 'card-hover-expanded');
@@ -2390,6 +2527,35 @@ export function setupCardInteractions(appEl) {
         state.collapsedTiers.add(p);
       }
       perfEnd(_h);
+    });
+  });
+
+  // ── Sprint context actions (TPT9208): select-all pill + Start tray ──
+  appEl.querySelectorAll('.tier-actions').forEach(group => {
+    // Nothing inside the group (buttons or the tray's padding) folds the sprint.
+    group.addEventListener('click', (e) => e.stopPropagation());
+    // Escape closes the tray while focus or the pointer is still inside it; leaving the
+    // group (focus or pointer) re-arms it. Focus returns to the select-all pill so the
+    // keyboard user is not dropped onto <body> when Start hides.
+    group.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape' || group.classList.contains('is-dismissed')) return;
+      if (!group.querySelector('.tier-action-menu')) return;
+      e.stopPropagation();
+      group.classList.add('is-dismissed');
+      group.querySelector('.btn-tier-select')?.focus();
+    });
+    group.addEventListener('pointerleave', () => group.classList.remove('is-dismissed'));
+    group.addEventListener('focusout', (e) => {
+      if (!group.contains(e.relatedTarget)) group.classList.remove('is-dismissed');
+    });
+  });
+  appEl.querySelectorAll('.btn-tier-select').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (btn.disabled) return;
+      applyTierSelectAll(btn);
+      if (_onUpdateBulkBar) _onUpdateBulkBar();
+      else syncTierSelectAll();
     });
   });
 
@@ -2504,6 +2670,11 @@ export function setupCardInteractions(appEl) {
       window.TipTask?.taskChat?.open(taskId);
     });
   });
+
+  // ── (TPT9268/TPT9271) Discuss → this task's chat; its start gate picks the model ──
+  appEl.querySelectorAll('.btn-task-discuss').forEach(btn => {
+    bindDiscussButton(btn, { onActivate: openCardDiscuss });
+  });
   appEl.querySelectorAll('.card[data-id]').forEach(card => {
     card.addEventListener('dblclick', (e) => {
       if (e.target.closest('select, button, input, textarea, .agent-badge, .sprint-combo, .id-badge')) return;
@@ -2543,13 +2714,12 @@ export function setupCardInteractions(appEl) {
     });
   });
 
-  // ── Overflow detection + title tooltip for card titles ──
-  refreshTitleOverflow(appEl);
-  // (C1580) Adaptive card widths mean the measurement above can go stale on a window resize
-  // (unlike the old fixed grid-column spans, which only ever changed at the 768px breakpoint).
-  // Bound once, globally, behind a module flag — appEl is the stable #app node every render
-  // reuses (only its innerHTML is rebuilt), so a single listener covers every future render.
-  _ensureTitleOverflowResizeListener(appEl);
+  // ── Description truncation on resize + title tooltip for card titles ──
+  // (C1580) Adaptive card widths mean the description-truncation flags can go stale on a window
+  // resize (unlike the old fixed grid-column spans, which only ever changed at the 768px
+  // breakpoint). Bound once, globally, behind a module flag — appEl is the stable #app node every
+  // render reuses (only its innerHTML is rebuilt), so a single listener covers every future render.
+  _ensureTruncationResizeListener(appEl);
   const _cardTitles = appEl.querySelectorAll('.card-title');
   _cardTitles.forEach((el) => {
     el.addEventListener('mouseenter', () => {

@@ -24,7 +24,7 @@ const STATUSES = [
   { name: 'canceled', is_workflow_canceled: true },
 ];
 // (TPT9194) What every pick of a Claude run on claude-opus-5-5 is saved with before it starts.
-const CLAUDE_PICK = { agentPermissionMode: 'bypass', cowboyMode: true, agentAssignee: 'claude', claudeModel: 'claude-opus-5-5' };
+const CLAUDE_PICK = { agentPermissionMode: 'bypass', cowboyMode: 'project', agentAssignee: 'claude', claudeModel: 'claude-opus-5-5' };
 
 function row(id, fields = {}) {
   return { id, title: `Task ${id}`, description: `Do ${id}.`, status: 'pending', category: 'CODING', priority: 5, order: 0,
@@ -121,9 +121,9 @@ test('each pick is saved with the finished run\'s agent, model, Bypass and Cowbo
   // get_task on a pick after the chain step: the inherited fields; the other agents' models stay.
   const t2 = await h.backend.getTask('T2');
   assert.deepEqual([t2.agentAssignee, t2.claudeModel, t2.codexModel, t2.agentPermissionMode, t2.cowboyMode],
-    ['claude', 'claude-opus-5-5', 'gpt-x', 'bypass', true]);
+    ['claude', 'claude-opus-5-5', 'gpt-x', 'bypass', 'project']);
   const t3 = await h.backend.getTask('T3');
-  assert.deepEqual([t3.agentAssignee, t3.claudeModel, t3.agentPermissionMode, t3.cowboyMode], ['claude', 'claude-opus-5-5', 'bypass', true]);
+  assert.deepEqual([t3.agentAssignee, t3.claudeModel, t3.agentPermissionMode, t3.cowboyMode], ['claude', 'claude-opus-5-5', 'bypass', 'project']);
   assert.deepEqual(h.launches.map(l => [l.task.agentAssignee, l.task.agentPermissionMode]), [['claude', 'bypass'], ['claude', 'bypass']],
     'the launch carries the saved row');
   assert.deepEqual(h.taskUpdates, [{ id: 'T2', projectPath: ROOT }, { id: 'T3', projectPath: ROOT }]);
@@ -134,13 +134,13 @@ test('each launch agent hands on its own model field; a run with no model hands 
     const tasks = [row('T1', { status: 'completed', agentPermissionMode: 'bypass' }), row('T2', { dependencies: ['T1'], agentAssignee: 'claude' })];
     const h = harness(tasks, { runs: [cowboyRun('T1', { taskAgent: agent, taskAgentModel: model })] });
     assert.deepEqual((await h.run('T1')).started, ['T2'], agent);
-    assert.deepEqual(h.backend.log[0].fields, { agentPermissionMode: 'bypass', cowboyMode: true, agentAssignee: agent, [field]: model });
+    assert.deepEqual(h.backend.log[0].fields, { agentPermissionMode: 'bypass', cowboyMode: 'project', agentAssignee: agent, [field]: model });
     assert.deepEqual([h.launches[0].agent, h.launches[0].model], [agent, model]);
   }
   const tasks = [row('T1', { status: 'completed', agentPermissionMode: 'bypass' }), row('T2', { dependencies: ['T1'], agentAssignee: 'claude', codexModel: 'own' })];
   const h = harness(tasks, { runs: [cowboyRun('T1', { taskAgent: 'codex', taskAgentModel: '' })] });
   await h.run('T1');
-  assert.deepEqual(h.backend.log[0].fields, { agentPermissionMode: 'bypass', cowboyMode: true, agentAssignee: 'codex' });
+  assert.deepEqual(h.backend.log[0].fields, { agentPermissionMode: 'bypass', cowboyMode: 'project', agentAssignee: 'codex' });
   assert.deepEqual([h.launches[0].agent, h.launches[0].model, tasks[1].codexModel], ['codex', '', 'own']);
 });
 
@@ -317,6 +317,7 @@ test('spawnTerminal: bypass with the task flag or a chain launch makes a cowboy 
   const agent = getTaskAgent('claude');
   t.mock.method(agent, 'cachedDetect', async () => ({ id: 'claude', available: true }));
   t.mock.method(agent, 'getPermissionVersion', async () => '2.1.311');
+  t.mock.method(agent, 'detectComputerUse', async () => null); // (TPT9225) never the real CLI bundle probe
   const specs = [];
   t.mock.method(agent, 'getSpawnSpec', async (cfg, prompt, taskId, opts) => {
     specs.push(opts);
@@ -361,8 +362,73 @@ test('spawnTerminal: bypass with the task flag or a chain launch makes a cowboy 
   assert.equal(chained._cowboyToken, 'chain-token');
   assert.equal(envs.at(-1)[COWBOY_TOKEN_ENV], 'chain-token');
 
+  const parent = await spawn(row('P1', { isObjective: true, agentPermissionMode: 'auto', cowboyMode: true }));
+  assert.equal(parent.parentPreparation, true);
+  assert.deepEqual(parent.objectiveChain, { rootTaskId: 'P1' });
+  assert.equal(parent.cowboyChain, false, 'objective scope supersedes project Cowboy mode');
+  assert.equal(specs.at(-1).parentPreparation, true);
+  assert.equal(specs.at(-1).permissionPolicy.mode, 'auto');
+  assert.match(envs.at(-1)[COWBOY_TOKEN_ENV], /^[A-Za-z0-9_-]{43}$/);
+
+  let objectiveStatus = 'canceled';
+  const objective = () => row('P1', { dbId: 1, isObjective: true, status: objectiveStatus });
+  const child = row('T5', { dbId: 5, parentDbId: 1, agentPermissionMode: 'auto' });
+  backend.getTask = async () => objective();
+  backend.getTasksUnfiltered = async () => [objective(), child];
+  const beforeCanceledChild = envs.length;
+  await assert.rejects(spawn(child, { objectiveChain: { rootTaskId: 'P1' } }), /Parent objective cannot start this child/);
+  assert.equal(envs.length, beforeCanceledChild, 'queued child never spawns after parent cancellation');
+  objectiveStatus = 'in_progress';
+  const objectiveChild = await spawn(child, { objectiveChain: { rootTaskId: 'P1' } });
+  assert.equal(objectiveChild.parentPreparation, false);
+  assert.deepEqual(specs.at(-1).objectiveChain, { rootTaskId: 'P1' });
+  assert.equal(specs.at(-1).permissionPolicy.mode, 'auto');
+  assert.equal(objectiveChild.cowboyChain, false);
+
   const spawned = envs.length;
   await assert.rejects(spawn(row('T4', { agentPermissionMode: null }), { cowboyChain: true, env: { [COWBOY_TOKEN_ENV]: 'x' } }),
     /Cowboy chain launches run only in Bypass mode/);
   assert.equal(envs.length, spawned, 'nothing was spawned');
+});
+
+
+for (const scope of ['related', 'project']) test(`a ${scope} waterfall preserves origin through dependents before sprint fallback`, async () => {
+  const tasks = [
+    row('T1', { status: 'completed', agentPermissionMode: 'bypass', cowboyMode: scope, priority: 5 }),
+    row('T2', { dependencies: ['T1'], priority: 6 }),
+    row('T3', { dependencies: ['T2'], priority: 8 }),
+    row('T4', { priority: 5, order: 1 }),
+    row('T5', { priority: 7, category: 'HUMAN' }),
+    row('T6', { priority: 9 }),
+  ];
+  const h = harness(tasks, { runs: [cowboyRun('T1', { cowboyScope: scope,
+    cowboyContext: { originTaskId: 'T1', originSprint: 5, sprint: 5, order: 0 } })] });
+  const step = async (from, expected) => {
+    const result = await h.run(from);
+    assert.deepEqual(result.started, expected ? [expected] : []);
+    if (!expected) return;
+    const launch = h.launches.at(-1);
+    assert.equal(launch.cowboyScope, scope);
+    assert.equal(launch.cowboyContext.originTaskId, 'T1');
+    assert.equal(launch.cowboyContext.originSprint, 5);
+    const next = tasks.find(t => t.id === expected);
+    next.status = 'completed';
+    h.sessions.set(`${expected}\0${ROOT}`, cowboyRun(expected, { cowboyScope: launch.cowboyScope,
+      cowboyContext: launch.cowboyContext, _cowboyToken: launch.env[COWBOY_TOKEN_ENV] }));
+  };
+  await step('T1', 'T2');
+  await step('T2', 'T3');
+  await step('T3', scope === 'project' ? 'T4' : null);
+  if (scope === 'project') {
+    await step('T4', 'T6');
+    await step('T6', null);
+  }
+  assert.equal(new Set(h.launches.map(l => l.env[COWBOY_TOKEN_ENV])).size, h.launches.length);
+});
+
+test('disabled saved scope stops a running chain without updating successors', async () => {
+  const h = harness([row('T1', { status: 'completed', cowboyMode: 'disabled' }), row('T2', { dependencies: ['T1'] })],
+    { runs: [cowboyRun('T1', { cowboyScope: 'project' })] });
+  assert.deepEqual(await h.run('T1'), { started: [], reason: 'not_cowboy' });
+  assert.equal(h.backend.log.length, 0);
 });

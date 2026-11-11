@@ -108,7 +108,7 @@ test('task-chat.js: connects on the taskChat: / projectChat: session id and expo
   // (TPT469) One project holds several chats: projectChat:<projectId>:<chatId>.
   assert.match(taskChat, /return `\$\{PROJECT_SESSION_PREFIX\}\$\{projectId\}:\$\{Date\.now\(\)\.toString\(36\)\}\$\{rand\}`;/);
   assert.match(taskChat, /buildWsUrl\(chat\.sessionId\)/);
-  assert.match(taskChat, /export async function open\(taskId\)/);
+  assert.match(taskChat, /export async function open\(taskId, opts = \{\}\)/);
   assert.match(taskChat, /export async function openProjectChat\(\{ chatId = '' \} = \{\}\)/);
   assert.match(taskChat, /export function close\(\)/);
 });
@@ -131,11 +131,17 @@ test('task-chat.js: a follow-up turn carries `content` and the model selection',
 
 test('task-chat.js: a socket with no history reset shows the start gate instead of starting', () => {
   const configCase = taskChat.slice(taskChat.indexOf("case 'config':"), taskChat.indexOf('case WS_RECV_TYPES.DATA:'));
-  assert.match(configCase, /if \(!sawReset\) \{[\s\S]*showStartGate\(\);[\s\S]*\} else \{\s*focusComposer\(\);/);
-  assert.doesNotMatch(configCase, /beginChat|sendStartFrame|START_/, 'no start frame from the config frame');
+  // (TPT9268/TPT9271) A chat opened with a model shows the gate too, that model preselected
+  // (gateFromLaunch()); an existing chat only adopts the model.
+  assert.match(configCase, /if \(!sawReset\) \{[\s\S]*if \(launch\) gateFromLaunch\(launch\);\s*else showStartGate\(\);[\s\S]*\} else \{\s*if \(launch\) adoptLaunchModel\(launch\);\s*focusComposer\(\);/);
+  assert.doesNotMatch(configCase, /beginChat|sendStartFrame|START_/, 'no start frame from the config frame itself');
   // Only the gate's Start button begins a chat.
   assert.match(taskChat, /querySelector\('\.task-chat-start-go'\)\.addEventListener\('click', beginChat\)/);
-  assert.equal(taskChat.split('beginChat(').length - 1, 1, 'beginChat() is only defined, never called directly');
+  assert.equal(taskChat.split('beginChat(').length - 1, 1, 'beginChat() is only defined; the Start button is its one caller');
+  const launchFn = taskChat.slice(taskChat.indexOf('function gateFromLaunch('), taskChat.indexOf('function adoptLaunchModel('));
+  assert.match(launchFn, /if \(isSelectable\(providers, launch\.model\)\) setSelection\(launch\.model, \{ remember: false \}\);\s*else launchMissed = launch\.model;\s*showStartGate\(\);/,
+    'a preselection only fills the gate; nothing starts');
+  assert.doesNotMatch(launchFn, /beginChat|sendStartFrame/);
 });
 
 test('task-chat.js: dialogs repaint on every socket state change, including the config frame of a reattach', () => {
@@ -287,8 +293,9 @@ test('task-edit-modal.js: the chat pane mounts the task chat through the bridge,
 });
 
 test('task-chat.js: open() routes a task chat to its workspace; the project chat stays a window', () => {
-  const open = taskChat.slice(taskChat.indexOf('export async function open(taskId)'), taskChat.indexOf('export function mount('));
-  assert.match(open, /const openWorkspace = window\.TipTask\?\.openTaskWorkspace;\s*if \(typeof openWorkspace === 'function'\) return openWorkspace\(key, \{ pane: 'chat' \}\);/);
+  const open = taskChat.slice(taskChat.indexOf('export async function open(taskId'), taskChat.indexOf('function launchOf('));
+  // (TPT9268/TPT9271) A preselected model travels with the route as the Chat pane's `chat` launch.
+  assert.match(open, /const openWorkspace = window\.TipTask\?\.openTaskWorkspace;\s*if \(typeof openWorkspace === 'function'\) return openWorkspace\(key, launch \? \{ pane: 'chat', chat: launch \} : \{ pane: 'chat' \}\);/);
   const project = taskChat.slice(taskChat.indexOf('export async function openProjectChat('), taskChat.indexOf('function openChat('));
   assert.doesNotMatch(project, /openTaskWorkspace/);
   assert.match(project, /openChat\(\{ kind: 'project'/);
@@ -366,6 +373,16 @@ test('task-chat.js: Embed, paste and drop come from the shared helpers, with no 
   // Send waits for uploads; user turns render their attachments.
   assert.match(taskChat, /send\.disabled = [^;]*uploadsPending > 0/);
   assert.match(taskChat, /userMessageHtml\(m\.content/);
+  // (TPT9279) Dropping a failed upload's placeholder keeps the caret, and so does the shared
+  // blob-to-URL swap: the next paste or Embed goes in at the caret, never at the end.
+  assert.match(taskChat, /setValueKeepingCaret\(input, stripPendingImageRefs\(input\.value\)\)/);
+  assert.ok(!/input\.value = (?:cleaned|stripPendingImageRefs)/.test(taskChat), 'no bare value write moves the caret to the end');
+  const swap = read('./task-board.js');
+  const swapFn = swap.slice(swap.indexOf('function _replaceImageBlobUrl('), swap.indexOf('function _reportImagePasteError('));
+  assert.match(swapFn, /setValueKeepingCaret\(target\.textarea, target\.textarea\.value\.split\(blobUrl\)\.join\(url\)\)/);
+  assert.ok(!swapFn.includes('textarea.value ='), 'the swap never assigns the value directly');
+  // An inline image that loads later keeps a transcript that was at its end there.
+  assert.match(taskChat, /scroller\.addEventListener\('load', \(e\) => \{\s*if \(e\.target && e\.target\.tagName === 'IMG' && stickToBottom\) scrollToBottom\(false\);\s*\}, true\);/);
 });
 
 test('chat-ui.js: the objective chat uses the same shared Embed control', () => {
@@ -381,10 +398,48 @@ test('chat-ui.js: the objective chat uses the same shared Embed control', () => 
 
 test('styles.css: attachments and the drop state are styled inside the Task Chat block', () => {
   const block = styles.slice(styles.indexOf('/* ── Task Chat window ──'), styles.indexOf('/* ── end Task Chat window ── */'));
-  for (const sel of ['.task-chat-attachments', '.task-chat-attach--image img', '.task-chat-attach--file', '.task-chat-panel--drop::after', '.task-chat-upload-status']) {
+  for (const sel of ['.task-chat-attachments', '.task-chat-inline-image', '.task-chat-inline-image img', '.task-chat-attach--file', '.task-chat-panel--drop::after', '.task-chat-upload-status']) {
     assert.ok(block.includes(sel), `styled: ${sel}`);
   }
   assert.ok(!styles.includes('.task-chat-start-embed') && !styles.includes('.task-chat-start-attachments'), 'the start gate has no Embed styles');
+  assert.ok(!styles.includes('.task-chat-attach--image'), 'images are inline, never strip thumbnails');
+});
+
+// (TPT9279) The inline image of a user turn: a bounded thumbnail on the text line, palette tokens
+// only, that a narrow bubble shrinks instead of overflowing.
+test('styles.css: the inline image is bounded, shrinks with the bubble and uses palette tokens only', () => {
+  const block = styles.slice(styles.indexOf('/* ── Task Chat window ──'), styles.indexOf('/* ── end Task Chat window ── */'));
+  const rule = (sel, from = 0) => {
+    const at = block.indexOf(`${sel} {`, from);
+    assert.ok(at >= 0, `rule: ${sel}`);
+    return block.slice(at, block.indexOf('}', at) + 1);
+  };
+  const link = rule('.task-chat-inline-image');
+  const img = rule('.task-chat-inline-image img');
+  assert.match(link, /display: inline-block;/);
+  assert.match(link, /max-width: \d+px;/, 'a fixed bound: a percentage would not cap the bubble\'s own sizing');
+  assert.match(link, /vertical-align: bottom;/);
+  assert.match(link, /overflow: hidden;/);
+  assert.match(img, /max-width: 100%;/, 'the image follows a link the bubble shrank');
+  assert.match(img, /max-height: \d+px;/);
+  const narrow = block.slice(block.indexOf('@media (max-width: 640px)'));
+  assert.match(narrow, /\.task-chat-inline-image \{ max-width: \d+px; \}/);
+  assert.match(narrow, /\.task-chat-inline-image img \{ max-height: \d+px; \}/);
+  // The global .file-attachment-link rule (an inline-flex box with a paperclip ::before) comes
+  // after this block with one class of specificity: the chat's rules must out-rank it, not follow it.
+  const fileLink = styles.search(/^\.file-attachment-link::before \{/m);
+  assert.ok(fileLink > styles.indexOf('/* ── end Task Chat window ── */'), 'the global rule is the later one');
+  assert.match(block, /\n {2}\.task-chat-user-text \.task-chat-inline-image \{\n {4}display: inline-block;/);
+  assert.match(narrow, /\.task-chat-user-text \.task-chat-inline-image \{ max-width: \d+px; \}/);
+  assert.match(narrow, /\.task-chat-user-text \.task-chat-inline-image img \{ max-height: \d+px; \}/);
+  assert.match(block, /\n {2}\.task-chat-msg--user \.file-attachment-link::before \{ content: none; \}/, 'no paperclip on a user turn\'s images and chips');
+  const all = block.match(/\.task-chat-inline-image[^{]*\{[^}]*\}/g).join('\n');
+  assert.doesNotMatch(all, /#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(/i, 'colors come from palette tokens');
+  for (const color of all.match(/(?:border|background|outline)[^:]*:[^;]*;/g)) {
+    if (/\b(?:border|outline):|background:|border-color:/.test(color) && !/\bvar\(--c-/.test(color)) {
+      assert.fail(`palette token expected: ${color}`);
+    }
+  }
 });
 
 test('(TPT539) task-chat.js: the history picker resumes by historyId and never falls back to a fresh chat', () => {

@@ -125,7 +125,26 @@ function fallbackModels(agentId, config) {
 
 const _cache = new Map();    // agentId -> { models, source: 'probe'|'fallback', probedAt, key }
 const _inflight = new Map(); // agentId -> Promise<entry> — coalesces concurrent window requests
+const _listeners = new Set(); // fn(agentId, entry) — told after every probe stores an entry
 let _diskHydrated = false;
+
+// Calls `listener(agentId, entry)` each time a probe (or its fallback) lands in this process's
+// cache — boot warm, Re-Check, re-probe on install, a stale entry's refresh. The device's model
+// report (agent-model-report.js) follows the registry this way. Returns an unsubscribe function.
+// A throwing listener is logged and never affects the probe or the other listeners.
+function onModelsResolved(listener) {
+  if (typeof listener !== 'function') return () => {};
+  _listeners.add(listener);
+  return () => { _listeners.delete(listener); };
+}
+
+function notifyResolved(agentId, entry) {
+  for (const listener of [..._listeners]) {
+    try { listener(agentId, entry); } catch (err) {
+      console.error('[model-registry] listener failed:', err && err.message);
+    }
+  }
+}
 
 function registryFilePath(config) {
   return path.join(config.USER_DATA_ROOT, 'model-registry.json');
@@ -196,6 +215,7 @@ async function resolveModels(agent, config, { force = false } = {}) {
         : { models: fallbackModels(agent.id, config), source: 'fallback', probedAt: Date.now(), key: currentKey };
       _cache.set(agent.id, entry);
       persistToDisk(config);
+      notifyResolved(agent.id, entry);
       return entry;
     })
     .catch((err) => {
@@ -203,6 +223,7 @@ async function resolveModels(agent, config, { force = false } = {}) {
       const entry = { models: fallbackModels(agent.id, config), source: 'fallback', probedAt: Date.now(), key: currentKey };
       _cache.set(agent.id, entry);
       persistToDisk(config);
+      notifyResolved(agent.id, entry);
       return entry;
     })
     .finally(() => { _inflight.delete(agent.id); });
@@ -222,6 +243,27 @@ function peekModels(agentId, config) {
   hydrateFromDisk(config);
   const entry = _cache.get(agentId);
   return entry ? entry.models : null;
+}
+
+// Cache-only read of the whole entry ({ models, source, probedAt, key }) — never probes.
+// Callers that must tell a live catalog (`source: 'probe'`) from the static fallback list
+// use this instead of peekModels().
+function peekModelEntry(agentId, config) {
+  hydrateFromDisk(config);
+  return _cache.get(agentId) || null;
+}
+
+// Pure. The model to pass explicitly when a launch names none and would otherwise run
+// `configModel` (the `model` its CLI config names, possibly blank). Returns the catalog's
+// top (`isLatest`) model when `entry` is a live probed catalog that does not list
+// `configModel`; '' (no override) when `configModel` is listed, or when there is no live
+// catalog to judge by — a static fallback list never overrides a config choice.
+function pickServedModel(entry, configModel) {
+  if (!entry || entry.source !== 'probe' || !Array.isArray(entry.models) || entry.models.length === 0) return '';
+  const wanted = typeof configModel === 'string' ? configModel.trim() : '';
+  if (wanted && entry.models.some(m => m && m.id === wanted)) return '';
+  const top = entry.models.find(m => m && m.isLatest && m.id) || entry.models.find(m => m && m.id);
+  return top ? top.id : '';
 }
 
 // Validator for POST /api/config's CLAUDE_MODEL/CODEX_MODEL fields. A value is allowed when
@@ -251,6 +293,7 @@ function isModelAllowed(agentId, value, projectRoot, config) {
 function _resetForTest() {
   _cache.clear();
   _inflight.clear();
+  _listeners.clear();
   _diskHydrated = false;
 }
 
@@ -267,6 +310,9 @@ module.exports = {
   fallbackModels,
   resolveModels,
   peekModels,
+  peekModelEntry,
+  onModelsResolved,
+  pickServedModel,
   isModelAllowed,
   _resetForTest,
 };

@@ -47,7 +47,8 @@ function makeBackend({ tasks = [], sprints = [] } = {}) {
     async getSprints() {
       return sprints;
     },
-    async createSprint(name, number) {
+    async createSprint(name, number, ...extra) {
+      assert.deepEqual(extra, [], 'sprint assignment delegates dates to the backend');
       createdSprints.push({ name, number });
       return { name, number };
     },

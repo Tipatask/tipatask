@@ -156,6 +156,7 @@ const OBJECTIVE_DISALLOWED_TOOLS = [
   'ToolSearch', 'WebFetch', 'WebSearch',
   'mcp__tipatask__update_task', 'mcp__tipatask__create_task',
   'mcp__tipatask__delete_task', 'mcp__tipatask__create_task_comment',
+  'mcp__tipatask__add_task_dev_link',
   'mcp__tipatask__create_system_tag',
   'mcp__tipatask__ensure_project_tag', 'mcp__tipatask__purge_stale_reservations',
   'mcp__tipatask-local__push_knowledge', 'mcp__tipatask-local__pull_knowledge',

@@ -1,20 +1,10 @@
 'use strict';
 
-// (TPT9162) Cowboy-coding chains: which tasks a finished cowboy run starts next. Pure — no IO;
-// terminal-session.js launchCowboyChain() reads the inputs, applies the run gates and starts the
-// picks. Rules (ai/architecture/tt-claude-session-terminal.md § Cowboy chains):
-//  (a) every task that directly depends on the finished task and whose other dependencies are all
-//      closed — every one of them starts;
-//  (b) only when no dependent qualifies: exactly one other task of the finished task's sprint (same
-//      `priority`; the backlog is not a sprint), lowest display order first.
-// Both pass the same start checks: not an objective, not a reservation placeholder, a CODING task,
-// not assigned to the human agent, not a Pi image task, not assigned to another member, no live
-// session, a not-started (workflow-start role) or urgent status, and every other dependency
-// closed. (TPT9193) The candidate's own permission mode is not checked. Every candidate that fails
-// a check is named in `skipped` with the code of the first check it failed (SKIP_REASONS order).
-// (TPT9194) Each pick then runs with the finished run's agent and model, Bypass and Cowboy-coding
-// mode: chainInheritance() / chainPickFields() / chainLaunchAgent().
+// Pure Cowboy successor selection. Enabled scopes follow direct dependents first. Whole
+// Project then resumes its saved sprint cursor and advances through later startable sprints.
+// Runtime gates, inherited settings, mutex and fresh sessions belong to terminal-session.js.
 
+const { normalizeCowboyScope } = require('../cowboy-mode.mjs');
 const { validateMode } = require('./permission-policy');
 const { isClosedName } = require('./status-roles');
 
@@ -54,13 +44,14 @@ function boardOrder(a, b) {
 // queued session. currentUserId: tasks assigned to anyone else are skipped (null skips that check,
 // as the start gate fails open). isImageTask: (TPT9194) true for a task whose run is a Pi image
 // operation — it never runs in bypass, and inheriting a text model would make it a coding run
-// (omitted: no task is one). Returns { tasks, reason: 'dependents'|'sprint'|'none', skipped }:
+// (omitted: no task is one). Returns { tasks, reason: 'dependents'|'sprint'|'next_sprint'|'none', skipped }:
 // `skipped` is [{ key, reason }] in board order — every direct dependent that does not qualify and,
 // when the sprint fallback runs, every other open task of that sprint that does not; a closed task
 // of the sprint is no candidate and is left out. Each task is listed once.
-function selectNextCowboyTasks(finishedTask, tasks, { statusRoles, liveTaskIds = [], currentUserId = null, isImageTask = null } = {}) {
+function selectNextCowboyTasks(finishedTask, tasks, { statusRoles, liveTaskIds = [], currentUserId = null, isImageTask = null, scope = finishedTask?.cowboyMode ?? finishedTask?.cowboy_mode, context = null, chainBusy = false } = {}) {
   const finishedKey = finishedTask?.id;
-  if (!finishedKey || !statusRoles) return { tasks: [], reason: 'none', skipped: [] };
+  scope = normalizeCowboyScope(scope);
+  if (scope === 'disabled' || !finishedKey || !statusRoles) return { tasks: [], reason: 'none', skipped: [] };
   const rows = (Array.isArray(tasks) ? tasks : []).filter(t => t && t.id);
   const byKey = new Map(rows.map(t => [t.id, t]));
   const live = new Set(liveTaskIds || []);
@@ -92,10 +83,20 @@ function selectNextCowboyTasks(finishedTask, tasks, { statusRoles, liveTaskIds =
   const dependents = startable(rows.filter(t => Array.isArray(t.dependencies) && t.dependencies.includes(finishedKey)));
   if (dependents.length) return { tasks: dependents, reason: 'dependents', skipped };
 
-  const sprint = Number(finishedTask.priority) || 0;
+  if (scope === 'related' || chainBusy) return { tasks: [], reason: 'none', skipped };
+  // Dependency branches can cross sprints. Resume the chain's saved sprint cursor rather
+  // than the leaf's sprint; only an unrelated pick advances it.
+  const sprint = Number(context?.sprint ?? finishedTask.priority) || 0;
   if (sprint > 0) {
-    const next = startable(rows.filter(t => (Number(t.priority) || 0) === sprint && !isClosedName(t.status, statusRoles)))[0];
-    if (next) return { tasks: [next], reason: 'sprint', skipped };
+    const sprints = [...new Set(rows.map(t => Number(t.priority)).filter(p => p >= sprint))].sort((a, b) => a - b);
+    for (const candidateSprint of sprints) {
+      const candidates = startable(rows.filter(t => Number(t.priority) === candidateSprint && !isClosedName(t.status, statusRoles)));
+      // Continue after the last unrelated task, then wrap to any earlier unfinished work.
+      const cursor = Number(context?.order);
+      const next = candidateSprint === sprint && Number.isFinite(cursor)
+        ? candidates.find(t => Number(t.order) > cursor) || candidates[0] : candidates[0];
+      if (next) return { tasks: [next], reason: candidateSprint === sprint ? 'sprint' : 'next_sprint', skipped };
+    }
   }
   return { tasks: [], reason: 'none', skipped };
 }
@@ -119,8 +120,8 @@ function chainInheritance(run) {
 // (TPT9194) The fields written to a pick before it starts: the task override `bypass`, so the
 // chained launch may run (spawnTerminal() refuses one outside bypass), and Cowboy-coding mode, so
 // the chain goes on from it; with an inherited agent, also agentAssignee and that agent's model field.
-function chainPickFields({ agent = null, model = '' } = {}) {
-  const fields = { agentPermissionMode: 'bypass', cowboyMode: true };
+function chainPickFields({ agent = null, model = '', scope = 'project' } = {}) {
+  const fields = { agentPermissionMode: 'bypass', cowboyMode: normalizeCowboyScope(scope) };
   if (LAUNCH_AGENTS.includes(agent)) {
     fields.agentAssignee = agent;
     if (model) fields[MODEL_FIELDS[agent]] = model;

@@ -1,6 +1,7 @@
 'use strict';
 
 const config = require('./config');
+const { normalizeCowboyScope } = require('../cowboy-mode.mjs');
 const { normalizeAgentAssignee } = require('../agent-assignee.mjs');
 const { getApiCredentials, createTokenWatch } = require('./api-credentials');
 const { request } = require('../cli/http');
@@ -157,8 +158,7 @@ function _invalidateSettings() {
   _effectiveSettingsEntry = null;
 }
 
-function _settingsRequestContext(includeWrites = true) {
-  const credentials = getCredentials(); // observe account/target changes before cache hits
+function _settingsRequestContext(includeWrites = true, credentials = getCredentials()) {
   const generation = _settingsGeneration;
   const userGeneration = _userIdGeneration;
   return () => {
@@ -672,6 +672,11 @@ async function apiRequest(method, urlPath, body, opts = {}) {
   }
   const { baseUrl, token, projectId } = getCredentials();
 
+  if (opts.expectedCredentials && (baseUrl !== opts.expectedCredentials.baseUrl
+    || token !== opts.expectedCredentials.token || String(projectId) !== String(opts.expectedCredentials.projectId))) {
+    throw new AuthCorruptedError('Credentials changed before request; retry with the current account', { reasonCode: 'identity_changed' });
+  }
+
   // (C1383) Pre-flight local expiry check — catches a KNOWN-dead token (decodable JWT,
   // past `exp`) before spending a request on it. Runs after the self-heal block above so
   // a freshly-written token still un-latches normally; deliberately permissive on any
@@ -836,6 +841,7 @@ function fromApi(t) {
     // worth threading an async registry lookup through fromApi() for.
     status: t.status || 'pending',
     priority: Number(t.priority ?? 0),
+    urgency: t.urgency ?? 0,
     order: t.display_order ?? 0,
     dependencies: t.dependencies || [],
     tags: t.tags || [],
@@ -849,6 +855,7 @@ function fromApi(t) {
     totalOutputTokens: t.total_output_tokens || 0,
     totalCostUsd: parseFloat(t.total_cost_usd) || 0,
     activeDevice: t.active_device || null,
+    ...(t.dev_links ? { dev_links: t.dev_links } : {}),
     recentDeviceId: t.recent_device_id ?? null,
     recentDevice: t.recent_device || null,
     agentAssignee: t.agent_assignee ?? null,
@@ -865,10 +872,9 @@ function fromApi(t) {
     // tasksDiffer() and the edit-modal dirty check both compare with ?? null, and a
     // null-vs-false mismatch would mark every task dirty.
     claudeDesignMode: !!t.claude_design_mode,
-    // (TPT9161) Cowboy-coding mode (tasks.cowboy_mode, TPT9160). Same TINYINT(1) NOT NULL
-    // coercion as claudeDesignMode; an API without the column reads as off. The API stores it
-    // only while the effective permission mode is bypass — see cowboyModeOn() (permission-mode.js).
-    cowboyMode: !!t.cowboy_mode,
+    // Preserve the canonical scope; older APIs may return a boolean or omit the field.
+    // Enabled scopes count only in effective Bypass (cowboyModeOn()).
+    cowboyMode: normalizeCowboyScope(t.cowboy_mode),
     due_date: t.due_date ?? null,
     // C1017: unfinalized reserve_task_keys placeholder marker. Not sent back by
     // toApi() below — it's server-owned, cleared only by a real PATCH/finalize.
@@ -899,6 +905,7 @@ function toApi(t) {
     agent_assignee: normalizeAgentAssignee(t.agentAssignee),
     due_date: t.due_date ?? null,
   };
+  if (t.urgency !== undefined) out.urgency = t.urgency;
   // Per-task model override forwarded ONLY when explicitly set to a non-empty
   // model id. Blank/undefined is omitted (not sent as null) so a plain new
   // task carries no defaulted model and inherits the project
@@ -919,7 +926,7 @@ function toApi(t) {
   // keeps the stored flag for a row without the field, so only a value the row carries is sent
   // — false included. The API re-checks the bypass-only rule on every write that carries it.
   const cowboyMode = t.cowboyMode !== undefined ? t.cowboyMode : t.cowboy_mode;
-  if (cowboyMode !== undefined) out.cowboy_mode = !!cowboyMode;
+  if (cowboyMode !== undefined) out.cowboy_mode = normalizeCowboyScope(cowboyMode);
   // C1207: same conditional-omit shape as the model fields above, different reason —
   // for a boolean, omitting *is* "false": the API's POST/PUT readers do
   // `toBoolInt(t.claude_design_mode)` → 0, identical to the column default.
@@ -1078,7 +1085,7 @@ async function assignIncomingNewTaskIds(backend, incomingNewTasks, liveTasks) {
 // Only differences against the client's own read base represent edits. Comparing
 // against live rows would misclassify concurrent changes as requested reversions.
 const DIFF_FIELDS = ['title', 'description', 'category', 'status', 'priority', 'order',
-  'dependencies', 'tags', 'assignee', 'agentAssignee', 'claudeModel', 'codexModel', 'piModel', 'effort', 'agentPermissionMode', 'claudeDesignMode', 'cowboyMode', 'due_date', 'parentDbId', 'isObjective', 'type', 'parentId'];
+  'dependencies', 'tags', 'urgency', 'assignee', 'agentAssignee', 'claudeModel', 'codexModel', 'piModel', 'effort', 'agentPermissionMode', 'claudeDesignMode', 'cowboyMode', 'due_date', 'parentDbId', 'isObjective', 'type', 'parentId'];
 function taskFieldChanges(incoming, base) {
   const patch = {};
   const permissionMode = incoming.agentPermissionMode !== undefined ? incoming.agentPermissionMode : incoming.agent_permission_mode;
@@ -1087,10 +1094,9 @@ function taskFieldChanges(incoming, base) {
     const a = f === 'agentPermissionMode' ? permissionMode : f === 'cowboyMode' ? cowboyMode : incoming[f];
     if (a === undefined) continue; // omission preserves the live field
     const b = base[f];
-    // (TPT9161) A boolean with no third state: a base without the field counts as off, so a
-    // snapshot that never carried it cannot turn an untouched `false` into a clearing write.
+    // A missing base counts as Disabled; scope-only changes still produce a patch.
     if (f === 'cowboyMode') {
-      if (!!a !== !!b) patch[f] = !!a;
+      if (normalizeCowboyScope(a) !== normalizeCowboyScope(b)) patch[f] = normalizeCowboyScope(a);
     } else if (Array.isArray(a) || Array.isArray(b)) {
       if (JSON.stringify(a || []) !== JSON.stringify(b || [])) patch[f] = a;
     } else if ((a ?? null) !== (b ?? null)) {
@@ -1164,6 +1170,7 @@ async function _rawUpdateTask(id, fields, opts = {}) {
   if (codexModel !== undefined) body.codex_model = codexModel;
   const piModel = fields.piModel !== undefined ? fields.piModel : fields.pi_model;
   if (piModel !== undefined) body.pi_model = piModel;
+  if (fields.urgency !== undefined) body.urgency = fields.urgency;
   // TPT285: single key in both casings; '' clears to null (API normalizeEffort does the same).
   if (fields.effort !== undefined) body.effort = fields.effort || null;
   const permissionMode = fields.agentPermissionMode !== undefined ? fields.agentPermissionMode : fields.agent_permission_mode;
@@ -1176,7 +1183,7 @@ async function _rawUpdateTask(id, fields, opts = {}) {
   // (TPT9161) Same mandatory snake_case fallback as claudeDesignMode above (the edit modal's
   // patch reaches here verbatim over IPC). The API stores false unless the effective mode is bypass.
   const cowboyMode = fields.cowboyMode !== undefined ? fields.cowboyMode : fields.cowboy_mode;
-  if (cowboyMode !== undefined) body.cowboy_mode = !!cowboyMode;
+  if (cowboyMode !== undefined) body.cowboy_mode = normalizeCowboyScope(cowboyMode);
   // Was missing entirely (migration 055 shipped the column but no client write path
   // ever set it) — same shape as claudeDesignMode above.
   const isObjective = fields.isObjective !== undefined ? fields.isObjective : fields.is_objective;
@@ -1295,7 +1302,12 @@ const backend = {
 
   // Full unfiltered list — all project tasks regardless of assignee.
   // Use for all save/merge/agent/system paths to prevent data loss.
-  async getTasksUnfiltered() {
+  async getTasksUnfiltered({ refresh = false } = {}) {
+    // Chain selection requires current dependencies/statuses and fails closed offline.
+    if (refresh) {
+      const data = await apiRequest('GET', '/tasks?include_reservations=true');
+      return _mapRawTasks(data.tasks || []);
+    }
     const t0 = TASKS_CACHE_LOG ? Date.now() : 0;
 
     if (_listEntry !== null && (Date.now() - _listEntry.at) < TASKS_CACHE_TTL_MS) {
@@ -1436,6 +1448,19 @@ const backend = {
   async getTask(id) {
     const data = await apiRequest('GET', `/tasks/${encodeURIComponent(id)}`);
     if (!data || data._notFound || !data.task) return null;
+    return fromApi(data.task);
+  },
+
+  // A remote launch requires an online, atomic self-claim. Never use updateTask's
+  // offline queue or fall back to PATCH when talking to an older API.
+  async claimTaskForStart(id, { credentials = getCredentials() } = {}) {
+    const assertCurrent = _settingsRequestContext(false, credentials);
+    const data = await apiRequest('POST', `/tasks/${encodeURIComponent(id)}/start-claim`, {}, {
+      timeoutMs: 8000, expectedCredentials: credentials,
+    });
+    assertCurrent();
+    if (!data?.task || data._notFound) throw Object.assign(new Error('Task claim unavailable'), { code: 'ECLAIM' });
+    _cacheInvalidate();
     return fromApi(data.task);
   },
 
@@ -1816,6 +1841,12 @@ const backend = {
     return data.comments || [];
   },
 
+  async addTaskDevLink(taskKey, link) {
+    const data = await apiRequest('POST', `/tasks/${encodeURIComponent(taskKey)}/dev-links`, link, { allowForbidden: true });
+    if (data && data._notFound) return null;
+    return data;
+  },
+
   async createTaskComment(taskKey, content, type = 'comment') {
     const data = await apiRequest('POST', `/tasks/${encodeURIComponent(taskKey)}/comments`, { content, type });
     if (data && data._notFound) return null;
@@ -1971,10 +2002,11 @@ const backend = {
         if (fields.claudeModel !== undefined) row.claudeModel = fields.claudeModel;
         if (fields.codexModel !== undefined) row.codexModel = fields.codexModel;
         if (fields.piModel !== undefined) row.piModel = fields.piModel;
+        if (fields.urgency !== undefined) row.urgency = fields.urgency;
         if (fields.effort !== undefined) row.effort = fields.effort || null;
         if (permissionMode !== undefined) row.agentPermissionMode = permissionMode;
         if (fields.claudeDesignMode !== undefined) row.claudeDesignMode = !!fields.claudeDesignMode;
-        if (cowboyMode !== undefined) row.cowboyMode = !!cowboyMode;
+        if (cowboyMode !== undefined) row.cowboyMode = normalizeCowboyScope(cowboyMode);
         if (fields.isObjective !== undefined) row.isObjective = !!fields.isObjective;
         if (fields.order !== undefined) row.order = fields.order;
         if (fields.assignee !== undefined) row.assignee = fields.assignee;
@@ -1983,7 +2015,7 @@ const backend = {
       }
     });
     if (_found) return _found;
-    return { id, ...fields, ...(permissionMode !== undefined ? { agentPermissionMode: permissionMode } : {}), ...(cowboyMode !== undefined ? { cowboyMode: !!cowboyMode } : {}), _pendingSync: true };
+    return { id, ...fields, ...(permissionMode !== undefined ? { agentPermissionMode: permissionMode } : {}), ...(cowboyMode !== undefined ? { cowboyMode: normalizeCowboyScope(cowboyMode) } : {}), _pendingSync: true };
   },
 
   async addTokenUsage(taskKey, tokens) {
@@ -2083,15 +2115,43 @@ const backend = {
     return (data && data.sprints) ? data.sprints : (Array.isArray(data) ? data : []);
   },
 
-  // extra (optional): { goal, start_date, end_date } — the other fields POST /sprints accepts
-  // (dates as YYYY-MM-DD). Project import (project-archive.js) uses it to restore a sprint.
+  getProjectRoot() { return _projectRoot; },
+
+  async applySprintForecast(id, dates) {
+    const { isUndatedSprint, fitsSprintDates } = require('./sprint-forecast');
+    const sprints = await this.getSprints();
+    const sprint = sprints.find(s => s.id === id);
+    if (!sprint || !isUndatedSprint(sprint)
+      || !fitsSprintDates(sprint.number, dates, sprints, new Date().toISOString().slice(0, 10))) return null;
+    try {
+      const data = await apiRequest('PATCH', `/sprints/${encodeURIComponent(id)}`, {
+        start_date: dates.start_date, end_date: dates.end_date, date_source: 'auto', only_if_undated: true,
+      });
+      return data?.sprint || null;
+    } catch (err) {
+      if (err.statusCode === 409 && err.body?.error === 'sprint_dates_changed') return null;
+      throw err;
+    }
+  },
+
+  // extra (optional): { goal, start_date, end_date } (dates as YYYY-MM-DD).
+  // Task App dates are automatic, including dates restored by project import.
   async createSprint(name, number, extra = {}) {
     const body = { name, number };
-    for (const field of ['goal', 'start_date', 'end_date']) {
-      if (extra[field] !== undefined) body[field] = extra[field];
-    }
+    if (extra.goal !== undefined) body.goal = extra.goal;
+    const hasDates = Boolean(extra.start_date && extra.end_date);
+    const dates = hasDates
+      ? { start_date: extra.start_date, end_date: extra.end_date, date_source: 'auto' }
+      : { auto_dates: true };
     try {
-      const data = await apiRequest('POST', '/sprints', body);
+      let data;
+      try {
+        data = await apiRequest('POST', '/sprints', { ...body, ...dates });
+      } catch (err) {
+        if (!hasDates || err.statusCode !== 400 || err.body?.error !== 'invalid_sprint_dates') throw err;
+        // Let the API allocate a valid range; never repeat rejected caller dates.
+        data = await apiRequest('POST', '/sprints', { ...body, auto_dates: true });
+      }
       return data && data.sprint ? data.sprint : null;
     } catch (err) {
       if (err.statusCode === 409) return null; // already exists
@@ -2565,7 +2625,30 @@ const backend = {
     return validateCredentialsGuard(_projectRoot);
   },
 
-  async getCurrentUserId() {
+  async getCurrentUserId({ strict = false, timeoutMs = 8000 } = {}) {
+    if (strict) {
+      // Remote authorization cannot use the cached/offline identity. Read /me with
+      // the current credentials and reject rotation, reset, failure or malformed IDs.
+      let generation;
+      try {
+        const credentials = getCredentials();
+        const { baseUrl, token } = credentials;
+        generation = _userIdGeneration;
+        const assertCurrent = _settingsRequestContext(false, credentials);
+        const res = await request(`${baseUrl}/api/auth/me`, {
+          method: 'GET', headers: { Authorization: `Bearer ${token}` }, timeoutMs,
+        });
+        assertCurrent();
+        const id = res.data?.user?.id;
+        if (res.status !== 200 || !Number.isSafeInteger(id) || id <= 0) throw new Error('Current identity unavailable');
+        _currentUserId = id;
+        return id;
+      } catch {
+        // Do not erase a newer account's successful lookup after a late response.
+        if (generation === undefined || generation === _userIdGeneration) _resetUserContext('strict identity unavailable');
+        throw new AuthCorruptedError('Current identity could not be verified; retry after signing in', { reasonCode: 'identity_unavailable' });
+      }
+    }
     _syncCredentialWatch();
     if (_currentUserId == null) await _fetchCurrentUserId();
     return _currentUserId;

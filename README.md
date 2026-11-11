@@ -62,7 +62,10 @@ sprints. If an import fails partway, the project it started is removed, so you c
 
 On macOS the first launch explains, then asks once for notification, microphone and folder
 access (Desktop, Documents, Downloads and your open projects), so an agent never stops mid-task
-waiting on a system prompt. You can change these later in System Settings.
+waiting on a system prompt. Agents also need Screen Recording and Accessibility for computer use,
+to see the screen and work in apps when they check their changes: while either is off, each
+launch shows one prompt that names it and opens its System Settings pane, until you turn it on or
+choose Don't Ask Again. You can change all of these later in System Settings.
 
 To update, install a newer release (or pull and rebuild) and reopen your project.
 
@@ -116,10 +119,36 @@ npm run electron:ci:mac
 
 Produces `dist-electron/TipATask-<version>-arm64.dmg` (Apple Silicon) and
 `dist-electron/TipATask-<version>-x64.dmg` (Intel). Both architectures are built in one run.
-The app is ad-hoc signed and not notarized, so macOS asks you to allow it on first launch
-(**System Settings ▸ Privacy & Security ▸ Open Anyway**). Building the x64 dmg on an Apple
+Local builds automatically use a valid Developer ID Application (or compatible development)
+certificate and its private key from your keychain. `build.mac.identity` is left unset so
+electron-builder can discover it. Set `CSC_NAME` to a name/Team ID substring to select a
+certificate, or provide a `.p12` through `CSC_LINK` and its password through `CSC_KEY_PASSWORD`.
+Explicit signing credentials must be valid; they do not silently fall back.
+
+With no certificate, the `beforePack` hook selects ad-hoc signing for both architectures.
+To test that path on a Mac with a certificate, leave `CSC_NAME` and `CSC_LINK` unset and run
+`CSC_IDENTITY_AUTO_DISCOVERY=false npm run electron:ci:mac`. Hardened runtime and the same
+entitlements apply to both paths. Local builds are not notarized by default; macOS may ask
+you to allow the app on first launch (**System Settings ▸ Privacy & Security ▸ Open Anyway**).
+
+For an unpacked check without bumping the version, run `npm run electron:pack -- --mac --arm64`
+(use `--x64` for Intel), then `codesign --verify --deep --strict dist-electron/mac-arm64/TipATask.app`
+and `codesign -dv --verbose=4 dist-electron/mac-arm64/TipATask.app` (Intel: `dist-electron/mac/`).
+Certificate signing shows `Authority` and `TeamIdentifier`; the fallback shows `Signature=adhoc`
+and `TeamIdentifier=not set`.
+
+Building the x64 dmg on an Apple
 Silicon Mac rebuilds `node-pty` for Intel; if `node-gyp` fails with a missing `distutils`, point
-`npm_config_python` at Python 3.11 or older (see [`ELECTRON_BUILD.md`](ELECTRON_BUILD.md)).
+`PYTHON` at Python 3.11 or older (adjust the path to your installation):
+
+```bash
+PYTHON=/usr/local/bin/python3.10 npm run electron:ci:mac
+```
+
+Use `PYTHON`, not `npm_config_python`: Python is a node-gyp setting, and current npm warns
+about the unsupported `python` config before the build starts. The packaging hooks translate
+the legacy variable for nested npm and native rebuilds, but cannot prevent that outer npm
+warning. See [`ELECTRON_BUILD.md`](ELECTRON_BUILD.md) for signing and distribution.
 
 ### Windows
 

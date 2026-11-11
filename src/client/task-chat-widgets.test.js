@@ -11,7 +11,7 @@ import { Window } from 'happy-dom';
 const source = readFileSync(new URL('./task-chat.js', import.meta.url), 'utf8');
 const model = await import('./task-chat-model.js');
 const { WS_SEND_TYPES, WS_RECV_TYPES } = await import('./ws-client.js');
-const { createLiveInserter } = await import('./utils.js');
+const { createLiveInserter, setValueKeepingCaret } = await import('./utils.js');
 const voiceHelpers = {
   ...await import('./voice-errors.js'),
   ...await import('./voice-model-state.js'),
@@ -84,6 +84,7 @@ function harness(t, { topLayer = () => true, draftStorage = new Map(), projectPa
     attachFileDrop: (target, textarea, opts) => uploads.drops.push({ target, textarea, opts }),
     attachImagePaste: (textarea, _ws, opts) => uploads.pastes.push({ textarea, opts }),
     closeOpenEmbedMenu: () => {},
+    setValueKeepingCaret,
     attachAudioRecorder: () => null,
     ...model,
   };
@@ -1238,7 +1239,7 @@ test('the composer gets the shared Embed control, paste and panel drop, all into
   assert.equal(h.uploads.drops[0].textarea, input);
 });
 
-test('Send waits for an upload; the sent turn carries the reference and shows it as a thumbnail', (t) => {
+test('Send waits for an upload; the sent turn carries the reference and shows the image inline', (t) => {
   const h = harness(t);
   h.start();
   const { opts } = h.uploads.pastes[0];
@@ -1256,8 +1257,41 @@ test('Send waits for an upload; the sent turn carries the reference and shows it
   assert.equal(h.sent.at(-1).type, WS_SEND_TYPES.TASK_CHAT_MESSAGE);
   assert.equal(h.sent.at(-1).content, 'See ![img](http://h/api/projects/2/images/5)');
   const bubble = h.$$('.task-chat-msg--user').at(-1);
-  assert.equal(bubble.querySelector('.task-chat-user-text').textContent, 'See');
-  assert.equal(bubble.querySelector('.task-chat-attach--image img').getAttribute('src'), '/api/images/2/5');
+  assert.equal(bubble.querySelector('.task-chat-user-text').textContent, 'See ');
+  assert.equal(bubble.querySelector('.task-chat-user-text > a.task-chat-inline-image img').getAttribute('src'), '/api/images/2/5');
+  assert.equal(bubble.querySelector('.task-chat-attachments'), null, 'an image is no strip thumbnail');
+});
+
+// The user text row of a bubble, as [node kind, content] pairs in document order.
+function bubbleNodes(bubble) {
+  return [...bubble.querySelector('.task-chat-user-text').childNodes].map(n => (n.nodeType === 3
+    ? ['text', n.textContent]
+    : [n.className, n.querySelector('img').getAttribute('src')]));
+}
+
+test('(TPT9279) a turn with text, image, text shows the image between the two texts, live and restored', (t) => {
+  const h = harness(t);
+  const content = 'Before ![img](http://h/api/projects/2/images/5) after\n[spec.pdf](http://h/api/projects/2/files/7)';
+  const expected = [
+    ['text', 'Before '],
+    ['file-attachment-link task-chat-inline-image', '/api/images/2/5'],
+    ['text', ' after'],
+  ];
+  h.start();
+  h.turn(content);
+  const live = h.$$('.task-chat-msg--user').at(-1);
+  assert.deepEqual(bubbleNodes(live), expected);
+  assert.equal(live.querySelector('.task-chat-attach--file').getAttribute('href'), '/api/files/2/7');
+  // The same turn restored from the server's history renders the same way.
+  h.feed({ type: 'chat-history-reset', messages: [
+    { role: 'user', content: 'seed', seed: true },
+    { role: 'assistant', content: 'Hi' },
+    { role: 'user', content },
+  ] });
+  const restored = h.$$('.task-chat-msg--user');
+  assert.equal(restored.length, 1);
+  assert.deepEqual(bubbleNodes(restored[0]), expected);
+  assert.equal(restored[0].querySelector('.task-chat-attach--file').getAttribute('href'), '/api/files/2/7');
 });
 
 test('a failed image upload drops its placeholder; a file upload holds Send until it settles', async (t) => {
@@ -1266,9 +1300,12 @@ test('a failed image upload drops its placeholder; a file upload holds Send unti
   const input = h.$('.task-chat-input');
   const image = h.uploads.pastes[0].opts;
   image.onFileDetected({ name: 'a.png' });
-  input.value = 'x![img](blob:x/2)';
+  input.value = 'ab![img](blob:x/2)cd';
+  input.setSelectionRange(input.value.length - 1, input.value.length - 1);
   image.onUploadError({ name: 'a.png' }, new Error('boom'));
-  assert.equal(input.value, 'x');
+  assert.equal(input.value, 'abcd');
+  // (TPT9279) The caret stays on its text (between c and d), so the next insert lands there.
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [3, 3]);
   let finish;
   h.uploads.menus[0].opts.onFileUpload(new Promise((resolve) => { finish = resolve; }), { name: 'spec.pdf' });
   assert.equal(h.$('.task-chat-send').disabled, true);

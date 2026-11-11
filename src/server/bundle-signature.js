@@ -77,6 +77,8 @@ async function cleanStrayBundleFiles(bundlePath, { fs = fsp } = {}) {
 // correctly fails on it. Verified live against the installed app. Dropped so this check can
 // never again report `valid: true` for a seal a strict verify would reject.
 async function verifyBundleSignature(bundlePath, { exec = execFile, timeoutMs = 10000 } = {}) {
+  // codesign validates both certificate and ad-hoc signatures. A valid Developer ID
+  // signature must pass through startup unchanged; only failed verification repairs.
   const { code, stderr } = await _run(exec, 'codesign', ['--verify', bundlePath], timeoutMs);
   return { valid: code === 0, reason: code === 0 ? null : (stderr.trim().split('\n').pop() || 'verify-failed') };
 }

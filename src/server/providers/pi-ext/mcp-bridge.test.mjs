@@ -166,6 +166,17 @@ test("registerMcpTools skips a name collision instead of overwriting", () => {
   assert.deepEqual(names, ["a_b__t"]);
 });
 
+test("native app consent gets a bounded timeout long enough for the user to answer", async () => {
+  const definitions = [];
+  let options;
+  registerMcpTools({ registerTool: tool => definitions.push(tool) }, [{ name: "computer-use", tools: [{ name: "request_access" }],
+    client: { async callTool(_request, _schema, requestOptions) { options = requestOptions; return { content: [] }; } } }]);
+  const signal = new AbortController().signal;
+  await definitions[0].execute("probe", { apps: ["test.app"], reason: "probe" }, signal);
+  assert.equal(options.timeout, 150000);
+  assert.equal(options.signal, signal);
+});
+
 test("bundlePiExt inlines the SDK and the bundle runs with no node_modules nearby", async () => {
   const { bundlePiExt } = require(path.join(SERVER_ROOT, "build.js"));
   const dir = scratch();

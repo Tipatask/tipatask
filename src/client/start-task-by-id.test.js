@@ -11,7 +11,7 @@ import { Window } from 'happy-dom';
 // api.tasks.get(): the Electron 403 marker and { _ipcError } failures toast and start nothing.
 // Real task-card.js bundle under happy-dom; only the IPC bridge and xterm are replaced.
 
-let window, scratch, cards, ipcGet;
+let window, scratch, cards, state, updateClaudeButtons, ipcGet;
 const globals = new Map();
 const opened = [];
 
@@ -34,7 +34,7 @@ before(async () => {
   window.electronAPI = { api: { tasks: { get: (...args) => ipcGet(...args) } } };
   const root = fileURLToPath(new URL('../../', import.meta.url));
   const result = await build({
-    stdin: { contents: `export * as cards from './src/client/task-card.js';`, resolveDir: root },
+    stdin: { contents: `export * as cards from './src/client/task-card.js'; export {default as state} from './src/client/state.js'; export {updateClaudeButtons} from './src/client/task-board.js';`, resolveDir: root },
     bundle: true, platform: 'node', format: 'esm', write: false, loader: { '.css': 'empty' },
     plugins: [{ name: 'terminal-double', setup(b) {
       b.onResolve({ filter: /^@xterm\/(xterm|addon-fit)$/ }, args => ({ path: args.path, namespace: 'terminal-double' }));
@@ -45,7 +45,7 @@ before(async () => {
   });
   const bundle = join(scratch, 'client.mjs');
   writeFileSync(bundle, result.outputFiles[0].contents);
-  ({ cards } = await import(pathToFileURL(bundle).href));
+  ({ cards, state, updateClaudeButtons } = await import(pathToFileURL(bundle).href));
   cards.registerCardCallbacks({ onOpenTerminal: (...args) => opened.push(args) });
 });
 
@@ -106,4 +106,33 @@ test('a snapshot for another task cannot replace the requested task read', async
   assert.equal(opened.length, 1);
   assert.equal(opened[0][1], 'Requested');
   assert.deepEqual(opened[0][4], { agent: 'codex' });
+});
+
+
+test('parent cards expose regular Start and open their own terminal with the pinned agent', async () => {
+  const parent = { id: 'P1', dbId: 1, title: 'Prepare objective', description: 'Full scope', status: 'pending',
+    category: 'CODING', isObjective: true, dependencies: [], tags: [], agentAssignee: 'codex', hasChildren: true };
+  state.currentUserId = 1;
+  opened.length = 0;
+  const html = cards.renderCard(parent);
+  assert.match(html, /card-start-btn btn-claude/);
+  assert.match(html, /btn-subtasks-show/);
+  assert.doesNotMatch(html, /btn-create-subtasks/);
+  document.body.innerHTML = '<div id="app">' + html + '</div>';
+  updateClaudeButtons();
+  assert.ok(document.querySelector('.card[data-id="P1"] .btn-claude'), 'session-button refresh retains parent Start');
+  assert.equal(cards.canStartTaskCard(parent), true);
+  await cards.startTaskById('P1', {}, parent);
+  assert.deepEqual(opened[0].slice(0, 4), ['P1', 'Prepare objective', 'Full scope', 'pending']);
+  assert.equal(opened[0][4].agent, 'codex');
+  assert.equal(cards.canStartTaskCard({ ...parent, assignee: 2 }), false);
+});
+
+test('unpinned parent uses the regular agent selection modal', async () => {
+  const selected = [];
+  state.availableAgents = ['claude', 'codex']; state.sessionAgent = null;
+  cards.registerCardCallbacks({ onOpenTerminal: (...args) => opened.push(args), onOpenAgentSelectorModal: (...args) => selected.push(args) });
+  await cards.startTaskById('P2', {}, { id: 'P2', title: 'Choose provider', status: 'pending', isObjective: true });
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0][0], 'P2');
 });

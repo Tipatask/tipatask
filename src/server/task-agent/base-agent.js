@@ -333,6 +333,44 @@ class BaseTaskAgent {
     ].join('\n');
   }
 
+  // ── Computer use (TPT9225) ──
+  // The run's desktop control: resolveComputerUse()'s answer (computer-use.js) for this adapter,
+  // or null when the adapter does not wire computer use. terminal-session.js asks once per spawn
+  // and threads the answer into getSpawnSpec() as opts.computerUse; the adapter applies it and
+  // hands buildPrompt() what it applied, so buildComputerUseDirective() speaks only of a server
+  // the run really has.
+  // eslint-disable-next-line no-unused-vars
+  async detectComputerUse(config) { return null; }
+
+  // Only a run whose opts.computerUse is available gets it: check UI changes in the running app,
+  // leave the live TipATask app alone (quitting it ends every agent session, this one included,
+  // and its windows hold live agent terminals), screenshots only while planning — the hook or gate
+  // enforces that; this says why. The Plan line goes to planning runs (Plan, or legacy without a
+  // policy). Compact wording is echoed by Pi: no question mark, sentinel or numbered option.
+  buildComputerUseDirective(opts = {}) {
+    const computerUse = opts.computerUse;
+    if (computerUse?.available !== true) return ['codex', 'pi'].includes(computerUse?.provider) && computerUse?.reason ? `Computer use unavailable: ${computerUse.reason}` : '';
+    const tools = computerUse.toolPrefix ? `the computer-use tools (\`${computerUse.toolPrefix}*\`)` : 'the computer-use tools';
+    const planning = !opts.permissionPolicy || opts.permissionPolicy.planning === true;
+    if (opts.compact) {
+      return [
+        'Computer use:',
+        `- Check UI changes in the running app with ${tools}: screenshots, clicks, typing. State what you checked in the resolution.`,
+        '- Never quit, restart or close the live TipATask app, kill its processes, or click or type in its windows: it runs this session. Check TipATask changes in a separate dev instance.',
+        planning ? '- Plan mode: screenshots only until the plan is approved.' : '',
+        '- If the tools are missing, say so and verify another way.',
+      ].filter(Boolean).join('\n');
+    }
+    return [
+      'Computer use:',
+      `- This run can see and control the desktop with ${tools}. Use them to check UI changes in the running app before you finish: start it, take screenshots, and click or type through the changed flow. State in the resolution what you checked, or why you could not.`,
+      '- Never quit, restart or close the live TipATask app and never kill its processes: it hosts this session and every other running agent session. Never click or type in its windows, whose terminals belong to running agents. To check a change to TipATask itself, run a separate development instance with its own port and user-data directory.',
+      planning ? '- While this run is in Plan mode the computer-use tools only look: take screenshots, and click, type or open apps after the plan is approved.' : '',
+      '- Ask for access only to the apps the check needs, and close what you opened when you are done. If the computer-use tools are missing in this session, say so in the resolution and verify another way.',
+      computerUse.backend === 'tipatask' ? '- This backend captures one approved app window. Supply its exact bundle identifier as app on screenshot, left_click and type; coordinates belong to that window image. Fresh tool connections require fresh consent.' : '',
+    ].filter(Boolean).join('\n');
+  }
+
   // A question batch precedes the plan and uses a separate sentinel: plan readiness is
   // latched once per session, and planReady outranks attention in a shared output tail.
   // Keep the directive safe when echoed into agent output: no bare sentinel line,
@@ -400,6 +438,34 @@ class BaseTaskAgent {
     ].join('\n');
   }
 
+  // Preparation and child continuation share the normal task permission and tool profiles.
+  buildParentPreparationDirective(opts = {}) {
+    if (!(opts.parentPreparation ?? opts.task?.isObjective)) return '';
+    const call = opts.nextCall || '`start_next_tasks(task_key)`';
+    if (opts.compact) return [
+      'Parent objective preparation:',
+      '- Research full task/comments, KB, source, existing tasks and dependencies. Preserve every requirement, literal URL/image/copy block; avoid duplicates and guessed paths.',
+      '- Follow selected permissions: Plan waits for approval before task writes, code or starts; Auto/Bypass proceed with normal tool gates.',
+      '- Persist an expanded parent description, or concrete linked children via create_task(parent_key: this parent key). Without that tool/field, use the credential-safe task CLI POST /tasks with numeric parent_id. Refine only not-started children; leave in-progress and closed children unchanged. Keep original text; add concrete files/symbols, steps/checks, registered tags and dependency order. Save the whole breakdown first.',
+      `- With children, call ${call} with THIS parent key to start the first ready child; report handoff and end preparation. This handoff replaces this run's normal completion checklist: never complete the parent or launch processes yourself. Guarded child completions continue one at a time; failure/cancellation stops. Parent closes through the child-status cascade.`,
+      '- Without children, implement and verify this parent now, then guarded completion. Preparation alone is not completion. Never open New Objective chat or emit proposal JSON.',
+    ].join('\n');
+    return [
+      'Parent objective preparation:',
+      '- Research before implementation: read this task and its full comments, preserve every requirement, URL, image reference and verbatim copy line. Inspect relevant architecture, source, existing tasks and dependencies; use evidence instead of guessing file paths or behavior. Reuse existing work and avoid duplicate tasks.',
+      '- Respect this run\'s permission policy. In Plan mode, research and present the preparation/execution plan first; wait for approval before any task writes, implementation or child starts. Auto and Bypass proceed under their normal tool permissions without a separate planning pause.',
+      '- After any required approval, persist an expanded, self-contained description on this same parent, or create subtasks with create_task(parent_key: this parent task key), or refine its not-started children. Leave in-progress and closed children unchanged. If the connected API lacks parent_key, use the credential-safe task CLI with POST /tasks and parent_id set to the parent numeric dbId: ELECTRON_RUN_AS_NODE=1 "$TIPATASK_TOOL_EXEC" "$TIPATASK_TOOL_SCRIPT" POST /tasks with JSON on stdin. Never read or pass a token. Keep the original source material verbatim. Each child needs concrete files/symbols, implementation steps and verification, registered module/action/detail tags, and explicit dependencies. Split only when distinct work needs separate sessions; order overlapping source changes through dependencies. Save the entire breakdown before starting work.',
+      `- With children, do not implement or complete the parent. Call ${call} with THIS parent\'s key after all children are saved: Task App starts the first ready child immediately, then one child at a time after guarded completion. Report the handoff and end preparation; this handoff replaces this preparation run's normal completion checklist. Never launch agent processes yourself or mark children in progress yourself. The parent closes through the existing child-completion cascade only after its children close. A failed, blocked or canceled child stops the chain.`,
+      '- Without children, immediately implement and verify the expanded parent in this same session, then use normal guarded completion. Preparation alone is not completion. Never replace this flow with New Objective chat or proposal JSON.',
+    ].join('\n');
+  }
+
+  buildObjectiveContinuationDirective(opts = {}) {
+    if (!opts.objectiveChain || (opts.parentPreparation ?? opts.task?.isObjective)) return '';
+    const call = opts.nextCall || '`start_next_tasks(task_key)`';
+    return `Parent objective execution: implement only this child, honoring this run\'s selected permissions. Guarded completion starts at most one next ready child inside the same parent, with this run\'s agent, model and permissions. Never start siblings yourself or change the parent\'s status. Failure, cancellation or refused completion stops the chain. Retry ${call} with this child\'s key once only if cowboyNext.reason is unavailable; report cowboyNext in the final reply.`;
+  }
+
   // (TPT9163) Cowboy chain hand-off (ai/architecture/tt-task-agent.md § Cowboy Directive). Only a run
   // spawned with opts.cowboyChain (terminal-session.js: a bypass run whose task has cowboyMode on, or
   // one launchCowboyChain() started) whose policy is bypass gets it; every other run gets ''. Task App
@@ -409,6 +475,7 @@ class BaseTaskAgent {
   // agent reaches start_next_tasks (Pi passes its bridged tool or `tt next`). Compact wording is echoed
   // by Pi and must stay under 400 characters: no questions or status literals.
   buildCowboyDirective(opts = {}) {
+    if (opts.objectiveChain || (opts.parentPreparation ?? opts.task?.isObjective)) return '';
     if (opts.cowboyChain !== true || opts.permissionPolicy?.mode !== 'bypass') return '';
     const call = opts.nextCall || '`start_next_tasks(task_key)`';
     if (opts.compact) {
@@ -459,10 +526,11 @@ class BaseTaskAgent {
   // (Claude joins with blank lines inside one template, Codex/Pi splice array lines, and Pi
   // places the directives after its grep note where Codex places them before), so each
   // buildPrompt() keeps ownership of where the slots land.
-  //   directives — [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, cowboy]
+  //   directives — [vcs, tagDesc, processSafety, resourceLimits, computerUse, kbHygiene, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation]
   //                in that fixed order, empties dropped, so absent optional data (no opts.vcsSettings,
-  //                nothing blank in opts.tagDescriptions, no bypass opts.cowboyChain) emits no
-  //                directive and no stray separator. resourceLimits reads opts.agentLimits and is never empty.
+  //                nothing blank in opts.tagDescriptions, no available opts.computerUse, no bypass
+  //                opts.cowboyChain) emits no directive and no stray separator. resourceLimits reads
+  //                opts.agentLimits and is never empty.
   //   clarify    — deliberately NOT part of `directives`: it must sit directly beside the
   //                adapter's own plan-ready instruction (see buildClarifyDirective's ORDERING
   //                note). Execution policies use mode-specific communication instead;
@@ -482,21 +550,27 @@ class BaseTaskAgent {
     const tagDesc = this.buildTagDescriptionDirective(opts);
     const processSafety = this.buildProcessSafetyDirective(variant);
     const resourceLimits = this.buildResourceLimitsDirective(opts.agentLimits, variant);
+    const computerUse = this.buildComputerUseDirective({ ...opts, ...variant });
     const kbHygiene = this.buildKbHygieneDirective(completion);
     const taskStatus = this.buildTaskStatusDirective(variant);
     const followUps = this.buildFollowUpDirective(completion);
     const cowboy = this.buildCowboyDirective({ ...opts, ...variant });
+    const parentPreparation = this.buildParentPreparationDirective({ ...opts, ...variant });
+    const objectiveContinuation = this.buildObjectiveContinuationDirective({ ...opts, ...variant });
     const clarify = this.buildCommunicationDirective(opts);
     return {
       vcs,
       tagDesc,
       processSafety,
       resourceLimits,
+      computerUse,
       kbHygiene,
       taskStatus,
       followUps,
       cowboy,
-      directives: [vcs, tagDesc, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, cowboy].filter(Boolean),
+      parentPreparation,
+      objectiveContinuation,
+      directives: [vcs, tagDesc, processSafety, resourceLimits, computerUse, kbHygiene, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation].filter(Boolean),
       clarify,
     };
   }

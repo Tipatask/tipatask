@@ -2,7 +2,7 @@
 import state from './state.js';
 import { statusLabel, statusColor, statusRoleToken, isActiveName, isStartName, startName, isLockedTargetStatus, loadStatuses } from './status-registry.js';
 import { escapeAttr, showSaveToast, showToast, fetchWithRetry, projectHeader, showSavingIndicator, hideSavingIndicator, buildUsedIds, upsertTaskEntry } from './utils.js';
-import { collapseCard, renderAgentBadge, renderCard as renderBoardCard } from './task-card.js';
+import { collapseCard, renderAgentBadge, renderCard as renderBoardCard, dependencyKeysMarkup } from './task-card.js';
 import { api } from './api-client.js';
 import {
   getUnsavedAcceptedCountForMsg, getConfirmedTaskIds,
@@ -356,7 +356,7 @@ export function renderCardHtml(msg, msgIdx) {
     const typeClass = (c.type === 'new' && !isOriginTarget) ? 'new-task' : 'modified-task';
     const typeLabel = (c.type === 'new' && !isOriginTarget) ? 'NEW' : 'MODIFIED';
     const deps = t.dependencies && t.dependencies.length
-      ? `<span class="preview-deps">Deps: ${t.dependencies.join(', ')}</span>` : '';
+      ? `<span class="preview-deps">Deps: ${dependencyKeysMarkup(t.dependencies)}</span>` : ''; // (TPT9216) closed keys struck
 
     const minStep = computeMinStep(c, allCards, existingMap);
     const currentStep = t.priority ?? 0;

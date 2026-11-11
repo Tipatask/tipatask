@@ -122,7 +122,7 @@ test('codex: tool and dialog frames survive, and a failed answer turn stays answ
   const codex = loadInVm('providers/codex-session.js', {
     'node:child_process': { spawn() { const proc = fakeProc(97000 + spawned.length); spawned.push(proc); return proc; } },
     '../../codex-mcp-config': { buildScopedCodexMcpOverride: () => 'mcp_servers={}' },
-    '../codex-env': { buildCodexEnv: () => ({ env: {} }), codexEffortArgs: () => [], toCodexEffort: level => level },
+    '../codex-env': { buildCodexEnv: () => ({ env: {} }), codexEffortArgs: () => [], servedCodexModelOverride: () => ({ model: '', configModel: '' }), toCodexEffort: level => level },
     '../claude-session': { normalizeProposals: x => x },
     './transcript': { buildTurnPrompt: () => ({ prompt: 'seed', mode: 'fresh' }), buildNudgeMessage: () => 'nudge' },
     '../task-agent/attachments': { localizeAttachments: async ({ prompt }) => ({ prompt }) },

@@ -2,6 +2,7 @@
 // Run after npm run build: electron scripts/probe-dialog-focus.cjs
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs');
 const { app, BrowserWindow } = require('electron');
 const esbuild = require('esbuild');
 
@@ -25,7 +26,10 @@ async function main() {
   wc.debugger.attach('1.3');
   await wc.debugger.sendCommand('Accessibility.enable');
 
-  const run = (expression) => wc.executeJavaScript(expression);
+  const run = async (expression) => {
+    try { return await wc.executeJavaScript(expression); }
+    catch (error) { throw new Error(`${error.message}; console: ${errors.join(' | ')}`, { cause: error }); }
+  };
   const wait = async (expression) => {
     for (let i = 0; i < 100; i++) {
       if (await run(expression)) return;
@@ -162,7 +166,7 @@ async function main() {
 
   await run('window.probe.openReadOnly()');
   await wait('!!document.querySelector(".task-edit-panel")');
-  assert.equal(await run('document.querySelector(".task-edit-panel").getAttribute("aria-label")'), 'Деталі задачі TPT335');
+  assert.equal(await run('document.querySelector(".task-edit-panel").getAttribute("aria-label")'), 'Деталі завдання TPT335');
   assert.equal(await run('document.querySelector(".modal-title-input").getAttribute("aria-label")'), 'Назва');
   await key('Escape');
   await wait('document.querySelector("#task-edit-modal").hidden');
@@ -174,6 +178,99 @@ async function main() {
   await key('Enter');
   await wait('!document.querySelector(".agents-modal")');
   assert.equal(await run('document.activeElement.id'), 'settings-agents-edit', 'Agents Save returns focus');
+
+  // Run the production Electron renderer block and markup. Only the native IPC boundary
+  // is stubbed; chooser opening, keyboard handling and cleanup are the real handlers.
+  const template = fs.readFileSync(path.join(root, 'src/client/template.html'), 'utf8');
+  const projectMarkup = template.slice(template.indexOf('<div id="project-open-modal"'), template.indexOf('<script src="/bundle.js"'));
+  const projectScript = template.slice(template.indexOf('// ── Electron project management'), template.lastIndexOf('</script>'));
+  await run(`
+    document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(projectMarkup)});
+    window.TipTask = { dialogFocus: window.probe.dialogFocus, projectOpenFlow: window.probe.projectOpenFlow };
+    window.probe.openedProjects = [];
+    window.probe.pick = null;
+    window.electronAPI = {
+      getProjectPath: () => '/current',
+      pickAndOpenProject: async () => window.probe.pick,
+      focusProjectWindow: async () => ({ ok: false }),
+      openProject: (dir, target) => window.probe.openedProjects.push({ dir, target }),
+      onProjectChanged() {},
+      onProjectMenu: (callback) => { window.probe.projectMenu = callback; },
+    };
+    (function(state, t) { ${projectScript} })(window.probe.state, window.probe.t);
+    document.querySelector('#settings-modal').classList.remove('open');
+    document.querySelector('.card-edit-btn').click();
+  `);
+  await wait('!!document.querySelector(".task-edit-panel")');
+  await run('document.querySelector(".modal-title-input").focus()');
+  await run('window.probe.projectMenu("open")');
+  assert.equal(await run('document.activeElement.classList.contains("modal-title-input")'), true,
+    'cancelling native folder picker preserves task focus');
+  await run('window.probe.pick = { path: "/configured", config: {} }; window.probe.projectMenu("open")');
+  assert.deepEqual(await run('window.probe.openedProjects.pop()'), { dir: '/configured', target: 'new' },
+    'configured project follows production Open dispatch');
+
+  const openChooser = () => run('window.dispatchEvent(new CustomEvent("project-created", { detail: { projectPath: "/picked" } }))');
+  const click = async (selector) => {
+    const { x, y } = await run(`(() => {
+      const rect = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    })()`);
+    await wc.debugger.sendCommand('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+    await wc.debugger.sendCommand('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+  };
+  const assertTaskRestored = async () => {
+    await wait('document.querySelector("#project-open-modal").style.display === "none"');
+    assert.equal(await run('!!document.querySelector(".task-edit-panel") && !document.querySelector("#task-edit-modal").inert'), true,
+      'chooser close preserves interactive task modal');
+    assert.equal(await run('document.activeElement.classList.contains("modal-title-input")'), true,
+      'chooser close restores task focus');
+  };
+  await openChooser();
+  assert.equal(await run('document.activeElement.id'), 'btn-project-cancel');
+  assert.equal(await run('!document.querySelector("#project-open-modal").inert && document.querySelector("#task-edit-modal").inert'), true);
+  assert.equal(await run(`(() => {
+    const button = document.querySelector('#btn-project-new');
+    const rect = button.getBoundingClientRect();
+    return document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2) === button;
+  })()`), true, 'Open Project button wins actual Chromium hit testing over task modal');
+  ax = (await wc.debugger.sendCommand('Accessibility.getFullAXTree')).nodes;
+  assert.ok(ax.some(node => !node.ignored && node.role?.value === 'dialog' && node.name?.value === 'Open Project'),
+    'Open Project has a named dialog in the accessibility tree');
+  await key('Tab', true);
+  assert.equal(await run('document.activeElement.id'), 'btn-project-new', 'Tab wraps within Open Project');
+  await key('Tab');
+  assert.equal(await run('document.activeElement.id'), 'btn-project-cancel');
+  await click('#btn-project-cancel');
+  await assertTaskRestored();
+
+  // Repeated show events reuse one layer; one Escape removes it without closing Task Edit.
+  for (let i = 0; i < 3; i++) await openChooser();
+  assert.equal(await run('document.querySelectorAll("#project-open-modal").length'), 1);
+  await key('Escape');
+  await assertTaskRestored();
+  await openChooser();
+  await click('#btn-project-new');
+  assert.deepEqual(await run('window.probe.openedProjects.pop()'), { dir: '/picked', target: 'new' });
+  await assertTaskRestored();
+  await openChooser();
+  await key('Tab');
+  assert.equal(await run('document.activeElement.id'), 'btn-project-current');
+  await key('Enter');
+  assert.deepEqual(await run('window.probe.openedProjects.pop()'), { dir: '/picked', target: 'current' });
+  await assertTaskRestored();
+
+  await run('window.probe.state.activeSessions.add("running");');
+  await openChooser();
+  assert.equal(await run('document.querySelector("#btn-project-current").disabled'), true);
+  await key('Tab');
+  assert.equal(await run('document.activeElement.id'), 'btn-project-new', 'active session guard stays intact');
+  await key('Escape');
+  await assertTaskRestored();
+  await run('window.probe.state.activeSessions.clear()');
+  await key('Escape');
+  await wait('document.querySelector("#task-edit-modal").hidden');
+  assert.equal(await run('document.querySelector("#app").inert'), false, 'no blocking layer remains after all dialogs close');
 
   console.log('Dialog focus browser probe passed');
   if (process.argv.includes('--voiceover-smoke')) {

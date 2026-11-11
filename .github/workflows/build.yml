@@ -216,7 +216,7 @@ jobs:
       #
       # macOS signing is opt-in: the five secrets below are passed to the macOS leg only (empty on
       # Windows/Linux, which stay unsigned). With none set the build is ad-hoc signed, as in
-      # package.json (`build.mac.identity: "-"`). With all five, the CLI overrides pick the
+      # the beforePack hook's no-certificate fallback. With all five, the CLI overrides pick the
       # Developer ID cert from the temporary keychain by Team ID (a substring of its name; the
       # "Developer ID Application:" prefix must NOT be passed, electron-builder rejects it),
       # force signing to fail loudly if it is missing, and turn notarization on. Some but not

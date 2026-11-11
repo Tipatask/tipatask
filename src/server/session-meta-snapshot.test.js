@@ -245,3 +245,35 @@ test('HTTP inventory and queue WS frames preserve diagnostics and detail-only up
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
   }
 });
+
+// (TPT9239) A run the web app started is marked on its row, so a window that opens or reloads
+// mid-run lists it with its web globe; a run started in Task App carries no origin field at all.
+test('GET /api/sessions marks a web-started run with origin web and leaves local runs unmarked', async () => {
+  const sessions = new Map([
+    ['TPT1', fakeSession({ startOrigin: 'web' })],
+    ['TPT2', fakeSession({ tabId: 'TPT2', startOrigin: null })],
+    ['TPT3', fakeSession({ tabId: 'TPT3', alive: false, _starting: true, startOrigin: 'web' })],
+  ]);
+  const server = http.createServer(createHttpHandler(sessions, () => ({})));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const r = await getJson(server.address().port, '/api/sessions');
+    assert.deepEqual(r.json.sessions.sort(), ['TPT1', 'TPT2', 'TPT3']);
+    assert.equal(r.json.sessionMeta.TPT1.origin, 'web');
+    assert.equal(r.json.sessionMeta.TPT3.origin, 'web', 'a web run still starting is listed as one');
+    assert.equal('origin' in r.json.sessionMeta.TPT2, false);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+  const frames = [];
+  const ws = { OPEN: 1, readyState: 1, send: raw => frames.push(JSON.parse(raw)) };
+  const { createSession } = require('./session-state');
+  const web = Object.assign(createSession(ws, false, 'TPT4', scratch), { startOrigin: 'web' });
+  const local = createSession(ws, false, 'TPT5', scratch);
+  const { emitTerminalState } = require('./terminal-session');
+  emitTerminalState(web);
+  emitTerminalState(local);
+  assert.equal(frames[0].origin, 'web');
+  assert.equal('origin' in frames[1], false);
+});

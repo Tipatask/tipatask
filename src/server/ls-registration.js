@@ -21,19 +21,29 @@ const LSREGISTER_PATH = '/System/Library/Frameworks/CoreServices.framework/Frame
 function _run(exec, cmd, args, timeoutMs) {
   return new Promise((resolve) => {
     let settled = false;
-    const child = exec(cmd, args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+    let child;
+    let backstop;
+    const settle = (result) => {
       if (settled) return;
       settled = true;
-      resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: stdout || '', stderr: stderr || '' });
-    });
+      clearTimeout(backstop);
+      resolve(result);
+    };
+    try {
+      child = exec(cmd, args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+        settle({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: stdout || '', stderr: stderr || err?.message || '' });
+      });
+    } catch (err) {
+      settle({ code: 1, stdout: '', stderr: err.message || 'exec-failed' });
+    }
+    if (settled) return;
     // Belt-and-braces: execFile's own `timeout` option above should always fire first, but a
     // hung lsregister must never hang app startup. `-dump` is a large, slow call on a system
     // with many registered apps — give it more room than bundle-signature.js's codesign calls.
-    const backstop = setTimeout(() => {
+    backstop = setTimeout(() => {
       if (settled) return;
-      settled = true;
       try { child.kill(); } catch { /* best-effort */ }
-      resolve({ code: 1, stdout: '', stderr: 'timeout' });
+      settle({ code: 1, stdout: '', stderr: 'timeout' });
     }, timeoutMs + 5000);
     if (typeof backstop.unref === 'function') backstop.unref();
   });
@@ -43,16 +53,25 @@ function _run(exec, cmd, args, timeoutMs) {
 // record, `mount state:`/`path:`/`identifier:`/`version:` lines (when present) describe that
 // one claimant. Returns every claimant whose `identifier:` line matches `bundleId` exactly.
 function _parseClaimants(dumpText, bundleId) {
-  const claimants = [];
+  const claimants = new Map();
   let curPath = null;
   let curMountState = null;
   let curVersion = null;
+  let curId = null;
+  const flush = () => {
+    if (curId !== bundleId || !curPath) return;
+    const key = path.resolve(curPath);
+    const prior = claimants.get(key);
+    claimants.set(key, { path: curPath, version: curVersion, mounted: prior?.mounted || curMountState !== 'not mounted' });
+  };
   const lines = dumpText.split('\n');
   for (const line of lines) {
     if (/^-{10,}/.test(line)) {
+      flush();
       curPath = null;
       curMountState = null;
       curVersion = null;
+      curId = null;
       continue;
     }
     let m;
@@ -69,21 +88,23 @@ function _parseClaimants(dumpText, bundleId) {
       continue;
     }
     if ((m = /^identifier:\s+(.*)$/.exec(line))) {
-      const id = m[1].trim();
-      if (id === bundleId && curPath) {
-        claimants.push({ path: curPath, version: curVersion, mounted: curMountState !== 'not mounted' });
-      }
+      curId = m[1].trim();
     }
   }
-  return claimants;
+  flush();
+  return [...claimants.values()];
 }
 
-// Lists every LaunchServices-registered claimant of `bundleId`. Returns `[]` (never throws) on
-// any failure — a probe that can't run is "unknown", not "zero conflicts".
-async function listBundleClaimants(bundleId, { exec = execFile, lsregisterPath = LSREGISTER_PATH, timeoutMs = 15000 } = {}) {
-  const { code, stdout } = await _run(exec, lsregisterPath, ['-dump'], timeoutMs);
-  if (code !== 0 || !stdout) return [];
-  return _parseClaimants(stdout, bundleId);
+async function _readClaimants(bundleId, { exec = execFile, lsregisterPath = LSREGISTER_PATH, timeoutMs = 15000 } = {}) {
+  const { code, stdout, stderr } = await _run(exec, lsregisterPath, ['-dump'], timeoutMs);
+  if (code !== 0 || !stdout.trim()) return { checked: false, reason: stderr.trim() || 'empty-dump', claimants: [] };
+  return { checked: true, reason: null, claimants: _parseClaimants(stdout, bundleId) };
+}
+
+// Legacy array interface. Verification callers use inspectRegistration() to distinguish an
+// unavailable dump from an empty, successfully checked set of claimants.
+async function listBundleClaimants(bundleId, deps = {}) {
+  return (await _readClaimants(bundleId, deps)).claimants;
 }
 
 // Splits claimants into: `self` (the running app's own path), `liveConflicts` (other paths that
@@ -97,8 +118,14 @@ async function classifyClaimants({ claimants, runningPath, fs = fsp } = {}) {
   const staleRecords = [];
   const mountedInstallerVolumes = [];
   let self = null;
+  const canonical = async p => {
+    try { return await fs.realpath(p); } catch { return path.resolve(p); }
+  };
+  const runningRealPath = runningPath ? await canonical(runningPath) : null;
   for (const c of claimants || []) {
-    if (runningPath && path.resolve(c.path) === path.resolve(runningPath)) {
+    // LaunchServices canonicalizes /var and symlinked install locations. Never unregister
+    // the running app because its dump path uses a different spelling of the same bundle.
+    if (runningPath && await canonical(c.path) === runningRealPath) {
       self = c;
       continue;
     }
@@ -120,6 +147,52 @@ async function reregisterBundle(bundlePath, { exec = execFile, lsregisterPath = 
   return { ok: code === 0, reason: code === 0 ? null : (stderr.trim().split('\n').pop() || 'register-failed') };
 }
 
+// Read-only snapshot shared by Settings Repair, startup and the diagnostic probe.
+async function inspectRegistration({ bundlePath, bundleId, deps = {} } = {}) {
+  const { checked, reason, claimants } = await _readClaimants(bundleId, deps);
+  const { self, liveConflicts, staleRecords, mountedInstallerVolumes } = await classifyClaimants({ claimants, runningPath: bundlePath, fs: deps.fs });
+  const installerVolumes = mountedInstallerVolumes.map(c => c.path);
+  if (self && /^\/Volumes\//.test(bundlePath)) installerVolumes.unshift(bundlePath);
+  return {
+    checked, reason,
+    registered: checked ? Boolean(self) : null,
+    conflicts: checked ? liveConflicts.length : null,
+    staleCount: checked ? staleRecords.length : null,
+    conflictPaths: liveConflicts.map(c => c.path),
+    stalePaths: staleRecords.map(c => c.path),
+    installerVolumes,
+  };
+}
+
+// Explicit user repair only. Never deletes bundles, ejects volumes, rebuilds the whole
+// database or restarts the app. A successful command is insufficient: re-read and verify.
+async function repairRegistrationWithVerification({ bundlePath, bundleId, deps = {} } = {}) {
+  const result = (outcome, reason, registration) => ({
+    ok: outcome === 'verified', outcome, reason, registration,
+    relaunchNeeded: outcome === 'verified',
+  });
+  const before = await inspectRegistration({ bundlePath, bundleId, deps });
+  if (!before.checked) return result('verification-failed', before.reason, before);
+  if (before.installerVolumes.length) return result('blocked-installer', 'mounted-installer', before);
+
+  const { exec = execFile, lsregisterPath = LSREGISTER_PATH, timeoutMs = 15000 } = deps;
+  const errors = [];
+  for (const claimantPath of [...before.conflictPaths, ...before.stalePaths]) {
+    const { code, stderr } = await _run(exec, lsregisterPath, ['-u', claimantPath], timeoutMs);
+    if (code !== 0) errors.push(`${claimantPath}: ${stderr.trim() || 'unregister-failed'}`);
+  }
+  const repair = await reregisterBundle(bundlePath, deps);
+  if (!repair.ok) errors.push(repair.reason);
+  const after = await inspectRegistration({ bundlePath, bundleId, deps });
+  if (errors.length) return result('repair-error', errors.join('\n'), after);
+  if (!after.checked) return result('verification-failed', after.reason, after);
+  if (after.installerVolumes.length) return result('blocked-installer', 'mounted-installer', after);
+  if (!after.registered || after.conflicts || after.staleCount) {
+    return result('verification-failed', after.registered ? 'claims-remain' : 'bundle-not-registered', after);
+  }
+  return result('verified', null, after);
+}
+
 function _markerPath(markerDir, version) {
   return path.join(markerDir, `.ls-repair-${version}.json`);
 }
@@ -139,19 +212,15 @@ async function _recordRepairAttempt(markerDir, version, result, { fs = fsp } = {
 // re-register the running bundle so LaunchServices treats it as the freshest claimant. Never
 // blocks or fails notify:show — this is purely informational plus a best-effort nudge.
 async function ensureLaunchServicesHealthy({ bundlePath, bundleId, markerDir, version, deps = {} } = {}) {
-  const claimants = await listBundleClaimants(bundleId, deps);
-  const { self, liveConflicts, staleRecords, mountedInstallerVolumes } = await classifyClaimants({ claimants, runningPath: bundlePath, fs: deps.fs });
+  const registration = await inspectRegistration({ bundlePath, bundleId, deps });
   let repaired = false;
-  if (liveConflicts.length > 0 && !(await _repairAttemptedThisVersion(markerDir, version, deps))) {
+  if (registration.conflicts > 0 && !(await _repairAttemptedThisVersion(markerDir, version, deps))) {
     const result = await reregisterBundle(bundlePath, deps);
     await _recordRepairAttempt(markerDir, version, result, deps);
     repaired = result.ok;
   }
   return {
-    registered: Boolean(self),
-    conflicts: liveConflicts.length,
-    staleCount: staleRecords.length,
-    installerVolumes: mountedInstallerVolumes.map((c) => c.path),
+    ...registration,
     repaired,
     relaunchNeeded: repaired,
   };
@@ -162,5 +231,7 @@ module.exports = {
   listBundleClaimants,
   classifyClaimants,
   reregisterBundle,
+  inspectRegistration,
+  repairRegistrationWithVerification,
   ensureLaunchServicesHealthy,
 };

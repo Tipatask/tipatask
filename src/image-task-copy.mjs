@@ -1,4 +1,4 @@
-// Shared English/Ukrainian image-task copy. An ES module on purpose: src/client/i18n.js imports it
+// Shared English/Ukrainian/Simplified Chinese/Spanish image-task copy. An ES module on purpose: src/client/i18n.js imports it
 // natively on the unbundled banner page (main/desktop-notifications.html), and the server loads it
 // with require() (Node's require(esm)). Keep it free of imports and top-level await.
 export const en = {
@@ -47,7 +47,7 @@ export const uk = {
   'agentSelect.aspectRatio': 'Співвідношення сторін',
   'agentSelect.imageCount': 'Кількість зображень',
   'agentSelect.outputFolder': 'Папка результатів',
-  'agentSelect.imageHint': 'OpenRouter генерує зображення безпосередньо з опису задачі. Зображення зберігаються всередині цього проєкту. Типово: одне квадратне зображення в generated-images/.',
+  'agentSelect.imageHint': 'OpenRouter генерує зображення безпосередньо з опису завдання. Зображення зберігаються всередині цього проєкту. Типово: одне квадратне зображення в generated-images/.',
   'agentSelect.err.imageProvider': 'Генерація зображень наразі підтримує OpenRouter. Виберіть OpenRouter і введіть його API-ключ.',
   'agentSelect.err.imageAspectRatio': 'Виберіть підтримуване співвідношення сторін.',
   'agentSelect.err.imageCount': 'Введіть ціле число від 1 до 10. Модель має підтримувати запитану кількість.',
@@ -56,8 +56,8 @@ export const uk = {
   'imageTask.requesting': 'Генерація зображень через OpenRouter…',
   'imageTask.saving': 'Збереження згенерованих зображень…',
   'imageTask.uploading': 'Прикріплення попереднього перегляду…',
-  'imageTask.finalizing': 'Перевірка контролю версій і завершення задачі…',
-  'imageTask.done': 'Зображення збережено, задачу завершено.',
+  'imageTask.finalizing': 'Перевірка керування версіями і завершення завдання…',
+  'imageTask.done': 'Зображення збережено, завдання завершено.',
   'imageTask.saved': 'Збережено: {path}',
   'imageTask.retry': 'Згенерувати знову (платний запит)',
   'imageTask.resume': 'Повторити збереження / прикріплення / завершення',
@@ -66,24 +66,106 @@ export const uk = {
   'imageTask.error.payment': 'Недостатньо коштів OpenRouter. Поповніть баланс і повторіть спробу.',
   'imageTask.error.rate': 'Досягнуто ліміту запитів OpenRouter. Зачекайте й повторіть спробу вручну.',
   'imageTask.error.timeout': 'Час очікування зображення вичерпано. Автоматичної повторної спроби не буде. Перевірте активність OpenRouter перед новою платною генерацією.',
-  'imageTask.error.provider': 'OpenRouter не зміг згенерувати зображення. Перевірте ідентифікатор моделі, підтримувані пропорції й кількість та доступність провайдера, потім повторіть спробу.',
-  'imageTask.error.invalid': 'OpenRouter повернув відсутні, неповні або некоректні зображення. Задачу не завершено. Повторіть спробу вручну.',
+  'imageTask.error.provider': 'OpenRouter не зміг згенерувати зображення. Перевірте ідентифікатор моделі, підтримувані пропорції й кількість та доступність постачальника, потім повторіть спробу.',
+  'imageTask.error.invalid': 'OpenRouter повернув відсутні, неповні або некоректні зображення. Завдання не завершено. Повторіть спробу вручну.',
   'imageTask.error.save': 'Не вдалося зберегти зображення. Перевірте папку результатів, вільне місце й права доступу. Збережені результати доступні для відновлення.',
   'imageTask.error.upload': 'Зображення збережено локально, але завантаження перегляду не вдалося або перевищено ліміт вкладення. Повторіть прикріплення/завершення без нової генерації.',
   'imageTask.error.completion': 'Зображення збережено, але завершення заблоковано. Перевірте чинні налаштування VCS, обов’язкові коміти/злиття/PR, конфлікти Git і доступ до API. Усуньте причину й повторіть завершення.',
   'imageTask.error.canceled': 'Генерацію зображень скасовано. Уже збережені результати залишаються доступними.',
   'imageTask.error.interrupted': 'Попередній запит зображення перервано. Він не перезапуститься автоматично. Нова генерація вручну може спричинити повторну оплату.',
-  'imageTask.error.busy': 'Операція із зображеннями для цієї задачі вже виконується. Під’єднайтеся знову, щоб побачити перебіг.',
-  'imageTask.error.prompt': 'Перед запуском додайте промпт зображення до опису задачі.',
+  'imageTask.error.busy': 'Операція із зображеннями для цього завдання вже виконується. Під’єднайтеся знову, щоб побачити перебіг.',
+  'imageTask.error.prompt': 'Перед запуском додайте запит на зображення до опису завдання.',
   'imageTask.error.settings': 'Налаштування моделі зображень некоректні або недоступні. Відредагуйте модель у Налаштування → Агенти.',
   'imageTask.error.runtime': 'Не вдалося завантажити вбудований модуль зображень Pi. Перезберіть або перевстановіть TipATask і повторіть спробу.',
   'imageTask.error.textOnly': 'Ця модель генерує зображення. Для планування чи обговорення виберіть текстову модель.',
 };
-for (const table of [en, uk]) {
+export const zh = {
+  "agentSelect.purpose": "模型用途",
+  "agentSelect.purposeText": "文本",
+  "agentSelect.purposeImage": "图像生成",
+  "agentSelect.aspectRatio": "宽高比",
+  "agentSelect.imageCount": "图像数量",
+  "agentSelect.outputFolder": "输出文件夹",
+  "agentSelect.imageHint": "OpenRouter 直接根据任务描述生成图像。图像保存在此项目内。默认在 generated-images/ 中生成一张正方形图像。",
+  "agentSelect.err.imageProvider": "图像生成目前支持 OpenRouter。请选择 OpenRouter 并输入其 API 密钥。",
+  "agentSelect.err.imageAspectRatio": "请选择支持的宽高比。",
+  "agentSelect.err.imageCount": "请输入 1 到 10 之间的整数。模型必须支持所请求的数量。",
+  "agentSelect.err.imageFolder": "请使用此项目内的文件夹，不得使用绝对路径、访问父目录、.git 或 .tipatask。",
+  "imageTask.preparing": "正在准备生成图像…",
+  "imageTask.requesting": "正在通过 OpenRouter 生成图像…",
+  "imageTask.saving": "正在保存生成的图像…",
+  "imageTask.uploading": "正在附加图像预览…",
+  "imageTask.finalizing": "正在检查版本控制并完成任务…",
+  "imageTask.done": "图像已保存，任务已完成。",
+  "imageTask.saved": "已保存：{path}",
+  "imageTask.retry": "重新生成（付费请求）",
+  "imageTask.resume": "重试保存／附加／完成",
+  "imageTask.open": "下载图像",
+  "imageTask.error.auth": "OpenRouter 拒绝了 API 密钥。请在设置 → 智能体中更新此模型的 API 密钥，然后重试。",
+  "imageTask.error.payment": "OpenRouter 余额不足。请充值后重试。",
+  "imageTask.error.rate": "已达到 OpenRouter 请求频率限制。请稍候，然后手动重试。",
+  "imageTask.error.timeout": "图像请求超时。不会自动重试。请先检查 OpenRouter 活动记录，再发起新的付费生成。",
+  "imageTask.error.provider": "OpenRouter 无法生成图像。请检查模型 ID、支持的宽高比及数量和提供商可用性，然后重试。",
+  "imageTask.error.invalid": "OpenRouter 返回的图像缺失、不完整或无效。任务未标记为完成。请手动重试。",
+  "imageTask.error.save": "无法保存图像。请检查输出文件夹、磁盘可用空间和权限。已保存的结果仍可恢复。",
+  "imageTask.error.upload": "图像已保存在本地，但预览上传失败或超出附件大小限制。请重试附加／完成，无需重新生成。",
+  "imageTask.error.completion": "图像已保留，但任务完成被阻止。请检查当前 VCS 设置、必需的提交／合并／PR、Git 冲突和 API 访问。解决阻碍后重试完成。",
+  "imageTask.error.canceled": "图像生成已取消。已保存的结果会保留。",
+  "imageTask.error.interrupted": "上一次图像请求已中断。不会自动重启。手动重新生成可能再次收费。",
+  "imageTask.error.busy": "此任务的图像操作已在运行。请重新连接以查看进度。",
+  "imageTask.error.prompt": "请先在任务描述中添加图像提示词，再启动任务。",
+  "imageTask.error.settings": "图像模型设置无效或不可用。请在设置 → 智能体中编辑模型。",
+  "imageTask.error.runtime": "无法加载内置 Pi 图像运行时。请重新构建或安装 TipATask，然后重试。",
+  "imageTask.error.textOnly": "此模型用于生成图像。规划或讨论时请选择文本模型。",
+};
+
+export const es = {
+  "agentSelect.purpose": "Finalidad del modelo",
+  "agentSelect.purposeText": "Texto",
+  "agentSelect.purposeImage": "Generación de imágenes",
+  "agentSelect.aspectRatio": "Relación de aspecto",
+  "agentSelect.imageCount": "Número de imágenes",
+  "agentSelect.outputFolder": "Carpeta de salida",
+  "agentSelect.imageHint": "OpenRouter genera imágenes directamente a partir de la descripción de la tarea. Se guardan dentro de este proyecto. Por defecto: una imagen cuadrada en generated-images/.",
+  "agentSelect.err.imageProvider": "La generación de imágenes admite actualmente OpenRouter. Seleccione OpenRouter e introduzca su clave de API.",
+  "agentSelect.err.imageAspectRatio": "Elija una relación de aspecto compatible.",
+  "agentSelect.err.imageCount": "Introduzca un número entero del 1 al 10. El modelo debe admitir la cantidad solicitada.",
+  "agentSelect.err.imageFolder": "Use una carpeta dentro de este proyecto, sin rutas absolutas, referencias a directorios superiores, .git ni .tipatask.",
+  "imageTask.preparing": "Preparando la generación de imágenes…",
+  "imageTask.requesting": "Generando imágenes con OpenRouter…",
+  "imageTask.saving": "Guardando las imágenes generadas…",
+  "imageTask.uploading": "Adjuntando las vistas previas de las imágenes…",
+  "imageTask.finalizing": "Comprobando el control de versiones y completando la tarea…",
+  "imageTask.done": "Imágenes guardadas y tarea completada.",
+  "imageTask.saved": "Guardado: {path}",
+  "imageTask.retry": "Generar de nuevo (solicitud de pago)",
+  "imageTask.resume": "Reintentar guardar / adjuntar / finalizar",
+  "imageTask.open": "Descargar imagen",
+  "imageTask.error.auth": "OpenRouter rechazó la clave de API. Actualice la clave de este modelo en Configuración → Agentes y vuelva a intentarlo.",
+  "imageTask.error.payment": "El saldo de OpenRouter es insuficiente. Añada saldo y vuelva a intentarlo.",
+  "imageTask.error.rate": "Se alcanzó el límite de solicitudes de OpenRouter. Espere y vuelva a intentarlo manualmente.",
+  "imageTask.error.timeout": "La solicitud de imágenes agotó el tiempo de espera. No se reintentará automáticamente. Revise la actividad de OpenRouter antes de iniciar otra generación de pago.",
+  "imageTask.error.provider": "OpenRouter no pudo generar las imágenes. Compruebe el ID del modelo, la relación de aspecto y cantidad admitidas y la disponibilidad del proveedor; después, reinténtelo.",
+  "imageTask.error.invalid": "OpenRouter devolvió imágenes ausentes, incompletas o no válidas. No se registró la finalización. Reinténtelo manualmente.",
+  "imageTask.error.save": "No se pudieron guardar las imágenes. Compruebe la carpeta de salida, el espacio libre y los permisos. Los resultados guardados siguen disponibles para recuperarlos.",
+  "imageTask.error.upload": "Las imágenes están guardadas localmente, pero la carga de vistas previas falló o supera el límite de archivos adjuntos. Reintente adjuntar/finalizar sin volver a generar.",
+  "imageTask.error.completion": "Las imágenes se conservan, pero la finalización está bloqueada. Compruebe la configuración actual de VCS, los commits/fusiones/PR requeridos, los conflictos de Git y el acceso a la API. Resuelva el bloqueo y reintente finalizar.",
+  "imageTask.error.canceled": "Generación de imágenes cancelada. Se conservan los resultados ya guardados.",
+  "imageTask.error.interrupted": "La solicitud de imágenes anterior se interrumpió. No se reiniciará automáticamente. Una nueva generación manual puede generar otro cargo.",
+  "imageTask.error.busy": "Ya hay una operación de imágenes en curso para esta tarea. Reconéctese para ver el progreso.",
+  "imageTask.error.prompt": "Añada una instrucción para la imagen en la descripción de la tarea antes de iniciar.",
+  "imageTask.error.settings": "La configuración del modelo de imágenes no es válida o no está disponible. Edite el modelo en Configuración → Agentes.",
+  "imageTask.error.runtime": "No se pudo cargar el entorno de imágenes de Pi incluido. Vuelva a compilar o instalar TipATask e inténtelo de nuevo.",
+  "imageTask.error.textOnly": "Este modelo genera imágenes. Elija un modelo de texto para planificar o conversar.",
+};
+
+const LOCALES = { en, uk, zh, es };
+for (const table of Object.values(LOCALES)) {
   for (const reason of ['auth', 'settings', 'textOnly']) table[`terminal.error.ESTART.image_${reason}.pi`] = table[`imageTask.error.${reason}`];
 }
 export function imageTaskCopy(locale, key, params = {}) {
-  let value = (locale === 'uk' ? uk : en)[key] || en[key] || en['imageTask.error.provider'];
+  const table = typeof locale === 'string' && Object.hasOwn(LOCALES, locale) ? LOCALES[locale] : en;
+  let value = table[key] || en[key] || en['imageTask.error.provider'];
   for (const [name, replacement] of Object.entries(params)) value = value.split(`{${name}}`).join(String(replacement));
   return value;
 }

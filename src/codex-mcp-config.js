@@ -6,6 +6,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { createHash, randomUUID } = require('node:crypto');
 const toml = require('toml');
+const { SERVER_NAME: COMPUTER_USE_SERVER } = require('./server/computer-use');
 
 const TIPATASK_MCP_NAME = 'tipatask';
 // C1382 — the local-only companion server name. The remote 'tipatask' server (17
@@ -885,7 +886,7 @@ function buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath } = {}
   };
 }
 
-function writeCodexMcpConfig({ targetPath, projectRoot, mcpServerPath, nodePath, seedPath = null, browserTools = null, browserRuntime }) {
+function writeCodexMcpConfig({ targetPath, projectRoot, mcpServerPath, nodePath, seedPath = null, browserTools = null, browserRuntime, computerUse = null }) {
   const remote = buildCodexMcpSection({ projectRoot });
   const local = buildCodexLocalMcpSection({ projectRoot, mcpServerPath, nodePath });
   const existing = readOptional(targetPath);
@@ -922,6 +923,25 @@ function writeCodexMcpConfig({ targetPath, projectRoot, mcpServerPath, nodePath,
   // command/args/env block — no separate detect-and-strip step needed.
   out = upsertTomlSection(out, remote.sectionName, remote.sectionLines);
   out = upsertTomlSection(out, local.sectionName, local.sectionLines);
+  // This app-owned name must never retain an inherited command, env or tool fence.
+  // Use parsed table identities so quoted headers and nested tables are removed too.
+  const computerUseLines = computerUse?.available && computerUse.provider === 'codex' ? [
+    `[mcp_servers.${COMPUTER_USE_SERVER}]`,
+    `command = ${tomlString(computerUse.server.command)}`,
+    `args = ${tomlValue(computerUse.server.args)}`,
+    `env_vars = ${tomlValue(computerUse.server.env_vars || [])}`,
+    `tool_timeout_sec = ${computerUse.server.tool_timeout_sec || 150}`,
+    `default_tools_approval_mode = ${tomlString(CODEX_MCP_DEFAULT_TOOLS_APPROVAL_MODE)}`,
+  ] : [];
+  let replacedComputerUse = false;
+  for (const block of extractMcpServerTableBlocks(out)) {
+    if (block.serverName !== COMPUTER_USE_SERVER) continue;
+    out = out.replace(block.content, replacedComputerUse ? '' : computerUseLines.join('\n'));
+    replacedComputerUse = true;
+  }
+  if (!replacedComputerUse && computerUseLines.length) {
+    out = upsertTomlSection(out, `mcp_servers.${COMPUTER_USE_SERVER}`, [...computerUseLines, '']);
+  }
   out = removeTipataskTransportKeys(out);
   // TPT95 — after both tipatask upserts, before the approve-mode sweep, so any preset
   // section this call writes inherits it too. `browserTools: null` (the default, and
@@ -1136,7 +1156,7 @@ function ensureProjectAuthLink(paths) {
   return ensureCodexAuthLink(paths.globalAuthPath, paths.projectAuthPath);
 }
 
-function ensureProjectCodexHome({ projectRoot, mcpServerPath, nodePath, browserTools } = {}) {
+function ensureProjectCodexHome({ projectRoot, mcpServerPath, nodePath, browserTools, computerUse } = {}) {
   if (!projectRoot) throw new Error('projectRoot is required');
   const paths = getCodexPaths(projectRoot);
   // TPT95 — explicit `browserTools` overrides a disk read (needed since
@@ -1154,6 +1174,7 @@ function ensureProjectCodexHome({ projectRoot, mcpServerPath, nodePath, browserT
     nodePath,
     seedPath: paths.globalConfigPath,
     browserTools: resolvedBrowserTools,
+    computerUse,
   });
   updateGlobalCodexMcpApprovalConfig({
     targetPath: paths.globalConfigPath,
