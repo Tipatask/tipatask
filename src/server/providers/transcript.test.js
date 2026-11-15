@@ -38,12 +38,17 @@ for (const { id, includeSystemPrompt } of PROVIDERS) {
   for (const mode of ['fresh', 'resume', 'handoff', 'rebuild']) {
     test(`${id}: ${mode} includes the metadata priority baseline exactly once`, () => {
       const session = startedSession({
-        firstPrompt: '### list_task_id_meta\n```json\n{"priorityBaseline":42,"active":[]}\n```\n\nObjective',
+        firstPrompt: '### list_task_id_meta\n```json\n{"priorityBaseline":423,"active":[]}\n```\n\nFix broken agent file reads urgently',
         messages: mode === 'fresh' ? [msg('user', 'LATEST')] : conversation(3, 'LATEST'),
         _providerSwitchPending: mode === 'handoff',
       });
       const result = buildTurnPrompt(session, { includeSystemPrompt, hasProviderSession: mode === 'resume' });
-      assert.equal(count(result.prompt, 'Priority baseline (list_task_id_meta): 42.'), 1);
+      assert.equal(count(result.prompt, 'regularTaskPriorityBaseline: 423 '), 1);
+      assert.match(result.prompt, /urgent maintenance and fixes to agents, tools or workflow, use 423 or a later dependency-required sprint/);
+      assert.match(result.prompt, /priority > every scheduled dependency/);
+      assert.match(result.prompt, /Backlog \(priority 0\) requires explicit user Backlog intent or a qualifying optional/);
+      assert.match(result.prompt, /never an optional suggestion solely because it concerns agents/);
+      assert.match(result.prompt, /task\._stepPinned: true.*never for a model-chosen default/);
       if (mode !== 'fresh') assert.ok(result.prompt.endsWith('LATEST'));
       if (mode === 'resume') assert.ok(!result.prompt.includes('```json'), 'resume carries only the compact hint');
     });
@@ -57,7 +62,7 @@ test('legacy prefetched metadata derives baseline from active CODING rows, inclu
     { category: 'HUMAN', status: 'working', priority: 100 },
   ] };
   const session = startedSession({ firstPrompt: '### list_task_id_meta\n```json\n' + JSON.stringify(meta) + '\n```' });
-  assert.match(buildTurnPrompt(session, { hasProviderSession: true }).prompt, /Priority baseline \(list_task_id_meta\): 42\./);
+  assert.match(buildTurnPrompt(session, { hasProviderSession: true }).prompt, /regularTaskPriorityBaseline: 42 /);
 });
 
 test('malformed prefetched metadata does not break a provider turn or invent a baseline', () => {

@@ -27,8 +27,20 @@ test('bulk bar Apply, Reset and Design mode render in English and Ukrainian with
   assert.match(runDomRunner().stdout, /TPT9159_BULK_LOCALES_PASS/);
 });
 
-test('bulk Cowboy stages, applies, discards, checks Bypass and reports failed saves', () => {
+test('bulk Cowboy stages beside Bypass, applies, discards and reports failed saves', () => {
   assert.match(runDomRunner().stdout, /TPT9209_BULK_COWBOY_PASS/);
+});
+
+test('bulk Permission mode stays usable for any selection and Cowboy shows only beside a staged Bypass', () => {
+  assert.match(runDomRunner().stdout, /TPT9322_BULK_COWBOY_ON_BYPASS_PASS/);
+});
+
+test('bulk permission mode stages, clears overrides, drops Cowboy off Bypass and refreshes shields', () => {
+  assert.match(runDomRunner().stdout, /TPT9308_BULK_PERMISSION_MODE_PASS/);
+});
+
+test('bulk permission labels, options and hints render in en, uk, zh and es', () => {
+  assert.match(runDomRunner().stdout, /TPT9308_BULK_PERMISSION_MODE_LOCALES_PASS/);
 });
 
 test('bulk Cowboy labels and hints render in en, uk, zh and es', () => {
@@ -41,4 +53,12 @@ test('bulk Model select offers each agent\'s available models, resets on agent c
 
 test('bulk Model label and hint render in en, uk, zh and es', () => {
   assert.match(runDomRunner().stdout, /TPT9212_BULK_MODEL_LOCALES_PASS/);
+});
+
+test('bulk agent picker opens an Effort flyout beside Claude Code and Codex, by pointer and keyboard, and Apply saves agent plus effort', () => {
+  assert.match(runDomRunner().stdout, /TPT9323_BULK_AGENT_EFFORT_PASS/);
+});
+
+test('bulk Effort flyout caption, levels, trigger tag and agent hint render in en, uk, zh and es', () => {
+  assert.match(runDomRunner().stdout, /TPT9323_BULK_AGENT_EFFORT_LOCALES_PASS/);
 });

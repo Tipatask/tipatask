@@ -13,8 +13,10 @@
 //
 // (TPT701) Callers that feed the model text they do not control (release-notes generation
 // from commit messages and task comments) pass `toolless: true`, a neutral `cwd` and
-// `sanitizeEnv: stripSensitiveEnv`: no built-in tools, no MCP servers, no project CLAUDE.md or
-// settings, and no Tipatask credentials or Claude Code nesting markers in the child env. An
+// `sanitizeEnv: stripSensitiveEnv`: no MCP servers or Tipatask credentials/Claude Code
+// nesting markers in the child env. Claude also disables built-in tools; Codex retains
+// native read-only filesystem tools. A neutral cwd avoids project instructions there,
+// while Codex still uses its refreshed project CODEX_HOME for auth and configuration. An
 // explicit `selection` (provider + model) replaces the project default; `fallbackToClaude:
 // false` turns the Claude retry off for it.
 
@@ -168,8 +170,9 @@ function runCliOnce(spec, prompt, { timeoutMs, label, spawn = cpSpawn }) {
  * @param {boolean} [opts.parseJson=false] - parse the answer as JSON (null when it doesn't parse)
  * @param {{providerId: string, model?: string}} [opts.selection] - explicit provider + model
  *   instead of the project default (an unknown providerId falls back to the default)
- * @param {boolean} [opts.toolless=false] - no built-in tools / MCP servers (Claude: `--tools ''`
- *   + empty strict MCP config; Codex: `-c mcp_servers={}`; Gemini/Pi already run without)
+ * @param {boolean} [opts.toolless=false] - exclude MCP servers (Claude: `--tools ''` + empty
+ *   strict MCP config; Codex: disable each refreshed server and app/plugin discovery, keeping native
+ *   read-only filesystem tools; Gemini/Pi already run without MCP)
  * @param {string} [opts.cwd] - child working directory (default projectRoot); a neutral empty
  *   directory keeps the cwd project's CLAUDE.md, settings and hooks out of the run
  * @param {(env: object) => object} [opts.sanitizeEnv] - applied to the child env of every leg

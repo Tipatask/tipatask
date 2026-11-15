@@ -17,7 +17,12 @@ if (process.versions.electron) {
 // spawning Pi via projectEnvExtras() below. C1121-forward writers (project-creation-wizard
 // wizard-complete → main.js) write PI_MODELS instead (see sanitizePiModels/piDefaultEntry)
 // and no longer write these two flat keys at all.
-const CONFIG_FIELDS = ['TASK_BACKEND', 'API_BASE_URL', 'API_TOKEN', 'API_PROJECT_ID', 'OPENROUTER_API_KEY', 'PI_MODEL', 'projectName', 'CLAUDE_MODEL', 'CODEX_MODEL', 'language'];
+// (TPT9316) KB_MODE is the project's knowledge-base mode, written once by the creation wizard:
+// KB_MODE_COMPOSE ('compose') for "compose the knowledge base as you go" (wizard preset A —
+// no discovery starter tasks; each coding task documents what it touches). Absent = the
+// default preset-driven KB. Per project: config.js never seeds it into process.env.
+const KB_MODE_COMPOSE = 'compose';
+const CONFIG_FIELDS = ['TASK_BACKEND', 'API_BASE_URL', 'API_TOKEN', 'API_PROJECT_ID', 'OPENROUTER_API_KEY', 'PI_MODEL', 'projectName', 'CLAUDE_MODEL', 'CODEX_MODEL', 'language', 'KB_MODE'];
 const API_CREDENTIAL_FIELDS = ['API_BASE_URL', 'API_TOKEN', 'API_PROJECT_ID'];
 const CONFIG_REL = path.join('.tipatask', 'config.json');
 const PROJECT_JSON_REL = path.join('.tipatask', 'project.json');
@@ -1035,6 +1040,7 @@ module.exports = {
   migrateFromLegacy,
   CONFIG_FIELDS,
   API_CREDENTIAL_FIELDS,
+  KB_MODE_COMPOSE,
   migrateLegacyApiToken,
   readProjectMeta,
   writeProjectMeta,

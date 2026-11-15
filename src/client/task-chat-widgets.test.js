@@ -9,6 +9,7 @@ import { Window } from 'happy-dom';
 // pure model and the WS type tables are the real ones. Frames go in through the fake socket's
 // onmessage, clicks through the DOM, and what the window sends is read off the wsSend spy.
 const source = readFileSync(new URL('./task-chat.js', import.meta.url), 'utf8');
+const clipboardSource = readFileSync(new URL('./clipboard-write.js', import.meta.url), 'utf8');
 const model = await import('./task-chat-model.js');
 const { WS_SEND_TYPES, WS_RECV_TYPES } = await import('./ws-client.js');
 const { createLiveInserter, setValueKeepingCaret } = await import('./utils.js');
@@ -113,6 +114,10 @@ function harness(t, { topLayer = () => true, draftStorage = new Map(), projectPa
     });
   }
   vm.createContext(env);
+  // The real clipboard write (clipboard-write.js), run in this context: its defaults read this
+  // window's document and the test's `navigator` and `console` when a Copy button is pressed.
+  env.writeClipboardText = vm.runInContext(
+    `(() => {\n${clipboardSource.replace(/^export /gm, '')}\nreturn writeClipboardText;\n})()`, env);
   if (voice) {
     // Run the real inserter in this DOM's realm so its input events use the matching Event.
     env.createLiveInserter = vm.runInContext(`(${createLiveInserter.toString()})`, env);
@@ -1371,7 +1376,15 @@ function copyHarness(t) {
   h.env.navigator = { clipboard: { writeText: async (text) => { copies.push(text); } } };
   h.env.showToast = (message, type) => toasts.push({ message, type });
   h.env.setTimeout = (fn, ms) => timers.push({ fn, ms });
-  return Object.assign(h, { copies, toasts, timers });
+  // The clipboard write's own log lines (clipboard-write.js), kept out of the test output.
+  const logs = [];
+  const capture = (level, original) => (...args) => {
+    const line = args.map(String).join(' ');
+    if (line.startsWith('[clipboard]')) logs.push([level, line]);
+    else original(...args);
+  };
+  h.env.console = { ...console, warn: capture('warn', console.warn), error: capture('error', console.error) };
+  return Object.assign(h, { copies, toasts, timers, logs });
 }
 
 const settleCopy = () => new Promise(resolve => setImmediate(resolve));
@@ -1470,14 +1483,42 @@ test('(TPT9134) a message\'s Copy puts its markdown source on the clipboard: a r
   assert.equal(h.$$('.task-chat-msg--system .task-chat-msg-copy, .task-chat-msg--system .task-chat-copy').length, 0, 'a notice has no Copy');
 });
 
-test('(TPT9134) a refused clipboard shows the failure toast and leaves the label as it was', async (t) => {
+test('(TPT9296) a refused clipboard falls back to execCommand(\'copy\') beside the button and still says Copied', async (t) => {
+  const h = copyHarness(t);
+  h.start();
+  const whole = h.$('.task-chat-msg--assistant > .task-chat-msg-copy');
+  // Electron's answer when the session's permission handler denies 'clipboard-sanitized-write'.
+  h.env.navigator = { clipboard: { writeText: async () => {
+    throw Object.assign(new Error("Failed to execute 'writeText' on 'Clipboard': Write permission denied."), { name: 'NotAllowedError' });
+  } } };
+  const execs = [];
+  h.doc.execCommand = (command) => {
+    const el = h.doc.activeElement;
+    execs.push({ command, text: el.value.slice(el.selectionStart, el.selectionEnd), beside: el.parentNode === whole.parentNode });
+    return true;
+  };
+  click(whole);
+  await settleCopy();
+  assert.deepEqual(execs, [{ command: 'copy', text: 'Hello.', beside: true }], 'the exact text, from a buffer next to the button');
+  assert.equal(whole.title, 'taskChat.copy.copied');
+  assert.ok(whole.hasAttribute('data-copied'));
+  assert.deepEqual(h.toasts, [], 'no failure toast: the text was copied');
+  assert.equal(h.logs.length, 1);
+  assert.equal(h.logs[0][0], 'warn');
+  assert.match(h.logs[0][1], /NotAllowedError: Failed to execute 'writeText' on 'Clipboard': Write permission denied\./, 'the real reason is logged');
+  assert.equal(h.$$('.task-chat-msg textarea').length, 0, 'the buffer is removed again');
+});
+
+test('(TPT9134) a copy neither clipboard path can make shows the failure toast and leaves the label as it was', async (t) => {
   const h = copyHarness(t);
   h.start();
   const whole = h.$('.task-chat-msg--assistant > .task-chat-msg-copy');
   h.env.navigator = { clipboard: { writeText: async () => { throw new Error('Document is not focused.'); } } };
+  h.doc.execCommand = () => false;
   click(whole);
   await settleCopy();
-  // No Clipboard API at all (an insecure origin) fails the same way.
+  // No Clipboard API at all (an insecure origin) and no execCommand fail the same way.
+  delete h.doc.execCommand;
   h.env.navigator = {};
   click(whole);
   await settleCopy();
@@ -1486,6 +1527,7 @@ test('(TPT9134) a refused clipboard shows the failure toast and leaves the label
   assert.equal(whole.title, 'taskChat.copy.message');
   assert.equal(whole.hasAttribute('data-copied'), false);
   assert.equal(h.timers.filter(timer => timer.ms === 1500).length, 0);
+  assert.deepEqual(h.logs.map(([level]) => level), ['warn', 'error', 'warn', 'error'], 'each failed path is logged');
 });
 
 test('(TPT9134) a focused code-block Copy keeps its focus while the reply streams on', (t) => {

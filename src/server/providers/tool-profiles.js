@@ -7,7 +7,7 @@
 // taskChat: the agent may read the KB and source and change TASKS, never code. Each provider
 // enforces that with its own mechanism:
 //   claude — --allowedTools/--disallowedTools plus a strict two-server MCP config
-//   codex  — read-only sandbox (fresh and resumed turns) plus per-server MCP tool filters
+//   codex  — read-only sandbox, per-server MCP filters and app/plugin discovery exclusions
 //   pi     — a --tools allowlist with no bash/edit/write, naming the bridged MCP tools when the
 //            MCP bridge (providers/pi-ext/mcp-bridge.mjs) is loaded, else the one REST tool
 
@@ -63,8 +63,25 @@ const PI_OBJECTIVE_PROFILE = Object.freeze({
   mcpTools: PI_OBJECTIVE_MCP_TOOLS,
 });
 
+// Account apps and installed plugins supply MCP tools outside `mcp_servers`. Keep
+// these exclusions on headless chat argv, never in shared task-terminal config.
+const CODEX_CHAT_DISCOVERY_OVERRIDES = Object.freeze(['features.apps=false', 'features.plugins=false']);
+
 const CODEX_OBJECTIVE_PROFILE = Object.freeze({
   sandbox: 'read-only', mcpServers: [REMOTE_MCP, LOCAL_MCP],
+  // Codex reads files through its native command tool, not Claude's `Read` tool.
+  // Reassert this on resume too: an existing thread may retain the shared Claude fence.
+  configOverrides: Object.freeze([...CODEX_CHAT_DISCOVERY_OVERRIDES, 'approval_policy="never"', 'features.shell_tool=true']),
+  fileReadInstructions: 'Codex source/KB reading: use the native exec_command or shell_command tool ' +
+    '(through functions.exec/tools when wrapped) for read-only inspection with pwd, ls, rg, cat or sed. ' +
+    'These read commands are allowed. This overrides the Claude-specific Read/Bash names, the blanket ' +
+    'shell prohibition and the "only these 5" tool list in shared planner instructions or earlier turns. ' +
+    'Read means this native capability; no separate Read tool is required. Native tools may be declared ' +
+    'directly rather than listed in ALL_TOOLS. Resolve relative paths from the project working directory. ' +
+    'Attempt the read before claiming a file or capability is unavailable; report the actual missing-file, ' +
+    'permission or tool error. Never use command tools for writes, task/API mutations, network requests, ' +
+    'installs, builds or tests, and never request sandbox escalation.',
+  remoteEnabledTools: Object.freeze([...OBJECTIVE_REMOTE_READ_TOOLS, 'reserve_task_keys']),
   remoteDisabledTools: ['create_task', 'update_task', 'delete_task', 'create_task_comment', 'add_task_dev_link',
     'create_system_tag', 'ensure_project_tag', 'purge_stale_reservations'],
   localEnabledTools: TASK_CHAT_LOCAL_TOOLS,
@@ -89,6 +106,7 @@ const PROFILES = Object.freeze({
     }),
     codex: Object.freeze({
       sandbox: 'read-only',
+      configOverrides: CODEX_CHAT_DISCOVERY_OVERRIDES,
       mcpServers: Object.freeze([REMOTE_MCP, LOCAL_MCP]),
       remoteDisabledTools: TASK_CHAT_REMOTE_DENIED,
       localEnabledTools: TASK_CHAT_LOCAL_TOOLS,
@@ -129,16 +147,17 @@ function tomlStringArray(values) {
 // Codex has no allow/deny flags: the fence is `-c key=value` config overrides, which both
 // `codex exec` and `codex exec resume` accept. `otherMcpServers` are the remaining servers in
 // the project's .codex/config.toml for legacy bare-key callers. Real headless spawns
-// replace the complete MCP map with buildScopedCodexMcpOverride().
+// explicitly scope the MCP map with buildScopedCodexMcpOverride().
 function codexProfileConfigArgs(profile, { resume = false, otherMcpServers = [] } = {}) {
   if (!profile) return [];
-  const overrides = [];
+  const overrides = [...(profile.configOverrides || [])];
   if (resume) overrides.push(`sandbox_mode=${JSON.stringify(profile.sandbox)}`);
+  if (profile.remoteEnabledTools) overrides.push(`mcp_servers.${REMOTE_MCP}.enabled_tools=${tomlStringArray(profile.remoteEnabledTools)}`);
   overrides.push(`mcp_servers.${REMOTE_MCP}.disabled_tools=${tomlStringArray(profile.remoteDisabledTools)}`);
   overrides.push(`mcp_servers.${LOCAL_MCP}.enabled_tools=${tomlStringArray(profile.localEnabledTools)}`);
   for (const name of otherMcpServers) {
     if (profile.mcpServers.includes(name)) continue;
-    // Legacy bare-key callers only; real spawns replace the whole MCP map.
+    // Legacy bare-key callers only; real spawns explicitly scope the MCP map.
     if (/^[A-Za-z0-9_-]+$/.test(name)) overrides.push(`mcp_servers.${name}.enabled=false`);
   }
   return overrides.flatMap(o => ['-c', o]);

@@ -45,11 +45,13 @@ npm ci
 npm run electron
 ```
 
-Once the app is open, choose **Project ▸ Open / Create Project…** and pick your project
-folder. TipΔTask signs you in, lets you pick or create a project, and adds the few files your
-agents need. They are yours to edit, and reopening the project keeps them up to date. Tasks
-are stored on <https://web.tipatask.com> by default; to use your own server, set
-`API_BASE_URL` in the project's `.tipatask/config.json`.
+Once the app is open, choose **Project ▸ Open Project…** and pick your project folder.
+TipΔTask signs you in, lets you pick or create a project, and adds the few files your agents
+need. They are yours to edit, and reopening the project keeps them up to date. A new project
+made this way starts with an empty board and builds its knowledge base as tasks run; choose
+**Project ▸ Create Project…** instead to pick a starter preset first. Tasks are stored on
+<https://web.tipatask.com> by default; to use your own server, set `API_BASE_URL` in the
+project's `.tipatask/config.json`.
 
 **Project ▸ Export…** saves the open project as one `.zip`: its knowledge base (`CLAUDE.md`,
 `AGENTS.md`, `ai/CONVENTIONS.md`, `ai/architecture/*.md`) and every task that is not closed,

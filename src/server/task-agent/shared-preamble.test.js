@@ -46,6 +46,7 @@ test('buildSharedPreamble: absent optional data emits no empty directive', () =>
     const p = agent.buildSharedPreamble({});
     assert.equal(p.vcs, '');
     assert.equal(p.tagDesc, '');
+    assert.equal(p.kbDiscovery, '');
     assert.equal(p.cowboy, '');
     assert.deepEqual(p.directives, [p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus, p.followUps]);
     assert.ok(p.directives.every(d => typeof d === 'string' && d.trim().length > 0));
@@ -63,6 +64,26 @@ test('buildSharedPreamble: fixed order vcs -> tagDesc -> processSafety -> resour
     assert.ok(p.vcs && p.tagDesc, 'both optional directives must render for this fixture');
     assert.deepEqual(p.directives, [p.vcs, p.tagDesc, p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus, p.followUps]);
   }
+});
+
+// (TPT9317) A compose project's CODING task (opts.kbMode + opts.task, threaded by terminal-session.js).
+test('buildSharedPreamble: a compose-mode CODING task adds the kbDiscovery slot right after kbHygiene', () => {
+  const compose = { kbMode: 'compose', task: { id: 'TPT1', category: 'CODING' } };
+  for (const agent of [bareAgent(), new ClaudeAgent(), new CodexAgent(), new PiAgent()]) {
+    const p = agent.buildSharedPreamble({ ...ALL_OPTS, ...compose });
+    assert.ok(p.kbDiscovery.startsWith('KB discovery:'), agent.id);
+    assert.deepEqual(p.directives, [p.vcs, p.tagDesc, p.processSafety, p.resourceLimits, p.kbHygiene, p.kbDiscovery, p.taskStatus, p.followUps]);
+    const variant = agent.getPreamblePolicy().compact ? { compact: true } : {};
+    assert.equal(p.kbDiscovery, agent.buildKbDiscoveryDirective({ ...ALL_OPTS, ...compose, ...variant }));
+    // A vcsContext gives it the guarded-completion deadline, like kbHygiene and followUps.
+    const guarded = agent.buildSharedPreamble({ ...compose, vcsContext: { verified: true } }).kbDiscovery;
+    assert.equal(guarded, agent.buildKbDiscoveryDirective({ ...compose, ...variant, guardedCompletion: true }));
+    // A HUMAN task or a project outside compose mode gets no slot.
+    assert.equal(agent.buildSharedPreamble({ ...ALL_OPTS, kbMode: 'compose', task: { id: 'H1', category: 'HUMAN' } }).kbDiscovery, '');
+    assert.equal(agent.buildSharedPreamble({ ...ALL_OPTS, task: compose.task }).kbDiscovery, '');
+  }
+  assert.ok(new PiAgent().buildSharedPreamble(compose).kbDiscovery.length
+    < new CodexAgent().buildSharedPreamble(compose).kbDiscovery.length, 'Pi gets the compact wording');
 });
 
 test('buildSharedPreamble: a bypass cowboy run adds the cowboy slot last, after followUps', () => {

@@ -18,6 +18,7 @@ import { openTaskEditModal } from './task-edit-modal.js';
 import { attachImagePaste } from './task-board.js';
 import { attachAudioRecorder } from './audio-recorder.js';
 import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu } from './embed-menu.js';
+import { writeClipboardText } from './clipboard-write.js';
 import {
   taskChatProviders, pickSelection, isSelectable, buildModelOptionsHtml, stripAskUserFence,
   visibleHistory, upsertById, shortToolName, hasWidgets, collapseTaskEvents,
@@ -76,6 +77,7 @@ let historySeq = 0;         // bumped per request; a slower reply to an older qu
 let historyTimer = null;
 let historyError = '';      // why the last resume was refused — shown on the gate until acted on
 let stickToBottom = true;
+let composerHidden = true;  // the composer was hidden at the last syncComposerShown() — see there
 let renderFrame = 0;
 let focusHandle = null;
 let keyHandler = null;
@@ -383,6 +385,7 @@ export function close() {
 
 function renderWindow() {
   const host = embedded ? embedded.host : null;
+  composerHidden = true; // the panel below starts out task-chat-panel--connecting
   root = document.createElement('div');
   root.className = host ? 'task-chat-embed' : 'task-chat-modal';
   if (!host) {
@@ -456,7 +459,10 @@ function renderWindow() {
   }
 
   const input = root.querySelector('.task-chat-input');
+  // The saved draft, at the height it was typed at. The composer is still hidden here, where a
+  // textarea measures zero: syncComposerShown() measures it again once the composer shows.
   input.value = readDraft(chat.draftKey);
+  growInput();
   root.querySelector('.task-chat-send').addEventListener('click', sendMessage);
   root.querySelector('.task-chat-stop').addEventListener('click', stopTurn);
   root.querySelector('.task-chat-jump').addEventListener('click', () => scrollToBottom(true));
@@ -520,7 +526,6 @@ function renderWindow() {
   applyChromeLabels();
   renderSelector();
   renderTranscript();
-  growInput();
   syncComposer();
 }
 
@@ -736,6 +741,7 @@ function syncStartGate() {
   const error = gate.querySelector('.task-chat-history-error');
   error.hidden = !historyError;
   error.textContent = historyError;
+  syncComposerShown();
 }
 
 // Providers were offered but none of them can run a chat. With no provider list at all the start
@@ -1141,12 +1147,14 @@ function copySnippetText(el) {
   return messageCopyText(messages.find(m => m.el === el));
 }
 
+// writeClipboardText() tries navigator.clipboard.writeText() first and, when that rejects (logged
+// with its real reason), a hidden textarea + document.execCommand('copy') placed beside the button.
+// The failure toast is only for a copy that neither path could make.
 async function copySnippet(btn) {
   const text = copySnippetText(btn.closest('pre') || btn.closest('.task-chat-msg'));
   if (!text) return;
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
+  const result = await writeClipboardText(text, { anchor: btn });
+  if (!result.ok) {
     showToast(t('taskChat.copy.failed'), 'error');
     return;
   }
@@ -1553,9 +1561,27 @@ function wireAttachments(input) {
   attachFileDrop(root.querySelector('.task-chat-panel'), input, { imageOpts, onFileUpload, activeClass: 'task-chat-panel--drop' });
 }
 
+// The input's height follows its text (the composer has no resize handle), up to 30% of the window.
 function growInput() {
   const input = root && root.querySelector('.task-chat-input');
   if (input) autoGrowTextarea(input, Math.round(window.innerHeight * 0.3));
+}
+
+// The composer is display: none while the first connect is still deciding between restore and the
+// start gate (task-chat-panel--connecting) and while the gate is up (task-chat-panel--gated), and a
+// hidden textarea measures zero height: the draft renderWindow() restored, or a file dropped on the
+// gate, would show one row tall. Once neither class hides it any more, growInput() measures it
+// again, and a transcript that was at its end stays there above the taller composer. Called by
+// syncComposer() and syncStartGate(), which toggle those classes.
+function syncComposerShown() {
+  const panel = root && root.querySelector('.task-chat-panel');
+  if (!panel) return;
+  const hidden = panel.classList.contains('task-chat-panel--connecting') || panel.classList.contains('task-chat-panel--gated');
+  const shown = composerHidden && !hidden;
+  composerHidden = hidden;
+  if (!shown) return;
+  growInput();
+  if (stickToBottom) scrollToBottom(false);
 }
 
 function setRunning(value) {
@@ -1594,6 +1620,7 @@ function syncComposer() {
   // Keep assistive tech from announcing every streamed re-render; the finished reply is read once.
   root.querySelector('.task-chat-messages').setAttribute('aria-busy', running ? 'true' : 'false');
   root.querySelector('.task-chat-panel').classList.toggle('task-chat-panel--running', running);
+  syncComposerShown();
 }
 
 function sendMessage() {

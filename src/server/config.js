@@ -112,6 +112,10 @@ const _CONFIG_ENV_SEED_SKIP = new Set([
   'AGENT_LIMITS_RSS_GROWTH_MB',
   'AGENT_LIMITS_RSS_PRESSURE_GROWTH_MB',
   'AGENT_LIMITS_RSS_SAMPLES',
+  // TPT9316 — the knowledge-base mode is per project (project-config.js KB_MODE_COMPOSE).
+  // Seeding the startup project's value would leak it into every other project's spawns;
+  // projectEnvExtras() hands each spawn its own project's value instead.
+  'KB_MODE',
   ...API_CREDENTIAL_FIELDS,
 ]);
 for (const [key, val] of Object.entries(_startupProjectCfg)) {

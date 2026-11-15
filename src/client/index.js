@@ -47,6 +47,7 @@ import * as agentQuota from './agent-quota.js'; // (TPT310) left-nav plan-usage 
 import * as mergeBranchesModal from './merge-branches-modal.js'; // (TPT345) Merge task branches panel; template.html reaches it via the Project menu
 import * as taskFetch from './task-fetch.js'; // (TPT672) template.html's Objective hand-off + parent-pane task reads
 import { handleProjectExportStatus } from './project-export.js';
+import * as firstProjectPrompt from './first-project-prompt.js'; // (TPT9319) a new project's first-open prompt
 
 notifications.requestPermission();
 // (TPT484) Shared alert registry: click/dismiss bridge plus main's surface decision for this window.
@@ -103,15 +104,28 @@ try {
 
 initApiConnection();
 
+// (TPT9319) A new project's first opening: once this window has loaded its board, offer New
+// Objective / Project Discussion / Dismiss. template.html fires 'tiptask:rendered' after every
+// successful full render; maybeShowFirstProjectPrompt() reads the project's one-time marker on
+// the first one only (per project and window) and is a no-op for every existing project.
+document.addEventListener('tiptask:rendered', () => {
+  firstProjectPrompt.maybeShowFirstProjectPrompt({
+    openObjective: () => window.TipTask.openNewObjectiveForm?.({ focus: true }),
+    openProjectChat: () => taskChat.openProjectChat(),
+  }).catch((err) => console.warn('[first-prompt] check failed', err));
+});
+
 window.addEventListener('create-project', async (e) => {
-  // (C1388, TPT160, TPT557) Sole dispatcher is the unified open flow itself (template.html's
-  // openOrCreateProject → decideOpenAction 'open-wizard' for an unconfigured folder), which
-  // always carries the already-picked folder in detail.projectPath. The fallback below is
-  // defensive only — no live caller omits detail.
+  // (C1388, TPT160, TPT557) Sole dispatcher is the open flow itself (template.html's
+  // openOrCreateProject(entry) → decideOpenAction 'open-wizard' for an unconfigured folder),
+  // which always carries the already-picked folder in detail.projectPath and the entry in
+  // detail.entry. The folder fallback below is defensive only — no live caller omits detail.
   // (TPT564) A window with no bound project must never land on the empty board: the wizard
   // opens locked (no Escape / ×) and every way out of it — Cancel, or a failed link/create
   // after Confirm already closed it — reopens Get Started through template.html's
   // 'show-get-started' listener. A window with a project keeps the dismissible wizard.
+  // (TPT9318) The Open Project entry runs the wizard without its Preset step: a new project
+  // is always created in compose-as-you-go mode. Create Project keeps the A/B/C choice.
   const unbound = !window.electronAPI?.getProjectPath?.();
   const showGetStarted = () => { if (unbound) window.dispatchEvent(new CustomEvent('show-get-started')); };
   const folder = e?.detail?.projectPath || await window.electronAPI?.selectFolder?.();
@@ -119,6 +133,7 @@ window.addEventListener('create-project', async (e) => {
   projectCreationWizard.open({
     projectPath: folder,
     locked: unbound,
+    presetLocked: projectOpenFlow.wizardPresetLocked(e?.detail?.entry),
     onCancel: unbound ? showGetStarted : undefined,
     onComplete: async (detail) => {
       if (detail?.apiProject && !detail.apiProject.isNew) {

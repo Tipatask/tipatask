@@ -25,6 +25,35 @@ stub('./codex-session.js', { spawnCodexTurn: (s, id) => {
 } });
 
 const { spawnTurn } = require('./dispatch');
+const { buildTurnPrompt } = require('./transcript');
+
+test('every provider receives the same priority policy and intact proposals after a handoff', async () => {
+  const changes = [
+    { type: 'new', task: { id: 'TPT3', title: 'Urgent agent maintenance', priority: 423, tags: ['tt-task-agent', 'bugfix'] } },
+    { type: 'new', task: { id: 'TPT4', title: 'Dependent maintenance', priority: 424, dependencies: ['TPT3'] } },
+    { type: 'new', task: { id: 'TPT5', title: 'Optional workflow suggestion', priority: 0, tags: ['tt-performance-suggestions'] } },
+    { type: 'new', task: { id: 'TPT6', title: 'Explicit Backlog request', priority: 0, _stepPinned: true } },
+  ];
+  const proposal = '```json\n' + JSON.stringify({ changes }) + '\n```';
+  for (const provider of ['claude', 'codex', 'gemini', 'pi']) {
+    calls.length = 0;
+    const session = {
+      type: 'objective', providerType: provider, _providerSwitchPending: true,
+      firstPrompt: '### list_task_id_meta\n```json\n{"priorityBaseline":423,"active":[]}\n```',
+      messages: [{ role: 'user', content: 'Fix urgent maintenance' }, { role: 'assistant', content: proposal },
+        { role: 'user', content: 'Keep these priorities' }],
+      backend: { getTasksUnfiltered: async () => [] },
+    };
+    await spawnTurn(session, 'id-priority');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], provider);
+    const { prompt, mode } = buildTurnPrompt(calls[0][1], { includeSystemPrompt: provider !== 'claude' });
+    assert.equal(mode, 'handoff');
+    assert.match(prompt, /regularTaskPriorityBaseline: 423 /);
+    assert.ok(prompt.includes(proposal), `${provider} must retain proposed priorities and explicit Backlog pin`);
+    assert.ok(prompt.endsWith('Keep these priorities'));
+  }
+});
 
 function route(session) {
   calls.length = 0;

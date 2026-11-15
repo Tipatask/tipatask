@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawnMcpClient } = require('./mcp-client');
 const { request } = require('./http');
+const { substitute, PLACEHOLDER_RE } = require('./placeholders');
 const { taskKeyFormatError } = require('../server/task-key-format');
 
 const GREEN = '\x1b[32m';
@@ -764,6 +765,36 @@ function applyPresetTemplate(preset, projectRoot, presetDescription) {
   }
 }
 
+// (TPT9316) The "compose the knowledge base as you go" preset has no preset template: no
+// CLAUDE.md overlay, no starter tasks. Its project gets the base harness guides
+// (refreshHarnessTemplates) and this base GENERAL.md — templates/ai/architecture/GENERAL.md.tpl
+// with every slot discover.js would fill from a scan marked as not documented yet, because
+// the tasks that touch each area document it. A GENERAL.md that already has content is kept.
+const BASE_GENERAL_PENDING = '_(not documented yet — the first task that works in this area fills it in)_';
+
+function applyBaseGeneralTemplate(projectRoot) {
+  const generalPath = path.join(projectRoot, 'ai', 'architecture', 'GENERAL.md');
+  try {
+    if (fs.readFileSync(generalPath, 'utf8').trim()) return { written: false, reason: 'exists' };
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  const tplPath = path.join(__dirname, '..', '..', 'templates', 'ai', 'architecture', 'GENERAL.md.tpl');
+  let tpl;
+  try {
+    tpl = fs.readFileSync(tplPath, 'utf8');
+  } catch {
+    console.log(`  ${YELLOW}Base GENERAL.md template not found: ${tplPath}${RESET}`);
+    return { written: false, reason: 'no-template' };
+  }
+  const ctx = {};
+  for (const [, key] of tpl.matchAll(PLACEHOLDER_RE)) ctx[key] = BASE_GENERAL_PENDING;
+  ctx.PROJECT_NAME = resolveProjectName(projectRoot);
+  fs.mkdirSync(path.dirname(generalPath), { recursive: true });
+  fs.writeFileSync(generalPath, substitute(tpl, ctx, { source: 'ai/architecture/GENERAL.md' }), 'utf8');
+  return { written: true };
+}
+
 async function seedPresetTasks(preset, { projectRoot, apiBaseUrl, token, projectId, presetDescription } = {}) {
   const defs = PRESET_TASKS[preset];
   if (!defs) return { seeded: 0, failed: 0 };
@@ -936,6 +967,8 @@ async function seedSyncTasks({ apiBaseUrl, token, projectId }) {
 module.exports = {
   runSeedSetupTasks, buildAgentInstructionTask, buildGeneralMdTask, buildAuditAiIdeConfigTask,
   seedPresetTasks, seedSyncTasks, applyPresetTemplate,
+  // TPT9316 — base GENERAL.md for the compose-as-you-go preset (project-seeder.js copyTemplates)
+  applyBaseGeneralTemplate, BASE_GENERAL_PENDING,
   // TPT200 — tag pre-registration before finalize, exported for src/cli/seed-setup-tasks.test.js
   SEED_TAG_DESCRIPTIONS, registerSeedTags, keepKnownTags,
   // TPT394 — reused by discover.js's discovery-task seeding

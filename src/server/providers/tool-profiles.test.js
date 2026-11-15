@@ -87,10 +87,22 @@ test('codex task chat: read-only sandbox on fresh and resumed turns, MCP narrowe
   }
 });
 
-test('codex objective argv denies task mutations and local completion', () => {
-  const fresh = buildCodexArgs({ type: 'objective', codexSessionId: null }, { cwd: '/p', model: 'm', imagePaths: [] });
-  assert.ok(configOverrides(fresh).some(o => o.includes('disabled_tools') && o.includes('update_task')));
-  assert.ok(configOverrides(fresh).includes('mcp_servers.tipatask-local.enabled_tools=["batch_grep_tags"]'));
+test('codex objective fresh/resumed turns enable native reads and allow only task reads plus key reservation', () => {
+  for (const codexSessionId of [null, 'tid']) {
+    const args = buildCodexArgs({ type: 'objective', codexSessionId }, { cwd: '/p', model: 'm', imagePaths: [] });
+    const overrides = configOverrides(args);
+    assert.ok(overrides.includes('features.shell_tool=true'));
+    assert.ok(overrides.includes('approval_policy="never"'));
+    assert.ok(overrides.some(o => o.includes('disabled_tools') && o.includes('update_task')));
+    assert.ok(overrides.includes('mcp_servers.tipatask-local.enabled_tools=["batch_grep_tags"]'));
+    const enabled = JSON.parse(overrides.find(o => o.startsWith('mcp_servers.tipatask.enabled_tools=')).split('=')[1]);
+    assert.ok(enabled.includes('get_task') && enabled.includes('reserve_task_keys'));
+    for (const forbidden of ['update_task', 'create_task', 'delete_task', 'create_task_comment', 'create_system_tag', 'ensure_project_tag', 'add_task_dev_link', 'purge_stale_reservations']) {
+      assert.ok(!enabled.includes(forbidden), forbidden);
+    }
+    if (codexSessionId) assert.ok(overrides.includes('sandbox_mode="read-only"'));
+    else assert.equal(flag(args, '-s'), 'read-only');
+  }
 });
 
 test('legacy dotted overrides only use bare server names; real spawns replace the entire map', () => {
@@ -99,6 +111,20 @@ test('legacy dotted overrides only use bare server names; real spawns replace th
   assert.ok(overrides.includes('mcp_servers.ok_name.enabled=false'));
   assert.equal(overrides.filter(o => o.endsWith('.enabled=false')).length, 1);
   assert.deepEqual(codexProfileConfigArgs(null), []);
+});
+
+test('Codex objective, task and project chats exclude account apps and plugins on fresh/resumed argv', () => {
+  const opts = { cwd: '/p', model: 'm', imagePaths: [] };
+  for (const session of [{ type: 'objective' }, chat(), chat({ taskKey: null })]) {
+    for (const codexSessionId of [null, 'existing-thread']) {
+      const args = buildCodexArgs({ ...session, codexSessionId }, opts);
+      const overrides = configOverrides(args);
+      assert.ok(overrides.includes('features.apps=false'));
+      assert.ok(overrides.includes('features.plugins=false'));
+      assert.ok(!overrides.includes('features.shell_tool=false'), 'native filesystem reads remain available');
+      assert.ok(overrides.includes('mcp_servers.tipatask-local.enabled_tools=["batch_grep_tags"]'));
+    }
+  }
 });
 
 test('pi task chat: no shell or file-writing tool, only the staged extension', () => {

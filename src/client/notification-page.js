@@ -135,13 +135,14 @@ function _reveal(cards) {
 
 // Renders `entries` (newest first, each with a stable `id`) into `host`, reusing card nodes by
 // id so an arrival never re-creates (flashes) a visible card. `act(id, action)` receives
-// 'click' | 'close' | 'clear-all' | 'hide' | 'show-more' | 'on-top-off'. `paged: false` shows
-// every entry (the stack scrolls) for the browser-mode local list; `header: false` hides the
-// count row. `headerAction` picks the header button: 'clear-all' (default) or 'hide' (the banner,
-// TPT505 — keeps every alert). `onTopToggle` adds the footer's checked "Show" box (banner only);
-// unchecking it acts 'on-top-off'.
+// 'click' | 'close' | 'clear-all' | 'hide' | 'show-more' | 'on-top-off' | 'on-top-on'.
+// `paged: false` shows every entry (the stack scrolls) for the browser-mode local list;
+// `header: false` hides the count row. `headerAction` picks the header button: 'clear-all'
+// (default) or 'hide' (the banner, TPT505 — keeps every alert). `onTopToggle` adds the footer's
+// "Show" box (banner only), checked per `onTop` (the saved setting); unchecking it acts
+// 'on-top-off', checking it 'on-top-on'.
 export function renderNotificationPage(host, entries, act,
-  { paged = true, header = true, headerAction = 'clear-all', onTopToggle = false } = {}) {
+  { paged = true, header = true, headerAction = 'clear-all', onTopToggle = false, onTop = true } = {}) {
   let page = host.querySelector(':scope > .tt-notif-page');
   if (!entries.length) { page?.remove(); return null; }
   const model = paged ? desktopPageModel(entries)
@@ -165,7 +166,7 @@ export function renderNotificationPage(host, entries, act,
     onTopInput.type = 'checkbox';
     const onTopText = document.createElement('span');
     onTop.append(onTopInput, onTopText);
-    onTopInput.addEventListener('change', () => { if (!onTopInput.checked) page._act(null, 'on-top-off'); });
+    onTopInput.addEventListener('change', () => page._act(null, onTopInput.checked ? 'on-top-on' : 'on-top-off'));
     const more = _button('tt-notif-page-more', () => page._act(null, 'show-more'));
     footer.append(onTop, more);
     page.append(head, cards, footer);
@@ -185,8 +186,8 @@ export function renderNotificationPage(host, entries, act,
   page._onTop.hidden = !onTopToggle;
   page._onTop.title = t('notifCenter.showOnTopTitle');
   page._onTopText.textContent = t('notifCenter.showOnTop');
-  // Shown only while "Show on Top" is on, so it always renders checked.
-  page._onTopInput.checked = true;
+  // The saved setting: off only while the banner stands in for blocked native notifications.
+  page._onTopInput.checked = !!onTop;
   page._more.textContent = t('notifCenter.showMore', { n: model.hidden });
   page._more.hidden = !model.hasMore;
   page._footer.hidden = !onTopToggle && !model.hasMore;

@@ -34,7 +34,10 @@ const en = {
   "projectAccess.unavailable": "Could not check project access. Check your connection and try again.",
   "projectAccess.signinFailed": "Sign-in did not finish successfully. Please try again.",
 
-  'menu.openOrCreateProject': 'Open / Create Project…',
+  // (TPT9318) Two entries since the Open / Create Project split: Open Project sets up an
+  // unconfigured folder in compose mode (no Preset step), Create Project offers A/B/C.
+  'menu.openProject': 'Open Project…',
+  'menu.createProject': 'Create Project…',
   'menu.recentProjects': 'Recent Projects',
   'menu.noRecentProjects': 'No Recent Projects',
   'menu.closeProject': 'Close Project',
@@ -111,7 +114,8 @@ const uk = {
   "projectAccess.unavailable": "Не вдалося перевірити доступ до проєкту. Перевірте з’єднання та спробуйте ще раз.",
   "projectAccess.signinFailed": "Не вдалося завершити вхід. Спробуйте ще раз.",
 
-  'menu.openOrCreateProject': 'Відкрити / Створити проєкт…',
+  'menu.openProject': 'Відкрити проєкт…',
+  'menu.createProject': 'Створити проєкт…',
   'menu.recentProjects': 'Останні проєкти',
   'menu.noRecentProjects': 'Немає останніх проєктів',
   'menu.closeProject': 'Закрити проєкт',

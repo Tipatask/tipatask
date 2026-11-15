@@ -1,5 +1,5 @@
 // (TPT9159) Staged edits of the board's bulk action bar. Picking a value in Move to, Status,
-// Agent (with its Model), Assignee or Cowboy scope only records it here; Apply turns the record
+// Agent (with its Model and Effort), Assignee, Permission mode or Cowboy scope only records it here; Apply turns the record
 // into one PATCH body per selected task. Pure, so node:test can drive it directly.
 //
 // Shape (every key optional, absent = no change):
@@ -10,19 +10,42 @@
 //                     Codex model id, or a Pi row id. Absent = the agent's resolved default
 //                     (resolveBulkAgentModel()). Never beside Human; dropped when another agent
 //                     is staged
+//   effort            (TPT9323) the agent picker's Effort flyout pick for the staged agent: an
+//                     EFFORT_LEVELS entry ('low' | 'medium' | 'high' | 'max'), or null for Agent
+//                     default, which clears each task's saved level (tasks.effort, the field the
+//                     Task Edit modal's Effort row saves). Absent = every task keeps its own
+//                     effort. Only beside 'claude' or 'codex' (BULK_EFFORT_AGENTS); dropped when
+//                     another agent, Human or none is staged
 //   claudeDesignMode  boolean, only beside agent 'claude'
 //   assignee          member user id; assigneeName is its display text for the picker input
-//   cowboyScope       'disabled' | 'related' | 'project'; never changes permission mode
+//   permissionMode    'plan' | 'auto' | 'bypass' | null (Project Default clears the override)
+//   cowboyScope       'disabled' | 'related' | 'project'; (TPT9322) only beside permissionMode
+//                     'bypass', so Apply always saves it together with Bypass
 
 import { normalizeCowboyScope, effectivePermissionMode } from './permission-mode.js';
+import { EFFORT_LEVELS } from './constants.js';
 
-export const BULK_CHANGE_FIELDS = Object.freeze(['priority', 'status', 'agent', 'assignee', 'cowboyScope']);
+export const BULK_CHANGE_FIELDS = Object.freeze(['priority', 'status', 'agent', 'assignee', 'permissionMode', 'cowboyScope']);
 
 // (TPT9212) The task field each agent's model is saved in. Human runs no model.
 export const BULK_MODEL_FIELDS = Object.freeze({ claude: 'claude_model', codex: 'codex_model', pi: 'pi_model' });
 
+// (TPT9323) The agents whose launch reads a task's effort: Claude (CLAUDE_CODE_EFFORT_LEVEL and
+// --effort) and Codex (model_reasoning_effort). Pi has no effort setting and Human runs no agent,
+// the same Claude/Codex gate as the Task Edit modal's Effort row.
+export const BULK_EFFORT_AGENTS = Object.freeze(['claude', 'codex']);
+
 function agentHasModels(agent) {
   return typeof agent === 'string' && Object.hasOwn(BULK_MODEL_FIELDS, agent);
+}
+
+export function agentHasEffort(agent) {
+  return BULK_EFFORT_AGENTS.includes(agent);
+}
+
+// An effort a PATCH may carry: a known level, or null (Agent default).
+function isEffortValue(effort) {
+  return effort === null || EFFORT_LEVELS.includes(effort);
 }
 
 // (TPT9212) The model Apply saves with a staged agent, or null when the agent has none to offer
@@ -58,15 +81,22 @@ export function stagedBulkFields(changes) {
 }
 
 // Returns a new record with `key` staged, or unstaged when `value` is undefined, null or ''.
+// Permission mode keeps null as an explicit Project Default pick; '' still unstages it.
+// (TPT9322) A Cowboy scope belongs to a staged Bypass, the way Design mode belongs to a staged
+// Claude: it stages only while permissionMode is 'bypass', and staging any other permission
+// mode (Plan, Auto, Project Default) or unstaging the mode drops it.
 export function stageBulkField(changes, key, value, extra = {}) {
   const next = { ...changes };
-  if (value === undefined || value === null || value === '') {
+  if (value === undefined || (value === null && key !== 'permissionMode') || value === '') {
     delete next[key];
     for (const extraKey of Object.keys(extra)) delete next[extraKey];
+  } else if (key === 'cowboyScope' && next.permissionMode !== 'bypass') {
+    return next;
   } else {
     next[key] = key === 'cowboyScope' ? normalizeCowboyScope(value) : value;
     Object.assign(next, extra);
   }
+  if (key === 'permissionMode' && next.permissionMode !== 'bypass') delete next.cowboyScope;
   return next;
 }
 
@@ -75,12 +105,15 @@ export function stageBulkField(changes, key, value, extra = {}) {
 // starts unchecked again. (TPT9212) A Model pick belongs to the agent it was made for the same
 // way: staging that agent again keeps it, any other agent (or none) drops it, so the new agent
 // starts on its own resolved default. `model` stages a pick together with the agent, for a
-// picker option that carries one (a Pi row).
+// picker option that carries one (a Pi row). (TPT9323) So does an Effort pick: picking the same
+// agent's row again keeps it, another agent, Human or none drops it, and every task then keeps
+// its own effort.
 export function stageBulkAgent(changes, agent, model = null) {
   const next = { ...changes };
   if (!agent) {
     delete next.agent;
     delete next.model;
+    delete next.effort;
     delete next.claudeDesignMode;
     return next;
   }
@@ -88,8 +121,29 @@ export function stageBulkAgent(changes, agent, model = null) {
   next.agent = agent;
   if (agentHasModels(agent) && model) next.model = model;
   else if (!sameAgent || !agentHasModels(agent)) delete next.model;
+  if (!sameAgent || !agentHasEffort(agent)) delete next.effort;
   if (agent === 'claude') next.claudeDesignMode = next.claudeDesignMode === true;
   else delete next.claudeDesignMode;
+  return next;
+}
+
+// (TPT9323) The Effort flyout's pick for the staged agent — stage the agent first
+// (stageBulkAgent()), so one flyout pick records both. A level stages that level; null stages
+// Agent default, which Apply saves as a cleared effort; '' or undefined removes the pick, so
+// every task keeps its own effort. Nothing stages without a staged Claude or Codex, and an
+// unknown level leaves the record as it was.
+export function stageBulkEffort(changes, effort) {
+  const next = { ...changes };
+  if (!agentHasEffort(next.agent)) {
+    delete next.effort;
+    return next;
+  }
+  if (effort === undefined || effort === '') {
+    delete next.effort;
+    return next;
+  }
+  const level = typeof effort === 'string' ? effort.trim().toLowerCase() : effort;
+  if (isEffortValue(level)) next.effort = level;
   return next;
 }
 
@@ -112,11 +166,15 @@ export function stageBulkDesignMode(changes, on) {
   return { ...changes, claudeDesignMode: !!on };
 }
 
-// Enabling Cowboy requires every selected task to start in Bypass, including inherited
-// defaults. Apply refuses the whole batch before writing; disabling needs no permission change.
+// Enabling Cowboy requires every selected task's effectivePermissionMode(), including the
+// project default it inherits, to be Bypass. A staged permissionMode replaces the saved
+// override (null clears it), so permissions and scope can be applied together. Apply runs it
+// before any write as a backstop: a record built with stageBulkField() always carries Bypass
+// beside a scope (TPT9322), which passes. Disabling needs no permission change.
 export function bulkCowboyBlockedTaskIds(changes, tasks, projectDefault) {
   if (changes?.cowboyScope === undefined || normalizeCowboyScope(changes.cowboyScope) === 'disabled') return [];
-  return tasks.filter(task => effectivePermissionMode(task, projectDefault).mode !== 'bypass').map(task => task.id);
+  return tasks.filter(task => effectivePermissionMode(changes.permissionMode !== undefined
+    ? { agentPermissionMode: changes.permissionMode } : task, projectDefault).mode !== 'bypass').map(task => task.id);
 }
 
 // One PATCH body for one selected task. `priority` is the resolved sprint number (0 = Backlog,
@@ -124,9 +182,10 @@ export function bulkCowboyBlockedTaskIds(changes, tasks, projectDefault) {
 // translate; the HTTP route rejects a literal priority 0). `model` is the model the staged agent
 // is saved with — Apply passes resolveBulkAgentModel()'s answer; left out, it is the record's
 // explicit pick. It goes in that agent's own field (BULK_MODEL_FIELDS); the other agents' model
-// fields are left as they are. `reassign` is false for a task whose agent is locked (in
-// progress, canceled): it gets every staged field except the agent, and the model and Design
-// mode ride only with the agent.
+// fields are left as they are. (TPT9323) A staged effort goes in `effort` (null = Agent
+// default), beside Claude or Codex only. `reassign` is false for a task whose agent is locked (in
+// progress, canceled): it gets every staged field except the agent, and the model, effort and
+// Design mode ride only with the agent.
 export function bulkPatchBody(changes, { priority, reassign = true, model = changes?.model } = {}) {
   const body = {};
   if (!changes) return body;
@@ -136,10 +195,12 @@ export function bulkPatchBody(changes, { priority, reassign = true, model = chan
   }
   if (changes.status) body.status = changes.status;
   if (changes.assignee !== undefined) body.assignee = changes.assignee;
+  if (changes.permissionMode !== undefined) body.agent_permission_mode = changes.permissionMode;
   if (changes.cowboyScope !== undefined) body.cowboy_mode = normalizeCowboyScope(changes.cowboyScope);
   if (changes.agent && reassign) {
     body.agent_assignee = changes.agent;
     if (agentHasModels(changes.agent) && model) body[BULK_MODEL_FIELDS[changes.agent]] = model;
+    if (agentHasEffort(changes.agent) && isEffortValue(changes.effort)) body.effort = changes.effort;
     if (changes.agent === 'claude') body.claude_design_mode = changes.claudeDesignMode === true;
   }
   return body;

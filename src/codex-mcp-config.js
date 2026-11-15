@@ -672,18 +672,24 @@ function tomlValue(value) {
   return JSON.stringify(value);
 }
 
-// Replace the complete MCP map for a headless turn. Codex -c dotted keys do not
+// Scope the MCP map for a headless turn. Codex merges inline tables with inherited
+// config, so omitted servers stay callable: explicitly disable every other entry.
+// An empty profile.mcpServers disables all servers for tool-less one-shot generation.
+// Codex -c dotted keys do not
 // parse TOML quotes, so quoting a server name there creates a different invalid
 // entry. A single inline table excludes every third-party entry without editing
 // the user's config (including names containing dots, spaces or quotes).
 function buildScopedCodexMcpOverride(projectRoot, profile) {
   const parsed = toml.parse(fs.readFileSync(path.join(projectRoot, '.codex/config.toml'), 'utf8'));
   const all = parsed.mcp_servers || {};
-  const selected = {};
+  const selected = Object.fromEntries(Object.keys(all).map(name => [name, { enabled: false }]));
   for (const name of profile.mcpServers) {
     if (!all[name]) continue;
     const entry = { ...all[name], enabled: true };
-    if (name === TIPATASK_MCP_NAME) entry.disabled_tools = profile.remoteDisabledTools;
+    if (name === TIPATASK_MCP_NAME) {
+      entry.disabled_tools = profile.remoteDisabledTools;
+      if (profile.remoteEnabledTools) entry.enabled_tools = profile.remoteEnabledTools;
+    }
     if (name === TIPATASK_MCP_LOCAL_NAME) entry.enabled_tools = profile.localEnabledTools;
     selected[name] = entry;
   }

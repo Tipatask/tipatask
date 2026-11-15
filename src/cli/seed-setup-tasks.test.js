@@ -52,6 +52,30 @@ test('PRESET_TASKS defines only the 2 wizard/CLI-shared keys', () => {
   );
 });
 
+// (TPT9316) The wizard's third preset, compose-as-you-go (letter A), deliberately has no
+// PRESET_TASKS entry: its project starts with an empty board. Even if a caller did hand it to
+// seedPresetTasks (main.js skips the call), nothing may be reserved, registered or written.
+test('seedPresetTasks seeds zero tasks for compose-as-you-go and sends no request', async (t) => {
+  const http = require('./http');
+  const calls = [];
+  t.mock.method(http, 'request', async (url, opts = {}) => {
+    calls.push(`${opts.method || 'GET'} ${url}`);
+    return { status: 500, data: 'unexpected request' };
+  });
+  delete require.cache[require.resolve('./seed-setup-tasks')];
+  const fresh = require('./seed-setup-tasks');
+  try {
+    assert.equal(fresh.PRESET_TASKS['compose-as-you-go'], undefined);
+    const result = await fresh.seedPresetTasks('compose-as-you-go', {
+      apiBaseUrl: 'http://example.invalid', token: 'test-token', projectId: 1,
+    });
+    assert.deepEqual(result, { seeded: 0, failed: 0 });
+  } finally {
+    delete require.cache[require.resolve('./seed-setup-tasks')];
+  }
+  assert.deepEqual(calls, []);
+});
+
 test('every preset in PRESET_TASKS has a template file on disk', () => {
   for (const letter of ['a', 'b']) {
     assert.ok(

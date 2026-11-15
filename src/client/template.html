@@ -148,9 +148,13 @@
           <div class="settings-notice" id="settings-remote-control-notice" role="status" hidden></div>
         </div>
       </section>
-      <!-- (C1058) Delivery status badge + Test/Enable button. Both notices ship hidden;
-           _populateSettingsNotificationsRows() shows #settings-notifications-hint when
-           delivery is blocked (with Repair for duplicate LaunchServices claimants, C1355) and
+      <!-- (C1058) Delivery status badge + Test/Enable button, then the Show on Top switch
+           (#settings-notifications-ontop): the app-level flag View ▸ Notifications and the
+           banner's "Show" box also write. Its row ships hidden and shows in Electron only —
+           browser mode has no always-on-top banner. The two notices follow both rows and ship
+           hidden too; _populateSettingsNotificationsRows() shows #settings-notifications-hint
+           when delivery is blocked, or when the banner stands in for system notifications the
+           OS cannot deliver (with Repair for duplicate LaunchServices claimants, C1355), and
            #settings-notifications-style-hint for the macOS Banner-vs-Alert advice (C1137). -->
       <section class="settings-section">
         <h3 class="settings-section-title" id="settings-notifications-title"></h3>
@@ -163,14 +167,23 @@
           <div class="settings-row-control">
             <button type="button" class="settings-row-btn" id="settings-notifications-test"></button>
           </div>
-          <div class="settings-notice" id="settings-notifications-hint" hidden>
-            <span id="settings-notifications-hint-text"></span>
-            <button type="button" class="settings-row-btn" id="settings-notifications-repair" hidden></button>
+        </div>
+        <div class="settings-row" id="settings-notifications-ontop-row" hidden>
+          <div class="settings-row-label">
+            <label for="settings-notifications-ontop" id="settings-notifications-ontop-label"></label>
+            <p class="settings-row-hint" id="settings-notifications-ontop-hint"></p>
           </div>
-          <div class="settings-notice settings-notice--info" id="settings-notifications-style-hint" hidden>
-            <span id="settings-notifications-style-text"></span>
-            <button type="button" class="settings-row-btn" id="settings-notifications-style-btn"></button>
+          <div class="settings-row-control">
+            <input type="checkbox" role="switch" id="settings-notifications-ontop" aria-describedby="settings-notifications-ontop-hint">
           </div>
+        </div>
+        <div class="settings-notice" id="settings-notifications-hint" hidden>
+          <span id="settings-notifications-hint-text"></span>
+          <button type="button" class="settings-row-btn" id="settings-notifications-repair" hidden></button>
+        </div>
+        <div class="settings-notice settings-notice--info" id="settings-notifications-style-hint" hidden>
+          <span id="settings-notifications-style-text"></span>
+          <button type="button" class="settings-row-btn" id="settings-notifications-style-btn"></button>
         </div>
       </section>
       <!-- (C1259) Click-to-render perf logging (src/client/perf-log.js). Off by default;
@@ -409,9 +422,10 @@
 
 <!-- (C1388) "Get Started" modal (first project — no folder bound yet), rendered by
      _showChooseModal(). (TPT557) It no longer doubles as the unconfigured-folder chooser:
-     an unconfigured folder opens the project wizard directly. The action button is still
-     built at show time so its label stays locale-live. (TPT564) No close control and no
-     backdrop handler; Escape dismisses it only in a window that already has a project. -->
+     an unconfigured folder opens the project wizard directly. (TPT9318) Its two action
+     buttons, Create Project… and Open Project…, are built at show time so their labels stay
+     locale-live. (TPT564) No close control and no backdrop handler; Escape dismisses it only
+     in a window that already has a project. -->
 <div id="project-choose-modal" style="display:none;position:fixed;inset:0;z-index:9999;align-items:center;justify-content:center;background:rgba(0,0,0,0.55)">
   <div style="background:var(--c-bg-card,#fbf9f3);border:1px solid var(--c-border,#e9e4d8);color:var(--c-text,#1a1a19);border-radius:10px;padding:32px 36px;min-width:320px;max-width:440px;box-shadow:0 8px 32px rgba(0,0,0,0.4);text-align:center">
     <div id="project-choose-title" style="font-size:15px;font-weight:700;margin-bottom:8px"></div>
@@ -667,6 +681,17 @@ function isTasksSectionTab(tab = state.activeTab) {
 function isNewSectionTab(tab = state.activeTab) {
   return tab === 'objective' || tab === 'new_task';
 }
+
+// (TPT9319) The Create section on its New Objective form. The empty board's Create Objective CTA
+// and a new project's first-open prompt (first-project-prompt.js, through index.js) share it;
+// `focus` puts the caret in the objective input once it has rendered (the prompt's choice).
+async function openNewObjectiveForm({ focus = false } = {}) {
+  state.activeTab = 'objective';
+  sessionStorage.setItem(ACTIVE_NEW_TAB_KEY, 'objective');
+  await loadAndRender({ scrollToTop: true });
+  if (focus && state.activeTab === 'objective') document.getElementById('chat-input')?.focus({ preventScroll: true });
+}
+window.TipTask.openNewObjectiveForm = openNewObjectiveForm;
 
 function setLeftNavCollapsed(collapsed) {
   // task-board owns the node-preserving state/icon/ARIA update and session-list refresh.
@@ -2778,11 +2803,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   }
   const emptyObjectiveBtn = app.querySelector('#empty-objective');
   if (emptyObjectiveBtn) {
-    emptyObjectiveBtn.addEventListener('click', () => {
-      state.activeTab = 'objective';
-      sessionStorage.setItem(ACTIVE_NEW_TAB_KEY, 'objective');
-      loadAndRender({ scrollToTop: true });
-    });
+    emptyObjectiveBtn.addEventListener('click', () => { void openNewObjectiveForm(); });
   }
 
   // ── Search input ──
@@ -4529,8 +4550,9 @@ if (window.electronAPI) {
     ensureOpenProjectDialogForeground();
   }
 
-  // (C1388) Renders the first-run "Get Started" state — one primary action running the
-  // unified openOrCreateProject() flow below. (TPT557) This modal used to double as the
+  // (C1388) Renders the first-run "Get Started" state. (TPT9318) Two actions, the same two
+  // entries as the Project menu: Create Project… (primary) and Open Project…, both running
+  // openOrCreateProject(entry) below. (TPT557) This modal used to double as the
   // unconfigured-folder "setup kind" chooser (Link-existing vs Create-new); that second
   // state is gone — an unconfigured folder now opens the project wizard directly, whose
   // Create Project step covers both outcomes. Rebuilt per call so the labels stay locale-live.
@@ -4557,7 +4579,8 @@ if (window.electronAPI) {
     };
     _chooseTitle.textContent = t('project.getStartedTitle');
     _chooseDesc.textContent = t('project.getStartedDesc');
-    addButton(t('project.getStartedAction'), true, () => openOrCreateProject());
+    addButton(t('project.getStartedCreate'), true, () => openOrCreateProject('create'));
+    addButton(t('project.getStartedOpen'), false, () => openOrCreateProject('open'));
     _chooseLocked = _isUnboundWindowSync();
     _chooseModal.style.display = 'flex';
   }
@@ -4565,22 +4588,25 @@ if (window.electronAPI) {
   // or its link/create fails in an unbound window.
   window.addEventListener('show-get-started', () => _showChooseModal());
 
-  // (C1388) Single entry point for "Open / Create Project" — used by BOTH the Project
-  // menu's 'open' action and the Get Started modal's one button. Folder first, then
-  // branch: already open elsewhere → focus it; configured → open it; unconfigured →
-  // (TPT557) open the project wizard straight away with the picked folder — its Create
-  // Project step is where the user creates a new API project or selects an existing one.
+  // (C1388) One implementation for both project entries (TPT9318): entry 'open' (Project ▸
+  // Open Project…, Get Started's Open Project…) and 'create' (Project ▸ Create Project…, Get
+  // Started's Create Project…). Folder first, then branch: already open elsewhere → focus it;
+  // configured → open it — the same for both entries; unconfigured → (TPT557) open the
+  // project wizard straight away with the picked folder — its Create Project step is where
+  // the user creates a new API project or selects an existing one. The entry rides along in
+  // the create-project event: Open locks the wizard's Preset step to compose-as-you-go,
+  // Create keeps the A/B/C choice (index.js).
   // (TPT564) In an unbound window every outcome but the wizard leaves this window blank —
   // picker cancelled, project already open elsewhere, or opened in a new window — so Get
   // Started comes back instead of the empty board.
-  async function openOrCreateProject() {
+  async function openOrCreateProject(entry) {
     const unbound = _isUnboundWindowSync();
-    const pick = await window.electronAPI.pickAndOpenProject();
+    const pick = await window.electronAPI.pickAndOpenProject(entry);
     const focusResult = pick && await window.electronAPI.focusProjectWindow(pick.path);
     if (focusResult?.canceled) { if (unbound) _showChooseModal(); return; }
     const alreadyOpen = !!focusResult?.ok;
-    const d = window.TipTask.projectOpenFlow.decideOpenAction({ pick, alreadyOpen });
-    if (d.action === 'open-wizard') { window.dispatchEvent(new CustomEvent('create-project', { detail: { projectPath: d.path } })); return; }
+    const d = window.TipTask.projectOpenFlow.decideOpenAction({ pick, alreadyOpen, entry });
+    if (d.action === 'open-wizard') { window.dispatchEvent(new CustomEvent('create-project', { detail: { projectPath: d.path, entry: d.entry } })); return; }
     if (d.action === 'open-new') window.electronAPI.openProject(d.path, 'new');
     if (unbound) _showChooseModal();
   }
@@ -4992,15 +5018,14 @@ if (window.electronAPI) {
   });
 
   // ── Create/Open chooser (replaces first-run onboarding) ──────────────────
-  // (C1388) Both Get Started's button clicks and the Project menu's 'open' action
-  // now share one implementation — see openOrCreateProject() / _showChooseModal()
-  // above. The old two-static-button wiring is gone with the markup that backed it.
+  // (C1388) Get Started's buttons and the Project menu's 'open' / 'create' actions share
+  // one implementation — see openOrCreateProject(entry) / _showChooseModal() above.
 
   window.electronAPI.onProjectMenu(async (action) => {
     if (action === 'choose') { _showChooseModal(); return; }
-    // (C1388 §B) Renamed from a bare "open a folder" action — this now IS the
-    // unified Open/Create entry point (menu label: "Open / Create Project…").
-    if (action === 'open') { await openOrCreateProject(); return; }
+    // (TPT9318) Project ▸ Open Project… sends 'open', Project ▸ Create Project… sends
+    // 'create' — the action string is the entry openOrCreateProject() takes.
+    if (action === 'open' || action === 'create') { await openOrCreateProject(action); return; }
     // (C1486) No 'close' branch here anymore — Cmd+W's menu item and the title-bar X both
     // call window.close() directly in main.js now, so both routes hit the shared
     // attachCloseGuard()/confirmWindowClose() native dialog. The prior C1485 renderer guard

@@ -62,9 +62,55 @@ test('open-project folder picker allows creating a new directory (createDirector
   assert.match(body, /properties:\s*\['openDirectory',\s*'createDirectory'\]/);
 });
 
-test('the Project menu\'s open action is labelled via menu-i18n\'s "Open / Create Project…" key, not a hardcoded English string', () => {
-  assert.match(mainSrc, /label:\s*mt\('menu\.openOrCreateProject'\)/, 'expected createMenu() to localize the renamed menu item via mt()');
-  assert.match(menuI18nSrc, /'menu\.openOrCreateProject':\s*'Open \/ Create Project…'/, "expected the en table to define the renamed label");
+// (TPT9318) Open Project… and Create Project… are two Project-menu items with their own
+// project:menu actions — the renderer's openOrCreateProject(entry) takes the action as its entry.
+test('the Project menu has separate Open Project… and Create Project… items, localized via mt(), sending distinct project:menu actions', () => {
+  const item = (key) => {
+    const at = mainSrc.indexOf(`label: mt('${key}')`);
+    assert.notEqual(at, -1, `expected createMenu() to localize ${key} via mt()`);
+    return mainSrc.slice(at, mainSrc.indexOf('\n        },', at));
+  };
+  const open = item('menu.openProject');
+  assert.match(open, /accelerator: 'CmdOrCtrl\+Shift\+O'/);
+  assert.match(open, /webContents\.send\('project:menu', 'open'\)/);
+  const create = item('menu.createProject');
+  assert.match(create, /accelerator: 'CmdOrCtrl\+Shift\+N'/);
+  assert.match(create, /webContents\.send\('project:menu', 'create'\)/);
+  assert.ok(mainSrc.indexOf("label: mt('menu.openProject')") < mainSrc.indexOf("label: mt('menu.createProject')"), 'Open Project… comes first');
+  assert.ok(mainSrc.indexOf("label: mt('menu.createProject')") < mainSrc.indexOf("label: mt('menu.recentProjects')"), 'both precede Recent Projects');
+  assert.doesNotMatch(mainSrc, /menu\.openOrCreateProject/, 'the combined Open / Create item is gone');
+  const { LOCALES } = require('../../main/menu-i18n');
+  assert.equal(LOCALES.en['menu.openProject'], 'Open Project…');
+  assert.equal(LOCALES.en['menu.createProject'], 'Create Project…');
+  for (const [locale, table] of Object.entries(LOCALES)) {
+    for (const key of ['menu.openProject', 'menu.createProject']) {
+      assert.ok(typeof table[key] === 'string' && table[key].endsWith('…'), `${locale} ${key} opens a dialog, so it ends with an ellipsis`);
+    }
+    assert.equal(table['menu.openOrCreateProject'], undefined, `${locale} drops the combined label`);
+  }
+  assert.notEqual(LOCALES.uk['menu.openProject'], LOCALES.en['menu.openProject']);
+  assert.notEqual(LOCALES.uk['menu.createProject'], LOCALES.en['menu.createProject']);
+  assert.doesNotMatch(menuI18nSrc, /menu\.openOrCreateProject/);
+});
+
+test("open-project titles its folder picker by entry: Create Project asks to select or create a folder", async () => {
+  const vm = require('node:vm');
+  const start = mainSrc.indexOf("  ipcMain.handle('open-project'");
+  const end = mainSrc.indexOf('\n  });', start) + '\n  });'.length;
+  assert.ok(start >= 0 && end > start);
+  let handler;
+  const titles = [];
+  vm.runInNewContext(mainSrc.slice(start, end), {
+    ipcMain: { handle: (_, fn) => { handler = fn; } },
+    BrowserWindow: { fromWebContents: () => ({}) },
+    dialog: { showOpenDialog: async (_w, opts) => { titles.push(opts.title); return { canceled: true, filePaths: [] }; } },
+    mt: (key) => `<${key}>`,
+  });
+  assert.equal(await handler({ sender: {} }, 'open'), null);
+  assert.equal(await handler({ sender: {} }, 'create'), null);
+  assert.equal(await handler({ sender: {} }), null);
+  assert.deepEqual(titles, ['<dialog.openProjectDirectory>', '<dialog.selectOrCreateProjectFolder>', '<dialog.openProjectDirectory>']);
+  assert.match(preloadSrc, /pickAndOpenProject: \(entry\) => inv\('open-project', entry\)/, 'preload forwards the entry');
 });
 
 test("the dead 'project:select-requested' channel is gone from BOTH preload.js and template.html (removing only one side throws inside template.html's linear electronAPI block — the other button/reauth wiring after it would silently stop running)", () => {

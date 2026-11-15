@@ -79,6 +79,11 @@ function onFocusin(event) {
   if (top() && !inside(top(), event.target)) focusFirst(top());
 }
 
+// Whether any dialog-focus layer is open right now — first-project-prompt.js never opens over one.
+export function hasOpenDialog() {
+  return layers.length > 0;
+}
+
 export function activateDialogFocus({ root, initialFocus, returnFocus, portals } = {}) {
   if (!root?.isConnected) throw new Error('Dialog root must be connected');
   const layer = { root, initialFocus, returnFocus: returnFocus || document.activeElement, portals };

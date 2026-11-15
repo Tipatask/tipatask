@@ -19,7 +19,10 @@ function createSession(ws, pending, tabId, projectPath) {
   const taskAgent = getTaskAgentInfo(resolveTaskAgentId(projectPath, null));
   return {
     tabId: tabId || null,
-    startedAt: Date.now(), // stable across reattachments; server clock, epoch milliseconds
+    // The run's start (server clock, epoch ms): stamped once here, as a restart is a new session,
+    // and kept through every reattach. Run identity for ?startedAt= reconnects; the left-nav rail
+    // orders terminal rows by it (TPT9324, from GET /api/sessions sessionMetaRow()).
+    startedAt: Date.now(),
     startOrigin: null,     // (TPT9239) WEB_ORIGIN for a web-app start; fixed for the session's life
     _webStateSent: null,   // (TPT9239) last remote-session-state broadcast for that run (ws-handlers.js)
     pty: null,

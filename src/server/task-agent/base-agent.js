@@ -2,7 +2,7 @@
 
 const { spawn } = require('node:child_process');
 const { killProcessGroup, AGENT_LIMIT_DEFAULTS } = require('../process-group');
-const { buildLanguageDirective } = require('../project-config');
+const { buildLanguageDirective, readProjectConfig, KB_MODE_COMPOSE } = require('../project-config');
 const { matchPromptLine, GENERIC_PROMPT_PATTERNS } = require('./prompt-detect');
 const { localizeAttachments } = require('./attachments');
 const { fetchStatusRoles, fetchStatusNames, LEGACY_STATUSES, LEGACY_ROLE_NAMES } = require('../status-roles');
@@ -438,6 +438,46 @@ class BaseTaskAgent {
     ].join('\n');
   }
 
+  // ── KB discovery in compose mode (TPT9317) ──
+  // A project created with the wizard's compose preset ("compose the knowledge base as you go")
+  // has KB_MODE 'compose' in its .tipatask/config.json and ran no discovery tasks, so its KB grows
+  // from the coding tasks themselves. Same resolve-once/sync-read split as the VCS pair above:
+  // terminal-session.js calls resolveKbMode() once per spawn with the session's project root and
+  // threads the answer into getSpawnSpec()'s opts as opts.kbMode; buildKbDiscoveryDirective() is
+  // the pure read. Per project by design (tt-project-config.md § KB_MODE): never process.env.
+  static resolveKbMode(projectRoot) {
+    if (typeof projectRoot !== 'string' || !projectRoot) return null;
+    return readProjectConfig(projectRoot)?.KB_MODE === KB_MODE_COMPOSE ? KB_MODE_COMPOSE : null;
+  }
+
+  // Only a CODING task of a compose project gets it (opts.task is the fetched task row); any other
+  // project, a HUMAN task or a run without a task row gets ''. The agent inspects the code the task
+  // touches, creates the missing tt-* tags, writes standing facts into the matching architecture
+  // doc and tags the task — in this task, never through a separate discovery task.
+  // opts.guardedCompletion names complete_task as the deadline (see buildFollowUpDirective).
+  // opts.tagStep is the compact variant's tag step (Pi passes its bridged tool or REST steps).
+  // Compact wording is echoed by Pi: no questions, status literals or MCP names of its own.
+  buildKbDiscoveryDirective(opts = {}) {
+    if (opts.kbMode !== KB_MODE_COMPOSE || opts.task?.category !== 'CODING') return '';
+    if (opts.compact) {
+      const tagStep = opts.tagStep || 'create its tt-* tag with a real description';
+      return [
+        'KB discovery:',
+        '- This project composes its KB as it goes: document what this task touches here, never in a separate discovery task.',
+        `- Inspect the code you read or change. For each touched module no tt-* tag covers, ${tagStep}. Put its standing facts in its ai/architecture/tt-*.md (stack, layout, commands: GENERAL.md) and add each touched module's tag to this task before completion.`,
+      ].join('\n');
+    }
+    const deadline = opts.guardedCompletion ? 'before `complete_task`' : 'before the final status update';
+    return [
+      'KB discovery:',
+      '- This project composes its knowledge base as it goes: it was created with no discovery tasks, so `ai/architecture/` documents only what earlier tasks touched. This task documents what it touches, in this session: never file a separate discovery or documentation task for it.',
+      '- Inspect the code this task touches — the files you read or change, the module each belongs to, and the endpoints, schema, config and behavior involved — and compare it with what `ai/architecture/GENERAL.md` and the matching `tt-*.md` docs already say. Planning only reads; the writes below come once implementation starts.',
+      '- For each touched module no `tt-*` tag covers — check `list_system_tags` first, since another task may have just added it — call `create_system_tag(tag_name, description, architecture_hint)` with a real one-line description and an `architecture_hint` naming the module\'s purpose, key files and endpoints, then follow the `next_step` it returns so the stub is on disk before you edit it.',
+      '- Write what you learned into the matching doc as standing facts: `ai/architecture/tt-*.md` for a module (responsibilities, files, endpoints, schema, invariants, gotchas), `ai/architecture/GENERAL.md` for stack, layout, env vars and commands. Replace each "not documented yet" placeholder your work now covers. KB hygiene above still applies.',
+      `- Tag this task ${deadline}: \`update_task\` with a final tag list carrying the \`tt-*\` tag of every module it touched.`,
+    ].join('\n');
+  }
+
   // Preparation and child continuation share the normal task permission and tool profiles.
   buildParentPreparationDirective(opts = {}) {
     if (!(opts.parentPreparation ?? opts.task?.isObjective)) return '';
@@ -526,11 +566,11 @@ class BaseTaskAgent {
   // (Claude joins with blank lines inside one template, Codex/Pi splice array lines, and Pi
   // places the directives after its grep note where Codex places them before), so each
   // buildPrompt() keeps ownership of where the slots land.
-  //   directives — [vcs, tagDesc, processSafety, resourceLimits, computerUse, kbHygiene, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation]
+  //   directives — [vcs, tagDesc, processSafety, resourceLimits, computerUse, kbHygiene, kbDiscovery, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation]
   //                in that fixed order, empties dropped, so absent optional data (no opts.vcsSettings,
-  //                nothing blank in opts.tagDescriptions, no available opts.computerUse, no bypass
-  //                opts.cowboyChain) emits no directive and no stray separator. resourceLimits reads
-  //                opts.agentLimits and is never empty.
+  //                nothing blank in opts.tagDescriptions, no available opts.computerUse, no compose
+  //                opts.kbMode for a CODING opts.task, no bypass opts.cowboyChain) emits no directive
+  //                and no stray separator. resourceLimits reads opts.agentLimits and is never empty.
   //   clarify    — deliberately NOT part of `directives`: it must sit directly beside the
   //                adapter's own plan-ready instruction (see buildClarifyDirective's ORDERING
   //                note). Execution policies use mode-specific communication instead;
@@ -540,8 +580,8 @@ class BaseTaskAgent {
   // subclass override (pi-agent.js's compact/REST wording) still applies.
   // Legacy SIMPLE_MODE and Claude's Design Mode return early in adapters. Explicit
   // policies retain the shared directives even in SIMPLE_MODE.
-  // kbHygiene and followUps get guardedCompletion only when opts.vcsContext is present (the
-  // Claude/Codex resolution mandate then finishes through complete_task); without it, args stay `variant`.
+  // kbHygiene, kbDiscovery and followUps get guardedCompletion only when opts.vcsContext is present
+  // (the Claude/Codex resolution mandate then finishes through complete_task); without it, args stay `variant`.
   buildSharedPreamble(opts = {}) {
     const policy = this.getPreamblePolicy();
     const variant = policy.compact ? { compact: true } : {};
@@ -552,6 +592,7 @@ class BaseTaskAgent {
     const resourceLimits = this.buildResourceLimitsDirective(opts.agentLimits, variant);
     const computerUse = this.buildComputerUseDirective({ ...opts, ...variant });
     const kbHygiene = this.buildKbHygieneDirective(completion);
+    const kbDiscovery = this.buildKbDiscoveryDirective({ ...opts, ...completion });
     const taskStatus = this.buildTaskStatusDirective(variant);
     const followUps = this.buildFollowUpDirective(completion);
     const cowboy = this.buildCowboyDirective({ ...opts, ...variant });
@@ -565,12 +606,13 @@ class BaseTaskAgent {
       resourceLimits,
       computerUse,
       kbHygiene,
+      kbDiscovery,
       taskStatus,
       followUps,
       cowboy,
       parentPreparation,
       objectiveContinuation,
-      directives: [vcs, tagDesc, processSafety, resourceLimits, computerUse, kbHygiene, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation].filter(Boolean),
+      directives: [vcs, tagDesc, processSafety, resourceLimits, computerUse, kbHygiene, kbDiscovery, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation].filter(Boolean),
       clarify,
     };
   }

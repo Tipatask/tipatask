@@ -2097,6 +2097,10 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   const agentLimits = scaleAgentLimitsForConcurrency(
     resolveAgentLimits(session.projectPath || config.PROJECT_ROOT), activeCount,
   );
+  // (TPT9317) The project's knowledge-base mode (KB_MODE in its own .tipatask/config.json): a
+  // compose project's CODING kickoffs carry the KB discovery directive
+  // (BaseTaskAgent#buildKbDiscoveryDirective()). null for every other project.
+  const kbMode = BaseTaskAgent.resolveKbMode(session.projectPath || config.PROJECT_ROOT);
   // (TPT9225) Desktop control for this run, from an adapter that wires it
   // (BaseTaskAgent#detectComputerUse(), computer-use.js). Optional: a failed probe starts the run
   // without it.
@@ -2118,7 +2122,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     });
     session._permissionGate.locale = sessionLocale(session);
   }
-  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode && !session.parentPreparation, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate, backend: opts.backend, cowboyChain: session.cowboyChain, objectiveChain: session.objectiveChain, parentPreparation: session.parentPreparation, computerUse });
+  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, kbMode, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode && !session.parentPreparation, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate, backend: opts.backend, cowboyChain: session.cowboyChain, objectiveChain: session.objectiveChain, parentPreparation: session.parentPreparation, computerUse });
   if (session.objectiveChain && !session.parentPreparation) {
     // Admission can queue a child for some time. Recheck its tree after all launch gates.
     const parent = await opts.backend.getTask(session.objectiveChain.rootTaskId);

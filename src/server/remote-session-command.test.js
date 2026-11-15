@@ -533,6 +533,39 @@ test('a Task App viewer of a web run sees the web origin; closing it and reopeni
   assert.equal(session.alive, true);
 });
 
+// (TPT9324) The left-nav rail orders runs by startedAt: one stamp per run, never moved by a reattach.
+test('a run keeps its startedAt through every reattach; a restart is a new run with a later one', async t => {
+  const h = harness(t);
+  const connect = async (query) => {
+    const viewer = new FakeViewer();
+    await handleConnection(viewer, viewerRequest(h.root, query), h.sessions, () => h.backend, () => {}, () => {}, () => h.backend);
+    return viewer;
+  };
+  const start = 'taskId=TPT1&prompt=Work%20on%20task%20TPT1';
+  const first = await connect(start);
+  const run = [...h.sessions.values()][0];
+  const { startedAt } = run;
+  assert.ok(Number.isFinite(startedAt) && startedAt > 0);
+  assert.equal(first.sent.find(f => f.type === 'terminal-state').startedAt, startedAt);
+  first.close();
+  for (const query of ['taskId=TPT1', `taskId=TPT1&startedAt=${startedAt}`]) {
+    const again = await connect(query);
+    assert.equal(again.sent.find(f => f.type === 'terminal-state').startedAt, startedAt, query);
+    assert.equal(run.startedAt, startedAt, query);
+    assert.equal(sessionMetaRow(run).startedAt, startedAt, query);
+    again.close();
+  }
+  assert.equal(h.spawns.length, 1, 'reattaching never starts a second run');
+  h.exit();
+  const tick = Date.now();
+  while (Date.now() === tick) { /* let the restart's stamp land in a later millisecond */ }
+  await connect(start);
+  const restart = [...h.sessions.values()][0];
+  assert.notEqual(restart, run, 'a restart is a new session');
+  assert.ok(restart.startedAt > startedAt, 'with its own, later start');
+  assert.equal(h.spawns.length, 2);
+});
+
 test('a run started in Task App carries no origin and sends no remote-session-state frame', async t => {
   const h = harness(t);
   const frames = captureBroadcasts(t, h.root);

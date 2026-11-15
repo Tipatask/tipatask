@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import { test } from 'node:test';
 import { Window } from 'happy-dom';
 import { registrationRepairMessage } from './notifications.js';
-import { setLocale, t } from './i18n.js';
+import { setLocale, t, tc } from './i18n.js';
 
 const source = readFileSync(new URL('./task-board.js', import.meta.url), 'utf8');
 const template = readFileSync(new URL('./template.html', import.meta.url), 'utf8');
@@ -25,7 +25,7 @@ for (const locale of ['en', 'uk', 'zh', 'es']) {
       let resolveRepair;
       const toasts = [];
       const context = vm.createContext({
-        document: window.document, window, t, registrationRepairMessage,
+        document: window.document, window, t, tc, registrationRepairMessage,
         getNotificationStatus: () => status,
         refreshNotificationStatus: async () => {},
         repairNotificationRegistration: () => new Promise(resolve => { resolveRepair = () => { status = { ...status, ...result.registration, registrationRepair: result }; resolve(result); }; }),

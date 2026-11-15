@@ -48,6 +48,7 @@ const fs = require('fs');
 const path = require('path');
 const { createDesktopNotifications } = require('./main/desktop-notifications');
 const notifyTarget = require('./main/notify-target');
+const notifyStatus = require('./main/notify-status');
 const { isTrustedTopFrame } = require('./main/ipc/external');
 const { loadWorkspace, saveWorkspace } = require('./src/server/workspace-state');
 // (C1430) Pure startup-restore precedence — no fs/electron, safe as top-level
@@ -62,6 +63,7 @@ const { writeProjectCodexConfig } = require('./src/codex-mcp-config');
 const { bindWindowToProject, getWindowState, dropWindow, reconfigureWindowBackend, setServerMessenger } = require('./main/window-state');
 const { shouldOpenExternally } = require('./main/external-links');
 const { installProjectRequestHeaders } = require('./main/project-request-headers');
+const { installRendererPermissions } = require('./main/renderer-permissions');
 const { registerExternalIpcHandlers } = require('./main/ipc/external');
 // (C1388) One-window-per-project registry — see window-registry.js header for why this is
 // a separate, electron-free module: it's the one piece of this invariant that's unit-testable.
@@ -77,6 +79,8 @@ const { EXPORT_MENU_ITEM_ID, focusedProjectWindow, createProjectExporter } = req
 // (TPT9169) Project ▸ Import… — open dialog, archive check, pending imports and the import
 // sequence; the project steps it runs are the closures passed in below (projectImporter).
 const { createProjectImporter } = require('./main/project-import');
+// (TPT9319) A new project's one-time first-open prompt marker (project.json) and its IPC.
+const { registerFirstOpenPromptIpc } = require('./main/first-open-prompt');
 // Startup OS permissions and ensureStartupAppManagementPermission() Settings guidance.
 // os-permissions.js has no electron import or module-scope I/O.
 const { requestStartupPermissions } = require('./main/os-permissions');
@@ -305,6 +309,9 @@ async function refreshBundleSignatureState({ force = false } = {}) {
     // thousands of sealed files) must not be worse than never having checked at all.
     _bundleSignatureState = { valid: null, reason: e.message || 'check-failed', relaunchNeeded: false };
   }
+  // "Show on Top" off: when macOS will not deliver native notifications for this bundle, sends
+  // go through the desktop banner instead. The controller re-reads the health refreshed above.
+  desktopNotifications?.refreshDelivery();
   return _bundleSignatureState;
 }
 
@@ -998,15 +1005,16 @@ function registerIpcHandlers() {
 
   // open-project — pick dir + read its .tipatask/config.json.
   // Returns null (cancelled), { path, needsSetup: true } (no config), or { path, config }.
-  ipcMain.handle('open-project', async (event) => {
+  // (TPT9318) `entry` is the menu entry that asked ('open' | 'create'); it only picks the
+  // picker title — what happens to the folder is decided by the renderer.
+  ipcMain.handle('open-project', async (event, entry) => {
     const w = BrowserWindow.fromWebContents(event.sender);
     const result = await dialog.showOpenDialog(w, {
-      // (C1388) createDirectory added — the unified Open/Create flow (B) picks a
-      // folder BEFORE knowing whether it'll be a fresh project, so the picker must
-      // support making a new one. Without this flag macOS hides NSOpenPanel's New
-      // Folder button entirely.
+      // (C1388) createDirectory added — both entries pick a folder BEFORE knowing
+      // whether it'll be a fresh project, so the picker must support making a new one.
+      // Without this flag macOS hides NSOpenPanel's New Folder button entirely.
       properties: ['openDirectory', 'createDirectory'],
-      title: mt('dialog.openProjectDirectory'),
+      title: mt(entry === 'create' ? 'dialog.selectOrCreateProjectFolder' : 'dialog.openProjectDirectory'),
     });
     if (result.canceled || !result.filePaths[0]) return null;
     const picked = result.filePaths[0];
@@ -1085,19 +1093,23 @@ function registerIpcHandlers() {
 
   // Desktop banners do not depend on native notification registration or permissions.
   // (TPT487) With "Show on Top" off, sends are native OS notifications again, so the Settings
-  // hints need the bundle-health signals that decide whether macOS shows them at all.
+  // hints need the bundle-health signals that decide whether macOS shows them at all. The
+  // delivery reported is the one a send uses right now: 'desktop' again, with `fallback`
+  // naming the reason, when native delivery is blocked and the banner stands in for it.
+  // `onTop` is the saved "Show on Top" choice itself, for the Settings switch. Off needs the
+  // bundle health first, and the choice is read again after that wait: it can be switched on
+  // meanwhile, and an answer must not report a choice that is already stale.
   ipcMain.handle('notify:status', async () => {
-    if (!desktopNotifications || desktopNotifications.isEnabled()) return { delivery: 'desktop', available: true };
-    await refreshBundleSignatureState();
-    return {
-      delivery: 'native',
-      available: Notification.isSupported(),
-      ...(_bundleSignatureState || { valid: null, reason: 'not-checked', relaunchNeeded: false }),
+    if (!desktopNotifications) return { delivery: 'desktop', available: true };
+    if (!desktopNotifications.isEnabled()) await refreshBundleSignatureState();
+    if (desktopNotifications.isEnabled()) return { delivery: 'desktop', available: true, onTop: true };
+    return notifyStatus.offStatus({
+      ...desktopNotifications.delivery(),
+      supported: () => Notification.isSupported(),
+      signature: _bundleSignatureState,
       registered: _ncRegistrationState,
-      conflicts: _lsRegistrationState?.conflicts ?? null,
-      installerVolumes: _lsRegistrationState?.installerVolumes ?? [],
-      registrationRepair: _lsRegistrationState?.repair ?? null,
-    };
+      registration: _lsRegistrationState,
+    });
   });
 
   // Settings Repair verifies its own fresh snapshot, bypassing the status TTL and startup
@@ -1139,10 +1151,17 @@ function registerIpcHandlers() {
 
   desktopNotifications = createDesktopNotifications({ BrowserWindow, screen, ipcMain, Notification,
     // (TPT480/TPT487) Persisted "Show on Top" choice — app-level, not per project. Controlled
-    // from View ▸ Notifications (createMenu()) and the banner's "Show" checkbox (onSetOnTop,
-    // TPT505). Off sends native OS notifications instead of the always-on-top stack.
+    // from View ▸ Notifications (createMenu()), the banner's "Show" checkbox (onSetOnTop,
+    // TPT505) and the Settings ▸ Notifications switch (notify:set-on-top). Off sends native OS
+    // notifications instead of the always-on-top stack.
     settingsFile: path.join(app.getPath('userData'), 'desktop-notifications.json'),
     onSetOnTop: (on) => applyNotificationsOnTop(on),
+    // Off, yet macOS would drop a native notification from this bundle (broken seal, no
+    // Notification Center registration): the controller keeps using the stack, so no alert is
+    // lost. A native send the OS fails at runtime leads to the same fallback on its own.
+    nativeBlocked: () => notifyStatus.nativeDeliveryBlocker({
+      signature: _bundleSignatureState, registered: _ncRegistrationState,
+    }),
     isTrustedProjectSender: (event) => isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` }),
     // (TPT484) One surface by app focus: the focused project window hosts the in-app panel;
     // with no project window focused, the always-on-top banner takes over.
@@ -1231,6 +1250,17 @@ function registerIpcHandlers() {
       return { shared: false, active: false, entries: [] };
     }
     return desktopNotifications.surfaceFor(BrowserWindow.fromWebContents(event.sender));
+  });
+
+  // Settings ▸ Notifications "Show on top of other apps": the flag View ▸ Notifications and the
+  // banner's "Show" box write, through the same writer. App-level, so any trusted project
+  // window may set it; answers { ok, enabled } like applyNotificationsOnTop().
+  ipcMain.handle('notify:set-on-top', (event, payload = {}) => {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+      return { ok: false, reason: 'untrusted_sender' };
+    }
+    if (typeof payload?.enabled !== 'boolean') return { ok: false, reason: 'invalid_value' };
+    return applyNotificationsOnTop(payload.enabled);
   });
 
   ipcMain.handle('notify:dismiss-task', (event, payload = {}) => {
@@ -1375,6 +1405,9 @@ function registerIpcHandlers() {
         // handler rewrites the whole file, so an already-recorded LAST_AGENT would
         // otherwise be silently dropped every time this open-existing flow re-runs.
         ...(existingCfg.LAST_AGENT ? { LAST_AGENT: existingCfg.LAST_AGENT } : {}),
+        // (TPT9316) The knowledge-base mode is chosen once, at creation; a re-run of this
+        // whole-file rewrite must keep it.
+        ...(existingCfg.KB_MODE ? { KB_MODE: existingCfg.KB_MODE } : {}),
       });
 
       await require('./src/cli/setup').initializeProjectSettings({ projectRoot: projectPath });
@@ -1723,7 +1756,11 @@ function registerIpcHandlers() {
       //    produces a one-row PI_MODELS. Only written when non-empty so an unchecked Other
       //    Model never writes an empty array (no case here since this is a brand-new config,
       //    but keeps parity with open-existing's carry-forward behavior).
+      //    (TPT9316) The preset adds its own config keys: compose-as-you-go (wizard preset A)
+      //    writes KB_MODE: 'compose' (presetConfigFields(), project-seeder.js).
       const { writeProjectConfig, sanitizePiModels } = require('./src/server/project-config');
+      const { copyTemplates, callSeedPresetTasks, presetConfigFields, presetSeedsTasks } = require('./src/server/project-seeder');
+      const presetValue = preset?.value;
       const piModels = sanitizePiModels(detail?.agentPreference);
       writeProjectConfig(projectPath, {
         TASK_BACKEND: 'api',
@@ -1736,20 +1773,33 @@ function registerIpcHandlers() {
         AVAILABLE_AGENTS,
         projectName: apiProject.name,
         ...(piModels.length ? { PI_MODELS: piModels } : {}),
+        ...presetConfigFields(presetValue),
       });
 
       await require('./src/cli/setup').initializeProjectSettings({ projectRoot: projectPath });
 
-      // 8. Write .tipatask/project.json for window title + cross-device sync
-      writeProjectMeta(projectPath, { name: apiProject.name, apiProjectId: projectId, updatedAt: new Date().toISOString() });
+      // 8. Write .tipatask/project.json for window title + cross-device sync.
+      //    (TPT9319) A NEW API project also gets the one-time firstOpenPrompt marker: its
+      //    window's first board render offers New Objective / Project Discussion / Dismiss
+      //    (src/client/first-project-prompt.js), which clears it. An existing API project
+      //    picked here never gets it — nor does project:open-existing's link path.
+      writeProjectMeta(projectPath, {
+        name: apiProject.name,
+        apiProjectId: projectId,
+        updatedAt: new Date().toISOString(),
+        ...(apiProject.isNew ? { firstOpenPrompt: true } : {}),
+      });
 
       // 9. Seed templates + tasks (non-fatal). The seed outcome is returned to the renderer
       //    (TPT203) so a partial seed is reported instead of looking like a clean success.
+      //    (TPT9316) The compose preset seeds no starter tasks — its board opens empty and
+      //    presetSeed stays null (nothing to report).
       let presetSeed = null;
       try {
-        const { copyTemplates, callSeedPresetTasks } = require('./src/server/project-seeder');
-        copyTemplates(preset.value, projectPath, presetDescription || null);
-        presetSeed = await callSeedPresetTasks(preset.value, { apiBaseUrl, token: scopedToken, projectId, presetDescription: presetDescription || null });
+        copyTemplates(presetValue, projectPath, presetDescription || null);
+        if (presetSeedsTasks(presetValue)) {
+          presetSeed = await callSeedPresetTasks(presetValue, { apiBaseUrl, token: scopedToken, projectId, presetDescription: presetDescription || null });
+        }
       } catch (err) {
         console.warn('[wizard] seeding failed:', err.message);
         presetSeed = { seeded: 0, failed: null, error: err.message };
@@ -1782,6 +1832,15 @@ function registerIpcHandlers() {
       console.error('[wizard] project:create-from-wizard failed:', err.message);
       return { ok: false, error: err.message };
     }
+  });
+
+  // (TPT9319) Read + clear of the sender window's firstOpenPrompt marker (written by the
+  // handler above), for first-project-prompt.js — see main/first-open-prompt.js.
+  registerFirstOpenPromptIpc({
+    ipcMain,
+    isTrusted: (event) => isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` }),
+    projectDirOf: (event) => projectDirs.get(event.sender.id) || null,
+    writeMeta: writeProjectMeta,
   });
 
   // (TPT9169) Project ▸ Import… wizard (setup-modal.js import mode) → main/project-import.js:
@@ -2036,8 +2095,10 @@ function applyNotificationsOnTop(on) {
 
 // (TPT480/TPT505) View ▸ Notifications. The checkbox applies at once and persists across
 // restarts: checked keeps the desktop stack on top; unchecked hides it and sends new alerts as
-// transient native OS notifications (TPT487). In-app cards are unaffected either way. The
-// banner's own "Show" checkbox writes the same flag.
+// transient native OS notifications (TPT487) — or, when the OS cannot deliver those, through
+// the stack after all (desktop-notifications.js `fallback`). In-app cards are unaffected either
+// way. The banner's own "Show" checkbox and the Settings ▸ Notifications switch write the same
+// flag.
 function notificationsMenu() {
   return {
     label: mt('menu.notifications'),
@@ -2232,14 +2293,20 @@ function createMenu() {
       label: mt('menu.project'),
       submenu: [
         {
-          // (C1388) Renamed from "Open Project…" — this is now the single entry point
-          // for both opening a configured project AND starting setup/create for an
-          // unconfigured one (renderer's openOrCreateProject(), template.html).
-          // Renderer owns the later Current/New Window chooser and its
-          // ensureOpenProjectDialogForeground() focus layer; this only dispatches.
-          label: mt('menu.openOrCreateProject'),
+          // (TPT9318) Open Project and Create Project are two entries of the same renderer
+          // flow (openOrCreateProject(entry), template.html): both pick a folder, open or
+          // focus a configured one, and run the project wizard for an unconfigured one —
+          // Open with the Preset step locked to compose-as-you-go, Create with the A/B/C
+          // choice. Renderer owns the later Current/New Window chooser and its
+          // ensureOpenProjectDialogForeground() focus layer; these only dispatch.
+          label: mt('menu.openProject'),
           accelerator: 'CmdOrCtrl+Shift+O',
           click: (mi, window) => { if (window && !window.isDestroyed()) window.webContents.send('project:menu', 'open'); },
+        },
+        {
+          label: mt('menu.createProject'),
+          accelerator: 'CmdOrCtrl+Shift+N',
+          click: (mi, window) => { if (window && !window.isDestroyed()) window.webContents.send('project:menu', 'create'); },
         },
         {
           label: mt('menu.recentProjects'),
@@ -2526,7 +2593,7 @@ function attachExternalLinkPolicy(w) {
   });
 }
 
-// ── Setup window (unconfigured folder picked via Project → Open / Create Project) ─
+// ── Setup window (dedicated window for an unconfigured folder, project:open-setup-window) ─
 // Blank window that immediately shows the setup wizard for projectPath.
 // On wizard completion project:open-existing adopts it as the project window.
 // On cancel the renderer calls closeCurrentProject() → closes this window.
@@ -2818,19 +2885,11 @@ app.whenReady()
     // runBundleSignatureCheck() above.
     await runBundleSignatureCheck();
 
-    // (C1057) 'notifications' added — this used to deny it outright, which is why the
-    // fallback Web Notification path in src/client/notifications.js never worked (the primary
-    // path is the native 'notify:show' IPC handler above, unaffected by this). `media`
-    // semantics unchanged.
-    const ALLOWED_NOTIFICATION_PERMISSIONS = new Set(['media', 'notifications']);
-    session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => {
-      cb(ALLOWED_NOTIFICATION_PERMISSIONS.has(permission));
-    });
-    // Electron's synchronous `Notification.permission` getter in the renderer consults the
-    // CHECK handler, not the request handler above — without this, the renderer kept
-    // reporting 'denied' even after a request-handler grant, since only the request handler
-    // existed before this task.
-    session.defaultSession.setPermissionCheckHandler((_wc, permission) => ALLOWED_NOTIFICATION_PERMISSIONS.has(permission));
+    // Renderer permissions: `media` (voice input), `notifications` (the Web Notification
+    // fallback, C1057; the native 'notify:show' IPC path above does not depend on it) and
+    // `clipboard-sanitized-write` (navigator.clipboard.writeText, TPT9296) — both the request
+    // and the check handler, everything else denied. See main/renderer-permissions.js.
+    installRendererPermissions(session.defaultSession);
     // Route local HTTP and WebSocket requests to the bound project with a signed
     // capability. The callback strips these headers from every other target,
     // including redirected requests.

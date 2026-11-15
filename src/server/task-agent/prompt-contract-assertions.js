@@ -37,6 +37,20 @@ function kbHygiene(text) {
   once(text, /(?:year from now[^\n]*forgotten|stays true and useful[^\n]*forgotten)/, 'KB line must remain useful after task closes exactly once');
 }
 
+// (TPT9317) A compose-mode project's CODING kickoff: the agent documents what this task touches,
+// in this task — inspect the code, tag uncovered modules, write standing facts, tag the task.
+function kbDiscovery(text) {
+  once(text, /KB discovery:/, 'KB discovery directive delivered exactly once');
+  once(text, /composes its (?:KB|knowledge base) as it goes/, 'the compose-mode reason is stated exactly once');
+  once(text, /never[^\n]*separate[^\n]*(?:discovery|documentation) task/, 'no separate discovery task, exactly once');
+  once(text, /Inspect the code (?:this task touches|you read or change)/, 'the touched code is inspected exactly once');
+  once(text, /touched module no `?tt-\*`? tag covers/, 'uncovered touched modules get a tag exactly once');
+  assert.match(text, /create_system_tag|POST \/tags|create its tt-\* tag/, 'a tag-creation step is named');
+  once(text, /standing facts[^\n]*ai\/architecture\/tt-\*\.md/, 'standing facts go in the matching architecture doc exactly once');
+  assert.match(text, /GENERAL\.md/, 'project-wide facts go in GENERAL.md');
+  once(text, /(?:Tag this task|tag to this task)[^\n]*(?:before|tt-\*)/, 'the task is tagged with the touched modules exactly once');
+}
+
 function taskStatus(text) {
   once(text, /Complete only when/, 'completion requires this task scope and verification exactly once');
   assert.match(text, /(?:this task's scope and checks pass|that scope is fully implemented and relevant checks pass)/);
@@ -109,4 +123,4 @@ function vcsOff(text) {
   assert.match(text, /Never[^\n]*(?:attribution|Co-Authored-By)/);
 }
 
-module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, taskStatus, followUps, cowboyChain, computerUse, tagBackfill, vcsOff };
+module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, kbDiscovery, taskStatus, followUps, cowboyChain, computerUse, tagBackfill, vcsOff };

@@ -16,6 +16,7 @@ const {
   BROWSER_PRESET_MARKER,
   buildCodexMcpSection,
   buildCodexLocalMcpSection,
+  buildScopedCodexMcpOverride,
   getCodexPaths,
   ensureProjectCodexHome,
   prepareCodexTerminalHome,
@@ -33,6 +34,37 @@ const {
 
 const toml = require('toml');
 const { resolveComputerUse } = require('./server/computer-use');
+
+test('headless MCP scope disables inherited servers, with zero servers for one-shot generation', t => {
+  const projectRoot = makeTempDir();
+  t.after(() => fs.rmSync(projectRoot, { recursive: true, force: true }));
+  const targetPath = path.join(projectRoot, '.codex', 'config.toml');
+  fs.mkdirSync(path.dirname(targetPath));
+  const inherited = {
+    tipatask: { url: 'https://example.test/mcp' },
+    'tipatask-local': { command: 'local' },
+    node_repl: { command: 'node' },
+    'server.with dots and "quotes"': { command: 'other' },
+  };
+  fs.writeFileSync(targetPath, Object.entries(inherited).map(([name, entry]) =>
+    `[mcp_servers.${JSON.stringify(name)}]\n${Object.entries(entry).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join('\n')}\n`).join('\n'));
+  const before = fs.readFileSync(targetPath, 'utf8');
+  const { CODEX_OBJECTIVE_PROFILE, PROFILES, TASK_CHAT } = require('./server/providers/tool-profiles');
+  for (const profile of [CODEX_OBJECTIVE_PROFILE, PROFILES[TASK_CHAT].codex, { mcpServers: [] }]) {
+    const scoped = toml.parse(buildScopedCodexMcpOverride(projectRoot, profile)).mcp_servers;
+    for (const name of ['node_repl', 'server.with dots and "quotes"']) assert.equal(scoped[name].enabled, false);
+    if (profile.mcpServers.length === 0) {
+      assert.deepEqual(Object.keys(scoped).sort(), Object.keys(inherited).sort());
+      for (const entry of Object.values(scoped)) assert.deepEqual({ ...entry }, { enabled: false });
+      continue;
+    }
+    assert.equal(scoped.tipatask.enabled, true);
+    assert.deepEqual(scoped['tipatask-local'].enabled_tools, ['batch_grep_tags']);
+    assert.deepEqual(scoped.tipatask.disabled_tools, profile.remoteDisabledTools);
+    assert.deepEqual(scoped.tipatask.enabled_tools, profile.remoteEnabledTools);
+  }
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), before, 'per-turn policy must not change terminal defaults');
+});
 
 test('computer-use TOML follows the resolver, replaces stale subtrees and drops unavailable servers', t => {
   const projectRoot = makeTempDir();

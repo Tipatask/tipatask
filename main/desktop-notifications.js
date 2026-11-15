@@ -20,6 +20,9 @@ const CATEGORIES = ['attention', 'completed', 'objective', 'activity', 'merge'];
 const THEME_KEYS = ['bg', 'text', 'muted', 'border', 'primary', 'warning', 'success', 'shadow'];
 // Live native notifications retained until their terminal event (TPT487); FIFO backstop.
 const NATIVE_MAX = 200;
+// Longest a native notification may take to report 'show' or 'failed'. Past it the OS counts
+// as not delivering (main/os-permissions.js gives its startup probe the same wait).
+const NATIVE_CONFIRM_MS = 5000;
 
 // The banner's footer row (the "Show" toggle, plus Show More past one page) is always present
 // (TPT505), so its height never depends on the overflow.
@@ -30,7 +33,8 @@ function pageHeight(count) {
 
 // Persisted app-level "Show on Top" preference: `{ desktopNotificationsEnabled: boolean }`.
 // Missing or unreadable file = on (the pre-TPT480 behavior). Off routes sends to native OS
-// notifications (TPT487); it never disables notifications.
+// notifications (TPT487); it never disables notifications, and falls back to the banner when
+// the OS cannot deliver them (see `fallback` in createDesktopNotifications()).
 function readEnabled(file) {
   if (!file) return true;
   try { return JSON.parse(fs.readFileSync(file, 'utf8')).desktopNotificationsEnabled !== false; }
@@ -65,7 +69,7 @@ const keyOf = (projectPath, tag) => (tag ? JSON.stringify([projectPath || null, 
 function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, onDismiss, Notification = null,
   onShowMore = () => null, onSetOnTop = () => null, isTrustedProjectSender = () => false, settingsFile = null,
   focusedProjectWindow = () => null, projectWindows = () => [], settleMs = SURFACE_SETTLE_MS,
-  platform = process.platform }) {
+  nativeBlocked = () => null, confirmMs = NATIVE_CONFIRM_MS, platform = process.platform }) {
   const entries = new Map();
   const keys = new Map();
   let sequence = 0;
@@ -83,24 +87,35 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   // Project window that owns the full list ("Show More"): { win, wc, opened, detach }.
   // `opened` turns true once notify:desktop-list-open was actually sent to a loaded page.
   let panel = null;
-  // A banner Show More whose target is still being resolved (async onShowMore). Treated like a
-  // pending card click by renderSurface(): the raise is the same.
+  // A banner Show More whose target is still being resolved (async onShowMore): repeat clicks
+  // are ignored until it answers. Its raise holds the surface like a card click (clicksPending).
   let showMorePending = false;
   // (TPT505) Banner dismissed with Hide: stays hidden, entries kept, until a new or changed
   // alert arrives (upsert) or Show on Top is toggled. The in-app panel is unaffected.
   let bannerHidden = false;
-  // (TPT645/TPT9056) Card clicks whose onClick (raise the project window, then deliver the
-  // click) has not settled. While one is pending the banner's surface decision is deferred
-  // (`surfaceHeld`, applied by settleClick()). On macOS the banner is hidden for the raise:
-  // the app must have no window on the user's current Space for activation to switch to the
-  // project window's Space, and the banner panel sits on every Space — it comes back only when
-  // no project window took the alerts. Elsewhere it stays up, minus the clicked card, so the
-  // desktop never flashes between banner and window.
+  // (TPT645/TPT9056) Window raises that have not settled: a card click's onClick (raise the
+  // project window, then deliver the click) or a banner Show More's target. While one is
+  // pending the banner's surface decision is deferred (`surfaceHeld`, applied by settleClick()),
+  // for CLICK_HOLD_MS at most. On macOS the banner is hidden for the raise: the app must have
+  // no window on the user's current Space for activation to switch to the project window's
+  // Space, and the banner panel sits on every Space — it comes back only when no project window
+  // took the alerts. Elsewhere it stays up, minus the clicked card, so the desktop never
+  // flashes between banner and window.
   let clicksPending = 0;
   let surfaceHeld = false;
-  // (TPT487) "Show on Top" off: one transient OS notification per alert, keyed like entries.
-  // Referenced until click/close/failed so V8 can't collect one before the OS shows it.
+  // (TPT487) "Show on Top" off: one transient OS notification per alert, keyed like entries:
+  // { notification, entry, payload, origin, confirmed, timer, settle }. Referenced until
+  // click/close/failed so V8 can't collect one before the OS shows it. `confirmed` turns true
+  // once the OS reported it shown; `settle` resolves that send's show() promise.
   const natives = new Map();
+  // Why native OS notifications are not used while "Show on Top" is off, or null: the injected
+  // health probe (`nativeBlocked`) named a blocker, or the OS failed a native send. Alerts then
+  // go to the shared registry and the banner exactly as with the setting on, so none is
+  // dropped. Kept until the setting is written again (setEnabled()) or the app restarts.
+  let fallback = null;
+  // The shared registry and the focus-chosen surface are in use: "Show on Top" on, or its
+  // banner fallback.
+  const sharing = () => enabled || !!fallback;
 
   const snapshot = () => [...entries.values()].reverse()
     .map(({ origin, key, ...entry }) => ({ ...entry, projectPath: origin?.projectPath || null }));
@@ -140,20 +155,23 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   function renderSurface() {
     const list = snapshot();
     const current = hostLive();
+    const shared = sharing();
     for (const w of projectWindows()) {
       if (!live(w)) continue;
-      const active = enabled && w === current;
-      const state = `${enabled}:${active}`;
+      const active = shared && w === current;
+      const state = `${shared}:${active}`;
       if (!active && sentState.get(w.webContents.id) === state) continue;
       sentState.set(w.webContents.id, state);
-      w.webContents.send('notify:surface', { shared: enabled, active, entries: active ? list : [] });
+      w.webContents.send('notify:surface', { shared, active, entries: active ? list : [] });
     }
     if (!window || window.isDestroyed() || loading) return;
     layout();
-    window.webContents.send('notify:desktop-state', { entries: list, theme });
+    // onTop: the persisted setting, for the banner's "Show" checkbox — off while the banner is
+    // only up as the fallback for native delivery.
+    window.webContents.send('notify:desktop-state', { entries: list, theme, onTop: enabled });
     surfaceHeld = false;
-    const wanted = list.length && enabled && !current && !bannerHidden;
-    const pending = (clicksPending || showMorePending) && enabled && !bannerHidden;
+    const wanted = list.length && shared && !current && !bannerHidden;
+    const pending = clicksPending && shared && !bannerHidden;
     if (pending && platform === 'darwin') {
       surfaceHeld = !current;
       window.hide();
@@ -187,12 +205,14 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
 
   // Read-back for a (re)loaded project renderer. Settles focus first unless a switch is pending.
   function surfaceFor(w) {
+    syncFallback();
     if (!settleTimer && !disposed) {
       const next = focusedProjectWindow();
       host = next !== window && live(next) ? next : null;
     }
-    const active = enabled && !!w && w === hostLive();
-    return { shared: enabled, active, entries: active ? snapshot() : [] };
+    const shared = sharing();
+    const active = shared && !!w && w === hostLive();
+    return { shared, active, entries: active ? snapshot() : [] };
   }
 
   function entryFields(payload) {
@@ -208,7 +228,9 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     const record = natives.get(slot);
     if (!record) return null;
     natives.delete(slot);
+    clearTimeout(record.timer);
     try { record.notification.close(); } catch {}
+    record.settle({ ok: true, id: record.entry.id, delivery: 'native' });
     onDismiss(record.entry, { keepCard: true });
     return record.entry;
   }
@@ -219,12 +241,66 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     return closed;
   }
 
-  // Placement and duration follow the OS settings. A repeat send for the same (project, tag)
-  // replaces the previous native, so one alert never shows twice.
-  function showNative(payload, origin) {
-    if (!Notification || (typeof Notification.isSupported === 'function' && !Notification.isSupported())) {
-      return { ok: false, reason: 'unsupported' };
+  // Moves native alerts into the shared registry, each with its callback identity, and closes
+  // the natives, so an alert the OS did not (or will no longer) show is on the banner instead.
+  // `pendingOnly` leaves the ones the OS reported shown to closeNatives().
+  function adoptNatives({ pendingOnly = false } = {}) {
+    for (const [slot, record] of [...natives]) {
+      if (pendingOnly && record.confirmed) continue;
+      natives.delete(slot);
+      clearTimeout(record.timer);
+      try { record.notification.close(); } catch {}
+      record.settle(showShared(record.payload, record.origin));
     }
+  }
+
+  function blockedReason() {
+    try { return String(nativeBlocked() || '') || null; } catch { return null; }
+  }
+
+  // "Show on Top" off and native delivery blocked: switch to the banner. Runs wherever a
+  // delivery decision is made; a no-op while the setting is on or the fallback already holds.
+  function syncFallback() {
+    if (disposed || enabled || fallback) return;
+    const reason = blockedReason();
+    if (reason) enterFallback(reason);
+  }
+
+  // Every project window re-mirrors its in-app cards on `shared: true`, like turning the
+  // setting on; live natives move to the registry so none is lost in between.
+  function enterFallback(reason) {
+    if (disposed || enabled || fallback) return;
+    fallback = String(reason || 'failed');
+    bannerHidden = false;
+    sentState.clear();
+    adoptNatives();
+    publish();
+  }
+
+  // The shared registry and the focus-chosen surface (the in-app panel, or the banner).
+  async function showShared(payload, origin) {
+    const { entry, created, released } = upsert(payload, origin, payload.notificationId);
+    publish();
+    releaseAfterPublish(released);
+    try {
+      await ensureWindow(origin);
+      publish();
+      return { ok: true, id: entry.id, delivery: 'desktop', ...(!enabled && fallback ? { fallback } : {}) };
+    } catch (error) {
+      if (created && entries.get(entry.id) === entry) { remove(entry); publish(); }
+      return { ok: false, reason: 'desktop-unavailable' };
+    }
+  }
+
+  // One transient OS notification; placement and duration follow the OS settings. A repeat
+  // send for the same (project, tag) replaces the previous native, so one alert never shows
+  // twice. Resolves once the OS reports it shown. A send the OS fails — or leaves unanswered
+  // for `confirmMs` — is not dropped: delivery falls back to the banner (enterFallback()), which
+  // takes this alert and every other live native.
+  function showNative(payload, origin) {
+    let supported = false;
+    try { supported = !!Notification && (typeof Notification.isSupported !== 'function' || Notification.isSupported()); } catch {}
+    if (!supported) { enterFallback('unsupported'); return showShared(payload, origin); }
     const id = String(++sequence);
     const key = keyOf(origin?.projectPath, payload.tag);
     const slot = key || `#${id}`;
@@ -232,18 +308,33 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     closeNative(slot);
     let notification;
     try { notification = new Notification({ title: entry.title, body: entry.body, silent: false }); }
-    catch { return { ok: false, reason: 'failed' }; }
-    const record = { notification, entry };
-    const settle = () => natives.get(slot) === record && natives.delete(slot);
-    notification.on('click', () => { if (settle()) onClick(entry); });
-    const gone = () => { if (settle()) onDismiss(entry, { keepCard: true }); };
-    notification.on('close', gone);
-    notification.on('failed', gone);
-    natives.set(slot, record);
-    while (natives.size > NATIVE_MAX) closeNative(natives.keys().next().value);
-    try { notification.show(); }
-    catch { settle(); return { ok: false, reason: 'failed' }; }
-    return { ok: true, id, delivery: 'native' };
+    catch { enterFallback('failed'); return showShared(payload, origin); }
+    return new Promise((resolve) => {
+      const record = { notification, entry, payload, origin, confirmed: false, timer: null, settle: resolve };
+      const current = () => natives.get(slot) === record;
+      const confirm = () => {
+        record.confirmed = true;
+        clearTimeout(record.timer);
+        resolve({ ok: true, id, delivery: 'native' });
+      };
+      const release = () => current() && natives.delete(slot);
+      const fail = (reason) => {
+        if (!current() || record.confirmed) return;
+        if (sharing()) adoptNatives();
+        else enterFallback(reason);
+      };
+      // A native that only shows after its alert moved to the banner must not stay as a twin.
+      notification.on('show', () => { if (current()) confirm(); else { try { notification.close(); } catch {} } });
+      notification.on('click', () => { if (release()) { confirm(); onClick(entry); } });
+      const gone = () => { if (release()) { confirm(); onDismiss(entry, { keepCard: true }); } };
+      notification.on('close', gone);
+      notification.on('failed', () => { if (record.confirmed) gone(); else fail('failed'); });
+      natives.set(slot, record);
+      while (natives.size > NATIVE_MAX) closeNative(natives.keys().next().value);
+      record.timer = setTimeout(() => fail('no-response'), confirmMs);
+      record.timer.unref?.();
+      try { notification.show(); } catch { fail('failed'); }
+    });
   }
 
   function remove(entry) {
@@ -333,7 +424,7 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   function perform(id, action, { from = null } = {}) {
     if (action === 'clear-all') return dismissAll();
     if (action === 'hide') return hideBanner();
-    if (action === 'on-top-off') return void onSetOnTop(false);
+    if (action === 'on-top-off' || action === 'on-top-on') return void onSetOnTop(action === 'on-top-on');
     if (action === 'show-more') {
       // From the in-app panel: open the full list right there, without moving focus.
       if (from) return attachPanel(from);
@@ -343,12 +434,12 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
       // verified raise, a reopened project window); no window means nothing changes here.
       const target = onShowMore(newest);
       if (typeof target?.then !== 'function') return attachPanel(target);
+      // The raise holds the surface like a card click, with the same cap: a target that never
+      // answers must not keep the banner down for good.
       showMorePending = true;
+      clicksPending += 1;
       publish();
-      target.then(attachPanel).catch(() => {}).finally(() => {
-        showMorePending = false;
-        if (!disposed && surfaceHeld) renderSurface();
-      });
+      settleClick(target.then(attachPanel).catch(() => {}).finally(() => { showMorePending = false; }));
       return;
     }
     const entry = entries.get(id);
@@ -366,9 +457,9 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     settleClick(result);
   }
 
-  // Ends one card click's hold once its onClick settles (at most CLICK_HOLD_MS), then applies
-  // the deferred surface decision: the raised project window hosts the alerts by then, or —
-  // nothing raised — the banner shows them again.
+  // Ends one hold (a card click, a banner Show More) once its raise settles, at most
+  // CLICK_HOLD_MS, then applies the deferred surface decision: the raised project window hosts
+  // the alerts by then, or — nothing raised — the banner shows them again.
   function settleClick(result) {
     let timer = null;
     let settled = false;
@@ -427,8 +518,9 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   }
 
   // The banner offers Hide and the "Show" toggle instead of Clear All (TPT505); the in-app
-  // panel keeps Clear All.
-  const BANNER_ACTIONS = ['click', 'close', 'hide', 'show-more', 'on-top-off'];
+  // panel keeps Clear All. The toggle writes the setting either way: it is unchecked while the
+  // banner is up as the native-delivery fallback, and checking it turns "Show on Top" on.
+  const BANNER_ACTIONS = ['click', 'close', 'hide', 'show-more', 'on-top-off', 'on-top-on'];
   const ACTIONS = ['click', 'close', 'clear-all', 'show-more'];
   ipcMain.on('notify:desktop-action', (event, { id, action } = {}) => {
     if (!trusted(event) || !BANNER_ACTIONS.includes(action)) return;
@@ -490,7 +582,8 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
     // In-app card mirrored from a project renderer's pushNotification(). Same identity as the
     // banner send for that tag; no callback identity of its own (the renderer keeps onClick).
     upsertCard(payload, origin) {
-      if (disposed || !enabled) return { ok: true, delivery: 'disabled' };
+      syncFallback();
+      if (disposed || !sharing()) return { ok: true, delivery: 'disabled' };
       if (!payload?.tag) return { ok: false, reason: 'invalid_tag' };
       const { entry, released } = upsert({ ...payload, cardSeq: Number(payload.seq) }, origin, null, { reveal: false });
       publish();
@@ -500,33 +593,41 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
       return { ok: true, id: entry.id, delivery: 'shared' };
     },
     async show(payload, origin) {
+      if (disposed && !enabled) return { ok: false, reason: 'closed' };
+      syncFallback();
       // "Show on Top" off: no shared registry and no banner window — a transient OS
-      // notification instead. Renderers keep their own in-app cards (notify:surface { shared:false }).
-      if (!enabled) return disposed ? { ok: false, reason: 'closed' } : showNative(payload, origin);
-      const { entry, created, released } = upsert(payload, origin, payload.notificationId);
-      publish();
-      releaseAfterPublish(released);
-      try { await ensureWindow(origin); publish(); return { ok: true, id: entry.id, delivery: 'desktop' }; }
-      catch (error) {
-        if (created && entries.get(entry.id) === entry) { remove(entry); publish(); }
-        return { ok: false, reason: 'desktop-unavailable' };
-      }
+      // notification instead; renderers keep their own in-app cards (notify:surface
+      // { shared: false }). Off with native delivery blocked uses the banner after all.
+      return sharing() ? showShared(payload, origin) : showNative(payload, origin);
     },
     syncNotificationSurface,
     surfaceFor,
     snapshot,
     owns: (w) => w === window,
     isEnabled: () => enabled,
+    // What a send uses right now — { delivery: 'desktop' | 'native', fallback } — after
+    // re-reading the native-delivery health. `fallback` is why the banner stands in for native
+    // notifications while "Show on Top" is off, else null.
+    delivery() {
+      syncFallback();
+      return { delivery: sharing() ? 'desktop' : 'native', fallback: enabled ? null : fallback };
+    },
+    // Re-reads the native-delivery health alone; main.js calls it after each bundle check.
+    refreshDelivery: syncFallback,
     // Applies immediately and persists for the next launch. Off clears the shared registry and
     // hides the banner but keeps every in-app card (renderers fall back to their local list);
-    // later sends go native. On closes open natives and re-shares the cards.
+    // later sends go native. Off while native delivery is known blocked keeps the registry (the
+    // banner fallback) and only hides the banner until the next alert. On closes open natives
+    // and re-shares the cards. Either way the fallback is decided afresh.
     // A failed write keeps the in-memory choice and reports ok:false.
     setEnabled(on) {
       enabled = !!on;
+      fallback = null;
       bannerHidden = false;
       sentState.clear();
-      if (!enabled) dismissAll({ keepCard: true });
-      else { closeNatives(); publish(); }
+      if (enabled) { adoptNatives({ pendingOnly: true }); closeNatives(); publish(); }
+      else if ((fallback = blockedReason())) { bannerHidden = entries.size > 0; adoptNatives(); publish(); }
+      else dismissAll({ keepCard: true });
       try { writeEnabled(settingsFile, enabled); return { ok: true, enabled }; }
       catch (error) { return { ok: false, enabled, reason: error.message }; }
     },
@@ -535,7 +636,11 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
       if (settleTimer) clearTimeout(settleTimer);
       const open = [...natives.values()];
       natives.clear();
-      for (const { notification } of open) { try { notification.close(); } catch {} }
+      for (const { notification, timer, settle } of open) {
+        clearTimeout(timer);
+        try { notification.close(); } catch {}
+        settle({ ok: false, reason: 'closed' });
+      }
       entries.clear();
       keys.clear();
       detachPanel();
@@ -546,4 +651,4 @@ function createDesktopNotifications({ BrowserWindow, screen, ipcMain, onClick, o
   };
 }
 
-module.exports = { createDesktopNotifications, PAGE_SIZE, pageHeight, SURFACE_SETTLE_MS, CLICK_HOLD_MS };
+module.exports = { createDesktopNotifications, PAGE_SIZE, pageHeight, SURFACE_SETTLE_MS, CLICK_HOLD_MS, NATIVE_CONFIRM_MS };

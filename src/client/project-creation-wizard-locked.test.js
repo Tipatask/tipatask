@@ -7,8 +7,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 import { Window } from 'happy-dom';
 
-// (TPT564) The wizard's locked first-run mode — and (TPT653) its Agent step's Default — driven in
-// happy-dom with the real module. Same bundling harness as dialog-focus.test.js; electronAPI is
+// (TPT564) The wizard's locked first-run mode — and (TPT653) its Agent step's Default, (TPT9316)
+// its A/B/C Preset step — driven in happy-dom with the real module. Same bundling harness as dialog-focus.test.js; electronAPI is
 // stubbed per test.
 async function withWizard(electronAPI, run) {
   const window = new Window({ url: 'http://localhost:4455/' });
@@ -149,4 +149,251 @@ test('Agent step: re-checking an agent after unchecking all makes it the Default
       .find((tr) => tr.querySelector('.setup-modal-summary-key')?.textContent === 'Agent');
     assert.equal(agentRow?.querySelector('.setup-modal-summary-val').textContent, 'codex', 'Confirm shows Codex');
   });
+});
+
+// (TPT9316) Preset step: three stacked toggle-button cards, A = compose the knowledge base as you
+// go, then B/C (the two seeding presets). The pick shows on Confirm and lands in the
+// wizard-complete detail as { letter, mode, value }.
+const PRESET_EXPECTATIONS = [
+  { letter: 'A', name: 'Compose the knowledge base as you go', preset: { letter: 'A', mode: 'compose', value: 'compose-as-you-go' } },
+  { letter: 'B', name: 'Original Specification', preset: { letter: 'B', mode: 'new', value: 'original-specification' } },
+  { letter: 'C', name: 'Existing Codebase', preset: { letter: 'C', mode: 'existing', value: 'existing-code' } },
+];
+
+for (const expected of PRESET_EXPECTATIONS) {
+  test(`Preset step: picking ${expected.letter} shows "${expected.letter} — ${expected.name}" on Confirm and emits its value`, async () => {
+    const electronAPI = {
+      setupStoredAccount: async () => ({ token: 'tok', user: { email: 'a@b.c' } }),
+      setupListProjects: async () => [{ id: 7, name: 'Proj' }],
+      setupGetDeviceName: async () => 'Mac',
+      setupGetAvailableAgents: async () => [{ id: 'claude', label: 'Claude Code', available: true }],
+    };
+    await withWizard(electronAPI, async ({ wizard, flush }) => {
+      let detail = null;
+      wizard.open({ projectPath: '/tmp/p', onComplete: (d) => { detail = d; } });
+      await flush();
+      const $ = (sel) => overlay().querySelector(sel);
+      $('#wiz-new-card').click();
+      $('#wiz-proj-name').value = 'Fresh';
+      $('#wiz-proj-name').dispatchEvent(new Event('input', { bubbles: true }));
+      $('#wiz-next-btn').click();
+      await flush(); // device-name prefill
+      $('#wiz-next-btn').click();
+      await flush(); // agent detection
+      $('#wiz-next-btn').click();
+
+      const cards = [...overlay().querySelectorAll('.setup-modal-preset-grid > button.setup-modal-preset-card')];
+      assert.deepEqual(cards.map((c) => c.querySelector('.setup-modal-preset-letter').textContent), ['A', 'B', 'C']);
+      assert.deepEqual(cards.map((c) => c.querySelector('.setup-modal-preset-name').textContent),
+        PRESET_EXPECTATIONS.map((p) => p.name));
+      assert.ok(cards.every((c) => c.getAttribute('type') === 'button' && c.getAttribute('aria-pressed') === 'false'),
+        'toggle buttons, none pressed on first paint');
+      assert.equal($('#wiz-next-btn').disabled, true, 'Next waits for a pick');
+
+      const card = cards.find((c) => c.dataset.letter === expected.letter);
+      card.click();
+      assert.equal(card.isConnected, true, 'selection updates in place (no repaint that would drop focus)');
+      assert.deepEqual(cards.map((c) => c.getAttribute('aria-pressed')),
+        cards.map((c) => String(c === card)));
+      assert.deepEqual(cards.map((c) => c.classList.contains('is-selected')), cards.map((c) => c === card));
+      assert.equal($('#wiz-next-btn').disabled, false);
+
+      $('#wiz-next-btn').click();
+      const presetRow = [...overlay().querySelectorAll('.setup-modal-summary tr')]
+        .find((tr) => tr.querySelector('.setup-modal-summary-key')?.textContent === 'Preset');
+      assert.equal(presetRow?.querySelector('.setup-modal-summary-val').textContent, `${expected.letter} — ${expected.name}`);
+
+      // Back keeps the pick.
+      $('#wiz-back-btn').click();
+      const again = overlay().querySelector(`.setup-modal-preset-card[data-letter="${expected.letter}"]`);
+      assert.equal(again.getAttribute('aria-pressed'), 'true');
+      assert.equal($('#wiz-next-btn').disabled, false);
+      $('#wiz-next-btn').click();
+
+      $('#wiz-confirm-btn').click();
+      assert.ok(detail, 'onComplete fired');
+      assert.deepEqual(detail.preset, expected.preset);
+      assert.equal(detail.apiProject.isNew, true);
+      assert.equal(overlay(), null, 'wizard closed after Create Project');
+    });
+  });
+}
+
+// (TPT9318) Open Project entry: open({ presetLocked: true }) has no Preset step and no Preset
+// dot. A new project goes Agent → Confirm, the summary names compose-as-you-go (no letter —
+// the A/B/C cards were never shown) and the detail carries the compose preset, so main.js
+// writes KB_MODE: 'compose' and seeds no starter tasks. Linking an existing project creates
+// nothing and still emits preset: null.
+function presetLockedAPI() {
+  return {
+    setupStoredAccount: async () => ({ token: 'tok', user: { email: 'a@b.c' } }),
+    setupListProjects: async () => [{ id: 7, name: 'Proj' }],
+    setupGetDeviceName: async () => 'Mac',
+    setupGetAvailableAgents: async () => [{ id: 'claude', label: 'Claude Code', available: true }],
+  };
+}
+
+const summaryValue = (key) => [...overlay().querySelectorAll('.setup-modal-summary tr')]
+  .find((tr) => tr.querySelector('.setup-modal-summary-key')?.textContent === key)
+  ?.querySelector('.setup-modal-summary-val').textContent;
+
+test('presetLocked: a new project skips the Preset step and emits compose-as-you-go', async () => {
+  await withWizard(presetLockedAPI(), async ({ wizard, flush }) => {
+    let detail = null;
+    wizard.open({ projectPath: '/tmp/p', presetLocked: true, onComplete: (d) => { detail = d; } });
+    await flush();
+    const $ = (sel) => overlay().querySelector(sel);
+    const dots = () => overlay().querySelectorAll('.setup-modal-steps .setup-modal-dot').length;
+    assert.equal(dots(), 5, 'five dots — no Preset dot');
+    $('#wiz-new-card').click();
+    $('#wiz-proj-name').value = 'Fresh';
+    $('#wiz-proj-name').dispatchEvent(new Event('input', { bubbles: true }));
+    $('#wiz-next-btn').click();
+    await flush(); // device-name prefill
+    assert.equal(dots(), 5, 'a new project keeps five dots');
+    $('#wiz-next-btn').click();
+    await flush(); // agent detection
+    $('#wiz-next-btn').click();
+    assert.equal($('.setup-modal-preset-grid'), null, 'Agent → Confirm, no Preset step');
+    assert.ok($('#wiz-confirm-btn'), 'on the Confirm step');
+    assert.equal($('#wiz-confirm-btn').textContent, 'Create Project');
+    assert.equal(summaryValue('Preset'), 'Compose the knowledge base as you go');
+
+    $('#wiz-back-btn').click();
+    assert.ok($('#wiz-agent-select'), 'Back from Confirm returns to the Agent step');
+    await flush();
+    $('#wiz-next-btn').click();
+    assert.ok($('#wiz-confirm-btn'), 'and Next goes to Confirm again');
+
+    $('#wiz-confirm-btn').click();
+    assert.ok(detail, 'onComplete fired');
+    assert.deepEqual(detail.preset, { letter: 'A', mode: 'compose', value: 'compose-as-you-go' });
+    assert.equal(detail.apiProject.isNew, true);
+    assert.equal(detail.apiProject.name, 'Fresh');
+    assert.equal(overlay(), null, 'wizard closed after Create Project');
+  });
+});
+
+test('presetLocked: linking an existing project emits preset: null', async () => {
+  await withWizard(presetLockedAPI(), async ({ wizard, flush }) => {
+    let detail = null;
+    wizard.open({ projectPath: '/tmp/p', presetLocked: true, onComplete: (d) => { detail = d; } });
+    await flush();
+    const $ = (sel) => overlay().querySelector(sel);
+    $('.setup-modal-project-card[data-id="7"]').click();
+    $('#wiz-next-btn').click();
+    await flush();
+    $('#wiz-next-btn').click();
+    await flush();
+    $('#wiz-next-btn').click();
+    assert.equal(summaryValue('Preset'), undefined, 'no Preset row for an existing project');
+    assert.equal($('#wiz-confirm-btn').textContent, 'Open Project');
+    $('#wiz-confirm-btn').click();
+    assert.equal(detail.preset, null);
+    assert.equal(detail.apiProject.isNew, false);
+    assert.equal(detail.apiProject.id, 7);
+  });
+});
+
+test('presetLocked does not leak: the next unlocked run shows six dots and the Preset step', async () => {
+  await withWizard(presetLockedAPI(), async ({ wizard, flush }) => {
+    wizard.open({ projectPath: '/tmp/p', presetLocked: true });
+    await flush();
+    wizard.close();
+    wizard.open({ projectPath: '/tmp/p' });
+    await flush();
+    const $ = (sel) => overlay().querySelector(sel);
+    assert.equal(overlay().querySelectorAll('.setup-modal-steps .setup-modal-dot').length, 6);
+    // The earlier session's sign-in is still in memory: step 1 shows "Signed in as …".
+    $('#wiz-next-btn').click();
+    await flush(); // project list
+    $('#wiz-new-card').click();
+    $('#wiz-proj-name').value = 'Fresh';
+    $('#wiz-proj-name').dispatchEvent(new Event('input', { bubbles: true }));
+    $('#wiz-next-btn').click();
+    await flush();
+    $('#wiz-next-btn').click();
+    await flush();
+    $('#wiz-next-btn').click();
+    assert.ok($('.setup-modal-preset-grid'), 'Create Project entry still asks for a preset');
+    assert.equal($('#wiz-next-btn').disabled, true, 'nothing preselected');
+  });
+});
+
+// (TPT9318) Whole Open Project chain for a new project: the preset-locked wizard's detail goes
+// through the real project:create-from-wizard handler (main.js, run in a vm with the API
+// calls stubbed and the real project-config / project-seeder modules), which must write
+// KB_MODE: 'compose' into the folder's config.json and never seed starter tasks.
+test('presetLocked chain: the created project has KB_MODE compose and no seeded tasks', async (t) => {
+  const { createRequire } = await import('node:module');
+  const { readFileSync, existsSync } = await import('node:fs');
+  const vm = await import('node:vm');
+  const projectDir = mkdtempSync(join(tmpdir(), 'tt-open-entry-project-'));
+  const userData = mkdtempSync(join(tmpdir(), 'tt-open-entry-userdata-'));
+  const savedUserData = process.env.TIPATASK_USER_DATA;
+  process.env.TIPATASK_USER_DATA = userData; // the scoped token lands in a private account store
+  t.after(() => {
+    if (savedUserData === undefined) delete process.env.TIPATASK_USER_DATA;
+    else process.env.TIPATASK_USER_DATA = savedUserData;
+    rmSync(projectDir, { recursive: true, force: true });
+    rmSync(userData, { recursive: true, force: true });
+  });
+
+  let detail = null;
+  await withWizard(presetLockedAPI(), async ({ wizard, flush }) => {
+    wizard.open({ projectPath: projectDir, presetLocked: true, onComplete: (d) => { detail = d; } });
+    await flush();
+    const $ = (sel) => overlay().querySelector(sel);
+    $('#wiz-new-card').click();
+    $('#wiz-proj-name').value = 'Fresh';
+    $('#wiz-proj-name').dispatchEvent(new Event('input', { bubbles: true }));
+    $('#wiz-next-btn').click();
+    await flush();
+    $('#wiz-next-btn').click();
+    await flush();
+    $('#wiz-next-btn').click();
+    $('#wiz-confirm-btn').click();
+  });
+  assert.ok(detail, 'the wizard completed');
+
+  const require = createRequire(import.meta.url);
+  const mainSrc = readFileSync(new URL('../../main.js', import.meta.url), 'utf8');
+  const start = mainSrc.indexOf("  ipcMain.handle('project:create-from-wizard'");
+  const end = mainSrc.indexOf('\n  });', start) + '\n  });'.length;
+  assert.ok(start !== -1 && end > start, 'create-from-wizard handler found');
+  const seeded = [];
+  const realSeeder = require('../server/project-seeder.js');
+  const modules = {
+    './src/cli/setup': {
+      createApiProject: async ({ name }) => ({ id: 41, name }),
+      registerDevice: async ({ name }) => ({ id: 9, name }),
+      associateDeviceProject: async () => ({}),
+      initializeProjectSettings: async () => {},
+    },
+    './src/cli/auth': { exchangeProjectToken: async () => 'scoped-token' },
+    './src/server/project-config': require('../server/project-config.js'),
+    './src/server/project-seeder': { ...realSeeder, callSeedPresetTasks: async (...args) => { seeded.push(args); return { seeded: 1 }; } },
+    './src/cli/knowledge-sync': { pushAll: async () => {}, pushArchitectureDocs: async () => {} },
+  };
+  let handler = null;
+  vm.runInNewContext(mainSrc.slice(start, end), {
+    ipcMain: { handle: (_, fn) => { handler = fn; } },
+    require: (id) => { assert.ok(id in modules, `unexpected require(${id})`); return modules[id]; },
+    getOrCreateMachineId: () => 'machine-1',
+    writeProjectMeta: () => {},
+    writeProjectMcpConfig: () => {},
+    writeProjectSkillsConfig: () => {},
+    writeProjectCodexConfig: () => {},
+    console: { warn: () => {}, error: () => {}, log: () => {} },
+  });
+
+  const res = await handler({}, detail);
+  assert.equal(res.ok, true, res.error);
+  assert.equal(res.presetSeed, null, 'nothing seeded, nothing to report');
+  assert.equal(seeded.length, 0, 'callSeedPresetTasks never ran');
+  const config = JSON.parse(readFileSync(join(projectDir, '.tipatask', 'config.json'), 'utf8'));
+  assert.equal(config.KB_MODE, 'compose');
+  assert.equal(config.API_PROJECT_ID, '41');
+  assert.equal(Object.hasOwn(config, 'API_TOKEN'), false, 'the token went to the account store');
+  assert.equal(existsSync(join(projectDir, 'ai', 'architecture', 'GENERAL.md')), true, 'base GENERAL.md written');
 });

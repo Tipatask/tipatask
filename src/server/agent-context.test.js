@@ -251,7 +251,7 @@ test('all provider continuations reject account or target changes before spawnin
 });
 
 
-test('Codex headless MCP map omits every unrelated server without editing user configuration', () => {
+test('Codex headless MCP map disables every unrelated server without editing user configuration', () => {
   const root = project('codex-map', 'https://codex-map.test', 4);
   const dir = path.join(root, '.codex');
   fs.mkdirSync(dir);
@@ -261,7 +261,11 @@ test('Codex headless MCP map omits every unrelated server without editing user c
   const { CODEX_OBJECTIVE_PROFILE } = require('./providers/tool-profiles');
   const value = require('../codex-mcp-config').buildScopedCodexMcpOverride(root, CODEX_OBJECTIVE_PROFILE);
   const parsed = require('toml').parse(value).mcp_servers;
-  assert.deepEqual(Object.keys(parsed), ['tipatask', 'tipatask-local']);
+  assert.deepEqual(Object.keys(parsed).filter(name => parsed[name].enabled), ['tipatask', 'tipatask-local']);
+  assert.equal(parsed['has space.with.dots'].enabled, false);
+  assert.equal(parsed.legacy.enabled, false);
+  assert.ok(parsed.tipatask.enabled_tools.includes('reserve_task_keys'));
+  assert.ok(!parsed.tipatask.enabled_tools.includes('update_task'));
   assert.ok(parsed.tipatask.disabled_tools.includes('update_task'));
   assert.deepEqual(parsed['tipatask-local'].enabled_tools, ['batch_grep_tags']);
   assert.equal(fs.readFileSync(file, 'utf8'), original);

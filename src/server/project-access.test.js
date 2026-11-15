@@ -218,7 +218,7 @@ test('denied current-window opens and switches preserve the current binding and 
 
 test('canceling access while focusing an existing project does not fall through to a second open', async () => {
   const template = fs.readFileSync(path.join(__dirname, '../client/template.html'), 'utf8');
-  const start = template.indexOf('  async function openOrCreateProject()');
+  const start = template.indexOf('  async function openOrCreateProject(');
   const end = template.indexOf('\n  }', start) + '\n  }'.length;
   let opens = 0;
   let getStarted = 0;
@@ -233,7 +233,7 @@ test('canceling access while focusing an existing project does not fall through 
     _showChooseModal: () => { getStarted++; },
   });
   vm.runInContext(template.slice(start, end), context);
-  await context.openOrCreateProject();
+  await context.openOrCreateProject('open');
   assert.equal(opens, 0);
   assert.equal(getStarted, 1);
 });

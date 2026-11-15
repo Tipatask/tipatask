@@ -230,6 +230,18 @@ test('parseObjectiveResult forces status to pending on new tasks, strips it on m
 // (sprint-assign.js minStepForDeps/healDependencyOrdering) pushes the downstream
 // task into a later sprint instead of the executor running both in parallel against
 // a tree where the sibling's edits don't exist yet.
+test('OBJECTIVE_SYSTEM_PROMPT separates urgent agent maintenance from optional Backlog suggestions', () => {
+  const { systemPrompt } = buildObjectivePrompt('Fix broken agent file reads urgently', null, null);
+  assert.match(systemPrompt, /new regular tasks use regularTaskPriorityBaseline/);
+  assert.match(systemPrompt, /highest active CODING sprint/);
+  assert.doesNotMatch(systemPrompt, /Priority defaults to lowest active CODING priority/);
+  assert.match(systemPrompt, /Urgent maintenance and bug fixes are regular work even when they concern agents/);
+  assert.match(systemPrompt, /Qualifying optional workflow-efficiency suggestions \(non-urgent, discretionary/);
+  assert.match(systemPrompt, /Urgent maintenance and requested bug fixes NEVER qualify solely because they concern agents/);
+  assert.match(systemPrompt, /explicit user Backlog intent/);
+  assert.match(systemPrompt, /task\._stepPinned: true.*never for a model-chosen default/);
+});
+
 test('OBJECTIVE_SYSTEM_PROMPT documents the dependency-detection rule with a WRONG/RIGHT pair', () => {
   const { systemPrompt } = buildObjectivePrompt('any objective', null, null);
 

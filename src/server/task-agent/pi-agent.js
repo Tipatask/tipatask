@@ -171,6 +171,16 @@ class PiAgent extends BaseTaskAgent {
     return super.buildCowboyDirective({ ...opts, compact: true, nextCall });
   }
 
+  // (TPT9317) Compose-mode KB discovery, always compact. Its tag step follows Pi's transport: the
+  // bridged create_system_tag (whose next_step brings the stub to disk), or the REST registration,
+  // after which Pi writes the ai/architecture/tt-*.md doc itself (its REST tag line above).
+  buildKbDiscoveryDirective(opts = {}) {
+    const tagStep = opts.piMcpBridge
+      ? 'create its tag with tipatask__create_system_tag and a real description, then follow its next_step'
+      : 'register its tag with a real description (POST /tags)';
+    return super.buildKbDiscoveryDirective({ ...opts, compact: true, tagStep });
+  }
+
   buildParentPreparationDirective(opts = {}) {
     const nextCall = opts.piMcpBridge ? '`tipatask-local__start_next_tasks(task_key)`' : '`tt next "$TIPATASK_TASK_ID"`';
     return super.buildParentPreparationDirective({ ...opts, nextCall });

@@ -58,7 +58,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   loadWorkspace: () => inv('load-workspace'),
   saveWorkspace: (state) => inv('save-workspace', state),
   onWorkspaceLoaded: (cb) => ipcRenderer.on('workspace-loaded', (_, state) => cb(state)),
-  pickAndOpenProject: () => inv('open-project'),
+  // (TPT9318) entry: 'open' | 'create' — the Project menu / Get Started entry that asked;
+  // main only uses it for the folder picker's title.
+  pickAndOpenProject: (entry) => inv('open-project', entry),
   openSetupWindow: (p) => inv('project:open-setup-window', p),
   onSetupOpenForPath: (cb) => ipcRenderer.on('setup:open-for-path', (_, p) => cb(p)),
   focusSelf: () => inv('window:focus-self'),
@@ -80,16 +82,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   notificationSurfaceAction: (action, id) => ipcRenderer.send('notify:surface-action', { action, id }),
   setNotificationTheme: (tokens) => ipcRenderer.send('notify:theme', tokens),
   // (TPT487) "Show on Top": on keeps the desktop stack, off sends native OS notifications.
-  // App-level (main persists it, set from View ▸ Notifications or the banner's "Show" box,
-  // TPT505); every project window hears changes.
+  // App-level (main persists it, set from View ▸ Notifications, the banner's "Show" box,
+  // TPT505, or the Settings ▸ Notifications switch below); every project window hears changes.
   onNotificationsOnTopChanged: (cb) => {
     const handler = (_, state) => cb(state);
     ipcRenderer.on('notify:on-top-changed', handler);
     return () => ipcRenderer.removeListener('notify:on-top-changed', handler);
   },
-  // (C1125) One-shot check of whether this bundle is code-signed — an unsigned bundle never
-  // gets a Notification Center registration on macOS, so notify:show can silently drop every
-  // banner while still resolving `{ok:true}`. See main.js's notify:status handler.
+  // Settings ▸ Notifications switch: writes that flag. Resolves { ok, enabled } — `enabled` is
+  // the live choice, also when it could not be saved for the next launch (ok: false).
+  setNotificationsOnTop: (enabled) => inv('notify:set-on-top', { enabled: enabled === true }),
+  // Delivery status for Settings: the mode a send uses right now (desktop banners, or native
+  // OS notifications while "Show on Top" is off and macOS can deliver them) plus the bundle
+  // health behind a blocked native path (C1125: an unsigned or unregistered bundle gets no
+  // Notification Center delivery). See main.js's notify:status handler.
   notifyStatus: () => inv('notify:status'),
   // (C1355) On-demand LaunchServices re-register from the Settings "Repair" button — see
   // main.js's notify:repair-registration handler.
@@ -159,6 +165,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setupStoredAccount: (apiBaseUrl) => inv('setup:stored-account', apiBaseUrl || null),
   completeProjectWizard: (detail) => inv('project:create-from-wizard', detail),
   openExistingProject: (detail) => inv('project:open-existing', detail),
+  // (TPT9319) This window's project: is the new project's one-time first-open prompt still
+  // due (boolean), and clear it (true only when this call removed it) — main/first-open-prompt.js.
+  getFirstOpenPrompt: () => inv('project:first-open-prompt'),
+  clearFirstOpenPrompt: () => inv('project:first-open-prompt-clear'),
   // (C1388) Native-menu locale follow — see main/menu-i18n.js. Pushed from
   // applyProjectLanguage()/writeProjectLanguage() (task-board.js).
   setAppLocale: (lang) => inv('app:set-locale', lang),

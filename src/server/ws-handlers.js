@@ -290,6 +290,8 @@ function sessionMetaRow(s) {
     // until its start-* message, so its id is what keeps the fields off.
     ...(!isAgentChatId(s.tabId) && (s.permissionPolicy || (s.type === 'terminal' && s.permissionMode))
       ? { permissionMode: permissionModeFrame(s), permissionSource: s.permissionPolicy?.source ?? null } : {}),
+    // (TPT415) The run's createSession() stamp: a reattach's ?startedAt= identity, and (TPT9324)
+    // the left-nav rail's terminal row order (task-board.js syncActiveSessionsNav()).
     ...(s.startedAt ? { startedAt: s.startedAt } : {}),
     // (TPT469) A project chat is listed in the left menu once it has a title — its first user
     // message. Untitled ones are drafts the next Start Chat reuses.

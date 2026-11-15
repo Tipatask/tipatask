@@ -6,7 +6,7 @@ import { queueReasonText } from './queue-reason.js';
 import { startFailureText, refusedStartTasks } from './terminal-frame-text.js';
 import { trackQueuedStart } from './queued-start-rollback.js';
 import { isTaskDiscussing } from './discuss-lock.js';
-import { DRAFT_KEY_TASK, ensureAgentModels, agentModelOptions, CHAT_BUBBLE_SVG } from './constants.js';
+import { DRAFT_KEY_TASK, ensureAgentModels, agentModelOptions, CHAT_BUBBLE_SVG, EFFORT_LEVELS, EFFORT_LABELS } from './constants.js';
 import {
   statusNames, statusLabel, statusColor, statusRoleToken, WORKFLOW_COLOR_SWATCHES,
   isActiveName, isClosedName, isInProgressName, isCompleteName, isCanceledName, isStartName,
@@ -22,7 +22,7 @@ import { buildSubtasksLabel, closedDelta, applyChildStatusDelta, countChildProgr
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { createMemberCache } from './member-cache.js';
 import { api, isTransportError, errorDetail } from './api-client.js';
-import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration, registrationRepairMessage, dismissTaskNotifications } from './notifications.js';
+import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration, registrationRepairMessage, dismissTaskNotifications, setNotificationsOnTop } from './notifications.js';
 import { buildDepGraph, collectCycleBlocked } from './dep-graph.js';
 import { tagName } from './tag-match.js';
 import { unregisteredTagNames } from './tag-registration.js';
@@ -50,9 +50,9 @@ import { formSprintValue } from './new-task-sprint.js';
 import { VCS_TYPES, VCS_GIT_FLAGS, buildVcsPatchBody } from './vcs-form.js';
 import { shouldTypeToFilter } from './type-to-filter.js';
 import { piTaskModelIds, piOnlyToolLess, piTaskPinHint } from './pi-task-models.js';
-import { hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkModel, stageBulkDesignMode, resolveBulkAgentModel, bulkPatchBody, bulkCowboyBlockedTaskIds } from './bulk-changes.js';
+import { hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkModel, stageBulkEffort, stageBulkDesignMode, resolveBulkAgentModel, bulkPatchBody, bulkCowboyBlockedTaskIds, BULK_EFFORT_AGENTS } from './bulk-changes.js';
 import { projectPermissionMode, setProjectPermissionMode } from './group-label.js';
-import { buildProjectModeOptions, effectivePermissionMode, permissionModeIcon, permissionModeTip, isAgentPermissionMode, cowboyModeOptions, normalizeCowboyScope } from './permission-mode.js';
+import { buildProjectModeOptions, buildTaskModeOptions, effectivePermissionMode, permissionModeIcon, permissionModeTip, isAgentPermissionMode, cowboyModeOptions, normalizeCowboyScope } from './permission-mode.js';
 import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
 import { syncAllPermissionButtons } from './task-permission-mode.js';
 import {
@@ -3020,12 +3020,28 @@ export function syncActiveSessionsNav() {
   // one mounts — following state.activeTerminal alone dropped the row and repainted it back.
   const openId = getOpenWorkspaceTaskId() || state.activeTerminal?.taskId || null;
   const projectDefault = projectPermissionMode();
+  // (TPT9324) Earliest-started run first. sessionMeta.startedAt is the server's start stamp of the
+  // run (createSession(), kept through every reattach), so a snapshot listing the sessions in
+  // another order never reshuffles the rail. A fresh start orders by its localStartedAt stand-in
+  // (console-modal.js ws.onopen) until that stamp lands. Rows with neither go last; ties by task id.
+  const runStart = (id) => {
+    const meta = state.sessionMeta.get(id);
+    for (const at of [meta?.startedAt, meta?.localStartedAt]) {
+      if (Number.isFinite(at) && at > 0) return at;
+    }
+    return Infinity;
+  };
   const rows = [...new Set([...state.activeSessions, ...state.lostSessions.keys()])]
     // /api/sessions does not filter by session type — keep objective/spec-chat sessions
     // (and their 'obj-'-prefixed synthetic ids) out of what is meant to be a terminal list.
     .filter((id) => (state.sessionMeta.get(id)?.type || 'terminal') === 'terminal')
     .filter((id) => !String(id).startsWith('obj-'))
-    .sort()
+    .sort((a, b) => {
+      const aStart = runStart(a);
+      const bStart = runStart(b);
+      if (aStart !== bStart) return aStart < bStart ? -1 : 1;
+      return String(a).localeCompare(String(b), undefined, { numeric: true });
+    })
     .map((id) => ({
       taskId: id,
       // (TPT413) sessionMeta is authoritative — GET /api/sessions ships the live session's
@@ -3222,7 +3238,8 @@ function _findTaskForBulkStart(id) {
   }
 
   const card = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
-  if (!card) return { id, title: id, description: '', status: startName(), agentAssignee: null, assignee: null };
+  const agentPermissionMode = state.taskPermissionModeById.get(id) ?? null;
+  if (!card) return { id, title: id, description: '', status: startName(), agentAssignee: null, assignee: null, agentPermissionMode };
   return {
     id,
     title: card.querySelector('.card-title')?.textContent?.trim() || id,
@@ -3230,6 +3247,7 @@ function _findTaskForBulkStart(id) {
     status: card.dataset.status || startName(),
     agentAssignee: card.dataset.agentAssignee || null,
     assignee: card.dataset.assignee ? Number(card.dataset.assignee) : null,
+    agentPermissionMode,
   };
 }
 
@@ -3310,6 +3328,11 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // mode toggle's <label> wraps just its own checkbox, never the agent picker.
   // (TPT9212) The Model select sits between the agent picker and Design mode, inside the Agent
   // field: it is part of the agent change. Its <label for> is a sibling, never a wrapper.
+  // (TPT9323) The agent picker is the 2-in-1 Agent + Effort menu (rebuildAgentOptions()); the
+  // hidden #bulk-agent-hint is its trigger's accessible description.
+  // (TPT9322) Permission mode is always offered; Cowboy-Coding mode joins it only while Bypass
+  // is staged (_syncBulkCowboyOptions()). The .bulk-field-pair keeps the two on one row when
+  // the edit fields wrap, like the Task Edit modal's Cowboy row right under Permission mode.
   bar.innerHTML = `
     <div class="bulk-group bulk-group--selection">
       <span class="bulk-count"></span>
@@ -3318,9 +3341,12 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     <div class="bulk-group bulk-group--edit">
       <div class="bulk-field bulk-move-label bulk-move-priority-label" data-bulk-field="priority"><label class="bulk-field-label bulk-move-text" for="bulk-move-input">${t('bulk.moveTo')}</label><div class="sprint-combo sprint-combo--plain bulk-priority-combo" data-id="__bulk__" data-current=""><input id="bulk-move-input" class="sprint-combo-input" type="text" readonly placeholder="${escapeAttr(t('bulk.moveToPlaceholder'))}"><div class="sprint-combo-dropdown" hidden></div></div></div>
       <div class="bulk-field bulk-move-label" data-bulk-field="status"><label class="bulk-field-label bulk-status-text" for="bulk-status-select">${t('bulk.status')}</label><select id="bulk-status-select" class="bulk-status-select" aria-label="${escapeAttr(t('bulk.status'))}"></select></div>
-      <div class="bulk-field bulk-move-label" data-bulk-field="agent"><span class="bulk-field-label bulk-agent-text" id="bulk-agent-label">${t('bulk.agent')}</span><span class="bulk-agent-picker-slot"></span><span class="bulk-model" hidden><label class="bulk-field-label bulk-model-text" for="bulk-model-select">${t('bulk.model')}</label><select id="bulk-model-select" class="bulk-model-select" aria-describedby="bulk-model-hint" title="${escapeAttr(t('bulk.modelHint'))}"></select><span id="bulk-model-hint" hidden>${escapeAttr(t('bulk.modelHint'))}</span></span><label class="bulk-design-mode" hidden title="${escapeAttr(t('bulk.designModeHint'))}"><input type="checkbox" class="bulk-design-mode-input"><span class="bulk-design-mode-text">${t('bulk.designMode')}</span></label></div>
+      <div class="bulk-field bulk-move-label" data-bulk-field="agent"><span class="bulk-field-label bulk-agent-text" id="bulk-agent-label">${t('bulk.agent')}</span><span class="bulk-agent-picker-slot"></span><span id="bulk-agent-hint" hidden>${escapeAttr(t('bulk.agentHint'))}</span><span class="bulk-model" hidden><label class="bulk-field-label bulk-model-text" for="bulk-model-select">${t('bulk.model')}</label><select id="bulk-model-select" class="bulk-model-select" aria-describedby="bulk-model-hint" title="${escapeAttr(t('bulk.modelHint'))}"></select><span id="bulk-model-hint" hidden>${escapeAttr(t('bulk.modelHint'))}</span></span><label class="bulk-design-mode" hidden title="${escapeAttr(t('bulk.designModeHint'))}"><input type="checkbox" class="bulk-design-mode-input"><span class="bulk-design-mode-text">${t('bulk.designMode')}</span></label></div>
       <div class="bulk-field bulk-move-label bulk-assignee-label" data-bulk-field="assignee"><label class="bulk-field-label bulk-assignee-text" for="bulk-assignee-input">${t('bulk.assignee')}</label><span class="bulk-assignee-picker-slot"></span></div>
-      <div class="bulk-field bulk-move-label" data-bulk-field="cowboyScope"><label class="bulk-field-label bulk-cowboy-text" for="bulk-cowboy-select">${t('field.cowboyMode')}</label><select id="bulk-cowboy-select" class="bulk-cowboy-select" aria-describedby="bulk-cowboy-hint"></select><span id="bulk-cowboy-hint" hidden></span></div>
+      <div class="bulk-field-pair">
+        <div class="bulk-field bulk-move-label" data-bulk-field="permissionMode"><label class="bulk-field-label bulk-permission-mode-text" for="bulk-permission-mode-select">${t('bulk.permissionMode')}</label><select id="bulk-permission-mode-select" class="bulk-permission-mode-select" aria-describedby="bulk-permission-mode-hint" title="${escapeAttr(t('bulk.permissionModeHint'))}"></select><span id="bulk-permission-mode-hint" hidden>${escapeAttr(t('bulk.permissionModeHint'))}</span></div>
+        <div class="bulk-field bulk-move-label bulk-cowboy-field" data-bulk-field="cowboyScope" hidden><label class="bulk-field-label bulk-cowboy-text" for="bulk-cowboy-select">${t('field.cowboyMode')}</label><select id="bulk-cowboy-select" class="bulk-cowboy-select" aria-describedby="bulk-cowboy-hint"></select><span id="bulk-cowboy-hint" hidden></span></div>
+      </div>
       <div class="bulk-apply-actions">
         <button type="button" class="btn-bulk-reset bulk-btn bulk-btn--ghost" hidden title="${escapeAttr(t('bulk.resetHint'))}">${t('bulk.reset')}</button>
         <button type="button" class="btn-bulk-apply bulk-btn bulk-btn--primary" disabled title="${escapeAttr(t('bulk.applyIdle'))}">${t('bulk.apply')}</button>
@@ -3367,6 +3393,12 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     syncBulkChanges();
   });
   _syncBulkStatusOptions(bar);
+  bar.querySelector('.bulk-permission-mode-select').addEventListener('change', (event) => {
+    const value = event.currentTarget.value;
+    _bulkChanges = stageBulkField(_bulkChanges, 'permissionMode', value === '__project_default__' ? null : value);
+    syncBulkChanges();
+  });
+  // (TPT9322) Shown only beside a staged Bypass; stageBulkField() ignores a scope without one.
   bar.querySelector('.bulk-cowboy-select').addEventListener('change', (event) => {
     _bulkChanges = stageBulkField(_bulkChanges, 'cowboyScope', event.currentTarget.value);
     syncBulkChanges();
@@ -3607,7 +3639,10 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // as before; Apply checks again against the selection it then has.
   // (TPT9212) Another agent drops the Model pick (stageBulkAgent()), so the Model select starts
   // on the new agent's default, then repaints once fresh project defaults and models arrive.
-  function stageAgent(agentId, { piModel = null } = {}, picker = null) {
+  // (TPT9323) An Effort flyout pick carries `effort` (a level, or null for Agent default) and
+  // stages it with the agent (stageBulkEffort()); a row pick stages the agent alone, so the
+  // tasks keep their own effort unless the same agent's level was already staged.
+  function stageAgent(agentId, { piModel = null, effort } = {}) {
     const ids = [...state.selectedCardIds];
     if (agentId && ids.length && ids.every(id => isAgentLocked(_bulkCardStatus(id)))) {
       showToast(t('bulk.allLocked'), 'error');
@@ -3615,25 +3650,56 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
       return;
     }
     _bulkChanges = stageBulkAgent(_bulkChanges, agentId, piModel);
-    // A re-render while its dropdown was open replaced this picker; show the pick on the new one.
-    if (picker && !picker.isConnected) rebuildAgentOptions();
+    if (effort !== undefined) _bulkChanges = stageBulkEffort(_bulkChanges, effort);
+    // The trigger shows the staged agent and effort, so it is re-rendered from the record.
+    rebuildAgentOptions();
     syncBulkChanges();
     if (agentId && agentId !== 'human') {
       void _refreshBulkModelSources().then(() => { if (bar.isConnected) syncBulkChanges(); });
     }
   }
 
-  function rebuildAgentOptions() {
+  // (TPT9323) The 2-in-1 menu's Effort flyout beside Claude Code and Codex: Agent default (saved
+  // as a cleared effort), then the Task Edit modal's levels, with their labels. `current` is the
+  // staged effort: undefined when none is staged, null for Agent default.
+  function bulkEffortMenu() {
+    return {
+      agents: BULK_EFFORT_AGENTS,
+      heading: t('field.effort'),
+      levels: [{ value: '', label: t('effort.inherit') }, ...EFFORT_LEVELS.map(value => ({ value, label: t(EFFORT_LABELS[value]) }))],
+      current: _bulkChanges.effort,
+      tagTitle: (level) => t('badge.effort', { level }),
+    };
+  }
+
+  // `refresh` is a board refresh (updateBulkActionBar()): (TPT9323) it leaves an open menu alone,
+  // like the Move to combo, so a pointer or keyboard walk through it is never cut short; the next
+  // refresh catches up. Keyboard focus on the trigger moves to its replacement.
+  function rebuildAgentOptions({ refresh = false } = {}) {
     const slot = bar.querySelector('.bulk-agent-picker-slot');
     if (!slot) return;
+    const current = slot.querySelector('.agent-picker');
+    if (refresh && current?._portaledDropdown) return;
+    const hadFocus = slot.contains(document.activeElement);
     const ids = _taskStartAgentIds();
     // A staged agent the project can no longer run is dropped, like a deleted status.
     if (_bulkChanges.agent && !ids.includes(_bulkChanges.agent)) _bulkChanges = stageBulkAgent(_bulkChanges, '');
     // (TPT9212) The picker names the agent only; a Pi row is picked in the Model select beside it.
-    slot.innerHTML = renderAgentPicker('bulkAgent', _bulkChanges.agent || '', false, ids, null, { emptyLabel: t('bulk.agentPlaceholder') });
+    slot.innerHTML = renderAgentPicker('bulkAgent', _bulkChanges.agent || '', false, ids, null, { emptyLabel: t('bulk.agentPlaceholder'), effort: bulkEffortMenu() });
     const picker = slot.querySelector('.agent-picker');
-    if (picker) initAgentPicker(picker, { onChange: (agentId, opts) => stageAgent(agentId, opts, picker) });
-    slot.querySelector('.agent-picker-trigger')?.setAttribute('aria-labelledby', 'bulk-agent-label');
+    if (picker) initAgentPicker(picker, { onChange: (agentId, opts) => stageAgent(agentId, opts) });
+    const trigger = slot.querySelector('.agent-picker-trigger');
+    if (!trigger) return;
+    // Named "Agent" plus what the trigger shows (agent and effort); the hint says where the
+    // effort levels are, after the Pi pin hint when there is one.
+    trigger.id = 'bulk-agent-trigger';
+    trigger.setAttribute('aria-labelledby', 'bulk-agent-label bulk-agent-trigger');
+    trigger.setAttribute('aria-describedby', 'bulk-agent-hint');
+    const hint = t('bulk.agentHint');
+    trigger.title = [trigger.title, hint].filter(Boolean).join('\n');
+    bar.querySelector('#bulk-agent-hint').textContent = hint;
+    picker.querySelector('.agent-picker-dropdown')?.setAttribute('aria-labelledby', 'bulk-agent-label');
+    if (hadFocus) trigger.focus();
   }
 
   // (TPT9212) The Model select lists the staged agent's available models (_bulkModelSource())
@@ -3766,9 +3832,10 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // (TPT9159) Paints the staged record onto the bar: staged fields get a marker, Design mode
   // shows only beside a staged Claude, Apply and Reset wake up, and Start and Deps wait —
   // Start would run on the saved agent, and both clear the selection the edits are staged on.
-  function syncBulkChanges() {
+  function syncBulkChanges(projectDefault = projectPermissionMode()) {
     syncBulkModelOptions();
     const staged = stagedBulkFields(_bulkChanges);
+    _syncBulkPermissionModeOptions(bar, projectDefault);
     _syncBulkCowboyOptions(bar);
     const dirty = staged.length > 0;
     bar.classList.toggle('bulk-action-bar--staged', dirty);
@@ -3817,7 +3884,7 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     bar.querySelector('.bulk-status-select')?.focus();
   });
 
-  bar._rebuildAgentOptions = rebuildAgentOptions;
+  bar._rebuildAgentOptions = () => rebuildAgentOptions({ refresh: true });
   bar._syncBulkChanges = syncBulkChanges;
   bar._discardBulkChanges = discardBulkChanges;
   rebuildAgentOptions();
@@ -3863,8 +3930,26 @@ function _syncBulkStatusOptions(bar) {
   select.value = _bulkChanges.status || '';
 }
 
+// (TPT9322) Offered for every selection: each selected task takes the override, agent-locked
+// ones included. The hint says Bypass also brings up Cowboy-Coding mode.
+function _syncBulkPermissionModeOptions(bar, projectDefault) {
+  const select = bar.querySelector('.bulk-permission-mode-select');
+  select.innerHTML = `<option value="">${escapeAttr(t('bulk.permissionModePlaceholder'))}</option>`
+    + buildTaskModeOptions(_bulkChanges.permissionMode, projectDefault, t).map(option => `<option value="${option.value || '__project_default__'}">${escapeAttr(option.label)}</option>`).join('');
+  select.value = _bulkChanges.permissionMode === null ? '__project_default__' : (_bulkChanges.permissionMode ?? '');
+  const hint = t('bulk.permissionModeHint');
+  select.title = hint;
+  bar.querySelector('#bulk-permission-mode-hint').textContent = hint;
+  bar.querySelector('.bulk-permission-mode-text').textContent = t('bulk.permissionMode');
+}
+
+// (TPT9322) Cowboy-Coding mode shows only while Bypass is the staged permission mode. Any other
+// pick (Plan, Auto, Project Default) or unstaging the mode drops the scope (stageBulkField()),
+// and the field hides with it. With Bypass staged every selected task starts in Bypass, so all
+// scopes are offered; Apply still re-checks with bulkCowboyBlockedTaskIds() before writing.
 function _syncBulkCowboyOptions(bar) {
   const select = bar.querySelector('.bulk-cowboy-select');
+  select.closest('[data-bulk-field]').hidden = _bulkChanges.permissionMode !== 'bypass';
   select.innerHTML = `<option value="">${escapeAttr(t('bulk.cowboyPlaceholder'))}</option>`
     + cowboyModeOptions(_bulkChanges.cowboyScope, t).map(option => `<option value="${option.value}">${escapeAttr(option.label)}</option>`).join('');
   select.value = _bulkChanges.cowboyScope ?? '';
@@ -3964,7 +4049,7 @@ export function updateBulkActionBar() {
 
   if (bar._rebuildAgentOptions) bar._rebuildAgentOptions();
   if (bar._refreshBulkAssigneePicker) bar._refreshBulkAssigneePicker();
-  if (bar._syncBulkChanges) bar._syncBulkChanges();
+  if (bar._syncBulkChanges) bar._syncBulkChanges(projectPermissionMode());
 }
 
 // ── Agent assignment modal ──
@@ -4319,9 +4404,51 @@ function _applyAgentPickerSelection(draft, value, { piModel } = {}, emptyValue =
   if (value === 'pi') draft.piModel = piModel || null;
 }
 
+// ── (TPT9323) Effort flyout of the bulk bar's 2-in-1 Agent + Effort menu ──
+const _FLYOUT_CARET_SVG = '<svg class="agent-picker-flyout-caret" viewBox="0 0 6 10" width="6" height="10" fill="none" aria-hidden="true"><path d="M1 1l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const _EFFORT_CHECK_SVG = '<svg class="agent-picker-effort-check" viewBox="0 0 12 10" width="12" height="10" fill="none" aria-hidden="true"><path d="M1 5.2l3.4 3.3L11 1.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+// Four rising bars with the level's rank filled (low 1 … max 4); Agent default leaves all four
+// faint. Colored per level by CSS, like the card's .effort-badge.
+function _effortBarsSvg(value) {
+  const rank = EFFORT_LEVELS.indexOf(value) + 1;
+  const bars = [0, 1, 2, 3].map((i) => {
+    const h = 4 + i * 2.5;
+    return `<rect x="${1 + i * 3.5}" y="${13 - h}" width="2.3" height="${h}" rx="0.7"${i < rank ? '' : ' class="is-off"'}/>`;
+  }).join('');
+  return `<svg class="agent-picker-effort-bars" viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">${bars}</svg>`;
+}
+
+// `effort.levels` rows are { value, label }, value '' = Agent default; `level` is the staged
+// level of this row's agent: a level, null (Agent default) or undefined (none staged).
+function _effortLevelLabel(effort, level) {
+  return effort.levels?.find(row => (row.value || null) === (level ?? null))?.label || String(level ?? '');
+}
+
+function _effortTagHtml(effort, level) {
+  const label = _effortLevelLabel(effort, level);
+  const title = effort.tagTitle ? effort.tagTitle(label) : label;
+  return `<span class="agent-picker-effort-tag agent-picker-effort-tag--${escapeAttr(level || 'default')}" title="${escapeAttr(title)}">${_effortBarsSvg(level)}<span class="agent-picker-effort-text">${escapeAttr(label)}</span></span>`;
+}
+
+function _effortFlyoutHtml(effort, level) {
+  const heading = escapeAttr(effort.heading || '');
+  const items = (effort.levels || []).map(({ value, label }) => {
+    const checked = level !== undefined && (value || null) === (level ?? null);
+    return `<li class="agent-picker-effort agent-picker-effort--${escapeAttr(value || 'default')}${checked ? ' active' : ''}" role="menuitemradio" aria-checked="${checked}" tabindex="-1" data-effort="${escapeAttr(value || '')}">${_effortBarsSvg(value)}<span class="agent-picker-effort-text">${escapeAttr(label)}</span>${checked ? _EFFORT_CHECK_SVG : ''}</li>`;
+  }).join('');
+  return `${_FLYOUT_CARET_SVG}<ul class="agent-picker-submenu" role="menu" aria-label="${heading}" hidden><li class="agent-picker-submenu-heading" role="none" aria-hidden="true">${heading}</li>${items}</ul>`;
+}
+
 // `emptyLabel` renames the empty first option — the bulk bar's reads "Change agent…", since
 // there it means "no change", not "unassigned".
-export function renderAgentPicker(name, currentValue, disabled, agents, currentPiModel = null, { emptyLabel } = {}) {
+// (TPT9323) `effort` makes the list the bulk bar's 2-in-1 Agent + Effort menu (_bulkEffortMenu()):
+// the row of each agent in `effort.agents` opens a flyout of `effort.levels` ({ value, label },
+// value '' = Agent default) under the `effort.heading` caption to its right, so one pick names
+// the agent and its effort, and the rows become keyboard menu items (initAgentPicker()).
+// `effort.current` is the staged effort of `currentValue` — undefined when none is staged, null
+// for Agent default — shown in the trigger after the agent and checked in its flyout.
+export function renderAgentPicker(name, currentValue, disabled, agents, currentPiModel = null, { emptyLabel, effort = null } = {}) {
   const allOpts = [
     { id: '', piModel: null, label: emptyLabel || t('agent.unassigned'), icon: '' },
     ...agents.map(_normalizeAgentPickerOption),
@@ -4334,13 +4461,23 @@ export function renderAgentPicker(name, currentValue, disabled, agents, currentP
   const pinHint = currentValue === 'pi' ? piTaskPinHint(state.objectiveProviders, currentPiModel, t) : '';
   const title = [disabled ? t('tooltip.cannotReassign') : '', pinHint].filter(Boolean).join('\n');
   const titleAttr = title ? ` title="${escapeAttr(title)}"` : '';
+  const effortAgents = effort ? new Set(effort.agents || []) : null;
+  const effortTag = effortAgents?.has(cur.id) && effort.current !== undefined ? _effortTagHtml(effort, effort.current) : '';
+  const option = (o) => {
+    const active = _agentPickerOptionMatches(o, currentValue, currentPiModel);
+    const flyout = effortAgents?.has(o.id) ? _effortFlyoutHtml(effort, active ? effort.current : undefined) : '';
+    const menuAttrs = effortAgents
+      ? ` role="menuitem" tabindex="-1"${active ? ' aria-current="true"' : ''}${flyout ? ' aria-haspopup="menu" aria-expanded="false"' : ''}`
+      : '';
+    return `<li class="agent-picker-option${active ? ' active' : ''}${flyout ? ' agent-picker-option--has-effort' : ''}" data-value="${escapeAttr(o.id)}" data-pi-model="${escapeAttr(o.piModel || '')}"${o.title ? ` title="${escapeAttr(o.title)}"` : ''}${menuAttrs}>${o.icon}<span>${escapeAttr(o.label)}</span>${flyout}</li>`;
+  };
   return `
-    <div class="agent-picker${disabledClass}" data-name="${escapeAttr(name)}" data-pi-model="${escapeAttr(currentPiModel || '')}"${titleAttr}>
-      <button type="button" class="agent-picker-trigger"${disabled ? ' tabindex="-1"' : ''}${titleAttr}>
-        ${cur.icon}<span class="agent-picker-label">${escapeAttr(cur.label)}</span>${_CARET_SVG}
+    <div class="agent-picker${disabledClass}${effortAgents ? ' agent-picker--effort' : ''}" data-name="${escapeAttr(name)}" data-pi-model="${escapeAttr(currentPiModel || '')}"${titleAttr}>
+      <button type="button" class="agent-picker-trigger"${disabled ? ' tabindex="-1"' : ''}${effortAgents ? ' aria-haspopup="menu" aria-expanded="false"' : ''}${titleAttr}>
+        ${cur.icon}<span class="agent-picker-label">${escapeAttr(cur.label)}</span>${effortTag}${_CARET_SVG}
       </button>
-      <ul class="agent-picker-dropdown" hidden>
-        ${allOpts.map(o => `<li class="agent-picker-option${_agentPickerOptionMatches(o, currentValue, currentPiModel) ? ' active' : ''}" data-value="${escapeAttr(o.id)}" data-pi-model="${escapeAttr(o.piModel || '')}"${o.title ? ` title="${escapeAttr(o.title)}"` : ''}>${o.icon}<span>${escapeAttr(o.label)}</span></li>`).join('')}
+      <ul class="agent-picker-dropdown${effortAgents ? ' agent-picker-dropdown--effort' : ''}"${effortAgents ? ' role="menu"' : ''} hidden>
+        ${allOpts.map(option).join('')}
       </ul>
       <input type="hidden" name="${escapeAttr(name)}" value="${escapeAttr(currentValue || '')}" data-pi-model="${escapeAttr(currentPiModel || '')}">
     </div>`;
@@ -4372,6 +4509,8 @@ export function initAgentPicker(pickerEl, { onChange } = {}) {
 
   let _scrollHandler = null;
   let _resizeHandler = null;
+  // (TPT9323) The Agent + Effort menu's flyouts and keyboard, wired below for an `effort` picker.
+  let effortMenu = null;
 
   function positionDropdown() {
     const rect = trigger.getBoundingClientRect();
@@ -4383,9 +4522,12 @@ export function initAgentPicker(pickerEl, { onChange } = {}) {
     } else {
       dropdown.style.top = (rect.bottom + 3) + 'px';
     }
+    effortMenu?.placeFlyout();
   }
 
   function closeDropdown() {
+    effortMenu?.closeFlyout();
+    if (effortMenu) trigger.setAttribute('aria-expanded', 'false');
     if (_scrollHandler) { window.removeEventListener('scroll', _scrollHandler, true); _scrollHandler = null; }
     if (_resizeHandler) { window.removeEventListener('resize', _resizeHandler); _resizeHandler = null; }
     dropdown.hidden = true;
@@ -4420,6 +4562,7 @@ export function initAgentPicker(pickerEl, { onChange } = {}) {
     window.addEventListener('scroll', _scrollHandler, true);
     window.addEventListener('resize', _resizeHandler);
     _openAgentPickerClose = closeDropdown;
+    if (effortMenu) trigger.setAttribute('aria-expanded', 'true');
   }
 
   trigger.addEventListener('click', (e) => {
@@ -4428,31 +4571,215 @@ export function initAgentPicker(pickerEl, { onChange } = {}) {
       closeDropdown();
     } else {
       openDropdown();
+      // (TPT9323) A keyboard click (Enter or Space: detail 0) takes focus into the menu.
+      if (effortMenu && e.detail === 0) effortMenu.focusRow();
     }
   });
 
-  pickerEl.querySelectorAll('.agent-picker-option').forEach(opt => {
+  // `extra` rides to onChange beside piModel — (TPT9323) { effort } for an Effort flyout pick:
+  // a level, or null for Agent default. Focus left inside the closing menu goes back to the trigger.
+  function pick(opt, extra = {}) {
+    const value = opt.dataset.value;
+    const piModel = value === 'pi' ? (opt.dataset.piModel || null) : null;
+    hiddenInput.value = value;
+    hiddenInput.dataset.piModel = piModel || '';
+    pickerEl.dataset.piModel = piModel || '';
+    dropdown.querySelectorAll('.agent-picker-option').forEach(o => o.classList.toggle('active', o === opt));
+    const icon = value ? _agentPickerIcon(value) : '';
+    const label = opt.querySelector('span')?.textContent || _AGENT_PICKER_LABELS[value] || t('agent.unassigned');
+    trigger.innerHTML = `${icon}<span class="agent-picker-label">${escapeAttr(label)}</span>${_CARET_SVG}`;
+    const pinHint = value === 'pi' ? piTaskPinHint(state.objectiveProviders, piModel, t) : '';
+    for (const el of [pickerEl, trigger]) {
+      if (pinHint) el.setAttribute('title', pinHint);
+      else el.removeAttribute('title');
+    }
+    const refocus = dropdown.contains(document.activeElement);
+    closeDropdown();
+    if (refocus) trigger.focus();
+    hiddenInput.dispatchEvent(new Event('change', { bubbles: true }));
+    if (onChange) onChange(value, { piModel, ...extra });
+  }
+
+  dropdown.querySelectorAll('.agent-picker-option').forEach(opt => {
     opt.addEventListener('click', (e) => {
       e.stopPropagation();
-      const value = opt.dataset.value;
-      const piModel = value === 'pi' ? (opt.dataset.piModel || null) : null;
-      hiddenInput.value = value;
-      hiddenInput.dataset.piModel = piModel || '';
-      pickerEl.dataset.piModel = piModel || '';
-      pickerEl.querySelectorAll('.agent-picker-option').forEach(o => o.classList.toggle('active', o === opt));
-      const icon = value ? _agentPickerIcon(value) : '';
-      const label = opt.querySelector('span')?.textContent || _AGENT_PICKER_LABELS[value] || t('agent.unassigned');
-      trigger.innerHTML = `${icon}<span class="agent-picker-label">${escapeAttr(label)}</span>${_CARET_SVG}`;
-      const pinHint = value === 'pi' ? piTaskPinHint(state.objectiveProviders, piModel, t) : '';
-      for (const el of [pickerEl, trigger]) {
-        if (pinHint) el.setAttribute('title', pinHint);
-        else el.removeAttribute('title');
-      }
-      closeDropdown();
-      hiddenInput.dispatchEvent(new Event('change', { bubbles: true }));
-      if (onChange) onChange(value, { piModel });
+      pick(opt);
     });
   });
+
+  if (pickerEl.classList.contains('agent-picker--effort')) {
+    effortMenu = _wireAgentEffortMenu({ trigger, dropdown, isOpen: () => !dropdown.hidden, open: openDropdown, close: closeDropdown, pick });
+  }
+}
+
+// (TPT9323) Flyouts and keyboard of the bulk bar's 2-in-1 Agent + Effort menu (renderAgentPicker()
+// `effort`). Rows are menu items with roving focus: ArrowDown/ArrowUp/Home/End move between them,
+// Enter or Space picks the row's agent alone, and ArrowRight opens a Claude Code or Codex row's
+// Effort flyout on its checked level (else the first). In the flyout ArrowDown/ArrowUp/Home/End
+// move, Enter or Space picks the agent and the level together, and ArrowLeft or Escape goes back
+// to the row. Escape on a row closes the menu, and Tab closes it and lets focus move on from the
+// trigger; ArrowDown/ArrowUp on the trigger open it. Keys stop at the menu, so the board's
+// type-to-filter never takes a keystroke meant for it. The pointer opens a row's flyout on hover,
+// or with a click on its chevron; reaching another row while one is open switches after
+// FLYOUT_SWITCH_MS, so a diagonal path into the open flyout over the neighbouring row keeps it.
+const FLYOUT_SWITCH_MS = 160;
+const FLYOUT_EDGE = 8;
+
+function _wireAgentEffortMenu({ trigger, dropdown, isOpen, open, close, pick }) {
+  const rows = () => [...dropdown.children].filter(el => el.classList.contains('agent-picker-option'));
+  const flyoutOf = (row) => row?.querySelector('.agent-picker-submenu') || null;
+  const levels = (row) => [...(flyoutOf(row)?.querySelectorAll('.agent-picker-effort') || [])];
+  let openRow = null;
+  let switchTimer = null;
+  const cancelSwitch = () => {
+    if (switchTimer) clearTimeout(switchTimer);
+    switchTimer = null;
+  };
+
+  // Right of the row; left of it when the viewport ends first, and shifted up or down to stay
+  // FLYOUT_EDGE inside it (the bulk bar sits at the bottom, so its menu opens upward).
+  function placeFlyout() {
+    const flyout = flyoutOf(openRow);
+    if (!flyout || flyout.hidden) return;
+    flyout.classList.remove('agent-picker-submenu--flip');
+    flyout.style.marginTop = '';
+    const rect = flyout.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    if (rect.right > window.innerWidth - FLYOUT_EDGE) flyout.classList.add('agent-picker-submenu--flip');
+    let shift = 0;
+    if (rect.bottom > window.innerHeight - FLYOUT_EDGE) shift = window.innerHeight - FLYOUT_EDGE - rect.bottom;
+    if (rect.top + shift < FLYOUT_EDGE) shift = FLYOUT_EDGE - rect.top;
+    if (shift) flyout.style.marginTop = `${Math.round(shift)}px`;
+  }
+
+  function closeFlyout() {
+    cancelSwitch();
+    if (!openRow) return;
+    const flyout = flyoutOf(openRow);
+    if (flyout) {
+      flyout.hidden = true;
+      flyout.classList.remove('agent-picker-submenu--flip');
+      flyout.style.marginTop = '';
+    }
+    openRow.classList.remove('is-open');
+    openRow.setAttribute('aria-expanded', 'false');
+    openRow = null;
+  }
+
+  function openFlyout(row, { focus = false } = {}) {
+    cancelSwitch();
+    const flyout = flyoutOf(row);
+    if (!flyout) return;
+    if (openRow !== row) {
+      closeFlyout();
+      openRow = row;
+      row.classList.add('is-open');
+      row.setAttribute('aria-expanded', 'true');
+      flyout.hidden = false;
+      placeFlyout();
+    }
+    if (focus) {
+      const list = levels(row);
+      (list.find(el => el.classList.contains('active')) || list[0])?.focus();
+    }
+  }
+
+  function focusRow(which = 'current') {
+    const list = rows();
+    const row = which === 'first' ? list[0] : which === 'last' ? list.at(-1)
+      : (list.find(el => el.classList.contains('active')) || list[0]);
+    row?.focus();
+  }
+
+  function step(list, current, key) {
+    if (!list.length) return;
+    const i = list.indexOf(current);
+    const next = key === 'Home' ? 0 : key === 'End' ? list.length - 1
+      : key === 'ArrowDown' ? (i + 1) % list.length : (i - 1 + list.length) % list.length;
+    list[next].focus();
+  }
+
+  const pickLevel = (row, item) => pick(row, { effort: item.dataset.effort || null });
+
+  for (const row of rows()) {
+    const flyout = flyoutOf(row);
+    row.addEventListener('mouseenter', () => {
+      // One highlight: while the keyboard is in the menu, the pointer's row takes the focus.
+      if (dropdown.contains(document.activeElement) && !row.contains(document.activeElement)) row.focus({ preventScroll: true });
+      if (row === openRow) { cancelSwitch(); return; }
+      if (!openRow) { if (flyout) openFlyout(row); return; }
+      cancelSwitch();
+      switchTimer = setTimeout(() => {
+        switchTimer = null;
+        if (!isOpen()) return;
+        if (flyout) openFlyout(row);
+        else closeFlyout();
+      }, FLYOUT_SWITCH_MS);
+    });
+    if (!flyout) continue;
+    // The chevron opens the flyout instead of picking the row's agent: the way in without
+    // hovering (a touch screen, a pen).
+    row.querySelector('.agent-picker-flyout-caret')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openFlyout(row, { focus: dropdown.contains(document.activeElement) });
+    });
+    flyout.addEventListener('mouseenter', cancelSwitch);
+    // A click on the caption or the flyout's padding picks nothing (the row would pick its agent).
+    flyout.addEventListener('click', (e) => e.stopPropagation());
+    for (const item of levels(row)) {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        pickLevel(row, item);
+      });
+      item.addEventListener('mouseenter', () => {
+        if (dropdown.contains(document.activeElement)) item.focus({ preventScroll: true });
+      });
+    }
+  }
+
+  dropdown.addEventListener('keydown', (e) => {
+    const row = e.target.closest?.('.agent-picker-option');
+    if (!row || !dropdown.contains(row)) return;
+    const item = e.target.closest('.agent-picker-effort');
+    const key = e.key;
+    if (key === 'Tab') {
+      close();
+      trigger.focus();
+      return;
+    }
+    e.stopPropagation();
+    const move = key === 'ArrowDown' || key === 'ArrowUp' || key === 'Home' || key === 'End';
+    if (item) {
+      if (move) step(levels(row), item, key);
+      else if (key === 'ArrowLeft' || key === 'Escape') { closeFlyout(); row.focus(); }
+      else if (key === 'Enter' || key === ' ') pickLevel(row, item);
+      else return;
+      e.preventDefault();
+      return;
+    }
+    if (move) { closeFlyout(); step(rows(), row, key); }
+    else if (key === 'ArrowRight' && flyoutOf(row)) openFlyout(row, { focus: true });
+    else if (key === 'ArrowLeft') closeFlyout();
+    else if (key === 'Escape') { close(); trigger.focus(); }
+    else if (key === 'Enter' || key === ' ') pick(row);
+    else return;
+    e.preventDefault();
+  });
+
+  trigger.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!isOpen()) open();
+      focusRow(e.key === 'ArrowUp' ? 'last' : 'current');
+    } else if (e.key === 'Escape' && isOpen()) {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  });
+
+  return { placeFlyout, closeFlyout, focusRow };
 }
 
 // Shared controls and caches used by Task Edit, New Task, and bulk actions.
@@ -5622,6 +5949,8 @@ const _SETTINGS_TEXT = [
   ['settings-notifications-label', 'settings.notifDesktop'],
   ['settings-notifications-row-hint', 'settings.notifDesktopHint'],
   ['settings-notifications-test', 'settings.notifTest'],
+  ['settings-notifications-ontop-label', 'settings.notifOnTop'],
+  ['settings-notifications-ontop-hint', 'settings.notifOnTopHint'],
   ['settings-debug-title', 'settings.debug'],
   ['settings-debug-label', 'settings.debugPerfLog'],
   ['settings-debug-perf-note', 'settings.debugPerfLogHint'],
@@ -7481,12 +7810,35 @@ async function _populateSettingsNotificationsRows() {
       || (status.transport === 'web' && status.permission === 'denied');
   }
 
+  // "Show on top of other apps" — the app-level flag main persists, also written by View ▸
+  // Notifications and the banner's "Show" box. Electron only: browser mode has no always-on-top
+  // banner, so the row stays hidden there. The switch shows the saved choice, which is not
+  // always the delivery in use: off with native delivery blocked still sends banners (the
+  // fallback the notice below explains).
+  const onTopRow = document.getElementById('settings-notifications-ontop-row');
+  const onTopToggle = document.getElementById('settings-notifications-ontop');
+  // Why the banner stands in for native notifications while the switch is off, or null.
+  const fallback = status.delivery === 'desktop' ? (status.fallback || null) : null;
+  // A desktop banner that could not be shown outranks every native-delivery message.
+  const desktopFailed = status.delivery === 'desktop' && !!status.lastError;
+  if (onTopRow && onTopToggle) {
+    onTopRow.hidden = typeof window.electronAPI?.setNotificationsOnTop !== 'function';
+    onTopToggle.checked = status.onTop !== false;
+    onTopToggle.disabled = typeof status.onTop !== 'boolean';
+    onTopToggle.setAttribute('aria-describedby', fallback && !desktopFailed
+      ? 'settings-notifications-ontop-hint settings-notifications-hint-text'
+      : 'settings-notifications-ontop-hint');
+  }
+
   if (hintEl) {
-    const repairFailed = status.delivery !== 'desktop' && status.registrationRepair && !status.registrationRepair.ok;
+    // What stops native delivery: the fallback's reason, or the native path's own error.
+    const cause = fallback || (status.delivery === 'desktop' ? null : status.lastError);
+    const repairFailed = (status.delivery !== 'desktop' || !!fallback) && status.registrationRepair && !status.registrationRepair.ok;
     const blocked = status.transport === 'unsupported'
       || status.permission === 'denied'
       || (status.transport === 'electron' && status.lastError)
-      || repairFailed;
+      || repairFailed
+      || !!fallback;
     // (C1125) 'unsigned' gets its own hint — "notifications blocked, go check System
     // Settings" sends the user chasing a permission that was never the problem.
     // (C1141) 'seal-broken' likewise — the bundle WAS signed, but its seal broke at runtime
@@ -7498,27 +7850,34 @@ async function _populateSettingsNotificationsRows() {
     // (C1355) 'not-registered' gets a more specific hint when the actual cause (other bundles
     // claiming the same identifier) is known — falls back to the generic not-registered hint
     // when conflicts is null/0 (e.g. non-darwin, or the LaunchServices check itself failed).
+    // The count is pluralized per locale (tc()): "1 other copy is", "8 other copies are".
     const mountedVolume = status.installerVolumes?.[0];
     const notRegisteredHint = status.conflicts
       ? (mountedVolume
-        ? t('settings.notifHintDuplicateBundlesWithVolume', { count: status.conflicts, volume: mountedVolume.split('/')[2] })
-        : t('settings.notifHintDuplicateBundles', { count: status.conflicts }))
+        ? tc('settings.notifHintDuplicateBundlesWithVolume', status.conflicts, { volume: mountedVolume.split('/')[2] })
+        : tc('settings.notifHintDuplicateBundles', status.conflicts))
       : t('settings.notifHintNotRegistered');
     if (hintTextEl) {
-      hintTextEl.textContent = status.transport === 'unsupported' ? t('settings.notifHintUnsupported')
-        : status.lastError === 'unsigned' ? t('settings.notifHintUnsigned')
-        : status.lastError === 'seal-broken' ? t('settings.notifHintSealBroken')
+      const text = status.transport === 'unsupported' ? t('settings.notifHintUnsupported')
+        : cause === 'unsigned' ? t('settings.notifHintUnsigned')
+        : cause === 'seal-broken' ? t('settings.notifHintSealBroken')
         : repairFailed ? registrationRepairMessage(status.registrationRepair, t)
-        : status.lastError === 'not-registered' ? notRegisteredHint
+        : cause === 'not-registered' ? notRegisteredHint
+        : fallback ? t('settings.notifHintFallbackCheck')
         : (blocked ? t('settings.notifHintBlocked') : '');
+      // The fallback is no failure — alerts still arrive — so its notice opens by saying where
+      // they go, then names what keeps system notifications away.
+      hintTextEl.textContent = desktopFailed ? t('settings.notifHintDesktopFailed')
+        : (fallback && text ? t('settings.notifHintFallback', { cause: text }) : text);
     }
-    if (status.delivery === 'desktop' && status.lastError && hintTextEl) hintTextEl.textContent = t('settings.notifHintDesktopFailed');
     hintEl.hidden = !blocked || !hintTextEl?.textContent;
     // (C1355) Repair button only makes sense when there's an actual duplicate-claimant conflict
     // to fix — for every other blocked reason (unsigned, seal-broken, denied, unsupported) it
-    // would just fail with nothing to repair.
+    // would just fail with nothing to repair. It stays reachable during the banner fallback:
+    // that is the state a Mac with duplicate registrations is in whenever the switch is off.
     if (repairBtn) {
-      repairBtn.hidden = !(status.delivery !== 'desktop' && (repairFailed || (status.lastError === 'not-registered' && status.conflicts > 0)));
+      const nativePath = status.delivery !== 'desktop' || !!fallback;
+      repairBtn.hidden = desktopFailed || !(nativePath && (repairFailed || (cause === 'not-registered' && status.conflicts > 0)));
       repairBtn.textContent = t('settings.notifRepairBtn');
     }
   }
@@ -7765,11 +8124,27 @@ export function initSettingsModal() {
       _populateSettingsNotificationsRows();
     });
   }
-  // (TPT487/TPT505) "Show on Top" lives in View ▸ Notifications and on the banner now; when it
-  // flips, the open modal's status badge/hints re-read the delivery mode.
+  // "Show on Top": this switch, View ▸ Notifications and the banner's "Show" box write one
+  // app-level flag (TPT487/TPT505). The switch applies on change. A write that never reached
+  // the flag puts the switch back (the re-read below); one that applied but could not be saved
+  // for the next launch keeps it and says so.
+  const notifOnTopToggle = modal.querySelector('#settings-notifications-ontop');
+  if (notifOnTopToggle) {
+    notifOnTopToggle.addEventListener('change', async () => {
+      const res = await setNotificationsOnTop(notifOnTopToggle.checked);
+      if (!res.ok) {
+        showToast(t(typeof res.enabled === 'boolean' ? 'settings.notifOnTopNotSaved' : 'settings.notifOnTopFailed'), 'error');
+      }
+      _populateSettingsNotificationsRows();
+    });
+  }
+  // Whoever flips the flag, the open modal follows: the switch at once, the status badge and
+  // notices once the delivery mode is re-read.
   try {
-    window.electronAPI?.onNotificationsOnTopChanged?.(() => {
-      if (document.getElementById('settings-modal')?.classList.contains('open')) _populateSettingsNotificationsRows();
+    window.electronAPI?.onNotificationsOnTopChanged?.((change) => {
+      if (!document.getElementById('settings-modal')?.classList.contains('open')) return;
+      if (notifOnTopToggle && typeof change?.enabled === 'boolean') notifOnTopToggle.checked = change.enabled;
+      _populateSettingsNotificationsRows();
     });
   } catch (_) {}
   // (C1259) Debug ▸ click-to-render perf logging toggle + log-path hint buttons — wired

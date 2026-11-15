@@ -263,14 +263,15 @@ test('a teardown/restart during localization never spawns the stale turn and lea
   assert.equal(h.session._spawning, 'restart-spawn', 'the newer spawn keeps ownership');
 });
 
-for (const resumed of [false, true]) {
-  test(`Codex task chat spawn retains effort, credentials and tool policy (${resumed ? 'resume' : 'fresh'})`, async t => {
+for (const kind of ['objective', 'task', 'project']) for (const resumed of [false, true]) {
+  test(`Codex ${kind} chat spawn retains effort, credentials and tool policy (${resumed ? 'resume' : 'fresh'})`, async t => {
     const config = require('../config');
     const effort = config.OBJECTIVE_EFFORT;
     config.OBJECTIVE_EFFORT = 'max';
     t.after(() => { config.OBJECTIVE_EFFORT = effort; });
     const h = harness(t);
-    Object.assign(h.session, { type: 'taskChat', toolProfile: 'taskChat', taskKey: 'TPT497',
+    Object.assign(h.session, { type: kind === 'objective' ? 'objective' : 'taskChat',
+      toolProfile: kind === 'objective' ? null : 'taskChat', taskKey: kind === 'task' ? 'TPT497' : null,
       projectPath: '/fixture/project', codexSessionId: resumed ? 'fixture-thread' : null });
     h.codex.spawnCodexTurn(h.session, 'taskChat:TPT497');
     h.releaseLocalize();
@@ -280,6 +281,8 @@ for (const resumed of [false, true]) {
     assert.equal(options.cwd, '/fixture/project');
     assert.equal(options.env.TIPATASK_API_TOKEN, 'fixture-token');
     assert.ok(args.includes('model_reasoning_effort="xhigh"'));
+    assert.ok(args.includes('features.apps=false'));
+    assert.ok(args.includes('features.plugins=false'));
     assert.ok(args.includes('mcp_servers.tipatask-local.enabled_tools=["batch_grep_tags"]'));
     assert.ok(args.includes('mcp_servers={}'));
     assert.ok(args.some(a => a.startsWith('mcp_servers.tipatask.disabled_tools=')));
@@ -307,7 +310,7 @@ for (const code of ['EPERM', 'EINVAL']) {
     });
     fs.mkdirSync(projectRoot);
     fs.mkdirSync(globalHome);
-    fs.writeFileSync(path.join(globalHome, 'config.toml'), '');
+    fs.writeFileSync(path.join(globalHome, 'config.toml'), '[features]\napps=true\nplugins=true\n');
     const auth = '{"token":"synthetic-codex-auth"}';
     fs.writeFileSync(path.join(globalHome, 'auth.json'), auth);
     process.env.CODEX_HOME = globalHome;
@@ -323,6 +326,9 @@ for (const code of ['EPERM', 'EINVAL']) {
     const terminalAuth = path.join(spec.env.CODEX_HOME, 'auth.json');
     assert.equal(fs.lstatSync(terminalAuth).isFile(), true);
     assert.equal(fs.readFileSync(terminalAuth, 'utf8'), auth);
+    const terminalConfigPath = path.join(spec.env.CODEX_HOME, 'config.toml');
+    const terminalConfig = fs.readFileSync(terminalConfigPath, 'utf8');
+    assert.ok(!spec.args.includes('features.apps=false') && !spec.args.includes('features.plugins=false'));
 
     const h = harness(t, { realEnv: true });
     Object.assign(h.session, { type: 'taskChat', toolProfile: 'taskChat', projectPath: projectRoot });
@@ -332,7 +338,12 @@ for (const code of ['EPERM', 'EINVAL']) {
       h.releaseLocalize();
       await settle(); await settle();
       assert.equal(h.spawned.length, resumed ? 2 : 1, 'chat reaches process spawn without an auth error');
-      const { options } = h.spawned.at(-1).spawnArgs;
+      const { args, options } = h.spawned.at(-1).spawnArgs;
+      assert.ok(args.includes('features.apps=false') && args.includes('features.plugins=false'));
+      const chatConfig = require('toml').parse(fs.readFileSync(path.join(options.env.CODEX_HOME, 'config.toml'), 'utf8'));
+      assert.equal(chatConfig.features.apps, true, 'chat exclusions never replace persisted app defaults');
+      assert.equal(chatConfig.features.plugins, true, 'chat exclusions never replace persisted plugin defaults');
+      assert.equal(fs.readFileSync(terminalConfigPath, 'utf8'), terminalConfig, 'existing terminal config stays intact');
       const chatAuth = path.join(options.env.CODEX_HOME, 'auth.json');
       assert.equal(fs.lstatSync(chatAuth).isFile(), true);
       assert.equal(fs.readFileSync(chatAuth, 'utf8'), auth);

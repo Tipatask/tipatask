@@ -393,6 +393,49 @@ test('(TPT9134) messageCopyText: a user turn without its task_edits note, attach
   assert.equal(m.messageCopyText({ role: 'assistant' }), '');
 });
 
+test('(TPT9296) messageCopyText: streamed, restored and resumed turns all give their whole text, never an empty string', () => {
+  const reply = 'Here is the fix:\n\n```js\nconst a = 1;\n```\n\nDone.';
+  const dialogFence = '\n\n```ask_user\n{"question":"Which?","options":["A","B"]}\n```\n';
+
+  // Streamed: the window's own reply record, grown by `data` frames, closed by `objective-result`
+  // (finishStreaming() keeps the final text and clears `streaming`).
+  const streamed = { role: 'assistant', content: '', streaming: true, dialogs: [], tools: [], taskEvents: [] };
+  for (const chunk of ['Here is the fix:\n\n```js\n', 'const a = 1;\n```\n', '\nDone.']) streamed.content += chunk;
+  assert.equal(m.messageCopyText(streamed), reply, 'the text so far, while it streams');
+  streamed.content = `${reply}${dialogFence}`;
+  streamed.streaming = false;
+  streamed.dialogs.push({ id: 'd1', question: 'Which?', options: ['A', 'B'] });
+  assert.equal(m.messageCopyText(streamed), reply, 'finished, without the dialog fence');
+
+  // Restored: a reattach (`chat-history-reset`) replays the server's history through visibleHistory().
+  const note = buildTaskEditNote([{ task: { id: 'TPT5', title: 'T' }, changed: ['title'] }]);
+  const restored = m.visibleHistory([
+    { role: 'user', content: 'task JSON and the opening ask', seed: true },
+    { role: 'assistant', content: 'Opening reply' },
+    { role: 'user', content: `${note}\n\nAnd rename it.` },
+    { role: 'assistant', content: `${reply}${dialogFence}`, dialogs: [{ id: 'd1', question: 'Which?', options: ['A', 'B'] }] },
+  ]);
+  assert.deepEqual(restored.map(turn => m.messageCopyText(turn)), ['Opening reply', 'And rename it.', reply]);
+
+  // Resumed: `chat-history-resumed` and any later reattach carry the provider's read-back turns
+  // (`restored: true`), then the hidden resume marker, then the turns of the resumed chat.
+  const resumed = m.visibleHistory([
+    { role: 'user', content: 'What was the codeword?', restored: true },
+    { role: 'assistant', content: 'The codeword is **TEAL**.\n\n```sh\necho TEAL\n```', restored: true },
+    { role: 'user', content: '', seed: true, resumed: true, provider: 'claude' },
+    { role: 'user', content: 'Thanks' },
+    { role: 'assistant', content: 'Any time.' },
+  ]);
+  const turns = resumed.filter(turn => turn.role === 'user' || turn.role === 'assistant');
+  assert.deepEqual(turns.map(turn => m.messageCopyText(turn)),
+    ['What was the codeword?', 'The codeword is **TEAL**.\n\n```sh\necho TEAL\n```', 'Thanks', 'Any time.']);
+  assert.deepEqual(turns.map(turn => !!turn.restored), [true, true, false, false]);
+  // The resumed-session line is a notice: no Copy button, nothing to copy.
+  assert.equal(m.messageCopyText(resumed.find(turn => turn.kind === 'resumed')), '');
+
+  for (const turn of [streamed, ...restored, ...turns]) assert.ok(m.messageCopyText(turn).length > 0, turn.content);
+});
+
 test('visibleHistory: a dialog answer turn is left out; a typed user turn stays and loses its task_edits block', () => {
   const note = buildTaskEditNote([{ task: { id: 'TPT5', title: 'T' }, changed: ['title'] }]);
   const asked = { id: 'dlg-1', answer: { selected: ['Backlog'], indexes: [1], other: 'soon' } };

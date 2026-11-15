@@ -35,6 +35,40 @@ const CONSOLE_STATUS_TICK_MS = 500;
 // state.js). Kept as one named constant so the guard and the delayed re-persist can't drift.
 const CHAT_CLEANUP_GUARD_MS = 500;
 
+// OSC 8 links bypass xterm's native dialog and renderer popup path. Keep confirmation
+// local to each terminal and pass the original URL unchanged to the platform opener.
+function createTerminalLinkHandler() {
+  let opening = false;
+  return {
+    allowNonHttpProtocols: true, // Let mailto reach our explicit allowlist.
+    async activate(event, uri) {
+      if (opening || typeof uri !== 'string' || uri.trim() !== uri || /[\u0000-\u001f\u007f]/.test(uri)) return;
+      try {
+        if (!['http:', 'https:', 'mailto:'].includes(new URL(uri).protocol)) return;
+      } catch { return; }
+
+      opening = true;
+      try {
+        if (!(await showActionConfirm({
+          message: t('terminal.confirmOpenLink', { url: `<span style="overflow-wrap: anywhere">${escapeAttr(uri)}</span>` }),
+          confirmLabel: t('terminal.openLink'),
+          overlayClass: 'modal-overlay--over-terminal',
+        }))) return;
+        if (window.electronAPI?.openExternal) {
+          const result = await window.electronAPI.openExternal(uri);
+          if (result?.ok === false) showToast(t('terminal.openLinkFailed'), 'error');
+        } else {
+          window.open(uri, '_blank', 'noopener,noreferrer');
+        }
+      } catch {
+        showToast(t('terminal.openLinkFailed'), 'error');
+      } finally {
+        opening = false;
+      }
+    },
+  };
+}
+
 // Shared close guard for terminal sessions. Completed tasks only have a lingering process
 // to clean up, so they can be terminated without prompting; every other status requires an
 // explicit confirmation before session teardown starts. The optional taskId keeps the
@@ -266,6 +300,7 @@ export function openObjectiveConsole() {
     fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", Menlo, Monaco, monospace',
     theme: XTERM_THEME,
     allowProposedApi: true,
+    linkHandler: createTerminalLinkHandler(),
   });
 
   const fitAddon = new FitAddon();
@@ -831,6 +866,7 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
     fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", Menlo, Monaco, monospace',
     theme: XTERM_THEME,
     allowProposedApi: true,
+    linkHandler: createTerminalLinkHandler(),
   });
 
   const fitAddon = new FitAddon();
@@ -1278,8 +1314,12 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
       // row's agent with either; keep the snapshot's value and let the `config` frame that
       // follows (adoptSessionAgent) confirm it. A resumed row not yet seen by any snapshot
       // is left agent-less until that frame lands a few ms later.
+      // (TPT9324) A fresh launch also stamps localStartedAt (this window's clock) so its left-nav
+      // row goes last at once; the row order switches to the server's startedAt as soon as a
+      // frame or GET /api/sessions carries it. Only startedAt identifies the run (the ?startedAt=
+      // reattach check, stale-frame guards), so the local stamp is never sent or compared.
       if (!isResume) {
-        state.sessionMeta.set(taskId, { agent: opts.agent || state.taskAgent, label: state.taskAgentLabel, type: 'terminal', alive: true });
+        state.sessionMeta.set(taskId, { agent: opts.agent || state.taskAgent, label: state.taskAgentLabel, type: 'terminal', alive: true, localStartedAt: Date.now() });
         state.leftUncommitted.delete(taskId); // (TPT613) a new run supersedes the exit-backstop flag
       } else {
         const prevMeta = state.sessionMeta.get(taskId) || { type: 'terminal' };

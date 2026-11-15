@@ -34,7 +34,7 @@ test('setupAuthWeb reports an actionable IPC failure and allows an immediate ret
 test('setupAuthWeb explains how to recover when desktop IPC is unavailable', async () => {
   await assert.rejects(
     setupAuthWeb('https://tt.example.test', null),
-    /Desktop sign-in is unavailable\. Restart TipATask, reopen Open \/ Create Project, and try again\./,
+    /Desktop sign-in is unavailable\. Restart TipATask, choose Open Project or Create Project, and try again\./,
   );
 });
 
@@ -96,15 +96,26 @@ test('visibleSteps: a new project walks all six steps, an existing one skips Pre
   assert.deepEqual(visibleSteps({ existing: true }), [1, 2, 3, 4, 6]);
 });
 
+// (TPT9318) The Open Project entry locks the preset to compose-as-you-go: no Preset step for a
+// new project either.
+test('visibleSteps: a preset-locked run skips Preset for a new and an existing project', () => {
+  assert.deepEqual(visibleSteps({ presetLocked: true }), [1, 2, 3, 4, 6]);
+  assert.deepEqual(visibleSteps({ existing: false, presetLocked: true }), [1, 2, 3, 4, 6]);
+  assert.deepEqual(visibleSteps({ existing: true, presetLocked: true }), [1, 2, 3, 4, 6]);
+  assert.deepEqual(visibleSteps({ existing: false, presetLocked: false }), [1, 2, 3, 4, 5, 6]);
+});
+
 test('existing-project pick skips Preset on both Next and Back, and emits preset: null', () => {
   const src = fs.readFileSync(new URL('./project-creation-wizard.js', import.meta.url), 'utf8');
   // Dots come from visibleSteps(), never a fixed six.
-  assert.match(src, /visibleSteps\(\{ existing: _isExisting\(\) \}\)\.map\(/);
-  // Agent → (Preset | Confirm), Confirm Back → (Preset | Agent).
+  assert.match(src, /visibleSteps\(\{ existing: _isExisting\(\), presetLocked: _presetLocked \}\)\.map\(/);
+  // Agent → (Preset | Confirm), Confirm Back → (Preset | Agent) — one rule for an existing
+  // project and a locked preset (TPT9318).
+  assert.match(src, /function _skipsPreset\(\) \{\n\s+return _isExisting\(\) \|\| _presetLocked;/);
   const step4 = src.slice(src.indexOf('function _renderStep4('), src.indexOf('// ── Step 5'));
-  assert.match(step4, /_goto\(_isExisting\(\) \? 6 : 5\)/);
+  assert.match(step4, /_goto\(_skipsPreset\(\) \? 6 : 5\)/);
   const step6 = src.slice(src.indexOf('function _renderStep6('));
-  assert.match(step6, /_goto\(existing \? 4 : 5\)/);
+  assert.match(step6, /_goto\(_skipsPreset\(\) \? 4 : 5\)/);
   // Captions + payload branch on the same flag.
   assert.match(step6, /existing \? t\('wizard\.confirmExistingProject'\) : t\('wizard\.confirmNewProject'\)/);
   assert.match(step6, /existing \? t\('wizard\.openProjectBtn'\) : t\('wizard\.createProjectBtn'\)/);
@@ -143,7 +154,28 @@ test('template.html: locked Get Started ignores Escape and comes back after a ca
   assert.match(src, /_chooseLocked = _isUnboundWindowSync\(\);/);
   assert.match(src, /_chooseModal\?\.style\.display === 'flex' && !_chooseLocked/);
   assert.match(src, /window\.addEventListener\('show-get-started', \(\) => _showChooseModal\(\)\);/);
-  const fn = src.slice(src.indexOf('async function openOrCreateProject()'), src.indexOf('function _showProjectRenameModal'));
+  const fn = src.slice(src.indexOf('async function openOrCreateProject('), src.indexOf('function _showProjectRenameModal'));
   assert.match(fn, /if \(focusResult\?\.canceled\) \{ if \(unbound\) _showChooseModal\(\); return; \}/);
   assert.match(fn, /if \(unbound\) _showChooseModal\(\);\n\s+\}/);
+});
+
+// (TPT9316) Preset letters follow display order (A = compose the knowledge base as you go), and
+// every value is one the main process knows: the compose value matches project-seeder.js, and
+// the other two are exactly the seeding presets (PRESET_TASKS).
+test('PRESETS: A compose-as-you-go, then the two seeding presets B and C, matching the server', async () => {
+  const { PRESETS, COMPOSE_PRESET } = await import('./project-creation-wizard.js');
+  assert.deepEqual(PRESETS.map((p) => [p.letter, p.mode, p.value]), [
+    ['A', 'compose', 'compose-as-you-go'],
+    ['B', 'new', 'original-specification'],
+    ['C', 'existing', 'existing-code'],
+  ]);
+  assert.equal(COMPOSE_PRESET, 'compose-as-you-go');
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  assert.equal(require('../server/project-seeder.js').COMPOSE_PRESET, COMPOSE_PRESET);
+  assert.deepEqual(
+    PRESETS.filter((p) => p.value !== COMPOSE_PRESET).map((p) => p.value).sort(),
+    Object.keys(require('../cli/seed-setup-tasks.js').PRESET_TASKS).sort(),
+  );
+  for (const p of PRESETS) assert.ok(p.name && p.desc, `${p.letter} has a name and description`);
 });

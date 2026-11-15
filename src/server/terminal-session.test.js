@@ -3303,6 +3303,33 @@ test('terminal kickoff scales the prompt cap against live sessions across projec
   }
 });
 
+// (TPT9317) KB_MODE is read once per spawn from the session's own project config and threaded into
+// getSpawnSpec() as opts.kbMode; with the fetched CODING task row it puts the KB discovery note in
+// the kickoff, a HUMAN row or a non-compose project gets none.
+test('terminal kickoff threads the project KB_MODE into the spawn opts for the KB discovery note', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const roots = [];
+  let mode = 'compose';
+  t.mock.method(BaseTaskAgent, 'resolveKbMode', (root) => { roots.push(root); return mode; });
+  const cases = [
+    { mode: 'compose', task: { id: 'TPT364', category: 'CODING' }, note: true },
+    { mode: 'compose', task: { id: 'TPT364', category: 'HUMAN' }, note: false },
+    { mode: null, task: { id: 'TPT364', category: 'CODING' }, note: false },
+  ];
+  for (const c of cases) {
+    mode = c.mode;
+    const captures = [];
+    const kickoff = await startClaudeKickoff(t, { task: c.task, captureSpawn: (agent, prompt, opts) => captures.push({
+      kbMode: opts.kbMode, task: opts.task, prompt: agent.buildPrompt(prompt, opts) }) });
+    t.after(() => stopSession(kickoff.session));
+    assert.equal(captures.length, 1);
+    assert.equal(captures[0].kbMode, c.mode, JSON.stringify(c));
+    assert.equal(captures[0].task.category, c.task.category);
+    assert.equal(/KB discovery:/.test(captures[0].prompt), c.note, JSON.stringify(c));
+  }
+  assert.deepEqual(roots, cases.map(() => config.PROJECT_ROOT), 'a session without a projectPath reads the startup project');
+});
+
 test('terminal kickoff beside 19 live terminals still states a sub-agent cap of at least one', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
   const sessions = new Map(Array.from({ length: 19 }, (_, n) => [`live-${n}`,

@@ -1,6 +1,6 @@
 # {{PROJECT_NAME}} — General Architecture
 
-<!-- Seeded by tipatask-setup discover.js. Fill in TBD sections as you learn the codebase. -->
+<!-- Seeded by Tipatask setup. Fill in TBD sections as you learn the codebase. -->
 
 ## Stack
 

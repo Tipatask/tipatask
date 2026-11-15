@@ -6,6 +6,10 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const toml = require('toml');
 const { extractFinalText, parseJsonAnswer, runOneShotPrompt } = require('./one-shot');
 
 const lines = (...events) => events.map(e => JSON.stringify(e)).join('\n') + '\n';
@@ -117,7 +121,50 @@ test('runOneShotPrompt never throws — a spec builder error falls back too', as
 // ---------------------------------------------------------------- TPT701: explicit selection, tool-less runs
 
 const { stripSensitiveEnv } = require('./one-shot');
-const { buildCodexOneShotArgs } = require('./codex-session');
+const { buildCodexOneShotArgs, codexOneShotSpec } = require('./codex-session');
+
+function oneShotProject(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-codex-one-shot-'));
+  const projectRoot = path.join(dir, 'project');
+  const globalHome = path.join(dir, 'global');
+  const cwd = path.join(dir, 'neutral');
+  const previousHome = process.env.CODEX_HOME;
+  const previousData = process.env.TIPATASK_USER_DATA;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+    if (previousData === undefined) delete process.env.TIPATASK_USER_DATA;
+    else process.env.TIPATASK_USER_DATA = previousData;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  process.env.CODEX_HOME = globalHome;
+  process.env.TIPATASK_USER_DATA = dir;
+  fs.mkdirSync(globalHome);
+  fs.mkdirSync(cwd);
+  fs.mkdirSync(path.join(projectRoot, '.tipatask'), { recursive: true });
+  fs.writeFileSync(path.join(projectRoot, '.tipatask/config.json'), JSON.stringify({
+    API_BASE_URL: 'https://example.test', API_PROJECT_ID: '1', MCP_BROWSER_TOOLS: [],
+  }));
+  const inheritedNames = ['node_repl', 'server.with dots and "quotes"'];
+  const globalConfig = path.join(globalHome, 'config.toml');
+  fs.writeFileSync(globalConfig, '[features]\napps=true\nplugins=true\n\n' + inheritedNames.map(name =>
+    `[mcp_servers.${JSON.stringify(name)}]\ncommand="external"\nenabled=true\n`).join('\n'));
+  const targetPath = path.join(projectRoot, '.codex/config.toml');
+  return { projectRoot, cwd, globalConfig, targetPath, inheritedNames };
+}
+
+function assertMcpExcluded(args, names) {
+  const overrides = args.filter(arg => arg.startsWith('mcp_servers='));
+  assert.equal(overrides.length, 1);
+  const servers = toml.parse(overrides[0]).mcp_servers;
+  assert.deepEqual(Object.keys(servers).sort(), names.slice().sort());
+  for (const entry of Object.values(servers)) assert.deepEqual({ ...entry }, { enabled: false });
+  assert.ok(args.includes('features.apps=false'), 'account app tools bypass the configured MCP map');
+  assert.ok(args.includes('features.plugins=false'), 'plugins can contribute additional MCP servers');
+  assert.ok(args.indexOf(overrides[0]) < args.indexOf('--json'));
+  assert.ok(args.includes('read-only'), 'native filesystem reads retain the read-only sandbox');
+  assert.ok(!args.includes('--disable'), 'native tools are not disabled');
+}
 
 test('runOneShotPrompt: selection, toolless, cwd and sanitizeEnv reach the spec + spawn; no Claude fallback when off', async () => {
   await withProvider('claude', async () => {
@@ -188,28 +235,50 @@ test('stripSensitiveEnv drops credentials, task identity and Claude Code nesting
   assert.deepEqual(stripSensitiveEnv(undefined), {});
 });
 
-test('buildCodexOneShotArgs: tool-less run replaces the whole MCP map before --json and runs in cwd', () => {
+test('buildCodexOneShotArgs: normal argv stays unchanged; tool-less runs explicitly disable every server', t => {
   assert.deepEqual(buildCodexOneShotArgs({ model: 'm', cwd: '/w' }),
     ['exec', '-m', 'm', '--json', '-s', 'read-only', '--skip-git-repo-check', '-C', '/w', '-']);
-  assert.deepEqual(buildCodexOneShotArgs({ toolless: true, cwd: '/w' }),
-    ['exec', '-c', 'mcp_servers={}', '--json', '-s', 'read-only', '--skip-git-repo-check', '-C', '/w', '-']);
+  const fixture = oneShotProject(t);
+  const spec = codexOneShotSpec({ ...fixture, toolless: true });
+  assertMcpExcluded(spec.args, [...fixture.inheritedNames, 'tipatask', 'tipatask-local']);
+  assert.equal(spec.cwd, fixture.cwd);
+  assert.equal(spec.env.CODEX_HOME, path.join(fixture.projectRoot, '.codex'));
+  const before = fs.readFileSync(fixture.targetPath, 'utf8');
+  buildCodexOneShotArgs({ ...fixture, toolless: true });
+  assert.equal(fs.readFileSync(fixture.targetPath, 'utf8'), before, 'exclusion never changes terminal defaults');
+  assert.equal(toml.parse(before).features.apps, true);
+  assert.equal(toml.parse(before).features.plugins, true);
+  for (const name of fixture.inheritedNames) assert.equal(toml.parse(before).mcp_servers[name].enabled, true);
+
+  fs.appendFileSync(fixture.globalConfig, '\n[mcp_servers.newly_inherited]\ncommand="new"\n');
+  const refreshed = codexOneShotSpec({ ...fixture, toolless: true });
+  assertMcpExcluded(refreshed.args, [...fixture.inheritedNames, 'newly_inherited', 'tipatask', 'tipatask-local']);
+  assert.ok(!codexOneShotSpec(fixture).args.some(arg => arg.startsWith('mcp_servers=')));
 });
 
-test('default-provider forecast call suppresses MCP and never retries with Claude', async () => {
+test('tool-less Codex refuses unreadable or invalid MCP configuration instead of launching unfenced', t => {
+  const fixture = oneShotProject(t);
+  assert.throws(() => buildCodexOneShotArgs({ ...fixture, toolless: true }), /ENOENT/);
+  fs.mkdirSync(path.dirname(fixture.targetPath));
+  fs.writeFileSync(fixture.targetPath, 'invalid = [');
+  assert.throws(() => buildCodexOneShotArgs({ ...fixture, toolless: true }));
+  assert.throws(() => codexOneShotSpec({ ...fixture, toolless: true }), /Invalid Codex configuration/);
+});
+
+test('default-provider forecast excludes refreshed MCP servers and completes without a Claude retry', async t => {
+  const fixture = oneShotProject(t);
   await withProvider('codex', async () => {
-    const result = await runOneShotPrompt('forecast', { toolless: true, fallbackToClaude: false, timeoutMs: 60000,
+    const result = await runOneShotPrompt('forecast', { ...fixture, toolless: true, fallbackToClaude: false, timeoutMs: 60000,
       deps: {
-        specBuilders: { codex: opts => ({ command: 'codex', args: buildCodexOneShotArgs(opts), env: {}, cwd: '/tmp' }) },
         spawn: (command, args) => {
-          assert.ok(args.includes('mcp_servers={}'));
+          assertMcpExcluded(args, [...fixture.inheritedNames, 'tipatask', 'tipatask-local']);
           assert.ok(!args.includes('--tools') && !args.includes('--mcp-config') && !args.includes('--enable'));
-          assert.ok(args.includes('read-only'));
-          return fakeSpawn('', 1)();
+          return fakeSpawn(lines({ type: 'item.completed', item: { type: 'agent_message', text: 'forecast complete' } }))();
         },
         runHeadlessClaude: () => assert.fail('forecast must use only the default provider'),
       },
     });
-    assert.equal(result, null);
+    assert.equal(result, 'forecast complete');
   });
 });
 

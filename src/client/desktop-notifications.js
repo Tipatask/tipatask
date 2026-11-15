@@ -16,12 +16,15 @@ function applyTheme(theme) {
 
 // Fixed-height page: header with Hide (TPT505 — never Clear All here), the five newest cards,
 // and a footer with the "Show" on-top checkbox and centered Show More. Never scrolls — the full
-// list opens in the newest notification's project window (main's show-more action).
+// list opens in the newest notification's project window (main's show-more action). The
+// checkbox shows the saved "Show on Top" setting (`state.onTop`): unchecked while the banner
+// only stands in for native notifications the OS cannot deliver.
 export function renderDesktopPage(state) {
   const entries = Array.isArray(state) ? state : (state?.entries || []);
   applyTheme(Array.isArray(state) ? null : state?.theme);
   if (entries.length) setLocale(entries[0].locale);
-  renderNotificationPage(document.body, entries, act, { headerAction: 'hide', onTopToggle: true });
+  renderNotificationPage(document.body, entries, act,
+    { headerAction: 'hide', onTopToggle: true, onTop: Array.isArray(state) || state?.onTop !== false });
 }
 
 window.desktopNotifications.onState(renderDesktopPage);

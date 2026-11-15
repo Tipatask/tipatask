@@ -26,7 +26,11 @@ const CODEX_TOOL_FENCE =
   'create_task_comment, or create_system_tag — you only propose changes as fenced ```json ' +
   'blocks for a human to review and save. reserve_task_keys is the one exception (it only ' +
   'claims a placeholder id, it never creates/mutates real task content). get_task is allowed ' +
-  '(read-only) to load an existing task\'s full description before proposing a modified one.';
+  '(read-only) to load an existing task\'s full description before proposing a modified one.\n\n' +
+  CODEX_OBJECTIVE_PROFILE.fileReadInstructions + '\n\n' +
+  'Callable Tipatask tools for this objective: ' + CODEX_OBJECTIVE_PROFILE.remoteEnabledTools.join(', ') +
+  '; tipatask-local: ' + CODEX_OBJECTIVE_PROFILE.localEnabledTools.join(', ') + '. ' +
+  'Other MCP servers are disabled. Source files and real task content must remain unchanged.';
 
 const MAX_IMAGE_ATTACH = 8;
 const IMAGE_ATTACH_RE = /@(\S+\.(?:png|jpe?g|gif|webp|svg))/gi;
@@ -61,8 +65,8 @@ function extractLocalImagePaths(text, max = MAX_IMAGE_ATTACH) {
   return out;
 }
 
-// `otherMcpServers` only matters for a session under a tool profile (task chat): the names of
-// every other MCP server in the project's Codex config, which the profile switches off.
+// Every fresh/resumed chat applies its MCP filters and app/plugin exclusions.
+// `otherMcpServers` supports legacy bare-key callers; real spawns scope the refreshed map.
 function buildCodexArgs(session, { cwd, model, imagePaths, otherMcpServers = [] }) {
   const imgFlags = imagePaths.flatMap(p => ['-i', p]);
   // Headless exec has its own process per turn. These overrides are intentional:
@@ -375,8 +379,12 @@ function spawnCodexTurn(session, taskId) {
     includeSystemPrompt: true,
     hasProviderSession,
   });
-  const fence = toolProfileFor(session, 'codex') ? CODEX_TASK_CHAT_FENCE : CODEX_TOOL_FENCE;
-  const withFence = promptMode === 'resume' ? basePrompt : `${fence}\n\n${basePrompt}`;
+  // The shared planner prompt uses Claude's tool names and forbids Bash. Codex's native
+  // file reader is a sandboxed command tool. Put its specific policy last on EVERY turn,
+  // including old resumed threads, without changing task chat's separate mutation contract.
+  const withFence = toolProfileFor(session, 'codex')
+    ? (promptMode === 'resume' ? basePrompt : `${CODEX_TASK_CHAT_FENCE}\n\n${basePrompt}`)
+    : `${basePrompt}\n\n${CODEX_TOOL_FENCE}`;
   if (promptMode === 'handoff') {
     console.log(`[objective:handoff] task=${taskId} switching to codex model=${model} — sending full transcript (${withFence.length} chars)`);
   }
@@ -611,15 +619,19 @@ function spawnCodexTurn(session, taskId) {
   })();
 }
 
-// TPT623 — launch spec for a one-shot, tool-less Codex prompt (providers/one-shot.js): the
+// TPT623 — launch spec for a one-shot Codex prompt (providers/one-shot.js): the
 // same env a chat turn gets (buildCodexEnv refreshes the project CODEX_HOME), a read-only
 // sandbox, no session to resume. The prompt goes to stdin (`-`).
-// (TPT701) `toolless` replaces the project's whole MCP server map with an empty one
-// (`-c mcp_servers={}`, the same whole-map override a scoped chat turn uses), so the run has
-// no Tipatask tools; the read-only sandbox's built-in file reads remain. `cwd` moves only the
-// working directory — CODEX_HOME (auth, config) stays the project's `.codex`.
-function buildCodexOneShotArgs({ model, toolless = false, cwd } = {}) {
-  return ['exec', ...(model ? ['-m', model] : []), ...(toolless ? ['-c', 'mcp_servers={}'] : []),
+// `toolless` explicitly disables every refreshed MCP server: Codex merges an empty map
+// with inherited config instead of clearing it. Native read-only file reads remain.
+// App/plugin discovery is also disabled because those MCP tools bypass mcp_servers.
+// `cwd` moves only the working directory — CODEX_HOME stays the project's `.codex`.
+function buildCodexOneShotArgs({ projectRoot, model, toolless = false, cwd } = {}) {
+  const mcpArgs = toolless ? [
+    '-c', buildScopedCodexMcpOverride(projectRoot, { mcpServers: [] }),
+    '-c', 'features.apps=false', '-c', 'features.plugins=false',
+  ] : [];
+  return ['exec', ...(model ? ['-m', model] : []), ...mcpArgs,
     '--json', '-s', 'read-only', '--skip-git-repo-check', '-C', cwd, '-'];
 }
 function codexOneShotSpec({ projectRoot, model, toolless = false, cwd } = {}) {
@@ -628,7 +640,8 @@ function codexOneShotSpec({ projectRoot, model, toolless = false, cwd } = {}) {
   const { env } = buildCodexEnv({ projectRoot: root });
   // (TPT9215) Same served-model rule as chat turns and task terminals.
   const runModel = model || servedCodexModelOverride(env.CODEX_HOME).model;
-  return { command: config.CODEX_BIN, args: buildCodexOneShotArgs({ model: runModel, toolless, cwd: runCwd }), env, cwd: runCwd };
+  // Build the exclusion only after buildCodexEnv refreshes inherited server names.
+  return { command: config.CODEX_BIN, args: buildCodexOneShotArgs({ projectRoot: root, model: runModel, toolless, cwd: runCwd }), env, cwd: runCwd };
 }
 
 module.exports = { spawnCodexTurn, finishFailedTaskChatTurn, resolveCodexModel, buildCodexArgs, extractLocalImagePaths, codexOneShotSpec, buildCodexOneShotArgs };

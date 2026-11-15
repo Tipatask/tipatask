@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkModel, stageBulkDesignMode, resolveBulkAgentModel,
-  bulkPatchBody, bulkCowboyBlockedTaskIds, BULK_MODEL_FIELDS,
+  hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkModel, stageBulkEffort, stageBulkDesignMode, resolveBulkAgentModel,
+  bulkPatchBody, bulkCowboyBlockedTaskIds, agentHasEffort, BULK_MODEL_FIELDS, BULK_EFFORT_AGENTS,
 } from './bulk-changes.js';
-import { CODEX_MODELS, CLAUDE_MODELS, normalizeAgentModels } from './constants.js';
+import { CODEX_MODELS, CLAUDE_MODELS, EFFORT_LEVELS, normalizeAgentModels } from './constants.js';
 
 // (TPT9159) The bulk bar's staged-edit record and the PATCH body Apply builds from it.
 
@@ -13,6 +13,50 @@ test('an empty record has nothing to apply', () => {
   assert.equal(hasBulkChanges(null), false);
   assert.deepEqual(stagedBulkFields({}), []);
   assert.deepEqual(bulkPatchBody({}, {}), {});
+});
+
+test('permission mode stages independently, clears with Project Default, and leaves untouched PATCHes alone', () => {
+  const original = { status: 'on_fire' };
+  assert.deepEqual(bulkPatchBody(original), { status: 'on_fire' });
+  for (const permissionMode of [null, 'plan', 'auto', 'bypass']) {
+    const changes = stageBulkField(original, 'permissionMode', permissionMode);
+    assert.equal(hasBulkChanges({ permissionMode }), true);
+    assert.deepEqual(stagedBulkFields(changes), ['status', 'permissionMode']);
+    assert.deepEqual(bulkPatchBody(changes, { reassign: false }), { status: 'on_fire', agent_permission_mode: permissionMode },
+      'permission overrides also apply to agent-locked tasks');
+    assert.deepEqual(stageBulkField(changes, 'permissionMode', ''), original);
+    assert.deepEqual(stageBulkField(changes, 'permissionMode', undefined), original);
+  }
+  assert.deepEqual(original, { status: 'on_fire' });
+});
+
+test('staged Bypass permits either Cowboy scope in the same PATCH regardless of saved overrides', () => {
+  const tasks = [{ id: 'plan', agentPermissionMode: 'plan' }, { id: 'auto', agent_permission_mode: 'auto' }, { id: 'unset' }];
+  for (const cowboyScope of ['related', 'project']) {
+    const changes = { permissionMode: 'bypass', cowboyScope };
+    assert.deepEqual(bulkCowboyBlockedTaskIds(changes, tasks, 'plan'), []);
+    assert.deepEqual(bulkPatchBody(changes), { agent_permission_mode: 'bypass', cowboy_mode: cowboyScope });
+  }
+});
+
+test('staged Plan or Auto blocks Cowboy even for saved and inherited Bypass tasks', () => {
+  const tasks = [{ id: 'bypass', agentPermissionMode: 'bypass' }, { id: 'raw', agent_permission_mode: 'bypass' }, { id: 'inherited' }];
+  for (const permissionMode of ['plan', 'auto']) {
+    for (const cowboyScope of ['related', 'project']) {
+      assert.deepEqual(bulkCowboyBlockedTaskIds({ permissionMode, cowboyScope }, tasks, 'bypass'), ['bypass', 'raw', 'inherited']);
+    }
+    assert.deepEqual(bulkCowboyBlockedTaskIds({ permissionMode, cowboyScope: 'disabled' }, tasks, 'bypass'), []);
+  }
+});
+
+test('staged Project Default resolves the project mode instead of either saved override shape', () => {
+  const tasks = [{ id: 'camel', agentPermissionMode: 'auto' }, { id: 'raw', agent_permission_mode: 'plan' }];
+  for (const cowboyScope of ['related', 'project']) {
+    assert.deepEqual(bulkCowboyBlockedTaskIds({ permissionMode: null, cowboyScope }, tasks, 'bypass'), []);
+    for (const projectDefault of ['plan', 'auto', null]) {
+      assert.deepEqual(bulkCowboyBlockedTaskIds({ permissionMode: null, cowboyScope }, tasks, projectDefault), ['camel', 'raw']);
+    }
+  }
 });
 
 test('stageBulkField stages a value and unstages it on an empty one', () => {
@@ -127,6 +171,79 @@ test('bulkPatchBody saves the model in the staged agent\'s own field, only with 
     'a locked task keeps its agent and model');
 });
 
+// (TPT9323) The Effort flyout beside Claude Code and Codex in the bulk agent picker: one pick
+// stages the agent and its effort, saved in tasks.effort like the Task Edit modal's Effort row.
+
+test('stageBulkEffort stages a level or Agent default beside a staged Claude or Codex', () => {
+  assert.deepEqual(BULK_EFFORT_AGENTS, ['claude', 'codex']);
+  assert.deepEqual(EFFORT_LEVELS, ['low', 'medium', 'high', 'max'], 'the Task Edit modal levels');
+  for (const agent of BULK_EFFORT_AGENTS) {
+    assert.equal(agentHasEffort(agent), true);
+    const withAgent = stageBulkAgent({ status: 'on_fire' }, agent);
+    for (const level of EFFORT_LEVELS) assert.equal(stageBulkEffort(withAgent, level).effort, level, `${agent} ${level}`);
+    assert.equal(stageBulkEffort(withAgent, ' HIGH ').effort, 'high', 'normalized like the API');
+    const agentDefault = stageBulkEffort(withAgent, null);
+    assert.equal(Object.hasOwn(agentDefault, 'effort'), true);
+    assert.equal(agentDefault.effort, null, 'null is an explicit Agent default');
+    for (const unstage of ['', undefined]) {
+      assert.deepEqual(stageBulkEffort(stageBulkEffort(withAgent, 'max'), unstage), withAgent, 'an empty value removes the pick');
+    }
+    assert.deepEqual(stageBulkEffort(stageBulkEffort(withAgent, 'low'), 'extreme'), { ...withAgent, effort: 'low' }, 'an unknown level stages nothing');
+    assert.deepEqual(stageBulkEffort(withAgent, 3), withAgent);
+    assert.deepEqual(stagedBulkFields(stageBulkEffort(withAgent, 'max')), ['status', 'agent'], 'the effort is part of the agent change');
+  }
+  for (const agent of ['human', 'pi', '', undefined, 'constructor', 'toString']) assert.equal(agentHasEffort(agent), false, `${agent} has no effort`);
+});
+
+test('stageBulkEffort stages nothing without a staged Claude or Codex', () => {
+  for (const changes of [{}, { status: 'on_fire' }, { agent: 'human' }, { agent: 'pi', model: 'openrouter/qwen' }]) {
+    const next = stageBulkEffort(changes, 'high');
+    assert.deepEqual(next, changes);
+    assert.notEqual(next, changes, 'still a new record');
+  }
+  assert.deepEqual(stageBulkEffort({ agent: 'pi', effort: 'high' }, 'max'), { agent: 'pi' }, 'a stray effort beside Pi is dropped');
+  assert.equal(hasBulkChanges(stageBulkEffort({}, 'max')), false);
+});
+
+test('an Effort pick belongs to its agent: kept on the same agent, dropped by another agent, Human or none', () => {
+  const claudeHigh = stageBulkEffort(stageBulkAgent({}, 'claude'), 'high');
+  assert.deepEqual(claudeHigh, { agent: 'claude', claudeDesignMode: false, effort: 'high' });
+  assert.deepEqual(stageBulkAgent(claudeHigh, 'claude'), claudeHigh, 'picking the Claude row again keeps the effort');
+  assert.deepEqual(stageBulkAgent(claudeHigh, 'codex'), { agent: 'codex' }, 'Codex drops the Claude effort');
+  assert.deepEqual(stageBulkAgent(claudeHigh, 'human'), { agent: 'human' });
+  assert.deepEqual(stageBulkAgent(claudeHigh, 'pi', 'openrouter/qwen'), { agent: 'pi', model: 'openrouter/qwen' });
+  assert.deepEqual(stageBulkAgent(claudeHigh, ''), {});
+  const codexDefault = stageBulkEffort(stageBulkAgent({ status: 'on_fire' }, 'codex'), null);
+  assert.deepEqual(codexDefault, { status: 'on_fire', agent: 'codex', effort: null });
+  assert.deepEqual(stageBulkAgent(codexDefault, 'codex'), codexDefault, 'so is Agent default');
+  assert.deepEqual(stageBulkAgent(codexDefault, 'claude'), { status: 'on_fire', agent: 'claude', claudeDesignMode: false });
+  // A flyout pick re-stages the agent, then its effort: the new level replaces the old one, and
+  // the agent's Model pick and Design mode stay.
+  const picked = stageBulkEffort(stageBulkAgent({ ...claudeHigh, model: 'claude-opus-5-5', claudeDesignMode: true }, 'claude'), 'max');
+  assert.deepEqual(picked, { agent: 'claude', model: 'claude-opus-5-5', claudeDesignMode: true, effort: 'max' });
+  // Picking another agent's level switches both at once.
+  assert.deepEqual(stageBulkEffort(stageBulkAgent(picked, 'codex'), 'low'), { agent: 'codex', effort: 'low' });
+  assert.deepEqual(claudeHigh, { agent: 'claude', claudeDesignMode: false, effort: 'high' }, 'records are never changed in place');
+});
+
+test('bulkPatchBody saves the staged effort with the agent only', () => {
+  assert.deepEqual(bulkPatchBody({ agent: 'codex', effort: 'max' }, { model: 'gpt-6.1-sol' }),
+    { agent_assignee: 'codex', codex_model: 'gpt-6.1-sol', effort: 'max' });
+  assert.deepEqual(bulkPatchBody({ agent: 'claude', claudeDesignMode: true, effort: 'low' }, { model: 'opusplan' }),
+    { agent_assignee: 'claude', claude_model: 'opusplan', claude_design_mode: true, effort: 'low' });
+  assert.deepEqual(bulkPatchBody({ agent: 'claude', claudeDesignMode: false, effort: null }),
+    { agent_assignee: 'claude', claude_design_mode: false, effort: null }, 'Agent default clears the saved level');
+  assert.deepEqual(bulkPatchBody({ agent: 'codex' }, { model: 'gpt-6.1-sol' }), { agent_assignee: 'codex', codex_model: 'gpt-6.1-sol' },
+    'no staged effort: every task keeps its own');
+  assert.deepEqual(bulkPatchBody({ status: 'completed', agent: 'codex', effort: 'high' }, { reassign: false, model: 'gpt-6.1-sol' }), { status: 'completed' },
+    'a locked task keeps its agent, model and effort');
+  // A record stageBulkEffort() would not build never writes an effort.
+  assert.deepEqual(bulkPatchBody({ agent: 'pi', effort: 'high' }, { model: 'openrouter/qwen' }), { agent_assignee: 'pi', pi_model: 'openrouter/qwen' });
+  assert.deepEqual(bulkPatchBody({ agent: 'human', effort: 'high' }), { agent_assignee: 'human' });
+  assert.deepEqual(bulkPatchBody({ agent: 'codex', effort: 'extreme' }), { agent_assignee: 'codex' });
+  assert.deepEqual(bulkPatchBody({ status: 'on_fire', effort: 'high' }), { status: 'on_fire' }, 'no effort without an agent');
+});
+
 test('bulkPatchBody carries every staged field in one body', () => {
   const changes = { priority: '4', status: 'on_fire', agent: 'claude', claudeDesignMode: true, assignee: 7, assigneeName: 'Dana' };
   assert.deepEqual(bulkPatchBody(changes, { priority: 4 }), {
@@ -147,19 +264,50 @@ test('Backlog is sent as sprint_id:null, a sprint as its number', () => {
   assert.deepEqual(bulkPatchBody({ priority: '__new__' }, { priority: 9 }), { priority: 9 });
 });
 
-test('Cowboy scopes stage independently, normalize legacy values and preserve other edits', () => {
-  const original = { status: 'on_fire', assignee: 7, agent: 'claude', claudeDesignMode: true };
+test('Cowboy scopes stage beside Bypass, normalize legacy values and preserve other edits', () => {
+  const original = { status: 'on_fire', assignee: 7, agent: 'claude', claudeDesignMode: true, permissionMode: 'bypass' };
   for (const [value, scope] of [['disabled', 'disabled'], ['related', 'related'], ['project', 'project'], [true, 'project'], [false, 'disabled']]) {
     const changes = stageBulkField(original, 'cowboyScope', value);
     assert.equal(hasBulkChanges({ cowboyScope: changes.cowboyScope }), true);
     assert.deepEqual(bulkPatchBody(changes), {
-      status: 'on_fire', assignee: 7, agent_assignee: 'claude', claude_design_mode: true, cowboy_mode: scope,
+      status: 'on_fire', assignee: 7, agent_permission_mode: 'bypass', agent_assignee: 'claude', claude_design_mode: true, cowboy_mode: scope,
     });
-    assert.deepEqual(bulkPatchBody(changes, { reassign: false }), { status: 'on_fire', assignee: 7, cowboy_mode: scope });
+    assert.deepEqual(bulkPatchBody(changes, { reassign: false }), { status: 'on_fire', assignee: 7, agent_permission_mode: 'bypass', cowboy_mode: scope });
     assert.deepEqual(stageBulkField(changes, 'cowboyScope', ''), original);
   }
-  assert.deepEqual(bulkPatchBody(original), { status: 'on_fire', assignee: 7, agent_assignee: 'claude', claude_design_mode: true });
-  assert.deepEqual(original, { status: 'on_fire', assignee: 7, agent: 'claude', claudeDesignMode: true });
+  assert.deepEqual(bulkPatchBody(original), { status: 'on_fire', assignee: 7, agent_permission_mode: 'bypass', agent_assignee: 'claude', claude_design_mode: true });
+  assert.deepEqual(original, { status: 'on_fire', assignee: 7, agent: 'claude', claudeDesignMode: true, permissionMode: 'bypass' });
+});
+
+// (TPT9322) The bulk bar shows Cowboy only beside a staged Bypass, and the record follows it.
+test('a staged Cowboy scope stays with Bypass and drops with Plan, Auto, Project Default or an unstaged mode', () => {
+  for (const scope of ['disabled', 'related', 'project']) {
+    const withCowboy = stageBulkField(stageBulkField({ status: 'on_fire' }, 'permissionMode', 'bypass'), 'cowboyScope', scope);
+    assert.deepEqual(withCowboy, { status: 'on_fire', permissionMode: 'bypass', cowboyScope: scope });
+    assert.deepEqual(bulkPatchBody(withCowboy), { status: 'on_fire', agent_permission_mode: 'bypass', cowboy_mode: scope },
+      'Apply sends the scope with Bypass in one PATCH');
+    assert.deepEqual(stageBulkField(withCowboy, 'permissionMode', 'bypass'), withCowboy, 'picking Bypass again keeps the scope');
+    assert.deepEqual(stageBulkField(withCowboy, 'status', 'completed').cowboyScope, scope, 'other fields leave it alone');
+    for (const mode of ['plan', 'auto', null]) {
+      const next = stageBulkField(withCowboy, 'permissionMode', mode);
+      assert.deepEqual(next, { status: 'on_fire', permissionMode: mode }, `${mode ?? 'Project Default'} drops the scope`);
+      assert.deepEqual(bulkPatchBody(next), { status: 'on_fire', agent_permission_mode: mode }, 'and Apply writes no cowboy_mode');
+    }
+    for (const unstaged of ['', undefined]) {
+      assert.deepEqual(stageBulkField(withCowboy, 'permissionMode', unstaged), { status: 'on_fire' }, 'unstaging the mode drops the scope');
+    }
+    assert.deepEqual(withCowboy, { status: 'on_fire', permissionMode: 'bypass', cowboyScope: scope }, 'the record itself is never changed');
+  }
+});
+
+test('a Cowboy scope does not stage without a staged Bypass', () => {
+  for (const changes of [{}, { status: 'on_fire' }, { permissionMode: 'plan' }, { permissionMode: 'auto' }, { permissionMode: null }]) {
+    const next = stageBulkField(changes, 'cowboyScope', 'related');
+    assert.deepEqual(next, changes);
+    assert.notEqual(next, changes, 'still a new record');
+    assert.deepEqual(stageBulkField(next, 'permissionMode', 'bypass').cowboyScope, undefined, 'a later Bypass pick starts with no scope');
+  }
+  assert.equal(hasBulkChanges(stageBulkField({}, 'cowboyScope', 'project')), false);
 });
 
 test('enabling Cowboy requires effective Bypass; disabling and unrelated edits work in any mode', () => {
@@ -176,4 +324,39 @@ test('enabling Cowboy requires effective Bypass; disabling and unrelated edits w
   }
   assert.deepEqual(bulkCowboyBlockedTaskIds({ cowboyScope: 'disabled' }, tasks, 'auto'), []);
   assert.deepEqual(bulkCowboyBlockedTaskIds({ status: 'on_fire' }, tasks, null), []);
+});
+
+test('tasks without permission overrides inherit Bypass for either enabled Cowboy scope', () => {
+  const tasks = [
+    { id: 'omitted' },
+    { id: 'null', agentPermissionMode: null },
+    { id: 'api-null', agent_permission_mode: null },
+  ];
+  // The Apply backstop reads any record, including one stageBulkField() would not build.
+  for (const cowboyScope of ['related', 'project']) {
+    const changes = { cowboyScope };
+    assert.deepEqual(bulkCowboyBlockedTaskIds(changes, tasks, 'bypass'), []);
+    assert.deepEqual(bulkPatchBody(changes), { cowboy_mode: cowboyScope },
+      'the scope does not create a permission override');
+  }
+});
+
+test('inherited Auto and Plan block enabling Cowboy while explicit Bypass still passes', () => {
+  const tasks = [{ id: 'inherited' }, { id: 'override', agent_permission_mode: 'bypass' }];
+  for (const projectDefault of ['auto', 'plan']) {
+    for (const cowboyScope of ['related', 'project']) {
+      assert.deepEqual(bulkCowboyBlockedTaskIds({ cowboyScope }, tasks, projectDefault), ['inherited']);
+    }
+  }
+});
+
+test('mixed inherited Bypass and explicit Plan or Auto reports only the blocking overrides', () => {
+  const tasks = [
+    { id: 'inherited', agentPermissionMode: null },
+    { id: 'bypass', agent_permission_mode: 'bypass' },
+    { id: 'plan', agentPermissionMode: 'plan' },
+  ];
+  assert.deepEqual(bulkCowboyBlockedTaskIds({ cowboyScope: 'related' }, tasks, 'bypass'), ['plan']);
+  tasks.push({ id: 'auto', agent_permission_mode: 'auto' });
+  assert.deepEqual(bulkCowboyBlockedTaskIds({ cowboyScope: 'project' }, tasks, 'bypass'), ['plan', 'auto']);
 });

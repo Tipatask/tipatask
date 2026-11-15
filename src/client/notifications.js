@@ -219,6 +219,22 @@ let _ncRegistered = null;
 // is off (transient OS notifications, so bundle health matters again), otherwise desktop.
 let _statusDelivery = null;
 
+// The saved "Show on Top" choice from that read (true | false; null = unknown: outside Electron
+// or never read), and — while it is off and the banner stands in for native notifications the
+// OS cannot deliver — main's reason for that fallback. Delivery reads 'desktop' in both cases;
+// these two tell the user's choice apart from the stand-in.
+let _statusOnTop = null;
+let _statusFallback = null;
+
+// What the bundle health says stops native OS notifications, or null. Same ranking as main's
+// nativeDeliveryBlocker(): a bundle that was never signed outranks a broken seal, which
+// outranks a missing Notification Center registration.
+function _healthBlocker() {
+  if (_bundleSignature.signed === false) return 'unsigned';
+  if (_bundleSignature.valid === false) return 'seal-broken';
+  return _ncRegistered === false ? 'not-registered' : null;
+}
+
 // (C1058) What the Settings-modal status row reads. (C1155: the nav-hamburger warning
 // dot that used to read this too was removed along with the hamburger button itself.)
 // `canDeliver` answers "can the OS receive a notification at all right now" — independent of
@@ -228,29 +244,37 @@ export function getNotificationStatus() {
   const hasWebApi = typeof Notification !== 'undefined';
   const transport = electron ? 'electron' : (hasWebApi ? 'web' : 'unsupported');
   const permission = electron ? 'granted' : (hasWebApi ? Notification.permission : 'unsupported');
+  const native = _desktopDelivery() && _statusDelivery === 'native';
+  if (_desktopDelivery() && !native) {
+    // Banners deliver either way, so a blocked native path is never an error here. While the
+    // banner only stands in for it ("Show on Top" off), `fallback` names why — the bundle
+    // health when it explains it, else main's own reason (a failed or unanswered native send)
+    // — and the duplicate-registration details follow, so Settings can still offer Repair.
+    const fallback = _statusFallback ? (_healthBlocker() || _statusFallback) : null;
+    return { transport: 'electron', delivery: 'desktop', permission: 'granted',
+      canDeliver: !_lastTransportError, lastError: _lastTransportError,
+      enabled: Object.fromEntries(Object.keys(NOTIFY_PREF_KEYS).map((key) => [key, isNotifyEnabled(key)])),
+      onTop: _statusOnTop,
+      ...(fallback
+        ? { fallback, conflicts: _lsConflicts.conflicts, installerVolumes: _lsConflicts.installerVolumes,
+          registrationRepair: _lsConflicts.registrationRepair }
+        : { conflicts: null, installerVolumes: [] }) };
+  }
   // (C1141) valid===false (seal broken by a stray write inside the bundle) is exactly as fatal
   // to delivery as signed===false (never signed at all) — both mean usernoted refuses to
   // register the app with Notification Center. (C1318) `_ncRegistered === false` is the same
   // fatal outcome by direct observation rather than inferred cause — folded in at the same
-  // rank, but only once signed/valid aren't already explaining it (see lastError below).
-  const native = _desktopDelivery() && _statusDelivery === 'native';
-  if (_desktopDelivery() && !native) return { transport: 'electron', delivery: 'desktop', permission: 'granted',
-    canDeliver: !_lastTransportError, lastError: _lastTransportError,
-    enabled: Object.fromEntries(Object.keys(NOTIFY_PREF_KEYS).map((key) => [key, isNotifyEnabled(key)])),
-    conflicts: null, installerVolumes: [] };
-  const signatureBroken = _bundleSignature.signed === false || _bundleSignature.valid === false;
-  const notRegistered = _ncRegistered === false;
-  const canDeliver = electron ? (!_lastTransportError && !signatureBroken && !notRegistered) : permission === 'granted';
-  let lastError = _lastTransportError;
-  if (_bundleSignature.signed === false) lastError = 'unsigned';
-  else if (_bundleSignature.valid === false) lastError = 'seal-broken';
-  else if (notRegistered) lastError = 'not-registered';
+  // rank, but only once signed/valid aren't already explaining it (_healthBlocker()).
+  const healthBlocker = _healthBlocker();
+  const canDeliver = electron ? (!_lastTransportError && !healthBlocker) : permission === 'granted';
+  const lastError = healthBlocker || _lastTransportError;
   return {
     transport,
     ...(native ? { delivery: 'native' } : {}),
     permission,
     canDeliver,
     enabled: { attention: isNotifyEnabled('attention'), objective: isNotifyEnabled('objective'), completed: isNotifyEnabled('completed'), activity: isNotifyEnabled('activity') },
+    onTop: _statusOnTop,
     lastError,
     // (C1355) Enriches the 'not-registered' case with the actual cause — never changes lastError
     // itself, since 'not-registered' is already correctly ranked below unsigned/seal-broken.
@@ -267,6 +291,8 @@ export function getNotificationStatus() {
 // the renderer's whole lifetime.
 function _foldSignatureStatus(status) {
   _statusDelivery = (status && status.delivery) || null;
+  _statusOnTop = typeof status?.onTop === 'boolean' ? status.onTop : null;
+  _statusFallback = (status?.delivery === 'desktop' && status.fallback) || null;
   _bundleSignature = {
     signed: status ? status.signed !== false : null,
     valid: status && status.valid !== undefined ? status.valid !== false : null,
@@ -291,6 +317,25 @@ export async function refreshNotificationStatus() {
   try {
     _foldSignatureStatus(await window.electronAPI.notifyStatus());
   } catch (_) { /* leave prior state — a failed refresh must not blank out a known-good read */ }
+}
+
+// Settings ▸ Notifications "Show on top of other apps". The flag is app-level and lives in
+// main; only the Electron bridge can write it (browser mode has no always-on-top banner).
+export function canSetNotificationsOnTop() {
+  return typeof window !== 'undefined' && typeof window.electronAPI?.setNotificationsOnTop === 'function';
+}
+
+// Writes that flag through main's one writer (the menu checkbox and the banner's "Show" box use
+// it too), then re-reads the delivery it leads to. Resolves main's { ok, enabled }: `enabled`
+// is the live choice, present even when it could not be saved for the next launch (ok: false);
+// a call that never reached the writer has no `enabled`.
+export async function setNotificationsOnTop(on) {
+  if (!canSetNotificationsOnTop()) return { ok: false, reason: 'unsupported' };
+  let result;
+  try { result = await window.electronAPI.setNotificationsOnTop(on === true); }
+  catch (err) { result = { ok: false, reason: err?.message || 'failed' }; }
+  await refreshNotificationStatus();
+  return result && typeof result === 'object' ? result : { ok: false, reason: 'failed' };
 }
 
 // Shared by the persistent Settings notice and the Repair toast. The result verifies

@@ -30,7 +30,10 @@ app.whenReady().then(async () => {
     constructor(options) { super(options); natives.push(this); this.once('show', () => { this.probeShown = true; }); }
   }
   ProbeNotification.isSupported = () => Notification.isSupported();
+  // What main.js's bundle-health probe would report; set for the forced-fallback phase.
+  let nativeBlocker = null;
   surface = createDesktopNotifications({ BrowserWindow, screen, ipcMain, Notification: ProbeNotification,
+    nativeBlocked: () => nativeBlocker,
     focusedProjectWindow: () => (projectFocus ? sources.find((w) => w.isFocused()) || null : null),
     projectWindows: () => sources,
     onClick: entry => { clicks.push(entry); BrowserWindow.fromId(entry.origin.windowId)?.show(); },
@@ -156,15 +159,75 @@ app.whenReady().then(async () => {
   await js("document.querySelector('.tt-notif-page-hide').click()");
   await delay(100);
   assert.equal(stack.isVisible(), false);
+  for (const { id } of surface.snapshot()) {
+    ipcMain.emit('notify:desktop-action', { sender: stack.webContents, senderFrame: stack.webContents.mainFrame }, { id, action: 'close' });
+  }
+  // Show on Top off. The real OS decides the first half: a native notification it shows keeps
+  // the stack hidden; one it fails (macOS refuses an unregistered or unsigned bundle, as a dev
+  // Electron is) must land on the stack instead, bottom-right, with the "Show" box unchecked.
+  const stackedBottomRight = () => {
+    const area = screen.getDisplayMatching(stack.getBounds()).workArea;
+    const b = stack.getBounds();
+    assert.deepEqual([b.x + b.width, b.y + b.height], [area.x + area.width, area.y + area.height], 'stack sits in the bottom-right corner');
+  };
+  const boxChecked = () => js("document.querySelector('.tt-notif-page-ontop input').checked");
   surface.setEnabled(false);
   const off = { windowId: sources[0].id, projectPath: '/probe/A' };
-  assert.equal((await surface.show({ title: 'TipATask probe', body: 'Show on Top off', tag: 'probe-native' }, off)).delivery, 'native');
-  assert.equal((await surface.show({ title: 'TipATask probe', body: 'repeat replaces', tag: 'probe-native' }, off)).delivery, 'native');
-  assert.equal(stack.isVisible(), false, 'Show on Top off: the stack stays hidden');
-  assert.equal(natives.length, 2);
-  await delay(500);
+  const first = await surface.show({ title: 'Project A · TPT9294: Native probe', body: 'Show on Top off', tag: 'probe-native', notificationId: 'probe-native-1' }, off);
+  const repeat = await surface.show({ title: 'Project A · TPT9294: Native probe', body: 'repeat replaces', tag: 'probe-native', notificationId: 'probe-native-2' }, off);
+  assert.equal(first.ok && repeat.ok, true);
+  await delay(300);
+  let nativeOutcome;
+  if (first.delivery === 'native') {
+    assert.equal(repeat.delivery, 'native');
+    assert.equal(stack.isVisible(), false, 'Show on Top off with working native delivery: the stack stays hidden');
+    assert.equal(natives.length, 2);
+    assert.deepEqual(surface.delivery(), { delivery: 'native', fallback: null });
+    nativeOutcome = `the OS showed native notifications (${natives.filter((n) => n.probeShown).length}/2 'show' events)`;
+  } else {
+    assert.deepEqual([first.delivery, repeat.delivery], ['desktop', 'desktop']);
+    assert.ok(first.fallback, 'a fallback names its reason');
+    assert.equal(natives.length, 1, 'after one failed native no further native is attempted');
+    assert.deepEqual(surface.delivery(), { delivery: 'desktop', fallback: first.fallback });
+    assert.equal(stack.isVisible(), true, 'the alert the OS refused is on the stack');
+    assert.equal(surface.snapshot().length, 1, 'the repeat updated the same alert');
+    assert.equal(await count(), 1);
+    assert.equal(await boxChecked(), false, 'the "Show" box shows the saved (off) setting');
+    stackedBottomRight();
+    nativeOutcome = `the OS refused the native notification (${first.fallback}) and the stack took it`;
+  }
+  // Forced fallback: main.js's bundle-health probe reports native delivery as blocked, so no
+  // native notification is attempted at all and every alert stacks on the banner.
   surface.setEnabled(true);
-  console.log(`PASS: five-card page, uk count, no scroll, persistence, focus, origins, isolated preload, click/close, Show More, Hide (no focus) and Show toggle, task dismissal and refill, focus flip between in-app and banner, banner kept over another app, native delivery when Show on Top is off (OS 'show' events: ${natives.filter((n) => n.probeShown).length}/2). Screenshot: ${screenshot}`);
+  for (const { id } of surface.snapshot()) {
+    ipcMain.emit('notify:desktop-action', { sender: stack.webContents, senderFrame: stack.webContents.mainFrame }, { id, action: 'close' });
+  }
+  nativeBlocker = 'not-registered';
+  surface.setEnabled(false);
+  const attempted = natives.length;
+  for (let i = 1; i <= 3; i++) {
+    const sentOff = await surface.show({ title: `Project A · TPT9294: Fallback ${i}`, body: 'Native delivery is blocked: shown on the stack.',
+      tag: `probe-fallback-${i}`, notificationId: `probe-fallback-${i}`, category: i === 2 ? 'completed' : 'attention' }, off);
+    assert.deepEqual([sentOff.ok, sentOff.delivery, sentOff.fallback], [true, 'desktop', 'not-registered']);
+  }
+  await delay(300);
+  assert.equal(natives.length, attempted, 'blocked native delivery: no native notification is created');
+  assert.equal(surface.isEnabled(), false, 'the saved setting stays off');
+  assert.equal(stack.isVisible(), true, 'Show on Top off + blocked native delivery: alerts stack on the banner');
+  assert.equal(await count(), 3);
+  assert.equal(await boxChecked(), false);
+  stackedBottomRight();
+  assert.equal(stack.isFocused(), false, 'the banner never takes focus');
+  const fallbackShot = path.join(os.tmpdir(), 'tpt9294-fallback-stack.png');
+  fs.writeFileSync(fallbackShot, (await stack.webContents.capturePage()).toPNG());
+  // Checking the box asks main to turn Show on Top back on.
+  await js("document.querySelector('.tt-notif-page-ontop input').click()");
+  await delay(100);
+  assert.equal(onTopSets.at(-1), true, 'checking Show asks main to turn Show on Top on');
+  surface.setEnabled(true);
+  await delay(100);
+  assert.equal(await boxChecked(), true);
+  console.log(`PASS: five-card page, uk count, no scroll, persistence, focus, origins, isolated preload, click/close, Show More, Hide (no focus) and Show toggle, task dismissal and refill, focus flip between in-app and banner, banner kept over another app; Show on Top off: ${nativeOutcome}; blocked native delivery stacks three alerts bottom-right with the Show box unchecked. Screenshots: ${screenshot}, ${fallbackShot}`);
 }).then(() => { surface?.dispose(); app.exit(0); }).catch(error => {
   console.error(error);
   surface?.dispose();

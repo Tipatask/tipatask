@@ -123,15 +123,20 @@ for (const id of Object.keys(providers)) {
       const result = await deliver(t, id, state);
       const { stdin, system, args, delivered } = result;
       const resumed = state === 'resume';
+      // Codex appends its current capability policy after the conversational payload.
+      const conversation = id === 'codex' ? stdin.slice(0, stdin.indexOf('\n\nYou are a read-only PLANNER.')) : stdin;
       for (const marker of [...systemMarkers, 'REHASH_UNIQUE']) occurrences(delivered, marker, resumed && id !== 'claude' ? 0 : 1);
       for (const marker of [...prefetchMarkers, objective]) occurrences(delivered, marker, resumed ? 0 : 1);
       occurrences(delivered, 'SUMMARY_UNIQUE', ['handoff', 'compressed'].includes(state) ? 1 : 0);
       if (state !== 'fresh') {
         occurrences(stdin, 'LATEST_ASK_UNIQUE');
-        assert.ok(stdin.endsWith('LATEST_ASK_UNIQUE'), 'latest ask stays last');
+        assert.ok(conversation.endsWith('LATEST_ASK_UNIQUE'), 'latest ask stays last in the conversation');
       }
-      occurrences(stdin, 'Priority baseline (list_task_id_meta): 42.');
-      if (resumed) assert.equal(stdin.split('\n\n').at(-1), 'LATEST_ASK_UNIQUE');
+      occurrences(stdin, 'regularTaskPriorityBaseline: 42 ');
+      assert.match(stdin, /urgent maintenance and fixes to agents, tools or workflow, use 42 or a later dependency-required sprint/);
+      assert.match(stdin, /Urgent maintenance is never an optional suggestion solely because it concerns agents/);
+      assert.match(stdin, /task\._stepPinned: true.*never for a model-chosen default/);
+      if (resumed) assert.equal(conversation.split('\n\n').at(-1), 'LATEST_ASK_UNIQUE');
       if (state === 'handoff' || state === 'compressed') {
         occurrences(stdin, 'REPLY_1_UNIQUE', 0);
         occurrences(stdin, 'REPLY_8_UNIQUE');
@@ -148,7 +153,10 @@ for (const id of Object.keys(providers)) {
         if (!resumed) assert.ok(stdin.includes('fenced ```json block ONLY') && stdin.includes('ORIGIN-LINKED PLANNING'));
       }
       if (id === 'codex') {
-        occurrences(stdin, 'Never call create_task, update_task, delete_task', resumed ? 0 : 1);
+        occurrences(stdin, 'Never call create_task, update_task, delete_task');
+        occurrences(stdin, 'Codex source/KB reading: use the native exec_command or shell_command tool');
+        assert.ok(stdin.indexOf('Codex source/KB reading:') > stdin.lastIndexOf('LATEST_ASK_UNIQUE'));
+        if (!resumed) assert.ok(stdin.indexOf('Codex source/KB reading:') > stdin.indexOf('Bash — shell execution forbidden'));
         if (!resumed) {
           assert.equal(args[args.indexOf('-s') + 1], 'read-only');
           assert.match(stdin, /reserve_task_keys is the one exception/);

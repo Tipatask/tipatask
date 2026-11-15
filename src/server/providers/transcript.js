@@ -20,7 +20,7 @@ function priorityBaselineLine(session) {
       if (!Array.isArray(meta.active)) return '';
       baseline = codingPriorityBaseline(meta.active, new Set(meta.active.map(t => t.status)));
     }
-    return `Priority baseline (list_task_id_meta): ${baseline}. New regular tasks use this sprint or a later dependency-required sprint; priority 0 is reserved for tt-performance-suggestions or an explicit user Backlog choice.`;
+    return `regularTaskPriorityBaseline: ${baseline} (list_task_id_meta.priorityBaseline). PRIORITY PRECEDENCE: New regular tasks, including urgent maintenance and fixes to agents, tools or workflow, use ${baseline} or a later dependency-required sprint (priority > every scheduled dependency). This baseline overrides any lowest-active-priority default. Backlog (priority 0) requires explicit user Backlog intent or a qualifying optional workflow-efficiency suggestion tagged tt-performance-suggestions. Urgent maintenance is never an optional suggestion solely because it concerns agents, tools or workflow; do not add tt-performance-suggestions for that reason. Preserve an explicit user sprint/Backlog choice by emitting task._stepPinned: true with that priority, never for a model-chosen default; keep an existing task's priority unless the requested change or dependency ordering requires otherwise.`;
   } catch { return ''; }
 }
 

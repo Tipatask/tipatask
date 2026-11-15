@@ -161,3 +161,38 @@ test('(TPT505) header action: Clear All by default, Hide on request; footer "Sho
   setLocale('en');
   host.remove();
 });
+
+// The banner can be up while "Show on Top" is off: it stands in for native notifications the
+// OS cannot deliver. Its checkbox then shows the saved (off) setting and turns it on.
+test('the footer "Show" toggle follows the saved setting and writes it both ways', () => {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const acts = [];
+  const act = (id, action) => acts.push(action);
+  const two = entries.slice(0, 2);
+  const page = renderNotificationPage(host, two, act, { headerAction: 'hide', onTopToggle: true, onTop: false });
+  const input = page.querySelector('.tt-notif-page-ontop input');
+  assert.equal(page.querySelector('.tt-notif-page-ontop').hidden, false);
+  assert.equal(input.checked, false);
+  input.checked = true;
+  input.dispatchEvent(new browser.Event('change'));
+  assert.deepEqual(acts, ['on-top-on']);
+  renderNotificationPage(host, two, act, { headerAction: 'hide', onTopToggle: true, onTop: true });
+  assert.equal(input.checked, true);
+  host.remove();
+
+  // The banner page reads it from main's state; a state without the flag counts as on.
+  onState({ entries: two, theme: null, onTop: false });
+  const banner = document.body.querySelector(':scope > .tt-notif-page');
+  const box = banner.querySelector('.tt-notif-page-ontop input');
+  assert.equal(box.checked, false);
+  onState({ entries: two, theme: null, onTop: true });
+  assert.equal(box.checked, true);
+  onState({ entries: two, theme: null });
+  assert.equal(box.checked, true);
+  onState({ entries: two, theme: null, onTop: false });
+  box.checked = true;
+  box.dispatchEvent(new browser.Event('change'));
+  assert.deepEqual(bannerActs.at(-1), ['on-top-on', null]);
+  onState({ entries: [], theme: null });
+});

@@ -119,6 +119,38 @@ test('GET /api/sessions reports the live session agent — a rewritten taskAgent
   }
 });
 
+// (TPT9324) The left-nav rail orders terminal rows by sessionMeta.startedAt, so every terminal
+// session in the registry, running, mid-spawn or exited, ships its own numeric run stamp, and the
+// same one on every call.
+test('GET /api/sessions ships each terminal session its own numeric startedAt, the same on every call', async () => {
+  const { createSession } = require('./session-state');
+  const run = (id, fields) => Object.assign(createSession(null, false, id, scratch), fields);
+  const sessions = new Map([
+    ['TPT21', run('TPT21', { alive: true })],
+    ['TPT22', run('TPT22', { _starting: true })],
+    ['TPT23', run('TPT23', { exitCode: 0 })],
+  ]);
+  const server = http.createServer(createHttpHandler(sessions, () => ({})));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    const first = await getJson(port, '/api/sessions');
+    const second = await getJson(port, '/api/sessions');
+    assert.deepEqual(first.json.sessions.sort(), ['TPT21', 'TPT22']);
+    assert.deepEqual(first.json.exited, ['TPT23']);
+    for (const [id, s] of sessions) {
+      assert.equal(first.json.sessionMeta[id].type, 'terminal', id);
+      assert.equal(typeof first.json.sessionMeta[id].startedAt, 'number', id);
+      assert.ok(first.json.sessionMeta[id].startedAt > 0, id);
+      assert.equal(first.json.sessionMeta[id].startedAt, s.startedAt, id);
+      assert.equal(second.json.sessionMeta[id].startedAt, first.json.sessionMeta[id].startedAt, `${id} on the next call`);
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 // A task or project chat connects as a pending session with the default terminal type and mode
 // state until its start-* message; its row never carries permission-mode fields.
 test('GET /api/sessions leaves permission-mode fields off chat rows, pending or started, and keeps them on terminals', async () => {
@@ -183,6 +215,8 @@ test('GET /api/sessions restores project-scoped losses from disk after registry 
     assert.ok(Number.isFinite(Date.parse(r.json.lostDetails.T1.at)));
     assert.equal(r.json.sessionMeta.T1.agent, 'claude');
     assert.equal(r.json.sessionMeta.T1.alive, false);
+    // (TPT9324) A lost row keeps its run's start, so it keeps its place in the left-nav rail.
+    assert.equal(r.json.sessionMeta.T1.startedAt, oldSessions.get('T1').startedAt);
     assert.equal(JSON.stringify(r.json).includes('private stack'), false);
     const other = await getJson(port, '/api/sessions', { 'x-tipatask-project': '/other-project' });
     assert.deepEqual(other.json.lost, ['T1']);

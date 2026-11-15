@@ -1,9 +1,11 @@
-// Project setup wizard — modal triggered by the create-project event, which the unified
-// Open / Create Project flow dispatches as soon as the picked folder turns out to be
-// unconfigured (TPT557 — there is no separate Link-vs-Create chooser in front of it).
+// Project setup wizard — modal triggered by the create-project event, which the Open Project /
+// Create Project flow dispatches as soon as the picked folder turns out to be unconfigured
+// (TPT557 — there is no separate Link-vs-Create chooser in front of it).
 // Collects: auth, API project (Create Project step: create new OR select existing), device
-// name, agent selection, preset (A/B — new project only). An existing-project pick skips
-// the Preset step (nothing to seed): 5 dots instead of 6, see visibleSteps().
+// name, agent selection, preset (A/B/C — new project only; A = compose the knowledge base as
+// you go, TPT9316). An existing-project pick skips the Preset step (nothing to seed): 5 dots
+// instead of 6, see visibleSteps(). (TPT9318) open({ presetLocked: true }) — the Open Project
+// entry — skips it too and creates a new project in compose-as-you-go mode.
 // Emits wizard-complete with all data. Does NOT write configs or call APIs — that
 // is handled by a downstream listener (index.js), which branches on apiProject.isNew.
 // (TPT564) open({ locked: true }) is the first-run mode for a window with no bound project:
@@ -21,16 +23,29 @@ import { activateDialogFocus } from './dialog-focus.js';
 // exactly this reason.
 import { t } from './i18n.js';
 
-const PRESETS = [
+// (TPT9316) The preset value main.js / project-seeder.js branch on for "compose the knowledge
+// base as you go": no starter tasks, base templates only, KB_MODE: 'compose' in config.json.
+export const COMPOSE_PRESET = 'compose-as-you-go';
+
+// Display order = letter order. `letter` is display-only (summary row, wizard-complete detail);
+// `value` is the contract the main process branches on.
+export const PRESETS = [
   {
     letter: 'A',
+    get name() { return t('wizard.presetComposeName'); },
+    mode: 'compose',
+    value: COMPOSE_PRESET,
+    get desc() { return t('wizard.presetComposeDesc'); },
+  },
+  {
+    letter: 'B',
     get name() { return t('wizard.presetSpecName'); },
     mode: 'new',
     value: 'original-specification',
     get desc() { return t('wizard.presetSpecDesc'); },
   },
   {
-    letter: 'B',
+    letter: 'C',
     get name() { return t('wizard.presetExistingName'); },
     mode: 'existing',
     value: 'existing-code',
@@ -57,6 +72,8 @@ let _onComplete = null;
 // run or by open() superseding an earlier session; see _cancel().
 let _onCancel = null;
 let _locked = false;
+// (TPT9318) Open Project entry: no Preset step, _preset fixed to compose-as-you-go.
+let _presetLocked = false;
 let _overlay = null;
 let _keyHandler = null;
 // (TPT561) The wizard's dialog-focus.js layer. An open Task Edit Modal owns a layer that inerts
@@ -67,13 +84,19 @@ let _focusHandle = null;
 
 // (TPT557) Step numbers shown for a wizard run — an existing API project has no Preset step
 // (step 5): nothing gets seeded, index.js links the folder through project:open-existing.
-// Pure (no DOM, no module state) so project-creation-wizard.test.js can pin it.
-export function visibleSteps({ existing = false } = {}) {
-  return existing ? [1, 2, 3, 4, 6] : [1, 2, 3, 4, 5, 6];
+// (TPT9318) A preset-locked run (Open Project entry) has none either: the preset is always
+// compose-as-you-go. Pure (no DOM, no module state) so project-creation-wizard.test.js can pin it.
+export function visibleSteps({ existing = false, presetLocked = false } = {}) {
+  return existing || presetLocked ? [1, 2, 3, 4, 6] : [1, 2, 3, 4, 5, 6];
 }
 
 function _isExisting() {
   return !!_apiProject && !_apiProject.isNew;
+}
+
+// Whether this run goes Agent → Confirm with no Preset step (existing project, or locked preset).
+function _skipsPreset() {
+  return _isExisting() || _presetLocked;
 }
 // Bumped by open()/close() — invalidates the in-flight stored-account check of a superseded session.
 let _openId = 0;
@@ -104,7 +127,7 @@ export async function setupAuthWeb(apiBaseUrl, invoke, opts) {
   }
 }
 
-export function open({ projectPath, onComplete, onCancel, locked = false }) {
+export function open({ projectPath, onComplete, onCancel, locked = false, presetLocked = false }) {
   if (_overlay) close();
   _projectPath = projectPath;
   _step = 1;
@@ -113,7 +136,8 @@ export function open({ projectPath, onComplete, onCancel, locked = false }) {
   _taskAgent = '';
   _availableAgents = [];
   _piModels = [{ model: '', apiKey: '' }];
-  _preset = null;
+  _presetLocked = !!presetLocked;
+  _preset = _presetLocked ? PRESETS.find((p) => p.value === COMPOSE_PRESET) : null;
   _onComplete = onComplete || null;
   _onCancel = typeof onCancel === 'function' ? onCancel : null;
   _locked = !!locked;
@@ -163,6 +187,7 @@ export function close() {
   _onComplete = null;
   _onCancel = null;
   _locked = false;
+  _presetLocked = false;
   _storedAccountPending = false;
   _openId++;
 }
@@ -194,7 +219,8 @@ function _render() {
   const STEP_LABELS = [t('wizard.stepSignIn'), t('wizard.stepApiProject'), t('wizard.stepDevice'), t('wizard.stepAgent'), t('wizard.stepPreset'), t('wizard.stepConfirm')];
   // (TPT557) One dot per VISIBLE step — the Preset dot disappears once an existing project
   // is picked on step 2 (and comes back if the user goes Back and picks "Create new").
-  const dots = visibleSteps({ existing: _isExisting() }).map((n) => {
+  // (TPT9318) A preset-locked run never shows it.
+  const dots = visibleSteps({ existing: _isExisting(), presetLocked: _presetLocked }).map((n) => {
     const cls = n < _step ? 'is-done' : n === _step ? 'is-active' : '';
     return `<span class="setup-modal-dot ${cls}" title="${_esc(STEP_LABELS[n - 1])}"></span>`;
   }).join('');
@@ -502,7 +528,7 @@ function _renderStep4(body, footer) {
       msgEl.textContent = t('agentSelect.fixOtherModelRows');
       return;
     }
-    _goto(_isExisting() ? 6 : 5); // (TPT557) existing project → no Preset step
+    _goto(_skipsPreset() ? 6 : 5); // (TPT557) existing project, (TPT9318) locked preset → no Preset step
   });
 
   const container = body.querySelector('#wiz-agent-select');
@@ -542,23 +568,27 @@ function _renderStep4(body, footer) {
   (async () => { applyAgents(await loadAgents()); })();
 }
 
-// ── Step 5: Preset (A/B) ──────────────────────────────────────────────────────
+// ── Step 5: Preset (A/B/C) ────────────────────────────────────────────────────
+// (TPT9316) One full-width card per preset, stacked in letter order. Cards are toggle buttons
+// (aria-pressed), so Tab/Enter/Space pick a preset; selection updates in place and keeps focus.
 
 function _renderStep5(body, footer) {
   const cards = PRESETS.map((p) => {
-    const sel = _preset?.letter === p.letter ? 'is-selected' : '';
+    const selected = _preset?.value === p.value;
     return `
-      <div class="setup-modal-preset-card ${sel}" data-letter="${p.letter}">
-        <div class="setup-modal-preset-letter">${p.letter}</div>
-        <div class="setup-modal-preset-name">${_esc(p.name)}</div>
-        <div class="setup-modal-preset-desc">${_esc(p.desc)}</div>
-      </div>
+      <button type="button" class="setup-modal-preset-card${selected ? ' is-selected' : ''}" data-letter="${p.letter}" aria-pressed="${selected}">
+        <span class="setup-modal-preset-letter">${p.letter}</span>
+        <span class="setup-modal-preset-text">
+          <span class="setup-modal-preset-name">${_esc(p.name)}</span>
+          <span class="setup-modal-preset-desc">${_esc(p.desc)}</span>
+        </span>
+      </button>
     `;
   }).join('');
 
   body.innerHTML = `
-    <p class="setup-modal-label">${_esc(t('wizard.choosePreset'))}</p>
-    <div class="setup-modal-preset-grid">${cards}</div>
+    <p class="setup-modal-label" id="wiz-preset-label">${_esc(t('wizard.choosePreset'))}</p>
+    <div class="setup-modal-preset-grid" role="group" aria-labelledby="wiz-preset-label">${cards}</div>
     <p class="setup-modal-hint">${_esc(t('wizard.presetHint'))}</p>
     <div class="setup-modal-msg setup-modal-msg--error" id="wiz-preset-msg"></div>
   `;
@@ -572,14 +602,16 @@ function _renderStep5(body, footer) {
   const msg = body.querySelector('#wiz-preset-msg');
   footer.querySelector('#wiz-back-btn').addEventListener('click', () => _goto(4));
 
-  body.querySelectorAll('.setup-modal-preset-card').forEach((card) => {
+  const cardEls = [...body.querySelectorAll('.setup-modal-preset-card')];
+  cardEls.forEach((card) => {
     card.addEventListener('click', () => {
-      body.querySelectorAll('.setup-modal-preset-card').forEach(c => c.classList.remove('is-selected'));
-      card.classList.add('is-selected');
-      _preset = PRESETS.find(p => p.letter === card.dataset.letter);
-      nextBtn.disabled = false;
+      _preset = PRESETS.find(p => p.letter === card.dataset.letter) || null;
+      for (const c of cardEls) {
+        c.classList.toggle('is-selected', c === card);
+        c.setAttribute('aria-pressed', String(c === card));
+      }
+      nextBtn.disabled = !_preset;
       msg.textContent = '';
-      _render();
     });
   });
 
@@ -595,12 +627,16 @@ function _renderStep6(body, footer) {
   // (TPT557) Two outcomes share this screen: a NEW API project (Preset row, "Create Project")
   // and an EXISTING one picked on step 2 (no Preset row, "Open Project", preset: null in the
   // emitted detail — index.js then links instead of creating/seeding).
+  // (TPT9318) A preset-locked run (Open Project entry) creates its new project in
+  // compose-as-you-go mode: the Preset row names the mode without a letter (no A/B/C cards
+  // were shown) and the detail carries the compose preset. Linking an existing project
+  // creates nothing, so it emits preset: null in both entries.
   const existing = _isExisting();
   const email = _userInfo?.email || '—';
   const projName = _apiProject?.name || '—';
   const projId = _apiProject?.isNew ? 'new' : (String(_apiProject?.id ?? '—'));
   const newBadge = _apiProject?.isNew ? `<span class="setup-modal-summary-badge">${_esc(t('wizard.newBadge'))}</span>` : '';
-  const presetLabel = _preset ? `${_preset.letter} — ${_preset.name}` : '—';
+  const presetLabel = !_preset ? '—' : _presetLocked ? _preset.name : `${_preset.letter} — ${_preset.name}`;
   const presetRow = existing ? '' :
     `<tr><td class="setup-modal-summary-key">${_esc(t('wizard.summaryPreset'))}</td><td class="setup-modal-summary-val">${_esc(presetLabel)}</td></tr>`;
   const agentLabel = _taskAgent || '—';
@@ -637,7 +673,7 @@ function _renderStep6(body, footer) {
     <button class="setup-modal-btn setup-modal-btn--primary" id="wiz-confirm-btn">${_esc(existing ? t('wizard.openProjectBtn') : t('wizard.createProjectBtn'))}</button>
   `;
 
-  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _goto(existing ? 4 : 5));
+  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _goto(_skipsPreset() ? 4 : 5));
 
   footer.querySelector('#wiz-confirm-btn').addEventListener('click', () => {
     const detail = {

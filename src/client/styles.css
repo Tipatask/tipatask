@@ -5331,6 +5331,7 @@
   /* Shared control metric */
   .bulk-action-bar .bulk-btn,
   .bulk-action-bar .bulk-status-select,
+  .bulk-action-bar .bulk-permission-mode-select,
   .bulk-action-bar .bulk-cowboy-select,
   .bulk-action-bar .bulk-model-select,
   .bulk-action-bar .bulk-priority-combo .sprint-combo-input,
@@ -5351,17 +5352,20 @@
     transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
   }
   .bulk-action-bar .bulk-status-select,
+  .bulk-action-bar .bulk-permission-mode-select,
   .bulk-action-bar .bulk-cowboy-select,
   .bulk-action-bar .bulk-model-select,
   .bulk-action-bar .bulk-priority-combo .sprint-combo-input,
   .bulk-action-bar .agent-picker-trigger { cursor: pointer; }
   .bulk-action-bar .bulk-status-select:hover,
+  .bulk-action-bar .bulk-permission-mode-select:hover,
   .bulk-action-bar .bulk-cowboy-select:hover,
   .bulk-action-bar .bulk-model-select:hover,
   .bulk-action-bar .bulk-priority-combo .sprint-combo-input:hover,
   .bulk-action-bar .bulk-assignee-input:hover,
   .bulk-action-bar .agent-picker-trigger:hover { border-color: var(--c-primary); }
   .bulk-action-bar .bulk-status-select:focus-visible,
+  .bulk-action-bar .bulk-permission-mode-select:focus-visible,
   .bulk-action-bar .bulk-cowboy-select:focus-visible,
   .bulk-action-bar .bulk-model-select:focus-visible,
   .bulk-action-bar .bulk-priority-combo .sprint-combo-input:focus,
@@ -5372,7 +5376,26 @@
     box-shadow: 0 0 0 2px var(--c-primary-light, rgba(139,92,246,0.25));
   }
   .bulk-action-bar .bulk-status-select { width: 140px; }
+  .bulk-action-bar .bulk-permission-mode-select { width: 210px; text-overflow: ellipsis; }
   .bulk-action-bar .bulk-cowboy-select { width: 180px; }
+  /* (TPT9322) Permission mode and the Cowboy-Coding field it brings up on a staged Bypass wrap
+     onto a new row together; only an edit group narrower than both stacks them. The Cowboy
+     field slides in from the Permission mode select. */
+  .bulk-field-pair {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    min-width: 0;
+  }
+  .bulk-cowboy-field:not([hidden]) { animation: bulk-field-reveal 0.16s ease-out; }
+  @keyframes bulk-field-reveal {
+    from { opacity: 0; transform: translateX(-6px); }
+    to { opacity: 1; transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bulk-cowboy-field:not([hidden]) { animation: none; }
+  }
   /* (TPT9212) Model select beside the agent picker, shown while the staged agent has models. */
   .bulk-model {
     display: inline-flex;
@@ -5446,6 +5469,7 @@
   /* .bulk-btn's inline-flex would otherwise beat the UA [hidden] rule (Reset at rest). */
   .bulk-action-bar .bulk-btn[hidden] { display: none; }
   .bulk-action-bar .bulk-field.is-staged .bulk-status-select,
+  .bulk-action-bar .bulk-field.is-staged .bulk-permission-mode-select,
   .bulk-action-bar .bulk-field.is-staged .bulk-cowboy-select,
   .bulk-action-bar .bulk-field.is-staged .bulk-model-select,
   .bulk-action-bar .bulk-field.is-staged .bulk-priority-combo .sprint-combo-input,
@@ -7737,6 +7761,9 @@
     color: var(--c-success);
   }
   .settings-row > .settings-notice { grid-column: 1 / -1; }
+  /* Notices that follow a section's rows (Notifications: they concern both rows above them)
+     keep the in-row rhythm — the last row's padding above the first, 12px between two. */
+  .settings-section > .settings-notice:not([hidden]) ~ .settings-notice { margin-top: 12px; }
 
   /* A narrow window stacks every row: label and hint above the control. */
   @media (max-width: 560px) {
@@ -11019,6 +11046,188 @@
     background: var(--c-primary-light);
   }
 
+  /* ── First-open prompt (TPT9319, first-project-prompt.js) ──
+     A new project's one-time "first objective or project discussion?" card over its empty
+     board. z-index 2900: above the board, the left nav (200) and terminal overlays
+     (2000/2100), below every modal tier (3000+), so a dialog opened from the native menu while
+     it is up still lands on top. Palette tokens only, so every [data-theme] recolours it. */
+  .first-prompt-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 2900;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    box-sizing: border-box;
+    background: rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(2px);
+    animation: first-prompt-fade 160ms ease-out;
+  }
+  .first-prompt {
+    width: min(460px, 100%);
+    max-height: 100%;
+    overflow-y: auto;
+    box-sizing: border-box;
+    padding: 28px 28px 20px;
+    border-radius: 14px;
+    border: 1px solid var(--c-border);
+    background: var(--c-bg-card);
+    color: var(--c-text);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.24);
+    animation: first-prompt-rise 200ms ease-out;
+  }
+  .first-prompt-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    margin-bottom: 14px;
+    border-radius: 12px;
+    background: var(--c-primary-light);
+    color: var(--c-primary-text);
+  }
+  .first-prompt-mark svg { width: 22px; height: 22px; }
+  .first-prompt-title {
+    margin: 0 0 6px;
+    font-size: 1.1rem;
+    font-weight: 700;
+    line-height: 1.3;
+    color: var(--c-text);
+  }
+  .first-prompt-question {
+    margin: 0 0 20px;
+    font-size: 0.92rem;
+    line-height: 1.5;
+    color: var(--c-text-secondary);
+  }
+  .first-prompt-choices {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .first-prompt-choice {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 14px 14px 14px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--c-border-input);
+    background: var(--c-bg-card);
+    color: var(--c-text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .first-prompt-choice--primary { border-color: var(--c-primary-border); }
+  .first-prompt-choice:hover {
+    border-color: var(--c-primary-border);
+    box-shadow: 0 2px 12px var(--c-shadow);
+  }
+  .first-prompt-choice:focus-visible,
+  .first-prompt-dismiss:focus-visible {
+    outline: 2px solid var(--c-primary-border);
+    outline-offset: 2px;
+  }
+  .first-prompt-choice-icon {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 9px;
+    background: var(--c-bg-sub-nav);
+    color: var(--c-text-secondary);
+  }
+  .first-prompt-choice--primary .first-prompt-choice-icon {
+    background: var(--c-primary);
+    color: var(--c-on-primary);
+  }
+  .first-prompt-choice-icon svg { width: 19px; height: 19px; }
+  .first-prompt-choice-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .first-prompt-choice-label {
+    font-size: 0.95rem;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+  .first-prompt-choice-hint {
+    font-size: 0.8rem;
+    line-height: 1.4;
+    color: var(--c-text-muted);
+  }
+  .first-prompt-choice-arrow {
+    flex: none;
+    display: inline-flex;
+    color: var(--c-text-faint);
+    transition: transform 0.15s ease, color 0.15s ease;
+  }
+  .first-prompt-choice-arrow svg { width: 16px; height: 16px; }
+  .first-prompt-choice:hover .first-prompt-choice-arrow {
+    transform: translateX(2px);
+    color: var(--c-primary-text);
+  }
+  .first-prompt-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    margin-top: 18px;
+  }
+  .first-prompt-note {
+    flex: 1 1 220px;
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: var(--c-text-muted);
+  }
+  .first-prompt-dismiss {
+    margin-left: auto;
+    padding: 7px 14px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--c-text-secondary);
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .first-prompt-dismiss:hover {
+    background: var(--c-bg-sub-nav);
+    color: var(--c-text);
+  }
+  @keyframes first-prompt-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes first-prompt-rise {
+    from { opacity: 0; transform: translateY(8px) scale(0.985); }
+    to { opacity: 1; transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .first-prompt-overlay,
+    .first-prompt { animation: none; }
+    .first-prompt-choice,
+    .first-prompt-choice-arrow { transition: none; }
+    .first-prompt-choice:hover .first-prompt-choice-arrow { transform: none; }
+  }
+  @media (forced-colors: active) {
+    .first-prompt-choice,
+    .first-prompt-dismiss { border-color: ButtonText; }
+  }
+
 /* (C1296) .ai-stats removed — assistant bubbles no longer render the token-stats line. */
 .terminal-footer {
   padding: 0.4rem 1rem;
@@ -11661,6 +11870,124 @@ img.agent-picker-icon {
   opacity: 0.55;
   cursor: not-allowed;
   pointer-events: none;
+}
+
+/* ── (TPT9323) Bulk bar's 2-in-1 Agent + Effort menu (renderAgentPicker() `effort`) ──
+   The list stays vertical; the Claude Code and Codex rows carry a chevron and open their Effort
+   flyout to the right (left when the viewport ends first). The open dropdown is portaled to
+   <body>, so every rule keys on the dropdown's own --effort class, never on .agent-picker.
+   Keyboard focus takes the hover tint plus an inset accent bar, so it reads apart from the
+   checked row or level; the transparent outline is the ring forced colors show. */
+.agent-picker-dropdown--effort .agent-picker-option:focus-visible,
+.agent-picker-effort:focus-visible {
+  outline: 2px solid transparent;
+  outline-offset: -2px;
+  background: var(--c-primary-lighter);
+  box-shadow: inset 3px 0 0 var(--c-primary-border);
+}
+.agent-picker-dropdown--effort .agent-picker-option.active:focus-visible,
+.agent-picker-effort.active:focus-visible { background: var(--c-primary-light); }
+.agent-picker-option--has-effort { position: relative; }
+.agent-picker-option--has-effort.is-open:not(.active) { background: var(--c-primary-lighter); }
+.agent-picker-flyout-caret {
+  flex-shrink: 0;
+  /* The padding sits outside the 6px glyph (border-box would squeeze the glyph to nothing) and
+     widens the click target that opens the flyout; the negative margins keep the row height. */
+  box-sizing: content-box;
+  margin: -8px -4px -8px auto;
+  padding: 8px 4px 8px 14px;
+  color: var(--c-text-muted);
+  transition: color 0.1s, transform 0.12s;
+}
+.agent-picker-option--has-effort.is-open .agent-picker-flyout-caret {
+  color: var(--c-primary-text);
+  transform: translateX(2px);
+}
+.agent-picker-submenu {
+  position: absolute;
+  top: -4px;
+  left: calc(100% + 3px);
+  min-width: 168px;
+  width: max-content;
+  margin: 0;
+  padding: 3px 0;
+  list-style: none;
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  background: var(--c-bg-card);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  /* Not inherited from an .active row's tint. */
+  color: var(--c-text);
+  font-size: 0.85rem;
+  cursor: default;
+  animation: agent-picker-flyout-in 0.12s ease-out;
+}
+.agent-picker-submenu[hidden] { display: none; }
+.agent-picker-submenu--flip {
+  left: auto;
+  right: calc(100% + 3px);
+  animation-name: agent-picker-flyout-in-flip;
+}
+@keyframes agent-picker-flyout-in {
+  from { opacity: 0; transform: translateX(-4px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes agent-picker-flyout-in-flip {
+  from { opacity: 0; transform: translateX(4px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-picker-submenu { animation: none; }
+  .agent-picker-flyout-caret { transition: none; }
+}
+.agent-picker-submenu-heading {
+  padding: 5px 12px 4px;
+  color: var(--c-text-muted);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.agent-picker-effort {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.1s;
+}
+.agent-picker-effort:hover { background: var(--c-primary-lighter); }
+.agent-picker-effort.active { background: var(--c-primary-light); color: var(--c-primary-text); }
+/* Agent default clears the level, so a rule sets it apart from the levels themselves. */
+.agent-picker-effort--default {
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--c-border-input);
+}
+.agent-picker-effort-text { flex: 1; }
+.agent-picker-effort-check { flex-shrink: 0; margin-left: 12px; }
+/* Level glyph: filled bars are the level's rank, faint ones the rest; tinted per level like the
+   card's .effort-badge (low muted, medium text, high warning, max danger). */
+.agent-picker-effort-bars { flex-shrink: 0; display: block; color: var(--c-text-muted); }
+.agent-picker-effort-bars rect { fill: currentColor; }
+.agent-picker-effort-bars rect.is-off { opacity: 0.25; }
+:is(.agent-picker-effort--medium, .agent-picker-effort-tag--medium) .agent-picker-effort-bars { color: var(--c-text); }
+:is(.agent-picker-effort--high, .agent-picker-effort-tag--high) .agent-picker-effort-bars { color: var(--c-warning); }
+:is(.agent-picker-effort--max, .agent-picker-effort-tag--max) .agent-picker-effort-bars { color: var(--c-danger); }
+/* The staged effort beside the agent in the trigger: "Claude Code │ ▂▄▆ High". */
+.agent-picker-effort-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding-left: 8px;
+  border-left: 1px solid var(--c-border-input);
+  color: var(--c-text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 /* ── Task Edit Modal ── */
@@ -13081,34 +13408,66 @@ mark.mention--agent {
 .setup-modal-dot.is-done { background: var(--c-success); }
 .setup-modal-dot.is-skipped { background: var(--c-border); opacity: 0.35; }
 
+/* (TPT9316) Three presets (A/B/C) stack as full-width toggle-button cards: a letter chip,
+   then name + description. The selected card's chip gets a 2px --c-primary-border ring
+   (inset shadow, no layout shift); its letter stays --c-primary-text on the card's tint. */
 .setup-modal-preset-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.5rem;
   margin-top: 0.25rem;
 }
 .setup-modal-preset-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 0.75rem;
+  align-items: start;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
   padding: 0.65rem 0.75rem;
   border: 1px solid var(--c-border);
   border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
 }
 .setup-modal-preset-card:hover { background: var(--c-bg-sub-nav, rgba(0,0,0,0.1)); }
 .setup-modal-preset-card.is-selected { border-color: var(--c-primary-border); background: var(--c-primary-lighter); }
+.setup-modal-preset-card:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
 .setup-modal-preset-letter {
-  font-size: 0.7rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  box-sizing: border-box;
+  border: 1px solid var(--c-border);
+  border-radius: 50%;
+  font-size: 0.72rem;
   font-weight: 700;
+  line-height: 1;
   color: var(--c-primary-text);
-  margin-bottom: 0.15rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.setup-modal-preset-card.is-selected .setup-modal-preset-letter {
+  border-color: var(--c-primary-border);
+  box-shadow: inset 0 0 0 1px var(--c-primary-border);
+}
+.setup-modal-preset-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+  padding-top: 0.1rem;
 }
 .setup-modal-preset-name {
   font-size: 0.82rem;
   font-weight: 600;
   color: var(--c-text);
-  margin-bottom: 0.2rem;
 }
 .setup-modal-preset-desc {
   font-size: 0.72rem;
