@@ -11,6 +11,7 @@ import { escapeAttr, insertAtCursor, renderMarkdown, renderSprintCombobox, initS
 import { api, isTransportError, errorDetail } from './api-client.js';
 import { isTaskDiscussing, lockIntentOf, lockMessageKey } from './discuss-lock.js';
 import { buildMentionCandidates, highlightMentionsInHtml, AGENT_HANDLES } from './mention-highlight.js';
+import { parseReplyCitation, buildReplyCitation } from './comment-reply.js';
 import { sanitizeMarkdownHtml } from './markdown-sanitize.js';
 import { diffWords, opsToRanges, highlightPlainText, normalizeRaw, summarizeMetadata, collectTextSegments, applyRanges, markStructuralBlockChanges, mapRenderedOffsetToRaw } from './modified-task-diff.js';
 import { hydrateModifiedCard } from './modified-task-merge.js';
@@ -75,6 +76,8 @@ const _WAND_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" st
 const _CHAT_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 9.5a1.5 1.5 0 0 1-1.5 1.5H5.5l-3 2.5V4A1.5 1.5 0 0 1 4 2.5h8A1.5 1.5 0 0 1 13.5 4z"/><path d="M5.5 6h5"/><path d="M5.5 8.25h3"/></svg>';
 const _TERMINAL_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6.5 6.5 8.25 4.5 10"/><path d="M8 10.25h3.5"/></svg>';
 const _CLOSE_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>';
+// (TPT9336) A reply citation's Show/Hide quote toggle; CSS turns it upside down while expanded.
+const _CITATION_CHEVRON_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 6.25 8 9.75l3.5-3.5"/></svg>';
 
 // ── (TPT466) Task workspace: the live-task modal is one surface with three panes — Edit (the
 // form below), Agent Terminal (the task's xterm session) and Chat (the task chat). The terminal
@@ -486,9 +489,58 @@ function _renderDescriptionHtml(raw) {
   return sanitizeMarkdownHtml(highlightMentionsInHtml(renderMarkdown(raw || ''), _mentionCandidates()));
 }
 
+// (TPT9337) The end marker of an auto-posted agent exit comment (exit-resolution.js), where it is
+// written: alone on the last non-empty line. A marker anywhere else, such as inside the code of a
+// comment about it, is the comment's own text and stays.
+const _AGENT_EXIT_MARKER_RE = /(?:^|\n)[ \t]*<!--\s*tipatask:agent-exit\s*-->\s*$/;
+
+// A comment's markdown (or a reply's quote) without machine markers: the Trello importer's
+// action ids and the agent exit marker. renderMarkdown() escapes raw HTML, so either would show
+// as text. Display only: the stored comment keeps its exit marker, which the API's
+// isAgentLogTailComment() reads.
+function _cleanCommentMarkdown(content) {
+  return String(content || '')
+    .replace(/<!--\s*trello-action:[^\s>]*\s*-->/g, '')
+    .replace(_AGENT_EXIT_MARKER_RE, '')
+    .trim();
+}
+
 function _renderCommentContent(content) {
-  const clean = String(content || '').replace(/<!--\s*trello-action:[^\s>]*\s*-->/g, '').trim();
-  return sanitizeMarkdownHtml(highlightMentionsInHtml(renderMarkdown(clean), _mentionCandidates()));
+  return sanitizeMarkdownHtml(highlightMentionsInHtml(renderMarkdown(_cleanCommentMarkdown(content)), _mentionCandidates()));
+}
+
+// (TPT9336) A comment body: a reply (TPT9334 format, comment-reply.js) shows its citation as a
+// one-line quote, collapsed until its toggle opens it, then the reply's own text; any other
+// comment renders whole. Names inside the quote are not highlighted: the API notifies nobody
+// for them (it scans stripReplyCitation(content) only), and a highlighted name here always means
+// a person the API notifies. Expanded state lives in _modalState.expandedCitations, not in the
+// DOM, because _renderModalComments() rebuilds the list with innerHTML.
+function _renderCommentBody(comment) {
+  const content = comment?.content || '';
+  const reply = parseReplyCitation(content);
+  const id = _commentId(comment);
+  if (!reply || !id) return _renderCommentContent(content);
+  const expanded = !!_modalState?.expandedCitations?.has(id);
+  const quoteId = `comment-citation-${id}`;
+  const quoteHtml = renderMarkdown(_cleanCommentMarkdown(reply.quote)); // sanitized by renderMarkdown()
+  // One line of markup on purpose: .comment-body keeps whitespace (pre-wrap).
+  return `<div class="comment-citation${expanded ? ' is-expanded' : ''}" data-cited-comment-id="${reply.commentId}">`
+    + (reply.author ? `<span class="comment-citation-author">${escapeAttr(reply.author)}</span>` : '')
+    + `<blockquote class="comment-citation-text" id="${quoteId}">${quoteHtml}</blockquote>`
+    + `<button type="button" class="comment-citation-toggle" data-act="toggle-citation" aria-expanded="${expanded}" aria-controls="${quoteId}">`
+    + `<span class="comment-citation-toggle-label">${t(expanded ? 'comments.hideQuote' : 'comments.showQuote')}</span>${_CITATION_CHEVRON_SVG}</button>`
+    + `</div>${_renderCommentContent(reply.body)}`;
+}
+
+// (TPT9336) The name a reply cites and mentions: the author's display name, else the email
+// local-part (the API resolves either as a mention; a whole address is never highlighted),
+// else null, so a comment whose author is gone is quoted without a label or a mention.
+function _commentAuthorHandle(comment) {
+  const user = comment?.user;
+  const name = typeof user?.name === 'string' ? user.name.trim() : '';
+  if (name) return name;
+  const localPart = typeof user?.email === 'string' ? user.email.split('@')[0].trim() : '';
+  return localPart || null;
 }
 
 function _sortModalComments(arr) {
@@ -522,18 +574,32 @@ function _renderCommentItem(comment) {
   const isEditing = _modalState && _modalState.editingCommentId === _commentId(comment);
   const canEdit = !isEditing && _canEditComment(comment);
   const editBtn = canEdit ? `<button type="button" class="comment-edit-btn" data-act="edit">${t('comments.edit')}</button>` : '';
+  // (TPT9336) Reply on every row with a real id; hidden like Edit while the row is being edited.
+  const replyBtn = !isEditing && _commentId(comment) > 0
+    ? `<button type="button" class="comment-reply-btn" data-act="reply">${t('comments.reply')}</button>`
+    : '';
+  const actions = editBtn || replyBtn ? `<div class="comment-actions">${editBtn}${replyBtn}</div>` : '';
+  // (TPT9340) Every body with a real id carries a Show more / Show less toggle, hidden until
+  // _syncCommentClamps() measures the body as long; the clamp itself is applied there too.
+  const id = _commentId(comment);
+  const bodyId = id > 0 ? `comment-body-${id}` : '';
+  const expanded = !!_modalState?.expandedComments?.has(id);
+  const clampToggle = bodyId
+    ? `<button type="button" class="comment-clamp-toggle" data-act="toggle-clamp" aria-expanded="${expanded}" aria-controls="${bodyId}" hidden>`
+      + `<span class="comment-clamp-toggle-label">${t(expanded ? 'comments.showLess' : 'comments.showMore')}</span>${_CITATION_CHEVRON_SVG}</button>`
+    : '';
   const bodyHtml = isEditing
     ? `<textarea class="comment-edit-input">${escapeAttr(_modalState.editingDraft)}</textarea>
        <div class="comment-edit-actions">
          <button type="button" class="comment-edit-cancel" data-act="cancel">${t('btn.cancel')}</button>
          <button type="button" class="comment-edit-save" data-act="save">${t('btn.save')}</button>
        </div>`
-    : `<div class="comment-body"${_canEditComment(comment) ? ' data-act="edit"' : ''}>${_renderCommentContent(comment?.content || '')}</div>`;
+    : `<div class="comment-body"${bodyId ? ` id="${bodyId}"` : ''}${_canEditComment(comment) ? ' data-act="edit"' : ''}>${_renderCommentBody(comment)}</div>${clampToggle}`;
   return `
     <div class="comment-item" data-comment-id="${escapeAttr(comment?.id || '')}" data-comment-type="${escapeAttr(comment?.comment_type || 'comment')}">
       <div class="comment-avatar">${escapeAttr(_commentInitial(name))}</div>
       <div class="comment-content">
-        <div class="comment-meta">${badge}<strong>${escapeAttr(name)}</strong>${timestamp ? `<span>${escapeAttr(timestamp)}</span>` : ''}${edited}${editBtn}</div>
+        <div class="comment-meta">${badge}<strong>${escapeAttr(name)}</strong>${timestamp ? `<span>${escapeAttr(timestamp)}</span>` : ''}${edited}${actions}</div>
         ${bodyHtml}
       </div>
     </div>`;
@@ -559,7 +625,9 @@ function _renderModalComments(modal) {
     ? comments.map(_renderCommentItem).join('')
     : `<div class="comment-empty">${t('comments.empty')}</div>`;
   _updateUnreadBadge(modal);
+  _syncCommentClamps(list); // (TPT9340) before the observer below, so it sees the clamped rows
   _observeVisibleComments(modal);
+  _syncCitationToggles(list); // (TPT9336)
   // (TPT34) The edit textarea is brand new every render — safe to attach unconditionally.
   const editTa = list.querySelector('.comment-edit-input');
   if (editTa) {
@@ -902,6 +970,14 @@ async function _openTaskEditModalImpl(taskId, callbacks = {}) {
     // out from under the user on any of those.
     editingCommentId: null,
     editingDraft: '',
+    // (TPT9336) Ids of the reply comments whose citation the user expanded. Same reason as the
+    // edit state above: the list's innerHTML rebuild would collapse a DOM-only toggle.
+    expandedCitations: new Set(),
+    // (TPT9340) Ids of the long comments the user expanded with Show more (same reason again),
+    // and whether Show description opened the description clamped on the Comments /
+    // Notifications sub-tabs — reset when General shows, see _syncDescCollapse().
+    expandedComments: new Set(),
+    descExpanded: false,
     discussLocked,
     // (TPT466) Workspace panes — see _switchPane(). `panes` holds the mounted terminal/chat
     // handles ({ show, hide, dispose }); `pendingTerminal` the launch args for the next mount.
@@ -1087,6 +1163,8 @@ export function closeTaskEditModal(force = false, { keepRail = false } = {}) {
   _removeMentionDropdown();
   _disconnectCommentSeenObserver();
   _disconnectNotifSeenObserver(); // (TPT17)
+  _disconnectCommentListObserver(); // (TPT9336/TPT9340)
+  _disconnectDescObserver(); // (TPT9340)
   _modalState._memberCombo?.destroy(); // (C1251) removes its resize/scroll listeners
   // Clean up all dropdowns portaled to body (tag typeahead, dep typeahead, member typeahead, sprint combo, agent picker)
   document.querySelectorAll('.tag-typeahead-dropdown').forEach(d => d.remove());
@@ -1363,7 +1441,8 @@ function _renderTaskEditModal() {
     <div class="diff-meta-row" hidden></div>
   ` : `
     <input class="modal-title-input" type="text" aria-label="${escapeAttr(t('field.title'))}" value="${escapeAttr(draft.title)}">
-    <div class="modal-desc-display"${canEditText ? ` role="button" tabindex="0" aria-label="${escapeAttr(t('modal.editDescription'))}"` : ''}>${_renderDescriptionHtml(draft.description)}</div>
+    <div class="modal-desc-display" id="modal-desc-display"${canEditText ? ` role="button" tabindex="0" aria-label="${escapeAttr(t('modal.editDescription'))}"` : ''}>${_renderDescriptionHtml(draft.description)}</div>
+    <button type="button" class="modal-desc-toggle" aria-controls="modal-desc-display" aria-expanded="false" hidden><span class="modal-desc-toggle-label">${t('modal.showDescription')}</span>${_CITATION_CHEVRON_SVG}</button>
   `;
 
   _disconnectCommentSeenObserver();
@@ -1879,7 +1958,11 @@ function _attachModalHandlers(modal) {
     modal.querySelectorAll('.modal-tab-panel').forEach(panel => {
       panel.hidden = panel.dataset.tab !== tab;
     });
+    // (TPT9340) Compact description on Comments / Notifications, whole on General; then the
+    // comment clamps, measured now that the list has layout (before the read observer below).
+    _syncDescCollapse(modal);
     if (tab === 'comments') {
+      _syncCommentClamps(modal.querySelector('.comments-list'));
       _observeVisibleComments(modal);
     } else {
       _disconnectCommentSeenObserver();
@@ -1984,6 +2067,9 @@ function _attachModalHandlers(modal) {
     // (TPT499) The description is a scroll region now — carry its scroll position into the
     // editor (as a fraction: rendered markdown and raw text differ in height) and back out.
     const displayScrollRatio = _scrollRatio(descDisplay);
+    // (TPT9340) A description clamped to three lines (Comments / Notifications) opens the editor
+    // at its full size rather than at the clamp's height.
+    const fromCollapsed = descDisplay.classList.contains('modal-desc-display--collapsed');
     const ta = document.createElement('textarea');
     ta.id = 'modal-desc-textarea';
     ta.className = 'modal-desc-textarea';
@@ -2006,6 +2092,8 @@ function _attachModalHandlers(modal) {
       const overhead = micWrap.getBoundingClientRect().height - ta.getBoundingClientRect().height;
       ta.style.height = Math.max(0, displayHeight - overhead) + 'px';
     }
+    if (fromCollapsed) _growDescTextarea(ta, !!_modalState.compareTask);
+    _syncDescCollapse(modal); // (TPT9340) hides the Show description toggle while editing
     // (TPT34) Must run before the keydown listener below (Escape→blur) is registered — see
     // _attachMentionTypeahead's own comment for why ordering matters on a shared element.
     _attachMentionTypeahead(ta);
@@ -2046,6 +2134,7 @@ function _attachModalHandlers(modal) {
         wrap.remove();
       }
       _applyScrollRatio(descDisplay, editorScrollRatio);
+      _syncDescCollapse(modal); // (TPT9340) back to the clamp on Comments / Notifications
       upd();
       if (restoreDisplayFocus) descDisplay.focus();
     });
@@ -2065,6 +2154,16 @@ function _attachModalHandlers(modal) {
     e.preventDefault();
     editDescription(e);
   });
+
+  // (TPT9340) Show description / Hide description under the description clamped on the Comments
+  // and Notifications sub-tabs. A render always starts on General, so the first sync resets it.
+  modal.querySelector('.modal-desc-toggle')?.addEventListener('click', () => {
+    if (!_modalState) return;
+    _modalState.descExpanded = !_modalState.descExpanded;
+    _syncDescCollapse(modal);
+  });
+  _observeDescriptionSize(modal, descDisplay);
+  _syncDescCollapse(modal);
 
   // C1095: diff-mode escape hatch — close this modal and open the real board-path one.
   const openLiveBtn = modal.querySelector('.btn-diff-open-live');
@@ -2514,6 +2613,13 @@ function _attachModalCommentHandlers(modal) {
 function _attachCommentEditHandlers(modal) {
   const list = modal.querySelector('.comments-list');
   if (!list) return;
+  _observeCommentListWidth(list); // (TPT9336/TPT9340)
+
+  // (TPT9340) An image that loads after the clamp was measured can make a short comment long.
+  // `load` does not bubble, so listen in the capture phase.
+  list.addEventListener('load', (e) => {
+    if (e.target instanceof HTMLImageElement && e.target.closest('.comment-body')) _syncCommentClamps(list);
+  }, true);
 
   list.addEventListener('input', (e) => {
     if (!_modalState || !e.target.classList?.contains('comment-edit-input')) return;
@@ -2521,8 +2627,11 @@ function _attachCommentEditHandlers(modal) {
   });
 
   // Double-click a own-comment body as a second way into edit mode, alongside the Edit
-  // button — both routes land on the same [data-act="edit"] handling below.
+  // button — both routes land on the same [data-act="edit"] handling below. (TPT9336) Not on a
+  // reply's citation: that is the quoted person's text, and a quick double-click on its toggle
+  // must only toggle.
   list.addEventListener('dblclick', (e) => {
+    if (e.target.closest('.comment-citation')) return;
     const body = e.target.closest('.comment-body[data-act="edit"]');
     if (body) _startCommentEdit(modal, list, body.closest('.comment-item'));
   });
@@ -2532,6 +2641,9 @@ function _attachCommentEditHandlers(modal) {
     if (!btn || btn.tagName !== 'BUTTON' || !list.contains(btn) || !_modalState) return;
     const item = btn.closest('.comment-item');
 
+    if (btn.dataset.act === 'reply') return replyToComment(modal, item);
+    if (btn.dataset.act === 'toggle-citation') return _toggleCitation(item, btn);
+    if (btn.dataset.act === 'toggle-clamp') return _toggleCommentClamp(item, btn);
     if (btn.dataset.act === 'edit') return _startCommentEdit(modal, list, item);
 
     if (btn.dataset.act === 'cancel') {
@@ -2574,6 +2686,215 @@ function _startCommentEdit(modal, list, item) {
   _modalState.editingDraft = comment.content || '';
   _removeMentionDropdown();
   _renderModalComments(modal);
+}
+
+// (TPT9336) Reply button: start a reply to one comment in the composer (.comment-input) — the
+// TPT9334 citation (marker, "> **Author:**" quote) and "@Author ", from buildReplyCitation() —
+// then focus it with the caret at the end. Posting stays the composer's ordinary Submit.
+function replyToComment(modal, item) {
+  const id = Number(item?.dataset.commentId);
+  if (!id || !_modalState) return;
+  const comment = (_modalState.comments || []).find(c => _commentId(c) === id);
+  const textarea = modal.querySelector('.comment-input');
+  if (!comment || !textarea) return;
+  const citation = buildReplyCitation({
+    commentId: id,
+    author: _commentAuthorHandle(comment),
+    text: _cleanCommentMarkdown(comment.content),
+  });
+  textarea.value = _replyComposerText(textarea.value, citation);
+  _removeMentionDropdown();
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  textarea.scrollTop = textarea.scrollHeight;
+}
+
+// (TPT9336) Composer text after Reply: the new citation, then what the user had typed. A
+// citation an earlier Reply left there is replaced rather than stacked, together with the
+// "@Author " it opened with, so moving the reply to another comment keeps only the typed text.
+function _replyComposerText(current, citation) {
+  const draft = String(current || '');
+  const earlier = parseReplyCitation(draft);
+  let typed = earlier ? earlier.body : draft;
+  if (earlier?.author) {
+    const mention = `@${earlier.author}`;
+    if (typed.startsWith(mention) && (typed.length === mention.length || /\s/.test(typed[mention.length]))) {
+      typed = typed.slice(mention.length);
+    }
+  }
+  return citation + typed.replace(/^\s+/, '');
+}
+
+// (TPT9336) Show/Hide quote on a reply's citation. Updates the row in place (no list rebuild, so
+// keyboard focus stays on the toggle) and records the choice for the next rebuild.
+function _toggleCitation(item, btn) {
+  const id = Number(item?.dataset.commentId);
+  const citation = btn.closest('.comment-citation');
+  if (!id || !citation || !_modalState) return;
+  const expandedIds = _modalState.expandedCitations || (_modalState.expandedCitations = new Set());
+  const expanded = !expandedIds.has(id);
+  if (expanded) expandedIds.add(id);
+  else expandedIds.delete(id);
+  citation.classList.toggle('is-expanded', expanded);
+  btn.setAttribute('aria-expanded', String(expanded));
+  const label = btn.querySelector('.comment-citation-toggle-label');
+  if (label) label.textContent = t(expanded ? 'comments.hideQuote' : 'comments.showQuote');
+}
+
+let _commentListObserver = null;
+let _commentListWidth = 0;
+let _commentClampFrame = 0;
+
+function _disconnectCommentListObserver() {
+  _commentListObserver?.disconnect();
+  _commentListObserver = null;
+  if (_commentClampFrame) cancelAnimationFrame(_commentClampFrame);
+  _commentClampFrame = 0;
+}
+
+// (TPT9336) Marks each collapsed citation whose quote already shows whole on its one line
+// (.is-whole), which hides its toggle: Show quote would reveal nothing. Needs layout, so a
+// hidden Comments tab (nothing measured) keeps every toggle; _observeCitationWidth() runs this
+// again once the tab shows or the list's width changes. A collapsed quote hides its images, so
+// a quote with one always keeps its toggle, and a focused toggle is left alone so keyboard focus
+// never lands on a hidden control. Reads all sizes before writing any class: one layout pass.
+function _syncCitationToggles(list) {
+  if (!list) return;
+  const citations = [...list.querySelectorAll('.comment-citation:not(.is-expanded)')]
+    .filter(citation => !citation.contains(document.activeElement));
+  const whole = citations.map((citation) => {
+    const quote = citation.querySelector('.comment-citation-text');
+    if (!quote || !quote.clientHeight || quote.querySelector('img')) return false;
+    return quote.scrollHeight <= quote.clientHeight + 1;
+  });
+  citations.forEach((citation, i) => citation.classList.toggle('is-whole', whole[i]));
+}
+
+// (TPT9336/TPT9340) One observer per rendered .comments-list (the element only changes on a full
+// modal render, which calls this again); disconnected on close. Any size change re-checks the
+// citation toggles, which only change visibility. A width change (the tab showing, a window, rail
+// or chat-panel resize) also re-measures the comment clamps, in the next frame: clamping changes
+// the list's own height, which inside this callback would raise the browser's ResizeObserver loop
+// error. The tab switch measures synchronously, so a first showing never paints unclamped.
+function _observeCommentListWidth(list) {
+  _disconnectCommentListObserver();
+  if (typeof ResizeObserver === 'undefined') return;
+  _commentListWidth = list.clientWidth;
+  _commentListObserver = new ResizeObserver(() => {
+    _syncCitationToggles(list);
+    if (list.clientWidth === _commentListWidth) return;
+    _commentListWidth = list.clientWidth;
+    if (_commentClampFrame) return;
+    _commentClampFrame = requestAnimationFrame(() => {
+      _commentClampFrame = 0;
+      _syncCommentClamps(list);
+    });
+  });
+  _commentListObserver.observe(list);
+}
+
+// (TPT9340) Comment bodies taller than about _COMMENT_CLAMP_LINES lines are clamped to that many
+// lines (.comment-body--clamped, faded at the bottom) with a Show more / Show less toggle under
+// them. _COMMENT_CLAMP_LINES matches the class's max-height in styles.css; a body counts as long
+// only past _COMMENT_CLAMP_SLACK_LINES more, so Show more never reveals just a line or two.
+const _COMMENT_CLAMP_LINES = 12;
+const _COMMENT_CLAMP_SLACK_LINES = 2;
+
+function _lineHeightPx(el) {
+  const style = getComputedStyle(el);
+  return parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.5 || 20;
+}
+
+// (TPT9340) Measures every comment body against the clamp and applies it: a long body is clamped
+// unless its id is in _modalState.expandedComments, and its toggle shows; a short one shows whole
+// with no toggle. Needs layout, so a hidden Comments tab (the list has no width) keeps the state
+// it has: switchTab() runs this again once the tab shows. A focused toggle is left as it is, so
+// keyboard focus never lands on a control that just hid. Reads every height before writing a
+// class: one layout pass.
+function _syncCommentClamps(list) {
+  if (!list || !_modalState || !list.clientWidth) return;
+  const rows = [];
+  for (const item of list.querySelectorAll('.comment-item')) {
+    const body = item.querySelector('.comment-body');
+    const toggle = item.querySelector('.comment-clamp-toggle');
+    if (body && toggle && toggle !== document.activeElement) rows.push({ item, body, toggle });
+  }
+  if (!rows.length) return;
+  const limit = _lineHeightPx(rows[0].body) * (_COMMENT_CLAMP_LINES + _COMMENT_CLAMP_SLACK_LINES);
+  const long = rows.map(({ body }) => body.scrollHeight > limit);
+  const expandedIds = _modalState.expandedComments;
+  rows.forEach(({ item, body, toggle }, i) => {
+    _applyCommentClamp(body, toggle, !!expandedIds?.has(Number(item.dataset.commentId)), long[i]);
+  });
+}
+
+function _applyCommentClamp(body, toggle, expanded, long) {
+  body.classList.toggle('comment-body--clamped', long && !expanded);
+  toggle.hidden = !long;
+  toggle.setAttribute('aria-expanded', String(expanded));
+  const label = toggle.querySelector('.comment-clamp-toggle-label');
+  if (label) label.textContent = t(expanded ? 'comments.showLess' : 'comments.showMore');
+}
+
+// (TPT9340) Show more / Show less on a long comment. Updates the row in place (no list rebuild,
+// so keyboard focus stays on the toggle) and records the choice for the next rebuild. Show less
+// shortens the list above the toggle, so the toggle is scrolled back into view.
+function _toggleCommentClamp(item, btn) {
+  const id = Number(item?.dataset.commentId);
+  const body = item?.querySelector('.comment-body');
+  if (!id || !body || !_modalState) return;
+  const expandedIds = _modalState.expandedComments || (_modalState.expandedComments = new Set());
+  const expanded = !expandedIds.has(id);
+  if (expanded) expandedIds.add(id);
+  else expandedIds.delete(id);
+  _applyCommentClamp(body, btn, expanded, true);
+  if (!expanded) btn.scrollIntoView?.({ block: 'nearest' });
+}
+
+// (TPT9340) The description on the Comments and Notifications sub-tabs gives the room to the list:
+// .modal-desc-display--collapsed stops it growing and clamps it to three lines, .is-clipped marks
+// text cut by that clamp (styles.css fades it out), and the Show description / Hide description
+// toggle under it shows whenever there is more to show or the reader opened it. General always
+// shows the description whole, and resets the reader's choice, so the next visit to Comments
+// starts compact again. The toggle hides while the description editor is open (the display is
+// display:none then). Not for diff mode, which has no Comments tab and no toggle.
+function _syncDescCollapse(modal) {
+  if (!modal || !_modalState) return;
+  const display = modal.querySelector('.modal-scroll-body > .modal-desc-display');
+  const toggle = modal.querySelector('.modal-desc-toggle');
+  if (!display || !toggle) return;
+  const tab = modal.querySelector('.modal-tab-btn.active')?.dataset.tab || 'general';
+  const listTab = tab === 'comments' || tab === 'notifications';
+  if (!listTab) _modalState.descExpanded = false;
+  const collapsed = listTab && !_modalState.descExpanded;
+  const editing = display.style.display === 'none';
+  display.classList.toggle('modal-desc-display--collapsed', collapsed);
+  if (collapsed) display.scrollTop = 0; // the clamp shows the start, whatever was scrolled before
+  const clipped = collapsed && !editing && display.clientWidth > 0
+    && display.scrollHeight > display.clientHeight + 1;
+  display.classList.toggle('is-clipped', clipped);
+  const wanted = listTab && !editing && (clipped || _modalState.descExpanded);
+  if (wanted || toggle !== document.activeElement) toggle.hidden = !wanted;
+  toggle.setAttribute('aria-expanded', String(!collapsed));
+  const label = toggle.querySelector('.modal-desc-toggle-label');
+  if (label) label.textContent = t(collapsed ? 'modal.showDescription' : 'modal.hideDescription');
+}
+
+let _descResizeObserver = null;
+
+function _disconnectDescObserver() {
+  _descResizeObserver?.disconnect();
+  _descResizeObserver = null;
+}
+
+// (TPT9340) Re-checks the description clamp when the description's box changes: a resize rewraps
+// its lines, a late image grows it. _syncDescCollapse() never changes the observed box itself here
+// (the collapsed class only changes on a tab switch or the toggle), so no ResizeObserver loop.
+function _observeDescriptionSize(modal, display) {
+  _disconnectDescObserver();
+  if (!display || display.dataset.diffSide || typeof ResizeObserver === 'undefined') return;
+  _descResizeObserver = new ResizeObserver(() => _syncDescCollapse(modal));
+  _descResizeObserver.observe(display);
 }
 
 function _attachModalTagInput(modal, onUpdate) {

@@ -12204,6 +12204,60 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
 .modal-scroll-body > .modal-tab-panel[data-tab="notifications"] {
   flex: 1 1 auto; min-height: 8rem; overflow-y: auto;
   overscroll-behavior: contain;
+  /* (TPT9340) A classic scrollbar coming and going must not change the list's width: the comment
+     clamps are measured against it (task-edit-modal.js _syncCommentClamps()). */
+  scrollbar-gutter: stable;
+}
+/* (TPT9340) On the Comments and Notifications sub-tabs the description gives the room to the list
+   (task-edit-modal.js _syncDescCollapse()): it no longer grows, and stops at three lines.
+   max-height is border-box: three lines plus the 10px padding and 1px border on each side. Cut
+   text (.is-clipped) fades into the card at the bottom — an overlay in the card's own colour, as a
+   mask would fade the card's border and background too. The toggle under it opens it again;
+   General always shows it whole. */
+.modal-scroll-body > .modal-desc-display.modal-desc-display--collapsed {
+  flex: 0 0 auto; min-height: 2.4em; max-height: calc(3lh + 22px);
+  overflow: hidden; position: relative;
+}
+.modal-desc-display--collapsed.is-clipped::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 0;
+  height: calc(1lh + 10px);
+  background: linear-gradient(to bottom, transparent, var(--c-bg-card));
+  pointer-events: none;
+}
+/* Show description / Hide description and a comment's Show more / Show less: small accent text
+   buttons with the reply citation toggle's chevron, which turns up while the content is open. */
+.modal-desc-toggle,
+.comment-clamp-toggle {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 1px 2px; border: 0; background: none;
+  color: var(--c-primary-text);
+  font: inherit; font-size: 0.72rem; font-weight: 600; line-height: 1.4;
+  cursor: pointer;
+}
+.modal-desc-toggle[hidden],
+.comment-clamp-toggle[hidden] { display: none; }
+.modal-desc-toggle:hover > span,
+.comment-clamp-toggle:hover > span { text-decoration: underline; }
+.modal-desc-toggle:focus-visible,
+.comment-clamp-toggle:focus-visible {
+  outline: 2px solid var(--c-primary-border); outline-offset: 2px; border-radius: 3px;
+}
+.modal-desc-toggle svg,
+.comment-clamp-toggle svg {
+  width: 12px; height: 12px; flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+.modal-desc-toggle[aria-expanded="true"] svg,
+.comment-clamp-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
+@media (prefers-reduced-motion: reduce) {
+  .modal-desc-toggle svg,
+  .comment-clamp-toggle svg { transition: none; }
+}
+/* Hangs off the card's bottom-right corner: 4px under it (its margin-bottom is 12px), 8px above
+   the tab strip. */
+.modal-scroll-body > .modal-desc-toggle {
+  flex-shrink: 0; align-self: flex-end;
+  margin: -8px 0 8px;
 }
 /* (TPT307) Key badge + status pill sit together on the left of the header, the way a card's
    id-badge and status pill do; Reset/Save are the only primary actions on the right. */
@@ -13033,19 +13087,49 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   color: var(--c-text-muted);
   font-size: 0.72rem;
 }
+/* (TPT9340) A body has no scroll region of its own: the Comments panel is the one scroll region.
+   A long body is clamped instead (.comment-body--clamped below). */
 .comment-body {
   margin-top: 3px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: var(--c-text);
   font-size: 0.85rem;
-  max-height: min(52vh, 420px); overflow-y: auto;
+  line-height: 1.5;
 }
+/* (TPT9340) A body longer than about twelve lines, until Show more (task-edit-modal.js
+   _syncCommentClamps(), whose _COMMENT_CLAMP_LINES is this 12): the last two lines fade out. */
+.comment-body--clamped {
+  max-height: calc(12 * 1lh); overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 2lh), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 2lh), transparent);
+}
+.comment-clamp-toggle { margin-top: 2px; }
 /* (TPT54) mirrors .modal-desc-display pre/code below — an auto-posted resolution
    comment's fenced log block has no wrap/scroll of its own otherwise and blows out
    .task-edit-panel's width. */
 .comment-body pre, .comment-body code {
   white-space: pre-wrap; word-break: break-all; max-width: 100%; overflow-x: auto;
+}
+/* (TPT9340) A markdown table keeps readable columns: no break inside a word in a cell (the body's
+   overflow-wrap:anywhere let auto table layout squeeze each column to a few letters), header
+   labels on one line, a floor under every column, and a table wider than the comment scrolls
+   sideways inside it. white-space:normal drops the body's pre-wrap, which would otherwise
+   render the newlines between the table's tags. */
+.comment-body table {
+  display: block; width: max-content; max-width: 100%; overflow-x: auto;
+  margin: 0.25em 0; border-collapse: collapse;
+  white-space: normal; overflow-wrap: normal; word-break: normal;
+  font-size: 0.95em; line-height: 1.45;
+}
+.comment-body th,
+.comment-body td {
+  min-width: 6em; padding: 0.3rem 0.6rem;
+  border: 1px solid var(--c-border);
+  text-align: left; vertical-align: top;
+}
+.comment-body th {
+  background: var(--c-bg-sub-nav); font-weight: 600; white-space: nowrap;
 }
 /* (TPT34) Own-comment inline edit — own-comment .comment-body double-click and the
    .comment-edit-btn both land here. Selector specificity note: .comment-meta .comment-edited
@@ -13056,17 +13140,133 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   font-size: 0.68rem;
   font-style: italic;
 }
-.comment-edit-btn {
+/* (TPT9336) Edit and Reply share the meta row's right edge. Reply comes last: it is on every row
+   (Edit only on the reader's own comments), so it lines up down the list. Their label colour is
+   --c-text-secondary: --c-text-muted misses 4.5:1 on the modal ground in several light palettes. */
+.comment-actions {
   margin-left: auto;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.comment-edit-btn,
+.comment-reply-btn {
   background: none;
   border: 0;
   padding: 0;
-  color: var(--c-text-muted);
+  color: var(--c-text-secondary);
+  font: inherit;
   font-size: 0.72rem;
   cursor: pointer;
 }
-.comment-edit-btn:hover {
+.comment-edit-btn:hover,
+.comment-reply-btn:hover {
   color: var(--c-primary-text);
+}
+.comment-edit-btn:focus-visible,
+.comment-reply-btn:focus-visible,
+.comment-citation-toggle:focus-visible {
+  outline: 2px solid var(--c-primary-border);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+/* (TPT9336) A reply's citation (TPT9334 format): accent bar, the quoted author, the quote clamped
+   to one line, and the Show quote toggle, all on one row. Expanded, the quote moves to a
+   full-width row of its own under the author and the toggle. */
+.comment-citation {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "author quote toggle";
+  align-items: baseline;
+  column-gap: 8px;
+  margin: 4px 0 6px;
+  padding: 4px 6px 4px 10px;
+  border-left: 3px solid var(--c-primary-border);
+  border-radius: 0 6px 6px 0;
+  background: var(--c-primary-lighter);
+  color: var(--c-text-secondary);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  white-space: normal;
+}
+.comment-citation:not(:has(.comment-citation-author)) {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "quote toggle";
+}
+.comment-citation-author {
+  grid-area: author;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--c-text);
+  font-weight: 600;
+}
+.comment-citation-text {
+  grid-area: quote;
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.comment-citation-text > * + * { margin-top: 0.35em; }
+.comment-citation-text ul,
+.comment-citation-text ol { padding-left: 1.4em; }
+.comment-citation-text ul { list-style: disc; }
+.comment-citation-text ol { list-style: decimal; }
+.comment-citation-text blockquote {
+  padding-left: 8px;
+  border-left: 2px solid var(--c-border-input);
+}
+/* Collapsed, the one line is text: an image in the quote waits for Show quote. */
+.comment-citation:not(.is-expanded) .comment-citation-text img { display: none; }
+.comment-citation-toggle {
+  grid-area: toggle;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: none;
+  border: 0;
+  padding: 0 2px;
+  color: var(--c-primary-text);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.comment-citation-toggle:hover .comment-citation-toggle-label { text-decoration: underline; }
+/* The quote already fits its one line: nothing to show (set by _syncCitationToggles()). */
+.comment-citation.is-whole:not(.is-expanded) .comment-citation-toggle { visibility: hidden; }
+.comment-citation-toggle svg {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+.comment-citation.is-expanded {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "author toggle" "quote quote";
+  row-gap: 2px;
+}
+.comment-citation.is-expanded:not(:has(.comment-citation-author)) {
+  grid-template-areas: ". toggle" "quote quote";
+}
+.comment-citation.is-expanded .comment-citation-author {
+  max-width: none;
+}
+.comment-citation.is-expanded .comment-citation-text {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: none;
+  line-clamp: none;
+}
+.comment-citation.is-expanded .comment-citation-toggle svg { transform: rotate(180deg); }
+@media (prefers-reduced-motion: reduce) {
+  .comment-citation-toggle svg { transition: none; }
 }
 .comment-edit-input {
   width: 100%;

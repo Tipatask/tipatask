@@ -219,16 +219,26 @@ let _ncRegistered = null;
 // is off (transient OS notifications, so bundle health matters again), otherwise desktop.
 let _statusDelivery = null;
 
-// The saved "Show on Top" choice from that read (true | false; null = unknown: outside Electron
-// or never read), and — while it is off and the banner stands in for native notifications the
-// OS cannot deliver — main's reason for that fallback. Delivery reads 'desktop' in both cases;
-// these two tell the user's choice apart from the stand-in.
-let _statusOnTop = null;
-let _statusFallback = null;
+// The saved "Show on Top" choice (true | false; null = unknown: outside Electron, not heard yet,
+// or main has no desktop-notification controller). It alone decides the delivery: on is the
+// desktop banner, off is native OS notifications — never the banner, even when the OS cannot
+// deliver them. Everything main says about it keeps it current: a notify:status read, the quick
+// notify:get-on-top read, a write's answer and the notify:on-top-changed broadcast (whichever
+// control flipped it: the banner's "Show" box, View ▸ Notifications or a Settings switch).
+let _onTopChoice = null;
+// Bumped by every write and every broadcast. A read answers for the moment main took it, so a
+// read asked before a later write or broadcast must not overwrite what that one said.
+let _onTopEpoch = 0;
+const _onTopListeners = new Set();
 
-// What the bundle health says stops native OS notifications, or null. Same ranking as main's
-// nativeDeliveryBlocker(): a bundle that was never signed outranks a broken seal, which
-// outranks a missing Notification Center registration.
+// A read's answer: the boolean choice, or null when main reports none (no controller).
+function _noteReadOnTop(value, epoch) {
+  if (epoch !== _onTopEpoch) return;
+  _onTopChoice = typeof value === 'boolean' ? value : null;
+}
+
+// What the bundle health says stops native OS notifications, or null: a bundle that was never
+// signed outranks a broken seal, which outranks a missing Notification Center registration.
 function _healthBlocker() {
   if (_bundleSignature.signed === false) return 'unsigned';
   if (_bundleSignature.valid === false) return 'seal-broken';
@@ -246,19 +256,12 @@ export function getNotificationStatus() {
   const permission = electron ? 'granted' : (hasWebApi ? Notification.permission : 'unsupported');
   const native = _desktopDelivery() && _statusDelivery === 'native';
   if (_desktopDelivery() && !native) {
-    // Banners deliver either way, so a blocked native path is never an error here. While the
-    // banner only stands in for it ("Show on Top" off), `fallback` names why — the bundle
-    // health when it explains it, else main's own reason (a failed or unanswered native send)
-    // — and the duplicate-registration details follow, so Settings can still offer Repair.
-    const fallback = _statusFallback ? (_healthBlocker() || _statusFallback) : null;
+    // "Show on Top" on: banners do not depend on native registration or permissions, so a
+    // blocked native path is never an error here.
     return { transport: 'electron', delivery: 'desktop', permission: 'granted',
       canDeliver: !_lastTransportError, lastError: _lastTransportError,
       enabled: Object.fromEntries(Object.keys(NOTIFY_PREF_KEYS).map((key) => [key, isNotifyEnabled(key)])),
-      onTop: _statusOnTop,
-      ...(fallback
-        ? { fallback, conflicts: _lsConflicts.conflicts, installerVolumes: _lsConflicts.installerVolumes,
-          registrationRepair: _lsConflicts.registrationRepair }
-        : { conflicts: null, installerVolumes: [] }) };
+      onTop: _onTopChoice, conflicts: null, installerVolumes: [] };
   }
   // (C1141) valid===false (seal broken by a stray write inside the bundle) is exactly as fatal
   // to delivery as signed===false (never signed at all) — both mean usernoted refuses to
@@ -274,7 +277,7 @@ export function getNotificationStatus() {
     permission,
     canDeliver,
     enabled: { attention: isNotifyEnabled('attention'), objective: isNotifyEnabled('objective'), completed: isNotifyEnabled('completed'), activity: isNotifyEnabled('activity') },
-    onTop: _statusOnTop,
+    onTop: _onTopChoice,
     lastError,
     // (C1355) Enriches the 'not-registered' case with the actual cause — never changes lastError
     // itself, since 'not-registered' is already correctly ranked below unsigned/seal-broken.
@@ -291,8 +294,6 @@ export function getNotificationStatus() {
 // the renderer's whole lifetime.
 function _foldSignatureStatus(status) {
   _statusDelivery = (status && status.delivery) || null;
-  _statusOnTop = typeof status?.onTop === 'boolean' ? status.onTop : null;
-  _statusFallback = (status?.delivery === 'desktop' && status.fallback) || null;
   _bundleSignature = {
     signed: status ? status.signed !== false : null,
     valid: status && status.valid !== undefined ? status.valid !== false : null,
@@ -312,30 +313,87 @@ function _foldSignatureStatus(status) {
 // re-folds the result, so a status read AFTER boot (Test button, reopening Settings) reflects
 // current reality instead of the one-shot snapshot taken at module load. No-op (resolves
 // immediately) outside Electron — the web transport has no bundle-signature concept at all.
+// The answer also carries the Show on Top choice (`onTop`), noted unless a write or broadcast
+// came after the read was asked.
 export async function refreshNotificationStatus() {
   if (typeof window === 'undefined' || typeof window.electronAPI?.notifyStatus !== 'function') return;
+  const epoch = _onTopEpoch;
   try {
-    _foldSignatureStatus(await window.electronAPI.notifyStatus());
+    const status = await window.electronAPI.notifyStatus();
+    _foldSignatureStatus(status);
+    _noteReadOnTop(status?.onTop, epoch);
   } catch (_) { /* leave prior state — a failed refresh must not blank out a known-good read */ }
 }
 
-// Settings ▸ Notifications "Show on top of other apps". The flag is app-level and lives in
-// main; only the Electron bridge can write it (browser mode has no always-on-top banner).
+// Settings ▸ Notifications "Always-on-top notifications" — the Show on Top flag. It is app-level
+// and lives in main; only the Electron bridge can write it (browser mode has no always-on-top
+// banner).
 export function canSetNotificationsOnTop() {
   return typeof window !== 'undefined' && typeof window.electronAPI?.setNotificationsOnTop === 'function';
 }
 
+// The choice as last heard from main (true | false | null), synchronously: a switch renders it
+// at once.
+export function getNotificationsOnTop() {
+  return _onTopChoice;
+}
+
+// Asks main for the choice on its own (notify:get-on-top), which answers at once — unlike
+// notify:status, which waits for the bundle-health refresh while the flag is off. Resolves the
+// choice known afterwards: without that bridge method, or when the read fails, the one known
+// before.
+export async function readNotificationsOnTop() {
+  if (typeof window === 'undefined' || typeof window.electronAPI?.getNotificationsOnTop !== 'function') return _onTopChoice;
+  const epoch = _onTopEpoch;
+  try {
+    const answer = await window.electronAPI.getNotificationsOnTop();
+    if (typeof answer?.enabled === 'boolean' || answer?.reason === 'unavailable') _noteReadOnTop(answer.enabled, epoch);
+  } catch (_) { /* keep what is known */ }
+  return _onTopChoice;
+}
+
+// Calls `cb(enabled)` after each change main broadcasts, whichever control made it;
+// getNotificationsOnTop() already returns the new choice by then. Returns the unsubscribe.
+export function onNotificationsOnTopChange(cb) {
+  _onTopListeners.add(cb);
+  return () => _onTopListeners.delete(cb);
+}
+
+function _onTopChanged(change) {
+  if (typeof change?.enabled !== 'boolean') return;
+  _onTopEpoch += 1;
+  _onTopChoice = change.enabled;
+  for (const cb of [..._onTopListeners]) {
+    try { cb(change.enabled); } catch (err) { debugNotifyLog('Show on Top listener failed', err); }
+  }
+}
+
 // Writes that flag through main's one writer (the menu checkbox and the banner's "Show" box use
-// it too), then re-reads the delivery it leads to. Resolves main's { ok, enabled }: `enabled`
-// is the live choice, present even when it could not be saved for the next launch (ok: false);
-// a call that never reached the writer has no `enabled`.
+// it too). The new choice is the known one at once; main's answer confirms it, and for a write
+// that never reached the flag the choice main still has is put back and read again. Resolves
+// main's { ok, enabled }: `enabled` is the live choice, present even when it could not be saved
+// for the next launch (ok: false); a call that never reached the writer has no `enabled`. The
+// delivery that choice leads to comes with the next status read (Settings re-reads it).
 export async function setNotificationsOnTop(on) {
   if (!canSetNotificationsOnTop()) return { ok: false, reason: 'unsupported' };
+  const enabled = on === true;
+  const before = _onTopChoice;
+  _onTopEpoch += 1;
+  const epoch = _onTopEpoch;
+  _onTopChoice = enabled;
   let result;
-  try { result = await window.electronAPI.setNotificationsOnTop(on === true); }
+  try { result = await window.electronAPI.setNotificationsOnTop(enabled); }
   catch (err) { result = { ok: false, reason: err?.message || 'failed' }; }
-  await refreshNotificationStatus();
-  return result && typeof result === 'object' ? result : { ok: false, reason: 'failed' };
+  if (!result || typeof result !== 'object') result = { ok: false, reason: 'failed' };
+  if (typeof result.enabled === 'boolean') {
+    _onTopEpoch += 1;
+    _onTopChoice = result.enabled;
+  } else {
+    // Unless a broadcast has said something newer meanwhile.
+    if (_onTopEpoch === epoch) _onTopChoice = before;
+    await readNotificationsOnTop();
+  }
+  return result;
 }
 
 // Shared by the persistent Settings notice and the Repair toast. The result verifies
@@ -376,11 +434,14 @@ export async function repairNotificationRegistration() {
 // Settings badge/warning dot can read `blocked`/`unsigned`/`seal-broken`/`not-registered` from
 // app start instead of only after a first failed notify() attempt. No-op outside Electron (no
 // `notifyStatus` bridge method exists there).
-if (typeof window !== 'undefined' && typeof window.electronAPI?.notifyStatus === 'function') {
-  Promise.resolve(window.electronAPI.notifyStatus())
-    .then(_foldSignatureStatus)
-    .catch(() => {});
+// The Show on Top choice is also read on its own first (notify:get-on-top answers at once; this
+// status read waits for the bundle-health refresh while the flag is off), and every change main
+// broadcasts keeps it current from then on, while no Settings dialog is open too.
+if (typeof window !== 'undefined' && typeof window.electronAPI?.onNotificationsOnTopChanged === 'function') {
+  try { window.electronAPI.onNotificationsOnTopChanged(_onTopChanged); } catch (_) { /* reads still work */ }
 }
+readNotificationsOnTop();
+refreshNotificationStatus();
 
 console.debug('[notifications] status:', getNotificationStatus());
 

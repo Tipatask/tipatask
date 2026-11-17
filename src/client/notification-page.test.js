@@ -162,9 +162,9 @@ test('(TPT505) header action: Clear All by default, Hide on request; footer "Sho
   host.remove();
 });
 
-// The banner can be up while "Show on Top" is off: it stands in for native notifications the
-// OS cannot deliver. Its checkbox then shows the saved (off) setting and turns it on.
-test('the footer "Show" toggle follows the saved setting and writes it both ways', () => {
+// The box renders whatever "Show on Top" state main sends and writes it both ways. Main only
+// shows the banner while the setting is on, and unchecking it empties and hides the banner.
+test('the footer "Show" toggle follows the setting and writes it both ways', () => {
   const host = document.createElement('div');
   document.body.appendChild(host);
   const acts = [];
@@ -194,5 +194,12 @@ test('the footer "Show" toggle follows the saved setting and writes it both ways
   box.checked = true;
   box.dispatchEvent(new browser.Event('change'));
   assert.deepEqual(bannerActs.at(-1), ['on-top-on', null]);
-  onState({ entries: [], theme: null });
+  // Unchecking it on a banner that shows it checked: main answers with the off state — no
+  // entries — and the page goes, so no unchecked box is ever left on screen.
+  onState({ entries: two, theme: null, onTop: true });
+  box.checked = false;
+  box.dispatchEvent(new browser.Event('change'));
+  assert.deepEqual(bannerActs.at(-1), ['on-top-off', null]);
+  onState({ entries: [], theme: null, onTop: false });
+  assert.equal(document.body.querySelector(':scope > .tt-notif-page'), null);
 });

@@ -148,14 +148,14 @@
           <div class="settings-notice" id="settings-remote-control-notice" role="status" hidden></div>
         </div>
       </section>
-      <!-- (C1058) Delivery status badge + Test/Enable button, then the Show on Top switch
-           (#settings-notifications-ontop): the app-level flag View ▸ Notifications and the
-           banner's "Show" box also write. Its row ships hidden and shows in Electron only —
-           browser mode has no always-on-top banner. The two notices follow both rows and ship
+      <!-- (C1058) Delivery status badge + Test/Enable button, then the "Always-on-top
+           notifications" switch (#settings-notifications-ontop): the Show on Top flag View ▸
+           Notifications and the banner's "Show" box also write. Its row ships hidden for browser
+           mode (no always-on-top banner); in Electron _renderSettingsOnTopSwitch() always shows
+           it, before the delivery status is read. The two notices follow both rows and ship
            hidden too; _populateSettingsNotificationsRows() shows #settings-notifications-hint
-           when delivery is blocked, or when the banner stands in for system notifications the
-           OS cannot deliver (with Repair for duplicate LaunchServices claimants, C1355), and
-           #settings-notifications-style-hint for the macOS Banner-vs-Alert advice (C1137). -->
+           when delivery is blocked (with Repair for duplicate LaunchServices claimants, C1355),
+           and #settings-notifications-style-hint for the macOS Banner-vs-Alert advice (C1137). -->
       <section class="settings-section">
         <h3 class="settings-section-title" id="settings-notifications-title"></h3>
         <div class="settings-row" id="settings-notifications-row">

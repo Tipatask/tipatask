@@ -34,8 +34,10 @@ const AGENT_LOG_HEADER_RE = /^(Agent session terminated by user|Agent completed 
 // (TPT354) Invisible HTML comment written as the LAST line of every auto-posted exit comment
 // (exit-resolution.js). The body between header and marker is rendered markdown (the agent's
 // final message) or a fenced sanitized tail, so the old "blank line + ``` fence" shape can no
-// longer be relied on — the marker is the current structural signal. Both markdown renderers
-// (Task App marked+DOMPurify, web marked) hide an HTML comment.
+// longer be relied on — the marker is the current structural signal. Neither comment view
+// shows it: the web's marked drops an HTML comment, and the Task App's renderMarkdown() escapes
+// raw HTML, so its comment view strips the marker first (task-edit-modal.js
+// _cleanCommentMarkdown()).
 const AGENT_EXIT_MARKER = '<!-- tipatask:agent-exit -->';
 
 function isAgentLogTailComment(content) {

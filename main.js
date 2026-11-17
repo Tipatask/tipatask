@@ -309,9 +309,6 @@ async function refreshBundleSignatureState({ force = false } = {}) {
     // thousands of sealed files) must not be worse than never having checked at all.
     _bundleSignatureState = { valid: null, reason: e.message || 'check-failed', relaunchNeeded: false };
   }
-  // "Show on Top" off: when macOS will not deliver native notifications for this bundle, sends
-  // go through the desktop banner instead. The controller re-reads the health refreshed above.
-  desktopNotifications?.refreshDelivery();
   return _bundleSignatureState;
 }
 
@@ -1092,19 +1089,16 @@ function registerIpcHandlers() {
   });
 
   // Desktop banners do not depend on native notification registration or permissions.
-  // (TPT487) With "Show on Top" off, sends are native OS notifications again, so the Settings
-  // hints need the bundle-health signals that decide whether macOS shows them at all. The
-  // delivery reported is the one a send uses right now: 'desktop' again, with `fallback`
-  // naming the reason, when native delivery is blocked and the banner stands in for it.
-  // `onTop` is the saved "Show on Top" choice itself, for the Settings switch. Off needs the
-  // bundle health first, and the choice is read again after that wait: it can be switched on
-  // meanwhile, and an answer must not report a choice that is already stale.
+  // (TPT487) With "Show on Top" off, sends are native OS notifications only — the banner is never
+  // used then — so the Settings hints need the bundle-health signals that decide whether macOS
+  // shows them at all. `onTop` is the saved "Show on Top" choice itself, for the Settings switch.
+  // Off needs the bundle health first, and the choice is read again after that wait: it can be
+  // switched on meanwhile, and an answer must not report a choice that is already stale.
   ipcMain.handle('notify:status', async () => {
     if (!desktopNotifications) return { delivery: 'desktop', available: true };
     if (!desktopNotifications.isEnabled()) await refreshBundleSignatureState();
     if (desktopNotifications.isEnabled()) return { delivery: 'desktop', available: true, onTop: true };
     return notifyStatus.offStatus({
-      ...desktopNotifications.delivery(),
       supported: () => Notification.isSupported(),
       signature: _bundleSignatureState,
       registered: _ncRegistrationState,
@@ -1152,16 +1146,12 @@ function registerIpcHandlers() {
   desktopNotifications = createDesktopNotifications({ BrowserWindow, screen, ipcMain, Notification,
     // (TPT480/TPT487) Persisted "Show on Top" choice — app-level, not per project. Controlled
     // from View ▸ Notifications (createMenu()), the banner's "Show" checkbox (onSetOnTop,
-    // TPT505) and the Settings ▸ Notifications switch (notify:set-on-top). Off sends native OS
-    // notifications instead of the always-on-top stack.
+    // TPT505) and the Settings ▸ Notifications switch (notify:set-on-top), all through
+    // applyNotificationsOnTop(). It alone decides whether the always-on-top stack is used: off
+    // sends native OS notifications instead and never shows the stack, even when macOS does not
+    // deliver them (the alert then stays an in-app card).
     settingsFile: path.join(app.getPath('userData'), 'desktop-notifications.json'),
     onSetOnTop: (on) => applyNotificationsOnTop(on),
-    // Off, yet macOS would drop a native notification from this bundle (broken seal, no
-    // Notification Center registration): the controller keeps using the stack, so no alert is
-    // lost. A native send the OS fails at runtime leads to the same fallback on its own.
-    nativeBlocked: () => notifyStatus.nativeDeliveryBlocker({
-      signature: _bundleSignatureState, registered: _ncRegistrationState,
-    }),
     isTrustedProjectSender: (event) => isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` }),
     // (TPT484) One surface by app focus: the focused project window hosts the in-app panel;
     // with no project window focused, the always-on-top banner takes over.
@@ -1252,7 +1242,19 @@ function registerIpcHandlers() {
     return desktopNotifications.surfaceFor(BrowserWindow.fromWebContents(event.sender));
   });
 
-  // Settings ▸ Notifications "Show on top of other apps": the flag View ▸ Notifications and the
+  // Settings ▸ Notifications "Always-on-top notifications" reads the Show on Top choice through
+  // this, on its own and at once. notify:status carries the choice too, but while it is off that
+  // read first waits for the bundle-health refresh (codesign, lsregister -dump: seconds), and the
+  // switch must never wait for it. Answers { ok, enabled } like the writer below.
+  ipcMain.handle('notify:get-on-top', (event) => {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+      return { ok: false, reason: 'untrusted_sender' };
+    }
+    if (!desktopNotifications) return { ok: false, reason: 'unavailable' };
+    return { ok: true, enabled: desktopNotifications.isEnabled() };
+  });
+
+  // Settings ▸ Notifications "Always-on-top notifications": the flag View ▸ Notifications and the
   // banner's "Show" box write, through the same writer. App-level, so any trusted project
   // window may set it; answers { ok, enabled } like applyNotificationsOnTop().
   ipcMain.handle('notify:set-on-top', (event, payload = {}) => {
@@ -2078,8 +2080,11 @@ async function showVoiceShortcutDiagnostics(win) {
   });
 }
 
-// (TPT487) One writer for the "Show on Top" flag: applies at once, persists, rebuilds the menu
-// checkbox and tells every project window (its Settings ▸ Notifications status follows it).
+// (TPT487) One writer for the "Show on Top" flag — the View menu item, the banner's "Show" box
+// (onSetOnTop) and the Settings switch (notify:set-on-top) all end here, in either direction:
+// setEnabled() applies it at once, persists it and re-sends the banner its state
+// (notify:desktop-state, `onTop` included); the menu is rebuilt with the new checkbox; every
+// project window gets notify:on-top-changed (an open Settings dialog follows it).
 function applyNotificationsOnTop(on) {
   if (!desktopNotifications) return { ok: false, reason: 'unavailable' };
   const result = desktopNotifications.setEnabled(on);
@@ -2094,11 +2099,10 @@ function applyNotificationsOnTop(on) {
 }
 
 // (TPT480/TPT505) View ▸ Notifications. The checkbox applies at once and persists across
-// restarts: checked keeps the desktop stack on top; unchecked hides it and sends new alerts as
-// transient native OS notifications (TPT487) — or, when the OS cannot deliver those, through
-// the stack after all (desktop-notifications.js `fallback`). In-app cards are unaffected either
-// way. The banner's own "Show" checkbox and the Settings ▸ Notifications switch write the same
-// flag.
+// restarts: checked keeps the desktop stack on top; unchecked hides it for good and sends new
+// alerts as transient native OS notifications (TPT487) — never through the stack, even when the
+// OS cannot deliver them. In-app cards are unaffected either way. The banner's own "Show"
+// checkbox and the Settings ▸ Notifications switch write the same flag.
 function notificationsMenu() {
   return {
     label: mt('menu.notifications'),

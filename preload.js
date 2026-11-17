@@ -92,6 +92,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Settings ▸ Notifications switch: writes that flag. Resolves { ok, enabled } — `enabled` is
   // the live choice, also when it could not be saved for the next launch (ok: false).
   setNotificationsOnTop: (enabled) => inv('notify:set-on-top', { enabled: enabled === true }),
+  // Reads that flag at once — { ok, enabled } — without the bundle-health wait notify:status
+  // has while it is off, so the Settings switch shows without waiting for that check.
+  getNotificationsOnTop: () => inv('notify:get-on-top'),
   // Delivery status for Settings: the mode a send uses right now (desktop banners, or native
   // OS notifications while "Show on Top" is off and macOS can deliver them) plus the bundle
   // health behind a blocked native path (C1125: an unsigned or unregistered bundle gets no

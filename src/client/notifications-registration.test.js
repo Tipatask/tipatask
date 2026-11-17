@@ -28,10 +28,13 @@ for (const locale of ['en', 'uk', 'zh', 'es']) {
         document: window.document, window, t, tc, registrationRepairMessage,
         getNotificationStatus: () => status,
         refreshNotificationStatus: async () => {},
+        getNotificationsOnTop: () => false,
+        readNotificationsOnTop: async () => false,
         repairNotificationRegistration: () => new Promise(resolve => { resolveRepair = () => { status = { ...status, ...result.registration, registrationRepair: result }; resolve(result); }; }),
         showToast: (message, kind) => toasts.push({ message, kind }),
       });
-      vm.runInContext(`${productionFunction('_notifStatusKey')}\n${productionFunction('_populateSettingsNotificationsRows')}\nconst modal = document.getElementById('settings-modal');\n${wiring}`, context);
+      vm.runInContext(`${productionFunction('_notifStatusKey')}\n${productionFunction('_renderSettingsOnTopSwitch')}\n`
+        + `${productionFunction('_populateSettingsNotificationsRows')}\nconst modal = document.getElementById('settings-modal');\n${wiring}`, context);
       await context._populateSettingsNotificationsRows();
       const button = window.document.getElementById('settings-notifications-repair');
       const hint = window.document.getElementById('settings-notifications-hint');

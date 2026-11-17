@@ -22,7 +22,7 @@ import { buildSubtasksLabel, closedDelta, applyChildStatusDelta, countChildProgr
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { createMemberCache } from './member-cache.js';
 import { api, isTransportError, errorDetail } from './api-client.js';
-import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration, registrationRepairMessage, dismissTaskNotifications, setNotificationsOnTop } from './notifications.js';
+import { getNotificationStatus, sendTestNotification, refreshNotificationStatus, repairNotificationRegistration, registrationRepairMessage, dismissTaskNotifications, setNotificationsOnTop, getNotificationsOnTop, readNotificationsOnTop, onNotificationsOnTopChange } from './notifications.js';
 import { buildDepGraph, collectCycleBlocked } from './dep-graph.js';
 import { tagName } from './tag-match.js';
 import { unregisteredTagNames } from './tag-registration.js';
@@ -7785,13 +7785,35 @@ function _populateSettingsDebugRow() {
   })();
 }
 
+// "Always-on-top notifications" (#settings-notifications-ontop) — the Show on Top flag main
+// persists, also written by View ▸ Notifications and the banner's "Show" box. Electron only:
+// browser mode has no always-on-top banner, so the row stays hidden there. In Electron it always
+// shows, whatever the delivery status says, and never waits for it: the status read waits for
+// the bundle-health check (seconds) while the flag is off. The switch shows the saved choice as
+// notifications.js last heard it (on: desktop banners; off: system notifications, never
+// banners) and is disabled only while main reports none (no desktop-notification controller).
+function _renderSettingsOnTopSwitch() {
+  const row = document.getElementById('settings-notifications-ontop-row');
+  const toggle = document.getElementById('settings-notifications-ontop');
+  if (!row || !toggle) return;
+  row.hidden = typeof window.electronAPI?.setNotificationsOnTop !== 'function';
+  const onTop = getNotificationsOnTop();
+  toggle.checked = onTop !== false;
+  toggle.disabled = typeof onTop !== 'boolean';
+}
+
 // (C1318) Async — re-verifies against main.js's live notify:status (bundle seal +
 // Notification Center registration) before rendering, instead of only ever showing the
 // boot-time snapshot notifications.js captured at module load. No-op/instant outside
 // Electron. Callers are fire-and-forget (unchanged) — the DOM updates once the refresh
-// settles rather than blocking the modal open.
+// settles rather than blocking the modal open. The always-on-top switch comes first and is
+// drawn before any await, then again after main's quick read of the choice.
 async function _populateSettingsNotificationsRows() {
+  _renderSettingsOnTopSwitch();
+  await readNotificationsOnTop();
+  _renderSettingsOnTopSwitch();
   await refreshNotificationStatus();
+  _renderSettingsOnTopSwitch();
 
   const stateEl = document.getElementById('settings-notifications-state');
   const testBtn = document.getElementById('settings-notifications-test');
@@ -7810,35 +7832,24 @@ async function _populateSettingsNotificationsRows() {
       || (status.transport === 'web' && status.permission === 'denied');
   }
 
-  // "Show on top of other apps" — the app-level flag main persists, also written by View ▸
-  // Notifications and the banner's "Show" box. Electron only: browser mode has no always-on-top
-  // banner, so the row stays hidden there. The switch shows the saved choice, which is not
-  // always the delivery in use: off with native delivery blocked still sends banners (the
-  // fallback the notice below explains).
-  const onTopRow = document.getElementById('settings-notifications-ontop-row');
+  // The always-on-top switch is drawn above (_renderSettingsOnTopSwitch()). Its choice is also
+  // the delivery in use: off is system notifications — never banners, even when the system
+  // cannot deliver them (the notice below then says why).
   const onTopToggle = document.getElementById('settings-notifications-ontop');
-  // Why the banner stands in for native notifications while the switch is off, or null.
-  const fallback = status.delivery === 'desktop' ? (status.fallback || null) : null;
   // A desktop banner that could not be shown outranks every native-delivery message.
   const desktopFailed = status.delivery === 'desktop' && !!status.lastError;
-  if (onTopRow && onTopToggle) {
-    onTopRow.hidden = typeof window.electronAPI?.setNotificationsOnTop !== 'function';
-    onTopToggle.checked = status.onTop !== false;
-    onTopToggle.disabled = typeof status.onTop !== 'boolean';
-    onTopToggle.setAttribute('aria-describedby', fallback && !desktopFailed
-      ? 'settings-notifications-ontop-hint settings-notifications-hint-text'
-      : 'settings-notifications-ontop-hint');
-  }
+  // Switch off and a notice saying why system notifications do not arrive: it describes the
+  // switch too.
+  let describesSwitch = false;
 
   if (hintEl) {
-    // What stops native delivery: the fallback's reason, or the native path's own error.
-    const cause = fallback || (status.delivery === 'desktop' ? null : status.lastError);
-    const repairFailed = (status.delivery !== 'desktop' || !!fallback) && status.registrationRepair && !status.registrationRepair.ok;
+    // What stops native delivery ("Show on Top" off): the native path's own error.
+    const cause = status.delivery === 'desktop' ? null : status.lastError;
+    const repairFailed = status.delivery !== 'desktop' && status.registrationRepair && !status.registrationRepair.ok;
     const blocked = status.transport === 'unsupported'
       || status.permission === 'denied'
       || (status.transport === 'electron' && status.lastError)
-      || repairFailed
-      || !!fallback;
+      || repairFailed;
     // (C1125) 'unsigned' gets its own hint — "notifications blocked, go check System
     // Settings" sends the user chasing a permission that was never the problem.
     // (C1141) 'seal-broken' likewise — the bundle WAS signed, but its seal broke at runtime
@@ -7863,23 +7874,24 @@ async function _populateSettingsNotificationsRows() {
         : cause === 'seal-broken' ? t('settings.notifHintSealBroken')
         : repairFailed ? registrationRepairMessage(status.registrationRepair, t)
         : cause === 'not-registered' ? notRegisteredHint
-        : fallback ? t('settings.notifHintFallbackCheck')
         : (blocked ? t('settings.notifHintBlocked') : '');
-      // The fallback is no failure — alerts still arrive — so its notice opens by saying where
-      // they go, then names what keeps system notifications away.
-      hintTextEl.textContent = desktopFailed ? t('settings.notifHintDesktopFailed')
-        : (fallback && text ? t('settings.notifHintFallback', { cause: text }) : text);
+      hintTextEl.textContent = desktopFailed ? t('settings.notifHintDesktopFailed') : text;
     }
     hintEl.hidden = !blocked || !hintTextEl?.textContent;
+    describesSwitch = !hintEl.hidden && !desktopFailed && status.onTop === false;
     // (C1355) Repair button only makes sense when there's an actual duplicate-claimant conflict
     // to fix — for every other blocked reason (unsigned, seal-broken, denied, unsupported) it
-    // would just fail with nothing to repair. It stays reachable during the banner fallback:
-    // that is the state a Mac with duplicate registrations is in whenever the switch is off.
+    // would just fail with nothing to repair. Only the native path ("Show on Top" off) needs it.
     if (repairBtn) {
-      const nativePath = status.delivery !== 'desktop' || !!fallback;
+      const nativePath = status.delivery !== 'desktop';
       repairBtn.hidden = desktopFailed || !(nativePath && (repairFailed || (cause === 'not-registered' && status.conflicts > 0)));
       repairBtn.textContent = t('settings.notifRepairBtn');
     }
+  }
+  if (onTopToggle) {
+    onTopToggle.setAttribute('aria-describedby', describesSwitch
+      ? 'settings-notifications-ontop-hint settings-notifications-hint-text'
+      : 'settings-notifications-ontop-hint');
   }
 
   // (C1137) macOS-only Banner-vs-Alert hint — only the OS setting itself can make banners
@@ -8124,10 +8136,10 @@ export function initSettingsModal() {
       _populateSettingsNotificationsRows();
     });
   }
-  // "Show on Top": this switch, View ▸ Notifications and the banner's "Show" box write one
-  // app-level flag (TPT487/TPT505). The switch applies on change. A write that never reached
-  // the flag puts the switch back (the re-read below); one that applied but could not be saved
-  // for the next launch keeps it and says so.
+  // "Always-on-top notifications": this switch, View ▸ Notifications and the banner's "Show" box
+  // write one app-level flag (TPT487/TPT505). The switch applies on change. A write that never
+  // reached the flag puts the switch back (notifications.js reads the choice main kept); one
+  // that applied but could not be saved for the next launch keeps it and says so.
   const notifOnTopToggle = modal.querySelector('#settings-notifications-ontop');
   if (notifOnTopToggle) {
     notifOnTopToggle.addEventListener('change', async () => {
@@ -8138,15 +8150,13 @@ export function initSettingsModal() {
       _populateSettingsNotificationsRows();
     });
   }
-  // Whoever flips the flag, the open modal follows: the switch at once, the status badge and
-  // notices once the delivery mode is re-read.
-  try {
-    window.electronAPI?.onNotificationsOnTopChanged?.((change) => {
-      if (!document.getElementById('settings-modal')?.classList.contains('open')) return;
-      if (notifOnTopToggle && typeof change?.enabled === 'boolean') notifOnTopToggle.checked = change.enabled;
-      _populateSettingsNotificationsRows();
-    });
-  } catch (_) {}
+  // Whoever flips the flag (main's notify:on-top-changed, heard through notifications.js, which
+  // already holds the new choice), the open modal follows: the switch at once, the status badge
+  // and notices once the delivery mode is re-read. A closed one shows it on its next open.
+  onNotificationsOnTopChange(() => {
+    if (!document.getElementById('settings-modal')?.classList.contains('open')) return;
+    _populateSettingsNotificationsRows();
+  });
   // (C1259) Debug ▸ click-to-render perf logging toggle + log-path hint buttons — wired
   // once; state/path repopulated on each open via _populateSettingsDebugRow().
   const debugToggle = modal.querySelector('#settings-debug-perf-toggle');

@@ -42,7 +42,7 @@ function nativeClass({ supported = true, outcome = 'show' } = {}) {
 }
 
 function fixture({ fail = false, settingsFile = null, showMoreTarget = null, loadGate = null, projects = [],
-  native = nativeClass(), platform = 'darwin', clickResult = null, nativeBlocked = undefined, confirmMs = undefined } = {}) {
+  native = nativeClass(), platform = 'darwin', clickResult = null, confirmMs = undefined } = {}) {
   const windows = [];
   class BrowserWindow extends EventEmitter {
     constructor(options) { super(); this.options = options; this.webContents = new EventEmitter();
@@ -69,7 +69,7 @@ function fixture({ fail = false, settingsFile = null, showMoreTarget = null, loa
     onClick: e => { clicked.push(e); return clickResult?.(e); },
     onDismiss: (e, { keepCard } = {}) => (keepCard ? released : dismissed).push(e),
     onShowMore: e => { shownMore.push(e); return showMoreTarget; },
-    onSetOnTop: on => onTopSets.push(on), platform, nativeBlocked, confirmMs,
+    onSetOnTop: on => onTopSets.push(on), platform, confirmMs,
     isTrustedProjectSender: (event) => event.trustedProject === true });
   const action = (id, action, trusted = true) => {
     const w = windows.at(-1);
@@ -661,131 +661,168 @@ test('native notifications close on task dismissal, dismissKey and turning Show 
   f.surface.dispose();
 });
 
-// "Show on Top" off must never mean "no alert": when the OS cannot deliver a native
-// notification, the alert goes to the shared registry and the banner after all.
+// "Show on Top" alone decides whether the banner is used. Off sends native OS notifications
+// and never the banner — not even when the OS cannot deliver them: that alert stays the in-app
+// card its project window shows, and the send reports the failure.
 const OFF = { windowId: 1, wcId: 7, projectPath: '/a' };
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-test('off on a platform without native notifications sends through the banner', async () => {
+test('off on a platform without native notifications reports it and never opens the banner', async () => {
   for (const native of [nativeClass({ supported: false }), { Notification: null, natives: [] }]) {
     const f = fixture({ native });
     f.surface.setEnabled(false);
-    const result = await f.surface.show({ title: 'x', tag: 't', notificationId: 'n1' }, OFF);
-    assert.deepEqual(result, { ok: true, id: result.id, delivery: 'desktop', fallback: 'unsupported' });
+    assert.deepEqual(await f.surface.show({ title: 'x', tag: 't', notificationId: 'n1' }, OFF), { ok: false, reason: 'unsupported' });
     assert.equal(f.natives.length, 0);
-    assert.deepEqual(f.surface.snapshot().map((e) => e.notificationId), ['n1']);
-    assert.equal(f.windows[0].visible, true);
+    assert.equal(f.surface.snapshot().length, 0);
+    assert.equal(f.windows.length, 0, 'no banner window');
     f.surface.dispose();
   }
 });
 
-test('off with native delivery known blocked: alerts stack on the banner from the first send', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpt9294-'));
+test('a saved off on a Mac that refuses native notifications never shows the banner', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tpt9327-'));
   const settingsFile = path.join(dir, 'desktop-notifications.json');
   fs.writeFileSync(settingsFile, JSON.stringify({ desktopNotificationsEnabled: false }));
   try {
     const a = projectWindow();
-    const f = fixture({ settingsFile, projects: [a], nativeBlocked: () => 'not-registered' });
-    assert.equal(f.surface.isEnabled(), false, 'the saved setting is untouched');
-    assert.deepEqual(f.surface.surfaceFor(a), { shared: true, active: false, entries: [] });
-    assert.deepEqual(f.surface.delivery(), { delivery: 'desktop', fallback: 'not-registered' });
+    // macOS answers an unregistered bundle's notification with 'failed' (UNErrorDomain error 1).
+    const f = fixture({ settingsFile, projects: [a], native: nativeClass({ outcome: 'failed' }) });
+    assert.equal(f.surface.isEnabled(), false);
+    assert.deepEqual(f.surface.surfaceFor(a), { shared: false, active: false, entries: [] });
     for (let i = 1; i <= 3; i++) {
       const result = await f.surface.show({ title: `T${i}`, tag: `TPT${i}`, notificationId: `n${i}` }, OFF);
-      assert.deepEqual(result, { ok: true, id: result.id, delivery: 'desktop', fallback: 'not-registered' });
+      assert.deepEqual(result, { ok: false, reason: 'failed' }, 'the renderer learns the alert was not delivered');
+      assert.equal(f.surface.upsertCard({ tag: `TPT${i}`, title: `T${i}`, seq: i }, OFF).delivery, 'disabled',
+        'the in-app card stays local');
     }
-    assert.equal(f.natives.length, 0, 'no native notification is attempted');
-    assert.equal(f.windows.length, 1);
-    assert.equal(f.windows[0].visible, true, 'another app focused: the banner is up');
-    assert.deepEqual(f.windows[0].data.entries.map((e) => e.title), ['T3', 'T2', 'T1']);
-    assert.equal(f.windows[0].data.onTop, false, 'the banner checkbox shows the saved (off) setting');
-    const { x, y, width, height } = f.windows[0].bounds;
-    assert.deepEqual([x + width, y + height], [100 + 1024, 20 + 768], 'bottom-right corner of the work area');
-    assert.equal(height, pageHeight(3));
-    // In-app cards share the registry again, and a focused project window hosts the alerts.
-    assert.equal(f.surface.upsertCard({ tag: 'TPT1', title: 'T1', seq: 1 }, OFF).delivery, 'shared');
+    assert.equal(f.natives.length, 3, 'every alert is tried as a native');
+    assert.equal(f.natives.every((n) => n.closed), true);
+    assert.equal(f.surface.snapshot().length, 0);
+    assert.equal(f.windows.length, 0, 'no banner window is ever created');
+    // The failure result releases the callback identity in the renderer; a notify:dismissed
+    // sent alongside could reach it first and swallow the failure report.
+    assert.deepEqual([f.released.length, f.dismissed.length], [0, 0]);
     f.focus(a);
-    assert.equal(f.windows[0].visible, false);
-    assert.equal(f.lastSurface(a).entries.length, 3);
     f.focus(null);
-    assert.equal(f.windows[0].visible, true);
-    // A card click routes like any banner click.
-    f.action(f.surface.snapshot().find((e) => e.notificationId === 'n3').id, 'click');
-    assert.deepEqual(f.clicked.map((e) => [e.notificationId, e.origin.projectPath]), [['n3', '/a']]);
+    assert.equal(f.windows.length, 0);
     assert.equal(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).desktopNotificationsEnabled, false);
     f.surface.dispose();
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('a native send the OS fails moves to the banner with its callback identity', async () => {
+test('unchecking Show on Top keeps the banner away: later alerts, card mirrors and focus flips never bring it back', async () => {
   const a = projectWindow();
   const f = fixture({ projects: [a], native: nativeClass({ outcome: 'failed' }) });
-  f.surface.setEnabled(false);
-  assert.deepEqual(f.surface.delivery(), { delivery: 'native', fallback: null }, 'nothing failed yet');
+  await show(f, 2);
+  assert.equal(f.windows[0].visible, true);
+  assert.equal(f.windows[0].data.onTop, true);
+  // What main's applyNotificationsOnTop(false) runs for the banner's "Show" box, the menu and Settings.
+  assert.deepEqual(f.surface.setEnabled(false), { ok: true, enabled: false });
+  assert.equal(f.windows[0].visible, false, 'the banner steps aside at once');
+  assert.deepEqual(f.windows[0].data, { entries: [], theme: null, onTop: false }, 'and is re-sent its state');
+  assert.equal(f.surface.snapshot().length, 0);
+  assert.deepEqual([f.released.length, f.dismissed.length], [2, 0], 'in-app cards are kept');
   assert.deepEqual(f.lastSurface(a), { shared: false, active: false, entries: [] });
-  const first = await f.surface.show({ title: 'T1', body: 'b', tag: 'TPT1', taskId: 'TPT1', notificationId: 'n1' }, OFF);
-  assert.deepEqual(first, { ok: true, id: first.id, delivery: 'desktop', fallback: 'failed' });
-  assert.equal(f.natives.length, 1);
-  assert.equal(f.natives[0].closed, true);
-  assert.deepEqual(f.surface.snapshot().map((e) => [e.title, e.notificationId, e.taskId]), [['T1', 'n1', 'TPT1']]);
-  assert.equal(f.windows[0].visible, true, 'the dropped alert is on the banner');
-  assert.equal(f.lastSurface(a).shared, true, 'project windows mirror their cards again');
-  assert.deepEqual(f.surface.delivery(), { delivery: 'desktop', fallback: 'failed' });
-  assert.deepEqual([f.released.length, f.dismissed.length], [0, 0], 'its callback identity is kept, not released');
-  // Later sends skip the native attempt.
-  const second = await f.surface.show({ title: 'T2', tag: 'TPT2', notificationId: 'n2' }, OFF);
-  assert.equal(second.delivery, 'desktop');
-  assert.equal(f.natives.length, 1);
-  f.action(first.id, 'click');
-  assert.deepEqual(f.clicked.map((e) => [e.notificationId, e.origin.projectPath]), [['n1', '/a']]);
-  // A native whose show() throws takes the same path.
-  const g = fixture({ native: nativeClass({ outcome: 'throw' }) });
-  g.surface.setEnabled(false);
-  const thrown = await g.surface.show({ title: 'T', tag: 't', notificationId: 'n9' }, OFF);
-  assert.deepEqual([thrown.ok, thrown.delivery, thrown.fallback], [true, 'desktop', 'failed']);
-  assert.equal(g.windows[0].visible, true);
+  for (let i = 1; i <= 3; i++) {
+    assert.deepEqual(await f.surface.show({ title: `late ${i}`, tag: `L${i}`, notificationId: `l${i}` }, OFF),
+      { ok: false, reason: 'failed' });
+    assert.equal(f.surface.upsertCard({ tag: `L${i}`, title: `late ${i}`, seq: i }, OFF).delivery, 'disabled');
+    f.focus(a);
+    f.focus(null);
+    assert.equal(f.windows[0].visible, false, `alert ${i} stays off the banner`);
+  }
+  f.action(null, 'hide');
+  assert.equal(f.windows[0].visible, false);
+  assert.equal(f.surface.snapshot().length, 0);
+  // Turning it on again brings the banner back with the next alert, checked.
+  f.surface.setEnabled(true);
+  assert.equal(f.lastSurface(a).shared, true);
+  assert.equal((await f.surface.show({ title: 'back', tag: 'B1', notificationId: 'b1' }, OFF)).delivery, 'desktop');
+  assert.equal(f.windows[0].visible, true);
+  assert.equal(f.windows[0].data.onTop, true);
   f.surface.dispose();
-  g.surface.dispose();
 });
 
-test('one failed native takes every unanswered native to the banner; a late show leaves no twin', async () => {
+test('the banner on screen always shows its "Show" box checked', async () => {
+  const a = projectWindow();
+  const f = fixture({ projects: [a], native: nativeClass({ outcome: 'failed' }) });
+  const seen = [];
+  const check = (label) => {
+    const banner = f.windows[0];
+    if (banner?.visible) seen.push([label, banner.data.onTop]);
+  };
+  await show(f, 2); check('first alerts');
+  f.action(null, 'hide'); check('hidden');
+  await f.surface.show({ title: 'new', tag: 'N1', notificationId: 'm1' }, OFF); check('a new alert after Hide');
+  f.focus(a); check('project window focused');
+  f.focus(null); check('another app focused');
+  f.surface.setEnabled(false); check('off');
+  await f.surface.show({ title: 'off', tag: 'N2', notificationId: 'm2' }, OFF); check('an alert while off');
+  f.surface.setEnabled(true); check('on again');
+  f.surface.upsertCard({ tag: 'N3', title: 'mirrored', seq: 3 }, OFF);
+  await flush(); check('a mirrored card');
+  assert.deepEqual(seen.map(([label]) => label),
+    ['first alerts', 'a new alert after Hide', 'another app focused', 'a mirrored card'], 'the banner is up only while on');
+  assert.deepEqual(seen.filter(([, onTop]) => onTop !== true), []);
+  f.surface.dispose();
+});
+
+test('a native the OS refuses, throws on or never answers is let go, not moved to the banner', async (t) => {
+  const a = projectWindow();
+  const f = fixture({ projects: [a], native: nativeClass({ outcome: 'throw' }) });
+  f.surface.setEnabled(false);
+  assert.deepEqual(await f.surface.show({ title: 'T', tag: 't', notificationId: 'n1' }, OFF), { ok: false, reason: 'failed' });
+  class Broken extends EventEmitter { static isSupported() { return true; } constructor() { super(); throw new Error('no presenter'); } }
+  const g = fixture({ native: { Notification: Broken, natives: [] } });
+  g.surface.setEnabled(false);
+  assert.deepEqual(await g.surface.show({ title: 'T', tag: 't' }, OFF), { ok: false, reason: 'failed' });
+  for (const surface of [f, g]) {
+    assert.equal(surface.windows.length, 0);
+    assert.equal(surface.surface.snapshot().length, 0);
+  }
+  f.surface.dispose();
+  g.surface.dispose();
+
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const h = fixture({ native: nativeClass({ outcome: 'silent' }), confirmMs: 300 });
+  h.surface.setEnabled(false);
+  let settled = null;
+  const pending = h.surface.show({ title: 'T1', tag: 'TPT1', notificationId: 'n1' }, OFF).then((r) => { settled = r; return r; });
+  t.mock.timers.tick(299);
+  await flush();
+  assert.equal(settled, null, 'still waiting for the OS');
+  t.mock.timers.tick(1);
+  assert.deepEqual(await pending, { ok: false, reason: 'no-response' });
+  assert.equal(h.natives[0].closed, true);
+  assert.equal(h.windows.length, 0);
+  // The OS showing it after all must not leave it up, and it can no longer act.
+  h.natives[0].closed = false;
+  h.natives[0].emit('show');
+  assert.equal(h.natives[0].closed, true);
+  h.natives[0].emit('click');
+  assert.equal(h.clicked.length, 0);
+  assert.equal(NATIVE_CONFIRM_MS, 5000);
+  h.surface.dispose();
+});
+
+test('one refused native leaves the others waiting for their own answer', async () => {
   const f = fixture({ native: nativeClass({ outcome: 'silent' }) });
   f.surface.setEnabled(false);
   const sends = [1, 2, 3].map((i) => f.surface.show({ title: `T${i}`, tag: `TPT${i}`, notificationId: `n${i}` }, OFF));
   await flush();
   assert.equal(f.natives.length, 3);
-  assert.equal(f.surface.snapshot().length, 0, 'still waiting for the OS');
   f.natives[1].emit('failed', {}, 'UNErrorDomain error 1');
-  const results = await Promise.all(sends);
-  assert.deepEqual(results.map((r) => [r.ok, r.delivery, r.fallback]), Array(3).fill([true, 'desktop', 'failed']));
-  assert.deepEqual(f.surface.snapshot().map((e) => e.notificationId).sort(), ['n1', 'n2', 'n3']);
-  assert.deepEqual(f.natives.map((n) => n.closed), [true, true, true]);
-  assert.deepEqual([f.released.length, f.dismissed.length], [0, 0]);
-  // The OS showing one after all must not leave a second copy beside the banner card.
-  f.natives[0].closed = false;
+  assert.deepEqual(await sends[1], { ok: false, reason: 'failed' });
+  assert.deepEqual(f.natives.map((n) => n.closed), [false, true, false]);
   f.natives[0].emit('show');
-  assert.equal(f.natives[0].closed, true);
-  f.natives[0].emit('click');
-  assert.equal(f.clicked.length, 0, 'a native that left the registry cannot act');
-  f.surface.dispose();
-});
-
-test('a native the OS never answers falls back after the confirm window', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
-  const f = fixture({ native: nativeClass({ outcome: 'silent' }), confirmMs: 300 });
-  f.surface.setEnabled(false);
-  const pending = f.surface.show({ title: 'T1', tag: 'TPT1', notificationId: 'n1' }, OFF);
-  t.mock.timers.tick(299);
-  await flush();
+  f.natives[2].emit('show');
+  assert.deepEqual((await Promise.all([sends[0], sends[2]])).map((r) => r.delivery), ['native', 'native']);
   assert.equal(f.surface.snapshot().length, 0);
-  t.mock.timers.tick(1);
-  const result = await pending;
-  assert.deepEqual([result.ok, result.delivery, result.fallback], [true, 'desktop', 'no-response']);
-  assert.equal(f.windows[0].visible, true);
-  assert.equal(NATIVE_CONFIRM_MS, 5000);
+  assert.equal(f.windows.length, 0);
   f.surface.dispose();
 });
 
-test('a native the OS shows resolves as native and never falls back afterwards', async () => {
+test('a native the OS shows resolves as native and stays native', async () => {
   const a = projectWindow();
   const f = fixture({ projects: [a], native: nativeClass({ outcome: 'silent' }) });
   f.surface.setEnabled(false);
@@ -800,95 +837,51 @@ test('a native the OS shows resolves as native and never falls back afterwards',
   assert.deepEqual(f.released.map((e) => e.notificationId), ['n1']);
   assert.equal(f.surface.snapshot().length, 0);
   assert.equal(f.windows.length, 0, 'no banner window');
-  assert.deepEqual(f.surface.delivery(), { delivery: 'native', fallback: null });
-  // A pending native replaced by a repeat send, or dismissed, resolves without falling back.
+  // A pending native replaced by a repeat send, or dismissed, resolves as native.
   const replaced = f.surface.show({ title: 'T2', tag: 'TPT2', notificationId: 'n2' }, OFF);
   const repeat = f.surface.show({ title: 'T2 again', tag: 'TPT2', notificationId: 'n3' }, OFF);
   assert.equal((await replaced).delivery, 'native');
   assert.equal(f.surface.dismissKey('TPT2', '/a'), 1);
   assert.equal((await repeat).delivery, 'native');
-  assert.deepEqual(f.surface.delivery(), { delivery: 'native', fallback: null });
   // Shutdown answers a send still waiting.
   const last = f.surface.show({ title: 'T3', tag: 'TPT3' }, OFF);
   f.surface.dispose();
   assert.deepEqual(await last, { ok: false, reason: 'closed' });
 });
 
-test('the fallback holds until Show on Top is written again; off while blocked only hides the banner', async () => {
-  let blocker = 'seal-broken';
+test('turning Show on Top on moves a native the OS has not answered yet to the shared surface', async () => {
   const a = projectWindow();
-  const f = fixture({ projects: [a], nativeBlocked: () => blocker });
-  await show(f, 2);
-  assert.equal(f.windows[0].visible, true);
-  // Unchecking Show on Top while native delivery is blocked: the stack steps aside at once, but
-  // the alerts stay in the registry and the next one brings it back.
-  assert.deepEqual(f.surface.setEnabled(false), { ok: true, enabled: false });
-  assert.equal(f.windows[0].visible, false);
-  assert.equal(f.surface.snapshot().length, 2);
-  assert.deepEqual([f.released.length, f.dismissed.length], [0, 0]);
-  assert.equal(f.lastSurface(a).shared, true);
-  assert.deepEqual(f.surface.delivery(), { delivery: 'desktop', fallback: 'seal-broken' });
-  await f.surface.show({ title: 'new', tag: 'TPT9', notificationId: 'n9' }, OFF);
-  assert.equal(f.windows[0].visible, true);
-  assert.equal(f.windows[0].data.entries.length, 3);
-  assert.equal(f.natives.length, 0);
-  // Health that recovers mid-run does not flip pending alerts off the banner.
-  blocker = null;
-  f.surface.refreshDelivery();
-  assert.deepEqual(f.surface.delivery(), { delivery: 'desktop', fallback: 'seal-broken' });
-  assert.equal(f.surface.snapshot().length, 3);
-  // Writing the setting decides afresh: off with healthy native delivery is the native path.
+  const f = fixture({ projects: [a], native: nativeClass({ outcome: 'silent' }) });
   f.surface.setEnabled(false);
-  assert.deepEqual(f.surface.delivery(), { delivery: 'native', fallback: null });
-  assert.equal(f.surface.snapshot().length, 0);
-  assert.equal(f.released.length, 3, 'in-app cards are kept');
-  assert.equal(f.lastSurface(a).shared, false);
-  assert.equal((await f.surface.show({ title: 'x', tag: 'TPT10' }, OFF)).delivery, 'native');
-  // On clears it too.
-  blocker = 'not-registered';
-  f.surface.refreshDelivery();
-  assert.equal(f.natives[0].closed, true, 'the live native moved to the banner');
-  assert.deepEqual(f.surface.snapshot().map((e) => e.tag), ['TPT10']);
-  f.surface.setEnabled(true);
-  assert.deepEqual(f.surface.delivery(), { delivery: 'desktop', fallback: null });
-  assert.equal((await f.surface.show({ title: 'y', tag: 'TPT11' }, OFF)).fallback, undefined);
-  assert.equal(f.windows[0].data.onTop, true);
-  f.surface.dispose();
-});
-
-test('health that turns blocked after the first read switches project windows to the shared registry', async () => {
-  let blocker = null;
-  const a = projectWindow();
-  const f = fixture({ projects: [a], nativeBlocked: () => blocker });
-  f.surface.setEnabled(false);
-  assert.deepEqual(f.surface.surfaceFor(a), { shared: false, active: false, entries: [] });
-  assert.equal(f.surface.upsertCard({ tag: 'TPT1', title: 'card', seq: 1 }, OFF).delivery, 'disabled');
-  blocker = 'not-registered';
-  f.surface.refreshDelivery();
-  assert.deepEqual(f.lastSurface(a), { shared: true, active: false, entries: [] });
-  // The window re-mirrors its local card on `shared: true`; it lands on the banner.
-  assert.equal(f.surface.upsertCard({ tag: 'TPT1', title: 'card', seq: 1 }, OFF).delivery, 'shared');
+  const waiting = f.surface.show({ title: 'T1', tag: 'TPT1', notificationId: 'n1' }, OFF);
+  const shown = f.surface.show({ title: 'T2', tag: 'TPT2', notificationId: 'n2' }, OFF);
   await flush();
+  f.natives[1].emit('show');
+  assert.equal((await shown).delivery, 'native');
+  f.surface.setEnabled(true);
+  assert.equal((await waiting).delivery, 'desktop', 'the unanswered one is on the banner, with its callback identity');
+  assert.deepEqual(f.natives.map((n) => n.closed), [true, true]);
+  assert.deepEqual(f.surface.snapshot().map((e) => e.notificationId), ['n1']);
+  assert.deepEqual(f.released.map((e) => e.notificationId), ['n2'], 'the shown one is closed; its window re-mirrors the card');
   assert.equal(f.windows[0].visible, true);
-  assert.deepEqual(f.windows[0].data.entries.map((e) => e.title), ['card']);
-  // A throwing probe never blocks or breaks delivery.
-  const g = fixture({ nativeBlocked: () => { throw new Error('probe failed'); } });
-  g.surface.setEnabled(false);
-  assert.equal((await g.surface.show({ title: 'x', tag: 't' }, OFF)).delivery, 'native');
+  assert.equal(f.windows[0].data.onTop, true);
+  // A late answer for the moved one leaves no second copy.
+  f.natives[0].closed = false;
+  f.natives[0].emit('show');
+  assert.equal(f.natives[0].closed, true);
   f.surface.dispose();
-  g.surface.dispose();
 });
 
-test('the banner "Show" checkbox writes the setting both ways', async () => {
-  const f = fixture({ nativeBlocked: () => 'not-registered' });
-  f.surface.setEnabled(false);
+test('the banner "Show" checkbox writes the setting both ways through main\'s writer', async () => {
+  const f = fixture();
   await f.surface.show({ title: 'T1', tag: 'TPT1' }, OFF);
-  assert.equal(f.windows[0].data.onTop, false);
+  assert.equal(f.windows[0].data.onTop, true);
+  f.action(null, 'on-top-off', false);
   f.action(null, 'on-top-on', false);
   assert.deepEqual(f.onTopSets, [], 'untrusted senders are ignored');
-  f.action(null, 'on-top-on');
   f.action(null, 'on-top-off');
-  assert.deepEqual(f.onTopSets, [true, false]);
+  f.action(null, 'on-top-on');
+  assert.deepEqual(f.onTopSets, [false, true]);
   f.surface.dispose();
 });
 

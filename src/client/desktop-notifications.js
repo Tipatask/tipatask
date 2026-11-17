@@ -17,8 +17,10 @@ function applyTheme(theme) {
 // Fixed-height page: header with Hide (TPT505 — never Clear All here), the five newest cards,
 // and a footer with the "Show" on-top checkbox and centered Show More. Never scrolls — the full
 // list opens in the newest notification's project window (main's show-more action). The
-// checkbox shows the saved "Show on Top" setting (`state.onTop`): unchecked while the banner
-// only stands in for native notifications the OS cannot deliver.
+// checkbox shows the "Show on Top" setting (`state.onTop`), the one flag that decides whether
+// this banner is used at all, so it reads checked whenever the banner is on screen; unchecking
+// it turns the setting off through main's single writer and the banner goes away until the
+// setting is turned on again.
 export function renderDesktopPage(state) {
   const entries = Array.isArray(state) ? state : (state?.entries || []);
   applyTheme(Array.isArray(state) ? null : state?.theme);
