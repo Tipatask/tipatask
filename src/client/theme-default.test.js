@@ -750,6 +750,64 @@ test('no other rule outranks the completed-card text and chip rules', () => {
   assert.deepEqual(offenders, [], `rules that would recolour completed-card text: ${offenders.join('; ')}`);
 });
 
+// (TPT9341) A resolution comment's meta row opens with the Resolution pill, a span beside the
+// timestamp span that `.comment-meta span` greys and shrinks. The pill's own rule has to win that
+// cascade, or its label is drawn in --c-text-muted on the orange fill (1.17:1 in ink, 3.03:1 in
+// paper). Modelled: rules whose subject is a span or `*`, or the pill by its class, with nothing
+// above it but `.comment-meta` and a theme scope on <html>. The winner by specificity, then source
+// order, must be the pill's own rule for its ink, size and fill, and the ink must clear 4.5:1 on
+// the fill in every palette.
+test('the comment Resolution pill keeps its own dark ink on the orange fill in every palette', () => {
+  const boardSet = /_DARK_THEMES\s*=\s*new Set\(\[([^\]]*)\]\)/.exec(BOARD);
+  assert.ok(boardSet, 'task-board.js has no _DARK_THEMES set');
+  const darkIds = new Set([...boardSet[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+  const PILL = /^(?:span)?\.badge-resolution$/;
+  const SPAN = /^(?:span|\*)$/;
+  const THEME_SCOPE = /^(?:html|:root)?(\.theme-dark)?(?:\[data-theme="([\w-]+)"\])?$/;
+  const FILL = 'background(?:-color)?';
+  const PROPS = { color: 'ink', 'font-size': 'size', [FILL]: 'fill' };
+  const declared = (body, prop) => {
+    let value = null;
+    for (const d of body.matchAll(new RegExp(`(?:^|[;\\s])${prop}\\s*:\\s*([^;]+)`, 'g'))) value = d[1].trim();
+    return value;
+  };
+  // Every modelled rule that reaches the pill in one palette.
+  const reaching = (id, dark) => {
+    const out = [];
+    for (const { index, parts, body } of CLEAN_RULES) {
+      for (const part of parts) {
+        const subject = lastCompound(part);
+        const pill = PILL.test(subject);
+        if (!pill && !SPAN.test(subject)) continue;
+        const above = part.slice(0, part.length - subject.length).split(/[\s>+~]+/).filter(Boolean);
+        const reaches = above.every((compound, k) => {
+          if (compound === '.comment-meta') return true;
+          const theme = k === 0 && THEME_SCOPE.exec(compound);
+          return !!theme && (!theme[1] || dark) && (!theme[2] || theme[2] === id);
+        });
+        if (reaches) out.push({ part, index, body, pill, specificity: specificity(part) });
+      }
+    }
+    return out;
+  };
+  for (const { id, values } of themePalettes()) {
+    const rules = reaching(id, darkIds.has(id));
+    const top = {};
+    for (const [prop, what] of Object.entries(PROPS)) {
+      top[prop] = rules
+        .filter((r) => declared(r.body, prop) !== null)
+        .reduce((best, r) => (!best || (compareSpecificity(r.specificity, best.specificity) || r.index - best.index) > 0 ? r : best), null);
+      assert.ok(top[prop]?.pill, `${id}: the Resolution pill's ${what} in a comment's meta row must come from its own rule, `
+        + `but ${top[prop] ? `\`${top[prop].part}\` outranks it` : 'no rule sets it'}`);
+    }
+    const v = layeredPalette(id, values, darkIds);
+    const ink = resolveColor(declared(top.color.body, 'color'), v);
+    const fill = resolveColor(declared(top[FILL].body, FILL), v);
+    const ratio = contrastRatio(ink, fill);
+    assert.ok(ratio >= 4.5, `${id}: the Resolution pill's label is ${ratio.toFixed(2)}:1 on its fill; expected at least 4.5:1`);
+  }
+});
+
 // (TPT686) The Start button on a closed card is still an active control (it re-runs the task),
 // so WCAG 1.4.11 wants 3:1 for its edge and glyph against the closed ground. An opacity fade can
 // never get there (a faded --c-primary fill sits near 1.2:1 on nord's canceled ground), so the

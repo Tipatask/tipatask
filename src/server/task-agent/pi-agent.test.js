@@ -775,9 +775,10 @@ test('PiAgent.buildPrompt: no line of the kickoff prompt can false-trigger the a
       // present, pushing the discovery/blank-tag variants past the old ceiling), then
       // 9000 -> 9300 for the unconditional compact resource-limits directive, then
       // 9300 -> 9600 for the commit-on compact definition-of-done line (TPT611, only the
-      // git all-on scenario carries it); still bounded without inviting unbounded growth.
-      t.diagnostic(`Pi REST ${JSON.stringify(scenario)}: ${prompt.length} / 9600`);
-      assert.ok(prompt.length < 9600, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
+      // git all-on scenario carries it), then 9600 -> 10200 for live-chain guidance now
+      // present in every ordinary task kickoff. The runtime hard budget stays 12000.
+      t.diagnostic(`Pi REST ${JSON.stringify(scenario)}: ${prompt.length} / 10200`);
+      assert.ok(prompt.length < 10200, `[discovery=${discovery}] prompt grew to ${prompt.length} chars`);
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

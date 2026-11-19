@@ -1,7 +1,7 @@
 'use strict';
 
-// (TPT9163) Cowboy chain hand-off: only a bypass run launched with cowboyChain is told how its chain
-// continues, never starting tasks itself. (TPT9195) Its successful completion starts the chain, and
+// Cowboy chain hand-off: every ordinary task run reads the live completion outcome,
+// never starting tasks itself. Successful completion asks Task App for the decision, and
 // start_next_tasks (Claude/Codex), the bridged tool or `tt next` (Pi) is only the retry of an
 // `unavailable` answer. Modeled on follow-up-prompt.test.js — see ai/architecture/tt-task-agent.md
 // § Cowboy Directive.
@@ -47,7 +47,7 @@ function kickoff(agent, t, extra = {}) {
 
 // ── BaseTaskAgent#buildCowboyDirective ──
 
-test('buildCowboyDirective: only a bypass run launched with cowboyChain gets it', () => {
+test('buildCowboyDirective: every ordinary task run gets live completion guidance', () => {
   const agent = bareAgent();
   const bypass = policy(agent, 'bypass');
   assert.ok(agent.buildCowboyDirective({ cowboyChain: true, permissionPolicy: bypass }).startsWith('Cowboy chain:'));
@@ -61,9 +61,12 @@ test('buildCowboyDirective: only a bypass run launched with cowboyChain gets it'
     { cowboyChain: true, permissionPolicy: policy(agent, 'plan') },
     { cowboyChain: true, permissionPolicy: policy(agent, null) },
   ]) {
-    assert.equal(agent.buildCowboyDirective(opts), '', JSON.stringify({ ...opts, permissionPolicy: opts.permissionPolicy?.mode }));
+    cowboyChain(agent.buildCowboyDirective(opts));
   }
-  assert.equal(agent.buildCowboyDirective(), '');
+  cowboyChain(agent.buildCowboyDirective());
+  for (const opts of [{ objectiveChain: { rootTaskId: 'P1' } }, { parentPreparation: true }, { task: { isObjective: true } }]) {
+    assert.equal(agent.buildCowboyDirective(opts), '', 'objective runs retain their separate chain guidance');
+  }
 });
 
 for (const compact of [false, true]) {
@@ -71,7 +74,7 @@ for (const compact of [false, true]) {
     const agent = bareAgent();
     const note = agent.buildCowboyDirective({ cowboyChain: true, permissionPolicy: policy(agent, 'bypass'), compact });
     cowboyChain(note);
-    for (const rule of ['starts the chain itself', 'Never pick, start or work on the next tasks yourself', 'refused', 'unavailable', 'started task keys']) {
+    for (const rule of ['Cowboy scope, permission mode and successor tasks can change', 'startup snapshot', 'asks Task App for a live decision', 'Never pick, start or work on the next tasks yourself', 'refused', 'unavailable', 'started task keys']) {
       assert.ok(note.includes(rule), rule);
       assert.throws(() => cowboyChain(note.replace(rule, '')), { code: 'ERR_ASSERTION' }, `omitting ${rule} must fail`);
     }
@@ -85,18 +88,19 @@ test('buildCowboyDirective: full wording names complete_task and start_next_task
   const agent = bareAgent();
   const opts = { cowboyChain: true, permissionPolicy: policy(agent, 'bypass') };
   const full = agent.buildCowboyDirective(opts);
-  assert.match(full, /When `complete_task` succeeds \(it returns completed: true\), it starts the chain itself/);
-  assert.match(full, /`cowboyNext` lists the tasks it started, the reason, and `skipped`/);
+  assert.match(full, /When `complete_task` succeeds \(it returns completed:true\), it asks Task App for a live decision/);
+  assert.match(full, /Read the returned `cowboyNext`: it lists the tasks it started, the reason, and `skipped`/);
+  assert.match(full, /`not_cowboy` and `no_run_capability` mean no tasks started/);
   assert.match(full, /tipatask-local tool `start_next_tasks\(task_key\)` only as a retry: once, with this task's key, when `cowboyNext\.reason` is `unavailable`/);
   assert.match(full, /After any other answer, do not call it\./);
   assert.match(full, /its own new agent session with this run's agent and model/);
   const compact = agent.buildCowboyDirective({ ...opts, compact: true });
   assert.ok(compact.length < full.length);
-  assert.match(compact, /Completion \(completed:true\) starts the chain itself[^\n]*cowboyNext/);
+  assert.match(compact, /Completion \(completed:true\) asks Task App for a live decision[^\n]*read cowboyNext/);
   for (const name of ['complete_task', 'mcp__']) assert.ok(!compact.includes(name), `compact wording must not name ${name}`);
   for (const nextCall of [undefined, '`tipatask-local__start_next_tasks(task_key)`', '`tt next "$TIPATASK_TASK_ID"`']) {
     const note = agent.buildCowboyDirective({ ...opts, compact: true, nextCall });
-    assert.ok(note.length < 400, `compact wording is ${note.length} chars with ${nextCall} — Pi echoes the whole kickoff`);
+    assert.ok(note.length < 600, `compact wording is ${note.length} chars with ${nextCall} — Pi echoes the whole kickoff`);
   }
   assert.match(agent.buildCowboyDirective({ ...opts, compact: true, nextCall: '`tt next "$TIPATASK_TASK_ID"`' }),
     /Retry with `tt next "\$TIPATASK_TASK_ID"` once, only if cowboyNext\.reason is unavailable\./);
@@ -115,7 +119,7 @@ test('PiAgent#buildCowboyDirective: always compact; bridged tool with the MCP br
     cowboyChain(note);
     assert.doesNotMatch(note, /complete_task/);
   }
-  assert.equal(pi.buildCowboyDirective({ ...opts, permissionPolicy: policy(pi, 'auto') }), '');
+  cowboyChain(pi.buildCowboyDirective({ ...opts, permissionPolicy: policy(pi, 'auto') }));
 });
 
 test('buildCowboyDirective: no line can false-trigger line or tail attention detection', () => {
@@ -159,7 +163,7 @@ for (const Agent of AGENTS) {
     else assert.match(prompt, /tipatask-local tool `start_next_tasks\(task_key\)`/);
   });
 
-  test(`${id}: no directive for a run without cowboyChain or outside bypass`, (t) => {
+  test(`${id}: live completion guidance also reaches runs without Cowboy or Bypass at startup`, (t) => {
     const agent = new Agent();
     for (const extra of [
       { permissionPolicy: policy(agent, 'bypass') },
@@ -168,7 +172,7 @@ for (const Agent of AGENTS) {
       { cowboyChain: true },
     ]) {
       const prompt = kickoff(agent, t, extra);
-      assert.doesNotMatch(prompt, /Cowboy chain:|start_next_tasks|tt next/, `${id} ${JSON.stringify({ ...extra, permissionPolicy: extra.permissionPolicy?.mode })}`);
+      cowboyChain(prompt);
     }
   });
 
@@ -187,14 +191,17 @@ for (const Agent of AGENTS) {
   });
 }
 
-test('SIMPLE_MODE keeps the directive for an explicit bypass cowboy run', (t) => {
+test('SIMPLE_MODE keeps the directive for enforced policies and Codex/Pi Plan', (t) => {
   const config = require('../config');
   const previous = config.SIMPLE_MODE;
   config.SIMPLE_MODE = true;
   t.after(() => { config.SIMPLE_MODE = previous; });
   for (const Agent of AGENTS) {
     const agent = new Agent();
-    cowboyChain(kickoff(agent, t, { permissionPolicy: policy(agent, 'bypass'), cowboyChain: true }));
+    // Claude's native Plan debug path returns the bare prompt before any shared directive.
+    for (const mode of agent.id === 'claude' ? ['auto', 'bypass'] : ['plan', 'auto', 'bypass']) {
+      cowboyChain(kickoff(agent, t, { permissionPolicy: policy(agent, mode), cowboyChain: false }));
+    }
   }
 });
 
@@ -233,6 +240,6 @@ test('Pi cowboy kickoff stays echo-safe and under the Pi prompt budget', (t) => 
     const growth = prompt.length - agent.buildPrompt('Do the thing.', opts).length;
     t.diagnostic(`Pi cowboy ${JSON.stringify(scenario)}: ${prompt.length} / 12000 (+${growth})`);
     assert.ok(prompt.length < 12000, `${JSON.stringify(scenario)} prompt grew to ${prompt.length} chars`);
-    assert.ok(growth < 400, `the hand-off added ${growth} chars`);
+    assert.equal(growth, 0, 'the launch-time Cowboy flag does not change the guidance');
   }
 });

@@ -3672,7 +3672,8 @@
   .permission-mode-select-menu[data-portaled="1"] { position: fixed; right: auto; box-sizing: border-box; z-index: 3200; }
   /* Opened from Settings' Workflow tab while Settings sits over the workspace (3250): above that
      panel, below the dialogs Settings opens itself (.agents-modal 3300, action confirms 3400). */
-  #settings-modal.settings-modal--over-modal ~ .permission-mode-select-menu[data-portaled="1"] { z-index: 3260; }
+  #settings-modal.settings-modal--over-modal ~ .permission-mode-select-menu[data-portaled="1"],
+  body.task-chat-open #settings-modal.open ~ .permission-mode-select-menu[data-portaled="1"] { z-index: 3260; }
   .permission-mode-select-option {
     padding: 8px; border-radius: 5px; cursor: pointer; font-size: 0.9rem;
   }
@@ -13312,7 +13313,11 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   background: transparent;
   color: var(--c-text-muted);
 }
-.badge-resolution {
+/* (TPT9341) The Resolution pill is a span in the meta row, so it is scoped like
+   .comment-meta .comment-edited above: a bare .badge-resolution (0,1,0) lost its ink and size to
+   .comment-meta span (0,1,1), which drew the label in --c-text-muted on the orange fill.
+   theme-default.test.js holds this rule above the meta row's span rules, at 4.5:1 or more. */
+.comment-meta .badge-resolution {
   display: inline-block;
   background: #fab387;
   color: #1e1e2e;
@@ -14065,8 +14070,11 @@ mark.mention--agent {
 /* (TPT508) Opened over the task workspace: above .task-edit-overlay (3000, 3150 with
    body.task-chat-open) and its portaled typeahead dropdowns (3200), below the dialogs Settings
    opens itself (.agents-modal 3300, action confirms 3400). Only toggled while a workspace is
-   open, so the default stacking is unchanged. */
-#settings-modal.settings-modal--over-modal {
+   open, so the default stacking is unchanged. (TPT9344) The same tier over a standalone task or
+   project chat window (.task-chat-modal 3100, which sets body.task-chat-open): Settings opened
+   with ⌘, while the chat is up would otherwise sit underneath it. */
+#settings-modal.settings-modal--over-modal,
+body.task-chat-open #settings-modal {
   z-index: 3250;
 }
 /* (TPT9110) Fixed-size dialog: the box is sized by the viewport, never by the active tab, so

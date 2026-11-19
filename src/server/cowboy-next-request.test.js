@@ -159,7 +159,7 @@ const { startChainAfterCompletion, REQUEST_TIMEOUT_MS, CHAIN_MIN_TIMEOUT_MS } = 
 
 const DONE = Object.freeze({ completed: true, resolutionPosted: true, task: { id: 'TPT1', status: 'completed' }, verification: { ready: true } });
 
-test('a saved completion in a cowboy run asks once and carries the answer as cowboyNext', async () => {
+test('a saved completion with a run token asks once and carries the live answer as cowboyNext', async () => {
   const skipped = [{ key: 'TPT4', reason: 'deps_open' }];
   const { calls, fetchImpl } = answer(200, { started: ['TPT2', 'TPT3'], reason: 'dependents', skipped });
   const result = await startChainAfterCompletion('TPT1', DONE, { env: ENV, fetchImpl });
@@ -177,6 +177,8 @@ test('a saved completion in a cowboy run asks once and carries the answer as cow
 
 test('a refused, failed or unanswered request fills cowboyNext and never the completion', async () => {
   const cases = [
+    { fetchImpl: answer(409, { started: [], reason: 'not_cowboy' }).fetchImpl, reason: 'not_cowboy' },
+    { fetchImpl: answer(409, { started: [], reason: 'not_bypass' }).fetchImpl, reason: 'not_bypass' },
     { fetchImpl: answer(409, { started: [], reason: 'not_finished' }).fetchImpl, reason: 'not_finished' },
     { fetchImpl: answer(503, { started: [], reason: 'unavailable', error: `read failed ${TOKEN}` }).fetchImpl, reason: 'unavailable' },
     { fetchImpl: answer(403, { error: 'Forbidden' }).fetchImpl, reason: 'forbidden' },
@@ -188,7 +190,7 @@ test('a refused, failed or unanswered request fills cowboyNext and never the com
     const { cowboyNext, ...completion } = result;
     assert.deepEqual(completion, DONE, `${reason}: the completion is unchanged`);
     assert.deepEqual([cowboyNext.reason, cowboyNext.started, cowboyNext.skipped], [reason, [], []]);
-    assert.match(cowboyNext.error, /Task App|start the next tasks/);
+    assert.match(cowboyNext.error, /Task App|This run|start the next tasks/);
     assert.ok(!JSON.stringify(result).includes(TOKEN), `${reason}: the token never comes back`);
   }
   // requestNextTasks() never throws; should it ever, the saved completion still stands.
@@ -198,15 +200,12 @@ test('a refused, failed or unanswered request fills cowboyNext and never the com
   assert.ok(!JSON.stringify(odd).includes(TOKEN));
 });
 
-test('no request for a refused completion, outside a cowboy run, or for another task than the run\'s own', async () => {
+test('a refused or absent completion makes no request and stays unchanged', async () => {
   const blocked = { completed: false, resolutionPosted: false, verification: { ready: false, blockers: [{ code: 'TASK_COMMIT_MISSING' }] } };
   const cases = [
     { key: 'TPT1', completion: blocked, env: ENV },
     { key: 'TPT1', completion: null, env: ENV },
-    { key: 'TPT1', completion: DONE, env: {} },
-    { key: 'TPT1', completion: DONE, env: { [COWBOY_TOKEN_ENV]: TOKEN } },
-    { key: 'TPT1', completion: DONE, env: { [COWBOY_URL_ENV]: URL_TPT1 } },
-    { key: 'TPT2', completion: DONE, env: ENV },
+    { key: 'TPT1', completion: blocked, env: {} },
   ];
   for (const { key, completion, env } of cases) {
     const { calls, fetchImpl } = answer(200, { started: ['TPT9'], reason: 'dependents' });
@@ -214,7 +213,30 @@ test('no request for a refused completion, outside a cowboy run, or for another 
     assert.equal(result, completion, `${key} ${JSON.stringify(Object.keys(env))}: returned unchanged`);
     assert.equal(calls.length, 0, `${key} ${JSON.stringify(Object.keys(env))}: no request`);
   }
-  // A present but unusable URL is a cowboy run gone wrong: the agent hears why nothing started.
+});
+
+test('a saved completion without a run token reports no_run_capability without a request', async () => {
+  for (const env of [{}, { [COWBOY_URL_ENV]: URL_TPT1 }]) {
+    const { calls, fetchImpl } = answer(200, { started: ['TPT9'], reason: 'dependents' });
+    const result = await startChainAfterCompletion('TPT1', DONE, { env, fetchImpl });
+    assert.deepEqual(result, { ...DONE, cowboyNext: { started: [], reason: 'no_run_capability' } });
+    assert.equal(calls.length, 0);
+  }
+});
+
+test('a saved completion reports a missing URL or wrong task without sending the token', async () => {
+  for (const { key, env, reason } of [
+    { key: 'TPT1', env: { [COWBOY_TOKEN_ENV]: TOKEN }, reason: 'no_url' },
+    { key: 'TPT2', env: ENV, reason: 'wrong_task' },
+  ]) {
+    const { calls, fetchImpl } = answer(200, { started: ['TPT9'], reason: 'dependents' });
+    const { cowboyNext, ...completion } = await startChainAfterCompletion(key, DONE, { env, fetchImpl });
+    assert.deepEqual(completion, DONE);
+    assert.equal(cowboyNext.reason, reason);
+    assert.deepEqual(cowboyNext.started, []);
+    assert.equal(calls.length, 0);
+  }
+  // An unsafe URL is also reported without making a request.
   const { calls, fetchImpl } = answer(200, { started: ['TPT9'], reason: 'dependents' });
   const badUrl = await startChainAfterCompletion('TPT1', DONE, { env: { ...ENV, [COWBOY_URL_ENV]: 'http://tasks.example.com/api/tasks/TPT1/cowboy-next' }, fetchImpl });
   assert.equal(badUrl.cowboyNext.reason, 'no_url');

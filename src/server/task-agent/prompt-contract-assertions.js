@@ -84,8 +84,11 @@ function followUps(text) {
 
 function cowboyChain(text) {
   once(text, /Cowboy chain:/, 'cowboy chain directive delivered exactly once');
-  once(text, /(?:complete_task`? succeeds|Completion \(completed: ?true\))[^\n]*starts the chain itself/,
-    'a successful completion starts the chain itself exactly once');
+  once(text, /Cowboy scope, permission mode and successor tasks can change/, 'scope, mode and successors may change');
+  once(text, /[Dd]o not rely on the startup snapshot/, 'startup state is not authoritative');
+  once(text, /(?:complete_task`? succeeds|Completion \(completed: ?true\))[^\n]*asks Task App for a live decision/,
+    'a successful completion asks for a live decision exactly once');
+  once(text, /(?:[Rr]ead the returned `cowboyNext`|read cowboyNext)/, 'read the completion outcome');
   once(text, /(?:start_next_tasks\(task_key\)|tt next)[^\n]*(?:only as a retry|once, only if)[^\n]*unavailable/,
     'the next-tasks call is only a retry of an unavailable answer exactly once');
   once(text, /Never pick, start or work on the next tasks yourself/, 'the agent never picks or starts tasks itself exactly once');

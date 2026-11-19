@@ -48,7 +48,9 @@ test('tipatask-local lists start_next_tasks and refuses clearly without the run 
   assert.match(tool.description, /Retry once only when cowboyNext.reason is unavailable/);
   assert.match(tool.description, /never choose or launch sessions yourself/);
   const complete = tools.find(item => item.name === 'complete_task');
-  assert.match(complete.description, /In a cowboy chain run it then starts the chain's next tasks itself and reports them as cowboyNext: \{ started, reason, skipped \}/);
+  assert.match(complete.description, /Every successful completion returns cowboyNext/);
+  assert.match(complete.description, /live chain decision, including not_cowboy/);
+  assert.match(complete.description, /no_run_capability/);
   assert.match(tool.description, /live run token/);
 
   const reply = await client.callTool({ name: 'start_next_tasks', arguments: { task_key: 'TPT1' } });
@@ -189,12 +191,12 @@ test('a refused or failed chain request never fails a saved completion', async (
   assert.equal(api.state.status, 'completed');
 });
 
-test('complete_task outside a cowboy run makes no chain request and adds no cowboyNext', async (t) => {
+test('complete_task without a run token reports no_run_capability', async (t) => {
   const api = await stubApi(t);
   const client = await connectLocal(t, {}, api.config);
   const reply = await client.callTool({ name: 'complete_task', arguments: { task_key: 'TPT1', resolution: REPORT } });
   assert.notEqual(reply.isError, true, reply.content[0].text);
   const body = JSON.parse(reply.content[0].text);
   assert.equal(body.completed, true);
-  assert.ok(!Object.hasOwn(body, 'cowboyNext'), 'no cowboyNext without the run variables');
+  assert.deepEqual(body.cowboyNext, { started: [], reason: 'no_run_capability' });
 });

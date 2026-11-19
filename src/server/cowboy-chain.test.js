@@ -28,7 +28,7 @@ const CLAUDE_PICK = { agentPermissionMode: 'bypass', cowboyMode: 'project', agen
 
 function row(id, fields = {}) {
   return { id, title: `Task ${id}`, description: `Do ${id}.`, status: 'pending', category: 'CODING', priority: 5, order: 0,
-    dependencies: [], assignee: 1, agentAssignee: 'claude', agentPermissionMode: null, ...fields };
+    dependencies: [], assignee: 1, agentAssignee: 'claude', agentPermissionMode: null, cowboyMode: 'project', ...fields };
 }
 
 function cowboyRun(taskId, fields = {}) {
@@ -207,13 +207,14 @@ test('a repeat is a no-op that names the earlier decision, also while the first 
     previous: { started: [], reason: 'none', skipped: [{ key: 'T2', reason: 'status' }] } });
 });
 
-test('the run gates: a live cowboy run, still in bypass, whose task is complete with a stored bypass mode', async () => {
+test('the run gates: a live run, still in bypass, whose task is complete with enabled scope and stored bypass mode', async () => {
   const finished = row('T1', { status: 'completed', agentPermissionMode: null });
   const tasks = [finished, row('T2', { dependencies: ['T1'], agentPermissionMode: 'bypass' })];
   assert.deepEqual(await harness(tasks, { runs: [] }).run('T1'), { started: [], reason: 'no_session' });
   assert.deepEqual(await harness(tasks, { runs: [cowboyRun('T1', { alive: false })] }).run('T1'), { started: [], reason: 'no_session' });
   assert.deepEqual(await harness(tasks, { runs: [cowboyRun('T1', { projectPath: '/projects/other' })] }).run('T1'), { started: [], reason: 'no_session' });
-  assert.deepEqual(await harness(tasks, { runs: [cowboyRun('T1', { cowboyChain: false })] }).run('T1'), { started: [], reason: 'not_cowboy' });
+  assert.deepEqual(await harness([{ ...finished, cowboyMode: undefined }, tasks[1]]).run('T1'), { started: [], reason: 'not_cowboy' },
+    'a launch-time Cowboy flag cannot enable a missing saved scope');
   assert.deepEqual(await harness(tasks, { runs: [cowboyRun('T1', { permissionPolicy: { mode: 'auto' } })] }).run('T1'), { started: [], reason: 'not_bypass' },
     'a run switched live out of bypass stops the chain');
   assert.deepEqual(await harness(tasks, { projectMode: 'auto' }).run('T1'), { started: [], reason: 'not_bypass' },
@@ -287,7 +288,7 @@ test('two runs finishing together start a shared dependent once', async () => {
   assert.deepEqual(h.backend.log.filter(e => e.update).map(e => e.update), ['T3'], 'only the run that starts it writes it');
 });
 
-test('the run token is listed only for a live cowboy run of that task', () => {
+test('the run token is listed for every live terminal of that task, including non-Cowboy runs', () => {
   const sessions = new Map([
     ['a', cowboyRun('T1')],
     ['b', cowboyRun('T2', { alive: false })],
@@ -296,13 +297,13 @@ test('the run token is listed only for a live cowboy run of that task', () => {
   ]);
   assert.deepEqual(cowboyRunTokens(sessions, 'T1'), [{ token: 'token-T1', projectPath: ROOT }]);
   assert.deepEqual(cowboyRunTokens(sessions, 'T2'), []);
-  assert.deepEqual(cowboyRunTokens(sessions, 'T3'), []);
+  assert.deepEqual(cowboyRunTokens(sessions, 'T3'), [{ token: 'token-T3', projectPath: ROOT }]);
 });
 
 test('the PTY env carries the run\'s own token and route URL, and never an inherited one', () => {
   const inherited = { PATH: '/bin', [COWBOY_TOKEN_ENV]: 'parent', [COWBOY_URL_ENV]: 'http://parent' };
   assert.deepEqual(withCowboyEnv(inherited, { cowboyChain: false, _cowboyToken: null }, 'T1'), { PATH: '/bin' });
-  const env = withCowboyEnv(inherited, { cowboyChain: true, _cowboyToken: 'mine' }, 'T 1');
+  const env = withCowboyEnv(inherited, { cowboyChain: false, _cowboyToken: 'mine' }, 'T 1');
   assert.equal(env[COWBOY_TOKEN_ENV], 'mine');
   assert.equal(env[COWBOY_URL_ENV], `http://127.0.0.1:${config.PORT}/api/tasks/T%201/cowboy-next`);
   assert.equal(inherited[COWBOY_TOKEN_ENV], 'parent', 'the spec env is copied, not changed');
@@ -352,9 +353,20 @@ test('spawnTerminal: bypass with the task flag or a chain launch makes a cowboy 
 
   const stale = await spawn(row('T2', { agentPermissionMode: null, cowboyMode: true })); // inherits auto
   assert.equal(stale.cowboyChain, false, 'a stored flag outside bypass is ignored');
-  assert.equal(stale._cowboyToken, null);
-  assert.equal(envs.at(-1)[COWBOY_TOKEN_ENV], undefined);
+  assert.match(stale._cowboyToken, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(envs.at(-1)[COWBOY_TOKEN_ENV], stale._cowboyToken);
+  assert.equal(envs.at(-1)[COWBOY_URL_ENV], `http://127.0.0.1:${config.PORT}/api/tasks/T2/cowboy-next`);
   assert.equal(specs.at(-1).cowboyChain, false);
+
+  for (const mode of ['plan', 'auto', 'bypass']) {
+    const disabled = await spawn(row(`disabled-${mode}`, { agentPermissionMode: mode, cowboyMode: 'disabled' }));
+    assert.equal(disabled.cowboyChain, false);
+    assert.match(disabled._cowboyToken, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(envs.at(-1)[COWBOY_TOKEN_ENV], disabled._cowboyToken);
+    assert.equal(envs.at(-1)[COWBOY_URL_ENV], `http://127.0.0.1:${config.PORT}/api/tasks/disabled-${mode}/cowboy-next`);
+    assert.equal(specs.at(-1).cowboyChain, false);
+  }
+  assert.equal(new Set(envs.map(env => env[COWBOY_TOKEN_ENV])).size, envs.length, 'each run has its own token');
 
   const chained = await spawn(row('T3', { agentPermissionMode: 'bypass', cowboyMode: false }),
     { cowboyChain: true, env: { [COWBOY_TOKEN_ENV]: 'chain-token' } });
@@ -430,5 +442,66 @@ test('disabled saved scope stops a running chain without updating successors', a
   const h = harness([row('T1', { status: 'completed', cowboyMode: 'disabled' }), row('T2', { dependencies: ['T1'] })],
     { runs: [cowboyRun('T1', { cowboyScope: 'project' })] });
   assert.deepEqual(await h.run('T1'), { started: [], reason: 'not_cowboy' });
+  assert.equal(h.backend.log.length, 0);
+});
+
+for (const source of ['task', 'project']) test(`enabling Whole Project and Bypass mid-run via ${source} settings starts dependents`, async () => {
+  const finished = row('T1', { status: 'completed', cowboyMode: 'disabled', priority: 7, order: 12 });
+  const run = cowboyRun('T1', { cowboyChain: false, cowboyScope: 'disabled', cowboyContext: null,
+    permissionPolicy: { mode: 'auto' } });
+  const h = harness([finished, row('T2', { dependencies: ['T1'], priority: 8 })], { runs: [run], projectMode: 'auto' });
+  assert.deepEqual(await h.run('T1'), { started: [], reason: 'not_cowboy' });
+  finished.cowboyMode = 'project';
+  if (source === 'task') finished.agentPermissionMode = 'bypass';
+  else h.backend.getEffectiveProjectSettings = async opts => {
+    assert.deepEqual(opts, { strict: true, refresh: true });
+    return { settings: { agent_permission_mode: 'bypass' } };
+  };
+  assert.deepEqual(await h.run('T1'), { started: [], reason: 'not_bypass' }, 'saved Bypass alone does not switch the live run');
+  run.permissionPolicy = { mode: 'bypass' };
+  assert.deepEqual(await h.run('T1'), { started: ['T2'], reason: 'dependents', skipped: [] });
+  const context = { originTaskId: 'T1', originSprint: 7, sprint: 7, order: 12 };
+  assert.deepEqual(run.cowboyContext, context);
+  assert.deepEqual(h.launches[0].cowboyContext, context);
+  assert.equal(h.launches[0].cowboyScope, 'project');
+});
+
+for (const scope of ['related', 'project']) test(`completion uses saved ${scope} scope instead of the launch scope`, async () => {
+  const finished = row('T1', { status: 'completed', cowboyMode: scope, order: 10 });
+  const context = { originTaskId: 'T0', originSprint: 5, sprint: 5, order: 10 };
+  const h = harness([finished, row('T2', { order: 1 }), row('T3', { order: 11 })],
+    { runs: [cowboyRun('T1', { cowboyScope: scope === 'related' ? 'project' : 'related', cowboyContext: context })] });
+  assert.deepEqual(await h.run('T1'), { started: scope === 'project' ? ['T3'] : [], reason: scope === 'project' ? 'sprint' : 'none', skipped: [] });
+  if (scope === 'project') {
+    assert.equal(h.launches[0].cowboyScope, 'project');
+    assert.deepEqual(h.launches[0].cowboyContext, { ...context, order: 11 });
+  } else assert.equal(h.backend.log.length, 0);
+});
+
+test('completion reads the task separately from the task list and honors a changed override', async () => {
+  const finished = row('T1', { status: 'completed', agentPermissionMode: 'bypass' });
+  const h = harness([finished, row('T2', { dependencies: ['T1'] })]);
+  h.backend.getTasksUnfiltered = async opts => {
+    assert.deepEqual(opts, { refresh: true });
+    return [finished, row('T2', { dependencies: ['T1'] })];
+  };
+  h.backend.getTask = async () => ({ ...finished, agentPermissionMode: 'auto' });
+  assert.deepEqual(await h.run('T1'), { started: [], reason: 'not_bypass' });
+  h.backend.getTask = async () => ({ ...finished, cowboyMode: 'disabled' });
+  assert.deepEqual(await h.run('T1'), { started: [], reason: 'not_cowboy' });
+  assert.equal(h.backend.log.length, 0);
+});
+
+for (const change of ['auto', 'pending', 'exited']) test(`a run becoming ${change} during fresh reads cannot start successors`, async () => {
+  const run = cowboyRun('T1');
+  const h = harness([row('T1', { status: 'completed' }), row('T2', { dependencies: ['T1'] })], { runs: [run] });
+  const read = h.backend.getTask;
+  h.backend.getTask = async id => {
+    if (change === 'auto') run.permissionPolicy = { mode: 'auto' };
+    if (change === 'pending') run.permissionMode = { confirmed: 'bypass', requested: 'auto', pending: true };
+    if (change === 'exited') run.alive = false;
+    return read(id);
+  };
+  assert.deepEqual(await h.run('T1'), { started: [], reason: change === 'exited' ? 'no_session' : 'not_bypass' });
   assert.equal(h.backend.log.length, 0);
 });

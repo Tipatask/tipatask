@@ -82,8 +82,8 @@ async function stubApi(t) {
 async function realRoute(t) {
   const root = '/projects/cowboy-complete';
   const sessions = new Map([[`TPT1\0${root}`, { type: 'terminal', alive: true, tabId: 'TPT1', taskId: 'TPT1', projectPath: root,
-    cowboyChain: true, _cowboyToken: TOKEN, _cowboyNext: null, permissionPolicy: { mode: 'bypass' }, _completionEmitted: true }]]);
-  const tasks = [row('TPT1', { status: 'completed' }), row('TPT2', { status: 'in_progress' })];
+    cowboyChain: false, cowboyScope: 'disabled', _cowboyToken: TOKEN, _cowboyNext: null, permissionPolicy: { mode: 'bypass' }, _completionEmitted: true }]]);
+  const tasks = [row('TPT1', { status: 'completed', cowboyMode: 'project' }), row('TPT2', { status: 'in_progress' })];
   const backend = {
     async getTasksUnfiltered() { return tasks; },
     async getTask(id) { const found = tasks.find(task => task.id === id); return found ? { ...found } : null; },
@@ -98,7 +98,7 @@ async function realRoute(t) {
   t.after(() => new Promise(resolve => server.close(resolve)));
   const port = server.address().port;
   access = createLocalAccess({ port, getActiveProjectPath: () => root, liveRunTokens: key => cowboyRunTokens(sessions, key) });
-  return { sessions, url: `http://${LOCAL_HOST}:${port}/api/tasks/TPT1/cowboy-next` };
+  return { sessions, tasks, url: `http://${LOCAL_HOST}:${port}/api/tasks/TPT1/cowboy-next` };
 }
 
 // Runs the CLI as Pi's `tt` does, in a scratch project pointed at the stub API.
@@ -120,7 +120,7 @@ function tt(t, args, { baseUrl, cowboyEnv = {}, input = '' }) {
   });
 }
 
-test('tt complete in a cowboy run starts the chain and prints the decision; a repeat tt next answers already_launched', async (t) => {
+test('tt complete after Cowboy is enabled mid-run prints the live decision; a repeat tt next answers already_launched', async (t) => {
   const api = await stubApi(t);
   const route = await realRoute(t);
   const cowboyEnv = { [COWBOY_TOKEN_ENV]: TOKEN, [COWBOY_URL_ENV]: route.url };
@@ -162,11 +162,26 @@ test('tt complete keeps a saved completion and exits 0 when the chain request fa
   assert.ok(!done.stdout.includes(TOKEN), 'the run token is never printed');
 });
 
-test('tt complete outside a cowboy run prints no cowboyNext', async (t) => {
+test('tt complete prints not_cowboy when Cowboy is disabled before completion', async (t) => {
+  const api = await stubApi(t);
+  const route = await realRoute(t);
+  route.sessions.get('TPT1\0/projects/cowboy-complete').cowboyChain = true;
+  route.tasks[0].cowboyMode = 'disabled';
+  const cowboyEnv = { [COWBOY_TOKEN_ENV]: TOKEN, [COWBOY_URL_ENV]: route.url };
+  const done = await tt(t, ['complete', 'TPT1'], { baseUrl: api.baseUrl, cowboyEnv, input: REPORT });
+  assert.equal(done.code, 0, done.stderr);
+  const result = JSON.parse(done.stdout);
+  assert.equal(result.completed, true);
+  assert.equal(result.cowboyNext.reason, 'not_cowboy');
+  assert.deepEqual(result.cowboyNext.started, []);
+  assert.equal(api.state.status, 'completed');
+});
+
+test('tt complete without task-terminal credentials prints no_run_capability', async (t) => {
   const api = await stubApi(t);
   const done = await tt(t, ['complete', 'TPT1'], { baseUrl: api.baseUrl, input: REPORT });
   assert.equal(done.code, 0, done.stderr);
   const result = JSON.parse(done.stdout);
   assert.equal(result.completed, true);
-  assert.ok(!Object.hasOwn(result, 'cowboyNext'));
+  assert.deepEqual(result.cowboyNext, { started: [], reason: 'no_run_capability' });
 });

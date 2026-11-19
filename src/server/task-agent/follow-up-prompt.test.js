@@ -194,9 +194,9 @@ test('Pi REST recipe documents keyless task creation, which compact follow-up fi
 
 // (C1119/C1116/C1117) The whole Pi kickoff is echoed verbatim into its TUI and rescanned by
 // prompt-detect.js; the follow-up directive must not push it past the shared Pi REST ceiling
-// (9300 normally; the existing git-all-on discovery exception is 9600 for its commit-on
-// definition-of-done line). Do not increase either ceiling for follow-up instructions.
-test('Pi kickoff with follow-up capture stays echo-safe and under its 9300/9600-char budgets', (t) => {
+// (9900 normally; 10200 with all Git flags). These include 600 characters for the
+// unconditional live-chain guidance; follow-up instructions keep their existing allowance.
+test('Pi kickoff with follow-up capture stays echo-safe and under its 9900/10200-char budgets', (t) => {
   const agent = new PiAgent();
   for (const scenario of [
     { discovery: false },
@@ -215,7 +215,7 @@ test('Pi kickoff with follow-up capture stays echo-safe and under its 9300/9600-
     }
     assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*plan ready[.!]?\s*$/im);
     assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*questions ready[.!]?\s*$/im);
-    const ceiling = scenario.vcsSettings ? 9600 : 9300;
+    const ceiling = scenario.vcsSettings ? 10200 : 9900;
     t.diagnostic(`Pi follow-up ${JSON.stringify(scenario)}: ${prompt.length} / ${ceiling}`);
     assert.ok(prompt.length < ceiling, `${JSON.stringify(scenario)} prompt grew to ${prompt.length} chars`);
   }

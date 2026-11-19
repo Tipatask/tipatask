@@ -35,7 +35,8 @@ async function withClient(run) {
         export * as setupModal from './src/client/setup-modal.js';
         export * as permissionModeSelect from './src/client/permission-mode-select.js';
         export * as permissionMode from './src/client/permission-mode.js';
-        export * as i18n from './src/client/i18n.js';`, resolveDir: root },
+        export * as i18n from './src/client/i18n.js';
+        export * as taskChat from './src/client/task-chat.js';`, resolveDir: root },
       bundle: true, platform: 'node', format: 'esm', write: false, loader: { '.css': 'empty' },
       plugins: [{ name: 'terminal-double', setup(build) {
         build.onResolve({ filter: /^@xterm\/(xterm|addon-fit)$/ }, args => ({ path: args.path, namespace: 'terminal-double' }));
@@ -201,6 +202,41 @@ test('Settings is interactive over the workspace and closing it restores the wor
 });
 
 // (TPT9110) The Settings box is fixed-size and each tab pane scrolls on its own.
+// (TPT9344) ⌘, over a standalone task chat window: Settings is the top layer (interactive,
+// focused, painted above via body.task-chat-open), and the first Escape closes only Settings.
+test('Settings over a standalone task chat is interactive and the first Escape closes only Settings', async () => {
+  await withClient(async ({ board, taskChat, flush }) => {
+    document.body.insertAdjacentHTML('beforeend', `<div id="settings-modal" role="dialog" aria-modal="true">
+      <div class="settings-panel"><button class="settings-close" type="button">x</button>
+        <div class="modal-tabs"><button class="modal-tab-btn active" data-tab="general">General</button></div>
+        <div class="settings-body modal-tab-panel" data-tab="general"><select id="settings-theme-select"></select></div></div></div>`);
+    board.initSettingsModal();
+    const modal = document.getElementById('settings-modal');
+    await taskChat.open('TPT1');
+    await flush();
+    const chatWindow = document.querySelector('.task-chat-modal');
+    assert.ok(chatWindow, 'the chat opened as its own window');
+    assert.ok(document.body.classList.contains('task-chat-open'), 'the body class the Settings tier keys on');
+
+    board.openSettingsModal();
+    await flush();
+    assert.notEqual(modal.inert, true, 'Settings is not inerted by the chat window');
+    assert.equal(chatWindow.inert, true, 'the chat is background while Settings is up');
+    assert.equal(document.activeElement, modal.querySelector('.modal-tab-btn.active'), 'focus lands inside Settings');
+
+    escape();
+    await flush();
+    assert.equal(modal.classList.contains('open'), false, 'the first Escape closes Settings');
+    assert.ok(chatWindow.isConnected, 'and leaves the chat open');
+    assert.notEqual(chatWindow.inert, true);
+    assert.ok(chatWindow.contains(document.activeElement), 'focus returns to the chat');
+
+    escape();
+    await flush();
+    assert.equal(chatWindow.isConnected, false, 'the second Escape closes the chat');
+  });
+});
+
 test('Settings tab switch keeps focus on the activated tab and shows the pane from its top', async () => {
   await withClient(async ({ board, flush }) => {
     document.body.innerHTML = `<div id="settings-modal" role="dialog" aria-modal="true">

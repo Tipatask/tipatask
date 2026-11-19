@@ -1657,11 +1657,10 @@ async function flagTaskLeftUncommitted(run, { backend, projectRoot, reason, term
 }
 
 // ── Cowboy-coding chains (TPT9162) ──
-// A cowboy run is a bypass run whose task has cowboyMode on, or one launchCowboyChain() started
-// (spawnTerminal() opts.cowboyChain). Its PTY env carries a per-run token and the exact URL of
+// Every task terminal's PTY env carries a per-run token and the exact URL of
 // POST /api/tasks/<key>/cowboy-next; local-access.js lets that token, sent as the
 // x-tipatask-run-token header while the run is live, open that one route for that one task. The
-// agent's start_next_tasks tool and `tt next` send it (cowboy-next-request.js, TPT9163).
+// completion request checks the saved scope and current modes before starting any successors.
 const { COWBOY_TOKEN_ENV, COWBOY_URL_ENV } = require('./cowboy-next-request');
 
 function mintCowboyToken() {
@@ -1678,7 +1677,7 @@ function withCowboyEnv(env, session, taskId) {
   const out = { ...(env || {}) };
   delete out[COWBOY_TOKEN_ENV];
   delete out[COWBOY_URL_ENV];
-  if ((session.cowboyChain || session.objectiveChain) && session._cowboyToken) {
+  if (session._cowboyToken) {
     out[COWBOY_TOKEN_ENV] = session._cowboyToken;
     out[COWBOY_URL_ENV] = cowboyNextUrl(taskId);
   }
@@ -1715,11 +1714,11 @@ function liveTerminalTaskKeys(sessions, projectRoot) {
   return keys;
 }
 
-// local-access.js liveRunTokens(): { token, projectPath } of every live cowboy run of `taskKey`.
+// local-access.js liveRunTokens(): { token, projectPath } of every live terminal run of `taskKey`.
 function cowboyRunTokens(sessions, taskKey) {
   const runs = [];
   for (const session of sessions?.values() || []) {
-    if (session && session.type === 'terminal' && session.alive && (session.cowboyChain || session.objectiveChain)
+    if (session && session.type === 'terminal' && session.alive
       && session._cowboyToken && sessionTaskKey(session) === taskKey) {
       runs.push({ token: session._cowboyToken, projectPath: session.projectPath || '' });
     }
@@ -1744,8 +1743,8 @@ function isPiImageTask(projectRoot, task) {
 
 // Starts the next tasks of a cowboy chain once the run of `finishedKey` has finished its task —
 // POST /api/tasks/:key/cowboy-next. Refuses (reason, nothing started) unless that run is live,
-// carries cowboyChain and is still confirmed in bypass, and its task — read fresh — is in the
-// complete role with a stored effective mode of bypass. The picks are selectNextCowboyTasks()
+// is still confirmed in bypass, and its task — read fresh — has an enabled Cowboy scope and is
+// in the complete role with a stored effective mode of bypass. The picks are selectNextCowboyTasks()
 // (cowboy-next.js) over a fresh read. (TPT9194) Each pick first takes this run's settings —
 // backend.updateTask() with chainPickFields(): its agent and model, the task override `bypass` and
 // Cowboy-coding mode, never queued offline — then starts through deps.startTask() — ws-handlers.js
@@ -1764,14 +1763,12 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
   const root = projectRoot || config.PROJECT_ROOT;
   const run = findCowboyRun(sessions, root, finishedKey);
   if (!run) return { started: [], reason: 'no_session' };
-  if (!run.cowboyChain && !run.objectiveChain) return { started: [], reason: 'not_cowboy' };
   if (run._cowboyNext) {
     const first = run._cowboyNext;
     return first.pending
       ? { started: [], reason: 'already_launched', skipped: [] }
       : { started: [], reason: 'already_launched', skipped: [], previous: { started: first.started, reason: first.reason, skipped: first.skipped } };
   }
-  if (!run.objectiveChain && run.permissionPolicy?.mode !== 'bypass') return { started: [], reason: 'not_bypass' };
   run._cowboyNext = { pending: true };
   const inherited = chainInheritance(run); // (TPT9194)
   const websocket = deps.websocket || require('./websocket');
@@ -1789,11 +1786,14 @@ async function launchCowboyChain(projectRoot, finishedKey, deps = {}) {
       if (run.objectiveChain) {
         return launchObjectiveChild({ root, run, finished, tasks, statusRoles, currentUserId, sessions, backend, startTask, websocket, inherited });
       }
+      // The run may have exited or switched mode while the fresh reads were in flight.
+      if (!run.alive || run._terminated) return { started: [], reason: 'no_session' };
       if (!finished || finished.status !== statusRoles.complete) return { started: [], reason: 'not_finished' };
-      if (effectivePermissionMode(finished, projectMode) !== 'bypass') return { started: [], reason: 'not_bypass' };
-      const scope = normalizeCowboyScope(run.cowboyScope ?? finished.cowboyMode ?? finished.cowboy_mode ?? true);
-      if (scope === 'disabled' || normalizeCowboyScope(finished.cowboyMode ?? finished.cowboy_mode ?? scope) === 'disabled') return { started: [], reason: 'not_cowboy' };
-      const context = run.cowboyContext || { originTaskId: finished.id, originSprint: finished.priority, sprint: finished.priority, order: finished.order };
+      const scope = normalizeCowboyScope(finished.cowboyMode ?? finished.cowboy_mode);
+      if (scope === 'disabled') return { started: [], reason: 'not_cowboy' };
+      if (run.permissionMode?.pending || run.permissionPolicy?.mode !== 'bypass'
+        || effectivePermissionMode(finished, projectMode) !== 'bypass') return { started: [], reason: 'not_bypass' };
+      const context = run.cowboyContext ||= { originTaskId: finished.id, originSprint: finished.priority, sprint: finished.priority, order: finished.order };
       // Wait for sibling dependency branches before starting unrelated work. Completed runs
       // can still be wrapping up their terminal output and do not hold the waterfall open.
       const chainBusy = Array.from(sessions.values()).some(s => s !== run && s.type === 'terminal' && sessionRoot(s) === root
@@ -1945,7 +1945,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   session.objectiveChain = !session.planOnly && !session.discussionMode
     ? opts.objectiveChain || (session.parentPreparation ? { rootTaskId: taskId } : null) : null;
   if (session.objectiveChain) { session.cowboyChain = false; session.cowboyScope = 'disabled'; session.cowboyContext = null; }
-  session._cowboyToken = (session.cowboyChain || session.objectiveChain) ? (opts.env?.[COWBOY_TOKEN_ENV] || mintCowboyToken()) : null;
+  session._cowboyToken = opts.env?.[COWBOY_TOKEN_ENV] || mintCowboyToken();
   session._cowboyNext = null;
   // Only a fresh spawn resolves stored preferences. Live switches replace this
   // snapshot after the provider confirms enforcement and behavioral instructions.

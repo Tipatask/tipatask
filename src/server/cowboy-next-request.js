@@ -104,15 +104,17 @@ async function requestNextTasks(taskKey, { env = process.env, fetchImpl = fetch,
 
 // (TPT9195) The chain trigger of complete_task (src/mcp/server.js) and `tt complete`
 // (src/cli/task-tools.js). `completion` is completion-guard.js completeVerifiedTask()'s result for
-// `taskKey`. Once it says completed: true inside a cowboy run (both variables set), this asks Task
-// App for the next tasks and returns the completion with the answer as
-// `cowboyNext: { started, reason, skipped, previous?, error? }`. A refused completion, a run without
-// the variables, or another task than the run's own (wrong_task, refused before any request) gets
+// `taskKey`. Every saved completion gets `cowboyNext`: with a run token, ask Task App to decide
+// from live settings; without one, report no_run_capability. Request validation still refuses
+// missing/unsafe URLs and other tasks before sending anything. Only a refused completion gets
 // `completion` back unchanged. A failed request only fills `cowboyNext`; the completion stays as
 // saved. Both share one tool call, so the request waits what is left of REQUEST_TIMEOUT_MS since
 // `since` (when the call began), and at least CHAIN_MIN_TIMEOUT_MS.
 async function startChainAfterCompletion(taskKey, completion, { env = process.env, fetchImpl = fetch, since = Date.now() } = {}) {
-  if (!completion || completion.completed !== true || !env[COWBOY_TOKEN_ENV] || !env[COWBOY_URL_ENV]) return completion;
+  if (!completion || completion.completed !== true) return completion;
+  if (!env[COWBOY_TOKEN_ENV]) {
+    return { ...completion, cowboyNext: { started: [], reason: 'no_run_capability' } };
+  }
   const timeoutMs = Math.max(CHAIN_MIN_TIMEOUT_MS, REQUEST_TIMEOUT_MS - (Date.now() - since));
   let next;
   try {
@@ -122,7 +124,6 @@ async function startChainAfterCompletion(taskKey, completion, { env = process.en
     const detail = String(err && err.message).split(env[COWBOY_TOKEN_ENV]).join('[redacted]');
     next = failure('unexpected', `Could not ask Task App for the next tasks: ${detail}. Nothing was started.`);
   }
-  if (next.reason === 'wrong_task') return completion;
   const { started, reason, skipped, previous, error } = next;
   return { ...completion, cowboyNext: { started, reason, skipped, ...(previous ? { previous } : {}), ...(error ? { error } : {}) } };
 }

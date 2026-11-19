@@ -79,7 +79,8 @@ test('task-edit-modal.js: hideActions drops Start and the manage actions, onSave
 test('stacking: the chat marks the body, lifts the edit modal above itself and yields Escape to the top layer', () => {
   assert.match(taskChat, /document\.body\.classList\.add\('task-chat-open'\)/);
   assert.match(taskChat, /document\.body\.classList\.remove\('task-chat-open'\)/);
-  assert.match(taskChat, /e\.key === 'Escape' && focusHandle && focusHandle\.isTop\(\)/);
+  // (TPT9344) An Escape a higher layer (Settings) already handled never also closes the chat.
+  assert.match(taskChat, /e\.key === 'Escape' && !e\.defaultPrevented && focusHandle && focusHandle\.isTop\(\)/);
   assert.match(taskChat, /document\.addEventListener\('keydown', keyHandler, true\)/);
   assert.match(taskChat, /document\.removeEventListener\('keydown', keyHandler, true\)/);
   assert.match(dialogFocus, /isTop: \(\) => top\(\) === layer/);
@@ -87,6 +88,27 @@ test('stacking: the chat marks the body, lifts the edit modal above itself and y
   const lifted = Number(/body\.task-chat-open \.task-edit-overlay \{ z-index: (\d+); \}/.exec(styles)[1]);
   assert.ok(lifted > chatZ, 'above the chat window');
   assert.ok(lifted < 3200, 'below the edit modal\'s portaled dropdowns');
+});
+
+// (TPT9344) Settings opened with ⌘, over a standalone chat window paints above it, and the
+// dialogs Settings opens itself (action confirms --over-settings) stay above Settings.
+test('styles.css: Settings over a chat window stacks above it and below its own confirms', () => {
+  const zOf = (re, what) => {
+    const m = re.exec(styles);
+    assert.ok(m, `rule found: ${what}`);
+    return Number(m[1]);
+  };
+  const chatZ = zOf(/\.task-chat-modal \{[^}]*?z-index: (\d+)/, '.task-chat-modal');
+  const liftedEdit = zOf(/body\.task-chat-open \.task-edit-overlay \{ z-index: (\d+); \}/, 'lifted .task-edit-overlay');
+  const settingsZ = zOf(/(?:^|,)\s*body\.task-chat-open #settings-modal \{\s*z-index: (\d+);/m, 'body.task-chat-open #settings-modal');
+  const confirmZ = zOf(/\.modal-overlay--over-settings,[^{]*\{\s*z-index: (\d+);/, '.modal-overlay--over-settings');
+  const agentsZ = zOf(/\n\.agents-modal \{[^}]*?z-index: (\d+)/, '.agents-modal');
+  assert.ok(settingsZ > chatZ, `Settings (${settingsZ}) above the chat window (${chatZ})`);
+  assert.ok(settingsZ > liftedEdit, `Settings (${settingsZ}) above a task modal opened from the chat (${liftedEdit})`);
+  assert.ok(settingsZ < confirmZ, `Settings (${settingsZ}) below its --over-settings confirms (${confirmZ})`);
+  assert.ok(settingsZ < agentsZ, `Settings (${settingsZ}) below Edit Agents (${agentsZ})`);
+  // Its Workflow permission-mode listbox follows Settings up to that tier.
+  assert.match(styles, /body\.task-chat-open #settings-modal\.open ~ \.permission-mode-select-menu\[data-portaled="1"\] \{ z-index: 3260; \}/);
 });
 
 test('styles.css: every widget variant is styled and cannot widen the transcript', () => {

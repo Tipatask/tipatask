@@ -29,7 +29,7 @@ const STATUSES = [
 function row(id, fields = {}) {
   return { id, title: `Task ${id}`, description: `Do ${id}.`, status: 'pending', category: 'CODING', priority: 5, order: 0,
     dependencies: [], assignee: 1, agentAssignee: 'claude', agentPermissionMode: null, claudeDesignMode: false,
-    isObjective: false, isReservation: false, tags: [], ...fields };
+    isObjective: false, isReservation: false, tags: [], cowboyMode: 'project', ...fields };
 }
 
 // A live cowboy run of `taskId` whose agent already completed its task (the completion sweep set
@@ -112,9 +112,10 @@ test('only the live run\'s own token opens cowboy-next, for its own task; a repe
   for (const electron of [false, true]) {
     const root = `/projects/cowboy-${electron ? 'electron' : 'browser'}`;
     const token = `run-token-${electron}`;
-    const sessions = new Map([[`TPT1\0${root}`, finishedRun('TPT1', root, token)]]);
+    const sessions = new Map([[`TPT1\0${root}`, finishedRun('TPT1', root, token, { cowboyChain: false, cowboyScope: 'disabled' })]]);
     // Nothing else can start: the decision is 'none', so no session is spawned here.
-    const backend = backendFor([row('TPT1', { status: 'completed' }), row('TPT2', { status: 'in_progress' })]);
+    const finished = row('TPT1', { status: 'completed', cowboyMode: 'disabled' });
+    const backend = backendFor([finished, row('TPT2', { status: 'in_progress' })]);
     const handler = createHttpHandler(sessions, () => backend, { getBackendForPath: () => backend });
     const secret = 'test-only-secret';
     const request = await serve(t, handler, { electron, secret, getActiveProjectPath: () => root,
@@ -133,6 +134,10 @@ test('only the live run\'s own token opens cowboy-next, for its own task; a repe
     }
     assert.equal(sessions.get(`TPT1\0${root}`)._cowboyNext, null, 'no refused request reached the launcher');
 
+    const disabled = await request(url, { headers: { [RUN_TOKEN_HEADER]: token } });
+    assert.equal(disabled.status, 409, 'a non-Cowboy run passes the token guard and reaches the settings check');
+    assert.deepEqual(disabled.json(), { started: [], reason: 'not_cowboy' });
+    finished.cowboyMode = 'project';
     const first = await request(url, { headers: { [RUN_TOKEN_HEADER]: token } });
     assert.equal(first.status, 200, first.text);
     const skipped = [{ key: 'TPT2', reason: 'status' }];

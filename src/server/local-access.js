@@ -88,7 +88,8 @@ function runTokenRouteKey(pathname) {
 }
 
 // The live run whose token equals the one supplied, or null. `runs` is liveRunTokens(taskKey):
-// [{ token, projectPath }] of the task's live cowboy runs; every one is compared.
+// [{ token, projectPath }] of all the task's live terminal runs, regardless of Cowboy scope
+// or permission mode; every one is compared. The route checks live settings after authorization.
 function matchRunToken(supplied, runs) {
   let match = null;
   for (const run of runs) {

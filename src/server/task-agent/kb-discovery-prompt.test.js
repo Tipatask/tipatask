@@ -310,8 +310,8 @@ test('Claude design mode keeps the KB discovery note out of the /design submissi
 // ── Pi: the echoed kickoff budget ──
 
 // (C1119/C1116/C1117) The whole Pi kickoff is echoed verbatim into its TUI and rescanned by
-// prompt-detect.js. A compose-mode CODING kickoff stays under the shared Pi ceilings (9300; 9600
-// with every Git flag on), grows by under 500 characters, and its worst case (a discovery-tagged
+// prompt-detect.js. A compose-mode CODING kickoff stays under the shared Pi ceilings (9900; 10200
+// with every Git flag on, including 600 for unconditional live-chain guidance), grows by under 500 characters, and its worst case (a discovery-tagged
 // task with every Git flag on) stays inside the 12,000-character assembled Pi budget.
 test('Pi compose-mode kickoff stays echo-safe and inside its budgets', (t) => {
   const agent = new PiAgent();
@@ -336,7 +336,7 @@ test('Pi compose-mode kickoff stays echo-safe and inside its budgets', (t) => {
     }
     assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*plan ready[.!]?\s*$/im);
     assert.doesNotMatch(prompt, /^[\s>│┃╎┆❯➤▶›*]*questions ready[.!]?\s*$/im);
-    const ceiling = scenario.discovery ? 12000 : scenario.vcsSettings ? 9600 : 9300;
+    const ceiling = scenario.discovery ? 12000 : scenario.vcsSettings ? 10200 : 9900;
     t.diagnostic(`Pi compose ${JSON.stringify(scenario)}: ${prompt.length} / ${ceiling} (+${prompt.length - base.length})`);
     assert.ok(prompt.length < ceiling, `${JSON.stringify(scenario)} prompt grew to ${prompt.length} chars`);
     assert.ok(prompt.length - base.length < 500, `${JSON.stringify(scenario)} the note added ${prompt.length - base.length} chars`);

@@ -116,7 +116,7 @@ test('buildSharedPreamble: the computerUse slot sits after resourceLimits, befor
   for (const agent of [bareAgent(), new ClaudeAgent(), new CodexAgent(), new PiAgent()]) {
     const p = agent.buildSharedPreamble({ agentLimits: { maxSubagents: 3 }, computerUse: available(agent.id === 'x' ? 'claude' : agent.id) });
     assert.ok(p.computerUse.startsWith('Computer use:'));
-    assert.deepEqual(p.directives, [p.processSafety, p.resourceLimits, p.computerUse, p.kbHygiene, p.taskStatus, p.followUps]);
+    assert.deepEqual(p.directives, [p.processSafety, p.resourceLimits, p.computerUse, p.kbHygiene, p.taskStatus, p.followUps, p.cowboy]);
     const variant = agent.getPreamblePolicy().compact ? { compact: true } : {};
     assert.equal(p.computerUse, agent.buildComputerUseDirective({ computerUse: available(agent.id === 'x' ? 'claude' : agent.id), ...variant }));
     assert.equal(agent.buildSharedPreamble({}).computerUse, '');

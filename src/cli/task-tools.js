@@ -4,9 +4,9 @@
 // Credential-safe REST recovery and Pi terminal tools. Bodies/resolutions arrive
 // on stdin; tokens are read internally and never passed through argv or stdout.
 // `next <key>` (TPT9163) is a cowboy chain run's start_next_tasks: it sends only the
-// run's own TIPATASK_COWBOY_TOKEN, never the account token. (TPT9195) In a cowboy run
-// `complete` makes that request itself once the completion is saved, printing the
-// answer as `cowboyNext`, as the complete_task MCP tool does.
+// run's own TIPATASK_COWBOY_TOKEN, never the account token. After every saved completion,
+// `complete` prints `cowboyNext`, as the complete_task MCP tool does: the live server
+// decision (including not_cowboy), or no_run_capability when the run token is absent.
 async function run(argv, { input = '', fetchImpl = fetch, env = process.env } = {}) {
   const since = Date.now();
   const [command, target] = argv;

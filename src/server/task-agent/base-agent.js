@@ -506,28 +506,26 @@ class BaseTaskAgent {
     return `Parent objective execution: implement only this child, honoring this run\'s selected permissions. Guarded completion starts at most one next ready child inside the same parent, with this run\'s agent, model and permissions. Never start siblings yourself or change the parent\'s status. Failure, cancellation or refused completion stops the chain. Retry ${call} with this child\'s key once only if cowboyNext.reason is unavailable; report cowboyNext in the final reply.`;
   }
 
-  // (TPT9163) Cowboy chain hand-off (ai/architecture/tt-task-agent.md § Cowboy Directive). Only a run
-  // spawned with opts.cowboyChain (terminal-session.js: a bypass run whose task has cowboyMode on, or
-  // one launchCowboyChain() started) whose policy is bypass gets it; every other run gets ''. Task App
-  // picks and starts the next tasks (POST /api/tasks/:key/cowboy-next). (TPT9195) The completion call
+  // Cowboy chain hand-off (ai/architecture/tt-task-agent.md § Cowboy Directive). Every ordinary
+  // task run gets it: scope, permission mode and successors may change after launch. Objective
+  // chains have their own directives. Task App picks and starts the next tasks. The completion call
   // (complete_task / `tt complete`) asks for them itself and returns the answer as `cowboyNext`; the
   // agent calls start_next_tasks only to retry an `unavailable` answer, once. opts.nextCall is how this
   // agent reaches start_next_tasks (Pi passes its bridged tool or `tt next`). Compact wording is echoed
-  // by Pi and must stay under 400 characters: no questions or status literals.
+  // by Pi and must stay compact: no questions or status literals.
   buildCowboyDirective(opts = {}) {
     if (opts.objectiveChain || (opts.parentPreparation ?? opts.task?.isObjective)) return '';
-    if (opts.cowboyChain !== true || opts.permissionPolicy?.mode !== 'bypass') return '';
     const call = opts.nextCall || '`start_next_tasks(task_key)`';
     if (opts.compact) {
       return [
         'Cowboy chain:',
-        '- Completion (completed:true) starts the chain itself, each next task in a new session; cowboyNext names them.',
+        '- Cowboy scope, permission mode and successor tasks can change mid-run; do not rely on the startup snapshot. Completion (completed:true) asks Task App for a live decision; read cowboyNext.',
         `- Never pick, start or work on the next tasks yourself. Retry with ${call} once, only if cowboyNext.reason is unavailable. Completion refused or blocked: the chain stops. Final message: the started task keys (or none) and the reason.`,
       ].join('\n');
     }
     return [
       'Cowboy chain:',
-      '- This Bypass run is part of a cowboy chain. When `complete_task` succeeds (it returns completed: true), it starts the chain itself: Task App picks the next tasks and starts each one in its own new agent session with this run\'s agent and model. Its result\'s `cowboyNext` lists the tasks it started, the reason, and `skipped`: each candidate task that did not start, with its reason code.',
+      '- Cowboy scope, permission mode and successor tasks can change while the task runs. Do not rely on the startup snapshot. When `complete_task` succeeds (it returns completed:true), it asks Task App for a live decision. Task App picks any eligible next tasks and starts each one in its own new agent session with this run\'s agent and model. Read the returned `cowboyNext`: it lists the tasks it started, the reason, and `skipped` candidates when supplied. Reasons such as `not_cowboy` and `no_run_capability` mean no tasks started.',
       '- Never pick, start or work on the next tasks yourself: no status changes on them, no new terminals, agent sessions or CLI launches. `complete_task`, with the one retry below, is the only way the chain continues.',
       `- Call the tipatask-local tool ${call} only as a retry: once, with this task's key, when \`cowboyNext.reason\` is \`unavailable\` (Task App could not read the tasks). After any other answer, do not call it.`,
       '- If `complete_task` refused or this task ends blocked, the chain stops here.',

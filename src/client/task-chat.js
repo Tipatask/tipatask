@@ -505,9 +505,14 @@ function renderWindow() {
   if (!host) {
     // Capture phase, and only while this window is the top dialog layer: with the Task Edit Modal
     // or a confirm open above it, Escape belongs to that layer and must not also close the chat.
-    // An open Embed menu takes Escape for itself (embed-menu.js).
+    // An open Embed menu takes Escape for itself (embed-menu.js). (TPT9344) An Escape a layer
+    // above already handled is skipped: Settings' capture-phase closer was registered first and
+    // runs first, so once it has closed Settings this window is top again — without the
+    // defaultPrevented check the same key would close the chat too.
     const embedMenuOpen = () => !!(root && root.querySelector('.embed-menu-wrap .import-submenu'));
-    keyHandler = (e) => { if (e.key === 'Escape' && focusHandle && focusHandle.isTop() && !embedMenuOpen()) close(); };
+    keyHandler = (e) => {
+      if (e.key === 'Escape' && !e.defaultPrevented && focusHandle && focusHandle.isTop() && !embedMenuOpen()) close();
+    };
     document.addEventListener('keydown', keyHandler, true);
   }
   providersHandler = (e) => {

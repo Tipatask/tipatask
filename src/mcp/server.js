@@ -1235,13 +1235,11 @@ async function main() {
     }
   );
 
-  // (TPT9195) In a cowboy chain run (TIPATASK_COWBOY_TOKEN/URL in this server's env) a saved
-  // completion of the run's own task also asks Task App for the chain's next tasks
-  // (cowboy-next-request.js startChainAfterCompletion()) and adds the answer as `cowboyNext`; a
-  // failed or refused request never fails the completion.
+  // Every saved completion carries cowboyNext: ask Task App for the live chain decision with
+  // this run's token, or report no_run_capability. A failed/refused request never fails completion.
   server.tool(
     'complete_task',
-    `Verify live VCS settings, the required task commit and local merges, then post one resolution report and set the project's completion status. Refuses a missing task commit (commits on), unmerged/dirty task branches, conflicts, incorrect gitlinks, and unknown verification. Run relevant checks first. Does not perform git writes. In a cowboy chain run it then starts the chain's next tasks itself and reports them as cowboyNext: { started, reason, skipped }. ${projectScopeNote}`,
+    `Verify live VCS settings, the required task commit and local merges, then post one resolution report and set the project's completion status. Refuses a missing task commit (commits on), unmerged/dirty task branches, conflicts, incorrect gitlinks, and unknown verification. Run relevant checks first. Does not perform git writes. Every successful completion returns cowboyNext: { started, reason, skipped? }. With a run token it asks Task App for the live chain decision, including not_cowboy; without one it reports no_run_capability. ${projectScopeNote}`,
     { task_key: z.string(), resolution: z.string().min(1).describe('Plain-English report: changes, files, verification results, follow-ups/caveats') },
     async ({ task_key, resolution }) => {
       const since = Date.now();
