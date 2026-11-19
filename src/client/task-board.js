@@ -63,6 +63,7 @@ import {
   // Builders shared with the New Task form (renderNewTaskForm / attachNewTaskFormHandlers).
   _renderDepChip, _statusOptionsHtml, _agentModelControlHtml, _applyModalAgentModelVisibility,
 } from './task-edit-modal.js';
+import { configureEmbedUploads } from './embed-menu.js';
 
 export {
   openTaskEditModal, closeTaskEditModal, requestCloseTaskEditModal,
@@ -8232,3 +8233,7 @@ configureTaskEditModal({
   getCachedProjectConfig: () => _cachedProjectConfig,
   setCachedProjectConfig: cfg => { _cachedProjectConfig = cfg; },
 });
+
+// (TPT9346) Every Embed control (embed-menu.js — the chat composers, the Task Edit description)
+// uploads images here: the shared module does not import the board.
+configureEmbedUploads({ uploadImage: uploadImageFile });

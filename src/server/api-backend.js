@@ -842,6 +842,9 @@ function fromApi(t) {
     status: t.status || 'pending',
     priority: Number(t.priority ?? 0),
     urgency: t.urgency ?? 0,
+    // Only when the API sent it: a row from an API without the column stays without the key,
+    // so toApi() omits it and the API keeps the stored value instead of clearing it.
+    ...(Object.hasOwn(t, 'severity') ? { severity: t.severity ?? null } : {}),
     order: t.display_order ?? 0,
     dependencies: t.dependencies || [],
     tags: t.tags || [],
@@ -906,6 +909,8 @@ function toApi(t) {
     due_date: t.due_date ?? null,
   };
   if (t.urgency !== undefined) out.urgency = t.urgency;
+  // Severity 1-4 or null (unrated); omitted keeps the stored value on PATCH and bulk PUT.
+  if (t.severity !== undefined) out.severity = t.severity;
   // Per-task model override forwarded ONLY when explicitly set to a non-empty
   // model id. Blank/undefined is omitted (not sent as null) so a plain new
   // task carries no defaulted model and inherits the project
@@ -1085,7 +1090,7 @@ async function assignIncomingNewTaskIds(backend, incomingNewTasks, liveTasks) {
 // Only differences against the client's own read base represent edits. Comparing
 // against live rows would misclassify concurrent changes as requested reversions.
 const DIFF_FIELDS = ['title', 'description', 'category', 'status', 'priority', 'order',
-  'dependencies', 'tags', 'urgency', 'assignee', 'agentAssignee', 'claudeModel', 'codexModel', 'piModel', 'effort', 'agentPermissionMode', 'claudeDesignMode', 'cowboyMode', 'due_date', 'parentDbId', 'isObjective', 'type', 'parentId'];
+  'dependencies', 'tags', 'urgency', 'severity', 'assignee', 'agentAssignee', 'claudeModel', 'codexModel', 'piModel', 'effort', 'agentPermissionMode', 'claudeDesignMode', 'cowboyMode', 'due_date', 'parentDbId', 'isObjective', 'type', 'parentId'];
 function taskFieldChanges(incoming, base) {
   const patch = {};
   const permissionMode = incoming.agentPermissionMode !== undefined ? incoming.agentPermissionMode : incoming.agent_permission_mode;
@@ -1171,6 +1176,7 @@ async function _rawUpdateTask(id, fields, opts = {}) {
   const piModel = fields.piModel !== undefined ? fields.piModel : fields.pi_model;
   if (piModel !== undefined) body.pi_model = piModel;
   if (fields.urgency !== undefined) body.urgency = fields.urgency;
+  if (fields.severity !== undefined) body.severity = fields.severity;
   // TPT285: single key in both casings; '' clears to null (API normalizeEffort does the same).
   if (fields.effort !== undefined) body.effort = fields.effort || null;
   const permissionMode = fields.agentPermissionMode !== undefined ? fields.agentPermissionMode : fields.agent_permission_mode;
@@ -2003,6 +2009,7 @@ const backend = {
         if (fields.codexModel !== undefined) row.codexModel = fields.codexModel;
         if (fields.piModel !== undefined) row.piModel = fields.piModel;
         if (fields.urgency !== undefined) row.urgency = fields.urgency;
+        if (fields.severity !== undefined) row.severity = fields.severity;
         if (fields.effort !== undefined) row.effort = fields.effort || null;
         if (permissionMode !== undefined) row.agentPermissionMode = permissionMode;
         if (fields.claudeDesignMode !== undefined) row.claudeDesignMode = !!fields.claudeDesignMode;

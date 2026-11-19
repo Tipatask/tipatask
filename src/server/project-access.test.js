@@ -65,7 +65,7 @@ function harness(overrides = {}) {
     BrowserWindow: FakeWindow, attachExternalLinkPolicy() {}, scheduleOpenProjectsSync() {},
     getWindowIcon() {}, projectDirs: new Map(), attachCloseGuard() {},
     bindWindowToProject: (_, dir) => events.push(['bind', dir]),
-    __dirname, path, PORT: 12345, console,
+    __dirname, path, PORT: 12345, APP_ORIGIN: 'http://127.0.0.1:12345', console,
   });
   vm.runInContext(mainFunction('createProjectWindow'), context);
   vm.runInContext(mainFunction('createInitialWindows'), context);

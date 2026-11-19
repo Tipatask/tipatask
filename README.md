@@ -13,6 +13,10 @@ hand them to Claude, Codex or Pi, and watch the work happen in one place. It als
 small knowledge base about your project, so agents start each task with real context instead
 of rediscovering your codebase every time.
 
+<p align="center">
+  <img src="docs/tipatask-demo-10s-cropped.gif" alt="Animated demonstration of the TipΔTask desktop app interface" width="960">
+</p>
+
 Created by Anton Matiienko and Apppixies — <https://tipatask.com>.
 
 ## Download
@@ -34,24 +38,49 @@ tools you already have, so install and sign in to the ones you want. Pi is inclu
 
 ## Getting started
 
-To run from source you need Node.js 22.19 or newer, npm 10 or newer, and a C/C++ build
-toolchain (see [`ELECTRON_BUILD.md`](ELECTRON_BUILD.md) for your platform).
+These steps are for the installed desktop app: install the package for your system from
+[Download](#download), then open TipΔTask. To run or build the app from source, see
+[Build from source](#build-from-source).
 
-```bash
-git clone https://github.com/Tipatask/tipatask.git
-cd tipatask
-nvm use
-npm ci
-npm run electron
-```
+### Open your project
 
-Once the app is open, choose **Project ▸ Open Project…** and pick your project folder.
-TipΔTask signs you in, lets you pick or create a project, and adds the few files your agents
-need. They are yours to edit, and reopening the project keeps them up to date. A new project
-made this way starts with an empty board and builds its knowledge base as tasks run; choose
-**Project ▸ Create Project…** instead to pick a starter preset first. Tasks are stored on
-<https://web.tipatask.com> by default; to use your own server, set `API_BASE_URL` in the
-project's `.tipatask/config.json`.
+Choose **Project ▸ Open Project…** and select your project folder. If TipΔTask has not set it
+up yet, a setup wizard walks you through it: sign in to TipΔTask in your browser, create or
+select a project, name this device and choose your agents.
+
+Claude and Codex use the command-line tools mentioned above, so install and sign in to the
+ones you want first. To use the bundled Pi agent, choose **Other Model** in the wizard and set
+its provider and model, plus an API key if the provider needs one.
+
+A new project set up this way starts with an empty board and builds its knowledge base as
+tasks run. To start a new project from a preset instead, use **Project ▸ Create Project…**.
+
+### Run your first task
+
+The first time a new project opens, it asks whether to start with an objective or a project
+discussion. Choose **Dismiss** to follow the steps below; both stay in the left menu, under
+**Create** and **Start Chat**.
+
+1. Click **Create** in the left menu, then choose **Task**. On an empty board, **+ New Task**
+   opens the same form.
+2. Fill in **Title** and **Description**. Start with a small change and say what done looks
+   like, for example a specific bug fixed or a missing test added.
+3. Pick the coding agent under **Agent**. If the form has a **Priority / Batch** field (its
+   name follows how your project groups tasks, such as Sprint), choose an existing group or
+   a new one so the task shows up on the board.
+4. Click **Preview**, check the task, then click **Confirm** to add it to the board.
+5. Click **Start** on the task's card. The task window opens on **Agent Terminal**, where you
+   can watch the agent work and answer it when it needs input.
+6. When the agent is done, read its report under **Edit ▸ Comments** in the task window
+   (double-click the card to reopen it), and review the code changes in your editor or Git
+   tool. Whether the agent commits or merges is up to your project's settings.
+
+### Project files, import and export
+
+TipΔTask adds the files your agents need to your project folder. They are yours to edit, and
+reopening the project keeps them up to date. Tasks are stored on <https://web.tipatask.com>
+by default; to use your own server, set `API_BASE_URL` in the project's
+`.tipatask/config.json`.
 
 **Project ▸ Export…** saves the open project as one `.zip`: its knowledge base (`CLAUDE.md`,
 `AGENTS.md`, `ai/CONVENTIONS.md`, `ai/architecture/*.md`) and every task that is not closed,
@@ -62,12 +91,16 @@ name the project and pick its folder and agents; TipΔTask then creates the proj
 knowledge base files into the folder (files already there are kept) and adds the tasks to their
 sprints. If an import fails partway, the project it started is removed, so you can import again.
 
+### macOS permissions
+
 On macOS the first launch explains, then asks once for notification, microphone and folder
 access (Desktop, Documents, Downloads and your open projects), so an agent never stops mid-task
 waiting on a system prompt. Agents also need Screen Recording and Accessibility for computer use,
 to see the screen and work in apps when they check their changes: while either is off, each
 launch shows one prompt that names it and opens its System Settings pane, until you turn it on or
 choose Don't Ask Again. You can change all of these later in System Settings.
+
+### Updating
 
 To update, install a newer release (or pull and rebuild) and reopen your project.
 
@@ -88,6 +121,19 @@ lands in `dist-electron/`.
 - **Linux only, for the pacman package:** `libarchive-tools` and `zstd`
   (`sudo apt-get install libarchive-tools zstd` on Debian/Ubuntu). AppImage and deb need nothing
   extra.
+
+### Run the app from source
+
+```bash
+git clone https://github.com/Tipatask/tipatask.git
+cd tipatask
+nvm use
+npm ci
+npm run electron
+```
+
+See [`ELECTRON_BUILD.md`](ELECTRON_BUILD.md) for platform-specific setup and packaging. Once the
+app opens, continue with [Open your project](#open-your-project).
 
 ### What `npm ci` does
 

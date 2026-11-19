@@ -84,7 +84,8 @@ test('localizeFileRefs fetches and saves a relative internal file ref', async ()
         { url: taskFileListingPath('C1247'), authorization: 'Bearer test-token' },
         { url: '/api/projects/1/files/45', authorization: 'Bearer test-token' },
       ]);
-      assert.match(result.prompt, /^See api-spec\.pdf: @.+\.pdf\.\n\nTask file attachments \(read these before implementing\):\n@.+\.pdf$/);
+      // (TPT9361) The sentence's full stop no longer runs into the path (`@….pdf.`): a space keeps it out.
+      assert.match(result.prompt, /^See api-spec\.pdf: @\S+\.pdf \.\n\nTask file attachments \(read these before implementing\):\n@.+\.pdf$/);
       const localPath = result.prompt.match(/@(\S+\.pdf)/)[1];
       assert.strictEqual(path.dirname(localPath), path.join(projectRoot, '.tipatask', 'files', 'C1247'));
       assert.strictEqual(path.basename(localPath), '45-api-spec.pdf');

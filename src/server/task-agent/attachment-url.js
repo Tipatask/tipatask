@@ -33,4 +33,16 @@ function resolveInternalAttachmentUrl(url, { baseUrl, projectId }, kind) {
   }
 }
 
-module.exports = { getApiOrigin, resolveInternalAttachmentUrl };
+// (TPT9361) The in-place rewrite of an attachment reference to its local copy: `label: @path`, or
+// `@path` when the reference has no label. The agent CLIs read an `@path` up to the next
+// whitespace, so the rewrite keeps it apart from its neighbours: a space after it before more text
+// (references in a row, `![img](…)and`), and before an unlabelled one right after a word.
+// `start` / `end` are the reference's offsets in `text`, the string being rewritten.
+function localReference(label, localPath, text, start, end) {
+  const mention = label ? `${label}: @${localPath}` : `@${localPath}`;
+  const before = !label && start > 0 && !/\s/.test(text[start - 1]) ? ' ' : '';
+  const after = end < text.length && !/\s/.test(text[end]) ? ' ' : '';
+  return before + mention + after;
+}
+
+module.exports = { getApiOrigin, resolveInternalAttachmentUrl, localReference };

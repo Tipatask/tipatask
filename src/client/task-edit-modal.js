@@ -7,7 +7,7 @@ import { agentModelOptions, ensureAgentModels, EFFORT_LEVELS, EFFORT_LABELS } fr
 import { statusNames, statusLabel, statusColor, isActiveName, isInProgressName, startName } from './status-registry.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { hasTaskSession } from './dependency-status.js';
-import { escapeAttr, insertAtCursor, renderMarkdown, renderSprintCombobox, initSprintCombobox, showToast, showBoardLoader, hideBoardLoader, showActionBanner, hideActionBanner, taskOpenErrorLabel, sprintRecordMax } from './utils.js';
+import { escapeAttr, insertAtCursor, setValueKeepingCaret, caretMapper, renderMarkdown, renderSprintCombobox, initSprintCombobox, showToast, showBoardLoader, hideBoardLoader, showActionBanner, hideActionBanner, taskOpenErrorLabel, sprintRecordMax } from './utils.js';
 import { api, isTransportError, errorDetail } from './api-client.js';
 import { isTaskDiscussing, lockIntentOf, lockMessageKey } from './discuss-lock.js';
 import { buildMentionCandidates, highlightMentionsInHtml, AGENT_HANDLES } from './mention-highlight.js';
@@ -26,21 +26,27 @@ import { showActionConfirm } from './action-confirm.js';
 import { buildTaskModeOptions, normalizePermissionMode, effectivePermissionMode, normalizeCowboyScope, cowboyModeOptions } from './permission-mode.js';
 import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
 import { activateDialogFocus } from './dialog-focus.js';
+import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu } from './embed-menu.js';
+import { stripPendingImageRefsAt } from './task-chat-model.js';
+import { isTaskKeyLike } from '../server/task-key-format.js';
 
 let commands;
 export function configureTaskEditModal(boardCommands) {
   commands = boardCommands;
 }
 
+// The board socket's `blob:` → URL swap for an image whose placeholder textarea is gone: the
+// description editor it went into was closed (and maybe opened again since, holding the draft's
+// copy of the placeholder). A caret remembered for the closed editor follows the swap.
 export function replaceModalImageBlobUrl(blobUrl, url) {
   if (!_modalState?.draft?.description?.includes(blobUrl)) return false;
-  _modalState.draft.description = _modalState.draft.description.split(blobUrl).join(url);
-  const descDisplay = document.querySelector('#task-edit-modal .modal-desc-display:not([data-diff-side="old"])');
-  if (descDisplay && descDisplay.style.display !== 'none') {
-    const modal = document.getElementById('task-edit-modal');
-    if (_modalState.compareTask && modal) _applyModalDiffHighlights(modal);
-    else descDisplay.innerHTML = _renderDescriptionHtml(_modalState.draft.description);
+  const editor = _modalState._descEditor?.ta;
+  if (editor?.isConnected && editor.value.includes(blobUrl)) {
+    setValueKeepingCaret(editor, editor.value.split(blobUrl).join(url));
+    editor.dispatchEvent(new Event('input', { bubbles: true })); // the editor syncs the draft
+    return true;
   }
+  _setClosedDescription(_modalState, _modalState.draft.description.split(blobUrl).join(url));
   return true;
 }
 
@@ -486,7 +492,35 @@ function _mentionCandidates() {
 // display (_renderDescriptionHtml). Diff mode deliberately does NOT use this — see
 // _applyModalDiffHighlights, which splits the same text nodes into <ins>/<del>.
 function _renderDescriptionHtml(raw) {
-  return sanitizeMarkdownHtml(highlightMentionsInHtml(renderMarkdown(raw || ''), _mentionCandidates()));
+  return _withPendingImages(raw, text => sanitizeMarkdownHtml(highlightMentionsInHtml(renderMarkdown(text), _mentionCandidates())));
+}
+
+// (TPT9346) An image still uploading into the description is a `![…](blob:…)` placeholder, and the
+// markdown sanitizer takes http(s) images only — the rendered description would show a broken
+// image until the upload lands. Show the picked image itself instead, dimmed: each placeholder
+// becomes a token while `render` runs, then an <img> of this page's own blob URL (nothing else is
+// let through). replaceModalImageBlobUrl() swaps the real URL in once the board socket answers.
+const _PENDING_IMAGE_REF_RE = /!\[[^\]\n]*\]\((blob:[^)\s]+)\)/g;
+function _ownBlobUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'blob:' && new URL(parsed.pathname).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+function _withPendingImages(raw, render) {
+  const blobs = [];
+  const text = String(raw || '').replace(_PENDING_IMAGE_REF_RE, (match, url) => {
+    if (!_ownBlobUrl(url)) return match;
+    blobs.push(url);
+    return `TIPATASKPENDINGIMAGE${blobs.length - 1}X`;
+  });
+  let html = render(text);
+  blobs.forEach((url, i) => {
+    html = html.split(`TIPATASKPENDINGIMAGE${i}X`).join(`<img class="modal-desc-pending-image" src="${escapeAttr(url)}" alt="">`);
+  });
+  return html;
 }
 
 // (TPT9337) The end marker of an auto-posted agent exit comment (exit-resolution.js), where it is
@@ -1156,6 +1190,7 @@ export function closeTaskEditModal(force = false, { keepRail = false } = {}) {
   // chat keep running, only this window's xterm and socket are released.
   _disposePanes();
   _modalState._permissionModeSelect?.destroy();
+  closeOpenEmbedMenu(); // (TPT9346) the description's Embed menu and its document listeners
   document.body.classList.remove('task-modal-rail');
   const el = document.getElementById('task-edit-modal');
   if (el) { el.hidden = true; el.innerHTML = ''; delete el.dataset.taskId; delete el.dataset.pane; }
@@ -1351,6 +1386,9 @@ function _renderTaskEditModal() {
   const modal = document.getElementById('task-edit-modal');
   if (!modal) return;
   _modalState._permissionModeSelect?.destroy();
+  closeOpenEmbedMenu(); // (TPT9346) the description's Embed menu lives on <body>
+  _modalState._descEditor = null;
+  _modalState._descPickerOpen = false;
   const { draft } = _modalState;
   const tierKeys = state.tierKeys || [];
   const dirty = _isModalDirty();
@@ -1424,6 +1462,15 @@ function _renderTaskEditModal() {
   const closeBtnHtml = tabs
     ? `<button type="button" class="btn-modal-close" title="${escapeAttr(t('btn.close'))}" aria-label="${escapeAttr(t('btn.close'))}">${_CLOSE_SVG}</button>`
     : '';
+  // (TPT9346) The composer's Embed control under the editable description — in diff mode under
+  // both columns, right-aligned below the PROPOSED one, so the two descriptions keep one height;
+  // none for a read-only task. _syncDescEmbed() hides it while the description is locked. Wired
+  // in _attachModalHandlers().
+  const descEmbedHtml = readOnly ? '' : `
+    <div class="modal-desc-embed">
+      <span class="modal-desc-embed-status" role="status" aria-live="polite" hidden></span>
+      ${embedMenuHtml({ title: t('modal.embedTooltip') })}
+    </div>`;
   const titleDescHtml = isDiffMode ? `
     <div class="diff-header-row">
       <div class="diff-col" data-diff-side="old">
@@ -1438,11 +1485,13 @@ function _renderTaskEditModal() {
         <div class="modal-desc-display" data-diff-side="new"${canEditText ? ` role="button" tabindex="0" aria-label="${escapeAttr(t('modal.editDescription'))}"` : ''}></div>
       </div>
     </div>
+    ${descEmbedHtml}
     <div class="diff-meta-row" hidden></div>
   ` : `
     <input class="modal-title-input" type="text" aria-label="${escapeAttr(t('field.title'))}" value="${escapeAttr(draft.title)}">
     <div class="modal-desc-display" id="modal-desc-display"${canEditText ? ` role="button" tabindex="0" aria-label="${escapeAttr(t('modal.editDescription'))}"` : ''}>${_renderDescriptionHtml(draft.description)}</div>
     <button type="button" class="modal-desc-toggle" aria-controls="modal-desc-display" aria-expanded="false" hidden><span class="modal-desc-toggle-label">${t('modal.showDescription')}</span>${_CITATION_CHEVRON_SVG}</button>
+    ${descEmbedHtml}
   `;
 
   _disconnectCommentSeenObserver();
@@ -1596,7 +1645,7 @@ function _applyModalDiffHighlights(modal) {
     oldDescEl.innerHTML = renderMarkdown(compareTask.description || '') || emptyHtml();
   }
   if (newDescEl) {
-    newDescEl.innerHTML = renderMarkdown(draft.description || '') || emptyHtml();
+    newDescEl.innerHTML = _withPendingImages(draft.description, renderMarkdown) || emptyHtml();
   }
   if (oldDescEl && newDescEl) {
     const oldSeg = collectTextSegments(oldDescEl);
@@ -1855,6 +1904,7 @@ function _applyModalLockState(modal, draft) {
   if (effortSelect) effortSelect.disabled = agentLocked;
   // (TPT95) Same live re-sync as the two above.
   modal.querySelectorAll('.modal-browser-tool').forEach(cb => { cb.disabled = agentLocked; });
+  _syncDescEmbed(modal); // (TPT9346) the description's Embed row follows the description lock
 }
 
 // (C1316) Single source of truth for the modal dirty check — was inlined identically
@@ -1883,7 +1933,8 @@ function _toastSaveFailure(err) {
 
 function _modalUpdateButtonStates(saveBtn, resetBtn) {
   const dirty = _isModalDirty();
-  saveBtn.disabled = !dirty;
+  // (TPT9346) A save waiting for description uploads keeps Save disabled, whatever lands meanwhile.
+  saveBtn.disabled = !dirty || !!_modalState?._waitingForUploads;
   resetBtn.disabled = !dirty;
   _syncPaneDots(document.getElementById('task-edit-modal'));
 }
@@ -2049,18 +2100,32 @@ function _attachModalHandlers(modal) {
     });
   }
 
+  // (TPT9346) Description attachments — the Embed control under the description, files dropped on
+  // the description or its editor, images pasted into the editor — counted per render of the form
+  // (open, Reset): see _descUploadOptions(). Each reference goes in at the caret
+  // (_descInsertTarget()).
+  const formState = _modalState;
+  const descSession = { pending: 0, waiters: [], images: new Map() };
+  formState._descUploads = descSession;
+  const descUploads = _descUploadOptions(formState, descSession);
+  const descTarget = () => _descInsertTarget(formState, descSession);
+
   // Description display is a keyboard-operable editor trigger when text is editable.
-  const editDescription = (evt) => {
-    if (!_modalState) return; // modal torn down mid-flight — draft below would throw
-    if (isInProgressName(_modalState.draft.status)) return;
-    if (_isModalReadOnly(_modalState.draft)) return; // (C1470) was CSS-only (.field-locked pointer-events) before
-    if (descDisplay.dataset.diffSide === 'old') return; // defensive — old side never has this listener (selector at top of fn), but never let it click-to-edit if it ever does
-    if (descDisplay.style.display === 'none') return;
-    const rawDesc = _modalState.draft.description || '';
+  // (TPT9346) An attachment insert opens it too: unfocused, with the caret at `caret`
+  // ([start, end]). Returns the editor ({ ta, close }), or null when the description can't be
+  // edited now.
+  const editDescription = (evt, { focus = true, caret = null } = {}) => {
+    if (!_modalState) return null; // modal torn down mid-flight — draft below would throw
+    if (isInProgressName(_modalState.draft.status)) return null;
+    if (_isModalReadOnly(_modalState.draft)) return null; // (C1470) was CSS-only (.field-locked pointer-events) before
+    if (descDisplay.dataset.diffSide === 'old') return null; // defensive — old side never has this listener (selector at top of fn), but never let it click-to-edit if it ever does
+    if (descDisplay.style.display === 'none') return null;
+    const st = _modalState;
+    const rawDesc = st.draft.description || '';
     // (C1470) Resolve BEFORE any DOM changes — needs the display's live rendered geometry.
     // Maps against the raw value verbatim (not normalizeRaw()'d) since that's what ta.value
     // is about to hold.
-    const caretOffset = evt instanceof MouseEvent && evt.detail > 0
+    const caretOffset = !caret && evt instanceof MouseEvent && evt.detail > 0
       ? _caretOffsetFromClick(evt, rawDesc) : null;
     // Measure before any DOM changes so layout is stable
     const displayHeight = descDisplay.getBoundingClientRect().height;
@@ -2078,7 +2143,11 @@ function _attachModalHandlers(modal) {
     ta.style.height = displayHeight + 'px'; // pre-reparent pin, avoids a flash before the correction below
     descDisplay.style.display = 'none';
     descDisplay.parentNode.insertBefore(ta, descDisplay.nextSibling);
-    _attachImageHandlers(ta);
+    // (TPT9346) A pasted image goes in at the caret through task-board.js attachImagePaste(),
+    // dropped files through the Embed control's drop (embed-menu.js) — both counted as this
+    // form's description uploads.
+    commands.attachImagePaste(ta, null, descUploads.imageOpts);
+    attachFileDrop(ta, descTarget, descUploads);
     // (C1212) mic → dictate into description via createLiveInserter. keep handle: blur
     // teardown below must not rip field out from under a live recording.
     const micHandle = attachAudioRecorder(ta);
@@ -2092,6 +2161,11 @@ function _attachModalHandlers(modal) {
       const overhead = micWrap.getBoundingClientRect().height - ta.getBoundingClientRect().height;
       ta.style.height = Math.max(0, displayHeight - overhead) + 'px';
     }
+    // `forInsert`: opened unfocused for attachment inserts (_descInsertTarget()), until the user
+    // takes it over.
+    const editor = { ta, close: null, forInsert: false };
+    st._descEditor = editor;
+    ta.addEventListener('focus', () => { editor.forInsert = false; });
     if (fromCollapsed) _growDescTextarea(ta, !!_modalState.compareTask);
     _syncDescCollapse(modal); // (TPT9340) hides the Show description toggle while editing
     // (TPT34) Must run before the keydown listener below (Escape→blur) is registered — see
@@ -2105,9 +2179,12 @@ function _attachModalHandlers(modal) {
     // so doing it in this order means the visible scroll position already matches the caret.
     // Null (unresolved click, e.g. clicked padding/an image/unsupported API) falls back to
     // today's top-anchored behavior instead of an arbitrary position.
-    ta.setSelectionRange(caretOffset ?? 0, caretOffset ?? 0);
-    ta.focus();
-    if (caretOffset == null) _applyScrollRatio(ta, displayScrollRatio);
+    if (caret) ta.setSelectionRange(caret[0], caret[1]);
+    else ta.setSelectionRange(caretOffset ?? 0, caretOffset ?? 0);
+    if (focus) {
+      ta.focus();
+      if (caretOffset == null && !caret) _applyScrollRatio(ta, displayScrollRatio);
+    }
     ta.addEventListener('input', () => {
       _modalState.draft.description = ta.value;
       // (C1470) Auto-grow while typing so leaving edit mode isn't a jump either.
@@ -2116,15 +2193,19 @@ function _attachModalHandlers(modal) {
       if (_modalState.compareTask) _scheduleModalDiffRecompute(modal, { description: true });
     });
     let restoreDisplayFocus = false;
-    ta.addEventListener('blur', () => {
-      _modalState.draft.description = ta.value;
-      // (C1212) mic click blurs field (mousedown preventDefault stops focus-steal, but
-      // toggling mid-dictation still blurs via other paths) — keep editor open while
-      // recording live, else field ripped out from under createLiveInserter.
-      if (micHandle?.isActive) { upd(); return; }
+    let closed = false;
+    // Commits the text and swaps the rendered description back in. (TPT9346) Remembers the caret:
+    // an attachment inserted while the editor is closed goes in there (_descInsertTarget()).
+    editor.close = () => {
+      if (closed) return;
+      closed = true;
+      if (st._descEditor === editor) st._descEditor = null;
+      if (_modalState !== st || !ta.isConnected) return; // the form was rebuilt or closed meanwhile
+      st.draft.description = ta.value;
+      st.descCaret = [ta.selectionStart, ta.selectionEnd];
       const wrap = ta.closest('.audio-rec-wrap') || ta; // (C1212) remove mic wrap too, not just ta
       const editorScrollRatio = _scrollRatio(ta);
-      if (_modalState.compareTask) {
+      if (st.compareTask) {
         descDisplay.style.display = '';
         wrap.remove();
         _applyModalDiffHighlights(modal); // restores rendered markdown + highlights, both sides
@@ -2137,6 +2218,17 @@ function _attachModalHandlers(modal) {
       _syncDescCollapse(modal); // (TPT9340) back to the clamp on Comments / Notifications
       upd();
       if (restoreDisplayFocus) descDisplay.focus();
+    };
+    ta.addEventListener('blur', () => {
+      if (closed || _modalState !== st || !ta.isConnected) return;
+      st.draft.description = ta.value;
+      // (C1212) mic click blurs field (mousedown preventDefault stops focus-steal, but
+      // toggling mid-dictation still blurs via other paths) — keep editor open while
+      // recording live, else field ripped out from under createLiveInserter. (TPT9346) Same for
+      // the native file dialog the Embed control opens: some engines blur the field while it is
+      // up, and the picked file goes in at this editor's caret.
+      if (micHandle?.isActive || st._descPickerOpen) { upd(); return; }
+      editor.close();
     });
     ta.addEventListener('keydown', (e) => {
       // stopPropagation: without it, Escape also reaches template.html's document-level
@@ -2147,13 +2239,31 @@ function _attachModalHandlers(modal) {
         e.preventDefault(); e.stopPropagation(); restoreDisplayFocus = true; ta.blur();
       }
     });
+    return editor;
   };
+  formState._openDescEditor = editDescription;
   descDisplay.addEventListener('click', editDescription);
   descDisplay.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
     e.preventDefault();
     editDescription(e);
   });
+
+  // (TPT9346) The Embed control under the description (embed-menu.js) and files dropped on the
+  // rendered description. The menu moves to <body> — the scroll body would clip it; pressing the
+  // trigger or a row leaves an open editor focused, and the editor stays open while the file
+  // dialog is up. No row for a read-only task; a locked description (.field-locked) takes no drop.
+  const embedWrap = modal.querySelector('.modal-desc-embed .embed-menu-wrap');
+  if (embedWrap) {
+    attachEmbedMenu(embedWrap, descTarget, {
+      ...descUploads,
+      portal: true,
+      keepFocus: true,
+      onPickerOpen: () => { formState._descPickerOpen = true; },
+      onPickerClose: () => { formState._descPickerOpen = false; },
+    });
+    attachFileDrop(descDisplay, descTarget, descUploads);
+  }
 
   // (TPT9340) Show description / Hide description under the description clamped on the Comments
   // and Notifications sub-tabs. A render always starts on General, so the first sync resets it.
@@ -2292,6 +2402,28 @@ function _attachModalHandlers(modal) {
   // failed and an error alert has already been shown to the user.
   const persistDraft = async () => {
     try {
+    // (TPT9346) An attachment still uploading into the description would be saved as its `blob:`
+    // placeholder (an image) or not at all (a file's link goes in once it lands): wait for the
+    // description's uploads first, Save saying so meanwhile. One that never settles is left out.
+    if (_descUploadsPending(_modalState)) {
+      const st = _modalState;
+      const saveLabel = saveBtn.textContent;
+      st._waitingForUploads = true;
+      saveBtn.disabled = true;
+      saveBtn.textContent = t('modal.embedUploading');
+      let settled = false;
+      try { settled = await _descUploadsSettled(st, DESC_UPLOAD_WAIT_MS); } finally {
+        st._waitingForUploads = false;
+        saveBtn.textContent = saveLabel;
+      }
+      if (_modalState !== st) return false; // closed or replaced while waiting: nothing to save
+      if (!settled) {
+        _abandonDescUploads(st, st._descUploads);
+        _dropPendingImageRefs(st, st._descUploads);
+        showToast(t('modal.embedLeftOut'), 'error', { durationMs: SAVE_ERROR_TOAST_MS });
+      }
+      upd();
+    }
     const { draft, original, taskId, callbacks } = _modalState;
     const patch = {};
     if (draft.title !== original.title) patch.title = draft.title;
@@ -2440,6 +2572,7 @@ function _attachModalHandlers(modal) {
   // Reset
   resetBtn.addEventListener('click', () => {
     _modalState.draft = structuredClone(_modalState.lastSaved);
+    _modalState.descCaret = null; // (TPT9346) a caret in the discarded text
     _renderTaskEditModal();
     _modalDialogFocus?.focusFirst();
   });
@@ -2468,8 +2601,9 @@ function _attachModalHandlers(modal) {
       }
       // (C1316) Persist a dirty draft and wait for success before launching — the agent
       // reads the task from the server, so an unsaved edit must land before Start fires.
-      // A clean draft launches immediately, no extra round-trip.
-      if (_isModalDirty()) {
+      // A clean draft launches immediately, no extra round-trip. (TPT9346) So does an
+      // attachment still uploading into the description: persistDraft() waits for it.
+      if (_isModalDirty() || _descUploadsPending(_modalState)) {
         btn.disabled = true; // re-entrancy guard: no double-launch while the save is in flight
         let saved = false;
         try { saved = await persistDraft(); } finally { _syncModalStartDependencyState(modal, draft); }
@@ -2488,7 +2622,7 @@ function _attachModalHandlers(modal) {
     } else if (action === 'stop') {
       // (TPT395) Same save-first path as Start (C1316): persist a dirty draft before
       // stopping so edits made while the session ran are not discarded by the close.
-      if (_isModalDirty()) {
+      if (_isModalDirty() || _descUploadsPending(_modalState)) {
         btn.disabled = true; // re-entrancy guard while the save is in flight
         let saved = false;
         try { saved = await persistDraft(); } finally { btn.disabled = false; }
@@ -2507,6 +2641,201 @@ function _attachModalHandlers(modal) {
       });
     }
   });
+}
+
+// ── (TPT9346) Description attachments ──
+// The Embed control under the description (embed-menu.js — the composer's control, not a copy),
+// file drop on the description and image paste in its editor. Images upload through task-board.js
+// uploadImageFile() / attachImagePaste(), other files through file-attach.js
+// uploadAttachmentFile(); each reference goes into the draft description at the caret
+// (_descInsertTarget()). A form render (open, Reset) counts its uploads in
+// `_modalState._descUploads`: Save, the Save shortcut, Start and Stop wait for them
+// (persistDraft()), so a `blob:` placeholder is never saved, and a failed image's placeholder goes
+// once nothing is pending.
+
+// How long a save waits for the description's uploads. One that never settles (its socket went
+// away mid-upload) is then left out instead of holding the save forever.
+const DESC_UPLOAD_WAIT_MS = 120000;
+
+// The key an upload from this modal is linked to (GET /images|files/task/:key, which the agent's
+// attachment localizers read too): the task's own key. A proposal has no server task yet when it
+// is a `new` card (`new-…` id) and uploads with none; a `modified` card names the live task.
+function _uploadTaskKey(st) {
+  const id = st?.taskId || null;
+  if (!id || !st.callbacks?.preloadedTask) return id;
+  return isTaskKeyLike(id) ? id : null;
+}
+
+function _descUploadsPending(st) {
+  return !!st?._descUploads?.pending;
+}
+
+// Options for embed-menu.js and attachImagePaste(): the task key, and every upload counted in
+// `session` until it settles — an image from detection to the board socket's answer, a file until
+// its upload promise settles. A failed image toasts like the board's own path does.
+function _descUploadOptions(st, session) {
+  const taskKey = _uploadTaskKey(st);
+  const begin = () => {
+    const gen = session.gen || 0;
+    session.pending += 1;
+    _syncDescUploadStatus(st, session);
+    let done = false;
+    return () => {
+      if (done || (session.gen || 0) !== gen) return; // abandoned by a save that gave up waiting
+      done = true;
+      session.pending -= 1;
+      if (!session.pending) {
+        _dropPendingImageRefs(st, session);
+        session.waiters.splice(0).forEach(resolve => resolve(true));
+      }
+      _syncDescUploadStatus(st, session);
+    };
+  };
+  const settleImage = (file) => {
+    const queue = session.images.get(file);
+    const settle = queue && queue.shift();
+    if (queue && !queue.length) session.images.delete(file);
+    if (settle) settle();
+  };
+  return {
+    imageOpts: {
+      taskKey,
+      onFileDetected: (file) => {
+        const queue = session.images.get(file) || [];
+        queue.push(begin());
+        session.images.set(file, queue);
+      },
+      onUploaded: file => settleImage(file),
+      onUploadError: (file, err) => {
+        if (_modalState === st) showToast(t('common.errImageUpload', { msg: err?.message || '' }), 'error');
+        settleImage(file);
+      },
+    },
+    fileOpts: { taskKey },
+    // uploadAttachmentFile() shows its own progress and error toasts and never rejects.
+    onFileUpload: (upload) => {
+      const settle = begin();
+      Promise.resolve(upload).then(settle, settle);
+    },
+  };
+}
+
+// Resolves true once nothing uploads into the description any more, false after `timeoutMs`.
+function _descUploadsSettled(st, timeoutMs) {
+  const session = st?._descUploads;
+  if (!session || !session.pending) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const finish = (settled) => { clearTimeout(timer); resolve(settled); };
+    const timer = setTimeout(() => {
+      const i = session.waiters.indexOf(finish);
+      if (i >= 0) session.waiters.splice(i, 1);
+      resolve(false);
+    }, timeoutMs);
+    session.waiters.push(finish);
+  });
+}
+
+// A save gave up waiting: what still uploads is left out, and a late answer changes nothing.
+function _abandonDescUploads(st, session) {
+  if (!session) return;
+  session.gen = (session.gen || 0) + 1;
+  session.pending = 0;
+  session.images.clear();
+  session.waiters.splice(0).forEach(resolve => resolve(false));
+  _syncDescUploadStatus(st, session);
+}
+
+// The "Uploading attachment…" note beside the Embed trigger.
+function _syncDescUploadStatus(st, session) {
+  if (_modalState !== st || st._descUploads !== session) return;
+  const status = document.querySelector('#task-edit-modal .modal-desc-embed-status');
+  if (!status) return;
+  status.hidden = !session.pending;
+  status.textContent = session.pending ? t('modal.embedUploading') : '';
+}
+
+// With nothing uploading, a `![…](blob:…)` placeholder still in the description belongs to an
+// image that failed (or was left out): it goes, and the caret stays on its text.
+function _dropPendingImageRefs(st, session) {
+  if (_modalState !== st || st._descUploads !== session) return;
+  const editor = st._descEditor?.ta;
+  if (editor?.isConnected) {
+    const { text, offsets } = stripPendingImageRefsAt(editor.value, [editor.selectionStart, editor.selectionEnd]);
+    if (text === editor.value) return;
+    editor.value = text;
+    editor.setSelectionRange(offsets[0], offsets[1]);
+    editor.dispatchEvent(new Event('input', { bubbles: true })); // the editor syncs the draft
+    return;
+  }
+  const { text, offsets } = stripPendingImageRefsAt(st.draft.description || '', st.descCaret || []);
+  _setClosedDescription(st, text, st.descCaret ? offsets : null);
+}
+
+// A change to the draft description while its editor is closed: the remembered caret follows it
+// (`caret` when the caller knows it exactly), and the rendered description (or diff) and
+// Save / Reset repaint.
+function _setClosedDescription(st, next, caret = null) {
+  const prev = st.draft.description || '';
+  if (next === prev) return;
+  st.draft.description = next;
+  if (caret) st.descCaret = caret;
+  else if (Array.isArray(st.descCaret)) st.descCaret = st.descCaret.map(caretMapper(prev, next));
+  const modal = document.getElementById('task-edit-modal');
+  const display = modal?.querySelector('.modal-desc-display:not([data-diff-side="old"])');
+  if (display && display.style.display !== 'none') {
+    if (st.compareTask) _applyModalDiffHighlights(modal);
+    else display.innerHTML = _renderDescriptionHtml(next);
+  }
+  const saveBtn = modal?.querySelector('.btn-modal-save');
+  const resetBtn = modal?.querySelector('.btn-modal-reset');
+  if (saveBtn && resetBtn) _modalUpdateButtonStates(saveBtn, resetBtn);
+}
+
+// The textarea an attachment reference goes into, resolved when it is inserted (embed-menu.js):
+// the open description editor, at its caret, as a composer does. With the editor closed: the
+// editor opened unfocused where its last edit left the caret (the end of the text when there was
+// none; after a selection, never over it), each reference put on a line of its own there — every
+// one of a pick of several, too (TPT9361) — and the editor closed again right after the inserts:
+// the references show in the rendered description, the focus stays where it is, and the next one
+// goes on the line below. Null once the form is gone, rebuilt (Reset) or locked.
+function _descInsertTarget(st, session) {
+  if (_modalState !== st || st._descUploads !== session) return null;
+  let editor = st._descEditor?.ta.isConnected ? st._descEditor : null;
+  if (editor && !editor.forInsert) return editor.ta;
+  if (!editor) {
+    const length = (st.draft.description || '').length;
+    const at = Array.isArray(st.descCaret) ? Math.min(st.descCaret[1], length) : length;
+    editor = st._openDescEditor?.(null, { focus: false, caret: [at, at] });
+    if (!editor) return null;
+    editor.forInsert = true;
+    // The inserts run right after each resolve (an image's placeholder at once, every image of a
+    // pick in the same task; a file's link when its upload lands).
+    queueMicrotask(() => {
+      if (st._descEditor === editor && document.activeElement !== editor.ta) editor.close();
+    });
+  }
+  const { ta } = editor;
+  const at = ta.selectionStart;
+  if (at > 0 && ta.value[at - 1] !== '\n') insertAtCursor(ta, '\n');
+  const pos = ta.selectionStart;
+  if (pos < ta.value.length && ta.value[pos] !== '\n') {
+    insertAtCursor(ta, '\n');
+    ta.setSelectionRange(pos, pos); // the reference goes before that line break
+  }
+  return ta;
+}
+
+// The description's Embed row shows while the description can be edited: never while it is locked
+// (in progress, read-only), and on the Comments / Notifications sub-tabs only with the editor open
+// — the compact description has its Show description toggle there.
+function _syncDescEmbed(modal) {
+  const row = modal?.querySelector('.modal-desc-embed');
+  if (!row || !_modalState) return;
+  const { draft } = _modalState;
+  const locked = isInProgressName(draft.status) || _isModalReadOnly(draft);
+  const tab = modal.querySelector('.modal-tab-btn.active')?.dataset.tab || 'general';
+  const editing = !!_modalState._descEditor?.ta.isConnected;
+  row.hidden = locked || (tab !== 'general' && !editing);
 }
 
 async function _uploadModalImage(file, taskKey = null) {
@@ -2860,6 +3189,7 @@ function _toggleCommentClamp(item, btn) {
 // display:none then). Not for diff mode, which has no Comments tab and no toggle.
 function _syncDescCollapse(modal) {
   if (!modal || !_modalState) return;
+  _syncDescEmbed(modal); // (TPT9346) same moments: tab switch, editor open and close, render
   const display = modal.querySelector('.modal-scroll-body > .modal-desc-display');
   const toggle = modal.querySelector('.modal-desc-toggle');
   if (!display || !toggle) return;

@@ -361,26 +361,32 @@ export function insertAtCursor(el, text) {
   el.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
-// Give a text field a new value without moving its caret off the text it was on — assigning
-// `.value` alone puts the caret at the end, so the next insertAtCursor() would append. Only the
-// span between the old and new value's common head and tail changed: an edge before that span
-// stays, one after it moves by the length change, one inside it lands at the span's new end.
-// Fires no event. Returns whether the value changed.
-export function setValueKeepingCaret(el, value) {
-  const prev = String(el.value ?? '');
-  const next = String(value ?? '');
-  if (prev === next) return false;
-  const { selectionStart: start, selectionEnd: end, selectionDirection: direction } = el;
+// Where a caret offset in text `prev` lands once the text becomes `next`. Only the span between
+// the two texts' common head and tail changed: an offset before that span stays, one after it
+// moves by the length change, one inside it lands at the span's new end. (TPT9346) Also used for a
+// caret remembered while its editor is closed (Task Edit's description).
+export function caretMapper(prev, next) {
   const limit = Math.min(prev.length, next.length);
   let head = 0;
   while (head < limit && prev[head] === next[head]) head++;
   let tail = 0;
   while (tail < limit - head && prev[prev.length - 1 - tail] === next[next.length - 1 - tail]) tail++;
-  const map = (pos) => {
+  return (pos) => {
     if (pos <= head) return pos;
     if (pos >= prev.length - tail) return pos + next.length - prev.length;
     return next.length - tail;
   };
+}
+
+// Give a text field a new value without moving its caret off the text it was on — assigning
+// `.value` alone puts the caret at the end, so the next insertAtCursor() would append. The caret
+// follows caretMapper(). Fires no event. Returns whether the value changed.
+export function setValueKeepingCaret(el, value) {
+  const prev = String(el.value ?? '');
+  const next = String(value ?? '');
+  if (prev === next) return false;
+  const { selectionStart: start, selectionEnd: end, selectionDirection: direction } = el;
+  const map = caretMapper(prev, next);
   el.value = next;
   if (Number.isInteger(start) && Number.isInteger(end)) el.setSelectionRange(map(start), map(end), direction || 'none');
   return true;

@@ -130,6 +130,11 @@ function migrateUserDataDir() {
 // own header comment above and createSplashWindow()'s caller below.
 
 const PORT = process.env.PORT || 4455;
+// The one origin every app window loads todo.html from (the server listens on loopback
+// 127.0.0.1 only). IPC sender checks and the navigation policy compare against this exact
+// origin, so it must never be spelled out separately: a `localhost` copy is a different
+// origin and makes every trusted-sender check fail.
+const APP_ORIGIN = `http://127.0.0.1:${PORT}`;
 const LOCAL_SECRET = crypto.randomBytes(32).toString('base64url');
 let serverChild = null;
 // Set once the app deliberately tears the server down on quit, so its exit is not
@@ -943,7 +948,7 @@ function getDockIconPath() {
 function registerIpcHandlers() {
   registerExternalIpcHandlers({
     ipcMain, shell, BrowserWindow, projectDirs, app,
-    appOrigin: `http://localhost:${PORT}`,
+    appOrigin: APP_ORIGIN,
   });
   const safeSend = (sender, channel, ...args) => {
     if (!sender.isDestroyed()) sender.send(channel, ...args);
@@ -984,7 +989,7 @@ function registerIpcHandlers() {
       w.webContents.send('workspace-loaded', workspaceState);
       w.webContents.send('project:changed', dir, getDisplayName(dir));
     });
-    w.loadURL(`http://127.0.0.1:${PORT}/todo.html${dir ? '?projectPath=' + encodeURIComponent(dir) : ''}`);
+    w.loadURL(`${APP_ORIGIN}/todo.html${dir ? '?projectPath=' + encodeURIComponent(dir) : ''}`);
   });
 
   ipcMain.handle('project:get-current', (event) => {
@@ -1152,7 +1157,7 @@ function registerIpcHandlers() {
     // deliver them (the alert then stays an in-app card).
     settingsFile: path.join(app.getPath('userData'), 'desktop-notifications.json'),
     onSetOnTop: (on) => applyNotificationsOnTop(on),
-    isTrustedProjectSender: (event) => isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` }),
+    isTrustedProjectSender: (event) => isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: APP_ORIGIN }),
     // (TPT484) One surface by app focus: the focused project window hosts the in-app panel;
     // with no project window focused, the always-on-top banner takes over.
     focusedProjectWindow: () => {
@@ -1207,7 +1212,7 @@ function registerIpcHandlers() {
   app.on('browser-window-focus', () => desktopNotifications?.syncNotificationSurface());
   app.on('browser-window-blur', () => desktopNotifications?.syncNotificationSurface());
   ipcMain.handle('notify:show', (event, payload = {}) => {
-    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: APP_ORIGIN })) {
       return { ok: false, reason: 'untrusted_sender' };
     }
     const w = BrowserWindow.fromWebContents(event.sender);
@@ -1218,7 +1223,7 @@ function registerIpcHandlers() {
   // (TPT484) In-app card mirror + programmatic dismissal + surface read-back. Project scope
   // always comes from the sender, never from the payload.
   ipcMain.handle('notify:card', (event, payload = {}) => {
-    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: APP_ORIGIN })) {
       return { ok: false, reason: 'untrusted_sender' };
     }
     const w = BrowserWindow.fromWebContents(event.sender);
@@ -1228,7 +1233,7 @@ function registerIpcHandlers() {
       wcId: event.sender.id, projectPath: projectDirs.get(event.sender.id) || null });
   });
   ipcMain.handle('notify:dismiss', (event, payload = {}) => {
-    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: APP_ORIGIN })) {
       return { ok: false, reason: 'untrusted_sender' };
     }
     const tag = payload?.tag;
@@ -1236,7 +1241,7 @@ function registerIpcHandlers() {
     return { ok: true, dismissed: desktopNotifications.dismissKey(tag, projectDirs.get(event.sender.id) || null) };
   });
   ipcMain.handle('notify:surface-state', (event) => {
-    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: APP_ORIGIN })) {
       return { shared: false, active: false, entries: [] };
     }
     return desktopNotifications.surfaceFor(BrowserWindow.fromWebContents(event.sender));
@@ -1247,7 +1252,7 @@ function registerIpcHandlers() {
   // read first waits for the bundle-health refresh (codesign, lsregister -dump: seconds), and the
   // switch must never wait for it. Answers { ok, enabled } like the writer below.
   ipcMain.handle('notify:get-on-top', (event) => {
-    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: APP_ORIGIN })) {
       return { ok: false, reason: 'untrusted_sender' };
     }
     if (!desktopNotifications) return { ok: false, reason: 'unavailable' };
@@ -1258,7 +1263,7 @@ function registerIpcHandlers() {
   // banner's "Show" box write, through the same writer. App-level, so any trusted project
   // window may set it; answers { ok, enabled } like applyNotificationsOnTop().
   ipcMain.handle('notify:set-on-top', (event, payload = {}) => {
-    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: APP_ORIGIN })) {
       return { ok: false, reason: 'untrusted_sender' };
     }
     if (typeof payload?.enabled !== 'boolean') return { ok: false, reason: 'invalid_value' };
@@ -1266,7 +1271,7 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('notify:dismiss-task', (event, payload = {}) => {
-    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` })) {
+    if (!isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: APP_ORIGIN })) {
       return { ok: false, reason: 'untrusted_sender' };
     }
     const taskId = payload?.taskId;
@@ -1840,7 +1845,7 @@ function registerIpcHandlers() {
   // handler above), for first-project-prompt.js — see main/first-open-prompt.js.
   registerFirstOpenPromptIpc({
     ipcMain,
-    isTrusted: (event) => isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: `http://127.0.0.1:${PORT}` }),
+    isTrusted: (event) => isTrustedTopFrame(event, { BrowserWindow, projectDirs, appOrigin: APP_ORIGIN }),
     projectDirOf: (event) => projectDirs.get(event.sender.id) || null,
     writeMeta: writeProjectMeta,
   });
@@ -2579,9 +2584,8 @@ function closeSplash() {
 }
 
 function attachExternalLinkPolicy(w) {
-  const appOrigin = `http://127.0.0.1:${PORT}`;
   const openIfExternal = (url) => {
-    if (!shouldOpenExternally(url, appOrigin)) return;
+    if (!shouldOpenExternally(url, APP_ORIGIN)) return;
     shell.openExternal(url).catch((err) => {
       console.warn('[external-link] Failed to open URL:', err.message);
     });
@@ -2631,7 +2635,7 @@ function createSetupWindow(projectPath) {
   const wcId = w.webContents.id;
   projectDirs.set(wcId, null);
   bindWindowToProject(wcId, null);
-  w.loadURL(`http://127.0.0.1:${PORT}/todo.html`);
+  w.loadURL(`${APP_ORIGIN}/todo.html`);
   w.webContents.on('did-finish-load', () => {
     if (w.isDestroyed()) return;
     w.webContents.send('workspace-loaded', workspaceState);
@@ -2711,7 +2715,7 @@ async function createProjectWindow(projectDir, { deferShow = false } = {}) {
   const wcId = w.webContents.id;
   projectDirs.set(wcId, projectDir || null);
   bindWindowToProject(wcId, projectDir || null);
-  w.loadURL(`http://127.0.0.1:${PORT}/todo.html${projectDir ? '?projectPath=' + encodeURIComponent(projectDir) : ''}`);
+  w.loadURL(`${APP_ORIGIN}/todo.html${projectDir ? '?projectPath=' + encodeURIComponent(projectDir) : ''}`);
   w.webContents.on('did-finish-load', () => {
     if (w.isDestroyed()) return;
     const currentProjectDir = projectDirs.get(wcId) || null;

@@ -1,12 +1,15 @@
-// ── Composer Embed control ──
+// ── Embed control ──
 // The Embed dropdown (Image / Other file), its two hidden pickers and file drop, shared by every
-// chat composer: the objective chat (chat-ui.js) and the task / project chat (task-chat.js).
-// Uploads always go through the one upload path each kind already has — images through
-// task-board.js (`uploadImageFile`, a `![img](blob:…)` placeholder swapped for the real URL once
-// the board socket answers), other files through file-attach.js (`uploadAttachmentFile`, a
-// `[name](url)` link) — so a composer only says which textarea receives the reference.
+// host that takes attachments into a textarea: the objective chat composer (chat-ui.js), the task /
+// project chat composer (task-chat.js) and the Task Edit modal's description editor
+// (task-edit-modal.js). Uploads always go through the one upload path each kind already has —
+// images through task-board.js (`uploadImageFile`, a `![img](blob:…)` placeholder swapped for the
+// real URL once the board socket answers), other files through file-attach.js
+// (`uploadAttachmentFile`, a `[name](url)` link) — so a host only says which textarea receives the
+// reference. The board hands its image upload to this module (configureEmbedUploads()) instead of
+// being imported here: an import would pull the board into every host's bundle, and the Task Edit
+// modal must load without it.
 import { t } from './i18n.js';
-import { uploadImageFile } from './task-board.js';
 import { FILE_ACCEPT, uploadAttachmentFile } from './file-attach.js';
 import { escapeAttr } from './utils.js';
 
@@ -16,17 +19,25 @@ export const DROPDOWN_CARET_SVG = '<svg class="embed-menu-caret" viewBox="0 0 24
 
 const PAPERCLIP_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>';
 
+// task-board.js uploadImageFile(file, textarea, wsClient, opts), handed over once by the board.
+let uploadImageFile = null;
+
+export function configureEmbedUploads({ uploadImage } = {}) {
+  uploadImageFile = typeof uploadImage === 'function' ? uploadImage : null;
+}
+
 // (C1241) Paperclip + label trigger opening a dropdown with Image / Other file rows, each backed
-// by its own hidden picker. Ids are optional: the objective chat keeps its historic ids
+// by its own hidden picker — (TPT9361) one that takes several files at once; each goes through its
+// own upload. Ids are optional: the objective chat keeps its historic ids
 // (#btn-obj-img-upload, #obj-img-file-input, #obj-file-input) for its tooltip and disabled-state
-// wiring; other composers find the parts by class inside the wrap.
-export function embedMenuHtml({ label = t('nav.embed'), disabled = false, triggerId = '', imageInputId = '', fileInputId = '' } = {}) {
+// wiring; other hosts find the parts by class inside the wrap. `title` is the trigger's tooltip.
+export function embedMenuHtml({ label = t('nav.embed'), disabled = false, triggerId = '', imageInputId = '', fileInputId = '', title = '' } = {}) {
   const id = value => (value ? ` id="${escapeAttr(value)}"` : '');
   return `
     <div class="embed-menu-wrap">
-      <input type="file" class="embed-image-input"${id(imageInputId)} accept="image/*" style="display:none">
-      <input type="file" class="embed-file-input"${id(fileInputId)} accept="${FILE_ACCEPT}" style="display:none">
-      <button class="embed-menu-trigger"${id(triggerId)} type="button" aria-haspopup="true" aria-expanded="false"${disabled ? ' disabled' : ''}>
+      <input type="file" class="embed-image-input"${id(imageInputId)} accept="image/*" multiple style="display:none">
+      <input type="file" class="embed-file-input"${id(fileInputId)} accept="${FILE_ACCEPT}" multiple style="display:none">
+      <button class="embed-menu-trigger"${id(triggerId)} type="button" aria-haspopup="true" aria-expanded="false"${title ? ` title="${escapeAttr(title)}"` : ''}${disabled ? ' disabled' : ''}>
         ${PAPERCLIP_SVG}
         <span class="embed-menu-label">${escapeAttr(label)}</span>
         ${DROPDOWN_CARET_SVG}
@@ -35,9 +46,9 @@ export function embedMenuHtml({ label = t('nav.embed'), disabled = false, trigge
 }
 
 // (C1241 fix, C1248) Teardown of the one open menu: the panel, the trigger's expanded state and
-// the document-level outside-click / Escape listeners. Every close path goes through it, and a
-// composer re-render or teardown calls closeOpenEmbedMenu() so those listeners never outlive the
-// DOM they were attached for.
+// the document-level outside-click / key listeners. Every close path goes through it, and a host
+// re-render or teardown calls closeOpenEmbedMenu() so those listeners never outlive the DOM they
+// were attached for.
 let _openMenuCleanup = null;
 
 export function closeOpenEmbedMenu() {
@@ -46,126 +57,239 @@ export function closeOpenEmbedMenu() {
   if (cleanup) cleanup();
 }
 
+// (TPT9346) Where a reference goes in. A host passes the textarea, or a function returning it when
+// the reference is inserted — for a host whose textarea comes and goes, like the Task Edit
+// description editor. That moment is the pick or drop for an image (its placeholder goes in
+// first), and the end of the upload for any other file. Null: there is nowhere to put it any more,
+// and the reference is dropped.
+function resolveTextarea(target) {
+  return typeof target === 'function' ? target() : target;
+}
+
+function uploadImage(file, target, imageOpts) {
+  if (!uploadImageFile) {
+    console.error('[embed-menu] no image upload configured (task-board.js configureEmbedUploads)');
+    return;
+  }
+  const textarea = resolveTextarea(target);
+  if (textarea) uploadImageFile(file, textarea, null, imageOpts);
+}
+
+function uploadFile(file, target, fileOpts, onFileUpload) {
+  const upload = uploadAttachmentFile(file, target, fileOpts);
+  if (typeof onFileUpload === 'function') onFileUpload(upload, file);
+}
+
 // Images to the image upload, everything else to the file upload. `imageOpts` is passed to
-// uploadImageFile() as is (taskKey, onFileDetected, onUploaded, onUploadError); `onFileUpload`
-// receives the promise of each file upload, so a composer can tell when it has settled.
-export function uploadComposerFiles(files, textarea, { imageOpts = {}, onFileUpload } = {}) {
+// uploadImageFile() as is (taskKey, onFileDetected, onUploaded, onUploadError), `fileOpts` to
+// uploadAttachmentFile() (taskKey); `onFileUpload` receives the promise of each file upload, so a
+// host can tell when it has settled.
+export function uploadComposerFiles(files, target, { imageOpts = {}, fileOpts = {}, onFileUpload } = {}) {
   for (const file of Array.from(files || [])) {
     if (!file) continue;
-    if (file.type && file.type.startsWith('image/')) {
-      uploadImageFile(file, textarea, null, imageOpts);
-    } else {
-      const upload = uploadAttachmentFile(file, textarea);
-      if (typeof onFileUpload === 'function') onFileUpload(upload, file);
-    }
+    if (file.type && file.type.startsWith('image/')) uploadImage(file, target, imageOpts);
+    else uploadFile(file, target, fileOpts, onFileUpload);
   }
 }
 
-// Wire one embedMenuHtml() wrap to `textarea`. `labels` overrides the two rows' text and the
-// file row's tooltip (functions, so a language switch is picked up the next time it opens).
-export function attachEmbedMenu(wrap, textarea, { imageOpts = {}, onFileUpload, labels = {} } = {}) {
+// Fixed placement for a menu moved to <body> (`portal`): under the trigger, right edges aligned,
+// or above it when the viewport has more room there; kept 8px inside the viewport.
+function placeMenu(menu, trigger) {
+  const r = trigger.getBoundingClientRect();
+  const margin = 8;
+  const width = menu.offsetWidth;
+  const height = menu.offsetHeight;
+  const below = window.innerHeight - r.bottom - margin;
+  const above = r.top - margin;
+  const top = height + 4 <= below || below >= above ? r.bottom + 4 : r.top - 4 - height;
+  menu.style.top = `${Math.round(Math.max(margin, Math.min(top, window.innerHeight - height - margin)))}px`;
+  menu.style.left = `${Math.round(Math.max(margin, Math.min(r.right - width, window.innerWidth - width - margin)))}px`;
+}
+
+let _menuSeq = 0;
+
+// Wire one embedMenuHtml() wrap to `target` (see resolveTextarea()). Options:
+// - imageOpts / fileOpts / onFileUpload — as for uploadComposerFiles().
+// - labels — the two rows' text and the file row's tooltip (functions, so a language switch is
+//   picked up the next time it opens).
+// - portal — the open menu moves to <body> at a fixed position, for a host whose layout would
+//   clip it (data-portaled="1", which dialog-focus.js layers and Task Edit's cleanup know).
+// - keepFocus — pressing the trigger or a row leaves the focus where it is, so an open editor
+//   keeps it (and its caret) while the menu is used.
+// - onPickerOpen / onPickerClose — around each native file dialog: some engines blur the focused
+//   field while it is up.
+// The menu opened from the keyboard takes focus on its first row: arrows move between rows, Enter
+// or Space picks one, Tab leaves it, Escape closes it.
+export function attachEmbedMenu(wrap, target, {
+  imageOpts = {}, fileOpts = {}, onFileUpload, labels = {}, portal = false, keepFocus = false, onPickerOpen, onPickerClose,
+} = {}) {
   const trigger = wrap && wrap.querySelector('.embed-menu-trigger');
   const imageInput = wrap && wrap.querySelector('.embed-image-input');
   const fileInput = wrap && wrap.querySelector('.embed-file-input');
-  if (!trigger || !imageInput || !textarea) return;
+  if (!trigger || !imageInput || !target) return;
   const label = (key, fallback) => (typeof labels[key] === 'function' ? labels[key]() : t(fallback));
 
-  const openMenu = () => {
+  // Opens a hidden picker and reports when its dialog is gone: a pick (`change`), a dismissal
+  // (`cancel`), or — on engines without `cancel` — the window getting focus back.
+  let pickerClosed = null;
+  const openPicker = (input) => {
+    if (!input) return;
+    pickerClosed?.();
+    let open = true;
+    const onWindowFocus = () => setTimeout(done, 300);
+    function done() {
+      if (!open) return;
+      open = false;
+      if (pickerClosed === done) pickerClosed = null;
+      input.removeEventListener('cancel', done);
+      window.removeEventListener('focus', onWindowFocus);
+      if (typeof onPickerClose === 'function') onPickerClose();
+    }
+    pickerClosed = done;
+    input.addEventListener('cancel', done);
+    window.addEventListener('focus', onWindowFocus);
+    if (typeof onPickerOpen === 'function') onPickerOpen();
+    input.click();
+  };
+
+  const openMenu = ({ fromKeyboard = false } = {}) => {
     closeOpenEmbedMenu();
+    const returnFocus = document.activeElement;
     const menu = document.createElement('div');
-    menu.className = 'import-submenu import-submenu--up';
+    menu.className = portal ? 'import-submenu import-submenu--portal' : 'import-submenu import-submenu--up';
+    menu.id = `embed-menu-${++_menuSeq}`;
+    menu.setAttribute('role', 'menu');
+    if (portal) menu.dataset.portaled = '1';
 
-    const imageItem = document.createElement('div');
-    imageItem.className = 'import-submenu-item';
-    imageItem.textContent = label('image', 'embed.image');
-    imageItem.addEventListener('click', () => { closeOpenEmbedMenu(); imageInput.click(); });
-    menu.appendChild(imageItem);
+    const addRow = (text, title, input) => {
+      const row = document.createElement('div');
+      row.className = 'import-submenu-item';
+      row.setAttribute('role', 'menuitem');
+      row.tabIndex = -1;
+      row.textContent = text;
+      if (title) row.title = title;
+      if (keepFocus) row.addEventListener('mousedown', e => e.preventDefault());
+      row.addEventListener('click', () => { closeOpenEmbedMenu(); openPicker(input); });
+      menu.appendChild(row);
+      return row;
+    };
+    addRow(label('image', 'embed.image'), '', imageInput);
+    addRow(label('file', 'embed.otherFile'), label('fileTitle', 'tooltip.embedFile'), fileInput);
+    const rows = [...menu.children];
 
-    const fileItem = document.createElement('div');
-    fileItem.className = 'import-submenu-item';
-    fileItem.textContent = label('file', 'embed.otherFile');
-    fileItem.title = label('fileTitle', 'tooltip.embedFile');
-    fileItem.addEventListener('click', () => { closeOpenEmbedMenu(); fileInput?.click(); });
-    menu.appendChild(fileItem);
-
-    wrap.appendChild(menu);
+    (portal ? document.body : wrap).appendChild(menu);
     trigger.setAttribute('aria-expanded', 'true');
+    trigger.setAttribute('aria-controls', menu.id);
+    const place = () => placeMenu(menu, trigger);
+    if (portal) place();
+    if (fromKeyboard) rows[0].focus();
 
-    const onOutsideClick = (ev) => { if (!wrap.contains(ev.target)) closeOpenEmbedMenu(); };
+    const onOutsideClick = (ev) => { if (!wrap.contains(ev.target) && !menu.contains(ev.target)) closeOpenEmbedMenu(); };
+    // Window capture: ahead of every document-level handler — dialog-focus.js's Tab trap, a
+    // host's own Escape (closing the chat window or the task workspace around it).
     const onKeydown = (ev) => {
-      if (ev.key !== 'Escape') return;
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        ev.stopPropagation();
+        closeOpenEmbedMenu();
+        const back = returnFocus && returnFocus !== document.body && returnFocus.isConnected ? returnFocus : trigger;
+        back.focus({ preventScroll: true });
+        return;
+      }
+      const at = rows.indexOf(document.activeElement);
+      if (at < 0) return;
+      if (ev.key === 'Tab') {
+        // Back on the trigger, the key moves on from there.
+        closeOpenEmbedMenu();
+        trigger.focus({ preventScroll: true });
+        return;
+      }
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        rows[at].click();
+        return;
+      }
+      const next = { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: rows.length - 1 }[ev.key];
+      if (next === undefined) return;
       ev.preventDefault();
-      // Escape closes the menu only — not also the chat window or task workspace around it.
-      ev.stopPropagation();
-      closeOpenEmbedMenu();
-      trigger.focus();
+      rows[(next + rows.length) % rows.length].focus();
     };
     const timer = setTimeout(() => {
       // A rapid open→close (toggle re-click) can run before this deferred attach fires.
       if (!menu.isConnected) return;
       document.addEventListener('click', onOutsideClick);
-      document.addEventListener('keydown', onKeydown, true);
     }, 0);
+    window.addEventListener('keydown', onKeydown, true);
+    if (portal) {
+      window.addEventListener('resize', place);
+      document.addEventListener('scroll', place, true);
+    }
     _openMenuCleanup = () => {
       clearTimeout(timer);
+      // A row holding the focus hands it back before it goes, never to <body>.
+      if (menu.contains(document.activeElement)) trigger.focus({ preventScroll: true });
       menu.remove();
       trigger.setAttribute('aria-expanded', 'false');
+      trigger.removeAttribute('aria-controls');
       document.removeEventListener('click', onOutsideClick);
-      document.removeEventListener('keydown', onKeydown, true);
+      window.removeEventListener('keydown', onKeydown, true);
+      window.removeEventListener('resize', place);
+      document.removeEventListener('scroll', place, true);
     };
   };
 
+  if (keepFocus) trigger.addEventListener('mousedown', e => e.preventDefault());
   trigger.addEventListener('click', (e) => {
     e.stopPropagation();
-    if (wrap.querySelector('.import-submenu')) { closeOpenEmbedMenu(); return; }
-    openMenu();
+    if (trigger.getAttribute('aria-expanded') === 'true') { closeOpenEmbedMenu(); return; }
+    // detail 0: Enter or Space on the trigger rather than a pointer click.
+    openMenu({ fromKeyboard: e.detail === 0 });
   });
   imageInput.addEventListener('change', () => {
+    pickerClosed?.();
     const files = Array.from(imageInput.files || []);
     imageInput.value = ''; // reset so the same file can be picked again
-    files.forEach(file => uploadImageFile(file, textarea, null, imageOpts));
+    files.forEach(file => uploadImage(file, target, imageOpts));
   });
   // (C1246) "Other file": uploadAttachmentFile does its own checks, read, upload and link insert.
   if (fileInput) {
     fileInput.addEventListener('change', () => {
+      pickerClosed?.();
       const files = Array.from(fileInput.files || []);
       fileInput.value = '';
-      for (const file of files) {
-        const upload = uploadAttachmentFile(file, textarea);
-        if (typeof onFileUpload === 'function') onFileUpload(upload, file);
-      }
+      for (const file of files) uploadFile(file, target, fileOpts, onFileUpload);
     });
   }
 }
 
-// Files dragged onto `target` upload into `textarea` (uploadComposerFiles). Only a drag that
-// carries files is taken over — dragged text still drops into the textarea as usual.
-// `activeClass` marks `target` while files are held over it.
-export function attachFileDrop(target, textarea, { imageOpts = {}, onFileUpload, activeClass = 'img-drop-active' } = {}) {
-  if (!target || !textarea) return;
+// Files dragged onto `zone` upload into `target` (uploadComposerFiles). Only a drag that carries
+// files is taken over — dragged text still drops into a textarea as usual. `activeClass` marks
+// `zone` while files are held over it.
+export function attachFileDrop(zone, target, { imageOpts = {}, fileOpts = {}, onFileUpload, activeClass = 'img-drop-active' } = {}) {
+  if (!zone || !target) return;
   const hasFiles = e => Array.from((e.dataTransfer && e.dataTransfer.types) || []).includes('Files');
   let depth = 0;
-  const reset = () => { depth = 0; target.classList.remove(activeClass); };
-  target.addEventListener('dragenter', (e) => {
+  const reset = () => { depth = 0; zone.classList.remove(activeClass); };
+  zone.addEventListener('dragenter', (e) => {
     if (!hasFiles(e)) return;
     e.preventDefault();
     depth++;
-    target.classList.add(activeClass);
+    zone.classList.add(activeClass);
   });
-  target.addEventListener('dragover', (e) => {
+  zone.addEventListener('dragover', (e) => {
     if (!hasFiles(e)) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
   });
-  target.addEventListener('dragleave', (e) => {
+  zone.addEventListener('dragleave', (e) => {
     if (!hasFiles(e)) return;
     depth = Math.max(0, depth - 1);
-    if (!depth) target.classList.remove(activeClass);
+    if (!depth) zone.classList.remove(activeClass);
   });
-  target.addEventListener('drop', (e) => {
+  zone.addEventListener('drop', (e) => {
     if (!hasFiles(e)) return;
     e.preventDefault();
     reset();
-    uploadComposerFiles(e.dataTransfer.files, textarea, { imageOpts, onFileUpload });
+    uploadComposerFiles(e.dataTransfer.files, target, { imageOpts, fileOpts, onFileUpload });
   });
 }

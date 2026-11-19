@@ -166,6 +166,7 @@ async function main() {
       category: t.category,
       priority: t.priority,
       urgency: t.urgency ?? 0,
+      severity: t.severity ?? null,
       order: t.order,
       tags: t.tags,
       assignee: t.assignee,
@@ -287,6 +288,7 @@ async function main() {
       description: z.string().optional().describe('New description'),
       priority: z.number().optional().describe("Priority (higher = more important). Normally OMIT means \"leave unchanged\" — EXCEPT when finalizing a reserve_task_keys placeholder (title being set for the first time): then priority is defaulted the same way create_task does (session task → in_progress CODING task → max(active)+1), never silently left at the reservation's priority 0/backlog (C1049)."),
       urgency: z.number().int().min(0).max(4).optional().describe('Urgency independent of sprint priority: 0 none, 1 low, 2 medium, 3 high, 4 urgent. Omit to preserve on update; new tasks default to 0.'),
+      severity: z.number().int().min(1).max(4).nullable().optional().describe('Severity (importance) independent of urgency and sprint priority: 1 low, 2 moderate, 3 high, 4 critical. null clears it (unrated); OMIT leaves it unchanged.'),
       tags: z.array(z.string()).optional().describe('Replace tags'),
       dependencies: z.array(z.string()).optional().describe("Replace the dependency list (task keys). Priority is auto-healed (C1053): if this task's sprint is at or below a dep's sprint it is bumped above it, and any active task depending on this one cascades upward too. Backlog (priority 0) tasks and backlog deps are exempt."),
       // assignee intentionally omitted — Task App tasks are owned by their creator and
@@ -435,6 +437,7 @@ async function main() {
       priority: z.number().optional().describe("Priority (higher = more important). OMIT to inherit the current task's priority — resolved from the session's TIPATASK_OBJECTIVE_TASK_ID/TIPATASK_TASK_ID, else the in_progress CODING task's priority (C874), else max(active priority)+1 — keeps deferred follow-up tasks in the same sprint as their parent (C956). Explicit 0 = backlog. NOTE: if `dependencies` is non-empty, this is a floor, not a fixed value — it is raised above every active dependency's sprint (C1052)."),
       dependencies: z.array(z.string()).default([]).describe('Task keys this depends on. Adding a dependency on an active task (not complete/canceled by this project\'s own workflow roles, C1187) moves this task into a LATER sprint than that dependency (C1052) — only list deps this task genuinely cannot start without.'),
       urgency: z.number().int().min(0).max(4).optional().describe('Urgency independent of sprint priority: 0 none, 1 low, 2 medium, 3 high, 4 urgent. Omit to preserve on update; new tasks default to 0.'),
+      severity: z.number().int().min(1).max(4).nullable().optional().describe('Severity (importance) independent of urgency and sprint priority: 1 low, 2 moderate, 3 high, 4 critical; null = unrated. OMIT on create = unrated.'),
       tags: z.array(z.string()).default([]).describe('Tag names'),
     },
     async (args) => {
@@ -562,6 +565,7 @@ async function main() {
         status,
         priority,
         urgency: args.urgency,
+        severity: args.severity,
         order,
         dependencies: normalizedDeps,
         tags: args.tags,

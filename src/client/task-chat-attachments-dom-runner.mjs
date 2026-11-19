@@ -4,6 +4,7 @@
 // board socket's blob-to-URL swap keeps the caret where it was, so the next image goes in after
 // the last one instead of at the end of the text; a failed upload's placeholder goes and the caret
 // stays. The sent turn shows each image inline, where it was inserted — live and restored.
+// (TPT9361) The Embed pickers take several files at once, and Send waits for every upload.
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -75,7 +76,7 @@ const bundlePath = join(temporary, 'client.mjs');
 let exitCode = 0;
 try {
   const bundled = await build({
-    stdin: { contents: "export * as taskChat from './src/client/task-chat.js'; export { default as state } from './src/client/state.js';", resolveDir: root },
+    stdin: { contents: "export * as taskChat from './src/client/task-chat.js'; export { default as state } from './src/client/state.js'; export { api } from './src/client/api-client.js';", resolveDir: root },
     bundle: true,
     platform: 'node',
     format: 'esm',
@@ -83,12 +84,18 @@ try {
     loader: { '.css': 'empty' },
   });
   writeFileSync(bundlePath, bundled.outputFiles[0].contents);
-  const { taskChat, state } = await import(pathToFileURL(bundlePath).href);
+  const { taskChat, state, api } = await import(pathToFileURL(bundlePath).href);
+  const fileUploads = [];
+  api.files.upload = async (filename, mimeType, data, taskKey) => {
+    fileUploads.push({ filename, taskKey });
+    return { id: fileUploads.length, url: `http://127.0.0.1:4454/api/projects/2/files/${fileUploads.length}`, filename };
+  };
   state.objectiveProviders = PROVIDERS;
   const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   const settle = async () => { for (let i = 0; i < 6; i++) await tick(); };
   const query = selector => document.querySelector(selector);
   const png = name => new File([Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10])], name, { type: 'image/png' });
+  const txt = name => new File(['notes'], name, { type: 'text/plain' });
   const caret = el => [el.selectionStart, el.selectionEnd];
   const board = () => sockets.find(s => s.url.includes('__board__'));
   // The board socket answers the upload of the image whose `blob:` placeholder is `blobUrl`.
@@ -209,6 +216,41 @@ try {
   const restored = [...document.querySelectorAll('.task-chat-msg--user')];
   assert.equal(restored.length, 1);
   assert.deepEqual(nodes(restored[0]), expected, 'restored: each image inline, in order');
+
+  // 7. (TPT9361) Both pickers take several files at once: each one uploads on its own, every
+  // reference lands, and Send waits for the last upload.
+  const imagePicker = query('.task-chat-embed-slot .embed-image-input');
+  const filePicker = query('.task-chat-embed-slot .embed-file-input');
+  assert.equal(imagePicker.multiple, true);
+  assert.equal(filePicker.multiple, true);
+  input.value = 'Three shots: ';
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.setSelectionRange(input.value.length, input.value.length);
+  query('.task-chat-embed-slot .embed-menu-trigger').click();
+  document.querySelectorAll('.task-chat-embed-slot .import-submenu-item')[0].click();
+  Object.defineProperty(imagePicker, 'files', { value: [png('e.png'), png('f.png'), png('g.png')], configurable: true });
+  imagePicker.dispatchEvent(new Event('change'));
+  const picked = [...input.value.matchAll(/!\[img\]\((blob:[^)\s]+)\)/g)].map(m => m[1]);
+  assert.equal(picked.length, 3, 'one placeholder per picked image');
+  assert.equal(send.disabled, true);
+  await settle();
+  assert.deepEqual(board().sent.filter(m => m.type === 'upload-image').slice(-3).map(m => m.blobUrl), picked, 'one upload each, in order');
+  uploaded(picked[0], 90);
+  uploaded(picked[1], 91);
+  assert.equal(send.disabled, true, 'Send waits for the last image');
+  uploaded(picked[2], 92);
+  assert.equal(send.disabled, false);
+  assert.equal(input.value, `Three shots: ![img](${API}/90)![img](${API}/91)![img](${API}/92)`);
+  query('.task-chat-embed-slot .embed-menu-trigger').click();
+  document.querySelectorAll('.task-chat-embed-slot .import-submenu-item')[1].click();
+  Object.defineProperty(filePicker, 'files', { value: [txt('a.txt'), txt('b.txt')], configurable: true });
+  filePicker.dispatchEvent(new Event('change'));
+  assert.equal(send.disabled, true, 'Send waits for the files');
+  await settle();
+  assert.deepEqual(fileUploads.map(f => f.filename), ['a.txt', 'b.txt']);
+  assert.equal(send.disabled, false);
+  assert.match(input.value, /\[a\.txt\]\(http:\/\/127\.0\.0\.1:4454\/api\/projects\/2\/files\/1\)/);
+  assert.match(input.value, /\[b\.txt\]\(http:\/\/127\.0\.0\.1:4454\/api\/projects\/2\/files\/2\)/);
   taskChat.close();
   console.log('TPT9279_INLINE_IMAGES_PASS');
 } catch (err) {

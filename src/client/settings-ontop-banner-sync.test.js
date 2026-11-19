@@ -80,7 +80,7 @@ const ipcMain = Object.assign(new EventEmitter(), { handle: (channel, cb) => { h
 const menus = [];
 const main = vm.createContext({
   console: { warn() {}, log() {} },
-  BrowserWindow, projectDirs, ipcMain, PORT: 4455, mt: (key) => key, desktopNotifications: null,
+  BrowserWindow, projectDirs, ipcMain, PORT: 4455, APP_ORIGIN: 'http://127.0.0.1:4455', mt: (key) => key, desktopNotifications: null,
   isTrustedTopFrame: (event) => projectDirs.has(event?.sender?.id),
   notifyStatus: { offStatus }, Notification: { isSupported: () => true },
   refreshBundleSignatureState: async () => {},

@@ -1,12 +1,10 @@
 // ── File attachments (C1246) ──
-// Generic (non-image) file upload for the Embed ▾ "Other file" composer row, backed by the
-// task_files API store. Deliberately simpler than task-board.js's image upload path
+// Generic (non-image) file upload for the Embed ▾ "Other file" row and file drop (embed-menu.js),
+// backed by the task_files API store. Deliberately simpler than task-board.js's image upload path
 // (uploadImageFile/_readFileBase64/_imagePasteTargets): no WS blob-swap optimistic preview,
 // because there is nothing to preview — a successful upload becomes a plain
-// `[filename](url)` markdown link in the composer, not inline content. Per the objective
-// ("most valuable info should be mentioned in a task itself" rather than embedding raw file
-// bytes), there is also no agent-side localization analogue of image-attach.js — this module
-// is client-only.
+// `[filename](url)` markdown link in the host's textarea, not inline content. A coding agent gets
+// the file itself at session start: task-agent/file-attach.js (C1247) downloads every linked file.
 
 import { api } from './api-client.js';
 import { insertAtCursor, showToast } from './utils.js';
@@ -73,7 +71,10 @@ function _readFileBase64(file) {
   });
 }
 
-export async function uploadAttachmentFile(file, textarea) {
+// `target` is the textarea that receives the link, or a function returning it once the upload has
+// landed (embed-menu.js; null when the host is gone — the link is dropped). `taskKey` links the
+// file to a task (GET /files/task/:key); without it the link in the text is the only reference.
+export async function uploadAttachmentFile(file, target, { taskKey = null } = {}) {
   if (!file) return;
   if (!file.size || file.size > MAX_FILE_BYTES) {
     showToast(t('toast.fileTooLarge', { max: '1 MB' }), 'error');
@@ -87,8 +88,10 @@ export async function uploadAttachmentFile(file, textarea) {
   showToast(t('toast.fileUploading', { name: file.name }));
   try {
     const data = await _readFileBase64(file);
-    const r = await api.files.upload(file.name, mime, data, null);
+    const r = await api.files.upload(file.name, mime, data, taskKey || null);
     const name = r?.filename || file.name;
+    const textarea = typeof target === 'function' ? target() : target;
+    if (!textarea) return;
     insertAtCursor(textarea, `[${name}](${r.url})`);
     showToast(t('toast.fileAttached', { name }), 'success');
   } catch (err) {

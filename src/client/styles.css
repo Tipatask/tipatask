@@ -5006,6 +5006,18 @@
     border-radius: 4px;
     cursor: zoom-in;
   }
+  /* (TPT9346) An image still uploading into the description (task-edit-modal.js
+     _withPendingImages()): the picked image itself, dimmed and pulsing until the upload lands. */
+  .modal-desc-display img.modal-desc-pending-image {
+    opacity: 0.55;
+    animation: modal-desc-pending-image 1.4s ease-in-out infinite;
+  }
+  @keyframes modal-desc-pending-image {
+    50% { opacity: 0.3; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .modal-desc-display img.modal-desc-pending-image { animation: none; }
+  }
 
   /* ── Trello import wizard ── */
   .trello-wizard-overlay {
@@ -12260,6 +12272,30 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   flex-shrink: 0; align-self: flex-end;
   margin: -8px 0 8px;
 }
+/* (TPT9346) The description's Embed control (embed-menu.js): the composer's trigger in the task
+   chat's compact size, right-aligned under the description card — 6px below it, 10px above the
+   tab strip; in diff mode under both columns, so right below the PROPOSED description.
+   "Uploading attachment…" shows beside it while an upload runs. The width / flex overrides keep it
+   compact under the composer's narrow breakpoints, which stretch every .embed-menu-trigger to its
+   row. */
+.modal-desc-embed {
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+  flex-shrink: 0; min-width: 0; margin: -6px 0 10px;
+}
+.modal-desc-embed[hidden] { display: none; }
+.modal-desc-embed .embed-menu-wrap { flex: 0 0 auto; }
+.modal-desc-embed .embed-menu-trigger {
+  width: auto; justify-content: flex-start;
+  min-height: 28px; padding: 0 10px; border-radius: 6px; font-size: 0.76rem;
+}
+.modal-desc-embed .embed-menu-trigger:focus-visible {
+  outline: 2px solid var(--c-primary-border); outline-offset: 2px;
+}
+.modal-desc-embed-status {
+  min-width: 0; font-size: 0.72rem; color: var(--c-primary-text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.modal-desc-embed-status[hidden] { display: none; }
 /* (TPT307) Key badge + status pill sit together on the left of the header, the way a card's
    id-badge and status pill do; Reset/Save are the only primary actions on the right. */
 .modal-head-meta {
@@ -14038,6 +14074,25 @@ mark.mention--agent {
   bottom: calc(100% + 4px);
   left: auto;
   right: 0;
+}
+/* (TPT9346) An Embed menu moved to <body> (embed-menu.js `portal`, the Task Edit description):
+   fixed beside its trigger — embed-menu.js sets top/left — and above the modal like the modal's
+   other body dropdowns (3200; .task-edit-overlay is 3000, 3150 over the task chat window). */
+.import-submenu--portal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 3200;
+}
+/* Rows of a menu opened from the keyboard take the focus (embed-menu.js). */
+.import-submenu-item:focus {
+  outline: none;
+  background: var(--c-primary-light);
+  color: var(--c-primary-text);
+}
+.import-submenu-item:focus-visible {
+  outline: 2px solid var(--c-primary-border);
+  outline-offset: -2px;
 }
 /* (C1246) task_files download links rendered from `[name](url)` markdown — paperclip marker so
    an attachment link reads distinctly from a regular hyperlink at a glance. */

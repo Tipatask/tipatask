@@ -468,7 +468,7 @@ test('dismiss IPC derives project scope from the trusted sender, ignoring suppli
   vm.runInNewContext(source.slice(start, end), {
     ipcMain: { handle: (_channel, cb) => { handler = cb; } },
     isTrustedTopFrame: event => event.trusted,
-    BrowserWindow: {}, projectDirs: new Map([[1, '/a']]), PORT: 4455,
+    BrowserWindow: {}, projectDirs: new Map([[1, '/a']]), PORT: 4455, APP_ORIGIN: 'http://127.0.0.1:4455',
     desktopNotifications: { dismissTask: (...args) => { calls.push(args); return 2; } },
   });
   assert.equal(handler({ trusted: false, sender: { id: 1 } }, { taskId: 'TPT483' }).reason, 'untrusted_sender');

@@ -466,6 +466,25 @@ export function stripPendingImageRefs(text) {
   return text.replace(PENDING_IMAGE_REF_RE, '');
 }
 
+// (TPT9346) The same strip, carrying caret offsets through it exactly: an offset moves back by the
+// placeholders removed before it, one inside a placeholder lands where that placeholder began. A
+// head/tail text diff can't do this when the next reference starts with the same `![img](`.
+export function stripPendingImageRefsAt(text, offsets = []) {
+  const source = typeof text === 'string' ? text : '';
+  const spans = [];
+  source.replace(PENDING_IMAGE_REF_RE, (match, at) => { spans.push([at, at + match.length]); return match; });
+  if (!spans.length) return { text: source, offsets: [...offsets] };
+  const map = (pos) => {
+    let removed = 0;
+    for (const [start, end] of spans) {
+      if (pos >= end) removed += end - start;
+      else { if (pos > start) removed += pos - start; break; }
+    }
+    return pos - removed;
+  };
+  return { text: source.replace(PENDING_IMAGE_REF_RE, ''), offsets: offsets.map(map) };
+}
+
 // ── Chat history picker (TPT539) ──
 
 // The transcript entry that marks where a resumed chat continues; its text is looked up with

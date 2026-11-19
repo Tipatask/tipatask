@@ -101,7 +101,7 @@ test('notify:get-on-top answers the saved choice at once, for a trusted project 
   const context = {
     ipcMain: { handle: (channel, cb) => { assert.equal(channel, 'notify:get-on-top'); handler = cb; } },
     isTrustedTopFrame: (event, deps) => { seen.push({ event, deps }); return trusted; },
-    BrowserWindow: {}, projectDirs: new Map(), PORT: 4455,
+    BrowserWindow: {}, projectDirs: new Map(), PORT: 4455, APP_ORIGIN: 'http://127.0.0.1:4455',
     refreshBundleSignatureState: async () => { refreshed += 1; },
     desktopNotifications: { isEnabled: () => state.enabled },
   };
@@ -135,7 +135,7 @@ test('notify:set-on-top writes the flag for a trusted project window only', () =
   const context = {
     ipcMain: { handle: (channel, cb) => { assert.equal(channel, 'notify:set-on-top'); handler = cb; } },
     isTrustedTopFrame: (event, deps) => { seen.push({ event, deps }); return trusted; },
-    BrowserWindow: {}, projectDirs: new Map(), PORT: 4455,
+    BrowserWindow: {}, projectDirs: new Map(), PORT: 4455, APP_ORIGIN: 'http://127.0.0.1:4455',
     applyNotificationsOnTop: (on) => { writes.push(on); return { ok: true, enabled: on }; },
   };
   vm.runInNewContext(source.slice(start, end), context);

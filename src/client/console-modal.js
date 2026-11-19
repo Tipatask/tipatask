@@ -27,6 +27,7 @@ import { renderImageTask } from './image-task-view.js';
 import { clearAttention, markSessionLost, dismissLostSession, mergeSessionsSnapshot } from './attention-state.js';
 import { _isPinnedToBottom, createTerminalOutputWriter } from './terminal-output.js';
 import { sessionOrigin, terminalOriginBadge } from './session-origin.js';
+import { registerPlainUrlLinks } from './terminal-links.js';
 
 const CONSOLE_STATUS_TICK_MS = 500;
 // (TPT19) How long cleanupChat() blocks state.cleanupInProgress (below) and, separately, how
@@ -35,8 +36,11 @@ const CONSOLE_STATUS_TICK_MS = 500;
 // state.js). Kept as one named constant so the guard and the delayed re-persist can't drift.
 const CHAT_CLEANUP_GUARD_MS = 500;
 
-// OSC 8 links bypass xterm's native dialog and renderer popup path. Keep confirmation
-// local to each terminal and pass the original URL unchanged to the platform opener.
+// Terminal links bypass xterm's native dialog and renderer popup path. One handler per
+// terminal serves both OSC 8 hyperlinks (xterm's `linkHandler` option) and plain-text URLs
+// (registerPlainUrlLinks()), so either form gets the same confirmation and scheme check and
+// passes the original URL unchanged to the platform opener. xterm activates a link on a
+// plain left click: mouse down and up on the same hovered link, no modifier key.
 function createTerminalLinkHandler() {
   let opening = false;
   return {
@@ -294,14 +298,16 @@ export function openObjectiveConsole() {
   const termBody = overlay.querySelector('.terminal-body');
   const statusBar = overlay.querySelector('#objective-console-status');
 
+  const linkHandler = createTerminalLinkHandler();
   const term = new Terminal({
     cursorBlink: true,
     fontSize: 14,
     fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", Menlo, Monaco, monospace',
     theme: XTERM_THEME,
     allowProposedApi: true,
-    linkHandler: createTerminalLinkHandler(),
+    linkHandler,
   });
+  registerPlainUrlLinks(term, linkHandler);
 
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
@@ -860,14 +866,16 @@ export function openTerminal(taskId, title, desc, taskStatus, opts = {}) {
   }
 
   // Init xterm.js
+  const linkHandler = createTerminalLinkHandler();
   const term = new Terminal({
     cursorBlink: true,
     fontSize: 14,
     fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", Menlo, Monaco, monospace',
     theme: XTERM_THEME,
     allowProposedApi: true,
-    linkHandler: createTerminalLinkHandler(),
+    linkHandler,
   });
+  registerPlainUrlLinks(term, linkHandler);
 
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);

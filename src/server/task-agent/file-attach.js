@@ -12,7 +12,7 @@ const config = require('../config');
 const { getApiCredentials } = require('../api-credentials');
 const { resolveAttachmentDir } = require('../attachment-paths');
 const { isTaskKeyLike } = require('../task-key-format');
-const { getApiOrigin, resolveInternalAttachmentUrl } = require('./attachment-url');
+const { getApiOrigin, resolveInternalAttachmentUrl, localReference } = require('./attachment-url');
 
 // Plain markdown link, deliberately excluding image syntax via a negative lookbehind —
 // `![alt](url)` is image-attach.js's territory, not this module's. An ordinary link whose text
@@ -184,10 +184,10 @@ async function fetchTaskFileUrls(taskId, { baseUrl, token, projectId }) {
 function rewriteRefs(text, urlToPath) {
   if (!text || !urlToPath.size) return text;
   FILE_REF_RE.lastIndex = 0;
-  return text.replace(FILE_REF_RE, (match, alt, url) => {
+  return text.replace(FILE_REF_RE, (match, alt, url, offset, whole) => {
     const localPath = urlToPath.get(url);
     if (!localPath) return match;
-    return alt ? `${alt}: @${localPath}` : `@${localPath}`;
+    return localReference(alt, localPath, whole, offset, offset + match.length);
   });
 }
 

@@ -141,7 +141,7 @@ test('main.js registers the channels with the top-frame guard and the sender\'s 
   const at = mainSrc.indexOf('registerFirstOpenPromptIpc({');
   assert.notEqual(at, -1, 'registered inside registerIpcHandlers()');
   const call = mainSrc.slice(at, mainSrc.indexOf('});', at));
-  assert.match(call, /isTrusted: \(event\) => isTrustedTopFrame\(event, \{ BrowserWindow, projectDirs, appOrigin: `http:\/\/127\.0\.0\.1:\$\{PORT\}` \}\)/);
+  assert.match(call, /isTrusted: \(event\) => isTrustedTopFrame\(event, \{ BrowserWindow, projectDirs, appOrigin: APP_ORIGIN \}\)/);
   assert.match(call, /projectDirOf: \(event\) => projectDirs\.get\(event\.sender\.id\) \|\| null/);
   assert.match(call, /writeMeta: writeProjectMeta/);
   assert.ok(preloadSrc.includes(`getFirstOpenPrompt: () => inv('${FIRST_OPEN_PROMPT_CHANNEL}')`));

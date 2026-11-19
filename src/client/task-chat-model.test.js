@@ -597,6 +597,20 @@ test('stripPendingImageRefs: drops blob placeholders and keeps uploaded refs', (
   assert.equal(m.stripPendingImageRefs(undefined), '');
 });
 
+test('(TPT9346) stripPendingImageRefsAt: carries offsets exactly, even before a same-prefix reference', () => {
+  const blob = '![img](blob:http://x/1)';
+  // The caret right after a failed placeholder that a real image follows: a head/tail diff would
+  // put it 7 characters into the next `![img](`.
+  const text = `ab${blob}![img](${IMG})c`;
+  const after = 2 + blob.length;
+  assert.deepEqual(m.stripPendingImageRefsAt(text, [after, after]), { text: `ab![img](${IMG})c`, offsets: [2, 2] });
+  // Before, inside and after placeholders; two of them.
+  const two = `x${blob}y${blob}z`;
+  assert.deepEqual(m.stripPendingImageRefsAt(two, [0, 1, 5, 1 + blob.length + 1, two.length]).offsets, [0, 1, 1, 2, 3]);
+  assert.deepEqual(m.stripPendingImageRefsAt('plain', [3]), { text: 'plain', offsets: [3] });
+  assert.deepEqual(m.stripPendingImageRefsAt(undefined), { text: '', offsets: [] });
+});
+
 // ── (TPT539) history picker ──
 test('(TPT539) visibleHistory shows restored turns and turns the resume marker into the indicator', async () => {
   const { visibleHistory } = await import('./task-chat-model.js');

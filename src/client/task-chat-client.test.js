@@ -415,7 +415,11 @@ test('chat-ui.js: the objective chat uses the same shared Embed control', () => 
   assert.ok(!chatUi.includes('_embedMenuCleanup'), 'the menu teardown lives in embed-menu.js');
   assert.ok(!chatUi.includes('import-submenu--up'), 'the menu is built in embed-menu.js');
   assert.match(embed, /uploadImageFile\(file, textarea, null, imageOpts\)/);
-  assert.match(embed, /uploadAttachmentFile\(file, textarea\)/);
+  assert.match(embed, /uploadAttachmentFile\(file, target, fileOpts\)/);
+  // (TPT9346) The board hands its image upload over; the shared module never imports the board,
+  // so the Task Edit modal can mount it without loading task-board.js.
+  assert.doesNotMatch(embed, /from '\.\/task-board\.js'/);
+  assert.match(read('./task-board.js'), /configureEmbedUploads\(\{ uploadImage: uploadImageFile \}\)/);
 });
 
 test('styles.css: attachments and the drop state are styled inside the Task Chat block', () => {
