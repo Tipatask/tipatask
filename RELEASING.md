@@ -38,7 +38,8 @@ workflow fails on purpose when `vX.Y.Z` and `package.json` disagree.
    installer plus `SHA256SUMS` to a **draft** GitHub Release whose body is
    `docs/releases/vX.Y.Z.md` from the tagged tree. A tag without that file still gets a
    draft, with a one-line placeholder body and a workflow warning. Nothing is published
-   automatically.
+   automatically. If only the `Draft release` job is red, run it again: see
+   [The Draft release job failed](#the-draft-release-job-failed).
 7. Open **Releases**, review the draft, and tick **Set as a pre-release** while the builds
    are unsigned. Download and smoke-test at least one installer per OS, then click
    **Publish release**. Prefer fixing the text in `docs/releases/vX.Y.Z.md` over editing the
@@ -86,6 +87,70 @@ Conventions the generator and the workflow rely on:
 **Actions ▸ Build installers ▸ Run workflow** builds every platform from the selected
 branch and keeps the installers as run artifacts for 14 days. It does not create a Release.
 Use it to check a packaging change before tagging.
+
+## The Draft release job failed
+
+The three build jobs passed and only `Draft release` is red. The installers exist as run
+artifacts, so nothing has to be rebuilt and the tag stays where it is. The job talks to
+GitHub's release API, and that is what usually fails: an HTTP 5xx answer or a dropped upload
+while GitHub is degraded (<https://www.githubstatus.com>). The job already retries each request
+with growing pauses, for about four minutes, before it gives up, and its error names the
+request, the HTTP status and GitHub's message.
+
+1. Run the job again: open the run under **Actions ▸ Build installers** and choose
+   **Re-run jobs ▸ Re-run failed jobs**, or
+
+   ```bash
+   gh run rerun <run-id> --failed -R Tipatask/tipatask
+   ```
+
+   Only `Draft release` runs; it downloads the installers the build jobs stored. Repeat until
+   it is green. A re-run never starts over. It continues with the draft the tag already has,
+   keeps every asset that is already uploaded with the same SHA-256, deletes and uploads again
+   what is partial or different, uploads what is missing, and rewrites the draft body from the
+   tagged `docs/releases/vX.Y.Z.md`. It is green only when the draft holds every file.
+2. The run artifacts are kept for 14 days. After that use **Re-run all jobs**: the installers
+   are built again and replace the assets the draft already holds.
+3. Check that the tag has one draft and that it lists seven files (two `.dmg`, one `.exe`,
+   `.AppImage`, `.deb`, `.pacman`, `SHA256SUMS`). Drafts are visible only to maintainers:
+
+   ```bash
+   gh api repos/Tipatask/tipatask/releases \
+     --jq '.[] | select(.draft) | [.id, .tag_name, (.assets | length)] | @tsv'
+   ```
+
+4. Delete leftover duplicate drafts. The job never creates a second draft for a tag that has
+   one, and it never deletes a release. When it finds several drafts of its tag, left by an
+   earlier failure, it completes the one that holds the most uploaded assets (the oldest on a
+   tie), names it in its **Draft release** notice and lists the others in a **Duplicate draft
+   releases** warning. Delete each of the others by its id, on the **Releases** page or with
+
+   ```bash
+   gh api -X DELETE repos/Tipatask/tipatask/releases/<id>
+   ```
+
+   Use the id: `gh release delete vX.Y.Z` goes by tag, and the duplicates share it. Deleting a
+   draft does not delete the tag.
+
+The job refuses to run for a tag whose release is already published. It fills drafts only and
+never changes a published release.
+
+A re-run uses the workflow of the tagged commit, so a tag made before a workflow fix re-runs
+the workflow it was tagged with. To complete such a draft, or when Actions itself is down,
+run the release step from a checkout that has it. It needs Node 18 or newer and a token that
+may write releases:
+
+```bash
+gh run download <run-id> -R Tipatask/tipatask -D artifacts
+mkdir installers && mv artifacts/*/* installers/
+(cd installers && sha256sum -- * > SHA256SUMS)        # macOS: shasum -a 256 -- * > SHA256SUMS
+grep -v '^<!-- tipatask-release-notes ' docs/releases/vX.Y.Z.md > notes.md
+GITHUB_TOKEN="$(gh auth token)" GITHUB_REPOSITORY=Tipatask/tipatask \
+  node scripts/draft-release.js --tag vX.Y.Z --notes notes.md --dir installers --dry-run
+```
+
+`--dry-run` only reads and prints what would be kept, replaced and uploaded. Run the last
+command again without it to apply.
 
 ## Fixing a bad tag or build
 

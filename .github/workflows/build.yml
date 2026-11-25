@@ -317,22 +317,34 @@ jobs:
   # auto-published -- the maintainer reviews and presses publish by hand. The body comes from
   # docs/releases/<tag>.md in the tagged tree (generated at export time, reviewed and committed
   # before tagging); a tag without that file gets a placeholder body plus a warning, never a
-  # failed job. A re-run of this job rewrites the draft body from the file, so edit the file,
-  # not the draft, until the release is published.
+  # failed job.
+  #
+  # The job can be repeated, and "Re-run failed jobs" is the fix for a red run: it continues with
+  # the draft the tag already has instead of creating another, keeps the assets that are already
+  # uploaded with the same SHA-256, replaces partial or different ones, uploads the missing ones
+  # and rewrites the draft body from the file -- so edit the file, not the draft, until the
+  # release is published. A published release is never changed: the job fails instead.
+  # RELEASING.md § The Draft release job failed has the maintainer's steps.
   release:
     name: Draft release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # A few minutes when GitHub is healthy. One request is retried for about four minutes at
+    # most, so a job near this limit is hanging, not being patient.
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
       # First: actions/checkout cleans the workspace, so it must precede the artifact download.
-      # Only docs/releases is needed; no token is persisted in the checkout.
+      # Only the release notes and the release script are needed; no token is persisted in the
+      # checkout.
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-          sparse-checkout: docs/releases
+          sparse-checkout: |
+            docs/releases
+            scripts
 
       # v7 is download-artifact's first Node 24 major (its v5 and v6 still run on node20). It reads
       # what upload-artifact@v6 writes in the build job: both use the same @actions/artifact backend.
@@ -372,8 +384,15 @@ jobs:
           fi
           echo "path=$out" >> "$GITHUB_OUTPUT"
 
-      - uses: softprops/action-gh-release@v3
-        with:
-          draft: true
-          body_path: ${{ steps.notes.outputs.path }}
-          files: installers/*
+      # The release step is the repo's own script, not a marketplace action, because it has to be
+      # repeatable and patient: it looks for the tag's draft before creating one (a 5xx answer does
+      # not say whether GitHub created it), retries every request with growing pauses, and deletes
+      # the `starter` record a failed upload leaves before sending that file again. A failure
+      # names the request, its HTTP status and GitHub's message. Built-ins only, run by the
+      # runner's preinstalled Node: no setup-node and no npm ci, so nothing more has to download
+      # while GitHub is degraded.
+      - name: Create or complete the draft release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NOTES_PATH: ${{ steps.notes.outputs.path }}
+        run: node scripts/draft-release.js --tag "$GITHUB_REF_NAME" --notes "$NOTES_PATH" --dir installers

@@ -272,7 +272,7 @@ src/
   cli/                Setup, sign-in and task import/export command-line tools
   mcp/                Local MCP server that gives agents task and knowledge-base tools
 bin/                  mcp-node (Node version resolver) and the bundled pi launcher
-scripts/              Postinstall, bundle staging, version bump, license notices, release notes, probes
+scripts/              Postinstall, bundle staging, version bump, license notices, release notes, draft release, probes
 vendor/
   pi/                 Staged Pi Coding Agent bundle (shipped outside the asar)
   voice-models/       Local speech models, downloaded on first use (not committed)
