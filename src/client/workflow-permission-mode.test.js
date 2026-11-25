@@ -26,7 +26,7 @@ function harness(tc, initial = null) {
   assert.ok(document.getElementById('settings-permission-mode-row'));
   const original = { settings: api.project.settings, update: api.project.update };
   let saved = initial;
-  const calls = { settings: 0, writes: [], toasts: [] };
+  const calls = { settings: 0, writes: [], toasts: [], policySyncs: 0 };
   api.project.settings = async () => { calls.settings++; return { agentPermissionMode: saved }; };
   api.project.update = async body => { calls.writes.push(body); saved = body.agent_permission_mode; };
   resetGroupLabel(); setLocale('en');
@@ -42,6 +42,8 @@ function harness(tc, initial = null) {
     renderPermissionModeSelect, bindPermissionModeSelect,
     escapeAttr: value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char])),
     showToast: (...args) => calls.toasts.push(args),
+    // The row rebuild replaces its markup, so it re-applies the project policy locks itself.
+    syncPolicyControls() { calls.policySyncs++; },
     syncAllPermissionButtons() {}, syncAttentionClasses() {}, syncActivityChips() {},
     getOpenWorkspaceTaskId: () => null, taskChatRows: () => [], projectChatRows: () => [],
     _sessionAgentIcon: () => '<svg class="agent-icon"></svg>', isCompleteName: () => false,
@@ -74,6 +76,7 @@ test('Workflow saves only project mode, refreshes hints/nav, survives reopen and
   const h = harness(tc);
   await h.context._populateSettingsWorkflowTab();
   assert.equal(h.calls.settings, 1);
+  assert.equal(h.calls.policySyncs, 1, 'a rebuilt row gets its policy lock back');
   assert.equal(h.row().querySelectorAll('[role="option"]').length, AGENT_PERMISSION_MODES.length + 1);
   assert.match(h.row().textContent, /Agent permissions/);
   assert.match(h.row().querySelector('.settings-row-hint').textContent, /Until a mode is chosen/);
@@ -81,6 +84,7 @@ test('Workflow saves only project mode, refreshes hints/nav, survives reopen and
   h.choose('plan');
   await h.settle();
   assert.equal(JSON.stringify(h.calls.writes), '[{"agent_permission_mode":"plan"}]');
+  assert.equal(h.calls.policySyncs, 2, 'the rebuild after a save re-applies it too');
   assert.equal(projectPermissionMode(), 'plan');
   assert.equal(h.row().querySelector('input').value, 'plan');
   assert.equal(h.document.activeElement, h.row().querySelector('button'), 'autosave preserves keyboard focus');

@@ -5,21 +5,14 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const config = require('../config');
 const { getApiCredentials } = require('../api-credentials');
+const { imageMimeExtension } = require('../attachment-mime');
 const { resolveAttachmentDir } = require('../attachment-paths');
 const { isTaskKeyLike } = require('../task-key-format');
 const { getApiOrigin, resolveInternalAttachmentUrl, localReference } = require('./attachment-url');
 
 const IMAGE_REF_RE = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
 
-const MIME_EXT = {
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/gif': '.gif',
-  'image/webp': '.webp',
-  'image/svg+xml': '.svg',
-};
-
-const DATA_IMAGE_URI_RE = /^data:(image\/(?:jpeg|png|gif|webp|svg\+xml));base64,([A-Za-z0-9+/]+={0,2})$/i;
+const DATA_IMAGE_URI_RE = /^data:(image\/[a-z0-9+.-]+);base64,([A-Za-z0-9+/]+={0,2})$/i;
 const MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024;
 
 // C1012: real task_keys are always uppercase — a project's own prefix + digits (e.g.
@@ -42,14 +35,21 @@ function extractImageRefs(text) {
   return refs;
 }
 
+function localImageExtension(mimeType) {
+  // Older APIs and inline image references can still supply SVG attachments.
+  return mimeType === 'image/svg+xml' ? '.svg' : imageMimeExtension(mimeType);
+}
+
 function parseDataImageUri(url) {
   const match = DATA_IMAGE_URI_RE.exec(url || '');
   if (!match) return null;
   const mimeType = match[1].toLowerCase();
+  const ext = localImageExtension(mimeType);
+  if (!ext) return null;
   const buf = Buffer.from(match[2], 'base64');
   if (!buf.length) throw new Error('Empty image data');
   if (buf.length > MAX_INLINE_IMAGE_BYTES) throw new Error('Image too large (>10 MB)');
-  return { mimeType, data: match[2], buf, ext: MIME_EXT[mimeType] };
+  return { mimeType, data: match[2], buf, ext };
 }
 
 function isDataImageUri(url) {
@@ -88,8 +88,8 @@ async function fetchAndSave(url, dir, { baseUrl, token, projectId }) {
   if (!res.ok) {
     throw new Error(`GET ${requestUrl} returned ${res.status}`);
   }
-  const contentType = (res.headers.get('content-type') || '').split(';')[0].trim();
-  const ext = MIME_EXT[contentType];
+  const contentType = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  const ext = localImageExtension(contentType);
   if (!ext) {
     throw new Error(`Unsupported image MIME type: ${contentType}`);
   }

@@ -36,6 +36,22 @@ function fixture(t) {
 
 function enable(store, project) { return store.write(project, true, store.read(project).context); }
 
+// Waits for a watcher's notification while repeating the change it watches for. fs.watch() returns
+// before macOS has started its event stream, and a change made in that window is never reported:
+// one write followed by a deadline loses that race now and then on a busy disk. A later repeat is
+// always seen. The cap only ends a run whose watcher never reports anything.
+async function notified(event, repeatChange, { everyMs = 25, capMs = 30000 } = {}) {
+  let seen = false;
+  event.then(() => { seen = true; });
+  const end = Date.now() + capMs;
+  for (;;) {
+    await new Promise(resolve => setTimeout(resolve, everyMs));
+    if (seen) return;
+    assert.ok(Date.now() < end, 'consent watch reported no change');
+    repeatChange();
+  }
+}
+
 test('portable true reproduces the old predicate but never grants local consent on either device', t => {
   const f = fixture(t);
   assert.equal(JSON.parse(fs.readFileSync(f.configFile)).REMOTE_CONTROL_ENABLED, true, 'legacy predicate grants both copied checkouts');
@@ -110,8 +126,8 @@ test('restart, multiple readers, explicit disable, malformed state and expired c
   const changed = new Promise(resolve => { const stop = otherWindow.watch(() => { stop(); resolve(); }); t.after(stop); });
   f.a.store.write(f.project, false, grant.context);
   assert.equal(otherWindow.read(f.project).enabled, false, 'no notification needed for authority');
-  let timer;
-  try { await Promise.race([changed, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('consent watch missed change')), 2000); })]); } finally { clearTimeout(timer); }
+  await notified(changed, () => f.a.store.write(f.project, false, f.a.store.read(f.project).context));
+  assert.equal(otherWindow.read(f.project).enabled, false);
   assert.throws(() => otherWindow.write(f.project, true, grant.context), /context changed/);
   const next = enable(otherWindow, f.project);
   assert.notEqual(next.grant, grant.grant, 'old pending starts cannot survive disable/re-enable');

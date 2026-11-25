@@ -10,6 +10,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const config = require('../config');
 const { getApiCredentials } = require('../api-credentials');
+const { fileMimeExtensions } = require('../attachment-mime');
 const { resolveAttachmentDir } = require('../attachment-paths');
 const { isTaskKeyLike } = require('../task-key-format');
 const { getApiOrigin, resolveInternalAttachmentUrl, localReference } = require('./attachment-url');
@@ -19,36 +20,6 @@ const { getApiOrigin, resolveInternalAttachmentUrl, localReference } = require('
 // happens to look like an image ref (`[screenshot.png](url)`) is still a *link* here; whether
 // it gets localized depends only on isInternalFileUrl() below, not on the link text.
 const FILE_REF_RE = /(?<!!)\[([^\]]*)\]\(([^)\s]+)\)/g;
-
-// Keep in sync with api/src/routes/files.js FILE_MIME_EXT — this is the authoritative source,
-// this table is a read-only mirror used to (a) validate a downloaded response actually is one
-// of the allowed document types before writing it to disk, and (b) force the on-disk extension
-// from the *verified* Content-Type rather than trusting the stored original_filename, so a
-// mismatched row (reachable via MCP/API, which validate mimeType but never cross-check it
-// against the filename's extension) can never land on disk with an image extension and get
-// swept up by codex-session.js's IMAGE_ATTACH_RE (which matches on extension alone).
-const FILE_MIME_EXT = {
-  'application/pdf': '.pdf',
-  'application/msword': '.doc',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
-  'application/vnd.ms-excel': '.xls',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
-  'application/vnd.ms-powerpoint': '.ppt',
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
-  'application/vnd.oasis.opendocument.text': '.odt',
-  'application/vnd.oasis.opendocument.spreadsheet': '.ods',
-  'text/plain': '.txt',
-  'text/markdown': '.md',
-  'text/csv': '.csv',
-  'text/tab-separated-values': '.tsv',
-  'application/json': '.json',
-  'application/xml': '.xml',
-  'text/xml': '.xml',
-  'application/yaml': '.yaml',
-  'text/yaml': '.yaml',
-  'application/rtf': '.rtf',
-  'text/rtf': '.rtf',
-};
 
 // (C1483: was a bespoke REAL_TASK_KEY_RE capped at 4-char prefixes, 2 short of the
 // TASK_KEY_RE contract's 6 — replaced with the shared isTaskKeyLike(), mirrors
@@ -128,9 +99,9 @@ async function fetchAndSave(url, dir, fileId, { baseUrl, token, projectId }, lis
   if (!res.ok) {
     throw new Error(`GET ${requestUrl} returned ${res.status}`);
   }
-  const contentType = (res.headers.get('content-type') || '').split(';')[0].trim();
-  const ext = FILE_MIME_EXT[contentType];
-  if (!ext) {
+  const contentType = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  const extensions = fileMimeExtensions(contentType);
+  if (!extensions) {
     throw new Error(`Unsupported file MIME type: ${contentType}`);
   }
   const contentLength = Number(res.headers.get('content-length') || 0);
@@ -141,12 +112,12 @@ async function fetchAndSave(url, dir, fileId, { baseUrl, token, projectId }, lis
   if (buf.length > MAX_FILE_BYTES) {
     throw new Error(`File too large (${buf.length} bytes, max ${MAX_FILE_BYTES})`);
   }
-  const rawName = nameFromContentDisposition(res.headers.get('content-disposition')) || listingFilename || 'file';
-  // On-disk name is always <fileId>-<sanitizedBase><extFromContentType> — deterministic
-  // (a re-spawn overwrites identical bytes instead of accumulating duplicates) and collision-
-  // free (two different files can share original_filename; their ids never collide) without
-  // any per-call bookkeeping. Extension is always the one FILE_MIME_EXT derives from the
-  // verified Content-Type, never taken from rawName — see the FILE_MIME_EXT comment above.
+  const responseName = nameFromContentDisposition(res.headers.get('content-disposition'));
+  const rawName = responseName || listingFilename || 'file';
+  // The API serves source files as text/plain. Retain the response filename's suffix
+  // only when the verified MIME permits it. Other types use their canonical suffix.
+  const responseExt = path.extname(responseName || '').toLowerCase();
+  const ext = contentType === 'text/plain' && extensions.includes(responseExt) ? responseExt : extensions[0];
   const filename = `${fileId}-${sanitizeBase(rawName)}${ext}`;
   const localPath = path.join(dir, filename);
   fs.writeFileSync(localPath, buf);

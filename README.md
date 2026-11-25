@@ -36,7 +36,7 @@ Grab the installer for your system from the
 Linux builds need glibc 2.35 or newer. TipΔTask uses the
 [`claude`](https://code.claude.com/docs/en/quickstart) and
 [`codex`](https://learn.chatgpt.com/docs/codex/cli) command-line
-tools you already have, so install and sign in to the ones you want. Pi is included.
+tools you definitely already have, so install and sign in to the ones you want. Pi is included.
 
 ## Getting started
 

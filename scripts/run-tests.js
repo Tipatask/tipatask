@@ -16,6 +16,15 @@ function discoverTests(dir) {
   }).sort();
 }
 
+// `node --test` picks its reporter by Node version: TAP into a pipe up to Node 22, the
+// human-readable spec reporter everywhere from Node 23 on. Logs, the CI job and the export's test
+// gate read the TAP rows and totals (`not ok N - name`, `# fail N`), so a run whose output is not a
+// terminal asks for TAP on every version, unless the caller named a reporter.
+function reporterArgs(argv, isTTY) {
+  const named = argv.some(arg => arg === '--test-reporter' || arg.startsWith('--test-reporter='));
+  return isTTY || named ? [] : ['--test-reporter=tap'];
+}
+
 function main() {
   const files = discoverTests(path.join(root, 'src'));
   if (!files.length) throw new Error('No unit tests discovered under src/');
@@ -36,8 +45,9 @@ function main() {
   });
   console.log(`Discovered ${files.length} test files under src/`);
   try {
+    const args = process.argv.slice(2);
     const result = spawnSync(process.execPath, [
-      '--test', '--test-concurrency=4', ...process.argv.slice(2), ...files,
+      '--test', '--test-concurrency=4', ...reporterArgs(args, process.stdout.isTTY), ...args, ...files,
     ], { cwd: root, env, stdio: 'inherit' });
     if (result.error) throw result.error;
     process.exitCode = result.status ?? 1;
@@ -51,4 +61,4 @@ function main() {
 }
 
 if (require.main === module) main();
-module.exports = { discoverTests };
+module.exports = { discoverTests, reporterArgs };

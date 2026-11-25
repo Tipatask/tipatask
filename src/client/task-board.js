@@ -65,7 +65,7 @@ import {
   // Builders shared with the New Task form (renderNewTaskForm / attachNewTaskFormHandlers).
   _renderDepChip, _statusOptionsHtml, _agentModelControlHtml, _applyModalAgentModelVisibility,
 } from './task-edit-modal.js';
-import { configureEmbedUploads } from './embed-menu.js';
+import { configureEmbedUploads, embedMenuHtml } from './embed-menu.js';
 
 export {
   openTaskEditModal, closeTaskEditModal, requestCloseTaskEditModal,
@@ -580,6 +580,7 @@ export function renderNewTaskForm(tasks, tierKeys, parentTaskKey = null) {
               <div class="new-task-field">
                 <label for="new-task-desc">${t('form.description')}</label>
                 <textarea id="new-task-desc" placeholder="${escapeAttr(t('form.descPlaceholder'))}">${desc}</textarea>
+                <div class="new-task-file">${embedMenuHtml({ title: t('modal.embedTooltip') })}</div>
               </div>
             </div>
             <div class="modal-fields new-task-meta-fields" id="new-task-fields">

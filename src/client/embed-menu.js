@@ -1,8 +1,8 @@
-// ── Embed control ──
-// The Embed dropdown (Image / Other file), its two hidden pickers and file drop, shared by every
+// ── File control ──
+// The File dropdown (Image / Other file), its two hidden pickers and file drop, shared by every
 // host that takes attachments into a textarea: the objective chat composer (chat-ui.js), the task /
-// project chat composer (task-chat.js) and the Task Edit modal's description editor
-// (task-edit-modal.js). Uploads always go through the one upload path each kind already has —
+// project chat composer (task-chat.js) and the descriptions in New Task and Task Edit.
+// Uploads always go through the one upload path each kind already has —
 // images through task-board.js (`uploadImageFile`, a `![img](blob:…)` placeholder swapped for the
 // real URL once the board socket answers), other files through file-attach.js
 // (`uploadAttachmentFile`, a `[name](url)` link) — so a host only says which textarea receives the
@@ -11,14 +11,28 @@
 // modal must load without it.
 import { t } from './i18n.js';
 import { FILE_ACCEPT, uploadAttachmentFile } from './file-attach.js';
-import { escapeAttr, insertAtCursor } from './utils.js';
+import { escapeAttr, insertAtCursor, showToast } from './utils.js';
 import { api } from './api-client.js';
 
-// (TPT280) Shared 12px chevron caret for the composer's Embed and Import dropdown triggers —
+// (TPT280) Shared 12px chevron caret for the composer's File and Import dropdown triggers —
 // one svg (not a text glyph) so both carets render at an identical size on every platform font.
 export const DROPDOWN_CARET_SVG = '<svg class="embed-menu-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>';
 
 const PAPERCLIP_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>';
+
+// Match the raster formats in api/src/lib/task-image-types.js.
+const IMAGE_MIME_BY_EXTENSION = new Map([
+  ['.png', 'image/png'], ['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg'],
+  ['.gif', 'image/gif'], ['.webp', 'image/webp'], ['.avif', 'image/avif'], ['.bmp', 'image/bmp'],
+]);
+const IMAGE_MIMES = new Set(IMAGE_MIME_BY_EXTENSION.values());
+const IMAGE_ACCEPT = [...IMAGE_MIMES, ...IMAGE_MIME_BY_EXTENSION.keys()].join(',');
+
+function imageMimeFromName(file) {
+  const name = file.name || '';
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? IMAGE_MIME_BY_EXTENSION.get(name.slice(dot).toLowerCase()) : undefined;
+}
 
 // task-board.js uploadImageFile(file, textarea, wsClient, opts), handed over once by the board.
 let uploadImageFile = null;
@@ -36,7 +50,7 @@ export function embedMenuHtml({ label = t('nav.embed'), disabled = false, trigge
   const id = value => (value ? ` id="${escapeAttr(value)}"` : '');
   return `
     <div class="embed-menu-wrap">
-      <input type="file" class="embed-image-input"${id(imageInputId)} accept="image/*" multiple style="display:none">
+      <input type="file" class="embed-image-input"${id(imageInputId)} accept="${IMAGE_ACCEPT}" multiple style="display:none">
       <input type="file" class="embed-file-input"${id(fileInputId)} accept="${FILE_ACCEPT}" multiple style="display:none">
       <button class="embed-menu-trigger"${id(triggerId)} type="button" aria-haspopup="true" aria-expanded="false"${title ? ` title="${escapeAttr(title)}"` : ''}${disabled ? ' disabled' : ''}>
         ${PAPERCLIP_SVG}
@@ -69,12 +83,20 @@ function resolveTextarea(target) {
 }
 
 function uploadImage(file, target, imageOpts) {
+  const mime = IMAGE_MIMES.has(file.type) ? file.type : imageMimeFromName(file);
+  if (!mime) {
+    showToast(t('toast.fileTypeUnsupported'), 'error');
+    return;
+  }
   if (!uploadImageFile) {
     console.error('[embed-menu] no image upload configured (task-board.js configureEmbedUploads)');
     return;
   }
   const textarea = resolveTextarea(target);
-  if (textarea) uploadImageFile(file, textarea, null, imageOpts);
+  if (textarea) {
+    const image = file.type === mime ? file : new File([file], file.name, { type: mime });
+    uploadImageFile(image, textarea, null, imageOpts);
+  }
 }
 
 function uploadFile(file, target, fileOpts, onFileUpload) {
@@ -89,7 +111,7 @@ function uploadFile(file, target, fileOpts, onFileUpload) {
 export function uploadComposerFiles(files, target, { imageOpts = {}, fileOpts = {}, onFileUpload } = {}) {
   for (const file of Array.from(files || [])) {
     if (!file) continue;
-    if (file.type && file.type.startsWith('image/')) uploadImage(file, target, imageOpts);
+    if (file.type?.startsWith('image/') || imageMimeFromName(file)) uploadImage(file, target, imageOpts);
     else uploadFile(file, target, fileOpts, onFileUpload);
   }
 }

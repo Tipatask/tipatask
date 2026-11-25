@@ -5,6 +5,7 @@ const { getWindowState, reconfigureWindowBackend, notifyProjectConfigChanged } =
 const serverConfig = require('../../src/server/config');
 const { applyReopenToPatch } = require('../../src/server/reopen-closed-task');
 const { resolveCodingPrefix } = require('../../src/server/task-key-format');
+const { fileMimeExtensions, imageMimeExtension, validateAttachmentUpload } = require('../../src/server/attachment-mime');
 
 let _taskAgentInfo = null;
 function getAgentInfo() {
@@ -463,16 +464,20 @@ function registerApiHandlers() {
 
   // ── Images ───────────────────────────────────────────────────────────────────
 
-  ipcMain.handle('api:images.upload', async (event, { filename, mimeType, data, taskKey }) => {
+  ipcMain.handle('api:images.upload', async (event, payload) => {
     const backend = b(event);
     if (!backend) throw new Error('No project loaded');
+    validateAttachmentUpload(payload, imageMimeExtension);
+    const { filename, mimeType, data, taskKey } = payload;
     return backend.uploadImage(filename, mimeType, data, taskKey || null);
   });
 
   // C1246 — task_files generic attachment upload
-  ipcMain.handle('api:files.upload', async (event, { filename, mimeType, data, taskKey }) => {
+  ipcMain.handle('api:files.upload', async (event, payload) => {
     const backend = b(event);
     if (!backend) throw new Error('No project loaded');
+    validateAttachmentUpload(payload, fileMimeExtensions);
+    const { filename, mimeType, data, taskKey } = payload;
     return backend.uploadFile(filename, mimeType, data, taskKey || null);
   });
 

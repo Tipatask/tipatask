@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { killProcessGroup, AGENT_LIMIT_DEFAULTS } = require('../process-group');
 const { buildLanguageDirective, readProjectConfig, KB_MODE_COMPOSE } = require('../project-config');
@@ -31,6 +33,36 @@ const CLI_PROBE_TIMEOUT_MS = 10_000;
 const CLI_PROBE_OUTPUT_BYTES = 64 * 1024;
 // Cap for the diagnostic `detail.output` on an unavailable detect() result — see buildDetectDetail().
 const DETECT_DETAIL_OUTPUT_CHARS = 200;
+
+// (TPT9393) The Task App's own unit suite, as a project can hold it: `checkouts` are the places a
+// project keeps this source (its root for a standalone checkout, the ai/todo/server mount of the
+// monorepo), recognised by the package name plus the suite runner. `doc` / `section` name the CI
+// test checklist in that project's knowledge base. See BaseTaskAgent.resolveCiTests().
+const CI_TEST_SUITE = Object.freeze({
+  packageName: 'tipatask-app',
+  runner: 'scripts/run-tests.js',
+  checkouts: Object.freeze(['', 'ai/todo/server']),
+  doc: 'ai/architecture/tt-ci.md',
+  section: 'Writing tests that pass on GitHub',
+});
+
+function isTaskAppCheckout(dir) {
+  try {
+    if (!fs.statSync(path.join(dir, CI_TEST_SUITE.runner)).isFile()) return false;
+    return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))?.name === CI_TEST_SUITE.packageName;
+  } catch {
+    return false;
+  }
+}
+
+function hasCiTestChecklist(projectRoot) {
+  try {
+    const doc = fs.readFileSync(path.join(projectRoot, CI_TEST_SUITE.doc), 'utf8');
+    return doc.split(/\r?\n/).some(line => /^#{2,} /.test(line) && line.replace(/^#+ /, '').trim() === CI_TEST_SUITE.section);
+  } catch {
+    return false;
+  }
+}
 
 function commentType(comment) {
   return String(comment?.comment_type || comment?.commentType || comment?.type || 'comment');
@@ -496,6 +528,56 @@ class BaseTaskAgent {
     ].join('\n');
   }
 
+  // ── CI-compatible tests (TPT9393) ──
+  // A project that holds the Task App's own source (CI_TEST_SUITE above) also runs that source's
+  // unit suite on GitHub, where a change can fail in a test file its author never opened: source
+  // scans, vm harnesses and whole-prompt comparisons in other files read it. Same
+  // resolve-once/sync-read split as resolveKbMode(): terminal-session.js calls resolveCiTests()
+  // once per spawn with the session's project root and threads the answer into getSpawnSpec()'s
+  // opts as opts.ciTests; buildCiTestDirective() is the pure read. null for every other project,
+  // whose kickoffs must not name a suite they do not have. `dir` is the checkout relative to the
+  // project root ('' for the root itself); `doc` is the project's CI test checklist, null when its
+  // knowledge base has no such section. Reads the project tree only, never throws.
+  static resolveCiTests(projectRoot) {
+    if (typeof projectRoot !== 'string' || !projectRoot) return null;
+    const dir = CI_TEST_SUITE.checkouts.find(rel => isTaskAppCheckout(path.join(projectRoot, rel)));
+    if (dir === undefined) return null;
+    return { dir, doc: hasCiTestChecklist(projectRoot) ? CI_TEST_SUITE.doc : null };
+  }
+
+  // Only a run whose opts.ciTests is resolved gets it: run the whole suite after the last source
+  // or test change and before the commit, because a focused run is not a CI result, and write
+  // tests that do not depend on this machine. The checklist line names opts.ciTests.doc when the
+  // project has it. Compact wording is echoed by Pi: no questions, status literals or MCP names.
+  buildCiTestDirective(opts = {}) {
+    const suite = opts.ciTests;
+    if (!suite || typeof suite.dir !== 'string') return '';
+    const at = rel => (suite.dir ? `${suite.dir}/${rel}` : rel);
+    const section = CI_TEST_SUITE.section;
+    if (opts.compact) {
+      const changed = suite.dir
+        ? `under ${suite.dir} (src, main, main.js, preload.js or a test)`
+        : 'to src, main, main.js, preload.js or a test';
+      const where = suite.dir ? 'from that directory' : 'from the project root';
+      const checklist = suite.doc ? `: follow ${suite.doc}, section ${section}` : '';
+      return [
+        'CI-compatible tests:',
+        `- After your last change ${changed} and before the commit, run the whole suite ${where} under its pinned Node: \`node ${CI_TEST_SUITE.runner}\`. Need \`# fail 0\` and no guard violation. A focused run is not a CI result: tests in other files read that source.`,
+        `- New or changed tests must pass on GitHub too (Linux, committed files only, no signed-in account, no real network, no fixed timing)${checklist}.`,
+      ].join('\n');
+    }
+    const suiteLabel = suite.dir ? `The Task App unit suite in \`${suite.dir}\`` : 'This project\'s unit suite';
+    const where = suite.dir ? `from \`${suite.dir}\`` : 'from the project root';
+    const checklist = suite.doc ? ` Apply the checklist in \`${suite.doc}\` § ${section} before the commit.` : '';
+    return [
+      'CI-compatible tests:',
+      `- ${suiteLabel} also runs on GitHub, in the job "Task App test suite": a Linux runner, the committed public snapshot, no signed-in account, no Electron binary. Its tests read production source (source scans, vm harnesses that run a function cut out of a module, comparisons of a whole spawn prompt), so a change under \`${at('src')}\`, \`${at('main')}\`, \`${at('main.js')}\` or \`${at('preload.js')}\` (or to \`scripts/\`, \`templates/\` or \`package.json\`, which tests also read) can break a test file you never opened.`,
+      `- After your last change to that source or to a test, and before the commit (before completion when this run does not commit), run the whole suite ${where} under the Node pinned in its \`.nvmrc\`: \`node ${CI_TEST_SUITE.runner}\`. Require \`# fail 0\` in the totals and no guard violation after them. A focused run of this task's own tests is not a CI result.`,
+      '- Fix every failure your change caused, in whichever test file it appears. A failure that was already red before your change is a caveat to report with that evidence, never one to leave unexamined.',
+      `- When you add or change a test, keep it independent of this machine: no signed-in account, no file outside the committed tree, no macOS-only path or filename case, no real network or PTY, no fixed timing.${checklist}`,
+    ].join('\n');
+  }
+
   // Preparation and child continuation share the normal task permission and tool profiles.
   buildParentPreparationDirective(opts = {}) {
     if (!(opts.parentPreparation ?? opts.task?.isObjective)) return '';
@@ -582,11 +664,11 @@ class BaseTaskAgent {
   // (Claude joins with blank lines inside one template, Codex/Pi splice array lines, and Pi
   // places the directives after its grep note where Codex places them before), so each
   // buildPrompt() keeps ownership of where the slots land.
-  //   directives — [vcs, tagDesc, processSafety, resourceLimits, computerUse, kbHygiene, kbDiscovery, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation]
+  //   directives — [vcs, tagDesc, processSafety, resourceLimits, computerUse, kbHygiene, kbDiscovery, ciTests, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation]
   //                in that fixed order, empties dropped, so absent optional data (no opts.vcsSettings,
   //                nothing blank in opts.tagDescriptions, no available opts.computerUse, no compose
-  //                opts.kbMode for a CODING opts.task, no bypass opts.cowboyChain) emits no directive
-  //                and no stray separator. resourceLimits reads opts.agentLimits and is never empty.
+  //                opts.kbMode for a CODING opts.task, no opts.ciTests, no bypass opts.cowboyChain) emits
+  //                no directive and no stray separator. resourceLimits reads opts.agentLimits and is never empty.
   //   clarify    — deliberately NOT part of `directives`: it must sit directly beside the
   //                adapter's own plan-ready instruction (see buildClarifyDirective's ORDERING
   //                note). Execution policies use mode-specific communication instead;
@@ -612,6 +694,7 @@ class BaseTaskAgent {
     const kbHygiene = harness.softwareOnly ? this.buildKbHygieneDirective(completion)
       : 'Keep reusable project facts in the knowledge base and task-specific evidence in the resolution.';
     const kbDiscovery = harness.softwareOnly ? this.buildKbDiscoveryDirective({ ...opts, ...completion }) : '';
+    const ciTests = harness.software ? this.buildCiTestDirective({ ...opts, ...variant }) : '';
     const taskStatus = this.buildTaskStatusDirective(variant);
     const followUps = this.buildFollowUpDirective(completion);
     const cowboy = this.buildCowboyDirective({ ...opts, ...variant });
@@ -626,13 +709,14 @@ class BaseTaskAgent {
       computerUse,
       kbHygiene,
       kbDiscovery,
+      ciTests,
       taskStatus,
       followUps,
       cowboy,
       parentPreparation,
       objectiveContinuation,
       preset,
-      directives: [vcs, tagDesc, preset, processSafety, resourceLimits, computerUse, kbHygiene, kbDiscovery, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation].filter(Boolean),
+      directives: [vcs, tagDesc, preset, processSafety, resourceLimits, computerUse, kbHygiene, kbDiscovery, ciTests, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation].filter(Boolean),
       clarify,
     };
   }

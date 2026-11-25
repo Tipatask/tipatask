@@ -15,10 +15,25 @@ const { createRemoteControlConsent } = require('./remote-control-consent');
 const { connectDeviceRelay, captureSessionOwner, runId } = require('./device-relay');
 
 const token = (id, revision = 1) => `synthetic.${Buffer.from(JSON.stringify({ id, revision, exp: 4000000000 })).toString('base64url')}.signature`;
+// The relay learns of a consent change from a real directory watcher, and macOS can drop a watcher
+// event on a busy disk: it is then never delivered, however long the wait. A wait that is not over
+// after a moment therefore touches the consent records again. Another event on that directory
+// makes the watcher fire again, and the relay's sync is driven by state, so the repeat changes
+// nothing once the first event was handled. The cap only ends a run that is really stuck.
+let consentDir = null;
+function nudgeConsentWatch() {
+  if (!consentDir) return;
+  const now = new Date();
+  try {
+    for (const name of fs.readdirSync(consentDir)) fs.utimesSync(path.join(consentDir, name), now, now);
+  } catch { /* a write is replacing a record at this moment; the next nudge sees it */ }
+}
 const waitFor = async predicate => {
-  const end = Date.now() + 4000;
+  const end = Date.now() + 20000;
+  let nudgeAt = Date.now() + 250;
   while (!predicate()) {
     assert.ok(Date.now() < end, 'isolated relay condition timed out');
+    if (Date.now() >= nudgeAt) { nudgeConsentWatch(); nudgeAt = Date.now() + 250; }
     await new Promise(resolve => setTimeout(resolve, 5));
   }
 };
@@ -31,10 +46,12 @@ async function fixture(t) {
   process.env.TIPATASK_USER_DATA = root;
   const machineIdPath = path.join(root, 'machine'); fs.writeFileSync(machineIdPath, 'isolated-device');
   const consent = createRemoteControlConsent({ userDataRoot: root, machineIdPath });
+  consentDir = path.join(root, 'remote-control');
   const servers = []; const projects = []; const sessions = new Map(); const events = new EventEmitter();
   const held = []; let hold = false; let queued; let delayed; let finish; let cancelled = 0;
   let relay; let stopConsentWatch;
   t.after(async () => {
+    consentDir = null;
     relay?.close();
     stopConsentWatch?.();
     for (const { server, wss } of servers) {

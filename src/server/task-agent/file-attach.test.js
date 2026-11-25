@@ -346,6 +346,45 @@ test('localizeFileRefs never matches image markdown syntax (negative lookbehind)
   }
 });
 
+test('localizeFileRefs saves Python source with a MIME-allowed extension', async () => {
+  const source = Buffer.from('print("hello")\n');
+  const responses = {
+    '/api/projects/1/files/45': { type: 'text/plain; charset=utf-8', name: 'script.py' },
+    '/api/projects/1/files/46': { type: 'text/x-python', name: 'mislabeled.exe' },
+    '/api/projects/1/files/47': { type: 'text/plain', name: 'notes.exe' },
+  };
+  const fileServer = await startFileServer((req, res) => {
+    const attachment = responses[req.url];
+    if (!attachment) return res.writeHead(404).end();
+    res.writeHead(200, {
+      'Content-Type': attachment.type,
+      'Content-Disposition': `attachment; filename="${attachment.name}"`,
+    });
+    res.end(source);
+  });
+
+  try {
+    await withConfig({ API_BASE_URL: fileServer.baseUrl, API_TOKEN: 'test-token' }, async (projectRoot) => {
+      const result = await localizeFileRefs({
+        taskId: 'C1247',
+        prompt: Object.keys(responses).map(url => `[source](${url})`).join('\n'),
+        taskCommentsBlock: '',
+        projectRoot,
+      });
+      const dir = path.join(projectRoot, '.tipatask', 'files', 'C1247');
+      const filenames = ['45-script.py', '46-mislabeled.py', '47-notes.txt'];
+      assert.deepEqual(fs.readdirSync(dir).filter(name => name !== '.gitignore').sort(), filenames);
+      for (const filename of filenames) {
+        const localPath = path.join(dir, filename);
+        assert.ok(result.prompt.includes(`@${localPath}`));
+        assert.deepEqual(fs.readFileSync(localPath), source);
+      }
+    });
+  } finally {
+    await fileServer.close();
+  }
+});
+
 test('localizeFileRefs skips a response whose Content-Type is not in the doc allowlist (e.g. spoofed image extension)', async () => {
   const warnings = [];
   const originalWarn = console.warn;

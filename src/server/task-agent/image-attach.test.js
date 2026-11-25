@@ -251,6 +251,32 @@ test('localizeImageRefs materializes embedded data images without API access (C1
   });
 });
 
+test('localizeImageRefs downloads an AVIF attachment with its AVIF extension', async () => {
+  const avif = Buffer.from('00000018667479706176696600000000617669666d696631', 'hex');
+  const imageServer = await startImageServer((req, res) => {
+    if (req.url !== '/api/projects/1/images/45') return res.writeHead(404).end();
+    res.writeHead(200, { 'Content-Type': 'image/avif' });
+    res.end(avif);
+  });
+
+  try {
+    await withConfig({ API_BASE_URL: imageServer.baseUrl, API_TOKEN: 'test-token' }, async (projectRoot) => {
+      const result = await localizeImageRefs({
+        taskId: 'C1011',
+        prompt: '![sample](/api/projects/1/images/45)',
+        taskCommentsBlock: '',
+        projectRoot,
+      });
+      assert.match(result.prompt, /^sample: @.+\.avif$/);
+      const localPath = result.prompt.slice('sample: @'.length);
+      assert.equal(path.dirname(localPath), path.join(projectRoot, '.tipatask', 'images', 'C1011'));
+      assert.deepEqual(fs.readFileSync(localPath), avif);
+    });
+  } finally {
+    await imageServer.close();
+  }
+});
+
 test('localizeImageRefs leaves external image refs untouched', async () => {
   const originalFetch = global.fetch;
   const fetchedUrls = [];

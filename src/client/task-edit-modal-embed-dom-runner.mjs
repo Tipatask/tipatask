@@ -160,14 +160,14 @@ try {
   const status = () => embedRow().querySelector('.modal-desc-embed-status');
 
   // 1. The Embed row sits under the description card (after its Show description toggle), above
-  // the tab strip, with the composer's trigger: paperclip, "Embed", caret, a tooltip of its own.
+  // the tab strip, with the composer's trigger: paperclip, "File", caret, a tooltip of its own.
   await board.openTaskEditModal('TPT1');
   const body = [...modal().querySelector('.modal-scroll-body').children].map(el => el.classList[0]);
   assert.equal(body.indexOf('modal-desc-embed'), body.indexOf('modal-desc-toggle') + 1);
   assert.equal(body.indexOf('modal-tabs'), body.indexOf('modal-desc-embed') + 1);
   assert.equal(embedRow().hidden, false);
-  assert.equal(trigger().querySelector('.embed-menu-label').textContent, 'Embed');
-  assert.equal(trigger().title, 'Attach an image or file to the description');
+  assert.equal(trigger().querySelector('.embed-menu-label').textContent, 'File');
+  assert.equal(trigger().title, 'Attach a file, image, or project artifact to the description');
   assert.equal(status().hidden, true);
 
   // 2. The menu opens on <body> (the scroll body would clip it), as a portaled menu the modal's

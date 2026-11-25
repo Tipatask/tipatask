@@ -414,14 +414,14 @@ test('task-chat.js: Embed, paste and drop come from the shared helpers, with no 
   assert.match(taskChat, /scroller\.addEventListener\('load', \(e\) => \{\s*if \(e\.target && e\.target\.tagName === 'IMG' && stickToBottom\) scrollToBottom\(false\);\s*\}, true\);/);
 });
 
-test('chat-ui.js: the objective chat uses the same shared Embed control', () => {
+test('chat-ui.js: the objective chat uses the same shared File control', () => {
   const chatUi = read('./chat-ui.js');
   const embed = read('./embed-menu.js');
   assert.match(chatUi, /from '\.\/embed-menu\.js'/);
   assert.match(chatUi, /attachEmbedMenu\(embedWrap, chatInput/);
   assert.ok(!chatUi.includes('_embedMenuCleanup'), 'the menu teardown lives in embed-menu.js');
   assert.ok(!chatUi.includes('import-submenu--up'), 'the menu is built in embed-menu.js');
-  assert.match(embed, /uploadImageFile\(file, textarea, null, imageOpts\)/);
+  assert.match(embed, /uploadImageFile\(image, textarea, null, imageOpts\)/);
   assert.match(embed, /uploadAttachmentFile\(file, target, fileOpts\)/);
   // (TPT9346) The board hands its image upload over; the shared module never imports the board,
   // so the Task Edit modal can mount it without loading task-board.js.

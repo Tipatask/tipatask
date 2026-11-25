@@ -18,7 +18,15 @@ const NOT_OK_RE = /^\s*not ok\s+\d+\s*-?\s*(.*?)\s*(?:#\s*(?:SKIP|TODO).*)?$/i;
 const OK_RE = /^\s*ok\s+\d+/;
 const PLAN_RE = /^#\s*(pass|fail)\s+(\d+)/;
 
-// TAP (node --test's non-TTY default): every `not ok N - name` line, deduplicated. Names
+// The node:test spec reporter: `✖ name (1.2ms)` for a failed test or suite, `✔ name (1.2ms)` for a
+// passed one, then the totals `ℹ tests N`, `ℹ pass N`, `ℹ fail N`. Colours are stripped first.
+const ANSI_RE = /\u001b\[[0-9;]*m/g;
+const SPEC_FAIL_RE = /^\s*✖ (.+) \(\d+(?:\.\d+)?ms\)\s*$/;
+const SPEC_PASS_RE = /^\s*✔ .+ \(\d+(?:\.\d+)?ms\)\s*$/;
+const SPEC_TOTAL_RE = /^ℹ (tests|pass|fail) (\d+)\s*$/;
+
+// TAP (node --test's default into a pipe up to Node 22, and `--test-reporter=tap` on any
+// version): every `not ok N - name` line, deduplicated. Names
 // keep their leading indentation stripped, so nested subtests and file-level rows both
 // count. `hasTap` false = no ok/not ok lines at all → callers fall back to exit code.
 function parseTap(text) {
@@ -39,6 +47,54 @@ function parseTap(text) {
     if (p) { if (p[1] === 'pass') passed = Number(p[2]); else failed = Number(p[2]); }
   }
   return { failures, ok, notOk, hasTap, passed, failed };
+}
+
+// The spec reporter (node --test's default from Node 23 on, even into a pipe): every `✖ name (Nms)`
+// row, deduplicated — a failed test is printed twice, in the stream and again under "failing
+// tests:". Skipped (`﹣`) and todo (`⚠`) rows are not failures. `hasSpec` needs the `ℹ tests N`
+// total, which only node:test prints: mocha also writes `✔ name (45ms)`, and reading its output as
+// a clean run would let a failing merge through. Totals that report failures no row names are not
+// trusted either. Unrecognised output leaves the verdict to the exit code.
+function parseSpec(text) {
+  const failures = [];
+  const seen = new Set();
+  const totals = {};
+  let ok = 0; let notOk = 0;
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.replace(ANSI_RE, '').replace(/\r$/, '');
+    const m = SPEC_FAIL_RE.exec(line);
+    if (m) {
+      notOk++;
+      if (!seen.has(m[1])) { seen.add(m[1]); failures.push(m[1]); }
+      continue;
+    }
+    if (SPEC_PASS_RE.test(line)) { ok++; continue; }
+    const t = SPEC_TOTAL_RE.exec(line);
+    if (t) totals[t[1]] = Number(t[2]);
+  }
+  const passed = totals.pass ?? null;
+  const failed = totals.fail ?? null;
+  const hasSpec = totals.tests !== undefined && !(failed > 0 && failures.length === 0);
+  return { failures, ok, notOk, hasSpec, passed, failed };
+}
+
+// What a test run printed, whichever node:test reporter wrote it: TAP rows, spec rows, or both
+// when a project's script runs two suites. `hasTap` means "per-test results were recognised" in
+// either format (the name predates the spec reporter); `format` says which.
+function parseTestOutput(text) {
+  const tap = parseTap(text);
+  const spec = parseSpec(text);
+  if (!spec.hasSpec) return { ...tap, format: tap.hasTap ? 'tap' : null };
+  if (!tap.hasTap) {
+    return { failures: spec.failures, ok: spec.ok, notOk: spec.notOk, hasTap: true, passed: spec.passed, failed: spec.failed, format: 'spec' };
+  }
+  const known = new Set(tap.failures);
+  const sum = (a, b) => (a == null && b == null ? null : (a || 0) + (b || 0));
+  return {
+    failures: [...tap.failures, ...spec.failures.filter(name => !known.has(name))],
+    ok: tap.ok + spec.ok, notOk: tap.notOk + spec.notOk, hasTap: true,
+    passed: sum(tap.passed, spec.passed), failed: sum(tap.failed, spec.failed), format: 'tap+spec',
+  };
 }
 
 function diffFailures(baseline = [], post = []) {
@@ -125,7 +181,7 @@ function runCheck({ repoPath, script, node, npmCli, binDir, timeoutMs = DEFAULT_
       if (settled) return; settled = true;
       clearTimeout(timer);
       const stdout = out.text(); const stderr = err.text();
-      resolve({ status, timedOut, stdout, stderr, tap: parseTap(stdout + '\n' + stderr), durationMs: Date.now() - started, command: [command, ...argv].join(' '), error: spawnError ? spawnError.message : null });
+      resolve({ status, timedOut, stdout, stderr, results: parseTestOutput(stdout + '\n' + stderr), durationMs: Date.now() - started, command: [command, ...argv].join(' '), error: spawnError ? spawnError.message : null });
     };
     try {
       const spec = !npmCli && isWin ? winExecSpec(command, argv, { isWin, env }) : { command, args: argv, options: {} };
@@ -143,14 +199,15 @@ function runCheck({ repoPath, script, node, npmCli, binDir, timeoutMs = DEFAULT_
   });
 }
 
-// One phase for one repo: { test:{status,timedOut,failures,hasTap,output}, build:{...} }.
+// One phase for one repo: { test:{status,timedOut,failures,hasTap,format,output}, build:{...} }.
+// hasTap: per-test results were recognised, as TAP or as the spec reporter (parseTestOutput()).
 async function runRepoChecks({ repo, enabled = { test: true, build: true }, resolved, timeoutMs, onOutput, signal, spawnFn }) {
   const result = { test: null, build: null };
   if (!resolved || !resolved.node) return { ...result, error: resolved ? resolved.error : 'node not resolved' };
   const scripts = repo.checks || {};
   if (enabled.test && scripts.test) {
     const r = await runCheck({ repoPath: repo.path, script: 'test', node: resolved.node, npmCli: resolved.npmCli, binDir: resolved.binDir, timeoutMs, onOutput, signal, spawnFn });
-    result.test = { status: r.status, timedOut: r.timedOut, failures: r.tap.failures, hasTap: r.tap.hasTap, passed: r.tap.passed, failed: r.tap.failed, durationMs: r.durationMs, output: (r.stdout + (r.stderr ? '\n' + r.stderr : '')).slice(-20000), error: r.error };
+    result.test = { status: r.status, timedOut: r.timedOut, failures: r.results.failures, hasTap: r.results.hasTap, format: r.results.format, passed: r.results.passed, failed: r.results.failed, durationMs: r.durationMs, output: (r.stdout + (r.stderr ? '\n' + r.stderr : '')).slice(-20000), error: r.error };
   }
   if (enabled.build && scripts.build && !(signal && signal.aborted)) {
     const r = await runCheck({ repoPath: repo.path, script: 'build', node: resolved.node, npmCli: resolved.npmCli, binDir: resolved.binDir, timeoutMs, onOutput, signal, spawnFn });
@@ -166,7 +223,7 @@ function compareChecks(baseline, post) {
     const baseFailures = baseline && baseline.test ? baseline.test.failures : [];
     const d = diffFailures(baseFailures, post.test.failures);
     const hadBaseline = !!(baseline && baseline.test);
-    const exitBlocking = post.test.status !== 0 && !post.test.hasTap; // no TAP → judge by exit code
+    const exitBlocking = post.test.status !== 0 && !post.test.hasTap; // no recognised results → judge by exit code
     const blocking = d.newFailures.length > 0 || (!hadBaseline && post.test.status !== 0) || exitBlocking || !!post.test.timedOut;
     report.test = { ...post.test, stdoutTail: post.test.output, baselineFailures: baseFailures, newFailures: d.newFailures, preExisting: d.preExisting, fixed: d.fixed, hadBaseline, blocking };
     if (blocking) report.blocking = true;
@@ -180,4 +237,4 @@ function compareChecks(baseline, post) {
   return report;
 }
 
-module.exports = { parseTap, diffFailures, resolveNodeForChecks, runCheck, runRepoChecks, compareChecks, OutputCapture, DEFAULT_TIMEOUT_MS };
+module.exports = { parseTap, parseSpec, parseTestOutput, diffFailures, resolveNodeForChecks, runCheck, runRepoChecks, compareChecks, OutputCapture, DEFAULT_TIMEOUT_MS };

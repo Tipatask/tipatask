@@ -6441,6 +6441,9 @@
   .new-task-form .new-task-field textarea {
     min-height: 9rem;
   }
+  .new-task-file {
+    align-self: flex-end;
+  }
   .new-task-form .audio-rec-btn {
     margin-bottom: 0.35rem;
   }

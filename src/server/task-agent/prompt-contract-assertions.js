@@ -51,6 +51,25 @@ function kbDiscovery(text) {
   once(text, /(?:Tag this task|tag to this task)[^\n]*(?:before|tt-\*)/, 'the task is tagged with the touched modules exactly once');
 }
 
+// (TPT9393) A project that holds the Task App source: the whole suite runs after the last source or
+// test change and before the commit, a focused run is not a CI result, and new tests follow the
+// project's CI checklist. `doc: false` is a project whose knowledge base has no such checklist.
+function ciTests(text, { doc = true } = {}) {
+  once(text, /CI-compatible tests:/, 'CI test directive delivered exactly once');
+  once(text, /After your last change[^\n]*before the commit[^\n]*run the whole suite/, 'the whole suite runs after the last change and before the commit, exactly once');
+  once(text, /`node scripts\/run-tests\.js`/, 'the suite runner is named exactly once');
+  assert.match(text, /run the whole suite[^\n]*pinned/, 'the suite runs under the pinned Node');
+  once(text, /`# fail 0`[^\n]*no guard violation/, 'zero failures and no guard violation are required exactly once');
+  once(text, /focused run[^\n]*is not a CI result/, 'a focused run is not a CI result, exactly once');
+  assert.match(text, /(?:test file you never opened|tests in other files read that source)/, 'tests in other files read the changed source');
+  once(text, /(?:add or change a test|New or changed tests)/, 'new and changed tests have their own rule exactly once');
+  assert.match(text, /no signed-in account/, 'tests need no signed-in account');
+  assert.match(text, /no real network/, 'tests need no real network');
+  assert.match(text, /no fixed timing/, 'tests need no fixed timing');
+  if (doc) once(text, /ai\/architecture\/tt-ci\.md[^\n]*Writing tests that pass on GitHub/, 'the CI test checklist is named exactly once');
+  else assert.doesNotMatch(text, /tt-ci\.md/, 'no checklist is named when the project has none');
+}
+
 function taskStatus(text) {
   once(text, /Complete only when/, 'completion requires this task scope and verification exactly once');
   assert.match(text, /(?:this task's scope and checks pass|that scope is fully implemented and relevant checks pass)/);
@@ -126,4 +145,4 @@ function vcsOff(text) {
   assert.match(text, /Never[^\n]*(?:attribution|Co-Authored-By)/);
 }
 
-module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, kbDiscovery, taskStatus, followUps, cowboyChain, computerUse, tagBackfill, vcsOff };
+module.exports = { projectFixture, once, processSafety, resourceLimits, kbHygiene, kbDiscovery, ciTests, taskStatus, followUps, cowboyChain, computerUse, tagBackfill, vcsOff };

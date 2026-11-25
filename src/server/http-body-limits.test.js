@@ -170,6 +170,34 @@ test('chat and image routes reject declared over-limit envelopes before mutation
   } finally { await closeServer(server); }
 });
 
+test('attachment upload routes reject invalid fields and unlisted types before calling the backend', async () => {
+  const backend = backendWithWrites();
+  const { server, port } = await startServer(backend);
+  try {
+    for (const [route, valid, unsupported] of [
+      ['/api/images', { filename: 'image.avif', mimeType: 'image/avif', data: 'YQ==' },
+        { filename: 'image.svg', mimeType: 'image/svg+xml' }],
+      ['/api/files', { filename: 'script.py', mimeType: 'text/x-python', data: 'YQ==' },
+        { filename: 'program.exe', mimeType: 'application/x-msdownload' }],
+    ]) {
+      const rejected = await request(port, 'POST', route, JSON.stringify({ ...valid, ...unsupported }));
+      assert.equal(rejected.status, 400);
+      assert.equal(JSON.parse(rejected.body).code, 'INVALID_MIME');
+
+      for (const field of ['filename', 'mimeType', 'data']) {
+        for (const value of ['', ' ', 42]) {
+          const result = await request(port, 'POST', route, JSON.stringify({ ...valid, [field]: value }));
+          assert.equal(result.status, 400, `${route} ${field}=${JSON.stringify(value)}`);
+          assert.equal(JSON.parse(result.body).code, field === 'mimeType' ? 'INVALID_MIME' : 'INVALID_DATA');
+        }
+      }
+      assert.equal((await request(port, 'POST', route, 'null')).status, 400);
+    }
+    assert.equal(backend.writes.images, 0);
+    assert.equal(backend.writes.files, 0);
+  } finally { await closeServer(server); }
+});
+
 test('multi-megabyte chat and supported attachment envelopes still succeed', async () => {
   const backend = backendWithWrites();
   const { server, port } = await startServer(backend);
@@ -179,9 +207,9 @@ test('multi-megabyte chat and supported attachment envelopes still succeed', asy
     assert.equal((await request(port, 'POST', '/api/objective/chat-draft', draft)).status, 200);
     assert.equal((await request(port, 'PUT', '/api/chat-state', JSON.stringify({ messages: [text] }))).status, 200);
 
-    const image = JSON.stringify({ filename: 'a.png', mimeType: 'image/png', data: 'A'.repeat(13_600_000) });
+    const image = JSON.stringify({ filename: 'a.avif', mimeType: 'image/avif', data: 'A'.repeat(13_600_000) });
     assert.equal((await request(port, 'POST', '/api/images', image)).status, 201);
-    const file = JSON.stringify({ filename: 'a.txt', mimeType: 'text/plain', data: 'A'.repeat(1_390_000) });
+    const file = JSON.stringify({ filename: 'a.py', mimeType: 'text/x-script.python', data: 'A'.repeat(1_390_000) });
     assert.equal((await request(port, 'POST', '/api/files', file)).status, 201);
     assert.equal(backend.writes.images, 1);
     assert.equal(backend.writes.files, 1);

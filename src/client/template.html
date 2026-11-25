@@ -886,7 +886,7 @@ function openCreateMode(mode) {
     if (state.activeTabId) dismissObjectiveNotification(state.activeTabId);
   }
   // (C1258) The picked mode is already showing: a full render would rebuild identical markup
-  // AND innerHTML-wipe an in-progress composer (lost caret, closed Embed/Import popovers,
+  // AND innerHTML-wipe an in-progress composer (lost caret, closed File/Import popovers,
   // collapsed textarea). syncLeftNavFromState() is required, not optional: the tickSeen write
   // just above flips getObjectiveNavState().isReady, which drives the tick/plus icon swap.
   // Keyboard focus goes back into the modal, and the board behind it is not scrolled.
@@ -3468,7 +3468,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
 
   // ── Chat send/stop/draft handlers (from chat-ui module) ──
   // (C1258) ensureGlobalChatBindings() carries the pieces that must bind regardless of section
-  // (bind-once voice shortcut/file-link delegate, the Embed-menu teardown, the one-shot
+  // (bind-once voice shortcut/file-link delegate, the File menu teardown, the one-shot
   // obj-image-preview listener) — kept unconditional. attachChatHandlers() itself wires up
   // composer-only controls (tab bar, model select, tooltips, etc.) that don't exist in the DOM
   // at all on a board render, so it's now gated to the New section — was C1256's answer to "is
@@ -3707,7 +3707,16 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   // New Task draft auto-save (immediate — syncs state.manualTaskState + sessionStorage)
   const taskTitleEl = newTaskForm?.querySelector('#new-task-title');
   const taskDescEl = newTaskForm?.querySelector('#new-task-desc');
-  if (taskDescEl) attachImagePaste(taskDescEl);
+  if (taskDescEl) {
+    const { attachEmbedMenu, attachFileDrop } = window.TipTask.embedMenu;
+    const target = () => taskDescEl.isConnected ? taskDescEl : null;
+    attachEmbedMenu(newTaskForm.querySelector('.new-task-file .embed-menu-wrap'), target, {
+      portal: true,
+      keepFocus: true,
+    });
+    attachFileDrop(taskDescEl, target);
+    attachImagePaste(taskDescEl);
+  }
   if (taskTitleEl) attachAudioRecorder(taskTitleEl);
   if (taskDescEl) attachAudioRecorder(taskDescEl);
   const taskPriorityEl = newTaskForm?.querySelector('#new-task-priority');
@@ -3719,7 +3728,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       saveNewTaskDraft();
     }});
   }
-  if (taskTitleEl && taskDescEl && taskPriorityCombo) {
+  if (taskTitleEl && taskDescEl) {
     // (C1245) Single writer (saveNewTaskDraft, task-board.js) now owns the actual
     // sessionStorage write — this just syncs the DOM-owned fields into state (lazily
     // creating it so a sprint/type-only-first interaction is never lost, same as the
@@ -3732,13 +3741,13 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       const st = ensureManualTaskState();
       st.title = taskTitleEl.value;
       st.description = taskDescEl.value;
-      st.priority = taskPriorityCombo.dataset.current;
+      if (taskPriorityCombo) st.priority = taskPriorityCombo.dataset.current;
       st.type = taskTypeEl ? taskTypeEl.value : 'task';
       saveNewTaskDraft();
     };
     taskTitleEl.addEventListener('input', saveTaskDraft);
     taskDescEl.addEventListener('input', saveTaskDraft);
-    taskPriorityCombo.addEventListener('sprint-combo:change', saveTaskDraft);
+    taskPriorityCombo?.addEventListener('sprint-combo:change', saveTaskDraft);
     if (taskTypeEl) taskTypeEl.addEventListener('change', saveTaskDraft);
   }
 

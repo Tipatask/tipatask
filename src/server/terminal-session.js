@@ -2102,6 +2102,10 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   // compose project's CODING kickoffs carry the KB discovery directive
   // (BaseTaskAgent#buildKbDiscoveryDirective()). null for every other project.
   const kbMode = BaseTaskAgent.resolveKbMode(session.projectPath || config.PROJECT_ROOT);
+  // (TPT9393) The Task App's own source inside this project (a standalone checkout of it, or the
+  // ai/todo/server mount): its kickoffs carry the CI-compatible tests directive
+  // (BaseTaskAgent#buildCiTestDirective()). null for every other project.
+  const ciTests = BaseTaskAgent.resolveCiTests(session.projectPath || config.PROJECT_ROOT);
   // The VCS read above has already warmed this project detail row. Providers use
   // the checkout selection when the backend has no work-domain metadata.
   const { harness } = await readProjectHarness(opts.backend, session.projectPath || config.PROJECT_ROOT);
@@ -2126,7 +2130,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     });
     session._permissionGate.locale = sessionLocale(session);
   }
-  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, kbMode, harness, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode && !session.parentPreparation, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate, backend: opts.backend, cowboyChain: session.cowboyChain, objectiveChain: session.objectiveChain, parentPreparation: session.parentPreparation, computerUse });
+  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, kbMode, ciTests, harness, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode && !session.parentPreparation, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate, backend: opts.backend, cowboyChain: session.cowboyChain, objectiveChain: session.objectiveChain, parentPreparation: session.parentPreparation, computerUse });
   if (session.objectiveChain && !session.parentPreparation) {
     // Admission can queue a child for some time. Recheck its tree after all launch gates.
     const parent = await opts.backend.getTask(session.objectiveChain.rootTaskId);

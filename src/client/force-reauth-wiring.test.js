@@ -28,6 +28,18 @@ function extractClosureFunction(source, name) {
   return source.slice(start, end);
 }
 
+// Source text from `from` to the bracket that closes one block: with depth 0 the block that
+// opens after `from` (a handler body, a call's argument list), with depth 1 the block `from`
+// already sits in (an object literal). The slice follows the code, so lines added inside the
+// block stay inside it — a fixed `from + N` character window drops them once the block grows.
+function sliceBlock(source, from, { open = '{', close = '}', depth = 0 } = {}) {
+  for (let i = from; i < source.length && depth >= 0; i++) {
+    if (source[i] === open) depth++;
+    else if (source[i] === close && --depth === 0) return source.slice(from, i + 1);
+  }
+  assert.fail(`no block to slice at offset ${from}: ${close} closes nothing there, or is missing`);
+}
+
 const template = readSource(CLIENT_DIR, 'template.html');
 const setupModal = readSource(CLIENT_DIR, 'setup-modal.js');
 const preload = readSource(SERVER_ROOT, 'preload.js');
@@ -36,7 +48,7 @@ const mainJs = readSource(SERVER_ROOT, 'main.js');
 test('Project menu item sends force-reauth to the window that owns the menu click', () => {
   const idx = mainJs.indexOf("label: mt('menu.reauthenticate')");
   assert.ok(idx >= 0, 'menu.reauthenticate item not found in main.js');
-  const item = mainJs.slice(idx, idx + 300);
+  const item = sliceBlock(mainJs, idx, { depth: 1 }); // to the end of this menu item's object
   assert.match(item, /window\.webContents\.send\('force-reauth'\)/);
   assert.match(item, /!window\.isDestroyed\(\)/, 'must guard against a destroyed window');
 });
@@ -201,7 +213,8 @@ test('setup-modal forwards chooseAccount into setupAuthWeb and resets it on a fr
   assert.match(openFn, /_chooseAccount = false/, 'a plain setup open() must not inherit a prior reauth session\'s flag');
   const switchIdx = setupModal.indexOf("'#setup-switch-btn'");
   assert.ok(switchIdx >= 0);
-  assert.match(setupModal.slice(switchIdx, switchIdx + 300), /_chooseAccount = true/,
+  // The whole click handler, however many fields it resets before asking for the chooser.
+  assert.match(sliceBlock(setupModal, switchIdx), /_chooseAccount = true/,
     '"Use a different account" must request the chooser');
 });
 
@@ -209,7 +222,7 @@ test('setupAuthWeb carries chooseAccount preload → main → authenticate()', (
   assert.match(preload, /setupAuthWeb:\s*\(apiBaseUrl, opts\)\s*=>\s*inv\('setup:auth-web', \{ apiBaseUrl, chooseAccount: !!\(opts && opts\.chooseAccount\) \}\)/);
   const idx = mainJs.indexOf("ipcMain.handle('setup:auth-web'");
   assert.ok(idx >= 0, 'setup:auth-web handler not found');
-  const handler = mainJs.slice(idx, idx + 400);
+  const handler = sliceBlock(mainJs, idx, { open: '(', close: ')' }); // the whole ipcMain.handle(...) call
   assert.match(handler, /\{ apiBaseUrl, chooseAccount \}/);
   assert.match(handler, /authenticate\(apiBaseUrl, \{ chooseAccount: !!chooseAccount \}\)/);
 });

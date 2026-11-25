@@ -3330,6 +3330,32 @@ test('terminal kickoff threads the project KB_MODE into the spawn opts for the K
   assert.deepEqual(roots, cases.map(() => config.PROJECT_ROOT), 'a session without a projectPath reads the startup project');
 });
 
+// (TPT9393) The Task App's own source inside the project is resolved once per spawn from the
+// session's project root and threaded into getSpawnSpec() as opts.ciTests; the kickoff then carries
+// the CI-compatible tests directive. A project without that source resolves to null and gets none.
+test('terminal kickoff threads the project CI test suite into the spawn opts for the CI test directive', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const roots = [];
+  let suite = null;
+  t.mock.method(BaseTaskAgent, 'resolveCiTests', (root) => { roots.push(root); return suite; });
+  const cases = [
+    { suite: { dir: 'ai/todo/server', doc: 'ai/architecture/tt-ci.md' }, note: true },
+    { suite: null, note: false },
+  ];
+  for (const c of cases) {
+    suite = c.suite;
+    const captures = [];
+    const kickoff = await startClaudeKickoff(t, { captureSpawn: (agent, prompt, opts) => captures.push({
+      ciTests: opts.ciTests, prompt: agent.buildPrompt(prompt, opts) }) });
+    t.after(() => stopSession(kickoff.session));
+    assert.equal(captures.length, 1);
+    assert.deepEqual(captures[0].ciTests, c.suite, JSON.stringify(c));
+    assert.equal(/CI-compatible tests:/.test(captures[0].prompt), c.note, JSON.stringify(c));
+    assert.equal(captures[0].prompt.includes('ai/architecture/tt-ci.md'), c.note, JSON.stringify(c));
+  }
+  assert.deepEqual(roots, cases.map(() => config.PROJECT_ROOT), 'a session without a projectPath reads the startup project');
+});
+
 test('terminal kickoff beside 19 live terminals still states a sub-agent cap of at least one', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
   const sessions = new Map(Array.from({ length: 19 }, (_, n) => [`live-${n}`,

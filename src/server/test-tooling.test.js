@@ -10,7 +10,7 @@ const { createPackage, createPackageWithOptions, uncache } = require('@electron/
 const { WINDOWS_PTY_BINARIES, WINDOWS_PTY_SCRIPTS } = require('../../scripts/windows-pty');
 const { FileMatcher } = require('app-builder-lib/out/fileMatcher');
 const afterPack = require('../../scripts/check-packaged-tests');
-const { discoverTests } = require('../../scripts/run-tests');
+const { discoverTests, reporterArgs } = require('../../scripts/run-tests');
 const pkg = require('../../package.json');
 
 function scratch(t) {
@@ -40,11 +40,11 @@ function runnerFixture(t) {
         ${code}
       `);
     },
-    run(overrides = {}) {
+    run(overrides = {}, args = []) {
       const env = { ...process.env, ...overrides, NODE_V8_COVERAGE: '' };
       delete env.NODE_TEST_CONTEXT;
       delete env.NODE_OPTIONS;
-      const result = spawnSync(process.execPath, [path.join(dir, 'scripts', 'run-tests.js')], {
+      const result = spawnSync(process.execPath, [path.join(dir, 'scripts', 'run-tests.js'), ...args], {
         cwd: os.tmpdir(), env, encoding: 'utf8', timeout: 20000,
       });
       assert.equal(result.error, undefined, result.stderr);
@@ -116,6 +116,30 @@ test('runner propagates assertion failures and cleans temporary state', t => {
   const result = fixture.run();
   assert.equal(result.status, 1);
   assert.match(result.stdout, /runner assertion sentinel/);
+});
+
+// `node --test` writes TAP into a pipe up to Node 22 and its spec reporter from Node 23 on. Logs,
+// the CI job and the export's test gate read TAP, so the runner names the reporter itself.
+test('runner writes TAP when its output is not a terminal, unless the caller names a reporter', t => {
+  assert.deepEqual(reporterArgs([], false), ['--test-reporter=tap']);
+  assert.deepEqual(reporterArgs([], undefined), ['--test-reporter=tap']);
+  assert.deepEqual(reporterArgs(['--test-name-pattern=x', '--test-reporter-destination=out.txt'], false), ['--test-reporter=tap']);
+  assert.deepEqual(reporterArgs([], true), [], 'a terminal keeps the version default');
+  for (const argv of [['--test-reporter=spec'], ['--test-reporter', 'dot'], ['--test-name-pattern=x', '--test-reporter=tap']]) {
+    assert.deepEqual(reporterArgs(argv, false), [], argv.join(' '));
+  }
+  const fixture = runnerFixture(t);
+  fixture.write("const { test } = require('node:test'); test('named pass', () => {}); test('named failure', () => { throw new Error('x'); });");
+  const piped = fixture.run();
+  assert.equal(piped.status, 1);
+  assert.match(piped.stdout, /^not ok \d+ - named failure$/m);
+  assert.match(piped.stdout, /^ok \d+ - named pass$/m);
+  assert.match(piped.stdout, /^# pass 1$/m);
+  assert.match(piped.stdout, /^# fail 1$/m);
+  const spec = fixture.run({}, ['--test-reporter=spec']);
+  assert.equal(spec.status, 1);
+  assert.match(spec.stdout, /✖ named failure \(/);
+  assert.doesNotMatch(spec.stdout, /^not ok /m);
 });
 
 test('runner fails for swallowed guard violations in inherited Node children', t => {

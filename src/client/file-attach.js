@@ -1,5 +1,5 @@
 // ── File attachments (C1246) ──
-// Generic (non-image) file upload for the Embed ▾ "Other file" row and file drop (embed-menu.js),
+// Generic (non-image) file upload for the File dropdown's "Other file" row and file drop,
 // backed by the task_files API store. Deliberately simpler than task-board.js's image upload path
 // (uploadImageFile/_readFileBase64/_imagePasteTargets): no WS blob-swap optimistic preview,
 // because there is nothing to preview — a successful upload becomes a plain
@@ -12,54 +12,42 @@ import { t } from './i18n.js';
 
 const MAX_FILE_BYTES = 1024 * 1024; // 1 MB — mirrors api/src/routes/files.js MAX_FILE_BYTES
 
-// Mirrors api/src/routes/files.js FILE_MIME_EXT — the API is the real enforcement point, this
-// is only for a fast, friendly client-side reject before spending a round trip.
-const ALLOWED_MIME = new Set([
-  'application/pdf',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  'application/vnd.ms-powerpoint',
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  'application/vnd.oasis.opendocument.text',
-  'application/vnd.oasis.opendocument.spreadsheet',
-  'text/plain',
-  'text/markdown',
-  'text/csv',
-  'text/tab-separated-values',
-  'application/json',
-  'application/xml',
-  'text/xml',
-  'application/yaml',
-  'text/yaml',
-  'application/rtf',
-  'text/rtf',
-]);
-
-// Browsers frequently report file.type === '' for plain-text-ish dev files (macOS reports no
-// type for .log/.diff/.patch/.sql/.yml/.ini/.conf). Fall back to extension when that happens.
-const EXT_MIME_FALLBACK = {
-  txt: 'text/plain', log: 'text/plain', diff: 'text/plain', patch: 'text/plain',
-  sql: 'text/plain', ini: 'text/plain', conf: 'text/plain',
-  md: 'text/markdown', markdown: 'text/markdown',
-  csv: 'text/csv', tsv: 'text/tab-separated-values',
-  json: 'application/json',
-  xml: 'application/xml',
-  yml: 'text/yaml', yaml: 'text/yaml',
-  rtf: 'application/rtf',
+// Match the extensions in api/src/lib/file-validation.js. Browser MIME labels vary by OS
+// (for example .ts may be video/mp2t). Send the API's canonical MIME and let it validate the bytes.
+const FILE_MIME_EXTENSIONS = {
+  'application/pdf': ['pdf'],
+  'application/msword': ['doc'],
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['docx'],
+  'application/vnd.ms-excel': ['xls'],
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['xlsx'],
+  'application/vnd.ms-powerpoint': ['ppt'],
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['pptx'],
+  'application/vnd.oasis.opendocument.text': ['odt'],
+  'application/vnd.oasis.opendocument.spreadsheet': ['ods'],
+  'text/markdown': ['md', 'markdown'],
+  'text/csv': ['csv'],
+  'text/tab-separated-values': ['tsv'],
+  'application/json': ['json'],
+  'application/xml': ['xml'],
+  'application/yaml': ['yaml', 'yml'],
+  'application/rtf': ['rtf'],
+  'text/plain': [
+    'txt', 'js', 'mjs', 'cjs', 'jsx', 'ts', 'mts', 'cts', 'tsx', 'py', 'pyw',
+    'php', 'go', 'rs', 'java', 'c', 'h', 'cc', 'cpp', 'cxx', 'hh', 'hpp', 'hxx',
+    'sh', 'bash', 'zsh', 'sql', 'css', 'html', 'htm', 'log', 'diff', 'patch',
+    'ini', 'conf', 'cfg', 'toml',
+  ],
 };
 
-export const FILE_ACCEPT = [
-  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods',
-  '.txt', '.md', '.csv', '.tsv', '.json', '.xml', '.yaml', '.yml', '.rtf',
-  '.log', '.diff', '.patch', '.sql', '.ini', '.conf',
-].join(',');
+const MIME_BY_EXTENSION = new Map(Object.entries(FILE_MIME_EXTENSIONS)
+  .flatMap(([mime, extensions]) => extensions.map(ext => [`.${ext}`, mime])));
+
+export const FILE_ACCEPT = [...MIME_BY_EXTENSION.keys()].join(',');
 
 export function resolveFileMime(file) {
-  if (file.type && ALLOWED_MIME.has(file.type)) return file.type;
-  const ext = String(file.name || '').split('.').pop().toLowerCase();
-  return EXT_MIME_FALLBACK[ext] || null;
+  const name = String(file.name || '');
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? MIME_BY_EXTENSION.get(name.slice(dot).toLowerCase()) || null : null;
 }
 
 function _readFileBase64(file) {

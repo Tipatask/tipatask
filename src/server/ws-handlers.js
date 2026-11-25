@@ -31,6 +31,7 @@ const { readChatDraft, writeChatDraft, deleteChatDraft, readChatState, writeChat
 const { HISTORY_PROVIDERS, isHistoryId, nativeStorageRef, historyAvailability, buildSearchData, filterHistory, publicHistoryRow } = require('./chat-history');
 const { readNativeConversation } = require('./task-agent/final-message');
 const { readFilePreview } = require('./file-preview');
+const { fileMimeExtensions, imageMimeExtension, validateAttachmentUpload } = require('./attachment-mime');
 const { readProjectConfig, readVoiceSettings, buildLanguageDirective, recordLastUsedAgent, readPiEntries, buildAgentsConfigPatch, summarizeAgents, PI_PROVIDERS, piProviderEnv, piKeyEnvVars } = require('./project-config');
 const { piTaskEntryForModel } = require('./pi-custom-endpoint');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolvePiLaunch, cliSpawnSpec } = require('./spawn-utils');
@@ -1198,15 +1199,7 @@ function _httpError(message, statusCode) {
 }
 
 async function uploadImageThroughBackend(backend, parsed) {
-  if (typeof parsed.filename !== 'string' || !parsed.filename) {
-    throw _httpError('filename required', 400);
-  }
-  if (typeof parsed.mimeType !== 'string' || !parsed.mimeType.startsWith('image/')) {
-    throw _httpError('mimeType must be an image type', 400);
-  }
-  if (typeof parsed.data !== 'string' || !parsed.data) {
-    throw _httpError('data required', 400);
-  }
+  validateAttachmentUpload(parsed, imageMimeExtension);
   const r = await backend.uploadImage(parsed.filename, parsed.mimeType, parsed.data, parsed.taskKey || null);
   if (!r) {
     throw _httpError('Upload rejected by API', 502);
@@ -1218,21 +1211,8 @@ async function uploadImageThroughBackend(backend, parsed) {
   return { id: r.id, url };
 }
 
-// C1246 — task_files generic attachment upload. Mirrors uploadImageThroughBackend above, but
-// mimeType is NOT checked here against the doc allowlist (unlike the image startsWith('image/')
-// check) — the API is the single source of truth for that list (files.js's FILE_MIME_EXT) and
-// returns 400 INVALID_MIME, which apiRequest turns into a thrown err.statusCode. Duplicating the
-// allowlist here would just be one more place to keep in sync.
 async function uploadFileThroughBackend(backend, parsed) {
-  if (typeof parsed.filename !== 'string' || !parsed.filename) {
-    throw _httpError('filename required', 400);
-  }
-  if (typeof parsed.mimeType !== 'string' || !parsed.mimeType) {
-    throw _httpError('mimeType required', 400);
-  }
-  if (typeof parsed.data !== 'string' || !parsed.data) {
-    throw _httpError('data required', 400);
-  }
+  validateAttachmentUpload(parsed, fileMimeExtensions);
   const r = await backend.uploadFile(parsed.filename, parsed.mimeType, parsed.data, parsed.taskKey || null);
   if (!r) {
     throw _httpError('Upload rejected by API', 502);
@@ -1305,6 +1285,7 @@ async function handleWsImageUpload(ws, backend, msg) {
       blobUrl,
       error: err.message,
       status: err.statusCode || 500,
+      ...(err.statusCode === 400 && err.code ? { code: err.code } : {}),
     });
   }
 }
@@ -3050,7 +3031,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify(r));
       } catch (err) {
         res.writeHead(err.statusCode || 500, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: err.message }));
+        return res.end(JSON.stringify({ error: err.message, code: err.statusCode === 400 ? err.code : undefined }));
       }
     }
 
@@ -3106,7 +3087,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify(r));
       } catch (err) {
         res.writeHead(err.statusCode || 500, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: err.message }));
+        return res.end(JSON.stringify({ error: err.message, code: err.statusCode === 400 ? err.code : undefined }));
       }
     }
 

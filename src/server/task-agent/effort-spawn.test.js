@@ -152,7 +152,9 @@ test('Pi: effort leaves the spawn spec unchanged', async (t) => {
   console.debug = (...a) => { debugLines.push(a.join(' ')); };
   t.after(() => { console.debug = origDebug; });
   const agent = new PiAgent();
-  const plain = await agent.getSpawnSpec(cfg, 'Work on task C1.', 'C1', { projectPath: dir });
+  // Both spawns carry a task, so the effort is the only difference: a task in opts adds its own
+  // prompt lines, which a spawn without one does not have.
+  const plain = await agent.getSpawnSpec(cfg, 'Work on task C1.', 'C1', { projectPath: dir, task: { effort: null } });
   const withEffort = await agent.getSpawnSpec(cfg, 'Work on task C1.', 'C1', { projectPath: dir, task: { effort: 'high' } });
   assert.deepEqual(withEffort.args, plain.args);
   assert.deepEqual(withEffort.env, plain.env);

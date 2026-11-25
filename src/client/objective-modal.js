@@ -14,6 +14,7 @@
 import { t } from './i18n.js';
 import { hasOpenDialog } from './dialog-focus.js';
 import { createMode } from './create-modes.js';
+import { closeOpenEmbedMenu } from './embed-menu.js';
 
 export const OBJECTIVE_MODAL_ID = 'objective-modal';
 
@@ -234,6 +235,7 @@ export function openObjectiveModal({ mode = 'objective' } = {}) {
 export function closeObjectiveModal({ restoreFocus = true } = {}) {
   const overlay = host();
   if (!overlay || overlay.hidden) return false;
+  closeOpenEmbedMenu();
   const hadFocus = overlay.contains(document.activeElement);
   overlay.hidden = true;
   overlay.querySelector('.objective-modal-body').innerHTML = '';

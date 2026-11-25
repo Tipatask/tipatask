@@ -47,6 +47,7 @@ test('buildSharedPreamble: absent optional data emits no empty directive', () =>
     assert.equal(p.vcs, '');
     assert.equal(p.tagDesc, '');
     assert.equal(p.kbDiscovery, '');
+    assert.equal(p.ciTests, '');
     assert.ok(p.cowboy.startsWith('Cowboy chain:'));
     assert.deepEqual(p.directives, [p.processSafety, p.resourceLimits, p.kbHygiene, p.taskStatus, p.followUps, p.cowboy]);
     assert.ok(p.directives.every(d => typeof d === 'string' && d.trim().length > 0));
@@ -84,6 +85,24 @@ test('buildSharedPreamble: a compose-mode CODING task adds the kbDiscovery slot 
   }
   assert.ok(new PiAgent().buildSharedPreamble(compose).kbDiscovery.length
     < new CodexAgent().buildSharedPreamble(compose).kbDiscovery.length, 'Pi gets the compact wording');
+});
+
+// (TPT9393) A project that holds the Task App source (opts.ciTests, threaded by terminal-session.js).
+test('buildSharedPreamble: a resolved CI test suite adds the ciTests slot after kbDiscovery, before taskStatus', () => {
+  const suite = { ciTests: { dir: 'ai/todo/server', doc: 'ai/architecture/tt-ci.md' } };
+  const compose = { kbMode: 'compose', task: { id: 'TPT1', category: 'CODING' } };
+  for (const agent of [bareAgent(), new ClaudeAgent(), new CodexAgent(), new PiAgent()]) {
+    const p = agent.buildSharedPreamble({ ...ALL_OPTS, ...suite });
+    assert.ok(p.ciTests.startsWith('CI-compatible tests:'), agent.id);
+    assert.deepEqual(p.directives, [p.vcs, p.tagDesc, p.processSafety, p.resourceLimits, p.kbHygiene, p.ciTests, p.taskStatus, p.followUps, p.cowboy]);
+    const variant = agent.getPreamblePolicy().compact ? { compact: true } : {};
+    assert.equal(p.ciTests, agent.buildCiTestDirective({ ...suite, ...variant }));
+    const both = agent.buildSharedPreamble({ ...ALL_OPTS, ...compose, ...suite });
+    assert.deepEqual(both.directives, [both.vcs, both.tagDesc, both.processSafety, both.resourceLimits, both.kbHygiene, both.kbDiscovery, both.ciTests, both.taskStatus, both.followUps, both.cowboy]);
+    // Every other project: no slot, and the remaining directives are untouched.
+    assert.equal(agent.buildSharedPreamble({ ...ALL_OPTS, ciTests: null }).ciTests, '');
+    assert.deepEqual(agent.buildSharedPreamble({ ...ALL_OPTS, ciTests: null }).directives, agent.buildSharedPreamble(ALL_OPTS).directives);
+  }
 });
 
 test('buildSharedPreamble: a bypass cowboy run adds the cowboy slot last, after followUps', () => {
