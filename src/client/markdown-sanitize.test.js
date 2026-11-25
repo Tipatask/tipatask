@@ -75,6 +75,7 @@ test('safe links, attachments, code, tables, checkboxes, task links and Unicode 
     '[Docs](https://example.com/path) [Email](mailto:user@example.com) [TPT318](#task-TPT318)',
     '![screenshot](https://web.tipatask.com/api/projects/2/images/4)',
     '[report](https://web.tipatask.com/api/projects/2/files/9)',
+    '[survey](/api/projects/2/files/artifacts/11/revisions/3/content)',
     '@src/app.js Український текст',
     '```js\n<script>alert(1)</script>\n```',
     '| Стан | Value |\n| :--- | ---: |\n| Готово | 3 |',
@@ -87,6 +88,7 @@ test('safe links, attachments, code, tables, checkboxes, task links and Unicode 
   assert.equal(output.querySelector('a[href="#task-TPT318"]')?.textContent, 'TPT318');
   assert.equal(output.querySelector('img')?.getAttribute('src'), '/api/images/2/4');
   assert.equal(output.querySelector('a.file-attachment-link')?.getAttribute('href'), '/api/files/2/9');
+  assert.equal(output.querySelector('a[download]')?.textContent, 'survey');
   assert.equal(output.querySelector('span.file-ref')?.textContent, '@src/app.js');
   assert.match(output.textContent, /Український текст/);
   assert.equal(output.querySelector('code.language-js')?.textContent.trim(), '<script>alert(1)</script>');

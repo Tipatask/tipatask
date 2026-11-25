@@ -336,6 +336,11 @@ function _connectWs() {
     let msg;
     try { msg = JSON.parse(event.data); } catch { return; }
 
+    if (msg.type === 'chat-ended' && msg.reason === 'account-changed') {
+      close();
+      return;
+    }
+
     if (msg.type === 'chat-history-reset') {
       _isReconnect = true;
       // Restore history, skipping the first user message (seed JSON dump).

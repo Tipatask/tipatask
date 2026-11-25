@@ -9,6 +9,8 @@ const {
   parseAskUserBlocks,
   resetTaskChatTurn,
   emitDialogs,
+  markSegmentBoundary,
+  separateTextRun,
   toolStarted,
   toolFinished,
   classifyTaskMutation,
@@ -268,14 +270,78 @@ test('widgets ride on the assistant message and replay to a client that attaches
   assert.equal(msg.taskEvents[0].task.id, 'TPT1', 'an event that resolved after the attach still lands');
   assert.doesNotThrow(() => JSON.stringify(msg));
 
+  assert.deepEqual(msg.breaks, [BLOCK.length], 'the call after the text ended its run');
+  assert.equal(msg.tools[0].at, BLOCK.length);
+
   const replayed = [];
   replayTaskChatTurn(session, frame => replayed.push(frame));
-  assert.deepEqual(replayed.map(f => f.type), ['task-chat-tool', 'task-chat-task', 'task-chat-dialog']);
-  assert.equal(replayed[1].action, 'updated');
+  assert.deepEqual(replayed.map(f => f.type), ['task-chat-segment', 'task-chat-tool', 'task-chat-task', 'task-chat-dialog'],
+    'boundaries first, so each replayed chip lands between its runs');
+  assert.equal(replayed[0].at, BLOCK.length);
+  assert.equal(replayed[2].action, 'updated');
 
   const plain = { role: 'assistant', content: 'no widgets' };
   attachTaskChatWidgets(chat().session, plain);
   assert.equal(plain.dialogs, undefined);
+});
+
+// ── (TPT9383) Text segments ──
+
+// The turn text split at its boundaries, as a client does.
+const segmentsOf = (text, breaks) => [0, ...breaks].map((start, i, all) => text.slice(start, all[i + 1] ?? text.length));
+// What a provider loop does with a chunk of the agent's text.
+const stream = (session, chunk) => { session.turnBuffer += separateTextRun(session, chunk); };
+
+const NOTE = "I'll check how the wizard saves preset selections and how the planner and task agents read them.";
+const ANSWER = 'Yes. The wizard sends `projectPresets` through the existing `POST /api/projects` endpoint.';
+
+test('(TPT9383) a turn with one tool call yields two text segments: the note before it, the answer after it', () => {
+  const { session, send, frames } = chat();
+  stream(session, NOTE.slice(0, 20));
+  stream(session, NOTE.slice(20));
+  toolStarted(session, send, { id: 't1', name: 'mcp__tipatask__list_system_tags', input: {} });
+  toolStarted(session, send, { id: 't1', name: 'mcp__tipatask__list_system_tags', input: { x: 1 } });
+  toolFinished(session, send, { id: 't1', result: '[]' });
+  stream(session, ANSWER);
+  const msg = { role: 'assistant', content: session.turnBuffer };
+  attachTaskChatWidgets(session, msg);
+
+  assert.deepEqual(frames.map(f => f.type), ['task-chat-segment', 'task-chat-tool', 'task-chat-tool', 'task-chat-tool'],
+    'the boundary goes out ahead of the call that ended the run, once');
+  assert.deepEqual(frames[0], { type: 'task-chat-segment', taskKey: 'TPT1', at: NOTE.length });
+  assert.ok(frames.slice(1).every(f => f.tool.at === NOTE.length), 'every frame of the call says where it happened');
+  assert.deepEqual(msg.breaks, [NOTE.length]);
+  assert.equal(msg.content, `${NOTE}\n\n${ANSWER}`, 'the answer opens on a blank line: never "…read them.Yes."');
+  assert.deepEqual(segmentsOf(msg.content, msg.breaks).map(s => s.trim()), [NOTE, ANSWER]);
+});
+
+test('(TPT9383) no boundary without text since the last one: a call that opens the turn, calls in a row', () => {
+  const { session, send, ofType } = chat();
+  toolStarted(session, send, { id: 'a', name: 'Read', input: { file_path: 'x' } });
+  toolStarted(session, send, { id: 'b', name: 'Read', input: { file_path: 'y' } });
+  assert.deepEqual(ofType('task-chat-segment'), [], 'nothing was written before the first calls');
+  assert.deepEqual(ofType('task-chat-tool').map(f => f.tool.at), [0, 0]);
+  stream(session, 'Both files read.');
+  assert.equal(session.turnBuffer, 'Both files read.', 'the first run opens with no blank line');
+  toolStarted(session, send, { id: 'c', name: 'Read', input: { file_path: 'z' } });
+  toolStarted(session, send, { id: 'd', name: 'Read', input: { file_path: 'w' } });
+  assert.equal(markSegmentBoundary(session, send), null, 'still nothing new to close');
+  assert.deepEqual(ofType('task-chat-segment').map(f => f.at), [16]);
+  assert.deepEqual(session._taskChatTurn.tools.map(tool => tool.at), [0, 0, 16, 16]);
+  assert.equal(separateTextRun(session, ''), '', 'an empty chunk carries no separator');
+  assert.equal(separateTextRun(session, 'Done.'), '\n\nDone.');
+  assert.equal(separateTextRun(session, ' More.'), ' More.', 'only the first text after a boundary');
+  resetTaskChatTurn(session);
+  assert.equal(separateTextRun(session, 'Fresh turn.'), 'Fresh turn.');
+});
+
+test('(TPT9383) a new message marks a boundary on its own (Codex), and to the session socket by default', () => {
+  const sent = [];
+  const { session } = chat({ ws: { OPEN: 1, readyState: 1, send: raw => sent.push(JSON.parse(raw)) } });
+  session.turnBuffer = NOTE;
+  assert.equal(markSegmentBoundary(session), NOTE.length);
+  assert.deepEqual(sent, [{ type: 'task-chat-segment', taskKey: 'TPT1', at: NOTE.length, tabId: 'tab-1' }]);
+  assert.equal(markSegmentBoundary(session), null);
 });
 
 test('only an unanswered dialog on the latest assistant message can be answered', () => {

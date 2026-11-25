@@ -8,8 +8,8 @@ import { test } from 'node:test';
 const { stepsFor, nextStep, computePiSaveRows, buildReauthConfig } = await import('./setup-modal.js');
 
 test('stepsFor: setup mode includes the device step, reauth never does', () => {
-  assert.deepEqual(stepsFor('setup'), ['signin', 'project', 'device', 'agent', 'confirm']);
-  assert.deepEqual(stepsFor('reauth'), ['signin', 'project', 'agent', 'confirm']);
+  assert.deepEqual(stepsFor('setup'), ['signin', 'project', 'profile', 'device', 'agent', 'confirm']);
+  assert.deepEqual(stepsFor('reauth'), ['signin', 'project', 'profile', 'agent', 'confirm']);
   assert.ok(!stepsFor('reauth').includes('device'));
   // No step list anywhere carries an API-URL step (TPT161's whole point).
   assert.ok(!stepsFor('setup').some(s => /api/i.test(s)));
@@ -18,16 +18,18 @@ test('stepsFor: setup mode includes the device step, reauth never does', () => {
 
 test('nextStep: setup walks signin -> project -> device -> agent -> confirm', () => {
   assert.equal(nextStep('setup', 'signin'), 'project');
-  assert.equal(nextStep('setup', 'project'), 'device');
+  assert.equal(nextStep('setup', 'project'), 'profile');
+  assert.equal(nextStep('setup', 'profile'), 'device');
   assert.equal(nextStep('setup', 'device'), 'agent');
   assert.equal(nextStep('setup', 'agent'), 'confirm');
 });
 
 test('nextStep: reauth skips the project picker only when a project is already known', () => {
-  assert.equal(nextStep('reauth', 'signin', { skipProject: true }), 'agent');
+  assert.equal(nextStep('reauth', 'signin', { skipProject: true }), 'profile');
   assert.equal(nextStep('reauth', 'signin', { skipProject: false }), 'project');
   assert.equal(nextStep('reauth', 'signin'), 'project'); // default: not skipped
-  assert.equal(nextStep('reauth', 'project'), 'agent'); // never 'device'
+  assert.equal(nextStep('reauth', 'project'), 'profile');
+  assert.equal(nextStep('reauth', 'profile'), 'agent'); // never 'device'
   assert.equal(nextStep('reauth', 'agent'), 'confirm');
 });
 

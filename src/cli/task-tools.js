@@ -7,6 +7,10 @@
 // run's own TIPATASK_COWBOY_TOKEN, never the account token. After every saved completion,
 // `complete` prints `cowboyNext`, as the complete_task MCP tool does: the live server
 // decision (including not_cowboy), or no_run_capability when the run token is absent.
+function redactResponse(value, token) {
+  return JSON.parse(JSON.stringify(value).split(token).join('[redacted]'));
+}
+
 async function run(argv, { input = '', fetchImpl = fetch, env = process.env } = {}) {
   const since = Date.now();
   const [command, target] = argv;
@@ -15,9 +19,21 @@ async function run(argv, { input = '', fetchImpl = fetch, env = process.env } = 
     return cowboy.requestNextTasks(target, { env, fetchImpl });
   }
   const { resolveProjectRoot } = require('../server/project-root');
-  const root = resolveProjectRoot();
+  const root = resolveProjectRoot({ env });
   const { getApiCredentials } = require('../server/api-credentials');
   const { baseUrl, projectId, token } = getApiCredentials(root);
+  if (command === 'publish-artifact') {
+    const { publishArtifact } = require('./publish-artifact');
+    const backend = require('../server/task-backend').createPerProjectBackend({ TASK_BACKEND: 'api' }, root);
+    try {
+      const saved = await publishArtifact(argv.slice(1), { projectRoot: root, taskKey: env.TIPATASK_TASK_ID, backend });
+      return redactResponse(saved, token);
+    } catch (err) {
+      // Print the API's validation/conflict message, never a request dump.
+      const error = err.body?.error || (err.networkError ? 'Artifact upload failed to reach the API' : err.message);
+      return redactResponse({ ok: false, error, ...(err.statusCode && { status: err.statusCode }) }, token);
+    } finally { backend.dispose(); }
+  }
   if (command === 'verify' || command === 'complete') {
     const { createPerProjectBackend } = require('../server/task-backend');
     const backend = createPerProjectBackend({ TASK_BACKEND: 'api' }, root);
@@ -41,7 +57,7 @@ async function run(argv, { input = '', fetchImpl = fetch, env = process.env } = 
   let body;
   try { body = await res.json(); } catch { throw new Error(`Tipatask returned HTTP ${res.status} with an unreadable response`); }
   // An unexpected server echo must never reveal a credential in diagnostics.
-  return { status: res.status, body: JSON.parse(JSON.stringify(body).split(token).join('[redacted]')) };
+  return { status: res.status, body: redactResponse(body, token) };
 }
 
 if (require.main === module) {

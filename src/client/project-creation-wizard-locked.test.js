@@ -19,8 +19,10 @@ async function withWizard(electronAPI, run) {
     Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
   }
   for (const key of ['document', 'location', 'HTMLElement', 'Event', 'CustomEvent', 'KeyboardEvent', 'MutationObserver',
-    'localStorage', 'sessionStorage', 'getComputedStyle', 'CSS', 'Node', 'navigator']) install(key, window[key]);
-  window.electronAPI = electronAPI;
+    'localStorage', 'sessionStorage', 'getComputedStyle', 'CSS', 'Node', 'navigator', 'FileReader']) install(key, window[key]);
+  // happy-dom supplies FileReader, but has no image decoder.
+  install('Image', class { naturalWidth = 1; naturalHeight = 1; async decode() {} });
+  window.electronAPI = { setupProjectProfile: async () => ({ policy: { rules: {} } }), ...electronAPI };
   install('window', window); install('self', window);
   install('requestAnimationFrame', window.requestAnimationFrame.bind(window));
   install('cancelAnimationFrame', window.cancelAnimationFrame.bind(window));
@@ -123,6 +125,8 @@ test('Agent step: re-checking an agent after unchecking all makes it the Default
     const $ = (sel) => overlay().querySelector(sel);
     $('.setup-modal-project-card[data-id="7"]').click();
     $('#wiz-next-btn').click();
+    await flush(); // policy and identity
+    $('#wiz-next-btn').click();
     await flush(); // device-name prefill
     $('#wiz-next-btn').click();
     await flush(); // agent detection
@@ -147,7 +151,104 @@ test('Agent step: re-checking an agent after unchecking all makes it the Default
     assert.equal($('#wiz-agent-select'), null, 'left the Agent step');
     const agentRow = [...overlay().querySelectorAll('.setup-modal-summary tr')]
       .find((tr) => tr.querySelector('.setup-modal-summary-key')?.textContent === 'Agent');
-    assert.equal(agentRow?.querySelector('.setup-modal-summary-val').textContent, 'codex', 'Confirm shows Codex');
+    // (TPT9388) By the name its card showed, not the stored id `codex`.
+    assert.equal(agentRow?.querySelector('.setup-modal-summary-val').textContent, 'Codex', 'Confirm shows Codex');
+  });
+});
+
+// (TPT9388) Every step names itself beside the dots with "Step n of N" (following visibleSteps(),
+// so a pick that adds or drops a step recounts at once) and opens with one heading block. Create
+// Project opens its form right under its card; Confirm is one aligned summary, the project first.
+test('every step names itself beside the dots and opens with one heading block', async () => {
+  const electronAPI = {
+    setupStoredAccount: async () => ({ token: 'tok', user: { email: 'a@b.c' } }),
+    setupListProjects: async () => [{ id: 7, name: 'Proj' }, { id: 8, name: 'Other' }],
+    setupGetDeviceName: async () => 'Mac',
+    setupGetAvailableAgents: async () => [
+      { id: 'claude', label: 'Claude Code', available: true },
+      { id: 'codex', label: 'Codex', available: true },
+    ],
+  };
+  await withWizard(electronAPI, async ({ wizard, flush }) => {
+    wizard.open({ projectPath: '/tmp/p' });
+    await flush();
+    const $ = (sel) => overlay().querySelector(sel);
+    const seen = [];
+    const look = () => {
+      const heads = overlay().querySelectorAll('.setup-modal-step-body .setup-modal-step-head');
+      assert.equal(heads.length, 1, 'one heading block per step');
+      const heading = heads[0].querySelector('h2.setup-modal-label#wiz-step-heading');
+      assert.ok(heading?.textContent.trim(), 'the block holds the step heading');
+      assert.ok([...overlay().querySelectorAll('.setup-modal-steps > .setup-modal-dot')].every((d) => d.getAttribute('aria-hidden') === 'true'));
+      seen.push(`${$('.setup-modal-step-name').textContent} | ${$('.setup-modal-step-count').textContent}`);
+    };
+
+    look(); // Create Project, nothing picked yet
+    $('.setup-modal-project-card[data-id="7"]').click();
+    look(); // an existing project drops Work presets and Onboarding
+    $('#wiz-new-card').click();
+    look();
+    const form = $('#wiz-create-form');
+    assert.equal($('#wiz-new-card').nextElementSibling, form, 'the form opens right under its card');
+    assert.ok(form.classList.contains('is-visible'));
+    assert.equal(form.nextElementSibling.textContent, 'Existing projects');
+    assert.ok(form.nextElementSibling.nextElementSibling.matches('.setup-modal-project-card[data-id="7"]'));
+    assert.ok($('#wiz-proj-desc').matches('textarea.setup-modal-input.setup-modal-input--multiline'));
+    assert.equal(overlay().querySelector('.setup-modal-textarea'), null);
+    $('#wiz-proj-name').value = 'Fresh';
+    $('#wiz-proj-name').dispatchEvent(new Event('input', { bubbles: true }));
+    $('#wiz-next-btn').click();
+    await flush();
+    look(); // identity and policy
+    assert.ok($('.setup-modal-profile [data-preview]'), 'the profile renders under the heading block');
+    $('#wiz-next-btn').click();
+    await flush();
+    look(); // device
+    assert.equal($('#wiz-device-input').getAttribute('aria-labelledby'), 'wiz-step-heading');
+    assert.equal($('#wiz-device-input').getAttribute('aria-describedby'), 'wiz-step-hint');
+    assert.ok($('#wiz-step-hint').textContent.trim(), 'the device hint sits under the heading');
+    $('#wiz-next-btn').click();
+    await flush();
+    look(); // agent
+    $('#wiz-next-btn').click();
+    look(); // work presets
+    assert.ok($('.setup-modal-step-head #wiz-work-all'), 'Select all sits on the heading row');
+    assert.equal($('.wizard-work-grid').getAttribute('aria-labelledby'), 'wiz-step-heading');
+    $('[value="software"]').click();
+    look(); // Software adds onboarding
+    $('#wiz-next-btn').click();
+    look(); // onboarding
+    assert.equal($('#wiz-step-hint').textContent, 'No project description is needed here — the agents ask for what they need as they work.');
+    $('.setup-modal-preset-card[data-letter="A"]').click();
+    $('#wiz-next-btn').click();
+    look(); // confirm
+
+    const rows = [...overlay().querySelectorAll('.setup-modal-summary tr')];
+    assert.ok(rows.every((tr) => tr.querySelector(':scope > th[scope="row"].setup-modal-summary-key')), 'every key is a row header');
+    assert.equal(rows[0].querySelector('th').textContent, 'Project', 'the project leads');
+    assert.equal(rows[0].querySelector('.setup-modal-summary-badge').textContent, 'new');
+    assert.doesNotMatch(rows[0].textContent, /#new/, 'a new project has no id to show');
+    const agent = rows.find((tr) => tr.querySelector('th').textContent === 'Agent');
+    assert.equal(agent.querySelector('td').textContent, 'Claude Code');
+
+    for (let i = 0; i < 7; i += 1) $('#wiz-back-btn').click();
+    look(); // signed-in variant of Sign In
+    assert.ok($('.setup-modal-step-body').classList.contains('setup-modal-step-body--center'), 'Sign in is centred');
+    assert.ok($('.setup-modal-signin #wiz-step-heading'));
+
+    assert.deepEqual(seen, [
+      'Create Project | Step 2 of 7',
+      'Create Project | Step 2 of 6',
+      'Create Project | Step 2 of 7',
+      'Project identity | Step 3 of 7',
+      'Device | Step 4 of 7',
+      'Agent | Step 5 of 7',
+      'Work presets | Step 6 of 7',
+      'Work presets | Step 6 of 8',
+      'Onboarding | Step 7 of 8',
+      'Confirm | Step 8 of 8',
+      'Sign In | Step 1 of 8',
+    ]);
   });
 });
 
@@ -177,11 +278,16 @@ for (const expected of PRESET_EXPECTATIONS) {
       $('#wiz-proj-name').value = 'Fresh';
       $('#wiz-proj-name').dispatchEvent(new Event('input', { bubbles: true }));
       $('#wiz-next-btn').click();
+      await flush(); // policy and identity
+      $('#wiz-next-btn').click();
       await flush(); // device-name prefill
       $('#wiz-next-btn').click();
       await flush(); // agent detection
       $('#wiz-next-btn').click();
 
+      $('[value="software"]').click();
+      $('[value="science"]').click();
+      $('#wiz-next-btn').click();
       const cards = [...overlay().querySelectorAll('.setup-modal-preset-grid > button.setup-modal-preset-card')];
       assert.deepEqual(cards.map((c) => c.querySelector('.setup-modal-preset-letter').textContent), ['A', 'B', 'C']);
       assert.deepEqual(cards.map((c) => c.querySelector('.setup-modal-preset-name').textContent),
@@ -200,7 +306,7 @@ for (const expected of PRESET_EXPECTATIONS) {
 
       $('#wiz-next-btn').click();
       const presetRow = [...overlay().querySelectorAll('.setup-modal-summary tr')]
-        .find((tr) => tr.querySelector('.setup-modal-summary-key')?.textContent === 'Preset');
+        .find((tr) => tr.querySelector('.setup-modal-summary-key')?.textContent === 'Onboarding');
       assert.equal(presetRow?.querySelector('.setup-modal-summary-val').textContent, `${expected.letter} — ${expected.name}`);
 
       // Back keeps the pick.
@@ -213,6 +319,7 @@ for (const expected of PRESET_EXPECTATIONS) {
       $('#wiz-confirm-btn').click();
       assert.ok(detail, 'onComplete fired');
       assert.deepEqual(detail.preset, expected.preset);
+      assert.deepEqual(detail.apiProject.projectPresets, ['software', 'science']);
       assert.equal(detail.apiProject.isNew, true);
       assert.equal(overlay(), null, 'wizard closed after Create Project');
     });
@@ -220,7 +327,7 @@ for (const expected of PRESET_EXPECTATIONS) {
 }
 
 // (TPT9318) Open Project entry: open({ presetLocked: true }) has no Preset step and no Preset
-// dot. A new project goes Agent → Confirm, the summary names compose-as-you-go (no letter —
+// dot. A new project goes Work presets → Confirm, the summary names compose-as-you-go (no letter —
 // the A/B/C cards were never shown) and the detail carries the compose preset, so main.js
 // writes KB_MODE: 'compose' and seeds no starter tasks. Linking an existing project creates
 // nothing and still emits preset: null.
@@ -237,6 +344,55 @@ const summaryValue = (key) => [...overlay().querySelectorAll('.setup-modal-summa
   .find((tr) => tr.querySelector('.setup-modal-summary-key')?.textContent === key)
   ?.querySelector('.setup-modal-summary-val').textContent;
 
+test('work presets track none, mixed and all in place; removing Software skips a prior code seed', async () => {
+  await withWizard(presetLockedAPI(), async ({ wizard, flush }) => {
+    let detail;
+    wizard.open({ projectPath: '/tmp/p', onComplete: d => { detail = d; } });
+    await flush();
+    const $ = selector => overlay().querySelector(selector);
+    $('#wiz-new-card').click();
+    $('#wiz-proj-name').value = 'Research';
+    $('#wiz-proj-name').dispatchEvent(new Event('input'));
+    $('#wiz-next-btn').click();
+    await flush(); // policy and identity
+    $('#wiz-next-btn').click();
+    await flush();
+    $('#wiz-next-btn').click();
+    await flush();
+    $('#wiz-next-btn').click();
+    const all = $('#wiz-work-all');
+    const inputs = [...overlay().querySelectorAll('.wizard-work-grid input')];
+    assert.equal(inputs.length, 8);
+    assert.equal($('#wiz-next-btn').disabled, true);
+    inputs[0].focus();
+    inputs[0].click();
+    assert.equal(document.activeElement, inputs[0]);
+    assert.equal(all.indeterminate, true);
+    all.click();
+    assert.ok(inputs.every(input => input.checked));
+    assert.equal(all.indeterminate, false);
+    all.click();
+    assert.ok(inputs.every(input => !input.checked));
+    assert.equal($('#wiz-next-btn').disabled, true);
+    inputs[0].click();
+    inputs[1].click();
+    $('#wiz-next-btn').click();
+    $('[data-letter="C"]').click();
+    $('#wiz-next-btn').click();
+    $('#wiz-back-btn').click();
+    $('#wiz-back-btn').click();
+    assert.equal($('[value="software"]').checked, true);
+    assert.equal($('[value="science"]').checked, true);
+    $('[value="software"]').click();
+    $('#wiz-next-btn').click();
+    assert.equal(summaryValue('Work presets'), 'Science');
+    assert.equal(summaryValue('Onboarding'), 'Compose the knowledge base as you go');
+    $('#wiz-confirm-btn').click();
+    assert.deepEqual(detail.apiProject.projectPresets, ['science']);
+    assert.equal(detail.preset.value, wizard.COMPOSE_PRESET);
+  });
+});
+
 test('presetLocked: a new project skips the Preset step and emits compose-as-you-go', async () => {
   await withWizard(presetLockedAPI(), async ({ wizard, flush }) => {
     let detail = null;
@@ -244,23 +400,29 @@ test('presetLocked: a new project skips the Preset step and emits compose-as-you
     await flush();
     const $ = (sel) => overlay().querySelector(sel);
     const dots = () => overlay().querySelectorAll('.setup-modal-steps .setup-modal-dot').length;
-    assert.equal(dots(), 5, 'five dots — no Preset dot');
+    assert.equal(dots(), 7, 'work presets included, onboarding skipped');
     $('#wiz-new-card').click();
     $('#wiz-proj-name').value = 'Fresh';
     $('#wiz-proj-name').dispatchEvent(new Event('input', { bubbles: true }));
     $('#wiz-next-btn').click();
+    await flush(); // policy and identity
+    $('#wiz-next-btn').click();
     await flush(); // device-name prefill
-    assert.equal(dots(), 5, 'a new project keeps five dots');
+    assert.equal(dots(), 7, 'a new project keeps the work step');
     $('#wiz-next-btn').click();
     await flush(); // agent detection
     $('#wiz-next-btn').click();
-    assert.equal($('.setup-modal-preset-grid'), null, 'Agent → Confirm, no Preset step');
+    assert.equal($('#wiz-next-btn').disabled, true);
+    $('[value="home"]').click();
+    $('#wiz-next-btn').click();
+    assert.equal($('.setup-modal-preset-grid'), null);
+    assert.equal(summaryValue('Work presets'), 'Home');
     assert.ok($('#wiz-confirm-btn'), 'on the Confirm step');
     assert.equal($('#wiz-confirm-btn').textContent, 'Create Project');
-    assert.equal(summaryValue('Preset'), 'Compose the knowledge base as you go');
+    assert.equal(summaryValue('Onboarding'), 'Compose the knowledge base as you go');
 
     $('#wiz-back-btn').click();
-    assert.ok($('#wiz-agent-select'), 'Back from Confirm returns to the Agent step');
+    assert.equal($('[value="home"]').checked, true, 'Back retains the selection');
     await flush();
     $('#wiz-next-btn').click();
     assert.ok($('#wiz-confirm-btn'), 'and Next goes to Confirm again');
@@ -270,32 +432,40 @@ test('presetLocked: a new project skips the Preset step and emits compose-as-you
     assert.deepEqual(detail.preset, { letter: 'A', mode: 'compose', value: 'compose-as-you-go' });
     assert.equal(detail.apiProject.isNew, true);
     assert.equal(detail.apiProject.name, 'Fresh');
+    assert.deepEqual(detail.apiProject.projectPresets, ['home']);
     assert.equal(overlay(), null, 'wizard closed after Create Project');
   });
 });
 
-test('presetLocked: linking an existing project emits preset: null', async () => {
-  await withWizard(presetLockedAPI(), async ({ wizard, flush }) => {
-    let detail = null;
-    wizard.open({ projectPath: '/tmp/p', presetLocked: true, onComplete: (d) => { detail = d; } });
-    await flush();
-    const $ = (sel) => overlay().querySelector(sel);
-    $('.setup-modal-project-card[data-id="7"]').click();
-    $('#wiz-next-btn').click();
-    await flush();
-    $('#wiz-next-btn').click();
-    await flush();
-    $('#wiz-next-btn').click();
-    assert.equal(summaryValue('Preset'), undefined, 'no Preset row for an existing project');
-    assert.equal($('#wiz-confirm-btn').textContent, 'Open Project');
-    $('#wiz-confirm-btn').click();
-    assert.equal(detail.preset, null);
-    assert.equal(detail.apiProject.isNew, false);
-    assert.equal(detail.apiProject.id, 7);
+for (const [projectPresets, summary] of [[['health', 'home'], 'Health, Home'], [undefined, 'Software'], [[], 'Software']]) {
+  test(`linking shows the API work presets ${JSON.stringify(projectPresets)} as ${summary} and skips onboarding`, async () => {
+    const api = { ...presetLockedAPI(), setupListProjects: async () => [{ id: 7, name: 'Proj', projectPresets }] };
+    await withWizard(api, async ({ wizard, flush }) => {
+      let detail = null;
+      wizard.open({ projectPath: '/tmp/p', presetLocked: true, onComplete: (d) => { detail = d; } });
+      await flush();
+      const $ = (sel) => overlay().querySelector(sel);
+      $('.setup-modal-project-card[data-id="7"]').click();
+      $('#wiz-next-btn').click();
+      await flush(); // policy and identity
+      $('#wiz-next-btn').click();
+      await flush();
+      $('#wiz-next-btn').click();
+      await flush();
+      $('#wiz-next-btn').click();
+      assert.equal(summaryValue('Onboarding'), undefined, 'no onboarding row for an existing project');
+      assert.equal(summaryValue('Work presets'), summary);
+      assert.equal($('#wiz-confirm-btn').textContent, 'Open Project');
+      $('#wiz-confirm-btn').click();
+      assert.equal(detail.preset, null);
+      assert.deepEqual(detail.apiProject.projectPresets, projectPresets?.length ? projectPresets : ['software']);
+      assert.equal(detail.apiProject.isNew, false);
+      assert.equal(detail.apiProject.id, 7);
+    });
   });
-});
+}
 
-test('presetLocked does not leak: the next unlocked run shows six dots and the Preset step', async () => {
+test('presetLocked does not leak: the next unlocked run can choose software onboarding', async () => {
   await withWizard(presetLockedAPI(), async ({ wizard, flush }) => {
     wizard.open({ projectPath: '/tmp/p', presetLocked: true });
     await flush();
@@ -303,7 +473,7 @@ test('presetLocked does not leak: the next unlocked run shows six dots and the P
     wizard.open({ projectPath: '/tmp/p' });
     await flush();
     const $ = (sel) => overlay().querySelector(sel);
-    assert.equal(overlay().querySelectorAll('.setup-modal-steps .setup-modal-dot').length, 6);
+    assert.equal(overlay().querySelectorAll('.setup-modal-steps .setup-modal-dot').length, 7);
     // The earlier session's sign-in is still in memory: step 1 shows "Signed in as …".
     $('#wiz-next-btn').click();
     await flush(); // project list
@@ -311,11 +481,15 @@ test('presetLocked does not leak: the next unlocked run shows six dots and the P
     $('#wiz-proj-name').value = 'Fresh';
     $('#wiz-proj-name').dispatchEvent(new Event('input', { bubbles: true }));
     $('#wiz-next-btn').click();
-    await flush();
+    await flush(); // policy and identity
     $('#wiz-next-btn').click();
     await flush();
     $('#wiz-next-btn').click();
-    assert.ok($('.setup-modal-preset-grid'), 'Create Project entry still asks for a preset');
+    await flush();
+    $('#wiz-next-btn').click();
+    $('[value="software"]').click();
+    $('#wiz-next-btn').click();
+    assert.ok($('.setup-modal-preset-grid'), 'Create Project entry still asks for an onboarding mode');
     assert.equal($('#wiz-next-btn').disabled, true, 'nothing preselected');
   });
 });
@@ -340,7 +514,12 @@ test('presetLocked chain: the created project has KB_MODE compose and no seeded 
   });
 
   let detail = null;
-  await withWizard(presetLockedAPI(), async ({ wizard, flush }) => {
+  const api = { ...presetLockedAPI(), setupProjectProfile: async () => ({
+    policy: { company: { name: 'Atlas' }, rules: { language: { value: 'uk', source: 'company' } } },
+  }) };
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XWQAAAABJRU5ErkJggg==';
+  const expectedLogo = 'data:image/png;base64,' + png;
+  await withWizard(api, async ({ wizard, flush }) => {
     wizard.open({ projectPath: projectDir, presetLocked: true, onComplete: (d) => { detail = d; } });
     await flush();
     const $ = (sel) => overlay().querySelector(sel);
@@ -348,10 +527,32 @@ test('presetLocked chain: the created project has KB_MODE compose and no seeded 
     $('#wiz-proj-name').value = 'Fresh';
     $('#wiz-proj-name').dispatchEvent(new Event('input', { bubbles: true }));
     $('#wiz-next-btn').click();
-    await flush();
+    await flush(); // policy and identity
+    assert.match($('.project-rules').textContent, /Atlas/);
+    const initials = $('[data-initials]');
+    initials.value = 'too long';
+    initials.dispatchEvent(new Event('input'));
+    assert.equal($('#wiz-next-btn').disabled, true);
+    initials.value = 'UX';
+    initials.dispatchEvent(new Event('input'));
+    $('[data-color]').value = '#134789';
+    $('[data-color]').dispatchEvent(new Event('input'));
+    assert.equal($('.project-monogram').textContent, 'UX');
+    const picker = $('[data-file]');
+    Object.defineProperty(picker, 'files', { value: [new window.File([Buffer.from(png, 'base64')], 'brand.png', { type: 'image/png' })] });
+    await picker.onchange();
+    assert.equal($('[data-preview] img').getAttribute('src'), expectedLogo);
     $('#wiz-next-btn').click();
     await flush();
     $('#wiz-next-btn').click();
+    await flush();
+    $('#wiz-next-btn').click();
+    $('[value="home"]').click();
+    $('[value="health"]').click();
+    $('#wiz-next-btn').click();
+    assert.equal($('.setup-modal-summary .project-monogram img').getAttribute('src'), expectedLogo);
+    assert.match($('.setup-modal-summary').textContent, /UX/);
+    assert.match($('.setup-modal-summary').textContent, /#134789/);
     $('#wiz-confirm-btn').click();
   });
   assert.ok(detail, 'the wizard completed');
@@ -365,7 +566,14 @@ test('presetLocked chain: the created project has KB_MODE compose and no seeded 
   const realSeeder = require('../server/project-seeder.js');
   const modules = {
     './src/cli/setup': {
-      createApiProject: async ({ name }) => ({ id: 41, name }),
+      createApiProject: async ({ name, projectPresets, identity, settings }) => {
+        assert.equal(identity.display_initials, 'UX');
+        assert.equal(identity.brand_color, '#134789');
+        assert.equal(identity.logo, expectedLogo);
+        assert.equal(settings.language, 'uk');
+        assert.deepEqual(projectPresets, ['health', 'home']);
+        return { id: 41, name, projectPresets };
+      },
       registerDevice: async ({ name }) => ({ id: 9, name }),
       associateDeviceProject: async () => ({}),
       initializeProjectSettings: async () => {},

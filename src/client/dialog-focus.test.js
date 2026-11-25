@@ -336,6 +336,7 @@ test('project creation wizard is interactive over the workspace on every step', 
     // Signed-in run: step changes repaint the same root, which stays interactive.
     window.electronAPI = {
       setupStoredAccount: async () => ({ token: 'tok', user: { email: 'a@example.com' } }),
+      setupProjectProfile: async () => ({ policy: { rules: {} } }),
       setupListProjects: async () => [{ id: 7, name: 'Seven' }],
     };
     wizard.open({ projectPath: '/tmp/new-project' });
@@ -350,10 +351,13 @@ test('project creation wizard is interactive over the workspace on every step', 
     await flush();
     assert.equal(document.querySelector('.wizard-modal'), root2, 'repaint keeps one overlay root');
     assert.notEqual(root2.inert, true, 'step 3 still interactive');
+    root2.querySelector('#wiz-next-btn').click();
     const device = root2.querySelector('#wiz-device-input');
     device.value = 'Laptop';
     device.dispatchEvent(new window.Event('input', { bubbles: true }));
     assert.equal(root2.querySelector('#wiz-next-btn').disabled, false, 'input responds');
+    root2.querySelector('#wiz-back-btn').click();
+    await wait(30);
     root2.querySelector('#wiz-back-btn').click();
     await wait(30);
     assert.ok(root2.querySelector('.setup-modal-project-card'), 'Back returns to step 2');
@@ -376,6 +380,7 @@ test('setup / re-auth modal is interactive over the workspace and every dismiss 
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') workspaceEscapes++; });
     window.electronAPI = {
       setupAuthWeb: async () => ({ token: 'tok', user: { email: 'a@example.com' } }),
+      setupProjectProfile: async () => ({ policy: { rules: {} } }),
       setupListProjects: async () => [{ id: 1, name: 'One' }],
       setupGetAvailableAgents: async () => [{ id: 'claude', name: 'Claude Code', available: true }],
     };
@@ -398,6 +403,8 @@ test('setup / re-auth modal is interactive over the workspace and every dismiss 
         root.querySelector('#setup-signin-btn').click();
         await new Promise(resolve => setTimeout(resolve, 500));
         assert.equal(document.querySelector('.setup-modal'), root, 'repaint keeps one overlay root');
+        root.querySelector('#setup-next-btn').click();
+        await flush();
         assert.ok(root.querySelector('#setup-agent-select'), 'Sign in advanced to the Agent step');
         assert.notEqual(root.inert, true);
         root.querySelector('.setup-modal-close').click();

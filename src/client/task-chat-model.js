@@ -1,9 +1,9 @@
 // Pure, DOM-free helpers behind task-chat.js — the per-task chat window. Same split as
 // merge-branches-model.js: everything that can be unit-tested under plain node lives here
-// (provider filtering, selection choice, transcript shaping, ask_user fence handling, and the
-// markup + answer rules of the dialog / tool / task widgets, a user turn's inline images and
-// file chips), the window only renders and wires. No imports on purpose — the test imports this
-// module directly.
+// (provider filtering, selection choice, transcript shaping, ask_user fence handling, a reply's
+// progress notes and answer, and the markup + answer rules of the dialog / tool / task widgets,
+// a user turn's inline images and file chips), the window only renders and wires. No imports on
+// purpose — the test imports this module directly.
 
 // Providers that can enforce the task-chat tool fence. Mirrors the server's profile list
 // (providers/tool-profiles.js); gemini is refused there, so it is never offered here even
@@ -307,6 +307,93 @@ export function hasWidgets(m) {
   return !!m && ['dialogs', 'tools', 'taskEvents'].some(k => Array.isArray(m[k]) && m[k].length > 0);
 }
 
+// ── Reply segments (TPT9383) ──
+// A reply's text arrives in runs. What the agent writes before calling tools ("I'll check…") is a
+// progress note; what it writes after them is another note or the answer. The server marks where
+// each run ends — `breaks`, offsets into `content`, from `task-chat-segment` frames or the stored
+// message — and where each tool call happened (`tool.at`, the same offsets). The window draws
+// every run as its own block, with the chips of the calls that followed a run right after it.
+
+// A reply's boundaries, ready to split its `length`-long text: whole offsets past its start,
+// beyond-the-end ones pulled back to its end, sorted, each once.
+export function segmentBreaks(breaks, length) {
+  const end = Number.isInteger(length) && length > 0 ? length : 0;
+  const offsets = (Array.isArray(breaks) ? breaks : [])
+    .filter(at => Number.isInteger(at) && at > 0)
+    .map(at => Math.min(at, end))
+    .filter(at => at > 0);
+  return [...new Set(offsets)].sort((a, b) => a - b);
+}
+
+// The boundary a `task-chat-segment` frame adds. A frame replayed on reconnect adds nothing new.
+export function withBreak(breaks, at) {
+  const list = Array.isArray(breaks) ? breaks.filter(Number.isInteger) : [];
+  if (!Number.isInteger(at) || at <= 0 || list.includes(at)) return list;
+  return [...list, at].sort((a, b) => a - b);
+}
+
+// A run as markdown: no `ask_user` fence (the dialog widget stands for it), no blank lines around
+// it — the server opens each run after the first with one — and no trailing whitespace. The first
+// line keeps its indent.
+function runText(text) {
+  return stripAskUserFence(text).replace(/^(?:[ \t]*\n)+/, '').replace(/\s+$/, '');
+}
+
+// The reply in reading order: [{ kind: 'note' | 'answer', key, text, step } | { kind: 'tools',
+// key, tools, step }].
+// - Runs: the text split at its boundaries. Each run with text is a block; a run of blank lines
+//   is none.
+// - The answer is the run still being written while the reply streams (no text yet while its
+//   tools run), else the last run with text. There is always one answer block, its text empty
+//   when the reply has none. The runs with text before it are notes.
+// - A call goes after the run that ended where it started (`tool.at`) and before the next one;
+//   calls with no text between them share one group. A call with no `at` goes after the text.
+// - `step` marks what comes before an answer that is streaming or has text: the notes and the
+//   chips of the work done on the way to it.
+export function replyBlocks(message) {
+  const m = message || {};
+  const content = typeof m.content === 'string' ? m.content : '';
+  const starts = [0, ...segmentBreaks(m.breaks, content.length)];
+  const runs = starts.map((start, i) => ({ start, end: i + 1 < starts.length ? starts[i + 1] : content.length }));
+  const texts = runs.map(run => runText(content.slice(run.start, run.end)));
+  // slots[i] holds the calls made before run i; slots[runs.length] the calls after the last run.
+  const slots = Array.from({ length: runs.length + 1 }, () => []);
+  for (const tool of Array.isArray(m.tools) ? m.tools : []) {
+    if (!tool || tool.id == null) continue;
+    const at = Number.isInteger(tool.at) && tool.at >= 0 ? Math.min(tool.at, content.length) : null;
+    slots[at === null ? runs.length : starts.filter(start => start < at).length].push(tool);
+  }
+  const answer = m.streaming ? runs.length - 1 : texts.findLastIndex(Boolean);
+  const blocks = [];
+  const addTools = (tools) => {
+    if (!tools.length) return;
+    const last = blocks[blocks.length - 1];
+    if (last && last.kind === 'tools') last.tools.push(...tools);
+    else blocks.push({ kind: 'tools', key: `tools:${tools[0].id}`, tools: [...tools] });
+  };
+  runs.forEach((run, i) => {
+    addTools(slots[i]);
+    if (i === answer) blocks.push({ kind: 'answer', key: 'answer', text: texts[i] });
+    else if (texts[i]) blocks.push({ kind: 'note', key: `note:${run.start}`, text: texts[i] });
+  });
+  addTools(slots[runs.length]);
+  if (answer < 0) blocks.push({ kind: 'answer', key: 'answer', text: '' });
+  const answerAt = blocks.findIndex(block => block.kind === 'answer');
+  const pending = !!m.streaming || !!blocks[answerAt].text;
+  blocks.forEach((block, i) => { block.step = pending && i < answerAt; });
+  return blocks;
+}
+
+// The reply's answer — its last run, without the progress notes before it.
+export function replyAnswer(message) {
+  return replyBlocks(message).find(block => block.kind === 'answer').text;
+}
+
+// True when the reply holds a progress note besides its answer.
+export function replyHasNotes(message) {
+  return replyBlocks(message).some(block => block.kind === 'note');
+}
+
 // A user turn sent after the user edited tasks by hand opens with a fenced `task_edits` block
 // for the agent (server: buildTaskEditNote()). It is context, not something the user typed.
 const TASK_EDITS_RE = /^```task_edits[^\n]*\n[^\n]*\n```[ \t]*\n*/;
@@ -317,12 +404,13 @@ export function stripTaskEditNote(text) {
 }
 
 // What a message's Copy action puts on the clipboard: its markdown source as the transcript shows
-// it — a reply without its `ask_user` fence (the dialog widget stands for it), a user turn without
-// the `task_edits` note. Attachment references stay, so the text pasted into the composer attaches
-// the same files again. A notice has nothing to copy. Blank lines around the text are dropped.
+// it — a reply's answer alone (replyAnswer(): no progress notes, no `ask_user` fence, which the
+// dialog widget stands for), a user turn without the `task_edits` note. Attachment references
+// stay, so the text pasted into the composer attaches the same files again. A notice has nothing
+// to copy. Blank lines around the text are dropped.
 export function messageCopyText(message) {
   const m = message || {};
-  const text = m.role === 'assistant' ? stripAskUserFence(m.content)
+  const text = m.role === 'assistant' ? replyAnswer(m)
     : m.role === 'user' ? stripTaskEditNote(m.content) : '';
   return text.replace(/^(?:[ \t]*\n)+/, '').replace(/\s+$/, '');
 }
@@ -335,6 +423,10 @@ export function messageCopyText(message) {
 // A chat resumed from history (TPT539) holds the earlier conversation read back from the
 // provider's session (`restored: true`, shown as ordinary turns) and then the hidden resume
 // marker, which becomes the resumed-session indicator in its place.
+//
+// (TPT9383) A reply keeps its segment boundaries (`breaks`, offsets into its `content`) and its
+// tool records their `at`, so reopening or resuming a chat splits its progress notes from its
+// answer exactly as the live turn did. A restored reply has boundaries and no tools.
 export function visibleHistory(serverMessages) {
   return (Array.isArray(serverMessages) ? serverMessages : [])
     .filter(m => m && (m.resumed || (!m.seed && !isDialogAnswerTurn(m) && (m.role === 'user' || m.role === 'assistant'))))
@@ -345,6 +437,7 @@ export function visibleHistory(serverMessages) {
       dialogs: Array.isArray(m.dialogs) ? m.dialogs.slice() : [],
       tools: Array.isArray(m.tools) ? m.tools.slice() : [],
       taskEvents: Array.isArray(m.taskEvents) ? m.taskEvents.slice() : [],
+      breaks: m.role === 'assistant' && Array.isArray(m.breaks) ? m.breaks.filter(Number.isInteger) : [],
     }));
 }
 
@@ -373,19 +466,35 @@ export function shortToolName(name) {
 // URLs are rewritten to the same-origin proxies, as renderMarkdown() (utils.js) does for rendered
 // markdown.
 const ATTACHMENT_REF_RE = /(!?)\[([^\]\n]*)\]\(\s*<?([^()\s<>]+)>?(?:\s+"[^"\n]*")?\s*\)/g;
-const IMAGE_URL_RE = /^(?:[a-z][a-z0-9+.-]*:\/\/[^/\s]+)?\/api\/projects\/(\d+)\/images\/(\d+)(?:[?#]\S*)?$/i;
-const FILE_URL_RE = /^(?:[a-z][a-z0-9+.-]*:\/\/[^/\s]+)?\/api\/projects\/(\d+)\/files\/(\d+)(?:[?#]\S*)?$/i;
+// Read the authored href, before the browser resolves it against the Task App's URL.
+export function fileRefFromHref(href) {
+  if (typeof href !== 'string' || !href || /[\x00-\x1f\x7f\\]/.test(href)) return null;
+  const lineMatch = /#L([1-9]\d*)$/.exec(href);
+  const line = lineMatch ? Number(lineMatch[1]) : null;
+  if (line !== null && !Number.isSafeInteger(line)) return null;
+  const raw = lineMatch ? href.slice(0, lineMatch.index) : href;
+  const attachment = /^(?:https?:\/\/[^/?#\s]+)?\/api\/projects\/(\d+)\/(files|images)\/(\d+)(?:\?[^#]*)?$/i.exec(raw);
+  if (attachment) return { href: '/api/' + attachment[2] + '/' + attachment[1] + '/' + attachment[3], line };
+  if (/^\/api\/(?:files|images)\/\d+\/\d+$/.test(raw)) return { href: raw, line };
+  const artifact = /^(?:https?:\/\/[^/?#\s]+)?(\/api\/projects\/\d+\/files\/artifacts\/\d+\/revisions\/\d+\/content)$/i.exec(raw);
+  if (artifact) return { href: artifact[1], line };
+  if (/[?#]/.test(raw)) return null;
+  let path;
+  try { path = decodeURIComponent(raw); } catch { return null; }
+  if (!path.trim() || /^(?:\/|[a-z][a-z0-9+.-]*:)|[\x00-\x1f\x7f\\]/i.test(path) || path.endsWith('/')) return null;
+  const parts = path.split('/');
+  if (parts.includes('..')) return null;
+  path = parts.filter(part => part && part !== '.').join('/');
+  return path ? { path, line } : null;
+}
 
-// What the reference `[name](url)` / `![name](url)` points at: `{ kind: 'image', name, src, href }`,
-// `{ kind: 'file', name, href }`, or null for any other link.
 function attachmentRef(name, url) {
-  const image = IMAGE_URL_RE.exec(url);
-  if (image) {
-    const proxy = `/api/images/${image[1]}/${image[2]}`;
-    return { kind: 'image', name: name.trim(), src: proxy, href: proxy };
-  }
-  const file = FILE_URL_RE.exec(url);
-  return file ? { kind: 'file', name: name.trim(), href: `/api/files/${file[1]}/${file[2]}` } : null;
+  const ref = fileRefFromHref(url);
+  if (!ref?.href) return null;
+  const href = ref.href + (ref.line ? '#L' + ref.line : '');
+  return ref.href.startsWith('/api/images/')
+    ? { kind: 'image', name: name.trim(), src: ref.href, href }
+    : { kind: 'file', name: name.trim(), href };
 }
 
 // Taking a reference out of the text leaves its line's trailing blanks and an extra blank line.
@@ -403,7 +512,7 @@ function tidyGaps(text) {
 // gaps they leave tidied. Other links, and an image still uploading (`blob:` URL), stay text.
 export function userMessageParts(text) {
   const source = typeof text === 'string' ? text : '';
-  if (!source.includes('/api/projects/')) return { parts: source ? [{ kind: 'text', text: source }] : [], files: [] };
+  if (!source.includes('/api/')) return { parts: source ? [{ kind: 'text', text: source }] : [], files: [] };
   const files = [];
   const withoutFiles = source.replace(ATTACHMENT_REF_RE, (whole, _bang, name, url) => {
     const ref = attachmentRef(name, url);
@@ -426,7 +535,7 @@ export function userMessageParts(text) {
 }
 
 // One image of a user message, in its text: a bounded thumbnail linking to the image. It is a
-// `.file-attachment-link`, so file-attach.js's delegated handler opens it outside the app.
+// transcript attachment link, handled by the chat's file viewer.
 function inlineImageHtml(image, tr) {
   // A pasted image carries the alt text `img`; name it plainly instead.
   const name = image.name && image.name !== 'img' ? image.name : tr('taskChat.embed.image');
@@ -434,8 +543,7 @@ function inlineImageHtml(image, tr) {
     + `<img src="${esc(image.src)}" alt="${esc(name)}" loading="lazy"></a>`;
 }
 
-// The chips of a user message's file references (userMessageParts() `files`). Each is a
-// `.file-attachment-link`, so file-attach.js's delegated handler opens it outside the app.
+// File chips in a user message share the transcript's delegated preview handler.
 export function attachmentsHtml(files, { t } = {}) {
   const tr = typeof t === 'function' ? t : key => key;
   const items = (Array.isArray(files) ? files : []).map((a) => {

@@ -81,10 +81,10 @@ test('console-modal.js: chatPersistEpoch is bumped before both persistence DELET
 
 test('console-modal.js: state.chatState = null only appears inside the wasActive-only branch, never the force-only branch', () => {
   const src = readSource('console-modal.js');
-  const purgeBranchIdx = src.indexOf('if (force || wasActive) {');
+  const purgeBranchIdx = src.indexOf('if (force || wasActive || preserveServerDraft) {');
   const reposIdx = src.indexOf('if (wasActive) {');
   const nullIdx = src.indexOf('state.chatState = null;');
-  assert.ok(purgeBranchIdx > -1, 'persistence-purge branch "if (force || wasActive) {" not found');
+  assert.ok(purgeBranchIdx > -1, 'local persistence cleanup branch not found');
   assert.ok(reposIdx > purgeBranchIdx, 're-pointing branch "if (wasActive) {" not found after the purge branch');
   assert.ok(nullIdx > -1, 'state.chatState = null; not found');
   assert.ok(
@@ -170,7 +170,7 @@ test('chat-ui.js: the chat-tab-close click handler no longer calls _abortTab dir
 test('console-modal.js: the chat-persist-purged dispatch is not scoped to the wasActive branch', () => {
   const src = readSource('console-modal.js');
   const wasActiveIdx = src.indexOf('if (wasActive) {\n    state.chatState = null;');
-  const dispatchGuardIdx = src.indexOf("if ((force || wasActive) && state.chatState) {");
+  const dispatchGuardIdx = src.indexOf('if (!preserveServerDraft && (force || wasActive) && state.chatState) {');
   const dispatchIdx = src.indexOf("document.dispatchEvent(new CustomEvent('tiptask:chat-persist-purged'));");
   assert.ok(wasActiveIdx > -1, 'could not find the wasActive re-pointing branch');
   assert.ok(dispatchGuardIdx > wasActiveIdx, 'the chat-persist-purged dispatch guard must come after the wasActive re-pointing branch closes');

@@ -141,23 +141,35 @@ function stripTurnReminder(text) {
   return String(text || '').split(ASK_USER_REMINDER).join('').trim();
 }
 
+// A reply's pieces are joined with a blank line. Where the agent called a tool between two of
+// them (Claude, Pi), or began another whole message (Codex, `newRun`), the reply also records a
+// segment boundary in `breaks`: the offset where the earlier run ends, as a live turn marks it
+// (task-chat-widgets.js markSegmentBoundary()), so a resumed chat shows its progress notes and
+// its answer as separate blocks too.
 function conversationBuilder() {
   const out = [];
   let sawUser = false;
+  let toolSince = false;
   return {
     user(text) {
       const t = stripTurnReminder(text);
       if (!t) return;
       sawUser = true;
+      toolSince = false;
       out.push({ role: 'user', content: t });
     },
-    assistant(text) {
+    assistant(text, { newRun = false } = {}) {
       const t = String(text || '').trim();
       if (!t) return;
       const last = out[out.length - 1];
-      if (last && last.role === 'assistant') last.content += `\n\n${t}`;
-      else out.push({ role: 'assistant', content: t });
+      if (last && last.role === 'assistant') {
+        if (toolSince || newRun) last.breaks = [...(last.breaks || []), last.content.length];
+        last.content += `\n\n${t}`;
+      } else out.push({ role: 'assistant', content: t });
+      toolSince = false;
     },
+    // A tool call or its result: the next assistant text starts a new run.
+    tool() { toolSince = true; },
     done(fromStart) {
       if (fromStart && sawUser) {
         const i = out.findIndex(m => m.role === 'user');
@@ -174,13 +186,21 @@ function userText(content) {
   return joinText(content, ['text', 'input_text']);
 }
 
+function hasBlock(content, type) {
+  return Array.isArray(content) && content.some(block => block && block.type === type);
+}
+
 function parseClaudeConversation(text, { fromStart = true } = {}) {
   const conv = conversationBuilder();
   let saw = false;
   for (const o of parseJsonLines(text)) {
     if (o.isSidechain || (o.type !== 'user' && o.type !== 'assistant') || !o.message) continue;
     saw = true;
-    if (o.type === 'assistant') { conv.assistant(joinText(o.message.content, ['text'])); continue; }
+    if (o.type === 'assistant') {
+      conv.assistant(joinText(o.message.content, ['text']));
+      if (hasBlock(o.message.content, 'tool_use')) conv.tool();
+      continue;
+    }
     if (o.isMeta || o.isCompactSummary || o.isVisibleInTranscriptOnly) continue;
     const t = userText(o.message.content);
     // Interactive-CLI bookkeeping (slash commands, local command output) is not a prompt.
@@ -201,7 +221,8 @@ function parseCodexConversation(text, { fromStart = true } = {}) {
     const p = o.payload || {};
     if (o.type !== 'response_item' || p.type !== 'message') continue;
     saw = true;
-    if (p.role === 'assistant') conv.assistant(joinText(p.content, ['output_text', 'text']));
+    // Each Codex message is its own run of text, as a live turn shows it (codex-session.js).
+    if (p.role === 'assistant') conv.assistant(joinText(p.content, ['output_text', 'text']), { newRun: true });
     else if (p.role === 'user') {
       const t = userText(p.content);
       if (t && !CODEX_INJECTED_RE.test(t)) conv.user(t);
@@ -213,7 +234,7 @@ function parseCodexConversation(text, { fromStart = true } = {}) {
     const p = o.payload || {};
     if (o.type !== 'event_msg') continue;
     if (p.type === 'user_message' && typeof p.message === 'string') { saw = true; conv.user(p.message); }
-    else if (p.type === 'agent_message' && typeof p.message === 'string') { saw = true; conv.assistant(p.message); }
+    else if (p.type === 'agent_message' && typeof p.message === 'string') { saw = true; conv.assistant(p.message, { newRun: true }); }
   }
   return saw ? conv.done(fromStart) : null;
 }
@@ -224,7 +245,11 @@ function parsePiConversation(text, { fromStart = true } = {}) {
   for (const o of parseJsonLines(text)) {
     if (o.type !== 'message' || !o.message) continue;
     const m = o.message;
-    if (m.role === 'assistant') { saw = true; conv.assistant(joinText(m.content, ['text'])); }
+    if (m.role === 'assistant') {
+      saw = true;
+      conv.assistant(joinText(m.content, ['text']));
+      if (hasBlock(m.content, 'toolCall')) conv.tool();
+    } else if (m.role === 'toolResult') conv.tool();
     else if (m.role === 'user') { saw = true; conv.user(userText(m.content)); }
   }
   return saw ? conv.done(fromStart) : null;
@@ -237,8 +262,9 @@ function clipText(text, max) {
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 }
 
-// provider + native session file → { messages: [{ role, content }] } with the newest
-// `maxMessages`, each clipped to `maxChars` and `maxTotalChars` overall; null when the file is
+// provider + native session file → { messages: [{ role, content, breaks? }] } with the newest
+// `maxMessages`, each clipped to `maxChars` and `maxTotalChars` overall; `breaks` are a reply's
+// segment boundaries (conversationBuilder()), on a reply that has any; null when the file is
 // missing or unreadable or holds nothing of that provider's shape. Never throws. A file larger
 // than `maxBytes` is read from its tail (its head — and the seed — then is not in view).
 function readNativeConversation(provider, file, {
@@ -251,7 +277,12 @@ function readNativeConversation(provider, file, {
     const fromStart = size <= maxBytes;
     const parsed = parse(fromStart ? fs.readFileSync(file, 'utf8') : readTail(file, maxBytes), { fromStart });
     if (!parsed) return null;
-    let messages = parsed.slice(-maxMessages).map(m => ({ role: m.role, content: clipText(m.content, maxChars) }));
+    let messages = parsed.slice(-maxMessages).map((m) => {
+      const content = clipText(m.content, maxChars);
+      // A boundary the clip cut away goes with the text it split.
+      const breaks = (m.breaks || []).filter(at => at > 0 && at < content.length);
+      return breaks.length ? { role: m.role, content, breaks } : { role: m.role, content };
+    });
     let total = messages.reduce((n, m) => n + m.content.length, 0);
     while (messages.length && total > maxTotalChars) total -= messages.shift().content.length;
     return { messages };

@@ -2,19 +2,18 @@
 // Create Project flow dispatches as soon as the picked folder turns out to be unconfigured
 // (TPT557 — there is no separate Link-vs-Create chooser in front of it).
 // Collects: auth, API project (Create Project step: create new OR select existing), device
-// name, agent selection, preset (A/B/C — new project only; A = compose the knowledge base as
-// you go, TPT9316). An existing-project pick skips the Preset step (nothing to seed): 5 dots
-// instead of 6, see visibleSteps(). (TPT9318) open({ presetLocked: true }) — the Open Project
-// entry — skips it too and creates a new project in compose-as-you-go mode.
-// Emits wizard-complete with all data. Does NOT write configs or call APIs — that
-// is handled by a downstream listener (index.js), which branches on apiProject.isNew.
+// name and agent selection. Both entries collect work presets for new projects. Software
+// projects created through Create Project also choose their A/B/C onboarding mode.
+// Reads the applicable policy and previews the identity before device and agent selection.
+// The wizard-complete listener in index.js creates or links the confirmed project.
 // (TPT564) open({ locked: true }) is the first-run mode for a window with no bound project:
 // Escape does nothing, the header has no ×, and the only way out (step 1 Cancel) calls
 // onCancel, which index.js routes back to Get Started — never to the empty board. The backdrop
 // never dismisses the wizard in either mode.
-import { renderAgentSelect, loadAgents, piCredentialsMissing, computePiSaveRows } from './agent-select.js';
+import { renderAgentSelect, loadAgents, piCredentialsMissing, computePiSaveRows, getAgentDisplayLabel } from './agent-select.js';
 import { recheckAgents } from './agent-recheck.js';
-import { headerHtml, fitHeaderPath } from './setup-modal-header.js';
+import { identityMarkup, policyMarkup, renderSetupProfile } from './project-profile.js';
+import { headerHtml, fitHeaderPath, escapeHtml as _esc } from './setup-modal-header.js';
 import { DEFAULT_API_BASE_URL } from './constants.js';
 import { activateDialogFocus } from './dialog-focus.js';
 // (C1388) This module re-renders its whole overlay per step (_render()/_renderStep()),
@@ -22,6 +21,25 @@ import { activateDialogFocus } from './dialog-focus.js';
 // in a module-level constant (i18n.js's own rule). PRESETS below uses getters for
 // exactly this reason.
 import { t } from './i18n.js';
+
+// Work-domain icons accompany the card's localized name. These IDs are independent of
+// the A/B/C onboarding choices below.
+const PRESET_ICON_PATHS = new Map([
+  ['software', 'M8 6l-6 6 6 6 M16 6l6 6-6 6'],
+  ['science', 'M8 3h8 M10 3v6L3.7 19.2A1.2 1.2 0 0 0 4.7 21h14.6a1.2 1.2 0 0 0 1-1.8L14 9V3 M7 14h10'],
+  ['marketing', 'M3 9h6l11-6v16L9 14H3z M9 9v5 M5 14l2 7h4l-2-7'],
+  ['sales', 'M3 3h8l10 10-8 8L3 11z M8.5 7.5a1 1 0 1 1-2 0 1 1 0 1 1 2 0z'],
+  ['finance', 'M3 3v18h18 M7 15l4-5 4 2 6-7'],
+  ['health', 'M12 21 3.7 12.7C-1.5 7.3 6 0 11 5.4L12 6.5l1-1.1C18 0 25.5 7.3 20.3 12.7Z'],
+  ['home', 'M2.5 10.5 12 3l9.5 7.5 M5 9v12h5v-7h4v7h5V9'],
+  ['personal-growth', 'M12 21v-4C12 10 7 7 3 7c0 6 3 10 9 10 M12 14C12 7 16 3 21 3c0 6-3 11-9 11'],
+]);
+
+export function presetIcon(presetId) {
+  const path = PRESET_ICON_PATHS.get(presetId);
+  if (!path) return '';
+  return `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="${path}"/></svg>`;
+}
 
 // (TPT9316) The preset value main.js / project-seeder.js branch on for "compose the knowledge
 // base as you go": no starter tasks, base templates only, KB_MODE: 'compose' in config.json.
@@ -59,20 +77,39 @@ let _apiBaseUrl = DEFAULT_API_BASE_URL;
 let _userToken = null;
 let _userInfo = null;
 let _apiProject = null;
+let _profile = null;
+let _identityDraft = {};
+let _targetKey = null;
+
+function resetProjectChoices(key) {
+  _targetKey = key;
+  _profile = null;
+  _identityDraft = {};
+  _taskAgent = '';
+  _availableAgents = [];
+  _piModels = [{ model: '', apiKey: '' }];
+  _workPresets = [];
+  _preset = null;
+  _deviceName = '';
+}
 let _deviceName = '';
 let _taskAgent = '';
 let _availableAgents = [];
+// The Agent step's detected agents, kept for their labels: Confirm names the Default the way its
+// card did ("Claude Code", not the stored id `claude`).
+let _agentList = [];
 // C1121 — up to 8 {model, apiKey} rows, replacing the old single piModel/piApiKey pair.
 // Always has >= 1 row (normalizePiModels() invariant); row 0 is the mirror used for the
 // legacy piModel/piApiKey confirm-payload fields main.js still reads.
 let _piModels = [{ model: '', apiKey: '' }];
 let _preset = null;
+let _workPresets = [];
 let _onComplete = null;
 // (TPT564) User-dismissal callback (step 1 Cancel, ×, Escape) — never fired by a completed
 // run or by open() superseding an earlier session; see _cancel().
 let _onCancel = null;
 let _locked = false;
-// (TPT9318) Open Project entry: no Preset step, _preset fixed to compose-as-you-go.
+// Open Project fixes onboarding to compose-as-you-go, regardless of the work presets.
 let _presetLocked = false;
 let _overlay = null;
 let _keyHandler = null;
@@ -82,21 +119,59 @@ let _keyHandler = null;
 // contents, never replaces it (a fresh body child would be inerted by the lower layer).
 let _focusHandle = null;
 
-// (TPT557) Step numbers shown for a wizard run — an existing API project has no Preset step
-// (step 5): nothing gets seeded, index.js links the folder through project:open-existing.
-// (TPT9318) A preset-locked run (Open Project entry) has none either: the preset is always
-// compose-as-you-go. Pure (no DOM, no module state) so project-creation-wizard.test.js can pin it.
-export function visibleSteps({ existing = false, presetLocked = false } = {}) {
-  return existing || presetLocked ? [1, 2, 3, 4, 6] : [1, 2, 3, 4, 5, 6];
+export function visibleSteps({ existing = false, presetLocked = false, software = false } = {}) {
+  if (existing) return [1, 2, 'profile', 3, 4, 7];
+  return software && !presetLocked ? [1, 2, 'profile', 3, 4, 5, 6, 7] : [1, 2, 'profile', 3, 4, 5, 7];
 }
 
 function _isExisting() {
   return !!_apiProject && !_apiProject.isNew;
 }
 
-// Whether this run goes Agent → Confirm with no Preset step (existing project, or locked preset).
-function _skipsPreset() {
-  return _isExisting() || _presetLocked;
+function _steps() {
+  return visibleSteps({ existing: _isExisting(), presetLocked: _presetLocked, software: _workPresets.includes('software') });
+}
+
+function _move(offset) {
+  const steps = _steps();
+  _goto(steps[steps.indexOf(_step) + offset]);
+}
+
+// Each visibleSteps() id's name, shown beside the progress dots and as each dot's tooltip.
+const STEP_NAME_KEYS = {
+  1: 'wizard.stepSignIn', 2: 'wizard.stepApiProject', profile: 'profile.title', 3: 'wizard.stepDevice',
+  4: 'wizard.stepAgent', 5: 'wizard.workPresets', 6: 'wizard.stepPreset', 7: 'wizard.stepConfirm',
+};
+
+// (TPT9388) The progress row: one dot per visible step (done, current, still to come), then the
+// current step's name and "Step n of N". The dots stay direct children of .setup-modal-steps, as in
+// setup-modal.js. The count follows visibleSteps(), so a pick that adds or drops a step (an
+// existing project, Software's onboarding) repaints it at once.
+function _renderProgress() {
+  const steps = _steps();
+  const current = steps.indexOf(_step);
+  const dots = steps.map((n, index) => {
+    const cls = index < current ? 'is-done' : index === current ? 'is-active' : '';
+    return `<span class="setup-modal-dot ${cls}" title="${_esc(t(STEP_NAME_KEYS[n]))}" aria-hidden="true"></span>`;
+  }).join('');
+  _overlay.querySelector('.setup-modal-steps').innerHTML = dots +
+    `<span class="setup-modal-step-name">${_esc(t(STEP_NAME_KEYS[_step]))}</span>` +
+    `<span class="setup-modal-step-count">${_esc(t('wizard.stepCount', { n: current + 1, total: steps.length }))}</span>`;
+}
+
+// (TPT9388) Every step opens the same way: its heading, then an optional hint under it. `aside`
+// sits at the far end of the heading row (Work presets' Select all). The heading's id labels the
+// step's own field or card group; the hint's id describes it.
+function stepHead(heading, { hint = '', hintHtml = '', aside = '', center = false } = {}) {
+  const hintMarkup = hintHtml || _esc(hint);
+  return `
+    <div class="setup-modal-step-head${center ? ' setup-modal-step-head--center' : ''}">
+      <div class="setup-modal-step-head-text">
+        <h2 class="setup-modal-label" id="wiz-step-heading">${_esc(heading)}</h2>
+        ${hintMarkup ? `<p class="setup-modal-hint" id="wiz-step-hint">${hintMarkup}</p>` : ''}
+      </div>
+      ${aside}
+    </div>`;
 }
 // Bumped by open()/close() — invalidates the in-flight stored-account check of a superseded session.
 let _openId = 0;
@@ -131,13 +206,15 @@ export function open({ projectPath, onComplete, onCancel, locked = false, preset
   if (_overlay) close();
   _projectPath = projectPath;
   _step = 1;
+  resetProjectChoices(null);
   _apiProject = null;
   _deviceName = '';
   _taskAgent = '';
   _availableAgents = [];
   _piModels = [{ model: '', apiKey: '' }];
   _presetLocked = !!presetLocked;
-  _preset = _presetLocked ? PRESETS.find((p) => p.value === COMPOSE_PRESET) : null;
+  _preset = null;
+  _workPresets = [];
   _onComplete = onComplete || null;
   _onCancel = typeof onCancel === 'function' ? onCancel : null;
   _locked = !!locked;
@@ -216,20 +293,11 @@ function _render() {
     _overlay.setAttribute('aria-modal', 'true');
   }
 
-  const STEP_LABELS = [t('wizard.stepSignIn'), t('wizard.stepApiProject'), t('wizard.stepDevice'), t('wizard.stepAgent'), t('wizard.stepPreset'), t('wizard.stepConfirm')];
-  // (TPT557) One dot per VISIBLE step — the Preset dot disappears once an existing project
-  // is picked on step 2 (and comes back if the user goes Back and picks "Create new").
-  // (TPT9318) A preset-locked run never shows it.
-  const dots = visibleSteps({ existing: _isExisting(), presetLocked: _presetLocked }).map((n) => {
-    const cls = n < _step ? 'is-done' : n === _step ? 'is-active' : '';
-    return `<span class="setup-modal-dot ${cls}" title="${_esc(STEP_LABELS[n - 1])}"></span>`;
-  }).join('');
-
   _overlay.innerHTML = `
     <div class="setup-modal-backdrop"></div>
     <div class="setup-modal-panel">
       ${headerHtml({ title: t('wizard.headerTitle'), projectPath: _projectPath, closable: !_locked })}
-      <div class="setup-modal-steps">${dots}</div>
+      <div class="setup-modal-steps"></div>
       <div class="setup-modal-step-body" id="wiz-step-body"></div>
       <div class="setup-modal-footer" id="wiz-footer"></div>
     </div>
@@ -244,6 +312,7 @@ function _render() {
     _focusHandle = activateDialogFocus({ root: _overlay, portals: '.sma-pi-suggest' });
   }
   fitHeaderPath(_overlay);
+  _renderProgress();
 
   // No × in locked mode (TPT564); .setup-modal-backdrop deliberately has no click handler.
   _overlay.querySelector('.setup-modal-close')?.addEventListener('click', _cancel);
@@ -257,17 +326,32 @@ function _renderStep() {
   const footer = _overlay.querySelector('#wiz-footer');
   if (_step === 1) _renderStep1(body, footer);
   else if (_step === 2) _renderStep2(body, footer);
+  else if (_step === 'profile') {
+    // The shared profile renderer fills its own host, so the step's heading stays above it.
+    body.innerHTML = stepHead(t('profile.title'), { hint: t('wizard.profileHint') }) + '<div class="setup-modal-profile"></div>';
+    renderSetupProfile({ body: body.querySelector('.setup-modal-profile'), footer, prefix: 'wiz', baseUrl: _apiBaseUrl,
+      token: _userToken, project: _apiProject, draft: _identityDraft, loaded: profile => { _profile = profile; },
+      back: () => _move(-1), next: () => _move(1) });
+  }
   else if (_step === 3) _renderStep3(body, footer);
   else if (_step === 4) _renderStep4(body, footer);  // Agent
-  else if (_step === 5) _renderStep5(body, footer);  // Preset
-  else if (_step === 6) _renderStep6(body, footer);  // Confirm
+  else if (_step === 5) _renderWorkPresets(body, footer);
+  else if (_step === 6) _renderOnboarding(body, footer);
+  else if (_step === 7) _renderConfirm(body, footer);
 }
 
 // ── Step 1: Sign in ──────────────────────────────────────────────────────────
 
+// (TPT9388) The Sign in step's mark: a person in a tinted circle, a tick once signed in. Decorative.
+const signInMark = (path) => `<span class="setup-modal-signin-mark" aria-hidden="true"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">${path}</svg></span>`;
+const SIGN_IN_MARK = signInMark('<circle cx="12" cy="8.5" r="3.5"/><path d="M5 19.5c1.4-3.2 4-4.8 7-4.8s5.6 1.6 7 4.8"/>');
+const SIGNED_IN_MARK = signInMark('<path d="M5.5 12.5l4.2 4.2 8.8-9.4"/>');
+
 function _renderStep1(body, footer) {
+  // Centred in the body, in every state: checking, signed out, signing in, signed in.
+  body.classList.add('setup-modal-step-body--center');
   if (_storedAccountPending) {
-    body.innerHTML = `<div class="setup-modal-spinner">${_esc(t('setup.checkingSignIn'))}</div>`;
+    body.innerHTML = `<div class="setup-modal-signin">${SIGN_IN_MARK}<div class="setup-modal-spinner">${_esc(t('setup.checkingSignIn'))}</div></div>`;
     footer.innerHTML = `
       <button class="setup-modal-btn setup-modal-btn--secondary" id="wiz-cancel-btn">${_esc(t('common.cancel'))}</button>
     `;
@@ -278,9 +362,11 @@ function _renderStep1(body, footer) {
   if (_userToken) {
     const email = _userInfo?.email || t('setup.userFallback');
     body.innerHTML = `
-      <p class="setup-modal-label">${_esc(t('wizard.signedIn'))}</p>
-      <p class="setup-modal-hint">${t('setup.signedInAs', { email: `<strong>${_esc(email)}</strong>` })}</p>
-      <div class="setup-modal-msg" id="wiz-auth-msg"></div>
+      <div class="setup-modal-signin">
+        ${SIGNED_IN_MARK}
+        ${stepHead(t('wizard.signedIn'), { hintHtml: t('setup.signedInAs', { email: `<strong>${_esc(email)}</strong>` }), center: true })}
+        <div class="setup-modal-msg" id="wiz-auth-msg"></div>
+      </div>
     `;
     footer.innerHTML = `
       <button class="setup-modal-btn setup-modal-btn--secondary" id="wiz-switch-btn">${_esc(t('wizard.useDifferentAccount'))}</button>
@@ -288,6 +374,8 @@ function _renderStep1(body, footer) {
     `;
     footer.querySelector('#wiz-next-btn').addEventListener('click', () => _goto(2));
     footer.querySelector('#wiz-switch-btn').addEventListener('click', () => {
+      resetProjectChoices(null);
+      _apiProject = null;
       _userToken = null;
       _userInfo = null;
       _chooseAccount = true;
@@ -297,13 +385,16 @@ function _renderStep1(body, footer) {
   }
 
   body.innerHTML = `
-    <p class="setup-modal-label">${_esc(t('setup.signIn'))}</p>
-    <div class="setup-modal-row setup-modal-row--center" id="wiz-auth-actions">
-      <button class="setup-modal-btn setup-modal-btn--primary" id="wiz-signin-btn">${_esc(t('setup.signIn'))}</button>
+    <div class="setup-modal-signin">
+      ${SIGN_IN_MARK}
+      ${stepHead(t('setup.signIn'), { hint: t('wizard.signInHint'), center: true })}
+      <div class="setup-modal-row setup-modal-row--center" id="wiz-auth-actions">
+        <button class="setup-modal-btn setup-modal-btn--primary setup-modal-btn--wide" id="wiz-signin-btn">${_esc(t('setup.signIn'))}</button>
+      </div>
+      <div class="setup-modal-spinner" id="wiz-auth-spinner" style="display:none">${_esc(t('wizard.openingBrowserEllipsis'))}</div>
+      <p class="setup-modal-hint" id="wiz-auth-hint"></p>
+      <div class="setup-modal-msg setup-modal-msg--error" id="wiz-auth-msg"></div>
     </div>
-    <p class="setup-modal-hint" id="wiz-auth-hint"></p>
-    <div class="setup-modal-spinner" id="wiz-auth-spinner" style="display:none">${_esc(t('wizard.openingBrowserEllipsis'))}</div>
-    <div class="setup-modal-msg setup-modal-msg--error" id="wiz-auth-msg"></div>
   `;
 
   footer.innerHTML = `
@@ -325,7 +416,8 @@ function _renderStep1(body, footer) {
     actions.style.display = 'none';
     spinner.style.display = '';
     msg.textContent = '';
-    hint.textContent = t('setup.openingBrowserSignIn');
+    // The spinner says it; the step's own hint already says the browser finishes the sign-in.
+    hint.textContent = '';
     try {
       const result = await setupAuthWeb(_apiBaseUrl, undefined, { chooseAccount: _chooseAccount });
       _userToken = result.token;
@@ -349,15 +441,19 @@ function _renderStep1(body, footer) {
 
 function _renderStep2(body, footer) {
   body.innerHTML = `
-    <p class="setup-modal-label">${_esc(t('wizard.selectOrCreateProject'))}</p>
+    ${stepHead(t('wizard.selectOrCreateProject'))}
     <div class="setup-modal-project-list" id="wiz-proj-list">
       <div class="setup-modal-spinner">${_esc(t('setup.loadingProjects'))}</div>
     </div>
     <div class="setup-modal-create-project-form" id="wiz-create-form">
-      <label class="setup-modal-form-label" for="wiz-proj-name">${_esc(t('wizard.projectName'))}</label>
-      <input class="setup-modal-input" id="wiz-proj-name" type="text" maxlength="255" placeholder="${_esc(t('wizard.projectNamePlaceholder'))}" spellcheck="false" />
-      <label class="setup-modal-form-label" style="margin-top:0.6rem" for="wiz-proj-desc">${_esc(t('wizard.descriptionOptional'))}</label>
-      <textarea class="setup-modal-textarea" id="wiz-proj-desc" maxlength="2000" rows="3" placeholder="${_esc(t('wizard.descriptionPlaceholder'))}"></textarea>
+      <div class="setup-modal-field">
+        <label class="setup-modal-form-label" for="wiz-proj-name">${_esc(t('wizard.projectName'))}</label>
+        <input class="setup-modal-input" id="wiz-proj-name" type="text" maxlength="255" placeholder="${_esc(t('wizard.projectNamePlaceholder'))}" spellcheck="false" />
+      </div>
+      <div class="setup-modal-field">
+        <label class="setup-modal-form-label" for="wiz-proj-desc">${_esc(t('wizard.descriptionOptional'))}</label>
+        <textarea class="setup-modal-input setup-modal-input--multiline" id="wiz-proj-desc" maxlength="2000" rows="3" placeholder="${_esc(t('wizard.descriptionPlaceholder'))}"></textarea>
+      </div>
     </div>
     <div class="setup-modal-msg setup-modal-msg--error" id="wiz-proj-msg"></div>
   `;
@@ -375,22 +471,29 @@ function _renderStep2(body, footer) {
   const nameInput = body.querySelector('#wiz-proj-name');
   const descInput = body.querySelector('#wiz-proj-desc');
   const msg = body.querySelector('#wiz-proj-msg');
+  const gen = _openId;
 
   let creatingNew = false;
 
   const selectCard = (card, proj) => {
-    list.querySelectorAll('.setup-modal-project-card').forEach(c => c.classList.remove('is-selected'));
-    if (card) card.classList.add('is-selected');
+    for (const option of list.querySelectorAll('.setup-modal-project-card')) {
+      option.classList.toggle('is-selected', option === card);
+      option.setAttribute('aria-pressed', String(option === card));
+    }
+    const key = proj?.id ?? 'new';
+    if (_targetKey !== key) resetProjectChoices(key);
     creatingNew = !proj;
     createForm.classList.toggle('is-visible', creatingNew);
     if (creatingNew) {
       _apiProject = null;
       nextBtn.disabled = nameInput.value.trim().length === 0;
-      setTimeout(() => nameInput.focus(), 50);
+      nameInput.focus();
     } else {
-      _apiProject = { id: proj.id, name: proj.name, isNew: false };
+      const projectPresets = Array.isArray(proj.projectPresets) && proj.projectPresets.length ? proj.projectPresets : ['software'];
+      _apiProject = { id: proj.id, name: proj.name, projectPresets, isNew: false };
       nextBtn.disabled = false;
     }
+    _renderProgress();
   };
 
   nextBtn.addEventListener('click', () => {
@@ -399,7 +502,7 @@ function _renderStep2(body, footer) {
       if (!name) { msg.textContent = t('wizard.projectNameRequired'); return; }
       _apiProject = { id: null, name, description: descInput.value.trim() || null, isNew: true };
     }
-    if (_apiProject) _goto(3);
+    if (_apiProject) _move(1);
   });
 
   nameInput?.addEventListener('input', () => {
@@ -421,37 +524,48 @@ function _renderStep2(body, footer) {
       }
       projects = Array.isArray(raw) ? raw : (raw?.projects || raw?.data || []);
     } catch (e) {
+      if (gen !== _openId || !list.isConnected) return;
       list.innerHTML = '';
       msg.textContent = t('setup.failedToLoadProjects', { msg: e.message });
       return;
     }
 
+    if (gen !== _openId || !list.isConnected) return;
     const newCard = `
-      <div class="setup-modal-project-card" id="wiz-new-card" data-new="1">
-        <span class="setup-modal-project-name">+ ${_esc(t('wizard.createNewProject'))}</span>
-      </div>
+      <button type="button" class="setup-modal-project-card setup-modal-project-card--new" id="wiz-new-card" aria-pressed="false" aria-controls="wiz-create-form">
+        <span class="setup-modal-project-plus" aria-hidden="true">+</span>
+        <span class="setup-modal-project-name">${_esc(t('wizard.createNewProject'))}</span>
+      </button>
     `;
     const existingCards = projects.map((p) => `
-      <div class="setup-modal-project-card" data-id="${_esc(String(p.id))}" data-name="${_esc(p.name || '')}">
+      <button type="button" class="setup-modal-project-card" data-id="${_esc(String(p.id))}" aria-pressed="false">
         <span class="setup-modal-project-name">${_esc(p.name || t('setup.unnamedProject'))}</span>
         <span class="setup-modal-project-id">#${_esc(String(p.id))}</span>
-      </div>
+      </button>
     `).join('');
-    list.innerHTML = newCard + existingCards;
+    list.innerHTML = newCard + (projects.length
+      ? `<p class="setup-modal-section-label">${_esc(t('wizard.existingProjects'))}</p>${existingCards}` : '');
+    // (TPT9388) The name/description form opens right under its card, never below a long project
+    // list. Moved, not re-rendered, so typed text and listeners survive.
+    list.querySelector('#wiz-new-card').after(createForm);
 
     list.querySelector('#wiz-new-card').addEventListener('click', (e) => {
       selectCard(e.currentTarget, null);
     });
 
-    list.querySelectorAll('.setup-modal-project-card:not(#wiz-new-card)').forEach((card) => {
+    list.querySelectorAll('.setup-modal-project-card:not(#wiz-new-card)').forEach((card, index) => {
       card.addEventListener('click', () => {
-        selectCard(card, { id: Number(card.dataset.id), name: card.dataset.name });
+        selectCard(card, projects[index]);
       });
     });
 
-    if (_apiProject && !_apiProject.isNew) {
+    if (_apiProject?.isNew) {
+      nameInput.value = _apiProject.name;
+      descInput.value = _apiProject.description || '';
+      selectCard(list.querySelector('#wiz-new-card'), null);
+    } else if (_apiProject) {
       const prev = list.querySelector(`[data-id="${_apiProject.id}"]`);
-      if (prev) selectCard(prev, { id: _apiProject.id, name: _apiProject.name });
+      if (prev) prev.click();
     }
   })();
 }
@@ -460,10 +574,12 @@ function _renderStep2(body, footer) {
 
 function _renderStep3(body, footer) {
   body.innerHTML = `
-    <p class="setup-modal-label">${_esc(t('wizard.deviceName'))}</p>
-    <p class="setup-modal-hint">${_esc(t('wizard.deviceNameHint'))}</p>
-    <input class="setup-modal-input" id="wiz-device-input" type="text" maxlength="100"
-      value="${_esc(_deviceName)}" placeholder="${_esc(t('wizard.deviceNamePlaceholder'))}" spellcheck="false" />
+    ${stepHead(t('wizard.deviceName'), { hint: t('wizard.deviceNameHint') })}
+    <div class="setup-modal-field">
+      <input class="setup-modal-input" id="wiz-device-input" type="text" maxlength="100"
+        aria-labelledby="wiz-step-heading" aria-describedby="wiz-step-hint"
+        value="${_esc(_deviceName)}" placeholder="${_esc(t('wizard.deviceNamePlaceholder'))}" spellcheck="false" />
+    </div>
     <div class="setup-modal-msg setup-modal-msg--error" id="wiz-device-msg"></div>
   `;
 
@@ -477,7 +593,7 @@ function _renderStep3(body, footer) {
   const msg = body.querySelector('#wiz-device-msg');
   nextBtn.disabled = input.value.trim().length === 0;
   input.addEventListener('input', () => { nextBtn.disabled = input.value.trim().length === 0; });
-  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _goto(2));
+  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _move(-1));
   nextBtn.addEventListener('click', () => {
     const val = input.value.trim();
     if (!val) { msg.textContent = t('wizard.deviceNameRequired'); return; }
@@ -502,8 +618,8 @@ function _renderStep3(body, footer) {
 
 function _renderStep4(body, footer) {
   body.innerHTML = `
-    <p class="setup-modal-label">${_esc(t('wizard.chooseAgent'))}</p>
-    <div id="wiz-agent-select"><span class="setup-modal-hint">${_esc(t('setup.detectingAgents'))}</span></div>
+    ${stepHead(t('wizard.chooseAgent'))}
+    <div id="wiz-agent-select"><span class="setup-modal-spinner">${_esc(t('setup.detectingAgents'))}</span></div>
     <div class="setup-modal-msg setup-modal-msg--error" id="wiz-agent-msg"></div>
   `;
 
@@ -528,7 +644,7 @@ function _renderStep4(body, footer) {
       msgEl.textContent = t('agentSelect.fixOtherModelRows');
       return;
     }
-    _goto(_skipsPreset() ? 6 : 5); // (TPT557) existing project, (TPT9318) locked preset → no Preset step
+    _move(1);
   });
 
   const container = body.querySelector('#wiz-agent-select');
@@ -536,6 +652,8 @@ function _renderStep4(body, footer) {
   // Fetch + apply agents. force=true busts the main-process detection caches
   // (resolveBin null-cache + cachedDetect TTL) so a just-installed agent is seen.
   const applyAgents = (agents) => {
+    if (!container.isConnected) return;
+    _agentList = agents;
     // Seed from existing state if returning from a later step; otherwise auto-init.
     if (!_taskAgent) {
       const avail = agents.filter(a => a.available);
@@ -568,11 +686,50 @@ function _renderStep4(body, footer) {
   (async () => { applyAgents(await loadAgents()); })();
 }
 
-// ── Step 5: Preset (A/B/C) ────────────────────────────────────────────────────
+// ── Step 5: Work presets ──────────────────────────────────────────────────────
+function _renderWorkPresets(body, footer) {
+  const cards = [...PRESET_ICON_PATHS.keys()].map(id => `
+    <label class="wizard-work-card">
+      <span class="wizard-work-icon">${presetIcon(id)}</span>
+      <input type="checkbox" value="${id}" ${_workPresets.includes(id) ? 'checked' : ''}
+        aria-labelledby="wiz-name-${id}" aria-describedby="wiz-desc-${id}">
+      <strong class="wizard-work-name" id="wiz-name-${id}">${_esc(t('wizard.work.' + id))}</strong>
+      <span class="wizard-work-desc" id="wiz-desc-${id}">${_esc(t('wizard.workDesc.' + id))}</span>
+    </label>`).join('');
+  const selectAll = `<label class="wizard-work-all"><input type="checkbox" id="wiz-work-all"> ${_esc(t('board.selectAll'))}</label>`;
+  body.innerHTML = `
+    ${stepHead(t('wizard.chooseWork'), { aside: selectAll })}
+    <div class="wizard-work-grid" role="group" aria-labelledby="wiz-step-heading">${cards}</div>`;
+  footer.innerHTML = `
+    <button class="setup-modal-btn setup-modal-btn--secondary" id="wiz-back-btn">${_esc(t('common.back'))}</button>
+    <button class="setup-modal-btn setup-modal-btn--primary" id="wiz-next-btn">${_esc(t('common.next'))}</button>`;
+
+  const all = body.querySelector('#wiz-work-all');
+  const grid = body.querySelector('.wizard-work-grid');
+  const inputs = [...grid.querySelectorAll('input')];
+  const next = footer.querySelector('#wiz-next-btn');
+  function syncSelection() {
+    _workPresets = inputs.filter(input => input.checked).map(input => input.value);
+    all.checked = _workPresets.length === inputs.length;
+    all.indeterminate = _workPresets.length > 0 && !all.checked;
+    next.disabled = !_workPresets.length;
+    _renderProgress();
+  }
+  all.addEventListener('change', () => {
+    for (const input of inputs) input.checked = all.checked;
+    syncSelection();
+  });
+  grid.addEventListener('change', syncSelection);
+  syncSelection();
+  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _move(-1));
+  next.addEventListener('click', () => { if (_workPresets.length) _move(1); });
+}
+
+// ── Step 6: Onboarding (A/B/C) ────────────────────────────────────────────────────
 // (TPT9316) One full-width card per preset, stacked in letter order. Cards are toggle buttons
 // (aria-pressed), so Tab/Enter/Space pick a preset; selection updates in place and keeps focus.
 
-function _renderStep5(body, footer) {
+function _renderOnboarding(body, footer) {
   const cards = PRESETS.map((p) => {
     const selected = _preset?.value === p.value;
     return `
@@ -587,9 +744,8 @@ function _renderStep5(body, footer) {
   }).join('');
 
   body.innerHTML = `
-    <p class="setup-modal-label" id="wiz-preset-label">${_esc(t('wizard.choosePreset'))}</p>
-    <div class="setup-modal-preset-grid" role="group" aria-labelledby="wiz-preset-label">${cards}</div>
-    <p class="setup-modal-hint">${_esc(t('wizard.presetHint'))}</p>
+    ${stepHead(t('wizard.choosePreset'), { hint: t('wizard.presetHint') })}
+    <div class="setup-modal-preset-grid" role="group" aria-labelledby="wiz-step-heading" aria-describedby="wiz-step-hint">${cards}</div>
     <div class="setup-modal-msg setup-modal-msg--error" id="wiz-preset-msg"></div>
   `;
 
@@ -600,7 +756,7 @@ function _renderStep5(body, footer) {
 
   const nextBtn = footer.querySelector('#wiz-next-btn');
   const msg = body.querySelector('#wiz-preset-msg');
-  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _goto(4));
+  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _move(-1));
 
   const cardEls = [...body.querySelectorAll('.setup-modal-preset-card')];
   cardEls.forEach((card) => {
@@ -617,29 +773,33 @@ function _renderStep5(body, footer) {
 
   nextBtn.addEventListener('click', () => {
     if (!_preset) { msg.textContent = t('wizard.selectPreset'); return; }
-    _goto(6);
+    _move(1);
   });
 }
 
-// ── Step 6: Confirm ───────────────────────────────────────────────────────────
+// ── Step 7: Confirm ───────────────────────────────────────────────────────────
 
-function _renderStep6(body, footer) {
-  // (TPT557) Two outcomes share this screen: a NEW API project (Preset row, "Create Project")
-  // and an EXISTING one picked on step 2 (no Preset row, "Open Project", preset: null in the
-  // emitted detail — index.js then links instead of creating/seeding).
-  // (TPT9318) A preset-locked run (Open Project entry) creates its new project in
-  // compose-as-you-go mode: the Preset row names the mode without a letter (no A/B/C cards
-  // were shown) and the detail carries the compose preset. Linking an existing project
-  // creates nothing, so it emits preset: null in both entries.
+function _renderConfirm(body, footer) {
+  // The summary and IPC payload use the same onboarding mode, including the implicit
+  // compose mode when the user went Back and removed Software after choosing a code seed.
   const existing = _isExisting();
   const email = _userInfo?.email || '—';
   const projName = _apiProject?.name || '—';
-  const projId = _apiProject?.isNew ? 'new' : (String(_apiProject?.id ?? '—'));
-  const newBadge = _apiProject?.isNew ? `<span class="setup-modal-summary-badge">${_esc(t('wizard.newBadge'))}</span>` : '';
-  const presetLabel = !_preset ? '—' : _presetLocked ? _preset.name : `${_preset.letter} — ${_preset.name}`;
-  const presetRow = existing ? '' :
-    `<tr><td class="setup-modal-summary-key">${_esc(t('wizard.summaryPreset'))}</td><td class="setup-modal-summary-val">${_esc(presetLabel)}</td></tr>`;
-  const agentLabel = _taskAgent || '—';
+  // A new project has no id yet: its badge says so. An existing one shows its #id.
+  const projRef = _apiProject?.isNew
+    ? `<span class="setup-modal-summary-badge">${_esc(t('wizard.newBadge'))}</span>`
+    : `<span class="setup-modal-project-id">#${_esc(String(_apiProject?.id ?? '—'))}</span>`;
+  const choseOnboarding = _steps().includes(6);
+  const preset = choseOnboarding ? _preset : PRESETS[0];
+  const presetLabel = choseOnboarding ? `${preset.letter} — ${preset.name}` : preset.name;
+  const projectPresets = existing ? _apiProject.projectPresets : _workPresets;
+  // (TPT9388) One aligned summary: every key in one column as wide as its longest label, each
+  // value beside it, the project itself first.
+  const row = (key, value, cls = '') =>
+    `<tr${cls ? ` class="${cls}"` : ''}><th scope="row" class="setup-modal-summary-key">${_esc(key)}</th><td class="setup-modal-summary-val">${value}</td></tr>`;
+  const presetRow = existing ? '' : row(t('wizard.summaryPreset'), _esc(presetLabel));
+  // The Default as its card named it ("Other Model" for Pi); `_taskAgent` stays the stored id.
+  const agentLabel = _taskAgent ? getAgentDisplayLabel(_taskAgent, { pi: t('agentSelect.namePi') }, _agentList) : '—';
   const piEnabled = _availableAgents.includes('pi');
   // C1121 — one row per configured model. API keys are never shown in the summary.
   // C1130 — only when Pi ("Other Model") is the selected DEFAULT agent: an enabled
@@ -650,21 +810,23 @@ function _renderStep6(body, footer) {
   // even when _piModels still holds a display-form seed.
   const piRows = computePiSaveRows(_piModels);
   const modelRow = piEnabled && _taskAgent === 'pi'
-    ? `<tr><td class="setup-modal-summary-key">${_esc(piRows.length > 1 ? t('agentSelect.models') : t('agentSelect.model'))}</td>` +
-      `<td class="setup-modal-summary-val">${piRows.length ? piRows.map(m => _esc(m.model.trim())).join('<br>') : '—'}</td></tr>`
+    ? row(piRows.length > 1 ? t('agentSelect.models') : t('agentSelect.model'),
+      piRows.length ? piRows.map(m => _esc(m.model.trim())).join('<br>') : '—')
     : '';
 
   body.innerHTML = `
-    <p class="setup-modal-label">${_esc(existing ? t('wizard.confirmExistingProject') : t('wizard.confirmNewProject'))}</p>
+    ${stepHead(existing ? t('wizard.confirmExistingProject') : t('wizard.confirmNewProject'))}
     <table class="setup-modal-summary">
-      <tr><td class="setup-modal-summary-key">${_esc(t('wizard.summaryFolder'))}</td><td class="setup-modal-summary-val">${_esc(_projectPath || '—')}</td></tr>
-      <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryAccount'))}</td><td class="setup-modal-summary-val">${_esc(email)}</td></tr>
-      <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryProject'))}</td><td class="setup-modal-summary-val">${_esc(projName)} <span class="setup-modal-project-id">#${_esc(projId)}</span>${newBadge}</td></tr>
-      <tr><td class="setup-modal-summary-key">${_esc(t('wizard.summaryDevice'))}</td><td class="setup-modal-summary-val">${_esc(_deviceName || '—')}</td></tr>
-      <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryAgent'))}</td><td class="setup-modal-summary-val">${_esc(agentLabel)}</td></tr>
+      ${row(t('setup.summaryProject'), `<span class="setup-modal-summary-project">${identityMarkup(projName, _profile, _identityDraft, true)}${projRef}</span>`, 'setup-modal-summary-row--project')}
+      ${row(t('wizard.summaryFolder'), `<span class="setup-modal-summary-path">${_esc(_projectPath || '—')}</span>`)}
+      ${row(t('setup.summaryAccount'), _esc(email))}
+      ${row(t('wizard.workPresets'), projectPresets.map(id => _esc(t('wizard.work.' + id))).join(', '))}
+      ${row(t('wizard.summaryDevice'), _esc(_deviceName || '—'))}
+      ${row(t('setup.summaryAgent'), _esc(agentLabel))}
       ${modelRow}
       ${presetRow}
     </table>
+    ${policyMarkup(_profile?.policy)}
     <div class="setup-modal-msg" id="wiz-confirm-msg"></div>
   `;
 
@@ -673,7 +835,7 @@ function _renderStep6(body, footer) {
     <button class="setup-modal-btn setup-modal-btn--primary" id="wiz-confirm-btn">${_esc(existing ? t('wizard.openProjectBtn') : t('wizard.createProjectBtn'))}</button>
   `;
 
-  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _goto(_skipsPreset() ? 4 : 5));
+  footer.querySelector('#wiz-back-btn').addEventListener('click', () => _move(-1));
 
   footer.querySelector('#wiz-confirm-btn').addEventListener('click', () => {
     const detail = {
@@ -681,7 +843,11 @@ function _renderStep6(body, footer) {
       apiBaseUrl: _apiBaseUrl,
       userToken: _userToken,
       userInfo: _userInfo,
-      apiProject: { ..._apiProject },
+      apiProject: {
+        ..._apiProject, projectPresets: [...projectPresets],
+        ...(!existing && { identity: { ..._identityDraft },
+          settings: Object.fromEntries(Object.entries(_profile.policy.rules).map(([field, rule]) => [field, rule.value])) }),
+      },
       deviceName: _deviceName,
       agentPreference: {
         taskAgent: _taskAgent,
@@ -693,19 +859,11 @@ function _renderStep6(body, footer) {
       },
       // (TPT557) null for an existing project — nothing to seed; index.js links the folder
       // via project:open-existing instead of project:create-from-wizard.
-      preset: existing || !_preset ? null : { letter: _preset.letter, mode: _preset.mode, value: _preset.value },
+      preset: existing ? null : { letter: preset.letter, mode: preset.mode, value: preset.value },
       presetDescription: null,
     };
     window.dispatchEvent(new CustomEvent('wizard-complete', { detail }));
     if (_onComplete) try { _onComplete(detail); } catch {}
     close();
   });
-}
-
-function _esc(str) {
-  return String(str ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 }

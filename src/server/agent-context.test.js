@@ -246,7 +246,8 @@ test('all provider continuations reject account or target changes before spawnin
       ws: { readyState: 1, send(raw) { frames.push(JSON.parse(raw)); } } };
     require('./providers/dispatch').spawnTurn(session, 'obj-test');
     assert.equal(frames[0].reason, 'project-context-changed');
-    for (const name of ['claudeSessionId', 'codexSessionId', 'geminiSessionId', 'piSessionId']) assert.equal(session[name], null);
+    assert.deepEqual([session.claudeSessionId, session.codexSessionId, session.geminiSessionId, session.piSessionId],
+      ['c', 'x', 'g', 'p'], 'restoring the original identity can still continue the conversation');
   }
 });
 

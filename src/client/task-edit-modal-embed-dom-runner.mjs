@@ -86,6 +86,7 @@ try {
   const bundled = await build({
     stdin: {
       contents: `export * as board from './src/client/task-board.js';
+        export { ensureGlobalChatBindings } from './src/client/chat-ui.js';
         export { default as state } from './src/client/state.js';
         export { api } from './src/client/api-client.js';`,
       resolveDir: root,
@@ -97,7 +98,7 @@ try {
     loader: { '.css': 'empty' },
   });
   writeFileSync(bundlePath, bundled.outputFiles[0].contents);
-  const { board, state, api } = await import(pathToFileURL(bundlePath).href);
+  const { board, state, api, ensureGlobalChatBindings } = await import(pathToFileURL(bundlePath).href);
   const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   const settle = async () => { for (let i = 0; i < 6; i++) await tick(); };
   const modal = () => document.getElementById('task-edit-modal');
@@ -181,7 +182,7 @@ try {
   assert.equal(menu.getAttribute('role'), 'menu');
   assert.equal(trigger().getAttribute('aria-expanded'), 'true');
   assert.equal(trigger().getAttribute('aria-controls'), menu.id);
-  assert.deepEqual(menuRows().map(r => r.textContent), ['Image', 'Other file']);
+  assert.deepEqual(menuRows().map(r => r.textContent), ['Image', 'Other file', 'Project artifact']);
   assert.equal(press(menuRows()[0], 'mousedown').defaultPrevented, true, 'a row keeps the focus too');
 
   // 3. Image with the editor closed: it goes at the end of the text, on a line of its own, and the
@@ -294,6 +295,8 @@ try {
   key(menuRows()[0], 'ArrowDown');
   assert.equal(document.activeElement === menuRows()[1], true);
   key(menuRows()[1], 'ArrowDown');
+  assert.equal(document.activeElement, menuRows()[2]);
+  key(menuRows()[2], 'ArrowDown');
   assert.equal(document.activeElement === menuRows()[0], true, 'wraps');
   key(menuRows()[0], 'Escape');
   assert.equal(document.querySelector('.import-submenu') === null, true);
@@ -301,7 +304,7 @@ try {
   assert.equal(modal().hidden, false);
   assert.equal(document.querySelector('.modal-overlay--over-modal') === null, true);
   trigger().dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 0 }));
-  key(menuRows()[0], 'End');
+  key(menuRows()[0], 'ArrowDown');
   key(menuRows()[1], 'Enter');
   assert.equal(document.querySelector('.import-submenu') === null, true);
   assert.equal(document.activeElement === trigger(), true, 'the picked row hands the focus back');
@@ -411,6 +414,35 @@ try {
   ]);
   board.closeTaskEditModal(true);
   console.log('TPT9361_MULTI_PICK_PASS');
+
+  // Choose an older revision from the second catalog page; identical filenames remain distinct.
+  const revision = (id, rev, name) => ({ artifact_id: id, revision: rev, revision_name: name,
+    filename: 'survey.csv', mime_type: 'text/csv', size_bytes: 18,
+    url: `/api/projects/2/files/artifacts/${id}/revisions/${rev}/content` });
+  const recent = revision(7, 2, 'Review');
+  const earlier = revision(7, 1, 'Baseline');
+  const another = revision(8, 1, 'Baseline');
+  api.artifacts.list = async before => before
+    ? { revisions: [earlier], next: null }
+    : { revisions: [another, recent], next: 12 };
+  await board.openTaskEditModal('TPT1');
+  openMenu();
+  await tick(); // outside-click listener is active
+  click(menuRows()[2]);
+  await tick();
+  ensureGlobalChatBindings(); // a board refresh behind the still-open modal
+  assert.match(menuRows()[0].textContent, /#8 · r1 Baseline/);
+  assert.match(menuRows()[1].textContent, /#7 · r2 Review/);
+  click(menuRows()[2]);
+  await tick();
+  assert.match(menuRows()[2].textContent, /#7 · r1 Baseline/);
+  click(menuRows()[2]);
+  await settle();
+  assert.equal(display().querySelector('a').getAttribute('href'), earlier.url);
+  click(modal().querySelector('.btn-modal-save'));
+  await settle();
+  assert.equal(writes.at(-1).patch.description, 'Description TPT1\n[survey.csv · r1](' + earlier.url + ')');
+  board.closeTaskEditModal(true);
 } catch (err) {
   console.error(err);
   exitCode = 1;

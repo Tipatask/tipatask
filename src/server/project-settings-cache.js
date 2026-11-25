@@ -39,7 +39,8 @@ function pickSettings(settings) {
 function settingsResult(data) {
   if (!data?.settings || typeof data.settings !== 'object' || Array.isArray(data.settings)
     || !['global', 'personal'].includes(data.source) || typeof data.is_creator !== 'boolean') return null;
-  return { settings: pickSettings(data.settings), source: data.source, is_creator: data.is_creator };
+  return { settings: pickSettings(data.settings), source: data.source, is_creator: data.is_creator,
+    ...(data.policy && { policy: data.policy }), ...(data.identity && { identity: data.identity }) };
 }
 
 function readSettingsCache(cfg) {

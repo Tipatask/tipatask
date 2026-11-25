@@ -34,6 +34,8 @@ function contentSecurityPolicy(html) {
     // Projects can select their API endpoint; local UI also uses WebSockets.
     "connect-src 'self' http: https: ws: wss:",
     "worker-src 'self' blob:",
+    // The file viewer embeds a locally constructed application/pdf Blob in an iframe.
+    "frame-src 'self' blob:",
     "object-src 'none'",
     "base-uri 'none'",
     "form-action 'self'",

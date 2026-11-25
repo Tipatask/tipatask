@@ -274,8 +274,6 @@ test('setup-modal focus, selected and active accents consume --c-primary-border,
   for (const selector of [
     '\\.setup-modal-dot\\.is-active',
     '\\.setup-modal-input:focus',
-    '\\.setup-modal-textarea:focus',
-    '\\.setup-modal-tab\\.is-active',
     '\\.setup-modal-preset-card\\.is-selected',
     '\\.setup-modal-project-card\\.is-selected',
     '\\.setup-modal-agent-card\\.is-selected',

@@ -3,6 +3,7 @@
 // Browser mode: falls back to fetch against the singleton HTTP server.
 
 import { projectHeader } from './utils.js';
+import { t } from './i18n.js';
 import { floatTo16LE } from './pcm.js';
 
 const ipc = (typeof window !== 'undefined') ? window.electronAPI?.api : null;
@@ -262,6 +263,10 @@ export const api = {
       if (!result?.ok) throw new Error(result?.error || 'Project settings were not saved');
       return result;
     },
+    async profile() {
+      if (ipc) return ipc.project.profile();
+      return _http('GET', '/api/project/profile');
+    },
     async settings() {
       if (ipc) return ipc.project.settings();
       return _http('GET', '/api/project/settings');
@@ -279,13 +284,20 @@ export const api = {
     // (`.message` carries the API's validation text via _http()'s `{ error }` unwrap / IPC
     // rejection) — callers (writeProjectLanguage/writeProjectGroupLabel in task-board.js)
     // roll their control back.
-    async update(fields) {
-      if (ipc) {
-        const result = await ipc.project.update(fields);
-        return result?.project ?? null;
+    async update(fields, expectedContext) {
+      try {
+        if (ipc) {
+          const result = await ipc.project.update(fields, expectedContext);
+          return result?.project ?? null;
+        }
+        const headers = expectedContext ? { 'x-tipatask-settings-context': expectedContext } : {};
+        const data = await _http('PATCH', '/api/project', fields, headers);
+        return data.project ?? null;
+      } catch (err) {
+        if (!/\bpolicy_conflict\b/.test(err.message)) throw err;
+        document.dispatchEvent(new Event('tiptask:policy-conflict'));
+        throw new Error(t('profile.changed'), { cause: err });
       }
-      const data = await _http('PATCH', '/api/project', fields);
-      return data.project ?? null;
     },
     // (TPT12) The caller's per-project `notifications` inbox rows — drives the board's
     // activity chip + OS push. Distinct from `tasks.events` above (TPT17's task-wide
@@ -349,6 +361,11 @@ export const api = {
     async upload(filename, mimeType, dataB64, taskKey = null) {
       if (ipc) return ipc.images.upload(filename, mimeType, dataB64, taskKey);
       return _http('POST', '/api/images', { filename, mimeType, data: dataB64, taskKey });
+    },
+  },
+  artifacts: {
+    list(before = null) {
+      return _http('GET', '/api/project/artifacts' + (before == null ? '' : `?before=${encodeURIComponent(before)}`));
     },
   },
   // C1246 — task_files generic (non-image) attachment upload

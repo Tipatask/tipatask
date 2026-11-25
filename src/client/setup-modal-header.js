@@ -6,12 +6,12 @@ import { t } from './i18n.js';
 
 export function headerHtml({ title, projectPath, closable = true }) {
   const path = projectPath || '';
-  const closeBtn = closable === false ? '' : `<button class="setup-modal-close" aria-label="${_esc(t('common.close'))}">×</button>`;
+  const closeBtn = closable === false ? '' : `<button class="setup-modal-close" aria-label="${escapeHtml(t('common.close'))}">×</button>`;
   return `
     <div class="setup-modal-header">
       <div class="setup-modal-header-text">
-        <span class="setup-modal-title">${_esc(title)}</span>
-        <span class="setup-modal-header-path" data-path="${_esc(path)}" title="${_esc(path)}">${_esc(path)}</span>
+        <span class="setup-modal-title">${escapeHtml(title)}</span>
+        <span class="setup-modal-header-path" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">${escapeHtml(path)}</span>
       </div>
       ${closeBtn}
     </div>
@@ -36,7 +36,7 @@ export function fitHeaderPath(root) {
   el.textContent = '…' + full.slice(-lo);
 }
 
-function _esc(str) {
+export function escapeHtml(str) {
   return String(str ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')

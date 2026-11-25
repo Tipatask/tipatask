@@ -115,6 +115,8 @@ test('the seed keeps the newest comments and truncates an oversized one', () => 
 for (const provider of ['claude', 'codex', 'pi']) {
   test(`${provider}: the system prompt states the task-only rule and never asks for planner JSON`, () => {
     const prompt = buildTaskChatSystemPrompt({ provider, task: TASK });
+    assert.match(prompt, /Markdown link with its file name or path.*project-relative path/);
+    assert.match(prompt, /\[check\.sql\]\(reports\/check\.sql#L209\)/);
     assert.match(prompt, /TASK CHAT/);
     assert.match(prompt, /TPT420/);
     assert.match(prompt, /cannot change code or any file/);

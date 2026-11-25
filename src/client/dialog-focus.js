@@ -1,5 +1,5 @@
 // Focus and background isolation for body-level modal layers. A dialog may own
-// portaled menus; those remain in its tab sequence while the rest of the page is inert.
+// portaled menus; those and dismissible error toasts remain in its tab sequence.
 const layers = [];
 const priorInert = new Map();
 let observer = null;
@@ -20,7 +20,8 @@ function ownsSharedPortal(layer, portal) {
 function portalsFor(layer) {
   const own = layer.portals ? [...document.body.querySelectorAll(layer.portals)] : [];
   const shared = [...document.body.querySelectorAll(SHARED_PORTALS)].filter(el => ownsSharedPortal(layer, el));
-  return [...new Set([...own, ...shared])].filter(el => !layer.root.contains(el) && el.isConnected);
+  const toasts = document.body.querySelectorAll(':scope > .tt-toast--dismissible');
+  return [...new Set([...own, ...shared, ...toasts])].filter(el => !layer.root.contains(el) && el.isConnected);
 }
 
 function inside(layer, el) {

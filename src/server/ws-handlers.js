@@ -30,12 +30,13 @@ const { maxNumbersByPrefix, resolveCodingPrefix, isValidTaskKey, parseTaskKey, r
 const { readChatDraft, writeChatDraft, deleteChatDraft, readChatState, writeChatState, deleteChatState, readChatHistory, upsertChatHistory } = require('./chat-persistence');
 const { HISTORY_PROVIDERS, isHistoryId, nativeStorageRef, historyAvailability, buildSearchData, filterHistory, publicHistoryRow } = require('./chat-history');
 const { readNativeConversation } = require('./task-agent/final-message');
+const { readFilePreview } = require('./file-preview');
 const { readProjectConfig, readVoiceSettings, buildLanguageDirective, recordLastUsedAgent, readPiEntries, buildAgentsConfigPatch, summarizeAgents, PI_PROVIDERS, piProviderEnv, piKeyEnvVars } = require('./project-config');
 const { piTaskEntryForModel } = require('./pi-custom-endpoint');
 const { augmentPathEnv, projectEnvExtras, resolveNvmBinDir, resolvePiLaunch, cliSpawnSpec } = require('./spawn-utils');
 const { transcribeWithAssemblyAI, ASSEMBLYAI_ERRORS, MAX_AUDIO_BYTES: ASSEMBLYAI_MAX_AUDIO_BYTES } = require('./assemblyai-batch');
 const { int16BufferToFloat32 } = require('./voice-stream/local-provider');
-const { getApiCredentials } = require('./api-credentials');
+const { getApiCredentials, getAccountUserId, projectContextIdentity } = require('./api-credentials');
 const { fireSessionSync, pullArchitectureDocs, syncOnSessionStart, pushArchitectureDocs, pushAll } = require('../cli/knowledge-sync');
 const { buildHistoryWindow, buildHistoryChunk, OBJECTIVE_HISTORY_PAGE_MESSAGES } = require('./objective-history');
 const websocket = require('./websocket');
@@ -53,6 +54,7 @@ const { forcePendingProposalStatuses, forcePendingTodoPayloadNewTasks } = requir
 const { promoteSplitOriginInTodo } = require('./split-origin-save');
 const { classifySaveError } = require('./todo-save-error');
 const { applyReopenToPatch } = require('./reopen-closed-task');
+const { projectObjectivePrompt } = require('./project-seeder');
 const { fetchStatusContext } = require('./status-roles');
 const { VOICE_MODEL_IDS, VOICE_MODEL_ERRORS, listVoiceModels, getVoiceModelStatus, downloadVoiceModel, abortVoiceModelDownload, deleteVoiceModel } = require('./voice-model-manager');
 const { modeSwitchError } = require('./permission-policy');
@@ -805,8 +807,38 @@ function dropObjectiveSession(sessions, sessionKey, session, taskId, reason) {
   if (session.type === 'objective') throttle.recordAbort(taskId);
   // The cold spare is global and only ever wanted by a chat that is being started; the next
   // composer keystroke re-warms it. A task chat never uses the pool, so ending one leaves it.
-  if (session.type !== 'taskChat') killColdPrewarm(reason);
+  if (session.type === 'objective' || session.type === 'specChat') killColdPrewarm(reason);
   if (sessions.get(sessionKey) === session) sessions.delete(sessionKey);
+}
+
+function endChatSession(sessions, sessionKey, session, taskId, reason) {
+  recordChatHistory(session, { ended: true });
+  dropObjectiveSession(sessions, sessionKey, session, taskId, reason);
+  session.alive = false;
+  session.pending = false;
+  sendChatFrame(session, { type: 'chat-ended', reason });
+}
+
+// A missing account may sign back in as the same user. A different known user on
+// the chat's original API server ends it, even if its checkout has since been retargeted.
+function endChatsForAccountChange(sessions, baseUrl) {
+  const currentUserId = getAccountUserId(baseUrl);
+  if (currentUserId == null) return;
+  const changedProjects = new Set();
+  for (const [key, session] of sessions) {
+    if (!session._agentContextIdentity) continue;
+    const [server, , userId] = JSON.parse(session._agentContextIdentity);
+    if (server !== baseUrl || userId == null || String(userId) === String(currentUserId)) continue;
+    const ws = session.ws;
+    endChatSession(sessions, key, session, session.tabId, 'account-changed');
+    session.ws = null;
+    ws?.close();
+    changedProjects.add(session.projectPath);
+  }
+  // Refetch rather than broadcasting bare chat IDs, which can be reused by the new account.
+  for (const projectPath of changedProjects) {
+    websocket.broadcastToProject(projectPath, 'chat-sessions-changed', {});
+  }
 }
 
 // (C1565) Group-kill first — reaps any backgrounded subprocess tree the agent spawned
@@ -1446,8 +1478,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       const attention = [];
       const attentionDetails = {}; // (C1057) taskId -> { kind, promptText, agent }
       const sessionMeta = {}; // (C1144) taskId -> { agent, label, type, alive } — left-nav active-sessions list needs the agent id per session
-      for (const [, s] of sessions) {
-        if (reqPath && s.projectPath && s.projectPath !== reqPath) continue;
+      for (const [, s] of projectSessionEntries(sessions, reqPath)) {
         const id = s.tabId; // bare id the board matches — not the composite sessKey map key
         if (!id) continue;
         const bucket = sessionListBucket(s); // (C1444) 'active' covers alive || _starting
@@ -1552,6 +1583,52 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       }
     }
 
+    if (req.method === 'GET' && urlPath === '/api/project/file-preview') {
+      const headers = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
+      const relPath = new URL(req.url, 'http://localhost').searchParams.get('path');
+      try {
+        const preview = await readFilePreview(req.localAccess?.projectPath, relPath);
+        res.writeHead(200, headers);
+        return res.end(JSON.stringify(preview));
+      } catch (err) {
+        res.writeHead(err.statusCode, headers);
+        return res.end(JSON.stringify({ code: err.code, error: err.message }));
+      }
+    }
+
+    if (req.method === 'GET' && urlPath === '/api/project/artifacts') {
+      try {
+        const before = new URL(req.url, 'http://localhost').searchParams.get('before');
+        const page = await backend.listArtifactRevisions(before);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify(page));
+      } catch (err) {
+        res.writeHead(err.statusCode || 502);
+        return res.end();
+      }
+    }
+
+    const artifactDownload = req.method === 'GET' && urlPath.match(/^\/api\/projects\/(\d+)\/files\/artifacts\/(\d+)\/revisions\/(\d+)\/content$/);
+    if (artifactDownload) {
+      try {
+        const [, project, id, revision] = artifactDownload;
+        const credentials = backend.getCredentials();
+        if (project !== String(credentials.projectId)) { res.writeHead(404); return res.end(); }
+        const row = await backend.getArtifact(id, revision, credentials);
+        res.writeHead(200, {
+          'Content-Type': 'application/octet-stream',
+          'X-Tipatask-Preview-Type': row.mime_type || 'application/octet-stream',
+          'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(row.filename).replace(/'/g, '%27')}`,
+          'Cache-Control': 'private, no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(Buffer.from(row.data, 'base64'));
+      } catch (err) {
+        res.writeHead(err.statusCode || 502);
+        return res.end();
+      }
+    }
+
     // GET /api/project/members — project members for edit-modal mention suggestions
     if (req.method === 'GET' && urlPath === '/api/project/members') {
       try {
@@ -1636,6 +1713,18 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
     if (urlPath.startsWith('/api/project/merge/')) {
       const { handleMergeRoute } = require('./merge-routes');
       await handleMergeRoute(req, res, urlPath, { projectRoot: resolveProjectRoot(req), backend, sessions, readTextBody });
+      return;
+    }
+
+    if (req.method === 'GET' && urlPath === '/api/project/profile') {
+      try {
+        const profile = await backend.getDesktopProjectProfile();
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(profile));
+      } catch (err) {
+        res.writeHead(err.statusCode || 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
       return;
     }
 
@@ -2160,6 +2249,9 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         }
         patch[field] = parsed[field];
       }
+      for (const field of ['display_initials', 'brand_color', 'logo']) {
+        if (Object.hasOwn(parsed, field)) patch[field] = parsed[field];
+      }
       if (parsed.agent_permission_mode !== undefined) {
         // TPT9063 — hand-mirrors api/src/lib/agent-permission-mode.js's AGENT_PERMISSION_MODES
         // (same "this server can't require() the API package's lib" reasoning as
@@ -2189,7 +2281,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ error: 'Project settings require API backend' }));
       }
       try {
-        const project = await backend.updateProject(patch);
+        const project = await backend.updateProject(patch, req.headers['x-tipatask-settings-context']);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ ok: true, project }));
       } catch (err) {
@@ -3739,7 +3831,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       const tabIdParam = u.searchParams.get('tabId') || '';
       const timingProjPath = req.headers['x-tipatask-project'] || '';
       const s = sessions.get(sessKey(tabIdParam || tid, timingProjPath));
-      const cacheActivity = objectiveCacheActivity(sessions);
+      const cacheActivity = objectiveCacheActivity(new Map(projectSessionEntries(sessions, timingProjPath)));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       if (!s || s.type !== 'objective') {
         return res.end(JSON.stringify({ exists: false, ...cacheActivity }));
@@ -3784,7 +3876,7 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         return res.end(JSON.stringify({ exists: true, task: tid, turns: s._profileTrail }));
       }
       const tasks = [];
-      for (const [taskId, s] of sessions) {
+      for (const [taskId, s] of projectSessionEntries(sessions, metricsProjPath)) {
         if (s.type === 'objective' && s._profileTrail && s._profileTrail.length) {
           tasks.push({ taskId, turns: s._profileTrail });
         }
@@ -4345,9 +4437,35 @@ h1{font-size:1.15rem;margin:0 0 12px}p{margin:0 0 8px;color:#4c4f69}ul{padding-l
 // Build a session map key that is unique per (tabId|taskId, projectPath) pair.
 // Prevents two Electron windows with the same-millisecond taskId (e.g. both
 // clicking New Objective at once) from sharing a single in-memory session object.
-function sessKey(id, projectPath) {
-  const identity = isAgentChatId(id) ? require('./api-credentials').projectContextIdentity(projectPath) : '';
+function sessKey(id, projectPath, identity = isAgentChatId(id) ? projectContextIdentity(projectPath) : '') {
   return id + (projectPath ? '\0' + projectPath : '') + (identity ? '\0' + identity : '');
+}
+
+function chatContextIsCurrent(session) {
+  return session._agentContextIdentity === undefined
+    || session._agentContextIdentity === projectContextIdentity(session.projectPath);
+}
+
+function* projectSessionEntries(sessions, projectPath) {
+  const identities = new Map();
+  for (const entry of sessions) {
+    const [, session] = entry;
+    const root = session.projectPath;
+    if (projectPath && root && root !== projectPath) continue;
+    if (session._agentContextIdentity !== undefined) {
+      if (!identities.has(root)) identities.set(root, projectContextIdentity(root));
+      if (session._agentContextIdentity !== identities.get(root)) continue;
+    }
+    yield entry;
+  }
+}
+
+function replaySessionAttention(ws, sessions) {
+  for (const [, session] of projectSessionEntries(sessions, ws._projectPath)) {
+    if (!session._attentionBroadcasted || !session.tabId) continue;
+    ws.send(JSON.stringify({ type: 'attention-needed', taskId: session.tabId,
+      agent: session.taskAgent, ...(session._attentionLastBroadcast || {}) }));
+  }
 }
 
 // (TPT444) Everything a NEW terminal task session does once it holds a start slot: resolve
@@ -4659,7 +4777,9 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
   // The entry-point guard validates the URL hint against the authenticated window or
   // browser scope before upgrade. Only the normalized, authorized header chooses backend.
   const projectPath = req.headers['x-tiptask-project-path'] || '';
-  const sessionKey = sessKey(isProjectChatId(taskId) ? taskId : (tabId || taskId), projectPath);
+  const sessionId = isProjectChatId(taskId) ? taskId : (tabId || taskId);
+  const chatIdentity = isAgentChatId(taskId) || isAgentChatId(sessionId) ? projectContextIdentity(projectPath) : undefined;
+  const sessionKey = sessKey(sessionId, projectPath, chatIdentity);
   const prompt = url.searchParams.get('prompt') || '';
   const terminateOnConnect = url.searchParams.get('terminate') === '1';
   const resumePausedOnConnect = url.searchParams.get('resumePaused') === '1';
@@ -4714,13 +4834,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     console.log(`[attention-ws] Subscriber connected${projectPath ? ` (project=${projectPath})` : ''}`);
     ws._attentionSubscriber = true;
     ws._projectPath = projectPath || '';
-    for (const [, s] of sessions) {
-      if (!s._attentionBroadcasted || !s.tabId) continue;
-      if (ws._projectPath && s.projectPath && s.projectPath !== ws._projectPath) continue;
-      // (C1058) agent included so a replay doesn't overwrite state.attentionDetails[taskId].agent
-      // with undefined on the client — _attentionLastBroadcast only ever stored {kind, promptText}.
-      ws.send(JSON.stringify({ type: 'attention-needed', taskId: s.tabId, agent: s.taskAgent, ...(s._attentionLastBroadcast || {}) }));
-    }
+    replaySessionAttention(ws, sessions);
     replayLeftUncommitted(ws, { backend }); // (TPT664; TPT670 restored-flag check)
     // (C1356) Standard `ws` isAlive liveness pattern — this socket previously had no way to
     // detect a half-open connection on either end (server pinged but never checked for a
@@ -4873,16 +4987,7 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
       objectiveProviders: _boardVisibleProviders,
       objectiveSelection: _boardSel ? formatSelection(_boardSel.providerId, _boardSel.model) : '',
     }));
-    // Send current attention states to the new board watcher (C1057: bare tabId, never the
-    // composite sessions-Map key — a card's data-id can never match "id\0projectPath").
-    // Project-filtered so a second Electron window's tasks don't cross-talk.
-    for (const [, s] of sessions) {
-      if (!s._attentionBroadcasted || !s.tabId) continue;
-      if (ws._projectPath && s.projectPath && s.projectPath !== ws._projectPath) continue;
-      // (C1058) agent included so a replay doesn't overwrite state.attentionDetails[taskId].agent
-      // with undefined on the client — _attentionLastBroadcast only ever stored {kind, promptText}.
-      ws.send(JSON.stringify({ type: 'attention-needed', taskId: s.tabId, agent: s.taskAgent, ...(s._attentionLastBroadcast || {}) }));
-    }
+    replaySessionAttention(ws, sessions);
     replayLeftUncommitted(ws, { backend }); // (TPT664; TPT670 restored-flag check)
     // Send recently assigned tasks (within last 60s) to the new board watcher
     for (const tid of websocket.getRecentAssignments()) {
@@ -4982,18 +5087,11 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
 
   const existing = sessions.get(sessionKey);
 
-  if (terminateOnConnect && existing && existing.type === 'taskChat') {
-    // (TPT469) The left menu's End control on a chat row. A chat has no PTY: end it the way
-    // its own `kill` frame does, telling a window still attached to it, then ack this socket.
-    console.log(`[task-chat] Terminate-on-connect requested for ${taskId}`);
-    const attached = existing.ws;
-    recordChatHistory(existing, { ended: true }); // keeps the history entry; the provider session is never deleted
-    dropObjectiveSession(sessions, sessionKey, existing, taskId, 'kill');
-    existing.alive = false;
-    if (attached && attached !== ws && attached.readyState === attached.OPEN) {
-      attached.send(JSON.stringify({ type: 'chat-ended', tabId: existing.tabId }));
+  if (terminateOnConnect && chatIdentity !== undefined) {
+    if (existing) {
+      endChatSession(sessions, sessionKey, existing, taskId, 'kill');
+      broadcastSessionEnded(taskId, existing);
     }
-    broadcastSessionEnded(taskId, existing);
     ws.send(JSON.stringify({ type: 'session-ended', ...sessionEndedPayload(taskId, existing, 'terminated') }), () => ws.close());
     return;
   }
@@ -5071,6 +5169,11 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     }
     existing.ws = ws;
     const historySource = await getObjectiveHistorySource(taskId, existing, projectPath);
+    if (existing.ws !== ws || existing._closed || !chatContextIsCurrent(existing)) {
+      _sendSessionGone(ws, existing.tabId, existing.providerType);
+      ws.close();
+      return;
+    }
     const historyWindow = buildHistoryWindow(historySource);
     // C1101 — per-project PI_MODEL; existing.projectPath was just refreshed above.
     const _resetSel = currentSelection(existing, configForProject(existing.projectPath));
@@ -5249,7 +5352,8 @@ async function handleConnection(ws, req, sessions, getActiveBackend, onAttention
     sessions.delete(sessionKey);
   }
 
-  const session = createSession(ws, !prompt, tabId || taskId, projectPath);
+  const session = createSession(ws, !prompt, sessionId, projectPath);
+  if (chatIdentity !== undefined) session._agentContextIdentity = chatIdentity;
   if (typeof onAttentionNeeded === 'function') {
     session.onAttentionNeeded = (detail) => onAttentionNeeded(sessionKey, detail);
   }
@@ -5330,7 +5434,7 @@ function _sendSessionGone(ws, tabId, provider) {
 // nothing will run.
 function _chatStartLost(session, sessions, sessionKey) {
   if (session._closed) return true;
-  if (sessions.get(sessionKey) === session) return false;
+  if (sessions.get(sessionKey) === session && chatContextIsCurrent(session)) return false;
   _sendSessionGone(session.ws, session.tabId, session.providerType || config.OBJECTIVE_PROVIDER);
   return true;
 }
@@ -5447,6 +5551,7 @@ function sendChatFrame(session, frame) {
 
 function historyProjectId(session) {
   if (session.chatProjectId) return String(session.chatProjectId);
+  if (session._agentContextIdentity) return JSON.parse(session._agentContextIdentity)[1];
   try { return String(session.backend?.getCredentials?.().projectId || ''); } catch { return ''; }
 }
 
@@ -5504,7 +5609,7 @@ function recordChatHistory(session, { ended = false } = {}) {
     };
     const previous = session._historyWrite || Promise.resolve();
     session._historyWrite = previous
-      .then(() => upsertChatHistory(session.projectPath || '', entry))
+      .then(() => upsertChatHistory(session.projectPath || '', entry, session._agentContextIdentity))
       .catch(err => { console.warn(`[chat-history] write failed: ${err.message}`); });
     return session._historyWrite;
   } catch (err) {
@@ -5592,8 +5697,10 @@ async function resumeChatFromHistory(session, { sessions, sessionKey, taskId, hi
   // reattaching client from treating an empty history as a dead chat.
   session.firstPrompt = null;
   const restoredAt = Date.now();
+  // A reply keeps its segment boundaries (`breaks`), so its progress notes and its answer come
+  // back as separate blocks, as they were drawn live.
   const restored = (conversation ? conversation.messages : [])
-    .map(m => ({ role: m.role, content: m.content, restored: true, timestamp: restoredAt }));
+    .map(m => ({ role: m.role, content: m.content, ...(m.breaks ? { breaks: m.breaks } : {}), restored: true, timestamp: restoredAt }));
   session.messages.push(...restored);
   session.messages.push({
     role: 'user', content: '', seed: true, resumed: true, historyId: entry.historyId,
@@ -5611,7 +5718,7 @@ async function resumeChatFromHistory(session, { sessions, sessionKey, taskId, hi
     provider: entry.provider,
     model: entry.model || null,
     objectiveSelection: current ? formatSelection(current.providerId, current.model) : '',
-    messages: restored.map(m => ({ role: m.role, content: m.content, restored: true })),
+    messages: restored.map(m => ({ role: m.role, content: m.content, ...(m.breaks ? { breaks: m.breaks } : {}), restored: true })),
     transcriptUnavailable,
   });
   sendChatFrame(session, { type: 'chat-ready', turnIndex: session.messages.length - 1 });
@@ -5625,8 +5732,9 @@ async function resumeChatFromHistory(session, { sessions, sessionKey, taskId, hi
 // or null — a failed read costs the widget, never the turn.
 async function handleTaskChatMutation(session, { action, taskKey, toolId }) {
   try {
+    if (session._closed || !chatContextIsCurrent(session)) return null;
     const task = session.backend ? await session.backend.getTask(taskKey) : null;
-    if (!task) return null;
+    if (!task || session._closed || !chatContextIsCurrent(session)) return null;
     const projectPath = session.projectPath || undefined;
     if (action === 'created') websocket.emitTaskCreated(task, projectPath);
     else websocket.emitTaskUpdated(task, null, projectPath);
@@ -5851,6 +5959,11 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
+    if (!chatContextIsCurrent(session)) {
+      _sendSessionGone(ws, session.tabId, session.providerType);
+      return;
+    }
+
     if (msg.type === 'session:permission-mode') {
       // Resolve only this socket's scoped Map key. Payload ids/project paths cannot
       // select another session; a displaced socket has no authority over its owner.
@@ -5933,7 +6046,8 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           // const (which in packaged builds pointed at the app bundle). Falls back to
           // config.PROJECT_ROOT (dev/single-project — unchanged) (C894).
           const objProjectRoot = session.projectPath || config.PROJECT_ROOT;
-          if (backend.getEffectiveProjectSettings) await backend.getEffectiveProjectSettings();
+          const planner = await projectObjectivePrompt(backend, objProjectRoot, msg);
+          session.presetPlanner = Boolean(planner.presetRules);
           // Pre-warm arch-doc disk cache so the first get_tag_architectures hook hits cache (~0ms) vs MCP stdio (~386ms).
           if (!config.SIMPLE_MODE && config.API_PROJECT_ID) {
             _fetchTaskTags(backend, taskId).then(ttTags => {
@@ -5945,20 +6059,20 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           }
           // Kick off pre-fetch before synchronous system-prompt work so both run concurrently.
           const prefetchPromise = config.SIMPLE_MODE ? null : prefetchObjectiveWorkflow(backend, taskId, objProjectRoot, msg.prompt);
-          if (msg.systemPrompt) {
+          if (planner.systemPrompt) {
             if (config.SIMPLE_MODE) {
-              // SIMPLE_MODE: suppress static bundle; --append-system-prompt is skipped in buildObjectiveArgs
-              session.systemPrompt = '';
+              // Simple mode keeps explicit domain planning rules and skips the static bundle.
+              session.systemPrompt = session.presetPlanner ? planner.systemPrompt : '';
             } else {
               const staticBundle = getStaticBundle(objProjectRoot);
               // Project-language directive first (C942), '' for 'en' — READ-ONLY
               // PLANNER gate stays a substring so CLAUDE.md detection is unaffected.
               const langDirective = buildLanguageDirective(objProjectRoot, { objective: true });
               // READ-ONLY PLANNER gate leads — static KB follows (C934)
-              session.systemPrompt = (langDirective ? langDirective + '\n\n' : '') + msg.systemPrompt + '\n\n' + staticBundle;
+              session.systemPrompt = (langDirective ? langDirective + '\n\n' : '') + planner.systemPrompt + '\n\n' + staticBundle;
               const stats = getStaticBundleStats(objProjectRoot);
-              session._profileStatic = { staticChars: stats.chars, sha: stats.sha, tagsCount: stats.tagsCount, clientChars: msg.systemPrompt.length };
-              console.log(`[objective:init] task=${taskId} staticBundle.chars=${stats.chars} sha=${stats.sha} tags=${stats.tagsCount} clientSystemPrompt.chars=${msg.systemPrompt.length} systemPrompt.chars=${session.systemPrompt.length}`);
+              session._profileStatic = { staticChars: stats.chars, sha: stats.sha, tagsCount: stats.tagsCount, clientChars: planner.systemPrompt.length };
+              console.log(`[objective:init] task=${taskId} staticBundle.chars=${stats.chars} sha=${stats.sha} tags=${stats.tagsCount} clientSystemPrompt.chars=${planner.systemPrompt.length} systemPrompt.chars=${session.systemPrompt.length}`);
             }
           }
           await applyRehashIntent(session, msg, taskId);
@@ -5983,7 +6097,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
               const currentTask = allTasks.find(t => t.id === taskId) || null;
               const cacheKey = objectiveResponseCache.buildKey({
                 taskId, task: currentTask, tasks: allTasks, userText: msg.userText || msg.prompt, projectPath: objProjectRoot,
-                provider: session.providerType, model: session.selectedModel,
+                provider: session.providerType, model: session.selectedModel, presetRules: planner.presetRules,
               });
               session._objectiveCacheKey = cacheKey;
               session._objectiveCacheTaskId = taskId;
@@ -6167,6 +6281,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       try {
         const taskKey = msg.taskKey || taskId.replace(/^specChat:/, '');
         const task = await backend.getTask(taskKey);
+        if (_chatStartLost(session, sessions, sessionKey)) return;
         if (!task) {
           if (session.ws && session.ws.readyState === session.ws.OPEN) {
             session.ws.send(JSON.stringify({ type: 'error', tabId: session.tabId, message: `Task not found: ${taskKey}` }));
@@ -6369,7 +6484,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
         }
       }
       // Torn down or restarted while the selection was being validated.
-      if (session._closed || (session._epoch || 0) !== epochAtReceipt) return;
+      if ((session._epoch || 0) !== epochAtReceipt || _chatStartLost(session, sessions, sessionKey)) return;
       if (_rejectBusyTurn()) return;
       ensureTaskChatSystemPrompt(session);
       console.log(`[task-chat] Follow-up for ${taskId}: "${content.slice(0, 80)}"`);
@@ -6635,6 +6750,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
       }
       const firstMessage = session.messages[0];
       clearContext(session, taskId);
+      const restartEpoch = session._epoch;
       if (session.type === 'objective') throttle.recordAbort(taskId);
       {
         const _sel = await applyModelSelection(session, msg.model, { taskId });
@@ -6645,6 +6761,7 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
           return;
         }
       }
+      if (session._epoch !== restartEpoch || _chatStartLost(session, sessions, sessionKey)) return;
       session.messages = [firstMessage];
       // Keep the start-time firstPrompt (prefetched workflow bundle + the client's full first
       // prompt) — the first message alone is only the user's visible text.
@@ -6663,15 +6780,8 @@ function wireClient(ws, session, taskId, sessionKey, sessions, backend) {
 
     } else if (msg.type === 'kill' || msg.type === 'terminate' || msg.type === 'stop') {
       console.log(`[terminal] Kill requested for task ${taskId}`);
-      if (isAgentChatType(session.type)) {
-        // Timers + prewarm + turn proc + _closed guard; also resets _spawning (C1030) for any
-        // in-flight closure still holding a reference to this discarded session.
-        recordChatHistory(session, { ended: true }); // keeps the history entry; the provider session is never deleted
-        dropObjectiveSession(sessions, sessionKey, session, taskId, 'kill');
-        session.alive = false;
-        if (session.ws && session.ws.readyState === session.ws.OPEN) {
-          session.ws.send(JSON.stringify({ type: 'chat-ended', tabId: session.tabId }));
-        }
+      if (isAgentChatType(session.type) || isAgentChatId(taskId)) {
+        endChatSession(sessions, sessionKey, session, taskId, 'kill');
       } else if (session.pty) {
         terminateTerminalSession(session, taskId, sessionKey, sessions, 'terminated', { ackWs: ws, closeAck: false, backend });
       } else {
@@ -6758,6 +6868,7 @@ module.exports = {
   maybeRefirePlanReady,
   createHttpHandler,
   handleConnection,
+  endChatsForAccountChange,
   normalizeProjectMember,
   assertTaskStartable,
   claimUnassignedTaskOnStart,

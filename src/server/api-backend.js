@@ -3,7 +3,7 @@
 const config = require('./config');
 const { normalizeCowboyScope } = require('../cowboy-mode.mjs');
 const { normalizeAgentAssignee } = require('../agent-assignee.mjs');
-const { getApiCredentials, createTokenWatch } = require('./api-credentials');
+const { projectContextIdentity, getApiCredentials, createTokenWatch } = require('./api-credentials');
 const { request } = require('../cli/http');
 const { STATUS_CODES } = require('node:http');
 const recipesStore = require('./recipes-store');
@@ -13,6 +13,7 @@ const { withProjectLock } = require('./project-mutex');
 const { isReservationPlaceholder } = require('./reservation-placeholder');
 const { isTaskKeyLike } = require('./task-key-format');
 const { readProjectConfig } = require('./project-config');
+const PROJECT_IDENTITY_FIELDS = ['display_initials', 'brand_color', 'logo'];
 const { PROJECT_SETTING_FIELDS, settingsResult, readSettingsCache, writeSettingsCache } = require('./project-settings-cache');
 const { buildSpecCommentBody, stripSpecCommentHeader } = require('./spec-comment');
 const { readOriginSpecSnapshot, postOriginSpecComment } = require('./origin-spec-capture');
@@ -752,7 +753,7 @@ async function apiRequest(method, urlPath, body, opts = {}) {
     // Task App session to `unauthorized` just because a user clicked Edit on someone else's
     // comment. Only a caller that opts in via `opts.allowForbidden` gets the non-latching
     // path below — every existing caller's behavior is unchanged.
-    if (opts.allowForbidden) {
+    if (opts.allowForbidden || (urlPath === '/settings' && res.data?.capability === 'settings:manage')) {
       const detail = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
       const err = new Error(`API 403: ${detail}`);
       err.statusCode = 403;
@@ -1683,9 +1684,19 @@ const backend = {
     }
   },
 
+  async getDesktopProjectProfile() {
+    const credentials = getCredentials();
+    const assertCurrent = _settingsRequestContext(true, credentials);
+    const project = await this.getProjectSettings({ refresh: true, strict: true });
+    const { readProjectLogo } = require('../project-profile.mjs');
+    const logo = await readProjectLogo(credentials.baseUrl, credentials.token, credentials.projectId, project.identity);
+    assertCurrent();
+    return { context: encodeURIComponent(projectContextIdentity(_projectRoot)), name: project.name, policy: project.policy, identity: project.identity, logo, editable: project.canManageIdentity };
+  },
+
   async saveEffectiveProjectSettings(fields) {
     if (!fields || typeof fields !== 'object' || Array.isArray(fields)
-      || !Object.keys(fields).length || Object.keys(fields).some(field => !PROJECT_SETTING_FIELDS.includes(field))) {
+      || !Object.keys(fields).length || Object.keys(fields).some(field => !PROJECT_SETTING_FIELDS.includes(field) && !PROJECT_IDENTITY_FIELDS.includes(field))) {
       throw new Error('Unknown or empty project settings patch');
     }
     // Serialize partial edits. A later response must not restore an earlier form's
@@ -1732,6 +1743,9 @@ const backend = {
         // Never fall back to unscoped preferences from an older project endpoint.
         row = Object.fromEntries(Object.entries(row).filter(([field]) => !PROJECT_SETTING_FIELDS.includes(field)));
         Object.assign(row, effective?.settings);
+        if (effective?.policy) row.policy = effective.policy;
+        if (effective?.identity) row.identity = effective.identity;
+        row.canManageIdentity = !!effective?.identity && data.capabilities?.includes('settings:manage') === true;
       }
       _projectSettingsEntry = { row, at: Date.now(), fallback: !row };
       return row;
@@ -1765,10 +1779,14 @@ const backend = {
 
   // Keep the existing settings editor response shape. Metadata edits retain the
   // API's own permission gate; preference-only writes use the effective contract.
-  async updateProject(fields) {
-    if (fields && Object.keys(fields).every(field => PROJECT_SETTING_FIELDS.includes(field))) {
+  async updateProject(fields, expectedContext) {
+    if (expectedContext !== undefined && expectedContext !== encodeURIComponent(projectContextIdentity(_projectRoot))) {
+      throw Object.assign(new Error('Project settings context changed; reload settings'), { statusCode: 409 });
+    }
+    if (fields && Object.keys(fields).every(field => PROJECT_SETTING_FIELDS.includes(field) || PROJECT_IDENTITY_FIELDS.includes(field))) {
       const data = await this.saveEffectiveProjectSettings(fields);
-      return data.settings;
+      return Object.keys(fields).some(field => PROJECT_IDENTITY_FIELDS.includes(field))
+        ? { ...data.settings, identity: data.identity } : data.settings;
     }
     const assertCurrent = _settingsRequestContext();
     try {
@@ -1963,6 +1981,27 @@ const backend = {
     const result = await apiRequest('POST', '/files', { filename, mimeType, data, taskKey });
     if (!result || result._notFound) return null;
     return result; // { id, url, filename, size_bytes }
+  },
+
+  async listArtifactRevisions(before = null) {
+    const suffix = before == null ? '' : `?before=${encodeURIComponent(before)}`;
+    const page = await apiRequest('GET', '/files/artifacts' + suffix);
+    if (page?._notFound) throw Object.assign(new Error('Artifact catalog unavailable'), { statusCode: 404 });
+    return page;
+  },
+
+  async getArtifact(id, revision = null, expectedCredentials) {
+    const suffix = revision == null ? '' : `/revisions/${encodeURIComponent(revision)}`;
+    const row = await apiRequest('GET', `/files/artifacts/${encodeURIComponent(id)}${suffix}`, undefined, { expectedCredentials });
+    if (row?._notFound) throw Object.assign(new Error('Artifact revision not found'), { statusCode: 404 });
+    return row;
+  },
+
+  async saveArtifactRevision(id, payload) {
+    const route = id == null ? '/files/artifacts' : `/files/artifacts/${encodeURIComponent(id)}/revisions`;
+    const result = await apiRequest('POST', route, payload, { allowForbidden: true });
+    if (result?._notFound) throw Object.assign(new Error('Artifact or output task not found'), { statusCode: 404 });
+    return result;
   },
 
   async listTaskFiles(taskKey) {

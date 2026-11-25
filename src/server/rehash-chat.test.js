@@ -24,6 +24,7 @@ function wire(backend, { simpleMode = true } = {}) {
   const env = {
     config: { SIMPLE_MODE: simpleMode }, console: { log() {}, warn() {} },
     process: { env: { OBJECTIVE_RESPONSE_CACHE_ENABLED: '0' } },
+    projectObjectivePrompt: require('./project-seeder').projectObjectivePrompt,
     prefetchObjectiveWorkflow: async () => ({ bundle: '', elapsedMs: 0 }),
     getStaticBundle: () => 'PROJECT KNOWLEDGE', buildLanguageDirective: () => '',
     getStaticBundleStats: () => ({ chars: 17, sha: 'fixture', tagsCount: 0 }),
@@ -31,6 +32,7 @@ function wire(backend, { simpleMode = true } = {}) {
     getAvailableAgentsPeek: () => [], listTaskAgentStatusesPeek: () => [], _agentLabels: () => ({}),
     wireSessionLifecycle() {}, ensureSessionStartName: async () => {}, applyModelSelection: () => ({}),
     applyRehashIntent, maybeCompressHistory: async () => {},
+    chatContextIsCurrent: () => true, _chatStartLost: () => false,
     _throttledSpawn: (_id, _session, spawn) => spawn(),
     spawnTurn: s => turns.push({ system: s.systemPrompt, prompt: buildTurnPrompt(s, { includeSystemPrompt: false, freshSource: 'firstPrompt' }).prompt }),
     providerSessionId: () => 'fixture', killPrewarm() {},
@@ -72,6 +74,22 @@ for (const simpleMode of [false, true]) {
     });
   }
 }
+
+test('New Objective uses the linked project presets, current statuses and original scope', async () => {
+  const { handlers, turns, session } = wire({
+    getProjectSettings: async () => ({ projectPresets: ['home'], use_objective_grouping: false }),
+    getStatuses: async () => [{ name: 'queued', is_workflow_start: true }],
+  }, { simpleMode: false });
+  await handlers.message(JSON.stringify({
+    type: 'start', mode: 'objective', userText: 'Plan dinner', prompt: 'Plan dinner',
+    systemPrompt: 'DEFAULT SOFTWARE RULES', originTaskKey: 'TPT123',
+  }));
+  assert.match(turns[0].system, /Household checklist/);
+  assert.match(turns[0].system, /status: "queued"/);
+  assert.match(turns[0].system, /REFINING the existing task TPT123/);
+  assert.doesNotMatch(turns[0].system, /DEFAULT SOFTWARE RULES/);
+  assert.equal(session.messages[0].content, 'Plan dinner');
+});
 
 test('start/chat/restart route split metadata to hidden system context; exit clears it', async () => {
   const { handlers, frames, turns, session } = wire({ async getTask(key) {

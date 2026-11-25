@@ -18,6 +18,7 @@ test('main HTML allows only its exact inline scripts and local script files', ()
   assert.ok(hashes.every(hash => csp.includes(hash)));
   assert.match(csp, /script-src 'self' 'sha256-/);
   assert.doesNotMatch(csp.split('; ').find(rule => rule.startsWith('script-src')), /unsafe-inline|unsafe-eval|\*/);
+  assert.ok(csp.split('; ').includes("frame-src 'self' blob:"));
   assert.match(csp, /object-src 'none'/);
   assert.match(csp, /base-uri 'none'/);
   assert.match(csp, /worker-src 'self' blob:/);

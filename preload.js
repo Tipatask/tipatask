@@ -154,6 +154,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openNotificationSettings: () => inv('settings:open-notifications'),
   // opts.chooseAccount — ask the web sign-in page for an account chooser (Change Account flow).
   setupAuthWeb: (apiBaseUrl, opts) => inv('setup:auth-web', { apiBaseUrl, chooseAccount: !!(opts && opts.chooseAccount) }),
+  setupProjectProfile: (baseUrl, token, projectId) => inv('setup:project-profile', { baseUrl, token, projectId }),
   setupListProjects: (apiBaseUrl, userToken) => inv('setup:list-projects', { apiBaseUrl, userToken }),
   setupGetDeviceName: (apiBaseUrl, userToken) => inv('setup:get-device-name', { apiBaseUrl, userToken }),
   setupExchangeProjectToken: (apiBaseUrl, userToken, projectId) => inv('setup:exchange-project-token', { apiBaseUrl, userToken, projectId }),
@@ -266,11 +267,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
       saveAgents: (selection) => inv('api:project.saveAgents', { selection }),
       // (C1235) Project scalars from the remote API row (today: taskGroupLabel).
       settings: () => inv('api:project.settings'),
+      profile: () => inv('api:project.profile'),
       // (TPT659) The key the API would allocate next for a category — New Task Preview badge.
       nextTaskKey: (category) => inv('api:project.nextTaskKey', { category }),
       // (C1271) Write project scalars (language/task_group_label) — per-window backend,
       // see api-router.js's api:project.update.
-      update: (fields) => inv('api:project.update', { fields }),
+      update: (fields, expectedContext) => inv('api:project.update', { fields, expectedContext }),
       // TPT12 — the caller's per-project `notifications` inbox rows, per-window backend.
       notifications: {
         list: (params) => inv('api:project.notifications.list', params),

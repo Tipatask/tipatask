@@ -87,6 +87,7 @@ async function harness(killEnv, failStartup = false, validationEnabled = false, 
     './crash-guard': { installCrashGuard: opts => installCrashGuard({ ...opts,
       proc, exit: proc.exit, log, recordExit() {} }) },
     './remote-control-consent': { read: p => ({ enabled: (typeof projectConfig === 'function' ? projectConfig(p) : projectConfig)?.localConsent === true, grant: 'local-grant' }), watch: () => () => {} },
+    './account-store': { onAccountChange: () => () => {} },
     './project-config': { readProjectConfig: p => typeof projectConfig === 'function' ? projectConfig(p) : projectConfig },
     './device-identity': { createDeviceIdentity(opts) {
       deviceIdentity.options = opts;

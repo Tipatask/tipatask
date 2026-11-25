@@ -291,11 +291,11 @@ function writeEnv(filePath, lines, updates, projectRoot = PROJECT_ROOT) {
     writeProjectConfig(projectRoot, { ...(readProjectConfig(projectRoot) || {}), ...updates });
     return;
   }
-  const credentialKeys = new Set(API_CREDENTIAL_FIELDS);
+  const projectConfigKeys = new Set([...API_CREDENTIAL_FIELDS, 'projectPresets']);
   const envUpdates = {};
   const credentialUpdates = {};
   for (const [key, val] of Object.entries(updates)) {
-    if (isMainEnv && credentialKeys.has(key)) credentialUpdates[key] = val;
+    if (isMainEnv && projectConfigKeys.has(key)) credentialUpdates[key] = val;
     else envUpdates[key] = val;
   }
 
@@ -311,7 +311,7 @@ function writeEnv(filePath, lines, updates, projectRoot = PROJECT_ROOT) {
     const eqIdx = trimmed.indexOf('=');
     if (eqIdx === -1) return [line];
     const key = trimmed.slice(0, eqIdx).trim();
-    if (isMainEnv && credentialKeys.has(key)) return [];
+    if (isMainEnv && projectConfigKeys.has(key)) return [];
     if (key in envUpdates) {
       handled.add(key);
       return [`${key}=${envUpdates[key]}`];
@@ -430,6 +430,7 @@ async function runInstallTemplates(flags, env) {
       console.log(`    ~ ${entry.path}`);
     }
   }
+  for (const entry of report.removed) console.log(`  ${flags.dryRun ? 'Would remove' : 'Removed'} ${entry.path}`);
   if (report.skipped.length) {
     console.log(`  ${YELLOW}Skipped:${RESET}`);
     for (const entry of report.skipped) {
@@ -557,6 +558,7 @@ async function runSyncSetupStep({ env, apiBaseUrl, token, deviceId, projectRoot 
   const { refreshHarnessTemplates } = require('./install-templates');
   const report = refreshHarnessTemplates(projectRoot, path.resolve(__dirname, '../..'), { dryRun });
   for (const entry of [...report.written, ...report.merged]) console.log(`  ${dryRun ? 'Would refresh' : 'Refreshed'} ${entry.path}`);
+  for (const entry of report.removed) console.log(`  ${dryRun ? 'Would remove' : 'Removed'} ${entry.path}`);
   for (const entry of report.skipped) console.log(`  Preserved ${entry.path}: ${entry.reason}`);
   for (const warning of report.warnings) console.warn(`  ${warning}`);
   if (dryRun) return { harness: report, dryRun: true };
@@ -795,15 +797,25 @@ async function registerDevice({ apiBaseUrl, token, machineId, name }) {
 /**
  * Create a new API project and return the project record.
  */
-async function createApiProject({ apiBaseUrl, token, name, description }) {
+async function createApiProject({ apiBaseUrl, token, name, description, projectPresets, identity = {}, settings = {} }) {
+  const { PROJECT_SETTING_FIELDS } = require('../server/project-settings-cache');
+  const acknowledged = Object.fromEntries([...PROJECT_SETTING_FIELDS, 'sprint_duration_days']
+    .filter(field => Object.hasOwn(settings, field)).map(field => [field, settings[field]]));
   const { status, data } = await request(`${apiBaseUrl}/api/projects`, {
     headers: { Authorization: `Bearer ${token}` },
-    body: { name, description: description || undefined },
+    body: { name, description: description || undefined, projectPresets, ...acknowledged,
+      display_initials: identity.display_initials, brand_color: identity.brand_color, logo: identity.logo },
   });
   if (status >= 400) {
     throw new Error(`Failed to create project: ${JSON.stringify(data)}`);
   }
-  return data.project || data;
+  const project = data.project || data;
+  const saved = project.projectPresets ?? ['software'];
+  if (projectPresets && (!Array.isArray(saved) || saved.length !== projectPresets.length ||
+      !projectPresets.every(id => saved.includes(id)))) {
+    throw new Error(`Project #${project.id} was created, but the API did not save the selected work presets. Check the API version before continuing setup.`);
+  }
+  return project;
 }
 
 /**
@@ -822,7 +834,17 @@ async function initializeProjectSettings({ projectRoot = PROJECT_ROOT, backend }
   const ownBackend = !backend;
   const target = backend || require('../server/api-backend').createApiBackend(null, projectRoot);
   try {
-    return await target.getEffectiveProjectSettings({ refresh: true, strict: true });
+    const effective = await target.getEffectiveProjectSettings({ refresh: true, strict: true });
+    // Work presets belong to the project detail row. Recover them once for checkouts
+    // linked by an older app; ordinary project metadata reads stay read-only.
+    const storedPresets = readProjectConfig(projectRoot)?.projectPresets;
+    if ((!Array.isArray(storedPresets) || !storedPresets.length) && target.getProjectSettings) {
+      try {
+        const project = await target.getProjectSettings();
+        if (project) require('../server/project-seeder').syncProjectPresets(projectRoot, project, target.getCredentials().baseUrl);
+      } catch (err) { console.warn(`[harness] Could not recover project work presets: ${err.message}`); }
+    }
+    return effective;
   } finally {
     if (ownBackend) target.dispose();
   }
@@ -1160,6 +1182,8 @@ async function main() {
         : mergedAgentIds[0]);
 
   // Write the target to config.json, token to the account store, and runtime settings to .env.
+  const { selectedPresetIds } = require('../server/project-seeder');
+  const projectPresets = selectedPresetIds(project.projectPresets);
   writeEnv(ENV_PATH, preWriteEnv.lines, {
     TASK_BACKEND: 'api',
     TASK_AGENT: finalTaskAgent,
@@ -1167,6 +1191,7 @@ async function main() {
     API_BASE_URL: apiBaseUrl,
     API_TOKEN: scopedToken,
     API_PROJECT_ID: String(project.id),
+    projectPresets,
     DEVICE_ID: String(device.id),
     DEVICE_NAME: device.name,
   }, projectRoot);
@@ -1251,10 +1276,11 @@ async function main() {
     console.log(`  ${YELLOW}Task import failed: ${err.message}${RESET}`);
   }
 
+  const software = projectPresets.includes('software');
   // Seed agent setup tasks (confirm-gated)
   try {
     const { runSeedSetupTasks } = require('./seed-setup-tasks');
-    const doSeedSetup = await confirm(`  Set up Tip${CYAN}Δ${RESET}Task for this project?`);
+    const doSeedSetup = software && await confirm(`  Set up Tip${CYAN}Δ${RESET}Task for this project?`);
     if (doSeedSetup) {
       await runSeedSetupTasks({
         projectRoot: flags.projectRoot ? path.resolve(flags.projectRoot) : PROJECT_ROOT,
@@ -1286,7 +1312,7 @@ async function main() {
   }
 
   // Discovery prompt
-  if (!flags.skipDiscover) {
+  if (!flags.skipDiscover && software) {
     const doDiscover = await confirm('  Seed architecture docs from project scan?');
     if (doDiscover) {
       try {

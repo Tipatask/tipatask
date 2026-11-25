@@ -63,8 +63,8 @@ The first time a new project opens, it asks whether to start with an objective o
 discussion. Choose **Dismiss** to follow the steps below; both stay in the left menu, under
 **Create** and **Start Chat**.
 
-1. Click **Create** in the left menu, then choose **Task**. On an empty board, **+ New Task**
-   opens the same form.
+1. Click **Create** in the left menu, then choose **New Task** in the menu that opens beside
+   it. On an empty board, **+ New Task** opens the same form.
 2. Fill in **Title** and **Description**. Start with a small change and say what done looks
    like, for example a specific bug fixed or a missing test added.
 3. Pick the coding agent under **Agent**. If the form has a **Priority / Batch** field (its

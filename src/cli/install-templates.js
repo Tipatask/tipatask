@@ -11,6 +11,7 @@ const {
   emptyManifest,
   MANIFEST_RELATIVE_PATH,
 } = require('./manifest');
+const { projectHarness, resolvePresetHarness, projectKnowledgeTemplate } = require('../server/project-seeder');
 const { substitute } = require('./placeholders');
 
 const TEMPLATES_DIR = path.resolve(__dirname, '../../templates');
@@ -179,6 +180,41 @@ function diffSummary(oldContent, newContent, maxLines = 5) {
   return out.join('\n');
 }
 
+// Both provider root guides point to the selected domain guides. Software keeps the
+// shipped root texts and Claude skill. Each guide has its own installer ownership hash.
+function harnessFiles(harness) {
+  const generated = new Map();
+  const domainGuides = [];
+  for (const entry of harness.entries) {
+    if (entry.id === 'software') continue;
+    const [guide] = entry.guides;
+    domainGuides.push(guide);
+    generated.set(guide, [
+      '# ' + entry.name, '', '## Planning', '', entry.planner, '',
+      '## Allowed sources', '', entry.sources, '',
+      '## Task execution', '', entry.executor, '',
+      '## Deliverables', '', entry.deliverables, '',
+      '## Verification and completion', '', entry.verification, '', entry.completion, '',
+      '## Standing knowledge', '', 'Maintain reusable project facts under the following headings.', '',
+      ...entry.kbSections.map(title => '- ' + title), '',
+    ].join('\n'));
+  }
+  const references = domainGuides.map(guide => '- ' + guide).join('\n');
+  const shared = [
+    '# Tipatask project guide', '',
+    'Follow the current session permissions. Read the task, its source material and the relevant project knowledge before starting.',
+    'New Objective proposes tasks for review. In a task run, deliver the requested work and verify it against its acceptance criteria.',
+    'Keep reusable project facts in ai/architecture/GENERAL.md or the relevant topic guide. Record task-specific evidence in the resolution.',
+    'Follow the verified project version-control settings and finish through the guarded completion tool named in the kickoff.',
+    '', '## Work presets', '', 'Apply the guides relevant to this task.', '', references, '',
+  ].join('\n');
+  if (!harness.software) {
+    for (const guide of ['AGENTS.md', 'CLAUDE.md']) generated.set(guide, shared);
+    generated.set('ai/architecture/GENERAL.md', projectKnowledgeTemplate(harness));
+  }
+  return { generated, references };
+}
+
 /**
  * Install all templates into a project root.
  *
@@ -198,6 +234,7 @@ function installTemplates(opts) {
     packageVersion = '0.0.0',
     templatesDir = TEMPLATES_DIR,
     include = () => true,
+    harness = templatesDir === TEMPLATES_DIR ? projectHarness(projectRoot) : null,
   } = opts;
 
   if (!projectRoot) throw new Error('installTemplates: projectRoot is required');
@@ -206,6 +243,7 @@ function installTemplates(opts) {
     written: [],
     skipped: [],
     merged: [],
+    removed: [],
     warnings: [],
     unchanged: [],
   };
@@ -214,7 +252,15 @@ function installTemplates(opts) {
   const nextManifest = emptyManifest(packageVersion);
   nextManifest.files = { ...manifest?.files };
 
-  const templateFiles = walk(templatesDir).filter(rel => include(destRelFor(rel)));
+  const { generated, references } = harness ? harnessFiles(harness) : { generated: new Map() };
+  const templateFiles = walk(templatesDir).filter(rel => {
+    const dest = destRelFor(rel);
+    return include(dest) && (!harness || harness.software || !isSoftwareTemplate(dest));
+  });
+  const present = new Set(templateFiles.map(destRelFor));
+  for (const rel of generated.keys()) {
+    if (include(rel) && !present.has(rel)) templateFiles.push(rel);
+  }
   if (templateFiles.length === 0) {
     report.warnings.push(`No templates found at ${templatesDir}`);
     return report;
@@ -227,9 +273,11 @@ function installTemplates(opts) {
 
     // Read the template content (binary-safe)
     const binary = isBinary(templateRel);
-    const rawContent = binary
-      ? fs.readFileSync(templateAbs)
-      : fs.readFileSync(templateAbs, 'utf8');
+    let rawContent = generated.get(destRel) ?? fs.readFileSync(templateAbs, binary ? undefined : 'utf8');
+    if (harness?.software && references && ['AGENTS.md', 'CLAUDE.md'].includes(destRel)) {
+      rawContent = '## Work presets\n\nApply the software workflow below to software work. Use the relevant domain guides for other deliverables.\n\n'
+        + references + '\n\n' + rawContent;
+    }
     const renderedContent = binary
       ? rawContent
       : substitute(rawContent, placeholders, { source: destRel });
@@ -333,6 +381,22 @@ function installTemplates(opts) {
     report.written.push({ path: destRel, reason });
   }
 
+  if (harness) {
+    const installed = new Set(templateFiles.map(destRelFor));
+    for (const rel of Object.keys(nextManifest.files)) {
+      // Only entries this installer manages can be retired on a preset change.
+      if (!include(rel) || installed.has(rel) || !isRetirableGuide(rel, nextManifest.files[rel])) continue;
+      const status = fileStatus(projectRoot, rel, manifest);
+      if (status === 'user-modified') {
+        report.skipped.push({ path: rel, reason: 'deselected guide has user edits' });
+        continue;
+      }
+      if (status === 'unchanged' && !dryRun) fs.unlinkSync(path.join(projectRoot, rel));
+      if (!dryRun) delete nextManifest.files[rel];
+      report.removed.push({ path: rel });
+    }
+  }
+
   if (!dryRun) {
     if (manifest?.version !== packageVersion || JSON.stringify(manifest?.files) !== JSON.stringify(nextManifest.files)) {
       writeManifest(projectRoot, nextManifest);
@@ -348,11 +412,23 @@ function installTemplates(opts) {
   return report;
 }
 
+
+const SOFTWARE_GUIDES = resolvePresetHarness(['software']).entries[0].guides.filter(rel => rel.startsWith('.claude/skills/'));
+
+function isSoftwareTemplate(rel) {
+  return SOFTWARE_GUIDES.includes(rel) || rel === 'preset-a.md' || rel === 'preset-b.md';
+}
+
+function isRetirableGuide(rel, entry) {
+  return entry.source === 'templates/' + rel &&
+    (/^\.tipatask\/guides\/[a-z-]+\.md$/.test(rel) || isSoftwareTemplate(rel));
+}
+
 // Refresh executable harness assets only. Project KB and preset context are
 // deliberately outside this selection: opening a project must never re-seed it.
 function isHarnessTemplate(rel) {
   return rel === 'AGENTS.md' || rel === 'CLAUDE.md' || rel === '.claude/settings.json'
-    || rel.startsWith('.claude/skills/');
+    || rel.startsWith('.claude/skills/') || rel.startsWith('.tipatask/guides/');
 }
 
 // Placeholder context for the harness templates. SERVER_ROOT is relative (POSIX form) when
@@ -376,13 +452,14 @@ function buildHarnessPlaceholders(projectRoot, serverRoot) {
   };
 }
 
-function refreshHarnessTemplates(projectRoot, serverRoot, { dryRun = false } = {}) {
+function refreshHarnessTemplates(projectRoot, serverRoot, { dryRun = false, presets } = {}) {
   return installTemplates({
     projectRoot,
     templatesDir: path.join(serverRoot, 'templates'),
     placeholders: buildHarnessPlaceholders(projectRoot, serverRoot),
     packageVersion: require('../../package.json').version,
     include: isHarnessTemplate,
+    harness: presets === undefined ? projectHarness(projectRoot) : resolvePresetHarness(presets),
     dryRun,
   });
 }

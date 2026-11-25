@@ -17,6 +17,7 @@ const registry = require('./registry');
 const { listTaskAgentStatuses } = require('../task-agent');
 const { providerSupportsProfile } = require('./tool-profiles');
 const { prepareObjectiveProposalContext } = require('../objective-proposal-status');
+const { projectContextIdentity } = require('../api-credentials');
 
 // Every turn either reaches a provider or fails visibly: a refused or failed turn sends
 // `objective-error`, and a task/project chat also gets the `chat-ready` that ends its turn, so
@@ -45,13 +46,9 @@ function failSpawn(session, taskId, err) {
  * Drop-in replacement for spawnObjectiveTurn(session, taskId) — same signature.
  */
 function spawnTurn(session, taskId) {
-  const identity = require('../api-credentials').projectContextIdentity(session.projectPath);
-  if (session._agentContextIdentity !== undefined && session._agentContextIdentity !== identity) {
-    registry.clearAllProviderSessionIds(session);
-    failTurn(session, { reason: 'project-context-changed', status: 409, detail: 'Project or account changed. Start a new chat.' });
-    return;
-  }
-  session._agentContextIdentity = identity;
+  const identity = projectContextIdentity(session.projectPath);
+  session._agentContextIdentity ??= identity;
+  if (!checkTurnContext(session, taskId, identity)) return;
   // A chat resumed from history (ws-handlers.js resumeChatFromHistory) has no local transcript
   // to rebuild from (its `restored` messages are display-only): without the provider's session id a turn would silently start a new
   // conversation, so it is refused instead.
@@ -73,10 +70,18 @@ function spawnTurn(session, taskId) {
       if (session._closed || session._aborted || (session._epoch || 0) !== epoch
         || session._proposalContext !== context) return;
       session._spawning = false;
+      if (!checkTurnContext(session, taskId)) return;
       return spawnGuarded(session, taskId);
     });
   }
   return spawnGuarded(session, taskId);
+}
+
+function checkTurnContext(session, taskId, identity = projectContextIdentity(session.projectPath)) {
+  if (session._agentContextIdentity === identity) return true;
+  if (session.type === 'objective') require('../objective-throttle').recordAbort(taskId);
+  failTurn(session, { reason: 'project-context-changed', status: 409, detail: 'Project or account changed. Reopen the chat under its original project and account.' });
+  return false;
 }
 
 function spawnGuarded(session, taskId) {

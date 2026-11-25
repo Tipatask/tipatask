@@ -66,6 +66,10 @@ function getPurifier(win) {
     }
   });
   purifier.addHook('afterSanitizeAttributes', (node) => {
+    // Same-origin artifact downloads stay in the authenticated project window.
+    if (node.nodeName === 'A' && /^\/api\/projects\/\d+\/files\/artifacts\/\d+\/revisions\/\d+\/content$/.test(node.getAttribute('href'))) {
+      node.setAttribute('download', '');
+    }
     if (node.nodeName.toUpperCase() === 'INPUT') {
       // GFM task-list checkboxes are display-only. Never leave a live form field.
       node.setAttribute('type', 'checkbox');

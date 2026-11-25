@@ -286,6 +286,15 @@ for (const kind of ['objective', 'task', 'project']) for (const resumed of [fals
     assert.ok(args.includes('mcp_servers.tipatask-local.enabled_tools=["batch_grep_tags"]'));
     assert.ok(args.includes('mcp_servers={}'));
     assert.ok(args.some(a => a.startsWith('mcp_servers.tipatask.disabled_tools=')));
+    const prompt = h.spawned[0].stdinText;
+    if (kind === 'objective') {
+      assert.match(prompt, /before reserving keys\.[\s\S]*read the relevant source or runbook/);
+      assert.match(prompt, /Use HUMAN for work only a person can perform/);
+      assert.match(prompt, /task key in dependencies and schedule it in a later sprint/);
+      assert.match(prompt, /self-contained change and its routine verification on one card/);
+    } else {
+      assert.doesNotMatch(prompt, /before reserving keys/);
+    }
     if (resumed) {
       assert.equal(args[1], 'resume');
       assert.equal(args[2], 'fixture-thread');

@@ -146,6 +146,7 @@ class CodexAgent extends BaseTaskAgent {
   wrapsBracketedPaste({ isWin = process.platform === 'win32' } = {}) { return !isWin; }
 
   buildPrompt(prompt, opts = {}) {
+    const harness = this.resolveHarness(opts);
     // C1575 — parent-task context (opts.parentTaskBlock), prepended ahead of this task's own
     // comments. Uncapped for Codex — no prompt-size test exists here, unlike pi-agent.js.
     const promptWithComments = BaseTaskAgent.prependParentTask(
@@ -153,7 +154,7 @@ class CodexAgent extends BaseTaskAgent {
 
     // SIMPLE_MODE skips static context but retains desktop-use instructions.
     if (config.SIMPLE_MODE && !(opts.parentPreparation ?? opts.task?.isObjective) && !opts.objectiveChain && !opts.permissionPolicy?.enforced && opts.permissionPolicy?.mode !== 'plan') {
-      return [this.buildComputerUseDirective(opts), promptWithComments].filter(Boolean).join('\n\n');
+      return [this.buildComputerUseDirective(opts), this.buildPresetDirective(harness), promptWithComments].filter(Boolean).join('\n\n');
     }
 
     const ttTags = (opts.taskTags || []).filter(t => t.startsWith('tt-'));
@@ -176,12 +177,12 @@ class CodexAgent extends BaseTaskAgent {
     // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status) plus the
     // separate clarify slot — see base-agent.js#buildSharedPreamble. Codex inherits the base
     // policy: full wording, text clarifying questions.
-    const { directives, clarify } = this.buildSharedPreamble(opts);
+    const { directives, clarify } = this.buildSharedPreamble({ ...opts, harness });
     const body = [
-      'Use the Tipatask workflow for this repository.',
+      harness.softwareOnly ? 'Use the Tipatask workflow for this repository.' : 'Use the Tipatask workflow for this project.',
       ...(opts.permissionPolicy?.enforced && !opts.permissionPolicy.planning ? [this.permissionPrompt(opts)] : [
       'You are starting in planning mode enforced by Task App.',
-      'First study the task, relevant source code, configuration files, and architecture docs.',
+      harness.softwareOnly ? 'First study the task, relevant source code, configuration files, and architecture docs.' : 'First study the task, relevant project records, guides and sources.',
       'Do not implement, edit files, or run mutating commands until the user approves the plan.',
       'Do not ask whether to create a plan or wait for Shift+Tab plan mode. Write the plan immediately in normal output, then stop. After the plan, emit one final line whose only content is the words Plan ready., then wait for Task App approval before mutating files.',
       ]),
@@ -196,15 +197,15 @@ class CodexAgent extends BaseTaskAgent {
       '- Taxonomy and GENERAL.md are pre-loaded above — no need to call list_system_tags or read GENERAL.md.',
       '- Prefer the tipatask MCP server when available.',
       `- ${tagNote}`,
-      '- After any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task to reflect added/removed/changed endpoints, DB schema, env vars, file structure, or module behavior. Do this before marking task complete.',
-      '- Before marking complete: if new module touched has no tt-* tag — call list_system_tags to verify, create tag via MCP or POST /api/tags, create ai/architecture/tt-*.md stub, add tag to task.',
+      ...(harness.softwareOnly ? ['- After any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task to reflect added/removed/changed endpoints, DB schema, env vars, file structure, or module behavior. Do this before marking task complete.',
+      '- Before marking complete: if new module touched has no tt-* tag — call list_system_tags to verify, create tag via MCP or POST /api/tags, create ai/architecture/tt-*.md stub, add tag to task.'] : []),
       // C1184: resolve the project's actual "complete" status name (role-based)
       // instead of the hardcoded literal "completed".
       opts.vcsContext
         ? `- MANDATORY: supply ONE self-authored plain-English resolution to tipatask-local complete_task. Cover what changed and why, key files, checks, and follow-ups/caveats (none if absent). That tool posts the resolution and completion status together after verification. Never also call \`create_task_comment\` or \`update_task\` to complete the task. When it refuses, fix the blockers it lists (e.g. TASK_COMMIT_MISSING: commit first) and call it again. If a blocker cannot be cleared within this task, do not complete it: post the same report with \`create_task_comment(task_key, content, type="resolution")\` so it is not lost, then set the task on_fire (when available) and state the blocker. The automatic terminal-tail comment does not satisfy this requirement. ${BaseTaskAgent.buildFinishChecklist(opts)}`
         : `- MANDATORY before marking this task \`${this.resolveStatusForRole('complete', opts)}\`: post ONE self-authored resolution comment via \`create_task_comment(task_key, content, type="resolution")\`. \`content\` must be a real report, written in plain English prose — do NOT use caveman style for this comment. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). Separate from and required IN ADDITION TO the auto-posted terminal-tail resolution comment (a raw log dump with no explanation, posted on session exit) — that one does not satisfy this step. Post it in the SAME tool-call batch as the final status update to \`${this.resolveStatusForRole('complete', opts)}\`.`,
       ...directives,
-      `- ${grepNote}`,
+      ...(harness.softwareOnly ? [`- ${grepNote}`] : []),
       '',
       ...(grepBundle ? [grepBundle, ''] : []),
       promptWithComments,

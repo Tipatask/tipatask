@@ -206,6 +206,7 @@ function buildTaskChatSystemPrompt({ provider, task, project, langDirective, piM
     '',
     ASK_USER_CONTRACT,
     '',
+    'When asking the user to look at a project file, use a Markdown link with its file name or path as the link text and its project-relative path as the destination. Append #L<line> for a specific line, for example [check.sql](reports/check.sql#L209).',
     'Apart from that block, reply in plain conversational prose; markdown is fine. Keep answers short unless the user asks for depth.',
   ];
   const prompt = lines.join('\n');

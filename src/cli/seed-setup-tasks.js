@@ -772,7 +772,7 @@ function applyPresetTemplate(preset, projectRoot, presetDescription) {
 // the tasks that touch each area document it. A GENERAL.md that already has content is kept.
 const BASE_GENERAL_PENDING = '_(not documented yet — the first task that works in this area fills it in)_';
 
-function applyBaseGeneralTemplate(projectRoot) {
+function applyBaseGeneralTemplate(projectRoot, { software = true } = {}) {
   const generalPath = path.join(projectRoot, 'ai', 'architecture', 'GENERAL.md');
   try {
     if (fs.readFileSync(generalPath, 'utf8').trim()) return { written: false, reason: 'exists' };
@@ -782,7 +782,11 @@ function applyBaseGeneralTemplate(projectRoot) {
   const tplPath = path.join(__dirname, '..', '..', 'templates', 'ai', 'architecture', 'GENERAL.md.tpl');
   let tpl;
   try {
-    tpl = fs.readFileSync(tplPath, 'utf8');
+    if (software) tpl = fs.readFileSync(tplPath, 'utf8');
+    else {
+      const { projectKnowledgeTemplate, projectHarness } = require('../server/project-seeder');
+      tpl = projectKnowledgeTemplate(projectHarness(projectRoot));
+    }
   } catch {
     console.log(`  ${YELLOW}Base GENERAL.md template not found: ${tplPath}${RESET}`);
     return { written: false, reason: 'no-template' };

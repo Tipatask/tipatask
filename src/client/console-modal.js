@@ -446,14 +446,14 @@ export function closeConsoleIfOpen() {
 // currently the visibly-active chatState — see the split below. Needed because a mid-save
 // tab-switch can leave `cs !== state.chatState` AND leave the closed tab not the active one
 // either, silently skipping the purge branch entirely before this option existed.
-export function cleanupChat(targetCs, { force = false } = {}) {
+export function cleanupChat(targetCs, { force = false, preserveServerDraft = false } = {}) {
   const cs = targetCs || state.chatState;
   if (!cs) return;
   state.cleanupInProgress = true;
   setTimeout(() => { state.cleanupInProgress = false; }, CHAT_CLEANUP_GUARD_MS);
   if (cs.ws) {
     if (cs.ws.readyState === WebSocket.OPEN) {
-      cs.ws.send(JSON.stringify({ type: 'kill' }));
+      if (!preserveServerDraft) cs.ws.send(JSON.stringify({ type: 'kill' }));
       cs.ws.close();
     } else if (cs.ws.readyState === WebSocket.CONNECTING) {
       cs.ws.close();
@@ -490,7 +490,7 @@ export function cleanupChat(targetCs, { force = false } = {}) {
   // re-pointing (must stay scoped to "this WAS the visible tab" — forcing it unconditionally
   // would teleport the user off a tab they deliberately switched to mid-save).
   const wasActive = cs === state.chatState || removedWasActive;
-  if (force || wasActive) {
+  if (force || wasActive || preserveServerDraft) {
     // Bumped BEFORE the DELETEs so any saveChatDraft()/saveChatState() write already
     // in-flight from this finalized chat is disowned by the epoch check in chat-ui.js —
     // see state.js's chatPersistEpoch comment. This is the actual fix for the
@@ -502,9 +502,14 @@ export function cleanupChat(targetCs, { force = false } = {}) {
     // bare fallback key a null activeTabId would have used.
     if (goneTabId) clearDraft(`${DRAFT_KEY_OBJECTIVE}-${goneTabId}`);
     clearDraft(DRAFT_KEY_OBJECTIVE);
-    if (force) clearDraft(LAST_PROMPT_KEY);
-    fetchWithRetry('/api/chat-state', { method: 'DELETE', headers: projectHeader(), retries: 1, timeoutMs: 5000, label: 'chat-state-delete' }).catch(() => {});
-    fetchWithRetry('/api/objective/chat-draft', { method: 'DELETE', headers: projectHeader(), retries: 1, timeoutMs: 5000, label: 'chat-draft-delete' }).catch(() => {});
+    if (force || preserveServerDraft) clearDraft(LAST_PROMPT_KEY);
+    if (preserveServerDraft) {
+      // The live server now resolves the new account. Keep both accounts' server drafts.
+      state.lastSentPrompt = '';
+    } else {
+      fetchWithRetry('/api/chat-state', { method: 'DELETE', headers: projectHeader(), retries: 1, timeoutMs: 5000, label: 'chat-state-delete' }).catch(() => {});
+      fetchWithRetry('/api/objective/chat-draft', { method: 'DELETE', headers: projectHeader(), retries: 1, timeoutMs: 5000, label: 'chat-draft-delete' }).catch(() => {});
+    }
   }
   if (wasActive) {
     state.chatState = null;
@@ -521,7 +526,7 @@ export function cleanupChat(targetCs, { force = false } = {}) {
   // pre-TPT20, so the gap was latent). Delayed past the cleanupInProgress window (via an event,
   // not a direct import, to avoid a chat-ui.js <-> console-modal.js cycle — see chat-ui.js's
   // ensureGlobalChatBindings()).
-  if ((force || wasActive) && state.chatState) {
+  if (!preserveServerDraft && (force || wasActive) && state.chatState) {
     setTimeout(() => {
       document.dispatchEvent(new CustomEvent('tiptask:chat-persist-purged'));
     }, CHAT_CLEANUP_GUARD_MS + 50);

@@ -95,6 +95,7 @@ function configureStatusline(projectRoot, { force = false } = {}) {
  * Best-effort caveman plugin setup step. Prints friendly guidance; never throws.
  */
 async function runCavemanPluginStep(projectRoot, { force = false } = {}) {
+  if (!require('../server/project-seeder').projectHarness(projectRoot).software) return { installed: false };
   let pluginDir = findCavemanPluginDir();
   let autoInstalled = false;
 

@@ -39,15 +39,22 @@ test('ws-client: the hand-edit message is one string in both directions and the 
   assert.ok(wsHandlers.includes("type: 'task-chat-task-edited'"), 'and answers with the task it read back');
 });
 
-test('task-chat.js: the three widget renderers exist and every widget frame repaints the slot', () => {
-  for (const fn of ['renderDialogWidget', 'renderTaskWidget', 'renderToolChip', 'paintWidgets']) {
+test('task-chat.js: the three widget renderers exist and every widget frame repaints where it is drawn', () => {
+  for (const fn of ['renderDialogWidget', 'renderTaskWidget', 'renderToolChip', 'paintWidgets', 'paintAssistant']) {
     assert.match(taskChat, new RegExp(`function ${fn}\\(`), `${fn}() is defined`);
   }
-  for (const type of ['TASK_CHAT_DIALOG', 'TASK_CHAT_TOOL', 'TASK_CHAT_TASK']) {
+  const caseBody = (type) => {
     const start = taskChat.indexOf(`case WS_RECV_TYPES.${type}: {`);
     assert.notEqual(start, -1, `${type} is handled`);
-    assert.match(taskChat.slice(start, taskChat.indexOf('\n    case ', start + 1)), /paintWidgets\(m\)/, `${type} repaints the widgets`);
-  }
+    return taskChat.slice(start, taskChat.indexOf('\n    case ', start + 1));
+  };
+  // Task cards and dialogs live in the widget slot; (TPT9383) tool chips and segment boundaries
+  // in the reply's flow, between the runs of text.
+  for (const type of ['TASK_CHAT_DIALOG', 'TASK_CHAT_TASK']) assert.match(caseBody(type), /paintWidgets\(m\)/, `${type} repaints the widgets`);
+  for (const type of ['TASK_CHAT_TOOL', 'TASK_CHAT_SEGMENT']) assert.match(caseBody(type), /paintAssistant\(m\)/, `${type} repaints the reply`);
+  assert.equal(WS_RECV_TYPES.TASK_CHAT_SEGMENT, 'task-chat-segment');
+  assert.ok(widgets.includes("type: 'task-chat-segment'"), 'task-chat-widgets.js emits task-chat-segment');
+  assert.match(taskChat, /WS_RECV_TYPES\.TASK_CHAT_SEGMENT,\n\]\);/, 'a segment frame is a turn frame');
 });
 
 test('task-chat.js: a dialog answer goes out as task-chat-answer with the model selection', () => {

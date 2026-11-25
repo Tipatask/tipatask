@@ -6,7 +6,10 @@ const state = {
   // Latest project-scoped merge scan; null until successfully loaded.
   taskMergeStatus: null,
   // Navigation
+  // 'objective' and 'new_task' are the Create modal's two modes (TPT9389): while activeTab is one
+  // of them the modal is open over the board, and boardTab names the Tasks view behind it.
   activeTab: 'board', // 'board' | 'list' | 'todo' | 'backlog' | 'objective' | 'new_task'
+  boardTab: 'board', // 'board' | 'list' | 'todo' | 'backlog' — the Tasks view last painted in #app
   todoDrawerTaskId: null,
   todoSprintPriority: null,
   mobileMenuOpen: false,

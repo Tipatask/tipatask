@@ -13,6 +13,8 @@ import {
   startName, inProgressName,
   seedStatuses,
 } from './status-registry.js';
+import { refreshDesktopProfile, syncPolicyControls } from './desktop-project-profile.js';
+export { refreshDesktopProfile };
 import { escapeAttr, insertAtCursor, setValueKeepingCaret, markTruncatedCards, loadDraft, saveDraft, clearDraft, getObjectiveDraftKey, renderMarkdown, renderSprintCombobox, initSprintCombobox, refreshSprintComboboxItems, showToast, showProgressToast, sprintRecordMax, showSavingIndicator, hideSavingIndicator, shortModelName, pushSubtaskCrumb, renderTagBadge } from './utils.js';
 import { computeTierWindow, HIDE_CLASS } from './sprint-tier-visibility.js';
 import { isStatusRowChecked } from './status-filter-select.js';
@@ -3334,6 +3336,9 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // (TPT9322) Permission mode is always offered; Cowboy-Coding mode joins it only while Bypass
   // is staged (_syncBulkCowboyOptions()). The .bulk-field-pair keeps the two on one row when
   // the edit fields wrap, like the Task Edit modal's Cowboy row right under Permission mode.
+  // (TPT9385) Placement is CSS only: no inline width or left offset here. styles.css bounds the
+  // bar to the board area right of #left-nav-panel and wraps the .bulk-field units, the
+  // .bulk-apply-actions pair and the actions cluster as whole units.
   bar.innerHTML = `
     <div class="bulk-group bulk-group--selection">
       <span class="bulk-count"></span>
@@ -5933,6 +5938,7 @@ const _SETTINGS_TEXT = [
   ['settings-workflow-tab-btn', 'settings.workflow.tab'],
   ['settings-memory-tab-btn', 'settings.memory.tab'],
   ['settings-vcs-tab-btn', 'settings.vcs.tab'],
+  ['settings-profile-title', 'profile.title'],
   ['settings-display-title', 'settings.sectionDisplay'],
   ['settings-language-label', 'settings.language'],
   ['settings-language-note', 'settings.projectWide'],
@@ -6002,18 +6008,18 @@ export function openSettingsModal() {
     }
   }
   _populateSettingsAgentsRow();
-  _populateSettingsLanguageSelect();
   _populateSettingsNotificationsRows();
   _populateSettingsDebugRow();
   populateRemoteControlSettings();
   _populateSettingsVoiceTab();
-  _populateSettingsWorkflowTab();
-  _populateSettingsMemoryTab();
-  _populateSettingsVersionControlTab();
-  // (C1305) Re-sync the theme select + palette with the DB every time Settings opens —
-  // catches a color_scheme changed elsewhere (web app, another Task App instance) since
-  // this window's last read. Fire-and-forget; applyProjectTheme() never throws.
-  applyProjectTheme();
+  refreshDesktopProfile(true).then(current => {
+    if (!current || !modal?.classList.contains('open')) return;
+    _populateSettingsLanguageSelect();
+    _populateSettingsWorkflowTab();
+    _populateSettingsMemoryTab();
+    _populateSettingsVersionControlTab().then(syncPolicyControls);
+    applyProjectTheme();
+  });
 }
 export function closeSettingsModal() {
   document.getElementById('settings-modal')?.classList.remove('open', 'settings-modal--over-modal');
@@ -7187,6 +7193,7 @@ function _populateSettingsPermissionModeRow() {
       control.disabled = false;
     }
   });
+  syncPolicyControls();
   if (restoreFocus) host.querySelector('button')?.focus();
 }
 
@@ -7959,6 +7966,9 @@ let _settingsModalWired = false;
 export function initSettingsModal() {
   if (_settingsModalWired) return;
   _settingsModalWired = true;
+  document.addEventListener('tiptask:policy-conflict', () => {
+    if (document.getElementById('settings-modal')?.classList.contains('open')) openSettingsModal();
+  });
   // (C1199) Fire at boot, independent of whether #settings-modal markup exists — mics on the
   // board (New Task title/desc, New Objective chat input, any open terminal) need their
   // correct disabled/enabled state before the user ever opens Settings.

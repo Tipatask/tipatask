@@ -105,7 +105,7 @@ test('project:create-from-wizard writes the preset config keys and skips seeding
   const write = handler.slice(handler.indexOf('writeProjectConfig(projectPath, {'));
   const writeBody = write.slice(0, write.indexOf('});'));
   assert.match(writeBody, /\.\.\.presetConfigFields\(presetValue\),/);
-  assert.match(handler, /const presetValue = preset\?\.value;/);
+  assert.match(handler, /projectPresets\.includes\('software'\) \? preset\?\.value : COMPOSE_PRESET/);
   assert.match(handler, /copyTemplates\(presetValue, projectPath, presetDescription \|\| null\);/);
   assert.match(handler, /if \(presetSeedsTasks\(presetValue\)\) \{\s*presetSeed = await callSeedPresetTasks\(presetValue,/);
   assert.doesNotMatch(handler, /preset\.value/, 'no unguarded preset.value dereference left');
@@ -146,4 +146,104 @@ test('KB_MODE reaches only its own project spawns, never process.env at startup'
   delete env.TT_SEED_PROBE;
   const out = JSON.parse(execFileSync(process.execPath, ['-e', script], { encoding: 'utf8', env }));
   assert.deepEqual(out, { startupEnv: null, probe: 'seeded', compose: 'compose', plain: null });
+});
+
+test('every work domain supplies guides, role-specific rules, outputs, verification and completion', () => {
+  const { resolvePresetHarness } = require('./project-seeder');
+  const ids = ['software', 'science', 'marketing', 'sales', 'finance', 'health', 'home', 'personal-growth'];
+  const all = resolvePresetHarness([...ids].reverse().concat('home'));
+  assert.deepEqual(all.entries.map(entry => entry.id), ids);
+  for (const domain of all.entries) {
+    assert.ok(domain.guides.length);
+    for (const field of ['planner', 'executor', 'deliverables', 'verification', 'completion']) assert.ok(domain[field], domain.id + '.' + field);
+  }
+  assert.deepEqual(resolvePresetHarness(['home', 'invalid']).entries.map(entry => entry.id), ['home']);
+  assert.deepEqual(resolvePresetHarness(), resolvePresetHarness(['software']));
+});
+
+test('project metadata takes precedence and an unavailable backend uses the linked checkout', async t => {
+  const root = scratchProject(t);
+  require('./project-config').writeProjectConfig(root, { projectPresets: ['home'] });
+  const { readProjectHarness } = require('./project-seeder');
+  const online = await readProjectHarness({ getProjectSettings: async () => ({ projectPresets: ['sales'], use_objective_grouping: 0 }) }, root);
+  assert.equal(online.harness.entries[0].id, 'sales');
+  assert.equal(online.groupingEnabled, false);
+  const offline = await readProjectHarness({ getProjectSettings: async () => { throw new Error('offline'); } }, root);
+  assert.equal(offline.harness.entries[0].id, 'home');
+});
+
+test('Claude, Codex and Pi kickoffs read the selected project and preserve Software defaults', t => {
+  const root = scratchProject(t);
+  const opts = { projectPath: root, vcsContext: { verified: true, vcs: { type: null } }, kbMode: 'compose', task: { category: 'CODING' } };
+  const { writeProjectConfig } = require('./project-config');
+  for (const id of ['claude', 'codex', 'pi']) {
+    const Agent = require('./task-agent/' + id + '-agent');
+    const agent = new Agent();
+    writeProjectConfig(root, {});
+    const legacy = agent.buildPrompt('Task brief', opts);
+    writeProjectConfig(root, { projectPresets: ['software'] });
+    assert.equal(agent.buildPrompt('Task brief', opts), legacy);
+    writeProjectConfig(root, { projectPresets: ['home'] });
+    const home = agent.buildPrompt('Task brief', opts);
+    assert.match(home, /Sequence the work around household constraints/);
+    assert.match(home, /Household checklist/);
+    assert.match(home, /Check quantities, timing, cost/);
+    assert.match(home, /owners, timing/);
+    assert.doesNotMatch(home, /\/tipatask-expert|\/caveman|npm run|After any code change|Campaign brief/);
+    assert.match(home, /complete_task|tt complete/);
+  }
+});
+
+test('each non-software preset delivers its sources, checks and standing topics to plan, kickoff, guide and KB', async t => {
+  const { projectObjectivePrompt, resolvePresetHarness } = require('./project-seeder');
+  const { writeProjectConfig } = require('./project-config');
+  const Agent = require('./task-agent/codex-agent');
+  const { installTemplates } = require('../cli/install-templates');
+  for (const id of ['science', 'marketing', 'sales', 'finance', 'health', 'home', 'personal-growth']) {
+    const root = scratchProject(t, id);
+    writeProjectConfig(root, { projectPresets: [id] });
+    const [contract] = resolvePresetHarness([id]).entries;
+    const planner = (await projectObjectivePrompt(null, root, {})).systemPrompt;
+    const kickoff = new Agent().buildPrompt('Deliver the task', { projectPath: root });
+    copyTemplates(COMPOSE_PRESET, root);
+    const guide = read(root, contract.guides[0]);
+    assert.ok(planner.includes(contract.planner));
+    assert.ok(kickoff.includes(contract.executor));
+    for (const text of [contract.sources, contract.deliverables, contract.verification, contract.completion, ...contract.kbSections]) {
+      for (const surface of [planner, kickoff, guide]) assert.ok(surface.includes(text), id + ': ' + text);
+    }
+    const cli = scratchProject(t, id);
+    writeProjectConfig(cli, { projectPresets: [id] });
+    installTemplates({ projectRoot: cli, placeholders: { PROJECT_NAME: id } });
+    const kb = read(root, 'ai/architecture/GENERAL.md');
+    assert.equal(kb, read(cli, 'ai/architecture/GENERAL.md'));
+    for (const title of contract.kbSections) assert.ok(kb.includes('### ' + title + '\n'));
+    assert.doesNotMatch(kb, /^## Stack$/m);
+  }
+});
+
+test('a mixed objective hands each task its own contract across Claude, Codex and Pi', async () => {
+  const { projectObjectivePrompt, resolvePresetHarness } = require('./project-seeder');
+  const projectPresets = ['science', 'marketing'];
+  const backend = { getProjectSettings: async () => ({ projectPresets }) };
+  const planner = (await projectObjectivePrompt(backend, null, {})).systemPrompt;
+  assert.match(planner, /Work presets: <ids>.*science, marketing/);
+  const harness = resolvePresetHarness(projectPresets);
+  const [science, marketing] = harness.entries;
+  for (const id of ['claude', 'codex', 'pi']) {
+    const Agent = require('./task-agent/' + id + '-agent');
+    const run = description => new Agent().buildPrompt(description, { harness, task: { description } });
+    const analyze = run('Work presets: science\n\nEstimate drying time from the lab observations.');
+    assert.ok(analyze.includes(science.verification));
+    assert.ok(!analyze.includes(marketing.verification));
+    const brief = run('Work presets: marketing\r\n\r\nUse the approved study summary to write a search brief.');
+    assert.ok(brief.includes(marketing.verification));
+    assert.ok(!brief.includes(science.verification));
+    for (const description of ['Work presets: marketing, science\n\nProduce a joint evidence brief.',
+      'Write a brief.\n\nSource material\nWork presets: marketing', 'Work presets: science, home']) {
+      const prompt = run(description);
+      assert.ok(prompt.includes(science.verification) && prompt.includes(marketing.verification));
+      assert.doesNotMatch(prompt, /Household checklist/);
+    }
+  }
 });

@@ -208,11 +208,12 @@ class PiAgent extends BaseTaskAgent {
   }
 
   buildPrompt(prompt, opts = {}) {
+    const harness = this.resolveHarness(opts);
     const promptWithComments = BaseTaskAgent.prependTaskComments(prompt, opts);
     // (C1575) SIMPLE_MODE is a bare debug path with no surrounding framing to budget the
     // parent block against — thread it through uncapped, same discipline SIMPLE_MODE gives
     // every other opt in this method.
-    if (runtimeConfig.SIMPLE_MODE && !(opts.parentPreparation ?? opts.task?.isObjective) && !opts.objectiveChain && !opts.permissionPolicy?.enforced && opts.permissionPolicy?.mode !== 'plan') return BaseTaskAgent.prependParentTask(promptWithComments, opts);
+    if (runtimeConfig.SIMPLE_MODE && !(opts.parentPreparation ?? opts.task?.isObjective) && !opts.objectiveChain && !opts.permissionPolicy?.enforced && opts.permissionPolicy?.mode !== 'plan') return [this.buildPresetDirective(harness), BaseTaskAgent.prependParentTask(promptWithComments, opts)].filter(Boolean).join('\n\n');
 
     const ttTags = (opts.taskTags || []).filter(t => t.startsWith('tt-'));
     const cachedTags = (opts.cachedTags || []).filter(t => t.startsWith('tt-') && !ttTags.includes(t));
@@ -233,7 +234,7 @@ class PiAgent extends BaseTaskAgent {
     // they stay safe under the HARD RULE above (no bare "Plan ready.", no "❯ n." prefix, no
     // "[y/n]", no "do you want to …?" etc.) and inside the echo-verbatim prompt budget —
     // pi-agent.test.js's echo-safety sweep covers them.
-    const { directives, clarify } = this.buildSharedPreamble(opts);
+    const { directives, clarify } = this.buildSharedPreamble({ ...opts, harness });
     const bridge = !!opts.piMcpBridge;
     const completeName = this.resolveStatusForRole('complete', opts);
     const inProgressName = this.resolveStatusForRole('in_progress', opts);
@@ -267,10 +268,10 @@ class PiAgent extends BaseTaskAgent {
     ];
 
     const lines = [
-      'Use the Tipatask workflow for this repository.',
+      harness.softwareOnly ? 'Use the Tipatask workflow for this repository.' : 'Use the Tipatask workflow for this project.',
       ...intro,
       ...(opts.permissionPolicy?.enforced && !opts.permissionPolicy.planning ? [this.permissionPrompt(opts)] : [
-      'Start in planning mode enforced by Task App. First study the task, relevant source code, configuration files, and architecture docs. Do not implement, edit files, or run mutating commands until the user approves the plan.',
+      harness.softwareOnly ? 'Start in planning mode enforced by Task App. First study the task, relevant source code, configuration files, and architecture docs. Do not implement, edit files, or run mutating commands until the user approves the plan.' : 'Start in planning mode. Read the task and its sources. Wait for plan approval before making changes.',
       // (C1116) The instruction below is deliberately kept as ONE unbroken sentence with no
       // literal newline — Pi's TUI echoes this prompt verbatim in its first frames, and the
       // server-side ready-detector (PI_PLAN_READY_PATTERNS, prompt-detect.js) anchors on a
@@ -283,12 +284,12 @@ class PiAgent extends BaseTaskAgent {
       clarify,
       'Project context:',
       '- General architecture and tag taxonomy are pre-loaded in the system prompt.',
-      `- ${tagNote}`,
-      '- After any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task (endpoints, schema, env vars, file structure, behavior). Never write ai/ARCHITECTURE.md — deprecated, no agent loads it. During exploration, if a STANDING fact is missing from a tt-*.md, fix that doc immediately with that fact alone.',
+      ...(harness.softwareOnly ? [`- ${tagNote}`,
+      '- After any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task (endpoints, schema, env vars, file structure, behavior). Never write ai/ARCHITECTURE.md — deprecated, no agent loads it. During exploration, if a STANDING fact is missing from a tt-*.md, fix that doc immediately with that fact alone.'] : ['- Read the project knowledge and guides relevant to the task.']),
       ...taskOps,
-      `- ${grepNote}`,
+      ...(harness.softwareOnly ? [`- ${grepNote}`] : []),
       ...directives,
-      ...(opts.discovery ? piDiscoveryMandateLines(bridge, !opts.permissionPolicy?.enforced || opts.permissionPolicy.planning) : []),
+      ...(opts.discovery && harness.software ? piDiscoveryMandateLines(bridge, !opts.permissionPolicy?.enforced || opts.permissionPolicy.planning) : []),
       '',
     ];
     // (C1575) Fit the parent-task block against the REAL assembled framing + task text

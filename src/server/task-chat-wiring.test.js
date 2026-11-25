@@ -161,6 +161,128 @@ function projectBackend(projectId, name = 'Project') {
   });
 }
 
+function chatIdentityFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tt-chat-identity-'));
+  const previousData = process.env.TIPATASK_USER_DATA;
+  process.env.TIPATASK_USER_DATA = path.join(root, 'data');
+  t.after(() => {
+    if (previousData === undefined) delete process.env.TIPATASK_USER_DATA;
+    else process.env.TIPATASK_USER_DATA = previousData;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const { writeProjectConfig } = require('./project-config');
+  const { saveAccountForServer } = require('./account-store');
+  const first = 'https://first.test';
+  const second = 'https://second.test';
+  const projectPath = path.join(root, 'project');
+  const retarget = baseUrl => writeProjectConfig(projectPath, { API_BASE_URL: baseUrl, API_PROJECT_ID: 2 });
+  const signIn = (baseUrl, userId) => saveAccountForServer(baseUrl, { token: 'fixture', userId });
+  signIn(first, 1);
+  signIn(second, 2);
+  retarget(first);
+  const snapshot = async (h, sessions) => {
+    let body;
+    await h.exports.createHttpHandler(sessions, () => ({}))(
+      { method: 'GET', url: '/api/sessions', headers: { 'x-tipatask-project': projectPath } },
+      { writeHead: status => assert.equal(status, 200), end: raw => { body = JSON.parse(raw); } },
+    );
+    return body;
+  };
+  return { first, second, projectPath, retarget, signIn, snapshot };
+}
+
+test('chat inventory, attach, terminate, and attention replay follow the live project identity', async t => {
+  const h = harness();
+  const { first, second, projectPath, retarget, snapshot } = chatIdentityFixture(t);
+  const backend = projectBackend('2');
+  const projectId = 'projectChat:2:abcdef';
+  const objectiveId = 'obj-test';
+  const sessions = new Map();
+  for (const [id, start] of [[CHAT_ID, 'start-task-chat'], [projectId, 'start-project-chat']]) {
+    const ws = await connect(h, sessions, backend, id, projectPath);
+    const session = [...sessions.values()].find(s => s.tabId === id);
+    assert.deepEqual(JSON.parse(session._agentContextIdentity), [first, '2', 1], 'identity is set before the first turn');
+    await send(ws, { type: start });
+    session.alive = true;
+    session._attentionBroadcasted = true;
+  }
+  await connect(h, sessions, backend, objectiveId, projectPath);
+  const objective = [...sessions.values()].find(s => s.tabId === objectiveId);
+  Object.assign(objective, { type: 'objective', pending: false, alive: true, _attentionBroadcasted: true });
+  const terminal = { tabId: 'TPT99', projectPath, type: 'terminal', alive: true, _attentionBroadcasted: true };
+  sessions.set('terminal', terminal);
+  const originalSessions = new Set(sessions.values());
+  assert.deepEqual((await snapshot(h, sessions)).sessions, [CHAT_ID, projectId, objectiveId, terminal.tabId]);
+
+  retarget(second);
+  const hidden = await snapshot(h, sessions);
+  assert.deepEqual(Object.keys(hidden.sessionMeta), [terminal.tabId]);
+  assert.deepEqual(hidden.sessions, [terminal.tabId]);
+  assert.deepEqual(hidden.exited, []);
+  assert.deepEqual(hidden.attention, [terminal.tabId]);
+  const watcher = await connect(h, sessions, backend, '__attention__', projectPath);
+  watcher.emit('close');
+  assert.deepEqual(framesOf(watcher, 'attention-needed').map(f => f.taskId), [terminal.tabId]);
+  for (const id of [CHAT_ID, projectId, objectiveId]) {
+    const foreign = await connect(h, sessions, backend, id, projectPath, '&reconnect=1');
+    assert.equal(framesOf(foreign, 'chat-history-reset').length, 0);
+    const end = await connect(h, sessions, backend, id, projectPath, '&terminate=1');
+    assert.equal(framesOf(end, 'session-ended').length, 1);
+  }
+  assert.ok(h.named('claude.teardownObjectiveSession').every(call => !originalSessions.has(call[1])));
+
+  retarget(first);
+  assert.deepEqual((await snapshot(h, sessions)).sessions, [CHAT_ID, projectId, objectiveId, terminal.tabId]);
+  for (const id of [CHAT_ID, projectId, objectiveId]) {
+    const restored = await connect(h, sessions, backend, id, projectPath, '&reconnect=1');
+    assert.equal(framesOf(restored, 'chat-history-reset').length, 1);
+  }
+});
+
+test('a different account ends chats from its server but same-account sign-in preserves them', async t => {
+  const h = harness();
+  const { first, second, projectPath, retarget, signIn, snapshot } = chatIdentityFixture(t);
+  const { onAccountChange, clearAccountToken } = require('./account-store');
+  const backend = projectBackend('2');
+  const sessions = new Map();
+  const stop = onAccountChange(({ baseUrl }) => h.exports.endChatsForAccountChange(sessions, baseUrl));
+  t.after(stop);
+  const ws = await connect(h, sessions, backend, CHAT_ID, projectPath);
+  await send(ws, { type: 'start-task-chat' });
+  const old = [...sessions.values()][0];
+  old.alive = true;
+  old.claudeSessionId = 'previous-account-conversation';
+  old.onNativeSession();
+  await old._historyWrite;
+  const pending = await connect(h, sessions, backend, 'projectChat:2:abcdef', projectPath);
+  const terminal = { tabId: 'TPT99', projectPath, type: 'terminal', alive: true };
+  sessions.set('terminal', terminal);
+
+  clearAccountToken(first);
+  assert.deepEqual((await snapshot(h, sessions)).sessions, [terminal.tabId]);
+  signIn(first, 1);
+  assert.deepEqual((await snapshot(h, sessions)).sessions, [CHAT_ID, terminal.tabId]);
+  retarget(second);
+  const other = await connect(h, sessions, backend, CHAT_ID, projectPath);
+  await send(other, { type: 'start-task-chat' });
+  signIn(first, 3);
+  assert.deepEqual(h.named('claude.teardownObjectiveSession').map(call => call.slice(2)),
+    [[CHAT_ID, 'account-changed'], ['projectChat:2:abcdef', 'account-changed']]);
+  assert.equal(ws.closed, true);
+  assert.equal(pending.closed, true);
+  assert.equal(framesOf(ws, 'chat-ended').at(-1).reason, 'account-changed');
+  assert.equal(other.closed, false);
+  assert.equal(sessions.get('terminal'), terminal);
+  await old._historyWrite;
+  assert.deepEqual(await h.history.readChatHistory(projectPath), []);
+  signIn(first, 1);
+  retarget(first);
+  assert.deepEqual(Object.keys((await snapshot(h, sessions)).sessionMeta), [terminal.tabId]);
+  const history = await h.history.readChatHistory(projectPath);
+  assert.equal(history[0].nativeSessionId, 'previous-account-conversation');
+  assert.ok(history[0].endedAt);
+});
+
 test('project connect waits for explicit Start; chosen model applies once without a task lookup', async () => {
   const selected = [];
   const h = harness({ applyModelSelection: (session, model) => {
@@ -1278,6 +1400,11 @@ test('(TPT539) resume reads the earlier conversation back ahead of the hidden ma
   assert.equal(frame.messages.length, 5);
   assert.ok(frame.messages.every(m => m.restored));
   assert.equal(frame.transcriptUnavailable, false);
+  // (TPT9383) The reply split by a tool call keeps its boundary: the window shows its note and
+  // its answer as separate blocks again.
+  const noteLength = 'Let me check the task first.'.length;
+  assert.deepEqual(frame.messages.map(m => m.breaks || null), [null, null, [noteLength], null, null]);
+  assert.deepEqual(restored[2].breaks, [noteLength]);
   await send(ws, { type: 'task-chat-message', content: 'And now?' });
   assert.equal(session.messages.at(-1).content, 'And now?');
   // The resumed record keeps the earlier search data and folds the new turn in.
@@ -1293,6 +1420,7 @@ test('(TPT539) resume reads the earlier conversation back ahead of the hidden ma
   const back = await connect(h, sessions, projectBackend('2', 'Alpha'), 'projectChat:2:bbbbbb2', '/proj/a');
   const reset = framesOf(back, 'chat-history-reset')[0];
   assert.equal(reset.messages.filter(m => m.restored).length, 5);
+  assert.deepEqual(reset.messages.filter(m => m.restored)[2].breaks, [noteLength], 'and keeps it on reattach');
   assert.equal(reset.resumedHistory.transcriptUnavailable, false);
   await send(back, { type: 'restart' });
   assert.match(framesOf(back, 'error').at(-1).message, /cannot restart/);

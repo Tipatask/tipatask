@@ -11,7 +11,8 @@
 // modal must load without it.
 import { t } from './i18n.js';
 import { FILE_ACCEPT, uploadAttachmentFile } from './file-attach.js';
-import { escapeAttr } from './utils.js';
+import { escapeAttr, insertAtCursor } from './utils.js';
+import { api } from './api-client.js';
 
 // (TPT280) Shared 12px chevron caret for the composer's Embed and Import dropdown triggers —
 // one svg (not a text glyph) so both carets render at an identical size on every platform font.
@@ -49,12 +50,13 @@ export function embedMenuHtml({ label = t('nav.embed'), disabled = false, trigge
 // the document-level outside-click / key listeners. Every close path goes through it, and a host
 // re-render or teardown calls closeOpenEmbedMenu() so those listeners never outlive the DOM they
 // were attached for.
-let _openMenuCleanup = null;
+let openMenuState = null;
 
-export function closeOpenEmbedMenu() {
-  const cleanup = _openMenuCleanup;
-  _openMenuCleanup = null;
-  if (cleanup) cleanup();
+export function closeOpenEmbedMenu({ detachedOnly = false } = {}) {
+  if (!openMenuState || (detachedOnly && openMenuState.trigger.isConnected)) return;
+  const { cleanup } = openMenuState;
+  openMenuState = null;
+  cleanup();
 }
 
 // (TPT9346) Where a reference goes in. A host passes the textarea, or a function returning it when
@@ -161,7 +163,7 @@ export function attachEmbedMenu(wrap, target, {
     menu.setAttribute('role', 'menu');
     if (portal) menu.dataset.portaled = '1';
 
-    const addRow = (text, title, input) => {
+    const addRow = (text, title, action) => {
       const row = document.createElement('div');
       row.className = 'import-submenu-item';
       row.setAttribute('role', 'menuitem');
@@ -169,20 +171,67 @@ export function attachEmbedMenu(wrap, target, {
       row.textContent = text;
       if (title) row.title = title;
       if (keepFocus) row.addEventListener('mousedown', e => e.preventDefault());
-      row.addEventListener('click', () => { closeOpenEmbedMenu(); openPicker(input); });
+      row.addEventListener('click', event => { event.stopPropagation(); action(); });
       menu.appendChild(row);
       return row;
     };
-    addRow(label('image', 'embed.image'), '', imageInput);
-    addRow(label('file', 'embed.otherFile'), label('fileTitle', 'tooltip.embedFile'), fileInput);
-    const rows = [...menu.children];
+    const pickFile = input => () => { closeOpenEmbedMenu(); openPicker(input); };
+    addRow(label('image', 'embed.image'), '', pickFile(imageInput));
+    addRow(label('file', 'embed.otherFile'), label('fileTitle', 'tooltip.embedFile'), pickFile(fileInput));
+    addRow(t('embed.artifact'), '', () => showArtifacts());
+
+    // Fetch metadata only. Each choice inserts a project-relative immutable link, so
+    // canceling a description edit or chat draft never creates an input assignment.
+    async function showArtifacts(before = null) {
+      const moveFocus = menu.contains(document.activeElement);
+      const previousCount = before == null ? 0 : menu.children.length - 1;
+      if (before == null) menu.replaceChildren();
+      else menu.lastElementChild?.remove(); // the More or Retry row
+      menu.classList.add('artifact-menu');
+      const status = document.createElement('div');
+      status.className = 'import-submenu-item loading';
+      status.setAttribute('role', 'status');
+      status.textContent = t('common.loading');
+      status.tabIndex = -1;
+      menu.appendChild(status);
+      if (moveFocus) status.focus();
+      if (portal) place();
+      try {
+        const page = await api.artifacts.list(before);
+        if (!menu.isConnected) return;
+        status.remove();
+        for (const entry of page.revisions) {
+          const row = addRow(entry.filename, '', () => {
+            closeOpenEmbedMenu();
+            const textarea = resolveTextarea(target);
+            if (!textarea) return;
+            const name = entry.filename.replace(/[\\[\]]/g, '\\$&');
+            insertAtCursor(textarea, `[${name} · r${entry.revision}](${entry.url})`);
+          });
+          const metadata = document.createElement('small');
+          metadata.textContent = `#${entry.artifact_id} · r${entry.revision} ${entry.revision_name} · ${entry.mime_type} · ${new Intl.NumberFormat(document.documentElement.lang || undefined, { style: 'unit', unit: 'byte', unitDisplay: 'narrow' }).format(entry.size_bytes)}`;
+          row.appendChild(metadata);
+        }
+        if (page.next) addRow(t('embed.moreRevisions'), '', () => showArtifacts(page.next));
+        if (!menu.children.length) {
+          status.textContent = t('embed.noArtifacts');
+          menu.appendChild(status);
+        }
+      } catch {
+        if (!menu.isConnected) return;
+        status.remove();
+        addRow(t('embed.artifactRetry'), '', () => showArtifacts(before));
+      }
+      if (portal) place();
+      if (moveFocus) (menu.children[previousCount] || trigger).focus();
+    }
 
     (portal ? document.body : wrap).appendChild(menu);
     trigger.setAttribute('aria-expanded', 'true');
     trigger.setAttribute('aria-controls', menu.id);
     const place = () => placeMenu(menu, trigger);
     if (portal) place();
-    if (fromKeyboard) rows[0].focus();
+    if (fromKeyboard) menu.firstElementChild.focus();
 
     const onOutsideClick = (ev) => { if (!wrap.contains(ev.target) && !menu.contains(ev.target)) closeOpenEmbedMenu(); };
     // Window capture: ahead of every document-level handler — dialog-focus.js's Tab trap, a
@@ -196,14 +245,15 @@ export function attachEmbedMenu(wrap, target, {
         back.focus({ preventScroll: true });
         return;
       }
+      const rows = [...menu.querySelectorAll('[role="menuitem"]')];
       const at = rows.indexOf(document.activeElement);
-      if (at < 0) return;
-      if (ev.key === 'Tab') {
+      if (ev.key === 'Tab' && menu.contains(document.activeElement)) {
         // Back on the trigger, the key moves on from there.
         closeOpenEmbedMenu();
         trigger.focus({ preventScroll: true });
         return;
       }
+      if (at < 0) return;
       if (ev.key === 'Enter' || ev.key === ' ') {
         ev.preventDefault();
         rows[at].click();
@@ -224,7 +274,7 @@ export function attachEmbedMenu(wrap, target, {
       window.addEventListener('resize', place);
       document.addEventListener('scroll', place, true);
     }
-    _openMenuCleanup = () => {
+    const cleanup = () => {
       clearTimeout(timer);
       // A row holding the focus hands it back before it goes, never to <body>.
       if (menu.contains(document.activeElement)) trigger.focus({ preventScroll: true });
@@ -236,6 +286,7 @@ export function attachEmbedMenu(wrap, target, {
       window.removeEventListener('resize', place);
       document.removeEventListener('scroll', place, true);
     };
+    openMenuState = { trigger, cleanup };
   };
 
   if (keepFocus) trigger.addEventListener('mousedown', e => e.preventDefault());

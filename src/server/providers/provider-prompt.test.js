@@ -61,7 +61,7 @@ function project(t) {
   return root;
 }
 
-async function deliver(t, id, state, { missingFirst = false, simple = false, origin = true } = {}) {
+async function deliver(t, id, state, { missingFirst = false, simple = false, origin = true, projectPresets } = {}) {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const previous = { SIMPLE_MODE: config.SIMPLE_MODE, OBJECTIVE_PREWARM_ENABLED: config.OBJECTIVE_PREWARM_ENABLED };
   config.SIMPLE_MODE = simple;
@@ -70,11 +70,15 @@ async function deliver(t, id, state, { missingFirst = false, simple = false, ori
   const root = project(t);
   const { buildObjectivePrompt } = await import('../../client/utils.js');
   const planner = buildObjectivePrompt(objective, null, null, { originTaskKey: origin ? 'TPT999' : null, groupingEnabled: false });
+  const scoped = await require('../project-seeder').projectObjectivePrompt({
+    getProjectSettings: async () => ({ projectPresets, use_objective_grouping: false }),
+  }, root, { ...planner, originTaskKey: origin ? 'TPT999' : null });
   const session = createSession(null, null, 'fixture-tab', root);
   Object.assign(session, {
     type: 'objective', projectPath: root, providerType: id,
     selectedModel: id === 'pi' ? 'openrouter/fixture' : null,
-    systemPrompt: simple ? '' : [buildLanguageDirective(root, { objective: true }), planner.systemPrompt, getStaticBundle(root)].join('\n\n'),
+    presetPlanner: Boolean(scoped.presetRules),
+    systemPrompt: simple ? (scoped.presetRules ? scoped.systemPrompt : '') : [buildLanguageDirective(root, { objective: true }), scoped.systemPrompt, getStaticBundle(root)].join('\n\n'),
     firstPrompt: missingFirst ? null : simple ? objective : `${prefetch}\n\n${planner.userPrompt}`,
     messages: [{ role: 'user', content: objective }],
   });
@@ -164,6 +168,16 @@ for (const id of Object.keys(providers)) {
       }
       if (id === 'pi') assert.equal(args[args.indexOf('--tools') + 1], 'read');
       if (id === 'gemini') { assert.ok(!args.includes('--yolo')); assert.ok(args.includes('--approval-mode')); }
+    });
+  }
+
+  for (const simple of [false, true]) {
+    test(`${id} objective delivers selected Home and Finance planner rules (simple=${simple})`, async t => {
+      const { delivered } = await deliver(t, id, 'fresh', { simple, projectPresets: ['finance', 'home'] });
+      occurrences(delivered, 'Household checklist');
+      occurrences(delivered, 'Reconciliation, cash-flow model');
+      assert.match(delivered, /ORIGIN-LINKED PLANNING/);
+      assert.doesNotMatch(delivered, /the specific function or variable name to add\/change|Campaign brief/);
     });
   }
 

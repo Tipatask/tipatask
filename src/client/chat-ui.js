@@ -12,6 +12,7 @@ import {
 } from './utils.js';
 import { t, tc } from './i18n.js';
 import { renderComposerHeader } from './composer-header.js';
+import { objectiveStageInfo, renderObjectiveStageHtml, syncObjectiveStageSlot, renderObjectiveGuideHtml, applyObjectiveExample } from './objective-stage.js';
 export { renderComposerHeader };
 import { buildWsUrl } from './ws-client.js';
 import { cleanupChat, closeConsoleIfOpen } from './console-modal.js';
@@ -44,7 +45,12 @@ export { buildObjectiveSeed } from './objective-origin-task.js';
 // (C1296) formatCost() removed with the assistant-bubble .ai-stats/.turn-timing render —
 // no other call site existed.
 
+// (TPT9389) New Objective lives in the Create modal over the board. While that modal is up, a
+// chat change repaints the modal through template.html's repaintCreateModal() and leaves the
+// board behind it alone; with the modal closed (a turn running in the background) the page
+// reloads as before.
 function reload() {
+  if (typeof window !== 'undefined' && window.TipTask?.repaintCreateModal?.()) return;
   document.dispatchEvent(new Event('tiptask:reload'));
 }
 
@@ -52,6 +58,26 @@ function reload() {
 // mic lock, so the two can never disagree on whether a turn is in flight.
 function objectiveIsStreaming() {
   return !!(state.chatState && state.chatState.messages.some(m => m.streaming));
+}
+
+// (TPT9391) The stage of the chat on screen — planning, proposals ready, saving, saved — for the
+// stage line under the Create modal's heading (objective-stage.js). renderObjectiveContent()
+// renders it; syncObjectiveStage() patches the mounted line when a save path changes the stage
+// between paints (chat-task-preview.js: Save Tasks start and failure, every save-bar update).
+function currentObjectiveStage() {
+  const cs = state.chatState;
+  let pendingCount = 0;
+  if (cs) for (const msg of cs.messages) pendingCount += getUnsavedAcceptedCountForMsg(msg);
+  return objectiveStageInfo({ chatState: cs, streaming: objectiveIsStreaming(), pendingCount });
+}
+
+function renderObjectiveStage() {
+  return renderObjectiveStageHtml(currentObjectiveStage());
+}
+
+export function syncObjectiveStage() {
+  if (typeof document === 'undefined') return false;
+  return syncObjectiveStageSlot(document.getElementById('objective-stage-slot'), currentObjectiveStage());
 }
 
 // Keep the mounted Objective shell in sync with the two composer layouts. Rendering stamps the
@@ -469,6 +495,11 @@ function initObjectiveReadyBroadcastListener() {
 function notifyObjectiveCardsReady(message, count, tabId) {
   if (!message || message._objectiveCompleteNotified || count <= 0) return;
   message._objectiveCompleteNotified = true;
+  // (TPT9389) Proposals that land while the Create modal is closed, or on a session tab other
+  // than the one on screen, are news: the left menu's ready tick shows for them even when Create
+  // was opened earlier in the same turn (tickSeen alone only ever went one way).
+  const readyTab = state.tabsState.find(tab => tab.tabId === tabId);
+  if (readyTab?.chatState) readyTab.chatState.tickSeen = state.activeTab === 'objective' && state.activeTabId === tabId;
   const title = getObjectiveReadyTitle(tabId);
   const payload = {
     type: 'objective-ready',
@@ -555,6 +586,7 @@ function switchTab(tabId) {
   syncActiveChatState();
   state.activeTabId = tabId;
   state.chatState = next.chatState;
+  if (state.chatState) state.chatState.tickSeen = true; // (TPT9389) on screen now: seen
   renderActiveTab();
 }
 
@@ -877,7 +909,6 @@ function renderTabBarOnly() {
   notifyObjectiveStatusChanged();
   const bar = document.getElementById('chat-tab-bar');
   if (!bar) return;
-  bar.closest('.content-area')?.style.setProperty('--chat-tab-count', state.tabsState.length);
   // Background frames can land between pointerdown and click. Replacing the
   // buttons here loses that click (and restarts every spinner), so patch them by
   // tab ID while keeping the button, title, close control, and unchanged icon alive.
@@ -1468,7 +1499,7 @@ const _hadSessionRestore = restoreChatState();
   // already wires the pane on its own, so this is a genuine no-op on the normal path and only
   // does real work if some future render path skips that step.
   document.addEventListener('tiptask:rendered', () => {
-    const root = document.querySelector('.content-area .chat-container');
+    const root = document.querySelector('.objective-modal .chat-container');
     if (root) window.TipTask?.wireObjectivePane?.(root);
   }, { once: true });
 
@@ -2025,6 +2056,11 @@ function objectiveProposalNotice(msg) {
 }
 
 // ── Render objective tab content (returns HTML string) ──
+// (TPT9389) The composer, the session tabs and the transcript this returns are mounted in the
+// Create modal — the `.objective-modal` dialog over the project board (objective-modal.js) — by
+// template.html's loadAndRender() while state.activeTab is 'objective'. Nothing here renders into
+// the page: closing the modal removes this markup, and the chat itself (state.tabsState, its
+// socket, the composer draft) lives on until the modal is opened again.
 export function renderObjectiveContent(options = {}) {
   if (state.chatState) syncChatHistoryMeta(state.chatState);
   // (TPT525) An explicit viewState (refreshObjectiveContent()/renderActiveTab()) is restored by
@@ -2172,6 +2208,12 @@ export function renderObjectiveContent(options = {}) {
     ? `<div class="chat-tab-bar" id="chat-tab-bar">${_buildTabBarInnerHtml()}</div>`
     : '';
 
+  // (TPT9391) The empty-state guide: what happens after Send and example objectives. Only a plain
+  // new objective gets it — a split, a web-origin plan and a Discuss chat each open on a task that
+  // already says what the chat is about.
+  const guideHtml = !state.chatState && !discussKey && !subtaskCtx && !originTaskKey
+    ? renderObjectiveGuideHtml() : '';
+
   return `
     <div class="chat-container ${layoutClass}">
       ${renderComposerHeader(`${consoleToggle}<button class="btn-archive" id="btn-archive">
@@ -2182,6 +2224,8 @@ export function renderObjectiveContent(options = {}) {
       ${subtaskSummaryHtml}
       ${originBannerHtml}
       ${discussPreviewHtml}
+      <div class="objective-stage-slot" id="objective-stage-slot">${renderObjectiveStage()}</div>
+      ${guideHtml}
       <div class="chat-body">
       <div class="chat-messages" id="chat-messages" data-active-tab="${escapeAttr(state.chatState && state.chatState.taskId ? String(state.chatState.taskId) : '')}" ${transcriptStampAttrs(state.chatState)}>
         ${historyBannerHtml}
@@ -2231,10 +2275,10 @@ export function renderObjectiveContent(options = {}) {
 // whose app.innerHTML replacement is correct for real navigation but destructive during compose.
 export function refreshObjectiveContent({ viewState = captureObjectiveViewState() } = {}) {
   if (state.activeTab !== 'objective') return false;
-  const contentArea = document.querySelector('.content-area');
-  const current = contentArea?.querySelector('.chat-container');
+  // (TPT9389) The Objective view is mounted in the Create modal (objective-modal.js), over the
+  // board; while that modal is closed there is nothing to repaint.
+  const current = document.querySelector('.objective-modal .chat-container');
   if (!current) return false;
-  contentArea.style.setProperty('--chat-tab-count', state.tabsState.length);
 
   const nextTemplate = document.createElement('template');
   nextTemplate.innerHTML = renderObjectiveContent({ viewState }).trim();
@@ -2249,16 +2293,14 @@ export function refreshObjectiveContent({ viewState = captureObjectiveViewState(
   // removing its window 'scroll' listener.
   window.TipTask?.taskCard?.collapseCard?.();
 
-  // A composer popover owns document-level listeners. Tear those down before removing the
-  // old subtree, then attach the normal handlers to the replacement subtree below.
-  ensureGlobalChatBindings();
   current.replaceWith(next);
+  ensureGlobalChatBindings();
   try {
     attachChatHandlers();
     window.TipTask?.chatTaskPreview?.attachCardHandlers?.();
     // (C1427) replaceWith() leaves `next` listener-less for everything the full render wires in
-    // template.html's tail — composer-header tab switcher, Import/History/console-toggle, and
-    // per-card hover/click/dblclick. See tt-objective-chat-persistence.md § Lifecycle.
+    // template.html's tail — Import/History/console-toggle, and per-card
+    // hover/click/dblclick. See tt-objective-chat-persistence.md § Lifecycle.
     window.TipTask?.wireObjectivePane?.(next);
   } catch (err) {
     // (C1427) template.html's loadAndRender().catch(() => {}) swallows this whole event handler
@@ -2276,7 +2318,9 @@ export function refreshObjectiveContent({ viewState = captureObjectiveViewState(
 export function ensureGlobalChatBindings() {
   registerVoiceShortcut();
   ensureFileLinkHandler();
-  closeOpenEmbedMenu(); // (C1248) a render must not leave an open menu's document listeners
+  // A background board refresh can run while the Task Edit picker is open. Only the
+  // host that a render actually replaced needs its portaled menu and listeners removed.
+  closeOpenEmbedMenu({ detachedOnly: true });
   if (!_objImgPreviewListenerRegistered) {
     _objImgPreviewListenerRegistered = true;
     document.addEventListener('tiptask:obj-image-preview', e => {
@@ -2397,6 +2441,22 @@ export function attachChatHandlers() {
       };
       chatInput.addEventListener('input', updateWordCount);
       updateWordCount();
+    }
+    // (TPT9391) Empty-state guide: an example fills the composer. The `input` event runs the
+    // composer's own listeners (draft save, word count, auto-grow), as typing the text would.
+    const guide = document.getElementById('objective-guide');
+    if (guide) {
+      guide.addEventListener('click', (e) => {
+        const btn = e.target.closest('.objective-example');
+        if (!btn || chatInput.disabled) return;
+        const next = applyObjectiveExample(chatInput.value, Number(btn.dataset.example));
+        if (next !== chatInput.value) {
+          chatInput.value = next;
+          chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        chatInput.focus();
+        chatInput.setSelectionRange(next.length, next.length);
+      });
     }
   }
   if (chatSendBtn && chatInput) {
@@ -2865,6 +2925,7 @@ export function connectObjectiveWS(taskId, prompt, opts) {
       mode: 'objective',
       ...rehashPayload(cs),
       systemPrompt: cs && cs.systemPrompt,
+      ...(cs?.originTaskKey ? { originTaskKey: cs.originTaskKey } : {}),
       clientTiming: baseTiming,
       // C1029 — this tab's chatState may not be state.chatState by the time a deferred
       // start fires (user switched tabs mid-flight), so resolve against the tab-scoped
@@ -2936,6 +2997,14 @@ export function connectObjectiveWS(taskId, prompt, opts) {
     // All subsequent handlers need the tab's chatState.
     const cs = tab ? tab.chatState : null;
     if (!cs) return;
+
+    if (msg.type === 'chat-ended' && msg.reason === 'account-changed' && cs.ws === ws) {
+      cleanupChat(cs, { preserveServerDraft: true });
+      syncDiscussLocks();
+      if (isActiveTab && state.activeTab === 'objective') renderActiveTab();
+      else renderTabBarOnly();
+      return;
+    }
 
     if (msg.type === 'objective-progress') {
       // C1031 — first frame of every turn from all four providers, so this is the one reliable

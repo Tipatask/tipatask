@@ -33,7 +33,7 @@ function fixture(targetStatus, { type = 'modified', confirmed = false, origin = 
     ...statuses, Map, Set, Date, console, document: dom.window.document,
     state: { chatState: { messages: [msg], ...(origin ? { originTaskKey: target.id } : {}) } },
     translate: t, tc: t, escapeAttr: esc, normalizeSingleItemList, reconcileModifiedCards,
-    previewOriginSingleTarget, outOfSubtreeModifiedIndexes, saveChatState() {},
+    previewOriginSingleTarget, outOfSubtreeModifiedIndexes, saveChatState() {}, syncObjectiveStage() {}, noteObjectiveSaved() {},
     groupTitle: n => `Batch ${n}`, groupNoun: () => 'Batch',
     renderAgentBadge: empty, renderEffortBadge: empty, renderMemberBadge: empty,
     renderMarkdown: esc, truncateMarkdownAtParagraph: v => v, MAX_DESC_LEN: 500,

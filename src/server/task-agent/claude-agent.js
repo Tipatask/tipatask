@@ -125,6 +125,10 @@ class ClaudeAgent extends BaseTaskAgent {
     const langDirective = this.getLanguageDirective(config, opts);
     const parts = [];
     if (langDirective) parts.push(langDirective);
+    if (opts.designMode) {
+      const rules = this.buildPresetDirective(this.resolveHarness(opts));
+      if (rules) parts.push(rules);
+    }
     parts.push(staticBundle);
     if (grepBundle) parts.push(grepBundle);
     const totalChars = parts.reduce((s, p) => s + p.length, 0);
@@ -152,6 +156,7 @@ class ClaudeAgent extends BaseTaskAgent {
   }
 
   buildPrompt(prompt, opts = {}) {
+    const harness = this.resolveHarness(opts);
     // C1575 — parent-task context (opts.parentTaskBlock), prepended ahead of this task's own
     // comments. Uncapped for Claude — no prompt-size test exists here, unlike pi-agent.js.
     const promptWithComments = BaseTaskAgent.prependParentTask(
@@ -168,7 +173,7 @@ class ClaudeAgent extends BaseTaskAgent {
     }
 
     // SIMPLE_MODE: skip all KB/cache preamble, return bare task prompt
-    if (config.SIMPLE_MODE && !(opts.parentPreparation ?? opts.task?.isObjective) && !opts.objectiveChain && !opts.permissionPolicy?.enforced) return promptWithComments;
+    if (config.SIMPLE_MODE && !(opts.parentPreparation ?? opts.task?.isObjective) && !opts.objectiveChain && !opts.permissionPolicy?.enforced) return [this.buildPresetDirective(harness), promptWithComments].filter(Boolean).join('\n\n');
 
     const ttTags = (opts.taskTags || []).filter(t => t.startsWith('tt-'));
     const cachedTags = (opts.cachedTags || []).filter(t => t.startsWith('tt-') && !ttTags.includes(t));
@@ -194,14 +199,17 @@ class ClaudeAgent extends BaseTaskAgent {
     // complete_task guard (commit/merge verification), never create_task_comment + remote update_task.
     // The legacy note stays for callers without a vcsContext (tests, out-of-tree callers).
     const resolutionNote = opts.vcsContext
-      ? `\n\nMANDATORY to finish this task: pass ONE self-authored resolution to \`mcp__tipatask-local__complete_task(task_key, resolution)\`. \`resolution\` must be a real report, written in plain English prose — do NOT use caveman style for it, even though the rest of this session runs in caveman mode. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). That tool verifies the task first, then posts this report as the task's resolution comment and sets \`${completeStatus}\`. Never also call \`create_task_comment\` or \`update_task\` to complete the task. When it refuses, fix the blockers it lists (e.g. TASK_COMMIT_MISSING: commit first) and call it again. If a blocker cannot be cleared within this task, do not complete it: post the same report with \`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")\` so it is not lost, then set the task \`on_fire\` (when available) and state the blocker. The auto-posted terminal-tail resolution comment (a raw log dump posted on session exit) does not replace this report. ${BaseTaskAgent.buildFinishChecklist(opts, { completeTool: '`complete_task`' })}`
-      :`\n\nMANDATORY before marking this task \`${completeStatus}\`: post ONE self-authored resolution comment via \`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")\`. \`content\` must be a real report, written in plain English prose — do NOT use caveman style for this comment, even though the rest of this session runs in caveman mode. Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). This is separate from and required IN ADDITION TO the auto-posted terminal-tail resolution comment (a raw log dump with no explanation, posted on session exit) — that one does not satisfy this step. Post it in the SAME tool-call batch as the final \`update_task(status="${completeStatus}")\`.`;
+      ? `\n\nMANDATORY to finish this task: pass ONE self-authored resolution to \`mcp__tipatask-local__complete_task(task_key, resolution)\`. \`resolution\` must be a real report, written in plain English prose${harness.softwareOnly ? ' — do NOT use caveman style for it, even though the rest of this session runs in caveman mode.' : '.'} Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). That tool verifies the task first, then posts this report as the task's resolution comment and sets \`${completeStatus}\`. Never also call \`create_task_comment\` or \`update_task\` to complete the task. When it refuses, fix the blockers it lists (e.g. TASK_COMMIT_MISSING: commit first) and call it again. If a blocker cannot be cleared within this task, do not complete it: post the same report with \`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")\` so it is not lost, then set the task \`on_fire\` (when available) and state the blocker. The auto-posted terminal-tail resolution comment (a raw log dump posted on session exit) does not replace this report. ${BaseTaskAgent.buildFinishChecklist(opts, { completeTool: '`complete_task`' })}`
+      :`\n\nMANDATORY before marking this task \`${completeStatus}\`: post ONE self-authored resolution comment via \`mcp__tipatask__create_task_comment(task_key, content, type: "resolution")\`. \`content\` must be a real report, written in plain English prose${harness.softwareOnly ? ' — do NOT use caveman style for this comment, even though the rest of this session runs in caveman mode.' : '.'} Cover: what changed and why, key files touched, how to verify, and follow-ups/caveats (write "none" if there are none). This is separate from and required IN ADDITION TO the auto-posted terminal-tail resolution comment (a raw log dump with no explanation, posted on session exit) — that one does not satisfy this step. Post it in the SAME tool-call batch as the final \`update_task(status="${completeStatus}")\`.`;
     // Shared directives (VCS, tag-description backfill, process safety, resource limits, KB hygiene, task status) — see
     // base-agent.js#buildSharedPreamble. Each is its own blank-line-separated block between
     // the resolution note and the task tail; absent optional ones leave no gap. The clarify
     // slot carries mode-specific communication; Claude retains native questions.
-    const { directives, clarify } = this.buildSharedPreamble(opts);
+    const { directives, clarify } = this.buildSharedPreamble({ ...opts, harness });
     const directiveBlocks = [clarify, ...directives].filter(Boolean).map(d => `\n\n${d}`).join('');
+    if (!harness.softwareOnly) {
+      return [this.permissionPrompt(opts), tagNote, resolutionNote.trim(), clarify, ...directives, promptWithComments].filter(Boolean).join('\n\n');
+    }
     return `${this.permissionPrompt(opts) ? this.permissionPrompt(opts) + '\n\n' : ''}/tipatask-expert\n${cavemanLine}\n\n⚠️ Architecture KB: NEVER write to \`ai/ARCHITECTURE.md\` (deprecated legacy path, will not be loaded by any agent). Always use \`ai/architecture/GENERAL.md\` for stack/env/commands and \`ai/architecture/tt-*.md\` for module docs.\n\nBefore starting:\n1. General architecture and tag taxonomy are pre-loaded in the system prompt (STATIC CONTEXT section) — no need to Read \`ai/architecture/GENERAL.md\` or call \`list_system_tags\`.\n2. ${tagNote}\n\nDuring exploration: when a STANDING fact is missing from KB (undocumented endpoint, file not in KB Files table, schema change, behavioral nuance) — update \`ai/architecture/tt-*.md\` immediately with that fact alone. What you find out about THIS task does not go there — see KB hygiene below.\n\n${grepNote}\n\nAfter any code change, update ai/architecture/GENERAL.md and/or ai/architecture/{tag}.md for each tt-* tag on this task to reflect added/removed/changed endpoints, DB schema, env vars, file structure, or module behavior. Do this before marking task complete — never \`ai/ARCHITECTURE.md\`.\n\nBefore marking complete: if new module touched has no tt-* tag — call list_system_tags to verify, create tag via MCP or POST /api/tags, create ai/architecture/tt-*.md stub, add tag to task.${resolutionNote}${directiveBlocks}\n\n${promptWithComments}`;
   }
 
@@ -318,6 +326,9 @@ class ClaudeAgent extends BaseTaskAgent {
     if (!config.SIMPLE_MODE) {
       args.push('--exclude-dynamic-system-prompt-sections');
       args.push('--append-system-prompt', this._buildAppendSystemPrompt(opts));
+    } else if (opts.designMode) {
+      const rules = this.buildPresetDirective(this.resolveHarness(opts));
+      if (rules) args.push('--append-system-prompt', rules);
     }
     // Keep the plan sentinel in the final kickoff instructions, including SIMPLE_MODE.
     // Design Mode must retain its single-line /design submission.

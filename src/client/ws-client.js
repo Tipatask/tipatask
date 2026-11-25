@@ -322,6 +322,7 @@ export const WS_RECV_TYPES = {
   TASK_CHAT_DIALOG: 'task-chat-dialog',
   TASK_CHAT_TOOL: 'task-chat-tool',
   TASK_CHAT_TASK: 'task-chat-task',
+  TASK_CHAT_SEGMENT: 'task-chat-segment', // (TPT9383) one run of the reply's text ended at `at`; the next begins
   TASK_CHAT_TASK_EDITED: 'task-chat-task-edited',
   PROJECT_CHAT_TITLED: 'project-chat-titled', // (TPT469) first user message named the chat
   CHAT_ENDED: 'chat-ended',

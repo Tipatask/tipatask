@@ -104,7 +104,10 @@ test('terminal header permission-mode selector: pending, confirm, failure, reatt
       assert.ok(row, `${value} is offered`);
       row.click();
     };
-    const toasts = () => [...document.querySelectorAll('.tt-saving-indicator--toast')].map(el => [el.getAttribute('role'), el.textContent]);
+    const toasts = () => [...document.querySelectorAll('.tt-saving-indicator--toast')].map(el => {
+      const message = el.querySelector('.tt-saving-label');
+      return [el.getAttribute('role') || message.getAttribute('role'), message.textContent];
+    });
 
     // A Plan run whose agent switches live: the selector sits right after the agent caption.
     modal.openTerminal('T9139', 'Task T9139', '', 'in_progress');
@@ -133,7 +136,7 @@ test('terminal header permission-mode selector: pending, confirm, failure, reatt
     assert.equal(shown(), 'Bypass');
     assert.equal(state.activeTerminal.permissionMode, 'bypass');
     assert.deepEqual(state.sessionMeta.get('T9139').permissionMode, modeState('bypass'));
-    assert.deepEqual(toasts(), [['status', '✓Bypass now applies to this run. An action already running is not cancelled.']]);
+    assert.deepEqual(toasts(), [['status', 'Bypass now applies to this run. An action already running is not cancelled.']]);
     trigger().click();
     assert.deepEqual([...document.querySelectorAll('.session-mode-menu [role="option"]')].map(r => r.dataset.value), ['bypass', 'auto'],
       'Plan is never offered once left');
@@ -152,7 +155,7 @@ test('terminal header permission-mode selector: pending, confirm, failure, reatt
     sockets[0].frame(changed('T9139', failure));
     sockets[0].frame(terminalState(failure));
     assert.equal(shown(), 'Bypass');
-    assert.deepEqual(toasts().at(-1), ['alert', "✕Couldn't switch to Auto mode: the agent couldn't apply it. This run stays in Bypass."]);
+    assert.deepEqual(toasts().at(-1), ['alert', "Couldn't switch to Auto mode: the agent couldn't apply it. This run stays in Bypass."]);
     assert.ok(control().classList.contains('session-mode-error'));
     assert.equal(toasts().length, 2);
 
@@ -171,7 +174,7 @@ test('terminal header permission-mode selector: pending, confirm, failure, reatt
     sockets[1].frame(changed('T9139', modeState('auto')));
     sockets[1].frame(terminalState(modeState('auto'), { permissionSource: 'session' }));
     assert.equal(shown(), 'Auto mode');
-    assert.deepEqual(toasts().at(-1), ['status', '✓Auto mode now applies to this run. An action already running is not cancelled.']);
+    assert.deepEqual(toasts().at(-1), ['status', 'Auto mode now applies to this run. An action already running is not cancelled.']);
 
     // A second reattach after a settled state shows the confirmed mode and stays quiet.
     serverSessions.sessionMeta.T9139.permissionMode = modeState('auto');

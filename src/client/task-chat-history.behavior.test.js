@@ -15,9 +15,9 @@ test('chat history updates and capacity recovery preserve history, reconcile reo
   assert.match(result.stdout, /TPT9145_CHAT_RECOVERY_PASS/);
 });
 
-test('the browser __board__ socket hands chat-history-updated to task-chat.js', () => {
+test('the browser __board__ socket hands chat inventory refresh events to task-chat.js', () => {
   const html = readFileSync(new URL('./template.html', import.meta.url), 'utf8');
-  assert.match(html, /if \(msg\.type === 'chat-history-updated'\) \{\s*window\.TipTask\?\.taskChat\?\.historyUpdated\?\.\(msg\);\s*return;\s*\}/);
+  assert.match(html, /if \(msg\.type === 'chat-history-updated' \|\| msg\.type === 'chat-sessions-changed'\) \{\s*window\.TipTask\?\.taskChat\?\.historyUpdated\?\.\(msg\);\s*return;\s*\}/);
   const index = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
   assert.match(index, /import \* as taskChat from '\.\/task-chat\.js';/, 'window.TipTask.taskChat is the module itself');
 });

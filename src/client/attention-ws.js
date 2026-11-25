@@ -301,9 +301,8 @@ export function connectAttentionWs() {
     if (window.electronAPI?.api && typeof msg.type === 'string' && (msg.type.startsWith('merge:') || msg.type === 'worktree-dirty-on-complete')) {
       window.TipTask?.mergeBranchesModal?.handleMergeWsMessage?.(msg);
     }
-    // (TPT9116) This project's chat history index changed: the left menu's chat rows (and an open
-    // start gate's history picker) refresh — task-chat.js historyUpdated(). Same Electron gate.
-    if (window.electronAPI?.api && msg.type === 'chat-history-updated') {
+    // A history write or account switch refreshes the project's chat rows. Same Electron gate.
+    if (window.electronAPI?.api && (msg.type === 'chat-history-updated' || msg.type === 'chat-sessions-changed')) {
       window.TipTask?.taskChat?.historyUpdated?.(msg);
     }
   };

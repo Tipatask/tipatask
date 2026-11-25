@@ -120,16 +120,19 @@ test("chat-ui.js: objective view never references renderParentTaskPane", () => {
   );
 });
 
-test('styles.css: .objective-chat--empty/--active height rules subtract --chat-chrome-above', () => {
+// (TPT9389) Create renders in a modal over the board, so no board chrome (the breadcrumb bar a
+// Create Subtasks click leaves behind) can sit above .chat-container any more: the chat takes
+// its height from the modal's body, and the measured --chat-chrome-above subtraction that kept
+// #chat-input above the fold on the Create page is gone with the page.
+test('styles.css: .objective-chat--empty/--active fill the Create modal, with no viewport or chrome math', () => {
   const css = readSource('styles.css');
-  const matches = css.match(/height:\s*calc\([^)]*--chat-chrome-above[^)]*\)/g) || [];
-  assert.ok(
-    matches.length >= 4,
-    '.objective-chat--empty/--active height rules (desktop 100vh/100dvh + mobile @media ' +
-      'variants) must all subtract var(--chat-chrome-above, 0px) — without it, any board ' +
-      'chrome (breadcrumb bar) left rendered above .chat-container on a composer tab pushes ' +
-      '#chat-input below the fold'
+  assert.match(
+    css,
+    /\.objective-chat--empty,\s*\.objective-chat--active \{\s*height: 100%;\s*min-height: 0;\s*\}/,
+    '.objective-chat--empty/--active must be exactly the height of .objective-modal-body'
   );
+  assert.doesNotMatch(css, /--chat-chrome-above/, 'styles.css must not read --chat-chrome-above');
+  assert.doesNotMatch(readSource('template.html'), /--chat-chrome-above/, 'template.html must not measure it');
 });
 
 test('task-board.js: .parent-task-pane markup carries no data-id and no card class', () => {

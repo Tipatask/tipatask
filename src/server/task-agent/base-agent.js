@@ -9,6 +9,7 @@ const { fetchStatusRoles, fetchStatusNames, LEGACY_STATUSES, LEGACY_ROLE_NAMES }
 const { fetchVcsSettings, buildVcsDirective } = require('../vcs-settings');
 const { fetchTagDescriptions, buildTagDescriptionDirective } = require('../tag-descriptions');
 const { resolveModels } = require('./model-registry');
+const { projectHarness, taskHarness, presetDirective } = require('../project-seeder');
 const { winExecSpec } = require('../spawn-utils');
 
 function combineCommandOutput(stdout, stderr) {
@@ -164,8 +165,16 @@ class BaseTaskAgent {
       taskId,
       prompt,
       taskCommentsBlock: originalComments,
+      description: opts.task?.description,
+      backend: opts.backend,
       projectRoot: opts.projectPath || config.PROJECT_ROOT,
     });
+    if (opts.task && !opts.parentPreparation) {
+      const command = process.platform === 'win32'
+        ? '$env:ELECTRON_RUN_AS_NODE="1"; & $env:TIPATASK_TOOL_EXEC $env:TIPATASK_TOOL_SCRIPT'
+        : 'ELECTRON_RUN_AS_NODE=1 "$TIPATASK_TOOL_EXEC" "$TIPATASK_TOOL_SCRIPT"';
+      localized.prompt += `\nWhen the task calls for a reusable project output, publish it after any required approval with ${command} publish-artifact FILE "revision name" KIND MIME [ARTIFACT_ID BASE_REVISION]. KIND is document, binary, data or source. Use a workspace file of up to 1 MiB. To append, supply the artifact ID and revision you edited. On conflict, reconcile with the newer revision. The result identifies the pinned output.`;
+    }
     return {
       prompt: localized.prompt,
       opts: localized.taskCommentsBlock !== originalComments
@@ -412,6 +421,15 @@ class BaseTaskAgent {
     ].join('\n');
   }
 
+  resolveHarness(opts) {
+    const harness = opts.harness || projectHarness(opts.projectPath || require('../config').PROJECT_ROOT);
+    return taskHarness(harness, opts.task?.description);
+  }
+
+  buildPresetDirective(harness) {
+    return presetDirective(harness, 'executor');
+  }
+
   // Follow-ups are an exception for evidenced shipped defects/risks or required manual steps.
   // Prefer outstanding-task comments; cap new tasks at two per run. Workflow concepts, not status names,
   // as above. opts.guardedCompletion names complete_task as the deadline (see buildKbHygieneDirective).
@@ -586,11 +604,14 @@ class BaseTaskAgent {
     const completion = opts.vcsContext ? { ...variant, guardedCompletion: true } : variant;
     const vcs = this.resolveVcsDirective(opts);
     const tagDesc = this.buildTagDescriptionDirective(opts);
-    const processSafety = this.buildProcessSafetyDirective(variant);
+    const harness = this.resolveHarness(opts);
+    const preset = this.buildPresetDirective(harness);
+    const processSafety = harness.software ? this.buildProcessSafetyDirective(variant) : '';
     const resourceLimits = this.buildResourceLimitsDirective(opts.agentLimits, variant);
     const computerUse = this.buildComputerUseDirective({ ...opts, ...variant });
-    const kbHygiene = this.buildKbHygieneDirective(completion);
-    const kbDiscovery = this.buildKbDiscoveryDirective({ ...opts, ...completion });
+    const kbHygiene = harness.softwareOnly ? this.buildKbHygieneDirective(completion)
+      : 'Keep reusable project facts in the knowledge base and task-specific evidence in the resolution.';
+    const kbDiscovery = harness.softwareOnly ? this.buildKbDiscoveryDirective({ ...opts, ...completion }) : '';
     const taskStatus = this.buildTaskStatusDirective(variant);
     const followUps = this.buildFollowUpDirective(completion);
     const cowboy = this.buildCowboyDirective({ ...opts, ...variant });
@@ -610,7 +631,8 @@ class BaseTaskAgent {
       cowboy,
       parentPreparation,
       objectiveContinuation,
-      directives: [vcs, tagDesc, processSafety, resourceLimits, computerUse, kbHygiene, kbDiscovery, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation].filter(Boolean),
+      preset,
+      directives: [vcs, tagDesc, preset, processSafety, resourceLimits, computerUse, kbHygiene, kbDiscovery, taskStatus, followUps, cowboy, parentPreparation, objectiveContinuation].filter(Boolean),
       clarify,
     };
   }

@@ -188,6 +188,7 @@ function createHandler(metaWrites) {
       ...apiStubs(),
       './src/server/project-config': { writeProjectConfig: () => {}, sanitizePiModels: () => [] },
       './src/server/project-seeder': {
+        ...require('./project-seeder'),
         copyTemplates: () => {},
         callSeedPresetTasks: async () => ({ seeded: 0, failed: null }),
         presetConfigFields: () => ({}),
@@ -230,20 +231,22 @@ test('project:create-from-wizard writes no marker for an existing API project', 
   assert.equal(metaWrites[0][1].apiProjectId, 12);
 });
 
-test('project:open-existing (the link path for an existing project) never writes the marker', async (t) => {
+test('linking another project clears the previous binding’s choices and leaves the first-open marker unset', async (t) => {
   const dir = tempProject(t); // a folder with no project.json yet: the handler writes a fresh one
   const metaWrites = [];
+  let config;
   const handler = loadHandler('project:open-existing', {
     modules: {
       ...apiStubs(),
       'node:os': os,
       './src/server/project-config': {
-        readProjectConfig: () => null,
-        writeProjectConfig: () => {},
+        readProjectConfig: () => ({ API_PROJECT_ID: '27', PI_MODEL: 'old-model', OPENROUTER_API_KEY: 'old-key',
+          LAST_AGENT: 'pi', KB_MODE: 'compose', PI_MODELS: [{ model: 'old-model', apiKey: 'old-key' }] }),
+        writeProjectConfig: (_, saved) => { config = saved; },
         sanitizePiModels: () => [],
-        readPiEntries: () => [],
+        readPiEntries: cfg => cfg.PI_MODELS || [],
       },
-      './src/server/project-seeder': { copyTemplates: () => {} },
+      './src/server/project-seeder': { ...require('./project-seeder'), copyTemplates: () => {} },
     },
     globals: { ...fileStubs, path, fs, writeProjectMeta: (root, meta) => metaWrites.push([root, meta]) },
   });
@@ -262,4 +265,8 @@ test('project:open-existing (the link path for an existing project) never writes
   assert.equal(metaWrites.length, 1, 'project.json was written');
   assert.equal(Object.hasOwn(metaWrites[0][1], 'firstOpenPrompt'), false);
   assert.equal(hasFirstOpenPrompt(dir), false);
+  assert.equal(config.API_PROJECT_ID, '12');
+  for (const key of ['LAST_AGENT', 'KB_MODE', 'PI_MODEL', 'PI_MODELS', 'OPENROUTER_API_KEY']) {
+    assert.equal(Object.hasOwn(config, key), false, key);
+  }
 });

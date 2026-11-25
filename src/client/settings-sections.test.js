@@ -16,7 +16,7 @@ const source = readFileSync(new URL('./task-board.js', import.meta.url), 'utf8')
 const css = readFileSync(new URL('./styles.css', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
 
 // Containers whose .settings-row children are built at open time.
-const ROW_CONTAINERS = ['settings-agents-summary', 'settings-voice-local-list'];
+const ROW_CONTAINERS = ['settings-profile-body', 'settings-agents-summary', 'settings-voice-local-list'];
 
 // Every id the Settings markup carried before the section/row rewrite; handlers, populators and
 // other tests query them, so none may disappear.

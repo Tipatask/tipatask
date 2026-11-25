@@ -17,7 +17,7 @@ const { augmentPathEnv, isAsarPath, cliSpawnSpec } = require('./spawn-utils');
 const { createBackend, createPerProjectBackend, coerceBackendType } = require('./task-backend');
 const { attachBackendBroadcasts, detachBackendBroadcasts } = require('./backend-broadcasts');
 const { createBackendEvictor, BACKEND_EVICT_SWEEP_MS } = require('./backend-eviction');
-const { createHttpHandler, handleConnection, handleRemoteSessionCommand, drainSessionQueue, sessionQueue, setDeviceIdentity } = require('./ws-handlers');
+const { createHttpHandler, handleConnection, handleRemoteSessionCommand, endChatsForAccountChange, drainSessionQueue, sessionQueue, setDeviceIdentity } = require('./ws-handlers');
 const websocket = require('./websocket');
 const { preloadAgentDetection, listAllAgentModels } = require('./task-agent');
 const { fetchStatusRoles, isClosedName } = require('./status-roles');
@@ -102,6 +102,7 @@ function askOnce(rl, question) {
 }
 
 async function ensureCavemanPlugin() {
+  if (config.BOUND_PROJECT_ROOT && !require('./project-seeder').projectHarness(config.BOUND_PROJECT_ROOT).software) return;
   try {
     const spawnEnv = augmentPathEnv({});
     // A Windows claude.cmd runs as the program its npm shim launches (else via cmd.exe), with no
@@ -407,6 +408,8 @@ const deviceRelay = require('./terminal-session').connectDeviceRelay({
   handleCommand: (command, context) => handleRemoteSessionCommand(command, context, { sessions, registryOps: _registryOps }),
 });
 process.once('exit', () => deviceRelay.close());
+const stopChatAccountWatch = require('./account-store').onAccountChange(({ baseUrl }) => endChatsForAccountChange(sessions, baseUrl));
+process.once('exit', stopChatAccountWatch);
 const stopConsentWatch = remoteControlConsent.watch(() => deviceRelay.sync());
 process.once('exit', stopConsentWatch);
 // (TPT9235) This device's agent model lists — the live model registry's Claude/Codex lists and
@@ -525,7 +528,7 @@ installCrashGuard({
 // SIGINT, or Electron main going away never reaches them. Reap them, then exit. Installed at module
 // load, not in the boot chain below, so a quit during boot is covered too.
 installShutdownReaper({ sessions, beforeShutdown: () => { deviceRelay.close(); stopMemoryAdmission(); } });
-server.once('close', () => { deviceRelay.close(); stopMemoryAdmission(); });
+server.once('close', () => { stopChatAccountWatch(); deviceRelay.close(); stopMemoryAdmission(); });
 
 const wss = createWebSocketGate(server, (ws, req) => {
   Promise.resolve(handleConnection(ws, req, sessions, getActiveBackend, broadcastAttentionFor, broadcastAttentionCleared, _registryOps.getBackendForPath)).catch(err => {

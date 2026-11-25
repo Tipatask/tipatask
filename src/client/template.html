@@ -64,6 +64,14 @@
          (agents, permission mode, voice models, Version Control) use the same classes — see
          styles.css § Settings sections and rows. -->
     <div class="settings-body modal-tab-panel" data-tab="general">
+      <section class="settings-section" id="settings-profile-section" hidden>
+        <h3 class="settings-section-title" id="settings-profile-title"></h3>
+        <div id="settings-profile-body">
+          <div id="settings-project-profile"></div>
+          <button type="button" id="settings-identity-save" class="settings-row-btn" hidden></button>
+          <p class="settings-notice" id="settings-profile-msg" role="status" hidden></p>
+        </div>
+      </section>
       <section class="settings-section">
         <h3 class="settings-section-title" id="settings-display-title"></h3>
         <!-- (C940/C941) Language is a whole-project setting for every member (badge + hint). -->
@@ -522,7 +530,7 @@ const {
   openAgentAssignModal,
   openTaskEditModal, closeTaskEditModal, requestCloseTaskEditModal,
   registerTaskEditNavigation, registerTaskWorkspaceOpener,
-  initSettingsModal, openSettingsModal, applyProjectTheme, applyProjectLanguage, syncKb, reindexKb,
+  initSettingsModal, openSettingsModal, refreshDesktopProfile, applyProjectTheme, applyProjectLanguage, syncKb, reindexKb,
   applyProjectBoardFilters, persistBoardFilters, onBoardFiltersChanged,
   refreshFilterBarChrome, refreshBoardForFilters, computeVisibleTiers, anyNarrowingFilterActive,
   FILTERED_TIER_PAGE_SIZE,
@@ -542,6 +550,10 @@ const {
 } = window.TipTask;
 
 const { showRecipesModal, saveRecipe, loadRecipes } = window.TipTask;
+// (TPT9389) The Create modal's shell — New Objective and New Task render into it over the board.
+const objectiveModal = window.TipTask.objectiveModal;
+// (TPT9390) The left menu's Create flyout — New Objective / New Task, each opening that modal.
+const createFlyout = window.TipTask.createFlyout;
 const { openMergeBranchesModal, handleMergeWsMessage } = window.TipTask.mergeBranchesModal; // (TPT345)
 const { attachAudioRecorder } = window.TipTask.audioRecorder;
 // (TPT310) Left-nav plan-usage block: mounted once with the nav panel, reset only on a real project switch.
@@ -693,6 +705,121 @@ async function openNewObjectiveForm({ focus = false } = {}) {
 }
 window.TipTask.openNewObjectiveForm = openNewObjectiveForm;
 
+// ── Create modal (TPT9389) ──
+// New Objective and New Task render into the `.objective-modal` dialog (objective-modal.js) over
+// the board instead of replacing it. The modal is open exactly while state.activeTab is
+// 'objective' or 'new_task': a render then paints only the modal (_loadAndRenderImpl()'s render
+// root), and #app keeps the Tasks view it showed when the modal opened (state.boardTab) until the
+// modal closes.
+//   _paintedBoard — the board #app holds: { tab, key } of its last commit, null before the first.
+//   _underlay — taken when the modal opens: the fingerprint of that board's cached snapshot, and
+//     `dirty` once a full reload was asked for meanwhile. closeCreateModal() compares.
+let _paintedBoard = null;
+let _underlay = null;
+
+function markBoardUnderlayDirty() {
+  if (_underlay) _underlay.dirty = true;
+}
+
+// Whether the board behind a closing Create modal is still what a render would paint now: same
+// view, same fetch context, same cached snapshot as when the modal opened, no reload asked since.
+function boardUnderlayCurrent() {
+  if (!_paintedBoard || !_underlay || _underlay.dirty) return false;
+  if (_paintedBoard.tab !== state.activeTab || _paintedBoard.key !== _boardTaskFilterHash()) return false;
+  const entry = _boardTaskCache.get(_paintedBoard.key);
+  return !!entry && entry.fingerprint === _underlay.fingerprint;
+}
+
+// Takes the Create modal down and returns to the board behind it. Drafts (the composer's text,
+// the New Task form) and running objective turns live in state and sessionStorage, not in the
+// modal's DOM, so both survive; the left menu's Create item keeps showing a running or finished
+// turn. The board is not rendered again unless it changed while the modal was open.
+// `reason` is 'button' | 'escape' | 'backdrop' from the dialog, undefined from the left menu.
+function closeCreateModal(reason) {
+  if (!isNewSectionTab()) return false;
+  // Escape first collapses a pinned proposal card (as a click on its backdrop would); the next
+  // one closes the dialog.
+  const pinnedBackdrop = reason === 'escape' && state.expandedCardMode === 'pinned'
+    ? document.querySelector('.card-overlay-backdrop') : null;
+  if (pinnedBackdrop && document.querySelector('#objective-modal .card-expanded')) {
+    pinnedBackdrop.click();
+    return false;
+  }
+  // A field mic writes into the field it started in: the recording ends before that field goes.
+  if (window.TipTask?.audioRecorder?.hasLiveFieldRecording?.()) {
+    showToast(t('chat.closeWhileRecording'));
+    return false;
+  }
+  captureCardEdits(); // title/description edits sit in the proposal cards until a render
+  if (document.querySelector('#objective-modal .card-expanded')) collapseCard();
+  state.activeTab = isTasksSectionTab(state.boardTab) ? state.boardTab : 'board';
+  const boardCurrent = boardUnderlayCurrent();
+  _underlay = null;
+  objectiveModal.closeObjectiveModal();
+  syncLeftNavFromState();
+  updateBulkActionBar();
+  if (!boardCurrent) {
+    loadAndRender().catch(() => {});
+  } else {
+    // Unchanged as far as this window knows, but an event marked the snapshot stale without
+    // fetching one: re-read it now, and render only if it really differs.
+    const entry = _boardTaskCache.get(_paintedBoard.key);
+    if (entry.storedAt === 0) refreshBoardSnapshotInBackground(_paintedBoard.key, entry.fingerprint, entry.context || null);
+  }
+  return true;
+}
+
+// A Tasks view is about to render while the Create modal is still up (a save landed on the
+// board, a task link navigated there): the modal goes first, so it never sits over a board that
+// is being rebuilt for a different view.
+function dropCreateModalForBoardRender() {
+  if (!objectiveModal.isObjectiveModalOpen()) return;
+  captureCardEdits();
+  if (document.querySelector('#objective-modal .card-expanded')) collapseCard();
+  _underlay = null;
+  objectiveModal.closeObjectiveModal();
+}
+
+// A Create tab is active but #app holds no board yet — the app started on a restored objective,
+// or the project switched under the open modal. Paints the Tasks view first so the modal has its
+// board behind it. False when that board did not paint or something navigated away meanwhile.
+async function paintBoardBehindCreate(options) {
+  const createTab = state.activeTab;
+  state.activeTab = isTasksSectionTab(state.boardTab) ? state.boardTab : 'board';
+  try {
+    await loadAndRender({ scrollToTop: true, force: options.force });
+  } finally {
+    // Still on the board this pass put there: back to the Create tab it interrupted.
+    if (isTasksSectionTab()) state.activeTab = createTab;
+  }
+  return isNewSectionTab() && !!_paintedBoard;
+}
+
+// Overlays that stack above the Create modal without a dialog-focus layer of their own: while
+// one is up it owns Escape and Tab, so the modal's own handlers stand down.
+const CREATE_MODAL_COVERS = [
+  '.modal-overlay', '.terminal-overlay', '.img-lightbox-overlay', '.trello-import-modal-overlay',
+  '.trello-wizard-overlay', '.gmail-wizard-overlay', '.tag-cloud-modal-overlay', '.mcp-auth-overlay',
+  '.spec-chat-modal', '.task-chat-modal', '#settings-modal.open', '#task-edit-modal:not([hidden])',
+].join(', ');
+
+objectiveModal.configureObjectiveModal({
+  onRequestClose: closeCreateModal,
+  isCovered: () => !!document.querySelector(CREATE_MODAL_COVERS),
+});
+
+// The chat modules' reload() while a Create tab is active: the same fresh read 'tiptask:reload'
+// does, repainting the modal, but without marking the board behind it for a rebuild. A chat
+// repaint changes nothing on the board; a save does, and then the fresh snapshot this read caches
+// differs from the one the modal opened over, which closeCreateModal() sees on its own.
+// False when no Create tab is active — the caller then dispatches 'tiptask:reload' as before.
+window.TipTask.repaintCreateModal = () => {
+  if (!isNewSectionTab()) return false;
+  staleBoardTaskCache();
+  loadAndRender({ forceFresh: true }).catch(() => {});
+  return true;
+};
+
 function setLeftNavCollapsed(collapsed) {
   // task-board owns the node-preserving state/icon/ARIA update and session-list refresh.
   taskBoard.toggleSidebar(collapsed);
@@ -700,6 +827,8 @@ function setLeftNavCollapsed(collapsed) {
 
 const PLUS_NAV_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
 const TICK_NAV_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+// (TPT9390) On the Create item: it opens a menu to the right.
+const CHEVRON_NAV_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>';
 
 function getObjectiveNavState() {
   const tabs = Array.isArray(state.tabsState) ? state.tabsState : [];
@@ -714,6 +843,66 @@ function getObjectiveNavState() {
   return { isStreaming, isReady };
 }
 
+// What every left-menu navigation does first. Returns false when the navigation has to wait:
+// `retry` then takes it again.
+function leaveTaskSurfacesForNav(retry) {
+  // (TPT466) The task workspace leaves the rail live on its Agent Terminal pane: close it
+  // (through the dirty-discard confirm) before navigating, then take the navigation again.
+  const workspace = document.getElementById('task-edit-modal');
+  if (workspace && !workspace.hidden) {
+    void requestCloseTaskEditModal().then((closed) => { if (closed) retry(); });
+    return false;
+  }
+  // (TPT360) The rail is no longer covered by an open task terminal, so a Project Board /
+  // Create navigation must not happen underneath it. Minimize it the way the header's Minimize
+  // button does — process stays alive server-side — and drop the scroll-restore context, since
+  // this is real navigation. The callers' bail-out paths return before any render, so repaint
+  // the session rows here to clear the open-row highlight.
+  if (state.activeTerminal) {
+    state.activeTerminal.detach?.({ refreshBoard: false });
+    state.pendingRestoreContext = null;
+    document.dispatchEvent(new Event('tiptask:sync-nav-statuses'));
+    taskBoard.syncActiveSessionsNav();
+  }
+  return true;
+}
+
+// (TPT9390) A pick in the left menu's Create flyout (create-flyout.js): the Create modal opens
+// in `mode` — 'objective' or 'new_task' — or switches to it when it is already up in the other
+// one. The flyout is the only mode switch; the modal's header just names the mode.
+function openCreateMode(mode) {
+  const next = mode === 'new_task' ? 'new_task' : 'objective';
+  if (!leaveTaskSurfacesForNav(() => openCreateMode(next))) return;
+  const _sw = perfStart('nav-section-switch', { section: 'new', mode: next, from: state.activeTab });
+  const modalWasOpen = isNewSectionTab();
+  const alreadyShown = state.activeTab === next;
+  state.activeTab = next;
+  sessionStorage.setItem(ACTIVE_NEW_TAB_KEY, next);
+  if (next === 'objective') {
+    // Opening the objective is what clears its ready tick; New Task leaves it for later.
+    if (state.chatState) state.chatState.tickSeen = true;
+    // (C1156) Not gated on a transition into the view — the already-showing case is exactly
+    // what C1154's transition guard skips (activeTab unchanged → no transition detected).
+    if (state.activeTabId) dismissObjectiveNotification(state.activeTabId);
+  }
+  // (C1258) The picked mode is already showing: a full render would rebuild identical markup
+  // AND innerHTML-wipe an in-progress composer (lost caret, closed Embed/Import popovers,
+  // collapsed textarea). syncLeftNavFromState() is required, not optional: the tickSeen write
+  // just above flips getObjectiveNavState().isReady, which drives the tick/plus icon swap.
+  // Keyboard focus goes back into the modal, and the board behind it is not scrolled.
+  if (alreadyShown) {
+    syncLeftNavFromState();
+    objectiveModal.focusObjectiveModal();
+    perfEnd(_sw, { bailed: true });
+    return;
+  }
+  loadAndRender({ scrollToTop: true })
+    // A render that opens the modal moves focus into it (_loadAndRenderImpl()). A switch between
+    // the two modes renders an already-open modal, so focus is moved here.
+    .then(() => { if (modalWasOpen && state.activeTab === next) objectiveModal.focusObjectiveModal(); })
+    .finally(() => perfEnd(_sw));
+}
+
 function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
   let panel = document.getElementById('left-nav-panel');
   if (!panel) {
@@ -723,13 +912,15 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
     panel.setAttribute('aria-label', 'Primary navigation');
     panel.innerHTML = `
       <div class="left-nav-main">
+        <div id="sidebar-project-identity" hidden></div>
         <button class="left-nav-btn" data-section="tasks" type="button" title="${escapeAttr(t('nav.tasks'))}">
           <span class="left-nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="13" y2="16"/></svg></span>
           <span class="left-nav-label">${escapeAttr(t('nav.tasks'))}</span>
         </button>
-        <button class="left-nav-btn left-nav-btn--primary" data-section="new" type="button" title="${escapeAttr(t('nav.create'))}">
+        <button class="left-nav-btn left-nav-btn--primary" data-section="new" type="button">
           <span class="left-nav-icon"></span>
           <span class="left-nav-label">${escapeAttr(t('nav.create'))}</span>
+          <span class="left-nav-chevron" aria-hidden="true">${CHEVRON_NAV_SVG}</span>
         </button>
         <button class="left-nav-btn left-nav-btn--chat" data-action="start-chat" type="button" title="${escapeAttr(t('nav.startChat'))}">
           <span class="left-nav-icon">${window.TipTask?.constants?.CHAT_BUBBLE_SVG || ''}</span>
@@ -750,6 +941,7 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
       </section>
       <button id="left-nav-toggle" class="sidebar-toggle" type="button"></button>`;
     document.body.appendChild(panel);
+    refreshDesktopProfile(document.getElementById('settings-modal')?.classList.contains('open'));
     // (TPT310) The panel HTML builds once, so this is the ONE startup plan-usage fetch. Every
     // later fetch is a refresh-button click or a real project switch (resetAgentQuota()).
     initializeAgentQuotaSidebar(panel.querySelector('#agent-quota-sidebar'));
@@ -762,28 +954,22 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
     });
 
     panel.querySelectorAll('.left-nav-btn[data-section]').forEach(btn => {
+      // (TPT9390) Create is a menu button, not a section link: its click opens the Create
+      // flyout mounted below, and a pick there navigates through openCreateMode().
+      if (btn.dataset.section === 'new') return;
       btn.addEventListener('click', () => {
         const section = btn.dataset.section;
-        // (TPT466) The task workspace leaves the rail live on its Agent Terminal pane: close it
-        // (through the dirty-discard confirm) before navigating, then take the click again.
-        const workspace = document.getElementById('task-edit-modal');
-        if (workspace && !workspace.hidden) {
-          void requestCloseTaskEditModal().then((closed) => { if (closed) btn.click(); });
-          return;
-        }
-        // (TPT360) The rail is no longer covered by an open task terminal, so a Project Board /
-        // Create click must not navigate underneath it. Minimize it the way the header's
-        // Minimize button does — process stays alive server-side — and drop the scroll-restore
-        // context, since this click is real navigation. The bail-out paths below return before
-        // any render, so repaint the session rows here to clear the open-row highlight.
-        if (state.activeTerminal) {
-          state.activeTerminal.detach?.({ refreshBoard: false });
-          state.pendingRestoreContext = null;
-          document.dispatchEvent(new Event('tiptask:sync-nav-statuses'));
-          taskBoard.syncActiveSessionsNav();
-        }
+        // An open task workspace or terminal goes first (TPT466, TPT360).
+        if (!leaveTaskSurfacesForNav(() => btn.click())) return;
         const _sw = perfStart('nav-section-switch', { section, from: state.activeTab });
         if (section === 'tasks') {
+          // (TPT9389) Create is a modal over the board: Tasks takes it down and leaves the board
+          // exactly where it was — view, drill-down and scroll. A second click navigates as usual.
+          if (isNewSectionTab()) {
+            closeCreateModal();
+            perfEnd(_sw, { bailed: true });
+            return;
+          }
           // (C1461) Dropping parent context can turn an apparent same-tab click into real
           // navigation (activeTab is already 'board' on a subtask drill-down) — check BEFORE
           // the C1258 same-tab bail below, or this button would silently keep fetching
@@ -796,33 +982,16 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
           // from list/todo/backlog is real navigation and must still render.
           if (!exitedSubtaskContext && state.activeTab === 'board') { window.scrollTo(0, 0); perfEnd(_sw, { bailed: true }); return; }
           state.activeTab = 'board';
-        } else if (section === 'new') {
-          const wasInNewSection = isNewSectionTab();
-          if (!wasInNewSection) {
-            const saved = sessionStorage.getItem(ACTIVE_NEW_TAB_KEY);
-            state.activeTab = (saved === 'new_task') ? 'new_task' : 'objective';
-          }
-          if (state.chatState) {
-            state.chatState.tickSeen = true;
-          }
-          // (C1156) Not gated on !isNewSectionTab() — already-in-New-section case is exactly
-          // what C1154's transition guard skips (activeTab unchanged → no transition detected).
-          // Clicking the tick already means "seen".
-          if (state.activeTabId) dismissObjectiveNotification(state.activeTabId);
-          // (C1258) Already in Create — activeTab is unchanged, so a full render would rebuild
-          // identical markup AND innerHTML-wipe an in-progress composer (lost caret, closed
-          // Embed/Import popovers, collapsed textarea). syncLeftNavFromState() is required, not
-          // optional: the tickSeen write just above flips getObjectiveNavState().isReady, which
-          // drives the tick/plus icon swap — skip it and the checkmark badge sticks.
-          if (wasInNewSection) {
-            syncLeftNavFromState();
-            window.scrollTo(0, 0);
-            perfEnd(_sw, { bailed: true });
-            return;
-          }
         }
         loadAndRender({ scrollToTop: true }).finally(() => perfEnd(_sw));
       });
+    });
+
+    // (TPT9390) The Create item opens a menu to its right — New Objective, New Task — by click,
+    // hover or keyboard. Mounted once, with the panel; syncCreateFlyout() below keeps it current.
+    createFlyout.mountCreateFlyout({
+      trigger: panel.querySelector('[data-section="new"]'),
+      onSelect: openCreateMode,
     });
 
     panel.querySelector('#left-nav-toggle').addEventListener('click', () => {
@@ -836,10 +1005,10 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
   );
   // (C1239) Panel HTML above builds once (`if (!panel)`) — re-apply labels every call so a
   // live locale switch (applyProjectLanguage → setLocale) updates already-mounted buttons.
-  const applyNavLabel = (btn, key) => {
+  const applyNavLabel = (btn, key, { tooltip = true } = {}) => {
     if (!btn) return;
     const label = t(key);
-    btn.title = label;
+    if (tooltip) btn.title = label;
     const lbl = btn.querySelector('.left-nav-label');
     if (lbl) lbl.textContent = label;
   };
@@ -849,7 +1018,8 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
   applyNavLabel(tasksBtn, 'nav.tasks');
   tasksBtn?.classList.toggle('active', isTasksSection);
   const newBtn = panel.querySelector('[data-section="new"]');
-  applyNavLabel(newBtn, 'nav.create');
+  // (TPT9390) No tooltip on Create: hovering it opens its flyout, which names what it makes.
+  applyNavLabel(newBtn, 'nav.create', { tooltip: false });
   applyNavLabel(panel.querySelector('[data-action="start-chat"]'), 'nav.startChat');
   const humanHeading = panel.querySelector('#active-human-tasks-heading');
   if (humanHeading) humanHeading.textContent = t('nav.humanTasks');
@@ -859,6 +1029,23 @@ function syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady) {
   if (newBtn) newBtn.setAttribute('aria-busy', isStreaming ? 'true' : 'false');
   const iconEl = newBtn?.querySelector('.left-nav-icon');
   if (iconEl) iconEl.innerHTML = isReady ? TICK_NAV_SVG : PLUS_NAV_SVG;
+  // (TPT9389) Create is a modal, so an objective turn can run — and finish — with it closed.
+  // The item then says so: `running` adds a pulsing dot to the spinner ring, and the accessible
+  // name names the state instead of the bare "Create". (TPT9390) The name is always set: in the
+  // collapsed rail the visible label is hidden, and the item carries no tooltip to fall back on.
+  if (newBtn) {
+    const inBackground = !isNewSection;
+    newBtn.classList.toggle('running', isStreaming && inBackground);
+    const stateLabel = !inBackground ? '' : isStreaming ? t('nav.createRunning') : isReady ? t('nav.createReady') : '';
+    newBtn.setAttribute('aria-label', stateLabel || t('nav.create'));
+  }
+  // (TPT9390) The flyout's strings follow the project language; its entry for the mode the modal
+  // is showing is marked, and New Objective says when a plan is running or waiting to be read.
+  createFlyout.syncCreateFlyout({
+    current: isNewSection ? state.activeTab : null,
+    running: isStreaming,
+    ready: isReady,
+  });
   // (C1144, dedup'd C1258) setLeftNavCollapsed() below unconditionally calls
   // syncActiveSessionsNav() as a side effect on every call — and this function calls it every
   // single loadAndRender() regardless of whether the collapse flag actually changed — so it
@@ -901,7 +1088,10 @@ document.addEventListener('tiptask:discuss-lock-changed', (e) => {
     if (card && applyDiscussLock(card)) needsRebuild = true;
   }
   updateClaudeButtons();
-  if (needsRebuild) loadAndRender();
+  // (TPT9389) With the Create modal up the cards to rebuild are behind it, and a render would
+  // only repaint the modal: the board is rebuilt when the modal closes instead.
+  if (needsRebuild && isNewSectionTab()) markBoardUnderlayDirty();
+  else if (needsRebuild) loadAndRender();
 });
 
 // Current user info (fetched once per session, used by the Human filter modal)
@@ -926,13 +1116,15 @@ let _peopleFilterPanelCleanup = null;
 // down bind straight to `app`, so without this guard every single loadAndRender() call added
 // three more permanent document-tree listeners that never got torn down — an unbounded leak
 // discovered while profiling the left-nav Tasks<->Create switch cost.
-let _appDelegatesBound = false;
+// (TPT9389) Tracked per render root: #app and the Create modal's body (where the preview cards
+// live now) each get the delegates once, and neither element is ever replaced.
+const _delegateRoots = new WeakSet();
 
 // (C1256) 'objective'/'new_task' added — _boardTaskCacheContext() (below) is keyed on
 // {project, parentKey, sprintWindowExtend}, never on the tab, so a board-tab snapshot is
 // byte-identical to what the Create screens need. Before this, the two Create tabs always
 // missed the cache (see the old comment on _canUseBoardTaskCache()) and paid a blocking,
-// uncached fetchBoardSnapshot() network round-trip on EVERY Objective<->Task click — up to
+// uncached fetchBoardSnapshot() network round-trip on EVERY switch between them — up to
 // 2s against a remote API_BASE_URL. Neither Create view renders a board, but the click
 // handler for #new-task-preview (below) still reads the `tasks` local for its next-id/order
 // guess, and loadAndRender() populates state.taskStatusById/taskTitleById/tierKeys from it
@@ -1040,12 +1232,17 @@ function _boardSnapshotFingerprint(snapshot) {
 }
 
 // Adopt the response's window and fetch mode for fresh, cached, and background snapshots.
-// A full search response has window:null and all tiers loaded; a windowed response with
-// has_older:false also has nothing left to reveal.
+// On the root board each reply decides allStepsLoaded afresh: true for a full search
+// response (window:null, every sprint fetched) or a window with has_older:false, false
+// otherwise. A flag kept from an earlier reply would, once the window floor rises again
+// (the oldest open task completed), reveal every all-closed tier and hide Load More with
+// older sprints still unfetched. A subtask drill-down fetch is unwindowed (window:null)
+// and leaves the flag unchanged.
 function _applyBoardWindow(win, fullWindow = false) {
   state.boardWindow = win || null;
   _searchFullWindowActive = !!fullWindow;
-  if (fullWindow || (state.boardWindow && state.boardWindow.has_older === false)) state.allStepsLoaded = true;
+  if (state.subtaskStack.length > 0) return;
+  state.allStepsLoaded = !!fullWindow || !!(win && win.has_older === false);
 }
 
 // Rebuild breadcrumbs from the snapshot's canonical ancestor chain. Verify
@@ -1518,6 +1715,7 @@ function stopOfflineRetry() {
 function renderTaskLoadError(err) {
   if (isAuthLoadError(err)) {
     if (state.lastLoadedTaskCount === 0) {
+      _paintedBoard = null; // (TPT9389) #app no longer holds a board
       app.innerHTML = `<div class="error-box"><h2>Sign-in required</h2><p>Waiting for re-authentication…</p></div>`;
     }
     return;
@@ -1534,6 +1732,7 @@ function renderTaskLoadError(err) {
   // (C1392) Electron-vs-browser split, matching the guidance also used by the
   // task-open-failure banner in task-board.js — see utils.js loadErrorGuidance().
   const g = loadErrorGuidance({ isElectron: !!window.electronAPI?.api });
+  _paintedBoard = null; // (TPT9389) #app no longer holds a board
   app.innerHTML = `
     <div class="error-box">
       <h2>${g.title}</h2>
@@ -1810,7 +2009,12 @@ document.addEventListener('tiptask:reload', () => {
   // below already refetches the CURRENT drill-down key fresh; other objectives' cached
   // entries have nothing to do with this event and should survive for their own next tab
   // click instead of being thrown away.
+  // (TPT9389) With the Create modal up this render repaints only the modal, so the board behind
+  // it is marked for a rebuild when the modal closes: a reload from here can be a setting that
+  // changed how the board draws (language, group noun, agents), which no snapshot shows. Chat
+  // repaints do not come through here while the modal is open — see repaintCreateModal().
   staleBoardTaskCache();
+  markBoardUnderlayDirty();
   loadAndRender({ forceFresh: true }).catch(() => {});
 });
 
@@ -2016,16 +2220,13 @@ function exitSubtaskContextForTab(tab) {
 
 function bindTabButton(btn) {
   btn.addEventListener('click', () => {
+    // Tasks views only (board / list / to-do / backlog): the Create modes are picked in the
+    // left menu's Create flyout and go through openCreateMode() (TPT9390).
     const next = btn.dataset.tab;
     const exitedSubtaskContext = exitSubtaskContextForTab(next);
-    // (C1147) Clicking into the Objective view — even when its tab was already active —
-    // should drop the completed tab's "Objective complete" card from the stack. Must stay
-    // unconditional (before the C1256 same-tab bail below) — it fires precisely on the
-    // already-active-tab case too.
-    if (next === 'objective' && state.activeTabId) dismissObjectiveNotification(state.activeTabId);
     // (C1256) Re-clicking the already-active tab used to still pay a full loadAndRender()
     // (uncached fetch + app.innerHTML wipe + ~50-listener rewire) to repaint identical
-    // markup. Value-based, so this is correct for both halves of the shared selector.
+    // markup.
     // (C1461) Skipped when exitSubtaskContextForTab() just cleared the drill-down — activeTab
     // is unchanged ('board'/'backlog') but the fetch scope (parentKey -> root) is not.
     if (!exitedSubtaskContext && next === state.activeTab) { window.scrollTo(0, 0); return; }
@@ -2034,7 +2235,6 @@ function bindTabButton(btn) {
     // hidden on another. Before the re-render: renderCard() reads selectedCardIds.
     clearBulkSelection();
     state.activeTab = next;
-    sessionStorage.setItem(ACTIVE_NEW_TAB_KEY, state.activeTab);
     loadAndRender({ scrollToTop: true });
   });
 }
@@ -2111,7 +2311,10 @@ function syncObjectiveTabsState(hint) {
 // generic .nav-tabs button[data-tab] delegation (bindTabButton) and the plain
 // .mobile-menu-item click handler must not treat these as real tabs.
 function renderObjectiveNavTabsHtml({ mobile = false } = {}) {
-  const activeKey = objectiveTabs.activeObjectiveTabKey({ activeTab: state.activeTab, subtaskStack: state.subtaskStack, objectiveTabs: state.objectiveTabs });
+  // (TPT9389) The out-of-band repaint can run with the Create modal up: the tabs belong to the
+  // board behind it, so the lit one follows that board's view, not the modal's.
+  const boardTab = isNewSectionTab() ? state.boardTab : state.activeTab;
+  const activeKey = objectiveTabs.activeObjectiveTabKey({ activeTab: boardTab, subtaskStack: state.subtaskStack, objectiveTabs: state.objectiveTabs });
   return state.objectiveTabs.map(tab => {
     const isActive = activeKey === tab.parentKey;
     const wrapCls = 'nav-tab-objective-wrap' + (mobile ? ' mobile-menu-item sub-item' : '') + (isActive ? ' active' : '');
@@ -2236,7 +2439,6 @@ function wireObjectivePaneExtras(root) {
 // rather than a double-bind.
 window.TipTask.wireObjectivePane = (root) => {
   if (!root || root.dataset.objWired === '1') return;
-  root.querySelectorAll('.composer-header-btn[data-tab]').forEach(bindTabButton);
   wireObjectivePaneExtras(root);
   setupCardInteractions(root);
   markTruncatedCards();
@@ -2256,6 +2458,13 @@ async function loadAndRender(options = {}) {
   // (TPT9025) Before the generation bump: a render the drag guard defers must not first
   // invalidate the one already in flight — during a drop, that is the drop's own render.
   if (_deferRenderForDrag(options)) return;
+  // (TPT9389) Create renders into a modal over the board. A Create tab with no board painted
+  // yet gets its board first; a Tasks view rendering under a still-open modal takes it down.
+  if (isNewSectionTab()) {
+    if (!_paintedBoard && !(await paintBoardBehindCreate(options))) return;
+  } else {
+    dropCreateModalForBoardRender();
+  }
   const renderGeneration = invalidateLoadAndRender();
   const _handle = perfStart('load-and-render', { tab: state.activeTab, cacheable: _canUseBoardTaskCache(), forceFresh: !!options.forceFresh, snapshot: !!options.snapshot, objectiveTaskRefresh: !!(options.objectiveTaskUpdate || options.objectiveTasksUpdated) });
   try {
@@ -2325,6 +2534,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   };
   const cachedEntry = (!options.forceFresh && cacheKey) ? _boardTaskCache.get(cacheKey) : null;
   let tasks = [];
+  let loadFailed = false; // (TPT9389) a Create render that fell back to the cached snapshot
   // (C1256) Attributes the data-fetch phase of loadAndRender — snapshot (handed in by a
   // caller)/cache-hit/network — so the perf log can prove a tab switch stopped paying the
   // network branch. Kept permanent, not just for this task: cheap (perfStart no-ops when
@@ -2362,10 +2572,16 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   } catch (err) {
     perfEnd(_larData, { source: _larDataSource, threw: true });
     if (!isCurrentLoadAndRender(renderGeneration)) return;
+    // (TPT9389) The Create modal shows no board: a failed fresh read must not stop its repaint,
+    // so it goes on with the snapshot already cached (the banner below still reports the
+    // failure). Only a Create render with nothing cached falls through to the error path.
+    const createFallback = isNewSectionTab() && cacheKey ? _boardTaskCache.get(cacheKey) : null;
     // Auth errors are handled by the reauth modal (driven by api:connection:changed).
     // Show a quiet placeholder until the user signs in again.
     renderTaskLoadError(err);
-    return;
+    if (!createFallback) return;
+    loadFailed = true;
+    tasks = _restoreBoardCacheEntry(createFallback);
   }
   if (!isCurrentLoadAndRender(renderGeneration)) {
     perfEnd(_larData, { source: _larDataSource, stale: true });
@@ -2551,7 +2767,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   let tabContent = '';
   // (C1256) Spans the view-build phase — answers C1256 sub-item (1) ("profile
   // renderComposerHeader() for synchronous work") with a real number per switch instead of a
-  // guess: renderComposerHeader() itself is a 2-button string builder called from inside
+  // guess: renderComposerHeader() itself is a small string builder called from inside
   // renderNewTaskForm()/renderObjectiveContent() below, so wrapping those two callers is
   // where the real per-tab cost (if any) would show up — e.g. renderObjectiveContent()
   // markdown-rendering the whole chat transcript.
@@ -2584,6 +2800,17 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   // and awaited its fetch through it — re-defer rather than detach the dragged card.
   if (_deferRenderForDrag(options)) return;
 
+  // (TPT9389) Render root. A Tasks view commits to #app. A Create view commits to the Create
+  // modal's body and leaves #app — the board behind the modal — exactly as it is. Everything
+  // below builds and wires what this render made through the one name, `app`, so the wiring that
+  // served the Create page now serves the modal unchanged.
+  const createModal = isNewSection ? objectiveModal.openObjectiveModal({ mode: state.activeTab }) : null;
+  const app = createModal ? createModal.body : document.getElementById('app');
+  if (createModal?.opened) {
+    // What the board behind shows as the modal opens, for closeCreateModal() to compare.
+    _underlay = { fingerprint: _boardTaskCache.get(_paintedBoard?.key)?.fingerprint ?? null, dirty: false };
+  }
+
   const { isStreaming, isReady } = getObjectiveNavState();
 
   // (TPT9023) Read at the commit, not at render start — the fetch above can outlast a scroll or a
@@ -2595,8 +2822,13 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   // Closes the open overlay before its node goes; restoreExpandedCard() below re-opens it in place.
   const expandedBefore = takeExpandedCard(app);
 
+  if (isNewSection) {
+    // (TPT9389) The modal holds the Create view alone: no top nav, breadcrumbs or parent pane —
+    // those belong to the board behind it.
+    app.innerHTML = tabContent;
+  } else {
   app.innerHTML = `
-    <nav class="top-nav${isNewSection ? ' top-nav--bare' : ''}">
+    <nav class="top-nav">
       ${isTasksSection ? `
       <div class="nav-tabs">
         ${visibleViewTabs().flatMap(v => {
@@ -2659,9 +2891,14 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
         fallback: state.subtaskStack[state.subtaskStack.length - 1],
         children: visibleTasks,
       }) : ''}
-    <div class="content-area" style="--chat-tab-count:${state.tabsState.length}">
+    <div class="content-area">
       ${isEmptyBoard ? renderEmptyBoardContent() : tabContent}
     </div>`;
+  // (TPT9389) #app now holds this Tasks view for this fetch context — what an opening Create
+  // modal sits over, and what closeCreateModal() goes back to.
+  _paintedBoard = { tab: state.activeTab, key: cacheKey };
+  state.boardTab = state.activeTab;
+  } // end board commit (TPT9389)
 
   // (TPT9025) The drop's own render just replaced #app: the tail below is the drop's repaint
   // (filters, session buttons, truncation, scroll restore) and runs inline, and a render
@@ -2695,21 +2932,6 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     document.body.appendChild(d);
   }
   syncLeftNavPanel(isTasksSection, isNewSection, isStreaming, isReady);
-
-  // (TPT24) Breadcrumb bar can render above .chat-container on a composer tab (the
-  // objective's own crumb from the yellow Create Subtasks button) — the composer's fixed
-  // 100dvh-based height (styles.css .objective-chat--empty/--active) has to subtract it
-  // or #chat-input gets pushed below the fold. Measured, not hardcoded: the bar is a
-  // single overflow-x:auto row so its height is stable per render, but font size/zoom
-  // shift it. Published on .content-area — the chat's own parent, already carrying the
-  // sibling --chat-tab-count inline var.
-  {
-    const _bc = app.querySelector('.breadcrumb-bar');
-    const _contentArea = app.querySelector('.content-area');
-    if (_contentArea) {
-      _contentArea.style.setProperty('--chat-chrome-above', _bc ? `${Math.round(_bc.getBoundingClientRect().height)}px` : '0px');
-    }
-  }
 
   // To-Do checkbox → PATCH status
   app.querySelectorAll('.todo-check').forEach(cb => {
@@ -2779,12 +3001,12 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     });
   }
 
-  // Tab switching — top-nav .nav-tabs (tasks section) + composer header (new section, C1239).
-  // (C1427) Handler body now lives in the shared bindTabButton() — pure extraction, same
-  // combined selector, zero behavior change here.
+  // Tab switching — top-nav .nav-tabs (tasks section). The Create modes have no tabs: they are
+  // picked in the left menu's Create flyout (TPT9390, openCreateMode()).
+  // (C1427) Handler body lives in the shared bindTabButton().
   // (C1442) .backlog-hint-link[data-tab] added — the "N matching task(s) in Backlog" pointer
   // rendered by renderBacklogHintHtml() needs no new logic, just the same click → tab switch.
-  app.querySelectorAll('.nav-tabs button[data-tab], .composer-header-btn[data-tab], .backlog-hint-link[data-tab]').forEach(bindTabButton);
+  app.querySelectorAll('.nav-tabs button[data-tab], .backlog-hint-link[data-tab]').forEach(bindTabButton);
 
   // (C1427) Import…/History/Debug-console — shared with the partial-repaint path via
   // wireObjectivePaneExtras() above. Passing `app` (not `.chat-container`) matches what this
@@ -3033,7 +3255,8 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     refreshBtn.addEventListener('click', () => {
       refreshBtn.classList.add('loading');
       clearBoardTaskCache();
-      loadAndRender().finally(() => refreshBtn.classList.remove('loading'));
+      Promise.all([loadAndRender(), fetchActiveSessions().then(updateClaudeButtons)])
+        .finally(() => refreshBtn.classList.remove('loading'));
     });
   }
 
@@ -3183,7 +3406,9 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   }
 
   // Apply search filter after render (preserves active search across re-renders)
-  applySearchFilter();
+  // (TPT9389) Not on a Create render: this pass walks the board's cards and tiers, and the board
+  // behind the modal was not rebuilt.
+  if (!isNewSection) applySearchFilter();
 
   // Burger menu toggle
   const burgerBtn = app.querySelector('.burger-btn');
@@ -3234,6 +3459,9 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
         state.activeTab = tab;
       }
       state.mobileMenuOpen = false;
+      // (TPT9389) Create opens as a modal and leaves this board — and this menu — mounted, so
+      // the menu closes here instead of with a board rebuild.
+      if (isNewSectionTab()) toggleMobileMenu(false);
       loadAndRender({ scrollToTop: true });
     });
   });
@@ -3734,8 +3962,8 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   // render (only its innerHTML is replaced), so re-running addEventListener here on every
   // loadAndRender() call was an unbounded listener leak. Delegation means they still work
   // against freshly-rendered preview cards with no rebinding needed.
-  if (!_appDelegatesBound) {
-  _appDelegatesBound = true;
+  if (!_delegateRoots.has(app)) {
+  _delegateRoots.add(app);
   // Double-click to edit preview-title and preview-desc (new-proposal cards only).
   // Real-key (modified/saved) and new-proposal cards are handled by the per-card
   // listeners in setupCardInteractions which call stopPropagation; this delegated
@@ -3813,7 +4041,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
       delete el.dataset.editSnapshot;
     }
   });
-  } // end _appDelegatesBound guard (C1258)
+  } // end _delegateRoots guard (C1258)
 
   // (C1427) Archive button + Chat console toggle — now bound by wireObjectivePaneExtras(app)
   // above, alongside the Import menu it used to sit next to.
@@ -3941,7 +4169,11 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   // DEFAULT IS PRESERVE. Scroll-to-top only happens on genuine navigation. This prevents
   // trailing debounced re-renders and status-confirm renders from jumping to top.
   let reopen = null;
-  if (state.activeTerminal) {
+  if (isNewSection) {
+    // (TPT9389) The board behind the Create modal keeps its scroll and its open card: neither
+    // was rebuilt. Navigation into the modal starts the modal itself at its top.
+    if (wantTop) app.scrollTop = 0;
+  } else if (state.activeTerminal) {
     // overlay open — leave state.pendingRestoreContext intact for when the terminal closes
     if (!wantTop) window.scrollTo(0, restoreScrollY);
   } else if (state.pendingRestoreContext) {
@@ -3961,7 +4193,8 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   }
 
   // Restore chain highlights after re-render
-  if (state.chainHighlightedTaskId) {
+  // (TPT9389) A Create render rebuilt no board card, so the highlight behind the modal stands.
+  if (state.chainHighlightedTaskId && !isNewSection) {
     const savedId = state.chainHighlightedTaskId;
     const savedMode = state.chainHighlightMode; // (C1433/C1569) 'deps' | 'objective' | 'related'
     state.chainHighlightedTaskId = null;
@@ -3977,8 +4210,14 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   if (reopen) restoreExpandedCard(app, reopen);
 
   // Board loaded successfully — dismiss any offline/reconnecting banner + stop Electron retry loop
-  if (document.getElementById('api-status-banner')) showApiStatusBanner('connected');
-  stopOfflineRetry();
+  // (TPT9389) Unless this Create render went on from the cached snapshot after its read failed.
+  if (!loadFailed) {
+    if (document.getElementById('api-status-banner')) showApiStatusBanner('connected');
+    stopOfflineRetry();
+  }
+  // (TPT9389) The Create modal just opened: keyboard focus moves into it (the composer, or the
+  // New Task title). Later renders of the open modal leave focus to the restore paths above.
+  if (createModal?.opened) objectiveModal.focusObjectiveModal();
   // (C1427) Signals "the DOM this render built is fully wired" — chat-ui.js's restore IIFE
   // listens for this once to run its post-render wireObjectivePane() safety net against the
   // right (freshly rendered) subtree instead of a synchronous call against the old one.
@@ -4122,6 +4361,7 @@ function connectBoardWs() {
     // loadAndRender() + fetchActiveSessions() of its own.
     if (!_boardWsHasConnectedOnce) { _boardWsHasConnectedOnce = true; return; }
     syncNavStatusesFromServer();
+    fetchActiveSessions().then(updateClaudeButtons);
     // (TPT58) Soft-stale, not a hard wipe — whatever was missed while the socket was down is
     // caught by the forceFresh render below (current key) and by each other entry's own
     // immediate background refetch on its next cache-hit render (storedAt zeroed).
@@ -4140,8 +4380,8 @@ function connectBoardWs() {
     // (TPT345) merge:* job frames + worktree-dirty-on-complete — browser mode only; Electron
     // dispatches these from attention-ws.js (connectBoardWs() is skipped there).
     if (handleMergeWsMessage(msg)) return;
-    // (TPT9116) The project's chat history index changed — same browser-only split.
-    if (msg.type === 'chat-history-updated') {
+    // A history write or account switch refreshes the project's chat rows.
+    if (msg.type === 'chat-history-updated' || msg.type === 'chat-sessions-changed') {
       window.TipTask?.taskChat?.historyUpdated?.(msg);
       return;
     }
@@ -4964,6 +5204,7 @@ if (window.electronAPI) {
     }
     if (!dir || (dir === _lastLoadedProject && !contextChanged)) return;
     _lastLoadedProject = dir;
+    refreshDesktopProfile(document.getElementById('settings-modal')?.classList.contains('open'));
     // Reset per-project sprint/tier state so stale data from the previous project doesn't bleed through.
     state.sprints = [];
     state.collapsedTiers.clear();
@@ -4979,6 +5220,9 @@ if (window.electronAPI) {
     // list until the refresh TTL. The loadAndRender() at the end of this handler re-fetches.
     chatUI.invalidateObjectiveProviders();
     clearBoardTaskCache();
+    // (TPT9389) #app still shows the previous project's board: under an open Create modal the
+    // render at the end of this handler must paint the new one first.
+    _paintedBoard = null;
     // (C1187) Drop back to the legacy status seed BEFORE the switch below, so no frame
     // renders the previous project's custom status names against the new project's tasks.
     resetStatuses();

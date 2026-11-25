@@ -91,6 +91,7 @@ test('open existing: no agent enabled blocks Next; Confirm saves only the re-che
   const saved = [];
   const electronAPI = {
     setupStoredAccount: async () => ({ token: 'tok', user: { email: 'a@b.c' } }),
+    setupProjectProfile: async () => ({ policy: { rules: {} } }),
     setupListProjects: async () => [{ id: 7, name: 'Proj' }],
     setupGetDeviceName: async () => 'Mac',
     setupGetAvailableAgents: async () => AGENTS,
@@ -101,6 +102,8 @@ test('open existing: no agent enabled blocks Next; Confirm saves only the re-che
     modal.open({ projectPath: '/tmp/p' });
     await flush();
     $('.setup-modal-project-card[data-id="7"]').click();
+    $('#setup-next-btn').click();
+    await flush(); // policy and identity
     $('#setup-next-btn').click();
     await flush(); // device-name prefill
     $('#setup-next-btn').click();
@@ -121,6 +124,7 @@ test('re-authenticate: no agent enabled blocks Next; Confirm saves only the re-c
   const saved = [];
   const electronAPI = {
     setupAuthWeb: async () => ({ token: 'tok', user: { email: 'a@b.c' } }),
+    setupProjectProfile: async () => ({ policy: { rules: {} } }),
     setupListProjects: async () => [{ id: 7, name: 'Proj' }],
     setupGetAvailableAgents: async () => AGENTS,
     setupExchangeProjectToken: async () => 'scoped',
@@ -133,7 +137,8 @@ test('re-authenticate: no agent enabled blocks Next; Confirm saves only the re-c
     });
     await flush();
     $('#setup-signin-btn').click();
-    await flush(500); // sign-in → 400ms hand-off straight to Agent (project already known)
+    await flush(500); // sign-in hands off to the known project’s policy
+    $('#setup-next-btn').click();
     await flush(); // agent detection
     assert.ok($('#setup-agent-select .sma-cb[data-id="codex"]'), 'on the Agent step');
 
@@ -144,5 +149,44 @@ test('re-authenticate: no agent enabled blocks Next; Confirm saves only the re-c
     assert.equal(saved.length, 1);
     assert.equal(saved[0].TASK_AGENT, 'codex');
     assert.equal(saved[0].AVAILABLE_AGENTS, 'codex', 'the old claude entry is not carried over');
+  });
+});
+
+test('first setup discards a late profile response after the user changes project', async () => {
+  let finishFirst;
+  const firstRead = new Promise(resolve => { finishFirst = resolve; });
+  const api = {
+    setupStoredAccount: async () => ({ token: 'tok', user: { email: 'member@example.test' } }),
+    setupListProjects: async () => [{ id: 1, name: 'Studio' }, { id: 2, name: 'Lab' }],
+    setupProjectProfile: (_base, _token, id) => id === 1 ? firstRead : Promise.resolve({
+      policy: { rules: { language: { value: 'en', source: 'owner' } } },
+      identity: { display_initials: 'LB', brand_color: '#114477' },
+    }),
+    setupGetDeviceName: async () => 'Laptop',
+    setupGetAvailableAgents: async () => AGENTS,
+  };
+  await withModal(api, async ({ modal, flush }) => {
+    modal.open({ projectPath: '/tmp/profile' });
+    await flush();
+    $('[data-id="1"]').click();
+    $('#setup-next-btn').click();
+    assert.equal($('#setup-next-btn').disabled, true);
+    $('#setup-back-btn').click();
+    await flush();
+    $('[data-id="2"]').click();
+    $('#setup-next-btn').click();
+    await flush();
+    finishFirst({ identity: { display_initials: 'OLD' }, policy: { rules: {} } });
+    await flush();
+    assert.equal($('.project-monogram').textContent, 'LB');
+    assert.equal($('[data-initials]'), null, 'linking an existing project is read-only');
+    assert.match($('.project-rules').textContent, /Project owner/);
+    $('#setup-next-btn').click();
+    await flush();
+    $('#setup-next-btn').click();
+    await flush();
+    $('#setup-next-btn').click();
+    assert.equal($('.setup-modal-summary .project-monogram').textContent, 'LB');
+    assert.doesNotMatch(overlay().textContent, /OLD|Studio/);
   });
 });

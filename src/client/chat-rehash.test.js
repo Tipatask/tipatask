@@ -50,6 +50,8 @@ function chat() {
     OBJECTIVE_HISTORY_PAGE_MESSAGES: 20, escapeAttr, t, tc,
     objectiveIsStreaming: () => false,
     renderComposerHeader: () => '', _buildTabBarInnerHtml: () => '',
+    // (TPT9391) The stage line and the empty-state guide have their own tests (objective-stage.test.js).
+    renderObjectiveStage: () => '', renderObjectiveGuideHtml: () => '',
     buildModelSelectorHtml: () => '', buildEmbedMenuHtml: () => '', DROPDOWN_CARET_SVG: '',
     rememberActiveTabView() {}, renderActiveTab() {},
     ensureDiscussTask() { assert.fail('plain New Objective must not fetch a task preview'); },

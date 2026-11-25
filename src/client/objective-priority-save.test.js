@@ -52,7 +52,7 @@ async function savePriorityProposals(provider, bulk, proposals) {
     previewOriginSingleTarget, outOfSubtreeModifiedIndexes, reconcileModifiedCards, normalizeSingleItemList,
     shouldCreateObjectiveParent, buildUsedIds, upsertTaskEntry, getObjectiveGroupingEnabled: () => false,
     projectHeader: () => ({}), isStartName: status => status === 'pending', startName: () => 'pending', loadStatuses: async () => [],
-    captureCardEdits() {}, showSavingIndicator() {}, hideSavingIndicator() {}, showSaveToast() {}, saveChatState() {},
+    captureCardEdits() {}, syncObjectiveStage() {}, noteObjectiveSaved() {}, setCardState() {}, showSavingIndicator() {}, hideSavingIndicator() {}, showSaveToast() {}, saveChatState() {},
     discardUnsavedProposals() {}, cleanupChat() {}, repaintAfterSavedChatClosed() {},
     translate: (key, params) => params?.msg || key, showToast: (text, type) => { if (type === 'error') errors.push(text); },
     async fetchWithRetry(url, options) {

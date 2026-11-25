@@ -18,12 +18,15 @@ import { openTaskEditModal } from './task-edit-modal.js';
 import { attachImagePaste } from './task-board.js';
 import { attachAudioRecorder } from './audio-recorder.js';
 import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu } from './embed-menu.js';
+import { createPreviewDrawer } from './preview-drawer.js';
+import { renderPreview } from './preview-renderers.js';
 import { writeClipboardText } from './clipboard-write.js';
 import {
   taskChatProviders, pickSelection, isSelectable, buildModelOptionsHtml, stripAskUserFence,
   visibleHistory, upsertById, shortToolName, hasWidgets, collapseTaskEvents,
   dialogSubmission, localAnswer, dialogWidgetHtml, toolChipHtml,
-  userMessageHtml, stripPendingImageRefs, messageCopyText,
+  userMessageHtml, stripPendingImageRefs, messageCopyText, fileRefFromHref,
+  replyBlocks, replyHasNotes, withBreak,
   dialogState, lastTurnMessage, isDialogAnswerTurn, answeredDialog,
   resumedIndicator, providerName, historyQuery, historyRowHtml, historyFocusIndex,
   TASK_CHAT_MODEL_STORAGE_KEY,
@@ -46,6 +49,7 @@ const ICON_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 const ICON_COPY = '<svg class="task-chat-copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 const ICON_COPIED = '<svg class="task-chat-copy-done" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
 const ICON_CHAT = CHAT_BUBBLE_SVG;
+const TYPING_HTML = '<span class="chat-typing-indicator"><span></span><span></span><span></span></span>';
 // (TPT469) A project holds several chats, `projectChat:<projectId>:<chatId>`. The bare
 // `projectChat:<projectId>` is a chat started before that, still reopened from the left menu.
 const PROJECT_CHAT_ID_RE = /^projectChat:([1-9]\d*)(?::[a-z0-9]{6,32})?$/;
@@ -54,7 +58,9 @@ let ws = null;
 let chat = null;            // { kind: 'task'|'project', key, sessionId, title } — the open chat
 let openSeq = 0;            // bumped per open request; a slower project-config read loses to a newer one
 let root = null;            // .task-chat-modal
-let messages = [];          // [{ role, content, streaming?, error?, retry?, dialogs, tools, taskEvents, el }]
+let viewer = null;
+const fileTabs = new WeakMap(); // panel → request and pending source line
+let messages = [];          // [{ role, content, streaming?, error?, retry?, dialogs, tools, taskEvents, breaks, el }]
 let providers = [];
 let selection = '';         // "provider:model" sent with the next turn
 let running = false;        // a turn is in progress on the server
@@ -87,6 +93,7 @@ let renderedLocale = '';     // locale the window's labels were last written in
 let pendingAnswer = null;   // { dialog } — an answer sent, no frame of its turn back yet
 let widgetSeq = 0;
 const widgetSig = new WeakMap(); // widget element -> signature of the record it was built from
+const blockSig = new WeakMap(); // note or answer element -> the text (or typing state) it was last drawn from
 const codeCopyButtons = new WeakMap(); // message element -> Copy buttons of its code blocks, in order
 const copyResetTimers = new WeakMap(); // Copy button -> timer that turns "Copied" back into its label
 let embedded = null;        // { host, onOpenTask, onClosed } while mounted in a workspace pane
@@ -349,6 +356,8 @@ export function close() {
   if (keyHandler) { document.removeEventListener('keydown', keyHandler, true); keyHandler = null; }
   if (providersHandler) { document.removeEventListener('tiptask:providers-changed', providersHandler); providersHandler = null; }
   if (reloadHandler) { document.removeEventListener('tiptask:reload', reloadHandler); reloadHandler = null; }
+  viewer?.destroy();
+  viewer = null;
   if (root) { root.remove(); root = null; }
   if (focusHandle) { focusHandle.close(); focusHandle = null; }
   if (!wasEmbedded) {
@@ -447,6 +456,10 @@ function renderWindow() {
       </footer>
     </div>`;
   (host || document.body).appendChild(root);
+  viewer = createPreviewDrawer(root.querySelector('.task-chat-panel'), {
+    hostClass: 'task-chat-panel--with-drawer', onSelect: scrollToFileLine,
+  });
+  listEl().addEventListener('click', onFileLinkClick);
 
   if (!host) {
     const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
@@ -532,6 +545,70 @@ function renderWindow() {
   renderSelector();
   renderTranscript();
   syncComposer();
+}
+
+function onFileLinkClick(event) {
+  const link = event.target.closest?.('.task-chat-md a[href], .task-chat-msg--user a.file-attachment-link');
+  if (!link) return;
+  const ref = fileRefFromHref(link.getAttribute('href'));
+  if (!ref) return;
+  event.preventDefault();
+  event.stopPropagation(); // the document-level attachment handler would open a second window
+  openFileViewer({ ...ref, title: ref.path || link.title || link.textContent.trim() || ref.href });
+}
+
+async function loadFilePreview(ref, signal) {
+  const url = ref.href || '/api/project/file-preview?path=' + encodeURIComponent(ref.path);
+  const response = await fetch(url, { headers: projectHeader(), signal });
+  if (!response.ok) {
+    const messages = { 400: 'unsupported', 403: 'forbidden', 404: 'notFound', 413: 'tooLarge' };
+    return { message: messages[response.status] || 'failed' };
+  }
+  if (!ref.href) return response.json();
+  const mime = (response.headers.get('X-Tipatask-Preview-Type') || response.headers.get('Content-Type') || '')
+    .split(';')[0].trim().toLowerCase();
+  if (mime === 'application/pdf' || mime.startsWith('image/')) {
+    return { kind: mime === 'application/pdf' ? 'pdf' : 'image', mime, blob: await response.blob() };
+  }
+  if (mime.startsWith('text/') || /^(application\/(json|xml|yaml|rtf)|application\/[\w.+-]+\+(json|xml))$/.test(mime)) {
+    const markdown = mime === 'text/markdown' || (mime === 'text/plain' && /\.m(?:arkdown|d)$/i.test(ref.title));
+    return { kind: markdown ? 'markdown' : 'text', mime, content: await response.text() };
+  }
+  return { kind: mime, mime, blob: await response.blob() };
+}
+
+function scrollToFileLine(panel) {
+  const tab = fileTabs.get(panel);
+  if (!tab?.line || panel.hidden) return;
+  const source = panel.querySelector('.file-preview-source');
+  if (!source) return;
+  const top = source.getBoundingClientRect().top - panel.getBoundingClientRect().top + panel.scrollTop;
+  panel.scrollTop = top + (tab.line - 1) * parseFloat(getComputedStyle(source).lineHeight);
+  tab.line = null;
+}
+
+async function openFileViewer(ref) {
+  const id = ref.href || ref.path;
+  const { panel, signal } = viewer.open({ id, title: ref.title });
+  let tab = fileTabs.get(panel);
+  if (!tab || tab.preview?.message) {
+    tab = { line: ref.line, source: false };
+    fileTabs.set(panel, tab);
+    panel.replaceChildren(renderPreview({ message: 'loading' }));
+    try { tab.preview = await loadFilePreview(ref, signal); }
+    catch { tab.preview = { message: 'failed' }; }
+    if (signal.aborted) return;
+  } else {
+    tab.line = ref.line;
+    if (!tab.preview) return; // the first request will use the most recently requested line
+    if (tab.preview.kind !== 'markdown' || Boolean(ref.line) === tab.source) {
+      scrollToFileLine(panel);
+      return;
+    }
+  }
+  tab.source = Boolean(tab.line);
+  panel.replaceChildren(renderPreview({ ...tab.preview, path: ref.title, line: tab.line, signal }));
+  scrollToFileLine(panel);
 }
 
 function rememberDraft() {
@@ -634,6 +711,7 @@ function relabel() {
   renderSelector();
   renderTranscript();
   renderHistoryPicker();
+  for (const el of root.querySelectorAll('[data-viewer-message]')) el.textContent = t(el.dataset.viewerMessage);
   syncComposer();
 }
 
@@ -1041,8 +1119,10 @@ function buildMessageEl(m) {
   }
   if (m.role === 'assistant') {
     el.innerHTML = `<div class="task-chat-author">${escapeAttr(t('taskChat.assistant'))}</div>`
-      + '<div class="task-chat-body task-chat-md"></div>'
-      // Slot for the interactive dialog / tool / task widgets of this turn.
+      // The reply in order (paintAssistant()): progress notes, the tool chips of the calls after
+      // each, and the answer, which is always this one `.task-chat-body`.
+      + '<div class="task-chat-flow"><div class="task-chat-body task-chat-md" data-block-key="answer"></div></div>'
+      // Slot for the task cards and dialogs of this turn.
       + '<div class="task-chat-widgets"></div>'
       + '<div class="task-chat-status" hidden></div>';
   } else {
@@ -1072,31 +1152,85 @@ function assistantMarkdown(m) {
   return stripAskUserFence(m.content);
 }
 
+// (TPT9383) The reply in reading order, laid out by replyBlocks() (task-chat-model.js): each
+// progress note the agent wrote before calling tools (`.task-chat-note`), the chips of the calls
+// that followed it (`.task-chat-tools`), then the answer (`.task-chat-body`). A segment boundary
+// closes the block being written; later text starts the next one. Elements are kept by block key
+// and redrawn only when their text changed, so a finished note renders once, an expanded chip
+// stays open and a selection inside a note survives the answer streaming below it. The notes
+// and chips before the answer carry `task-chat-step`: the work on the way to it.
 function paintAssistant(m) {
-  const body = m.el && m.el.querySelector('.task-chat-body');
+  const flow = m.el && m.el.querySelector(':scope > .task-chat-flow');
+  const body = flow && flow.querySelector(':scope > .task-chat-body');
   if (!body) return;
   // A code block's Copy button focused in the old render moves into the new one: keep its focus.
-  const focused = body.contains(document.activeElement) ? document.activeElement : null;
-  const md = assistantMarkdown(m);
-  if (md) {
-    body.innerHTML = renderMarkdown(md, { cache: !m.streaming });
-  } else if (m.streaming) {
-    body.innerHTML = '<span class="chat-typing-indicator"><span></span><span></span><span></span></span>';
-  } else {
-    body.textContent = '';
+  const focused = flow.contains(document.activeElement) ? document.activeElement : null;
+  const old = new Map([...flow.children].map(el => [el.dataset.blockKey, el]));
+  // A chip can change groups between two paints: lend every chip of this reply to every group.
+  const chips = new Map([...flow.querySelectorAll(':scope > .task-chat-tools > .task-chat-widget--tool')]
+    .map(el => [el.dataset.widgetId, el]));
+  let prev = null;
+  for (const block of replyBlocks(m)) {
+    let el = old.get(block.key);
+    old.delete(block.key);
+    if (block.kind === 'answer') {
+      el = body;
+      paintAnswer(m, body, block.text);
+    } else if (block.kind === 'note') {
+      if (!el) el = flowBlock('task-chat-note task-chat-md', block.key);
+      paintBlock(el, `md:${block.text}`, () => renderMarkdown(block.text, { cache: true }));
+    } else {
+      if (!el) el = flowBlock('task-chat-tools', block.key);
+      syncWidgetList(el, block.tools.map(tool => ({ id: tool.id, sig: JSON.stringify(tool), record: tool })), renderToolChip, chips);
+    }
+    el.classList.toggle('task-chat-step', block.step);
+    const want = prev ? prev.nextSibling : flow.firstChild;
+    if (el !== want) flow.insertBefore(el, want);
+    prev = el;
   }
-  // A reply that is only widgets (a dialog, a task card) has no text row to show.
-  body.hidden = !md && !m.streaming;
+  for (const el of old.values()) if (el !== body) el.remove();
   m.el.classList.toggle('task-chat-msg--streaming', !!m.streaming);
   attachCopyControls(m.el, m);
   if (focused && focused.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
 }
 
+function flowBlock(className, key) {
+  const el = document.createElement('div');
+  el.className = className;
+  el.dataset.blockKey = key;
+  return el;
+}
+
+// Rewrite a block only when what it shows changed (`sig`): its markdown source, or its typing dots.
+function paintBlock(el, sig, html) {
+  if (blockSig.get(el) === sig) return;
+  blockSig.set(el, sig);
+  el.innerHTML = typeof html === 'function' ? html() : html;
+  for (const image of el.querySelectorAll('img[src^="/api/images/"]')) {
+    if (image.closest('a')) continue;
+    const link = document.createElement('a');
+    link.href = image.getAttribute('src');
+    link.title = image.alt || t('taskChat.embed.image');
+    image.replaceWith(link);
+    link.appendChild(image);
+  }
+}
+
+// The answer: re-rendered as it streams (without the renderMarkdown() memo), the typing dots
+// while the reply has no answer text yet, and nothing at all — hidden — for a finished reply
+// with no text (only widgets: a dialog, a task card).
+function paintAnswer(m, body, text) {
+  if (text) paintBlock(body, `md:${text}`, () => renderMarkdown(text, { cache: !m.streaming }));
+  else paintBlock(body, m.streaming ? 'typing' : '', m.streaming ? TYPING_HTML : '');
+  body.hidden = !text && !m.streaming;
+}
+
 // ── Copy ──
-// Every reply and user turn has a Copy action for its whole text, and every code block of a reply
-// one for that block alone. They are added by the paint step after each markdown render, never by
-// renderMarkdown() (its memoized HTML is shared with the board), so they come back with every
-// re-render of a streaming reply. A code block's button is kept by position across re-renders:
+// Every reply has a Copy action for its answer (its progress notes stay out, TPT9383), every user
+// turn one for its whole text, and every code block of a reply one for that block alone. They
+// are added by the paint step after each markdown render, never by renderMarkdown() (its
+// memoized HTML is shared with the board), so they come back with every re-render of a
+// streaming reply. A code block's button is kept by position across re-renders:
 // the same element moves into the new block, so a press, its focus and "Copied" are not lost.
 
 function attachCopyControls(msgEl, m) {
@@ -1111,8 +1245,15 @@ function attachCopyControls(msgEl, m) {
   }
   // A reply still streaming is not done yet; one that is only widgets has no text at all.
   whole.hidden = !!m.streaming || !messageCopyText(m);
+  // (TPT9383) A reply with progress notes copies its answer alone, and says so.
+  const labelKey = m.role === 'assistant' && replyHasNotes(m) ? 'taskChat.copy.answer' : 'taskChat.copy.message';
+  if (whole.dataset.labelKey !== labelKey) {
+    whole.dataset.labelKey = labelKey;
+    if (!whole.hasAttribute('data-copied')) setCopyLabel(whole, false);
+  }
   const kept = codeCopyButtons.get(msgEl) || [];
-  const blocks = [...msgEl.querySelectorAll('.task-chat-body pre')];
+  // Every code block of the reply, notes and answer alike, in reading order.
+  const blocks = [...msgEl.querySelectorAll('.task-chat-md pre')];
   codeCopyButtons.set(msgEl, blocks.map((pre, i) => {
     const btn = kept[i] || copyButton('task-chat-copy', 'taskChat.copy.button');
     pre.appendChild(btn);
@@ -1171,7 +1312,7 @@ async function copySnippet(btn) {
 function pushMessage(m) {
   // A dialog answer is shown by its dialog alone, never as a turn of its own.
   if (isDialogAnswerTurn(m)) return null;
-  const entry = { dialogs: [], tools: [], taskEvents: [], ...m };
+  const entry = { dialogs: [], tools: [], taskEvents: [], breaks: [], ...m };
   messages.push(entry);
   const list = listEl();
   if (list) {
@@ -1231,7 +1372,13 @@ function setStatus(text) {
 function finishStreaming(finalContent) {
   const m = streamingMessage();
   if (!m) return null;
-  if (typeof finalContent === 'string' && finalContent) m.content = finalContent;
+  // The final text is the streamed one, at most trimmed: keep the streamed copy, which the
+  // segment boundaries and the tools' `at` count in. A different text (nothing streamed, a
+  // provider's own result) replaces it, and its boundaries no longer describe it.
+  if (typeof finalContent === 'string' && finalContent && finalContent.trim() !== m.content.trim()) {
+    m.content = finalContent;
+    m.breaks = [];
+  }
   m.streaming = false;
   const status = m.el && m.el.querySelector('.task-chat-status');
   if (status) { status.hidden = true; status.textContent = ''; }
@@ -1255,10 +1402,11 @@ function scrollToBottom(force) {
 }
 
 // ── Widgets ──
-// Each assistant message has a `.task-chat-widgets` slot holding, in this order, the turn's tool
-// chips, the cards of the tasks it created or updated, and the dialogs it asked.
+// Each assistant message has a `.task-chat-widgets` slot holding, in this order, the cards of
+// the tasks the turn created or updated and the dialogs it asked. Its tool chips are part of the
+// reply's flow, between the runs of text they came between (paintAssistant()).
 
-const WIDGET_GROUPS = ['task-chat-tools', 'task-chat-tasks', 'task-chat-dialogs'];
+const WIDGET_GROUPS = ['task-chat-tasks', 'task-chat-dialogs'];
 
 function fromHtml(html) {
   const tpl = document.createElement('template');
@@ -1277,16 +1425,16 @@ function widgetGroup(slot, cls) {
   return el;
 }
 
-// Reconcile one group with its records `[{ id, sig, record }]`. An element whose record did not
-// change is kept as it is, so an expanded chip or a half-filled dialog survives later frames.
-function syncWidgetGroup(slot, cls, items, build) {
-  if (!items.length && !slot.querySelector(`:scope > .${cls}`)) return;
-  const group = widgetGroup(slot, cls);
+// Reconcile one group's elements with its records `[{ id, sig, record }]`. An element whose
+// record did not change is kept as it is, so an expanded chip or a half-filled dialog survives
+// later frames. `pool` (id -> element) lends elements of other groups: a chip whose call moved
+// into this group keeps its element.
+function syncWidgetList(group, items, build, pool = null) {
   const old = new Map([...group.children].map(el => [el.dataset.widgetId, el]));
   let prev = null;
   for (const item of items) {
     const id = String(item.id);
-    let el = old.get(id);
+    let el = old.get(id) || (pool && pool.get(id)) || null;
     if (!el || widgetSig.get(el) !== item.sig) {
       const next = build(item.record, el);
       if (!next) continue;
@@ -1296,20 +1444,24 @@ function syncWidgetGroup(slot, cls, items, build) {
       el = next;
     }
     old.delete(id);
+    if (pool) pool.delete(id);
     const want = prev ? prev.nextSibling : group.firstChild;
     if (el !== want) group.insertBefore(el, want);
     prev = el;
   }
   for (const el of old.values()) el.remove();
+}
+
+function syncWidgetGroup(slot, cls, items, build) {
+  if (!items.length && !slot.querySelector(`:scope > .${cls}`)) return;
+  const group = widgetGroup(slot, cls);
+  syncWidgetList(group, items, build);
   if (!group.children.length) group.remove();
 }
 
 function paintWidgets(m) {
   const slot = m.el && m.el.querySelector('.task-chat-widgets');
   if (!slot) return;
-  syncWidgetGroup(slot, 'task-chat-tools',
-    (m.tools || []).filter(tool => tool && tool.id != null).map(tool => ({ id: tool.id, sig: JSON.stringify(tool), record: tool })),
-    renderToolChip);
   syncWidgetGroup(slot, 'task-chat-tasks',
     collapseTaskEvents(m.taskEvents).map(entry => ({ id: entry.id, sig: JSON.stringify([entry.action, entry.task]), record: entry })),
     renderTaskWidget);
@@ -1765,6 +1917,7 @@ const TURN_FRAMES = new Set([
   WS_RECV_TYPES.DATA, 'objective-progress', 'objective-thinking', 'objective-retry',
   WS_RECV_TYPES.OBJECTIVE_RESULT, WS_RECV_TYPES.CHAT_READY, WS_RECV_TYPES.EXIT,
   WS_RECV_TYPES.TASK_CHAT_DIALOG, WS_RECV_TYPES.TASK_CHAT_TOOL, WS_RECV_TYPES.TASK_CHAT_TASK,
+  WS_RECV_TYPES.TASK_CHAT_SEGMENT,
 ]);
 
 function handleFrame(msg) {
@@ -1779,7 +1932,7 @@ function handleFrame(msg) {
       if (!msg.running && !(Array.isArray(msg.messages) && msg.messages.length)) wantFresh = true;
       messages = visibleHistory(msg.messages);
       if (msg.title) applyProjectChatTitle(msg.title);
-      if (msg.running) messages.push({ role: 'assistant', content: '', streaming: true, dialogs: [], tools: [], taskEvents: [] });
+      if (msg.running) messages.push({ role: 'assistant', content: '', streaming: true, dialogs: [], tools: [], taskEvents: [], breaks: [] });
       renderTranscript();
       setRunning(msg.running);
       break;
@@ -1852,9 +2005,9 @@ function handleFrame(msg) {
       const content = typeof msg.content === 'string' ? msg.content : '';
       if (!finishStreaming(content) && content) {
         // A turn that finished while no window was attached is flushed after the history,
-        // which normally holds it already.
+        // which normally holds it already (its stored text untrimmed, this one maybe trimmed).
         const last = messages.findLast(m => m.role === 'assistant');
-        if (!last || last.content !== content) pushMessage({ role: 'assistant', content });
+        if (!last || String(last.content || '').trim() !== content.trim()) pushMessage({ role: 'assistant', content });
       }
       setRunning(false);
       break;
@@ -1890,11 +2043,23 @@ function handleFrame(msg) {
       break;
     }
 
+    // (TPT9383) A run of the reply's text ended: the block being written is closed, the chips
+    // of the calls that follow land after it, and later text starts a new block.
+    case WS_RECV_TYPES.TASK_CHAT_SEGMENT: {
+      const m = streamingMessage();
+      if (!m) break;
+      m.breaks = withBreak(m.breaks, msg.at);
+      paintAssistant(m);
+      scrollToBottom(false);
+      break;
+    }
+
     case WS_RECV_TYPES.TASK_CHAT_TOOL: {
       const m = widgetTarget();
       if (!m || !msg.tool) break;
       upsertById(m.tools, msg.tool);
-      paintWidgets(m);
+      // Chips are part of the reply's flow, between the runs of text they came between.
+      paintAssistant(m);
       if (msg.tool.status === 'running') {
         setStatus(t('taskChat.status.tool', { tool: shortToolName(msg.tool.tool || msg.tool.name) }));
       } else {
@@ -1983,6 +2148,12 @@ function handleFrame(msg) {
       break;
 
     case WS_RECV_TYPES.CHAT_ENDED:
+      if (msg.reason === 'account-changed') {
+        const onClosed = embedded?.onClosed;
+        close();
+        onClosed?.();
+        break;
+      }
       clearTimeout(freshTimer);
       if (isProjectChat()) refreshSessionsNav(true);
       if (wantFresh) { connect(); break; }

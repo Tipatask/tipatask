@@ -246,3 +246,96 @@ test('audit recognizes refreshed configuration and a standalone AGENTS guide', a
   assert.equal(state.hasKb, true);
   assert.deepEqual(state.harnessConfiguration.map(c => c.status), ['current', 'current', 'current']);
 });
+
+test('Home setup installs its domain and neutral root guides on desktop and full CLI installs', t => {
+  for (const desktop of [true, false]) {
+    const { root } = fixture(t);
+    writeProjectConfig(root, { projectPresets: ['home'] });
+    if (desktop) copyTemplates('compose-as-you-go', root, null);
+    else installTemplates({ projectRoot: root, placeholders: { PROJECT_NAME: 'Household' } });
+    for (const guide of ['AGENTS.md', 'CLAUDE.md']) {
+      assert.match(read(root, guide), /\.tipatask\/guides\/home\.md/);
+      assert.doesNotMatch(read(root, guide), /caveman|npm run|coding workflow/i);
+    }
+    assert.match(read(root, '.tipatask/guides/home.md'), /meal plan/);
+    assert.match(read(root, 'ai/architecture/GENERAL.md'), /Goals and constraints/);
+    assert.ok(!fs.existsSync(path.join(root, '.claude/skills/tipatask-expert/SKILL.md')));
+    assert.ok(!fs.existsSync(path.join(root, 'preset-b.md')));
+    assert.ok(fs.existsSync(path.join(root, '.claude/settings.json')));
+  }
+});
+
+test('changing work presets retires only unchanged managed guides and respects dry run', t => {
+  const { root } = fixture(t);
+  const skill = '.claude/skills/tipatask-expert/SKILL.md';
+  const refresh = (presets, dryRun = false) => refreshHarnessTemplates(root, serverRoot, { presets, dryRun });
+  refresh(['software', 'home', 'science']);
+  assert.match(read(root, 'AGENTS.md'), /Additional work presets|Work presets/);
+  put(root, 'CLAUDE.md', 'My guide');
+  put(root, '.tipatask/guides/science.md', 'My sources');
+  put(root, '.tipatask/guides/custom.md', 'My custom guide');
+  refresh(['home'], true);
+  assert.ok(fs.existsSync(path.join(root, skill)));
+  refresh(['home']);
+  assert.ok(!fs.existsSync(path.join(root, skill)));
+  assert.doesNotMatch(read(root, 'AGENTS.md'), /[Cc]aveman/);
+  assert.match(read(root, 'AGENTS.md'), /guides\/home/);
+  assert.equal(read(root, 'CLAUDE.md'), 'My guide');
+  assert.equal(read(root, '.tipatask/guides/science.md'), 'My sources');
+  assert.equal(read(root, '.tipatask/guides/custom.md'), 'My custom guide');
+  assert.deepEqual(refresh(['home']).written, []);
+  refresh(['software']);
+  assert.ok(fs.existsSync(path.join(root, skill)));
+  assert.ok(!fs.existsSync(path.join(root, '.tipatask/guides/home.md')));
+  assert.equal(read(root, 'CLAUDE.md'), 'My guide');
+});
+
+test('an upgraded linked checkout adopts only its own API project work presets', t => {
+  const { syncProjectPresets } = require('../server/project-seeder');
+  const { root } = fixture(t);
+  const url = 'https://selected.test';
+  writeProjectConfig(root, { API_PROJECT_ID: '8', API_BASE_URL: url });
+  refreshHarnessTemplates(root, serverRoot);
+  const skill = path.join(root, '.claude/skills/tipatask-expert/SKILL.md');
+  syncProjectPresets(root, { id: 7, projectPresets: ['home'] }, url);
+  syncProjectPresets(root, { id: 8, projectPresets: ['home'] }, 'https://elsewhere.test');
+  assert.ok(fs.existsSync(skill));
+  syncProjectPresets(root, { id: 8, projectPresets: ['home'] }, url);
+  assert.deepEqual(JSON.parse(read(root, '.tipatask/config.json')).projectPresets, ['home']);
+  assert.ok(!fs.existsSync(skill));
+  assert.match(read(root, 'AGENTS.md'), /guides\/home/);
+});
+
+test('startup defaults an unselected linked project to Software and recovers an offline selection on reconnect', async t => {
+  const { initializeProjectSettings } = require('./setup');
+  const { readProjectConfig } = require('../server/project-config');
+  const { projectHarness } = require('../server/project-seeder');
+  for (const selection of [undefined, null, []]) {
+    const { root } = fixture(t);
+    const url = 'https://selected.test';
+    writeProjectConfig(root, { API_PROJECT_ID: '8', API_BASE_URL: url, projectPresets: selection });
+    const backend = {
+      getEffectiveProjectSettings: async () => ({}),
+      getCredentials: () => ({ baseUrl: url }),
+      getProjectSettings: async () => null,
+    };
+    await initializeProjectSettings({ projectRoot: root, backend });
+    assert.ok(projectHarness(root).softwareOnly);
+    assert.deepEqual(readProjectConfig(root).projectPresets, selection);
+    backend.getProjectSettings = async () => ({ id: 8, projectPresets: selection });
+    await initializeProjectSettings({ projectRoot: root, backend });
+    assert.deepEqual(readProjectConfig(root).projectPresets, ['software']);
+    writeProjectSkillsConfig(root, serverRoot);
+    assert.ok(fs.existsSync(path.join(root, '.claude/skills/tipatask-expert/SKILL.md')));
+  }
+  const { root } = fixture(t);
+  writeProjectConfig(root, { API_PROJECT_ID: '8', API_BASE_URL: 'https://selected.test', projectPresets: [] });
+  const backend = {
+    getEffectiveProjectSettings: async () => ({}),
+    getCredentials: () => ({ baseUrl: 'https://selected.test' }),
+    getProjectSettings: async () => ({ id: 8, projectPresets: ['science', 'marketing'] }),
+  };
+  await initializeProjectSettings({ projectRoot: root, backend });
+  assert.deepEqual(readProjectConfig(root).projectPresets, ['science', 'marketing']);
+  assert.match(read(root, 'AGENTS.md'), /guides\/science\.md/);
+});

@@ -299,7 +299,41 @@ test('large claude transcript: only the tail is read, final message still found'
       const text = JSON.stringify(result);
       assert.doesNotMatch(text, /Fixture task|AGENTS\.md|environment_context|Reminder:|sidechain|compacted summary|tool_result|\{"id":"TPT1"\}/);
     });
+
+    // (TPT9383) The note before the tool call and the answer after it stay two runs on resume.
+    test(`(TPT9383) ${provider}: a reply split by a tool call keeps its segment boundary`, () => {
+      const result = readNativeConversation(provider, path.join(FIXTURES, `${provider}.jsonl`));
+      const note = 'Let me check the task first.';
+      assert.deepEqual(result.messages.map(m => m.breaks || null), [null, null, [note.length], null, null]);
+      const reply = result.messages[2];
+      assert.deepEqual([reply.content.slice(0, note.length), reply.content.slice(note.length).trim()], [note, 'Noted: PELICAN.']);
+    });
   }
+
+  test('(TPT9383) a boundary needs a tool call between two texts (Claude, Pi) or a new message (Codex)', () => {
+    const claude = parseClaudeConversation(jl(
+      { type: 'user', message: { role: 'user', content: 'SEED' } },
+      { type: 'user', message: { role: 'user', content: 'Q' } },
+      { type: 'assistant', message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'One.' }] } },
+      { type: 'assistant', message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'Same message.' }] } },
+      { type: 'assistant', message: { id: 'm1', role: 'assistant', content: [{ type: 'tool_use', id: 'tu', name: 'Read', input: {} }] } },
+      { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu', content: 'x' }] } },
+      { type: 'assistant', message: { id: 'm2', role: 'assistant', content: [{ type: 'text', text: 'After.' }] } },
+    ));
+    assert.deepEqual(claude.at(-1), { role: 'assistant', content: 'One.\n\nSame message.\n\nAfter.', breaks: ['One.\n\nSame message.'.length] });
+    const codex = parseCodexConversation(jl(
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'SEED' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Q' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Checking.' }] } },
+      { type: 'response_item', payload: { type: 'local_shell_call', call_id: 'c1' } },
+      { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Found it.' }] } },
+    ));
+    assert.deepEqual(codex.at(-1), { role: 'assistant', content: 'Checking.\n\nFound it.', breaks: ['Checking.'.length] });
+    assert.deepEqual(parseClaudeConversation(jl(
+      { type: 'user', message: { role: 'user', content: 'Q' } },
+      { type: 'assistant', message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'Plain.' }] } },
+    ), { fromStart: false }), [{ role: 'user', content: 'Q' }, { role: 'assistant', content: 'Plain.' }], 'no boundary, no breaks field');
+  });
 
   test('(TPT539) a tail read keeps its first user message: the seed is not in view', () => {
     const raw = fs.readFileSync(path.join(FIXTURES, 'pi.jsonl'), 'utf8');
@@ -319,6 +353,8 @@ test('large claude transcript: only the tail is read, final message still found'
     fs.writeFileSync(file, jl(...turns));
     const capped = readNativeConversation('claude', file, { maxMessages: 10, maxChars: 30 });
     assert.equal(capped.messages.length, 10);
+    const clipped = readNativeConversation('claude', path.join(FIXTURES, 'claude.jsonl'), { maxChars: 20 });
+    assert.equal(clipped.messages[2].breaks, undefined, 'a boundary the clip cut away goes with its text');
     assert.equal(capped.messages.at(-1).content, 'answer 39');
     assert.ok(capped.messages.every(m => m.content.length <= 30));
     const total = readNativeConversation('claude', file, { maxTotalChars: 500 });

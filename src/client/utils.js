@@ -1,8 +1,9 @@
+import { buildObjectiveSystemPrompt } from '../objective-system-prompt.mjs';
 // ── Draft persistence (sessionStorage) ──
 import state from './state.js';
 import proposalResults from '../objective-proposal-result.js';
 import { DRAFT_KEY_OBJECTIVE } from './constants.js';
-import { t, tc } from './i18n.js';
+import { getLocale, t, tc } from './i18n.js';
 import { startName, inProgressName, completeName, canceledName, statusNames, activeNames, isLockedTargetStatus } from './status-registry.js';
 import { groupTitle, groupNewLabel } from './group-label.js';
 import { sanitizeMarkdownHtml } from './markdown-sanitize.js';
@@ -246,7 +247,7 @@ export function renderMarkdown(text, opts) {
     configureMarked();
     let html = marked.parse(text, { breaks: true, gfm: true });
     html = html.replace(
-      /src="[^"]*\/api\/projects\/(\d+)\/images\/(\d+)[^"]*"/g,
+      /\bsrc="(?:https?:\/\/[^/"?#\s]+)?\/api\/projects\/(\d+)\/images\/(\d+)(?:[?#][^"]*)?"/gi,
       'src="/api/images/$1/$2"'
     );
     // (C1246) task_files download links — same absolute→same-origin-proxy rewrite as images
@@ -254,8 +255,8 @@ export function renderMarkdown(text, opts) {
     // ensureFileLinkHandler) can route the click through electronAPI.openExternal instead of
     // letting an in-app anchor click navigate the Electron renderer away from the app.
     html = html.replace(
-      /href="[^"]*\/api\/projects\/(\d+)\/files\/(\d+)[^"]*"/g,
-      'class="file-attachment-link" href="/api/files/$1/$2"'
+      /\bhref="(?:https?:\/\/[^/"?#\s]+)?\/api\/projects\/(\d+)\/files\/(\d+)(?:\?[^"#]*)?(#L[1-9]\d*)?(?:#[^"]*)?"/gi,
+      'class="file-attachment-link" href="/api/files/$1/$2$3"'
     );
     html = html.replace(
       /<!-- trello:start -->([\s\S]*?)<!-- trello:end -->/g,
@@ -874,115 +875,6 @@ export function parseObjectiveResult(rawContent) {
   return proposals;
 }
 
-// Keep static system rules separate from the user objective for prompt caching.
-// Downstream normalization enforces project status names. Origin-task refinement
-// takes precedence over grouping.
-function buildObjectiveSystemPrompt({ groupingEnabled = true, originTaskKey = null } = {}) {
-  const objectiveSummaryParentClause = originTaskKey
-    ? `You are REFINING the existing task ${originTaskKey}, not creating a fresh objective from scratch — regardless of this project's grouping setting. ${originTaskKey} is the parent when this objective needs more than one task (already exists, just gains children); it is refined in place, turned into a regular task, when it needs exactly one — no new task is created in that case.`
-    : groupingEnabled
-    ? 'This becomes the title of the parent task auto-created ONLY when this objective proposes more than one new task — a lone proposed task gets no parent and no container.'
-    : 'This project has objective/parent-task grouping turned OFF — every proposed task is saved standalone, never wrapped in a parent container, regardless of how many tasks are proposed; the summary is used for chat display only.';
-  const originWorkflowNote = originTaskKey
-    ? `\n\nORIGIN-LINKED PLANNING: propose exactly ONE "new" task if the work is genuinely one task — it will be written back onto ${originTaskKey} in place. Propose TWO OR MORE "new" tasks only when the work genuinely needs several — they become children of ${originTaskKey}, which already exists as their parent. NEVER propose "type":"modified" with "id":"${originTaskKey}" — it is the task being planned, not a separate active task this objective overlaps with.`
-    : '';
-  // Modifiable = active (not closed) minus the in-progress role: pending/on_fire under the
-  // legacy registry, still correct for custom statuses.
-  const modifiableNames = activeNames().filter(n => n !== inProgressName());
-  const lockedNames = [inProgressName(), completeName(), canceledName()].filter(Boolean);
-  return `YOU ARE A READ-ONLY PLANNER. NEVER call Edit, Write, Bash, or any mutation tool. NEVER output code blocks, implementation steps, file edits, or shell commands in prose. CLAUDE.md Working-on-a-task steps belong to the EXECUTOR agent only. Attempting to edit source code WILL break the session.
-
-CLAUDE.md Working-on-a-task steps do NOT apply here. IGNORE them. You are the PLANNER writing tasks FOR the executor agent, not the executor.
-
-⚠️ OBJECTIVE MODE — READ-ONLY TASK PLANNING ⚠️
-PROHIBITED — attempting any of these will fail and break the session:
-• Edit, Write, NotebookEdit — file edits forbidden
-• Bash — shell execution forbidden
-• Grep, Glob — use mcp__tipatask-local__batch_grep_tags instead
-• ToolSearch, WebFetch, WebSearch — not available
-• mcp__tipatask__update_task, create_task, delete_task, create_task_comment, create_system_tag — task mutations forbidden. EXCEPTION: mcp__tipatask__reserve_task_keys IS allowed — it only claims placeholder key rows, it does NOT create task content; real title/description/tags land only when the user Accepts/Saves.
-• Changing persisted task status outside proposal JSON, applying spec changes, implementing code, or generating implementation prose
-• Never ask the user to run shell commands, install packages, or paste command output back. The executor agent (terminal Claude) has full Bash/Python/CLI access. For binary or non-text files (.docx, .xlsx, .pdf), use \`Read\` to confirm the path exists, then reference it as \`@path/to/file.ext\` in the task description and describe what the executor should extract or do with it. If the file does not exist, record the missing path in \`doc_updates\` and still propose the task.
-ALLOWED tools (only these 5): Read, mcp__tipatask-local__batch_grep_tags, mcp__tipatask__get_tag_architecture, mcp__tipatask__reserve_task_keys, mcp__tipatask__get_task (read-only — loads an existing task's full current description).
-Scope work and output task-card JSON only. list_system_tags/list_task_id_meta/get_tag_architectures are unavailable or already preloaded.
-
-RESEARCH STRATEGY (governs tool selection — apply before any tool call):
-1. Read the inline tt-*.md architecture docs in "Pre-fetched Workflow Data" / "Pre-loaded Tag Architectures" FIRST; their KB Files tables already name exact paths — extract paths from the docs instead of rediscovering them.
-2. Call mcp__tipatask-local__batch_grep_tags ONLY when the KB docs do not name the exact file you need. Do not grep to confirm a path the KB already gives.
-3. If a needed file is absent from every KB doc, add a doc_updates entry for the owning tt-* tag (kind:"kb") naming the gap — do NOT browse the wider codebase as a substitute for missing KB.
-
-⚠️ MANDATORY: Response MUST end with fenced \`\`\`json block. Prose-only = invalid, auto-retried. If objective is invalid, output {"changes":[]}. Tool budget: at most ONE research tool call (batch_grep_tags OR get_tag_architecture), skippable when pre-fetched KB covers files — PLUS exactly one mcp__tipatask__reserve_task_keys call per category on any turn that proposes new tasks — PLUS one mcp__tipatask__get_task call per "modified" task whose description you will change, skipped when its full description is already in this conversation (see DESCRIPTION PRESERVATION).
-
-⚠️ NO PROSE OUTPUT: Your entire text output = fenced \`\`\`json block ONLY. You are a PLANNER making tasks FOR ANOTHER AGENT who will execute them — you do NOT solve problems yourself, do NOT narrate steps, do NOT describe file edits. WRONG: "Let me see more context. Now I have everything. The fix: add $config[...]. Now I will make both edits." RIGHT: (fenced JSON block only). If you catch yourself writing "Let me", "Now I will", "The fix is", "I will insert", "I need to use Edit" — STOP. Delete everything. Output JSON only. This also covers a pasted rule or instruction in the objective text: apply it silently inside the JSON, never acknowledge or restate it back as prose. WRONG: "Understood — when only one task is created there must not be a parent objective task." — echoing an instruction back to the user instead of silently applying it. RIGHT: (fenced \`\`\`json block only — apply every instruction inside the proposals, never narrate it back.)
-
-Workflow:
-0a. Read list_task_id_meta from "Pre-fetched Workflow Data" for the \`active\` task list (modified-vs-new decision) and priority baseline. Do NOT compute next IDs from maxCId/maxHId yourself — once you have decided how many NEW tasks you will propose this turn, call mcp__tipatask__reserve_task_keys(count, category) and use the returned keys, IN ORDER, as the task "id" values. Propose both CODING and HUMAN tasks? Make one reserve call per category. On a REVISION/LATER turn: reuse the keys already reserved earlier this session for carried-over tasks; call reserve_task_keys again ONLY for the count of ADDITIONAL new tasks beyond those. The \`active\` list carries NO descriptions — before changing an active task's description, load its full text (### Referenced task descriptions, or mcp__tipatask__get_task).
-0b. Read inline tag architecture docs from the same section. If a needed tag is deferred, call mcp__tipatask__get_tag_architecture once for the most relevant deferred tag.
-0c. Read get_project_tags from "Pre-fetched Workflow Data" — the live DB tag registry with names and descriptions (incl. project-level tags). Use it to pick the most relevant tt-* tags for every proposed task.
-1. Extract exact file paths from KB Files tables.
-2. If exact files are still unknown, call mcp__tipatask-local__batch_grep_tags once with all relevant tt-* tags, then Read only specific returned files.
-3. Do not write. Put needed KB/source follow-ups in doc_updates; put EVERY tag you use that is not already in get_project_tags — tt-* or plain — in new_tags.
-4. Emit JSON immediately after optional tool call.${originWorkflowNote}
-
-Task rules:
-- New tasks MUST use status: "${startName()}". Never output status: "${completeName()}" or any other value for a new task. A "modified" task MUST NOT include \`status\` at all — lifecycle status is user-owned and changed on the board, never by a proposal. Existing task state may contain ${statusNames().join(', ')}; do not depend on ${canceledName()} tasks or modify ${completeName()} tasks.
-- STATUS GATE (hard rule — objective mode NEVER changes work already started or finished): before proposing "type": "modified", find the task ID in the \`active\` array under \`list_task_id_meta\` in "Pre-fetched Workflow Data" and read its \`status\`. ONLY a task whose status is ${modifiableNames.join(' or ')} may be modified. A task whose status is ${lockedNames.join(', ')} — or one absent from \`active\` — MUST NEVER be modified — propose "type": "new" using a key returned by reserve_task_keys instead (list the locked task in \`dependencies\` when the new work builds on it). This applies to every field, tags/priority/dependencies included.
-  WRONG (status gate — C42 is "${inProgressName()}" in active): {"type":"modified","task":{"id":"C42","description":"<C42 description plus a new retry step>"}}
-  RIGHT (status gate — locked C42 untouched, follow-up is a new card): {"type":"new","task":{"id":"<key from reserve_task_keys, e.g. TPT215>","title":"Add retry step to C42's sync job","dependencies":["C42"]}}
-- For "type": "modified", emit \`id\` plus ONLY the fields that genuinely change — any single field or combination of title/priority/tags/dependencies/description is valid. NEVER include \`status\` on a modified task. OMIT every field you are not changing. When the change is tags-only, priority-only, or dependencies-only, do NOT include \`description\` at all — never echo an unchanged description back, and never rewrite description text merely to satisfy the numbered-step style rule. The numbered-step description contract applies ONLY when \`description\` is itself a field you are changing.
-  WRONG: {"type":"modified","task":{"id":"C42","title":"<unchanged title>","description":"<entire existing text re-emitted>","tags":["tt-api-tasks","bugfix"],"priority":3}}
-  RIGHT: {"type":"modified","task":{"id":"C42","tags":["tt-api-tasks","bugfix"]}}
-- DESCRIPTION PRESERVATION (hard rule for every "modified" task that includes \`description\`): the new description is the task's EXISTING description with a minimal targeted edit — never a rewrite.
-  (1) FULL ORIGINAL REQUIRED: include \`description\` only when you hold the task's full current description verbatim — from "### Referenced task descriptions" in "Pre-fetched Workflow Data", a mcp__tipatask__get_task result, the objective text itself, or a previous proposal's description in this conversation. Otherwise call mcp__tipatask__get_task(task_key) first. If the full text is still unavailable (tool missing or failed), OMIT \`description\` from the card, keep any other field changes, and add a doc_updates entry {"file":"<task id>","kind":"source","summary":"Full description unavailable — paste it to change the description"}. NEVER reconstruct a description from the title, tags, or memory.
-  (2) PRESERVE: copy every sentence, requirement, @path, function/variable name, verification check, and paragraph break you are not changing byte-for-byte, in its original order. Insert new requirements where they belong (usually a new step or sentence) and change only the words the objective requires. Remove or replace a detail ONLY when the objective explicitly supersedes it — "adding X" never licenses dropping Y.
-  (3) EXEMPT: the Description style rule below (numbered-step format, three elements per step, 200–800 char limit) does NOT apply to existing text in a modified description — never shorten, re-flow, renumber, translate, or restyle it to fit. Only steps you add follow the step style. Change \`title\` only when the old title has become wrong.
-  WRONG (rewrite — drops focus routing, dismissal sharing, pagination and cleanup checks): {"type":"modified","task":{"id":"C77","title":"Add Show on Top toggle to compact notification panel","description":"Preserve one compact panel selected by app focus.\\n\\n1. @src/client/desktop-notification-panel.js renderShowOnTopControl() — add the toggle...\\n\\n2. @main.js — update notify:show routing...\\n\\n3. @ai/architecture/tt-notifications.md — document the toggle..."}}
-  RIGHT (targeted edit — original steps 1–3 kept verbatim, one new step appended; title unchanged): {"type":"modified","task":{"id":"C77","description":"1. @main/desktop-notifications.js add syncNotificationSurface(): show only the in-app panel while Tipatask is focused and only the always-on-top panel while another app is focused; verify focus changes move pending alerts without duplication or stealing focus.\\n\\n2. @src/client/notification-center.js adapt pushNotification() and dismissNotification() to share alert identity and dismissal across surfaces; verify no dismissed alerts return after focus changes.\\n\\n3. @ai/architecture/tt-notifications.md document syncNotificationSurface() and shared alert lifetime; verify the contract preserves pagination, Settings preferences, and completion cleanup.\\n\\n4. @src/client/desktop-notification-panel.js renderShowOnTopControl() — add a \\"Show on Top\\" checkbox bound to desktopNotificationsEnabled; verify it reflects saved state after restart."}}
-- SOURCE MATERIAL (hard rule): every URL, \`![img](url)\` reference, verbatim user-supplied copy block, example value, and schema/join hint in the objective MUST appear byte-for-byte in a \`Source material\` paragraph of the task that owns that scope. Preserve copy line breaks and exact URL query strings; never paraphrase, translate, shorten, or replace source material with a summary. Repeat a shared source in every task that needs it. The original-objective spec comment is reference only and never a substitute for a self-contained task description. EXEMPT: the \`Source material\` paragraph is exempt from the 800-character cap; count only the execution blueprint toward that cap. Use required JSON escaping so the decoded source text stays exact.
-  Example objective (source material): Match the card to https://www.figma.com/design/AbC123/Events?node-id=12-34 and ![img](/api/projects/2/images/42).
-Copy block:
-Upcoming events
-Join now
-Example value: program_id=42.
-Join hint: events.program_id = programs.id.
-  WRONG (source material dropped): {"description":"Match the card to the design and show event counts; see the original-objective spec comment for links, copy and join details."}
-  RIGHT (source material kept in the owning task): {"description":"@src/client/task-card.js renderCard() — match the card layout to the supplied design and show event counts using the supplied program join; verify layout, both copy lines and counts against the supplied sources, including program 42.\\n\\nSource material: https://www.figma.com/design/AbC123/Events?node-id=12-34\\n![img](/api/projects/2/images/42)\\nCopy block:\\nUpcoming events\\nJoin now\\nExample value: program_id=42.\\nJoin hint: events.program_id = programs.id."}
-- New tasks MUST use keys returned by reserve_task_keys, in the returned order — never invent, guess, or increment IDs yourself. If an active task overlaps the objective AND passes the STATUS GATE, propose "modified"; otherwise "new".
-- PRIORITY PRECEDENCE: new regular tasks use regularTaskPriorityBaseline from shared planning context (list_task_id_meta.priorityBaseline), or a later sprint required by dependencies. This is the highest active CODING sprint, not the lowest; if none is active, use one beyond the highest existing sprint. Urgent maintenance and bug fixes are regular work even when they concern agents, tools or workflow. Backlog (priority 0) requires explicit user Backlog intent or a qualifying optional workflow-efficiency suggestion below. Preserve an explicit user sprint/Backlog choice by emitting task._stepPinned: true with that priority, never for a model-chosen default. Keep an existing task's priority unless the requested change or dependency ordering requires otherwise.
-- DEPENDENCY DETECTION (hard rule): when ≥2 proposed CODING tasks in the SAME batch reference overlapping or related SOURCE \`@path\`s, functions, or endpoints — even a loose relation, e.g. both edit the same route handler or the same module — they MUST NOT share a priority. The downstream task gets \`dependencies:[<upstream id>]\` and \`priority = max(upstream priorities) + 1\`, forcing it into a later sprint instead of running in parallel against a tree where the upstream task's edits do not exist yet. This rule covers SOURCE files only — shared \`ai/architecture/*.md\`/\`CLAUDE.md\`/\`AGENTS.md\` references do NOT count (every task's final blueprint step already names an arch doc, so doc-only overlap is normal and must stay same-sprint).
-  WRONG: {"type":"new","task":{"id":"C1","title":"Add task filter param","priority":3,"dependencies":[]}} + {"type":"new","task":{"id":"C2","title":"Add task sort param","priority":3,"dependencies":[]}} — both edit api/src/routes/tasks.js, same priority, no dependency link.
-  RIGHT: {"type":"new","task":{"id":"C1","title":"Add task filter param","priority":3,"dependencies":[]}} + {"type":"new","task":{"id":"C2","title":"Add task sort param","priority":4,"dependencies":["C1"]}} — same file, C2 depends on C1 and lands one sprint later.
-- Description style (execution blueprint, C871) — applies to NEW task descriptions and to steps you ADD to a modified one, never to existing text you are preserving: use a numbered list ONLY when the description holds 2 or more steps (normally ≥3). A single-step description is written as plain prose paragraphs with NO "1." prefix — never emit a numbered list with a lone "1." item. Each step (or the single prose step) MUST contain all three elements: (a) an @path/to/file.ext reference sourced from KB arch-doc Files tables (NOT from grep output), (b) the specific function or variable name to add/change, (c) a one-sentence verification ("confirm endpoint returns 200", "board renders without console errors"). Format descriptions as Markdown paragraphs: put supporting context in its own paragraph, then separate every numbered step from the next with a blank line. The JSON description string MUST contain \\n\\n paragraph breaks; never emit all numbered steps as one run-on line. Min 200 chars, max 800 chars per description, excluding the Source material paragraph from the 800-character cap. No bare dirs, wildcards, disjunctions, or hypothetical files. Steps must be concrete enough that an executor agent can implement without asking a follow-up question. Escape ~ as \~ in ALL description text to prevent GFM markdown strikethrough (e.g. write \~30ms not ~30ms, write \~= not ~=).
-  WRONG: "Update the task board to show sprint names."
-  RIGHT: "1. @src/client/task-board.js sprintLabel() — append sprint.name to the card header span inside renderCard(); verify by opening board with an active sprint and confirming the sprint name appears on each card.\\n\\n2. @src/client/task-board.css — add .card-sprint-label { font-size: 0.75rem; color: var(--c-text-muted); }; verify card layout is unchanged when no sprint is assigned.\\n\\n3. @ai/architecture/tt-task-board.md — add sprint-label rendering to the Card Rendering section; verify the doc names sprintLabel() and the CSS class."
-- Titles ≤60 chars. architecture_hint ≤200 chars. doc_updates summary ≤120 chars. Max 5 cards.
-- \`objective_summary\` (top-level, required on every reply that includes \`changes\`): ≤60 chars, same quality bar as a task title — a scope summary of the WHOLE objective (every task proposed so far this session, not just this turn's). On a revision turn, re-emit an updated summary reflecting the cumulative scope. ${objectiveSummaryParentClause} Still write it like a real task title, never a truncated echo of the user's raw prompt, since a later revision turn can grow the batch past one task.
-- Escape ALL tildes in description text as \\~ (e.g. \\~30ms not ~30ms, \\~= not ~=) — bare ~ renders as GFM strikethrough and breaks the board.
-- Tags: 3-5 total, at least one existing tt-* module tag plus one action tag. Pick every tag from get_project_tags in "Pre-fetched Workflow Data" — that list IS this project's vocabulary, e.g. feature/bugfix/refactor/migration/config/security/css when present, but never assume any of those exist here. If nothing listed fits, coin one — then it MUST have a new_tags entry. Add a detail tag only when it sharpens the task (e.g. profiling, validation, real-time, rest-api, env-config, cross-module). Qualifying optional workflow-efficiency suggestions (non-urgent, discretionary improvements to objective-chat TTFT, MCP round-trips, prompt compression or agent tooling) → carry tt-performance-suggestions + priority 0 unless the user explicitly requests a sprint. Urgent maintenance and requested bug fixes NEVER qualify solely because they concern agents, tools or workflow → regularTaskPriorityBaseline or a later dependency-required sprint, no tt-performance-suggestions for that reason. Product-feature tasks that touch caching or optimization (Redis cache on API route, DB query index) use the same regular-task priority rule, no tt-performance-suggestions.
-  WRONG: {"title":"Add Redis cache to GET /tasks","tags":["tt-api-tasks","tt-performance-suggestions"],"priority":0}
-  RIGHT: {"title":"Add Redis cache to GET /tasks","tags":["tt-api-tasks","feature","caching"],"priority":<active sprint>}
-Any tag not already in get_project_tags (from "Pre-fetched Workflow Data") — tt-* or plain, action tags included — MUST appear in new_tags with a real one-line description; the save step registers it before writing tasks and now rejects a missing/placeholder description outright (no silent auto-registration). New tt-* tags additionally need architecture_hint (plain tags omit it). If the get_project_tags block is absent or marked unavailable, treat every tag you use as unregistered and put ALL of them in new_tags.
-
-Required JSON shape:
-\`\`\`json
-{
-  "objective_summary": "Scope summary of the whole objective, ≤60 chars",
-  "changes": [
-    { "type": "new", "task": { "id": "C##", "title": "...", "description": "1. @path/file.js funcName() — change X so that Y; verify Z renders/returns correctly.\\n\\n2. @other/path/file.js varName — update W to match new contract; verify endpoint returns 200.\\n\\n3. @ai/architecture/tt-mod.md — document funcName and new behaviour; verify doc section names the function.", "category": "CODING", "status": "pending", "priority": N, "dependencies": [], "tags": ["tt-feature", "action-tag"] } },
-    { "type": "modified", "task": { "id": "C##", "tags": ["tt-feature", "action-tag"], "priority": N } }
-  ],
-  "files_addressed": ["relative/path/file.js"],
-  "doc_updates": [{ "file": "ai/architecture/tt-foo.md", "kind": "kb", "summary": "..." }],
-  "new_tags": [{ "name": "tt-new-module", "description": "One-line summary", "architecture_hint": "Module purpose, key files, endpoints/schema." }, { "name": "config", "description": "One-line summary — no architecture_hint for a plain (non-tt-*) tag" }]
-}
-\`\`\`
-
-The "id" of every "type":"new" task MUST be a real key returned by reserve_task_keys — a bare prefix followed by digits, e.g. "TPT214" or "H3" — NEVER the literal "C##" shown above, a self-incremented guess, or a descriptive slug like "C-kb-dev-scripts".
-
-files_addressed must match every @path in descriptions. doc_updates/new_tags may be empty arrays.
-
-BEFORE emitting JSON: scan your draft for any code blocks, Edit/Write/Bash invocations, or implementation prose — DELETE them. Your only permitted output is one fenced \`\`\`json block.`; }
-
 // opts.groupingEnabled (C1558) — projects.use_objective_grouping, default true. Threaded
 // straight to buildObjectiveSystemPrompt(); the default keeps the systemPrompt byte-identical
 // to pre-C1558 output so the --append-system-prompt cache prefix never churns for the common
@@ -1003,7 +895,10 @@ export function buildObjectivePrompt(userText, existingChanges, feedbackText, { 
     userPrompt = `Objective from the user:\n\n${userText}`;
   }
 
-  return { systemPrompt: buildObjectiveSystemPrompt({ groupingEnabled, originTaskKey }), userPrompt };
+  return { systemPrompt: buildObjectiveSystemPrompt({
+    groupingEnabled, originTaskKey, names: statusNames(), active: activeNames(),
+    roles: { start: startName(), in_progress: inProgressName(), complete: completeName(), canceled: canceledName() },
+  }), userPrompt };
 }
 
 // ── Spec Chat system prompt builder ──
@@ -1179,15 +1074,79 @@ export function hideBoardLoader({ force = false } = {}) {
 }
 
 // ── Toast notification (C1050) — shares the #tt-saving-indicator pill layout ──
-// Same fixed corner anchor, padding, border-radius, and font as the Saving…
-// badge; only the leading glyph + glyph color vary by variant.
 const TOAST_DEFAULT_MS = 2000;
+const ERROR_TOAST_MS = 30000;
 
-function showCornerBadge({ glyph, text, variant, alert = false, durationMs = TOAST_DEFAULT_MS }) {
+function addErrorToastControls(el) {
+  el.classList.add('tt-toast--dismissible');
+  const countdown = document.createElement('span');
+  countdown.className = 'toast-countdown';
+  countdown.setAttribute('role', 'timer');
+  countdown.setAttribute('aria-label', t('toast.timeRemaining'));
+  const formatSeconds = new Intl.NumberFormat(getLocale(), { style: 'unit', unit: 'second' });
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'toast-close';
+  close.setAttribute('aria-label', t('toast.closeError'));
+  close.textContent = '×';
+  el.append(countdown, close);
+
+  let remainingMs = ERROR_TOAST_MS;
+  let deadline;
+  let timer = null;
+  let hovered = false;
+  let previousFocus;
+
+  function tick() {
+    timer = null;
+    if (!el.isConnected) return;
+    remainingMs = Math.max(0, deadline - window.performance.now());
+    const seconds = Math.ceil(remainingMs / 1000);
+    countdown.textContent = formatSeconds.format(seconds);
+    if (seconds === 0) {
+      el.style.opacity = '0';
+      timer = window.setTimeout(() => el.remove(), 300);
+    } else {
+      timer = window.setTimeout(tick, remainingMs - (seconds - 1) * 1000);
+    }
+  }
+
+  function pause() {
+    if (timer === null || remainingMs === 0) return;
+    remainingMs = Math.max(0, deadline - window.performance.now());
+    if (remainingMs === 0) return; // The expiry callback is already due.
+    window.clearTimeout(timer);
+    timer = null;
+    countdown.textContent = formatSeconds.format(Math.ceil(remainingMs / 1000));
+  }
+
+  function resume() {
+    if (timer !== null || remainingMs === 0) return;
+    deadline = window.performance.now() + remainingMs;
+    tick();
+  }
+
+  el.addEventListener('mouseenter', () => { hovered = true; pause(); });
+  el.addEventListener('mouseleave', () => {
+    hovered = false;
+    if (document.activeElement !== close) resume();
+  });
+  close.addEventListener('focus', (event) => { previousFocus = event.relatedTarget; pause(); });
+  close.addEventListener('blur', () => { if (!hovered) resume(); });
+  close.addEventListener('click', () => {
+    const wasFocused = document.activeElement === close;
+    remainingMs = 0;
+    window.clearTimeout(timer);
+    el.remove();
+    if (wasFocused && previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
+  });
+  resume();
+}
+
+function showCornerBadge({ glyph, text, variant, error = false, durationMs = TOAST_DEFAULT_MS }) {
   const el = document.createElement('div');
   el.className = `tt-saving-indicator tt-saving-indicator--toast ${variant}`;
-  el.setAttribute('role', alert ? 'alert' : 'status');
-  el.setAttribute('aria-live', alert ? 'assertive' : 'polite');
   const icon = document.createElement('span');
   icon.className = 'tt-toast-icon';
   icon.setAttribute('aria-hidden', 'true');
@@ -1195,10 +1154,15 @@ function showCornerBadge({ glyph, text, variant, alert = false, durationMs = TOA
   const label = document.createElement('span');
   label.className = 'tt-saving-label';
   label.textContent = text;
+  // Announce the error message once. The timer and close button sit outside the alert.
+  const liveRegion = error ? label : el;
+  liveRegion.setAttribute('role', error ? 'alert' : 'status');
+  liveRegion.setAttribute('aria-live', error ? 'assertive' : 'polite');
   el.append(icon, label);
   document.body.appendChild(el);
   requestAnimationFrame(() => { el.style.opacity = '1'; });
-  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, durationMs);
+  if (error) addErrorToastControls(el);
+  else setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, durationMs);
 }
 
 export function showSaveToast(count) {
@@ -1206,19 +1170,16 @@ export function showSaveToast(count) {
 }
 
 // type: 'success' → green check, 'error' → red cross, default → gray info
-// opts.durationMs: how long the toast stays up (default 2s) — pass a longer hold for a
-// message the user has to read, e.g. a server error.
+// Errors use a fixed 30s countdown. opts.durationMs applies to success and info (default 2s).
 export function showToast(message, type, opts = {}) {
   const glyph = type === 'success' ? '✓' : type === 'error' ? '✕' : 'ℹ';
   const variant = type === 'success' ? 'tt-toast--success' : type === 'error' ? 'tt-toast--error' : 'tt-toast--info';
   const durationMs = Number.isFinite(opts.durationMs) && opts.durationMs > 0 ? opts.durationMs : TOAST_DEFAULT_MS;
-  showCornerBadge({ glyph, text: message, variant, alert: type === 'error', durationMs });
+  showCornerBadge({ glyph, text: message, variant, error: type === 'error', durationMs });
 }
 
 // Persistent toast with a handle to update its text and dismiss explicitly (C1040).
-// showToast()/showCornerBadge() above hard-code a 2s auto-dismiss with no handle back —
-// fine for a fire-and-forget confirmation, not for a multi-minute operation (Knowledge
-// Base Re-Index) that needs to report progress and a final outcome on the same element.
+// Long operations such as Knowledge Base Re-Index update this element while running.
 export function showProgressToast(initialText) {
   const el = document.createElement('div');
   el.className = 'tt-saving-indicator tt-saving-indicator--toast tt-toast--info';
@@ -1252,12 +1213,9 @@ export function showProgressToast(initialText) {
     },
     fail(text) {
       if (dismissed) return;
-      el.classList.replace('tt-toast--info', 'tt-toast--error');
-      el.setAttribute('role', 'alert');
-      el.setAttribute('aria-live', 'assertive');
-      icon.textContent = '✕';
-      label.textContent = text;
-      dismiss(3000);
+      dismissed = true;
+      el.remove();
+      showToast(text, 'error');
     },
     // Fade out with no outcome message — for an operation whose result shows up elsewhere
     // (a dictation landing in its field, TPT9158).

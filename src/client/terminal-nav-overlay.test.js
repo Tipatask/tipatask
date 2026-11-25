@@ -96,11 +96,18 @@ test('rail rows are not rewritten when their markup is unchanged', () => {
 });
 
 test('Project Board / Create rail buttons minimize an open task terminal before navigating', () => {
+  // One helper holds what every left-menu navigation does first; the Project Board click and a
+  // pick in the Create flyout (openCreateMode()) both go through it before they navigate.
+  const guard = fnBody(template, 'function leaveTaskSurfacesForNav(retry) {', '');
+  assert.match(guard, /if \(state\.activeTerminal\) \{\s*state\.activeTerminal\.detach\?\.\(\{ refreshBoard: false \}\);\s*state\.pendingRestoreContext = null;/,
+    'left-menu navigation must detach state.activeTerminal and drop its scroll-restore context');
   const handler = template.slice(template.indexOf("panel.querySelectorAll('.left-nav-btn[data-section]').forEach"));
-  const minimize = handler.indexOf('state.activeTerminal.detach?.({ refreshBoard: false })');
-  assert.ok(minimize > -1, 'section nav handler must detach state.activeTerminal');
-  assert.ok(minimize < handler.indexOf("perfStart('nav-section-switch'"), 'detach must precede navigation');
-  assert.match(handler.slice(0, handler.indexOf("perfStart('nav-section-switch'")), /state\.pendingRestoreContext = null/);
+  const pick = fnBody(template, 'function openCreateMode(mode) {', '');
+  for (const [name, src] of [['the Project Board click', handler], ['a Create flyout pick', pick]]) {
+    const guarded = src.indexOf('if (!leaveTaskSurfacesForNav(');
+    assert.ok(guarded > -1, `${name} must go through leaveTaskSurfacesForNav()`);
+    assert.ok(guarded < src.indexOf("perfStart('nav-section-switch'"), `${name}: detach must precede navigation`);
+  }
 });
 
 // (TPT479) The task workspace is one stable frame: rail uncovered on every pane, one header

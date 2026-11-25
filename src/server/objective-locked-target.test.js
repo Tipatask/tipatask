@@ -60,7 +60,7 @@ for (const rows of [LEGACY_STATUSES, renamed]) {
       const session = { type: 'objective', ws, messages: [] };
       const env = { console, config: {}, isAgentChatType, isAgentChatId, wireSessionLifecycle() {}, getTaskAgentInfo: () => ({}), configForProject: () => ({}),
         listVisibleObjectiveProviders: () => [], _agentLabels: () => ({}), getAvailableAgentsPeek: () => [], listTaskAgentStatusesPeek: () => [], fetchStatusContext, assertEditableModifiedTargets,
-        forcePendingProposalStatuses, clearTimeout, dropObjectiveSession() {} };
+        forcePendingProposalStatuses, clearTimeout, chatContextIsCurrent: () => true, dropObjectiveSession() {} };
       vm.createContext(env);
       vm.runInContext(source.slice(start, source.indexOf('\n}', start) + 2), env);
       env.wireClient(ws, session, 'objective', 'objective', new Map(), backend);

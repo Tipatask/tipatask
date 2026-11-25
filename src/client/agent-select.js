@@ -457,6 +457,9 @@ export function buildAgentCardRows({ agents, piModels = [], enabledIds = [], def
   return out;
 }
 
+// (TPT9387) Counter behind each rendered picker's id prefix (see `uid` in renderAgentSelect()).
+let _pickerSeq = 0;
+
 /**
  * Render agent selection into container.
  * @param {HTMLElement} container - mount target (contents replaced)
@@ -494,6 +497,9 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
   }
 
   const single = availableOnes.length <= 1;
+  // (TPT9387) Per-render prefix for the Default radios' ids, so two pickers on screen at once
+  // (a wizard under Edit Agents) never share one: each card's name cell is a <label for> its radio.
+  const uid = String(++_pickerSeq);
   const availableIdSet = new Set(availableOnes.map(a => a.id));
   const piAvailable = availableIdSet.has('pi');
 
@@ -593,9 +599,10 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     ? `<p class="setup-modal-hint">${t('agentSelect.oneAgentDetected')}</p>`
     : `<p class="setup-modal-hint">${t('agentSelect.enableAgentsHint')}</p>`;
   const recheckHtml = typeof onReCheck === 'function' ? _recheckBtnHtml() : '';
+  // `--single`: one installed agent, so no card has an enable switch (see buildAgentCardRows()).
   container.innerHTML = `
     <div class="setup-modal-agent-header">${headerNote}${recheckHtml}</div>
-    <div class="setup-modal-agent-grid"></div>
+    <div class="setup-modal-agent-grid${single ? ' setup-modal-agent-grid--single' : ''}"></div>
     <p class="setup-modal-agent-extra-note setup-modal-agent-unchecked-note" hidden>${_esc(t('agentSelect.uncheckedNotSaved'))}</p>`;
   if (recheckHtml) _wireRecheck(container, onReCheck);
 
@@ -619,11 +626,14 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     let html = '';
     cards.forEach((d, i) => {
       const model = modelView(d);
-      html += _cardHtml(d, model);
-      if (model?.editable && form?.mode === 'model' && form.id === d.id) {
+      // The card whose inline form is open right under it: the two are drawn as one unit.
+      const modelFormOpen = !!model?.editable && form?.mode === 'model' && form.id === d.id;
+      const piFormOpen = d.kind === 'pi-model' && form?.mode === 'edit' && form.idx === d.piIdx;
+      html += _cardHtml(d, model, { uid, editing: modelFormOpen || piFormOpen });
+      if (modelFormOpen) {
         html += _modelFormHtml(d.id, d.name, modelSelects[d.id], agentModels[d.id]);
       }
-      if (d.kind === 'pi-model' && form?.mode === 'edit' && form.idx === d.piIdx) {
+      if (piFormOpen) {
         html += _piFormHtml(form, piModels.length);
       }
       // After the last Pi card: the inline Add form, or the quiet "+ Add model" row.
@@ -642,6 +652,16 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
   const refocus = (cls, id, piIdx) => {
     const idx = id === 'pi' ? `[data-pi-idx="${piIdx}"]` : '';
     gridEl.querySelector(`.${cls}[data-id="${id}"]${idx}`)?.focus();
+  };
+
+  // (TPT9387) Where focus goes once the Pi form closes or a model row is removed — the rebuild
+  // replaced the control that had it, and keyboard users must not be dropped to <body>: that row's
+  // ✎ (or the × now at the removed row's place), else "+ Add model", else the last row's ✎.
+  const focusPiControl = (cls, idx) => {
+    const target = (idx >= 0 && gridEl.querySelector(`.${cls}[data-pi-idx="${idx}"]`))
+      || gridEl.querySelector('.sma-pi-add:not(:disabled)')
+      || gridEl.querySelector(`.sma-pi-edit[data-pi-idx="${piModels.length - 1}"]`);
+    target?.focus();
   };
 
   const openForm = (mode, idx) => {
@@ -723,14 +743,29 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
   // ── (TPT191) Model typeahead ──────────────────────────────────────────────
   // Suggestions from GET /api/pi/models for the draft's provider, filtered client-side. An
   // aid only: the input stays free text and an empty/failed catalog just shows nothing. The
-  // list is portaled to <body> (the grid scrolls and would clip it) and sits above every host
-  // modal. Picking mutates the draft + input in place — no re-render, the caret stays put.
-  let suggest = null; // { el, input, items, active }
+  // list is portaled to <body> (a scrolling grid or step body would clip it) and sits above
+  // every host modal. Picking mutates the draft + input in place — no re-render, the caret stays
+  // put.
+  let suggest = null; // { el, input, items, active, at }
+  // The list is placed at the input's on-screen rect (`at`), so a scroll that moves the input
+  // closes it: the grid's own scroll (Edit Agents) or the fixed-size wizards' scrolling step body
+  // (TPT9386). Scroll events don't bubble, so this listens in the capture phase on document while
+  // the list is open, reacts only to a scroller that contains the input (never the list's own
+  // scroll), and only when the input really moved — the scroll that focusing or scrollIntoView()
+  // starts just before the list opens arrives afterwards, with the input already where the list
+  // was placed.
+  const closeOnScroll = (e) => {
+    const scroller = e.target;
+    if (!suggest || scroller === document || !scroller?.contains?.(suggest.input)) return;
+    const r = suggest.input.getBoundingClientRect();
+    if (!suggest.at || r.top !== suggest.at.top || r.left !== suggest.at.left) closeSuggest();
+  };
   function closeSuggest() {
     if (!suggest) return;
     suggest.el.remove();
     suggest.input.setAttribute('aria-expanded', 'false');
     suggest = null;
+    document.removeEventListener('scroll', closeOnScroll, true);
   }
   const pickSuggestion = (catalogId) => {
     if (!form || !suggest) return;
@@ -745,6 +780,7 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     const { el, input, items, active } = suggest;
     el.innerHTML = items.map((id, i) => `<div class="sma-pi-suggest-option${i === active ? ' active' : ''}" role="option" data-index="${i}">${_esc(id)}</div>`).join('');
     const r = input.getBoundingClientRect();
+    suggest.at = { top: r.top, left: r.left };
     const below = window.innerHeight - r.bottom;
     const h = Math.min(el.scrollHeight, 220);
     el.style.left = `${r.left}px`;
@@ -775,8 +811,9 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
         if (opt && suggest) pickSuggestion(suggest.items[Number(opt.dataset.index)]);
       });
       document.body.appendChild(el);
+      document.addEventListener('scroll', closeOnScroll, { capture: true, passive: true });
       input.setAttribute('aria-expanded', 'true');
-      suggest = { el, input, items, active: -1 };
+      suggest = { el, input, items, active: -1, at: null };
     } else {
       suggest.items = items;
       suggest.active = -1;
@@ -813,7 +850,6 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
   }
   gridEl.addEventListener('focusin', (e) => { if (e.target.matches('.sma-pi-model')) openSuggest(e.target); });
   gridEl.addEventListener('focusout', (e) => { if (e.target.matches('.sma-pi-model')) closeSuggest(); });
-  gridEl.addEventListener('scroll', closeSuggest, { passive: true });
 
   // Validate, then commit the form's draft as a checked row. `_displayRow()` strips a typed
   // `openrouter/` so the working array stays in display form whichever form was typed; _piRow()
@@ -832,6 +868,7 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     syncPiEnabledId();
     renderGrid();
     emit();
+    focusPiControl('sma-pi-edit', editIdx);
   };
 
   const removeRow = (idx) => {
@@ -845,6 +882,7 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     syncPiEnabledId();
     renderGrid();
     emit();
+    focusPiControl('sma-pi-remove', Math.min(idx, piModels.length - 1));
   };
 
   // ── Checkbox / radio ──────────────────────────────────────────────────────
@@ -980,9 +1018,11 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
     } else if (btn.classList.contains('sma-pi-remove')) {
       removeRow(Number(btn.dataset.piIdx));
     } else if (btn.classList.contains('sma-pi-form-cancel')) {
+      const editIdx = form?.mode === 'edit' ? form.idx : -1;
       form = null;
       closeSuggest();
       renderGrid();
+      focusPiControl('sma-pi-edit', editIdx);
     } else if (btn.classList.contains('sma-pi-form-save')) {
       submitForm();
     } else if (btn.classList.contains('sma-model-edit')) {
@@ -1028,6 +1068,8 @@ export function renderAgentSelect(container, { agents, value, onChange, onReChec
 }
 
 // Render the all-unavailable empty state: install commands per agent + Re-Check button.
+// (TPT9387) Same header row as the populated grid (hint | Re-Check), so Re-Check stays put when
+// the grid replaces this list; each agent is a row reading `<name> · <status>` like a card.
 function _renderEmpty(container, agents, onReCheck) {
   const items = agents.map(({ id, label, reason, detail }) => {
     const color = AGENT_COLORS[id] || '#888';
@@ -1035,35 +1077,46 @@ function _renderEmpty(container, agents, onReCheck) {
     // Non-"not found" reason (e.g. "not logged in") — installed but broken:
     // show the real reason instead of a misleading install command.
     const installed = reason && !/not found/i.test(reason);
-    const detailHtml = installed
-      ? `<span class="setup-modal-agent-unavailable" title="${_esc(_unavailHint(reason))}">${_esc(reason)}</span>`
-      : `<code>${_esc(cmd)}</code>`;
+    const statusHtml = installed
+      ? `<span class="setup-modal-agent-unavailable" title="${_esc(_unavailHint(reason))}">${_esc(_unavailText(reason))}</span>`
+      : `<span class="setup-modal-agent-unavailable">${_esc(t('agentSelect.notInstalled'))}</span>`;
+    const cmdHtml = installed ? '' : `<code class="setup-modal-agent-install">${_esc(cmd)}</code>`;
     // (TPT567) Same launcher/probe diagnostics as the card grid — this all-unavailable list is
     // what a Windows user whose CLIs both fail detection actually sees.
     const diagHtml = _detailHtml(detail);
     return `
       <li class="setup-modal-agent-empty-item">
-        <span class="setup-modal-agent-dot" style="background:${color}"></span>
-        <span class="setup-modal-agent-name">${_esc(_displayName(id, label))}</span>
-        ${detailHtml}
+        <span class="setup-modal-agent-ident">
+          <span class="setup-modal-agent-dot" style="background:${color}"></span>
+          <span class="setup-modal-agent-name">${_esc(_displayName(id, label))}</span>
+          <span class="setup-modal-agent-sep" aria-hidden="true">·</span>${statusHtml}
+        </span>
+        ${cmdHtml}
         ${diagHtml}
       </li>`;
   }).join('');
 
   container.innerHTML = `
     <div class="setup-modal-agent-empty">
-      <p class="setup-modal-hint">${t('agentSelect.noAgentsDetected')}</p>
+      <div class="setup-modal-agent-header">
+        <p class="setup-modal-hint">${_esc(t('agentSelect.noAgentsDetected'))}</p>
+        ${_recheckBtnHtml()}
+      </div>
       <ul class="setup-modal-agent-empty-list">${items}</ul>
-      ${_recheckBtnHtml()}
     </div>`;
 
   _wireRecheck(container, onReCheck);
 }
 
+// Circular-arrow glyph for Re-Check; stroked in currentColor, so the loading state's transparent
+// text hides it with the label.
+const RECHECK_ICON = '<svg class="setup-modal-agent-recheck-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">'
+  + '<path d="M20 12a8 8 0 1 1-2.34-5.66L20 8"/><path d="M20 3v5h-5"/></svg>';
+
 // Re-Check button markup, shared by the empty state and the populated grid header.
 // No id — both render paths can be on screen across re-renders and must not collide.
 function _recheckBtnHtml() {
-  return `<button type="button" class="setup-modal-btn setup-modal-btn--secondary setup-modal-agent-recheck">${_esc(t('agentSelect.recheck'))}</button>`;
+  return `<button type="button" class="setup-modal-btn setup-modal-btn--secondary setup-modal-agent-recheck">${RECHECK_ICON}<span>${_esc(t('agentSelect.recheck'))}</span></button>`;
 }
 
 // Wire the click handler for a Re-Check button rendered into container by either
@@ -1086,37 +1139,54 @@ function _wireRecheck(container, onReCheck) {
   });
 }
 
-// One card from a buildAgentCardRows() descriptor. The Pi model rows carry data-pi-idx (the
-// display index) next to data-id="pi"; every Pi radio shares the single `sma-default` group with
-// value="pi", so the emitted taskAgent is always the literal 'pi'. `model` ({value, label,
-// editable}, TPT637) is set only for a Claude/Codex card the caller gave a modelSelects entry —
-// without it every card renders exactly as before.
-function _cardHtml(d, model = null) {
+// One card from a buildAgentCardRows() descriptor (TPT9387), its cells on the grid's five shared
+// columns:
+//   enable switch | dot · name · status or model | badge | ✎ × | Default pill
+// The Pi model rows carry data-pi-idx (the display index) next to data-id="pi"; every Pi radio
+// shares the single `sma-default` group with value="pi", so the emitted taskAgent is always the
+// literal 'pi'. `model` ({value, label, editable}, TPT637) is set only for a Claude/Codex card the
+// caller gave a modelSelects entry — without it the name cell holds the plain name. `uid` prefixes
+// the Default radio's id: the name cell is a second <label> for that radio, so a click on the
+// name picks the Default and the radio is announced with its agent ("Claude Code Default"), not as
+// a bare "Default". `editing` marks the card whose inline form is open right under it.
+function _cardHtml(d, model = null, { uid = '', editing = false } = {}) {
   const piAttr = d.kind === 'pi-model' ? ` data-pi-idx="${d.piIdx}"` : '';
+  const radioId = d.hasRadio && uid ? `sma-default-${uid}-${d.id}${d.kind === 'pi-model' ? `-${d.piIdx}` : ''}` : '';
+  // The enable control: a native checkbox drawn as a switch (role="switch" is announced on/off),
+  // named after the agent or model it turns on.
   const checkHtml = d.hasCheckbox
-    ? `<input type="checkbox" class="sma-cb" data-id="${_esc(d.id)}"${piAttr}${d.enabled ? ' checked' : ''}${!d.available ? ' disabled' : ''} />`
+    ? `<input type="checkbox" role="switch" class="sma-cb" data-id="${_esc(d.id)}"${piAttr} aria-label="${_esc(d.name)}"${d.enabled ? ' checked' : ''}${!d.available ? ' disabled' : ''} />`
     : '';
+  // The Default pill. The native radio lies transparently over it, so it stays focusable and the
+  // group keeps its arrow keys; the mark is a ring that becomes a tick when the radio is checked.
   const radioHtml = d.hasRadio
     ? `<label class="setup-modal-agent-default-wrap">
-          <input type="radio" name="sma-default" class="sma-radio" data-id="${_esc(d.id)}"${piAttr} value="${_esc(d.id)}"${d.isDefault ? ' checked' : ''}${!d.available || !d.enabled ? ' disabled' : ''} />
+          <input type="radio" name="sma-default" class="sma-radio"${radioId ? ` id="${radioId}"` : ''} data-id="${_esc(d.id)}"${piAttr} value="${_esc(d.id)}"${d.isDefault ? ' checked' : ''}${!d.available || !d.enabled ? ' disabled' : ''} />
+          <span class="setup-modal-agent-default-mark" aria-hidden="true"></span>
           <span class="setup-modal-agent-default-label">${_esc(t('agentSelect.default'))}</span>
         </label>`
     : '';
-  const unavailHtml = !d.available
-    ? `<span class="setup-modal-agent-unavailable" title="${_esc(_unavailHint(d.reason))}">${_esc(_unavailText(d.reason))}</span>`
-    : '';
+  // Status on the name's own line: why an agent is unavailable (the tooltip says how to fix it),
+  // or the placeholder Pi card's "No model added yet".
+  const statusHtml = !d.available
+    ? `<span class="setup-modal-agent-sep" aria-hidden="true">·</span><span class="setup-modal-agent-unavailable" title="${_esc(_unavailHint(d.reason))}">${_esc(_unavailText(d.reason))}</span>`
+    : d.kind === 'pi-empty'
+      ? `<span class="setup-modal-agent-sep" aria-hidden="true">·</span><span class="setup-modal-agent-sub">${_esc(t('agentSelect.noModelsYet'))}</span>`
+      : '';
   // (TPT567) Launcher path + probe exit/output behind the negative — the only place a packaged
-  // app ever shows them. Full-width row under the name/reason line (card is flex-wrap).
+  // app ever shows them. Second row of the card, under the name/status line.
   const detailHtml = !d.available ? _detailHtml(d.detail) : '';
-  // A custom row declared `tools: false`: a badge before its ✎/×; the tooltip says what it can and
-  // cannot run.
-  const noToolsHtml = d.imagePurpose
-    ? `<span class="setup-modal-agent-badge">${_esc(t('agentSelect.purposeImage'))}</span>`
+  // An image-model row says so; a custom row declared `tools: false` gets the warning badge, whose
+  // tooltip says what it can and cannot run.
+  const badgeHtml = d.imagePurpose
+    ? `<span class="setup-modal-agent-badge setup-modal-agent-badge--purpose">${_esc(t('agentSelect.purposeImage'))}</span>`
     : d.noTools
     ? `<span class="setup-modal-agent-badge" title="${_esc(t('agentSelect.noToolsHint'))}">${_esc(t('agentSelect.noTools'))}</span>`
     : '';
   const isPi = d.kind === 'pi-model' || d.kind === 'pi-empty';
-  const cls = `setup-modal-agent-card${isPi ? ' setup-modal-agent-card--pi' : ''}${model ? ' setup-modal-agent-card--model' : ''}${d.isDefault ? ' is-selected' : ''}${!d.available ? ' is-unavailable' : ''}${d.kind === 'pi-model' && !d.enabled ? ' is-off' : ''}`;
+  // Off: installed but switched off — still re-checkable until the host saves, just quieter.
+  const off = d.available && !d.enabled && d.kind !== 'pi-empty';
+  const cls = `setup-modal-agent-card${isPi ? ' setup-modal-agent-card--pi' : ''}${model ? ' setup-modal-agent-card--model' : ''}${d.isDefault ? ' is-selected' : ''}${!d.available ? ' is-unavailable' : ''}${off ? ' is-off' : ''}${editing ? ' is-editing' : ''}`;
 
   let nameHtml;
   let actionsHtml = '';
@@ -1127,11 +1197,10 @@ function _cardHtml(d, model = null) {
           <span class="setup-modal-agent-model" title="${_esc(d.storedModel)}">${_esc(d.modelText)}</span>
         </span>`;
     actionsHtml = `
-        <button type="button" class="sma-pi-edit" data-pi-idx="${d.piIdx}" title="${_esc(t('agentSelect.editModelName', { name: d.name }))}" aria-label="${_esc(t('agentSelect.editModelName', { name: d.name }))}">✎</button>
-        <button type="button" class="sma-pi-remove" data-pi-idx="${d.piIdx}" title="${_esc(t('agentSelect.removeModelName', { name: d.name }))}" aria-label="${_esc(t('agentSelect.removeModelName', { name: d.name }))}">×</button>`;
-  } else if (d.kind === 'pi-empty') {
-    nameHtml = `<span class="setup-modal-agent-name">${_esc(d.name)}</span>
-        <span class="setup-modal-agent-sub">${_esc(t('agentSelect.noModelsYet'))}</span>`;
+        <span class="setup-modal-agent-actions">
+          <button type="button" class="sma-pi-edit" data-pi-idx="${d.piIdx}" aria-expanded="${editing}" title="${_esc(t('agentSelect.editModelName', { name: d.name }))}" aria-label="${_esc(t('agentSelect.editModelName', { name: d.name }))}">✎</button>
+          <button type="button" class="sma-pi-remove" data-pi-idx="${d.piIdx}" title="${_esc(t('agentSelect.removeModelName', { name: d.name }))}" aria-label="${_esc(t('agentSelect.removeModelName', { name: d.name }))}">×</button>
+        </span>`;
   } else if (model) {
     // (TPT637) The Pi card's `<name> · <model>` row; the ✎ opens _modelFormHtml() under the card.
     nameHtml = model.label
@@ -1144,18 +1213,24 @@ function _cardHtml(d, model = null) {
     if (model.editable) {
       const editLabel = _esc(t('agentSelect.editModel', { name: d.name }));
       actionsHtml = `
-        <button type="button" class="sma-model-edit" data-id="${_esc(d.id)}" title="${editLabel}" aria-label="${editLabel}">✎</button>`;
+        <span class="setup-modal-agent-actions">
+          <button type="button" class="sma-model-edit" data-id="${_esc(d.id)}" aria-expanded="${editing}" title="${editLabel}" aria-label="${editLabel}">✎</button>
+        </span>`;
     }
   } else {
     nameHtml = `<span class="setup-modal-agent-name">${_esc(d.name)}</span>`;
   }
+  const identTag = radioId ? 'label' : 'span';
+  const identHtml = `<${identTag} class="setup-modal-agent-ident"${radioId ? ` for="${radioId}"` : ''}>
+          <span class="setup-modal-agent-dot" style="background:${d.color}"></span>
+          ${nameHtml}${statusHtml}
+        </${identTag}>`;
 
   return `
       <div class="${cls}" data-id="${_esc(d.id)}"${piAttr}>
         ${checkHtml}
-        <span class="setup-modal-agent-dot" style="background:${d.color}"></span>
-        ${nameHtml}
-        ${unavailHtml}${noToolsHtml}${actionsHtml}
+        ${identHtml}
+        ${badgeHtml}${actionsHtml}
         ${radioHtml}
         ${detailHtml}
       </div>`;
@@ -1187,13 +1262,14 @@ function _detailHtml(detail) {
   return `<div class="setup-modal-agent-detail">${binHtml}${outHtml}</div>`;
 }
 
-// The quiet "+ Add model" row shown while no form is open, with the N/8 count.
+// The quiet "+ Add model" row shown while no form is open, with the N/8 count. (TPT9387) Drawn as
+// an empty card slot: the + sits in the switch column and the label lines up with the names.
 function _piAddRowHtml(count) {
   const atMax = count >= PI_MAX_MODELS;
   return `
       <div class="setup-modal-agent-add-row">
         <button type="button" class="setup-modal-btn setup-modal-btn--secondary sma-pi-add"${atMax ? ' disabled' : ''}
-          title="${_esc(atMax ? t('agentSelect.maxModels', { n: PI_MAX_MODELS }) : t('agentSelect.addAnotherModel'))}">+ ${_esc(t('agentSelect.addModel'))}</button>
+          title="${_esc(atMax ? t('agentSelect.maxModels', { n: PI_MAX_MODELS }) : t('agentSelect.addAnotherModel'))}"><span class="sma-pi-add-icon" aria-hidden="true">+</span><span>${_esc(t('agentSelect.addModel'))}</span></button>
         <span class="setup-modal-agent-add-count">${count}/${PI_MAX_MODELS}</span>
       </div>`;
 }

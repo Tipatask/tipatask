@@ -252,6 +252,12 @@ test('browser and Electron editors use the same preferences and preserve window 
   await handlers.get('api:project.update')(event(2), { fields: { language: 'de', color_scheme: 'slate' } });
   assert.equal((await handlers.get('api:project.settings')(event(2))).language, 'de');
   assert.equal((await web('GET', '/api/project/settings')).language, 'fr');
+  const profile = await web('GET', '/api/project/profile');
+  assert.deepEqual(profile, JSON.parse(JSON.stringify(await handlers.get('api:project.profile')(event(1)))));
+  const wrongWindow = handlers.get('api:project.update')(event(2), {
+    fields: { display_initials: 'AA' }, expectedContext: profile.context,
+  });
+  await assert.rejects(wrongWindow, /context changed/);
   await handlers.get('api:project.mergeConfig')(event(1), { partial: { language: 'uk', theme: 'meadow' } });
   assert.equal((await f.backend.getEffectiveProjectSettings()).settings.color_scheme, 'meadow');
   await web('POST', '/api/project-config', { language: 'fr' });

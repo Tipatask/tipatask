@@ -37,7 +37,7 @@ function fixture(cards, { objective = OBJECTIVE, lang = 'en', accepted = cards.m
     getLocale: () => lang, getObjectiveGroupingEnabled: () => false, shouldCreateObjectiveParent: () => false,
     startName: () => 'pending', isStartName: status => status === 'pending', isLockedTargetStatus: () => false,
     loadStatuses: async () => [],
-    projectHeader: () => ({}), captureCardEdits() {}, showSavingIndicator() {}, hideSavingIndicator() {},
+    projectHeader: () => ({}), captureCardEdits() {}, syncObjectiveStage() {}, noteObjectiveSaved() {}, setCardState() {}, showSavingIndicator() {}, hideSavingIndicator() {},
     showSaveToast() {}, saveChatState() {}, discardUnsavedProposals() {}, cleanupChat() {}, repaintAfterSavedChatClosed() {},
     translate: (key, params) => params?.msg || key,
     showToast: (message, type) => { if (type === 'error') errors.push(message); },

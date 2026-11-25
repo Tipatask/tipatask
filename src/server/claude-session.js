@@ -431,6 +431,8 @@ function buildObjectiveArgs(session) {
   if (!config.SIMPLE_MODE) {
     args.push('--exclude-dynamic-system-prompt-sections');
     if (session.systemPrompt) args.push(...appendSystemPromptArgs(session.systemPrompt));
+  } else if (session.presetPlanner && session.systemPrompt) {
+    args.push(...appendSystemPromptArgs(session.systemPrompt));
   } else if (session._rehashDirective) {
     args.push(...appendSystemPromptArgs(session._rehashDirective));
   }
@@ -1074,7 +1076,7 @@ function spawnObjectiveTurn(session, taskId) {
 
   // Cold path: first turn with no claudeSessionId — try the global cold prewarm slot.
   // consumeColdPrewarm() rejects and kills a slot whose model or project root differs.
-  if (!pw && !session.claudeSessionId && prewarmEnabled && !session.rehashIntent) {
+  if (!pw && !session.claudeSessionId && prewarmEnabled && !session.rehashIntent && !session.presetPlanner) {
     const cpw = consumeColdPrewarm(resolveClaudeModel(session), cwd);
     if (cpw) pw = { ...cpw, sessionId: null };
   }
@@ -1365,7 +1367,9 @@ function spawnObjectiveTurn(session, taskId) {
           console.log(`[objective] Claude session: ${event.session_id}`);
         }
 
-        if (session.type === 'taskChat') tryEmitTaskChatWidgets(session, event);
+        // A full `assistant` message goes through the widgets after its text (below), so a tool
+        // call it lists is placed after that text when no deltas streamed it.
+        if (session.type === 'taskChat' && event.type !== 'assistant') tryEmitTaskChatWidgets(session, event);
 
         // Tool-use start — record name + start timestamp + emit progress to client
         if (inner.type === 'content_block_start' && inner.content_block?.type === 'tool_use') {
@@ -1439,7 +1443,8 @@ function spawnObjectiveTurn(session, taskId) {
             if (!session.timingMilestones.firstSignalAt) session.timingMilestones.firstSignalAt = now;
             session.timingMilestones.lastSignalAt = now; // C1255
           }
-          const text = inner.delta.text;
+          // A task chat's first text after a tool call opens a new run (task-chat-widgets.js).
+          const text = session.type === 'taskChat' ? taskChatWidgets.separateTextRun(session, inner.delta.text) : inner.delta.text;
           _textStreamed = true;
           session.turnBuffer += text;
           session.buffer += text;
@@ -1470,15 +1475,17 @@ function spawnObjectiveTurn(session, taskId) {
         if (event.type === 'assistant' && event.message?.content) {
           for (const block of event.message.content) {
             if (block.type === 'text' && block.text && !_textStreamed && !session.timingMilestones.firstChunk) {
-              session.turnBuffer += block.text;
-              session.buffer += block.text;
+              const text = session.type === 'taskChat' ? taskChatWidgets.separateTextRun(session, block.text) : block.text;
+              session.turnBuffer += text;
+              session.buffer += text;
               if (session.ws && session.ws.readyState === session.ws.OPEN) {
-                session.ws.send(JSON.stringify({ type: 'data', tabId: session.tabId, data: block.text }));
+                session.ws.send(JSON.stringify({ type: 'data', tabId: session.tabId, data: text }));
               }
               if (session.type === 'taskChat') tryEmitTaskChatWidgets(session);
             }
           }
         }
+        if (session.type === 'taskChat' && event.type === 'assistant') tryEmitTaskChatWidgets(session, event);
 
         // Authoritative result + token usage (includes prompt cache stats)
         if (event.type === 'result') {

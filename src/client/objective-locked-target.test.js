@@ -75,7 +75,7 @@ function fixture(status, { bulk = false, scoped = false, origin = false } = {}) 
       writes.push({ url, opts });
       throw new Error('Unexpected write');
     },
-    captureCardEdits() {}, showSavingIndicator() {}, hideSavingIndicator() {}, saveChatState() {},
+    captureCardEdits() {}, syncObjectiveStage() {}, noteObjectiveSaved() {}, setCardState() {}, showSavingIndicator() {}, hideSavingIndicator() {}, saveChatState() {},
     showToast: (...args) => toasts.push(args),
   };
   vm.runInNewContext(source + '\nattachCardHandlers(); globalThis.save = saveTaskChange;', env);

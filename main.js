@@ -1383,7 +1383,12 @@ function registerIpcHandlers() {
       //    (whole-array replace, not a per-row merge — the setup-modal payload always
       //    carries every configured row, not just changed ones).
       const { readProjectConfig, writeProjectConfig, sanitizePiModels, readPiEntries } = require('./src/server/project-config');
-      const existingCfg = readProjectConfig(projectPath) || {};
+      const { selectedPresetIds, copyTemplates, COMPOSE_PRESET } = require('./src/server/project-seeder');
+      const savedCfg = readProjectConfig(projectPath) || {};
+      const sameBinding = (!savedCfg.API_PROJECT_ID || String(savedCfg.API_PROJECT_ID) === String(apiProject.id))
+        && (!savedCfg.API_BASE_URL || normalizeBaseUrl(savedCfg.API_BASE_URL) === normalizeBaseUrl(apiBaseUrl));
+      const existingCfg = sameBinding ? savedCfg : {};
+      const projectPresets = selectedPresetIds(apiProject.projectPresets);
       const piModels = Array.isArray(detailPiModels) && detailPiModels.length
         ? sanitizePiModels({ piModels: detailPiModels })
         : readPiEntries(existingCfg);
@@ -1402,6 +1407,7 @@ function registerIpcHandlers() {
         TASK_AGENT,
         AVAILABLE_AGENTS,
         projectName: apiProject.name,
+        projectPresets,
         ...(piModels.length ? { PI_MODELS: piModels } : {}),
         // Only surfaces for a pre-C1121 project with no PI_MODELS array at all — keeps
         // Pi spawning for it until it's re-configured through the new wizard/setup-modal.
@@ -1430,8 +1436,7 @@ function registerIpcHandlers() {
           updatedAt: new Date().toISOString(),
         });
         try {
-          const { copyTemplates } = require('./src/server/project-seeder');
-          copyTemplates('existing-code', projectPath, null);
+          copyTemplates(projectPresets.includes('software') ? 'existing-code' : COMPOSE_PRESET, projectPath, null);
         } catch (err) {
           console.warn('[open-existing] templates copy failed:', err.message);
         }
@@ -1525,6 +1530,9 @@ function registerIpcHandlers() {
     return Array.isArray(data) ? data : (data?.projects || data?.data || []);
   });
 
+  ipcMain.handle('setup:project-profile', (_event, { baseUrl, token, projectId }) =>
+    require('./src/project-profile.mjs').readSetupProfile(baseUrl, token, projectId));
+
   ipcMain.handle('setup:get-device-name', async (_event, { apiBaseUrl, userToken }) => {
     const os = require('node:os');
     const deviceIdPath = path.join(os.homedir(), '.tipatask', 'device_id');
@@ -1600,6 +1608,8 @@ function registerIpcHandlers() {
         );
         if (pStatus === 200 && pData && pData.project && pData.project.name) {
           newConfig.projectName = pData.project.name;
+          const { selectedPresetIds } = require('./src/server/project-seeder');
+          newConfig.projectPresets = selectedPresetIds(pData.project.projectPresets ?? cfg.projectPresets);
         }
       } catch (e) {
         console.warn('[force-reauth] project name refresh failed (non-fatal):', e.message);
@@ -1722,9 +1732,14 @@ function registerIpcHandlers() {
       const { exchangeProjectToken } = require('./src/cli/auth');
 
       // 2. Project ID
+      const { selectedPresetIds, copyTemplates, callSeedPresetTasks, presetConfigFields, presetSeedsTasks, COMPOSE_PRESET } = require('./src/server/project-seeder');
       let projectId;
+      const projectPresets = apiProject.isNew ? (apiProject.projectPresets ?? ['software']) : selectedPresetIds(apiProject.projectPresets);
       if (apiProject.isNew) {
-        const proj = await createApiProject({ apiBaseUrl, token: userToken, name: apiProject.name, description: apiProject.description });
+        const proj = await createApiProject({
+          apiBaseUrl, token: userToken, name: apiProject.name, description: apiProject.description, projectPresets,
+          identity: apiProject.identity, settings: apiProject.settings,
+        });
         projectId = proj.id;
       } else {
         projectId = apiProject.id;
@@ -1766,8 +1781,7 @@ function registerIpcHandlers() {
       //    (TPT9316) The preset adds its own config keys: compose-as-you-go (wizard preset A)
       //    writes KB_MODE: 'compose' (presetConfigFields(), project-seeder.js).
       const { writeProjectConfig, sanitizePiModels } = require('./src/server/project-config');
-      const { copyTemplates, callSeedPresetTasks, presetConfigFields, presetSeedsTasks } = require('./src/server/project-seeder');
-      const presetValue = preset?.value;
+      const presetValue = projectPresets.includes('software') ? preset?.value : COMPOSE_PRESET;
       const piModels = sanitizePiModels(detail?.agentPreference);
       writeProjectConfig(projectPath, {
         TASK_BACKEND: 'api',
@@ -1779,6 +1793,7 @@ function registerIpcHandlers() {
         TASK_AGENT,
         AVAILABLE_AGENTS,
         projectName: apiProject.name,
+        projectPresets,
         ...(piModels.length ? { PI_MODELS: piModels } : {}),
         ...presetConfigFields(presetValue),
       });

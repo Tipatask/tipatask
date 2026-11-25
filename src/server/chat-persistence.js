@@ -41,8 +41,9 @@ function validateDraftRelationship(options) {
   }
 }
 
-function hashProject(projectPath) {
-  const identity = require('./api-credentials').projectContextIdentity(projectPath);
+const { projectContextIdentity } = require('./api-credentials');
+
+function hashProject(projectPath, identity = projectContextIdentity(projectPath)) {
   // Do not guess an owner for legacy path-only drafts after configuration.
   return crypto.createHash('md5').update(String(projectPath) + (identity ? '\0' + identity : '')).digest('hex').slice(0, identity ? 16 : 8);
 }
@@ -211,9 +212,9 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
     });
   }
 
-  function chatHistoryPath(projectPath) {
+  function chatHistoryPath(projectPath, identity) {
     return path.join(userDataRoot, projectPath
-      ? `chat-history-${hashProject(projectPath)}.json`
+      ? `chat-history-${hashProject(projectPath, identity)}.json`
       : 'chat-history.json');
   }
 
@@ -242,13 +243,13 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
 
   // Insert or merge one entry by historyId. createdAt of an existing entry is kept; the list is
   // stored newest-activity first and capped, so the oldest entries fall off.
-  async function upsertChatHistory(projectPath, entry) {
+  async function upsertChatHistory(projectPath, entry, identity = projectContextIdentity(projectPath)) {
     if (!entry || typeof entry.historyId !== 'string' || !entry.historyId) {
       const err = new Error('Chat history entry requires a historyId');
       err.code = 'INVALID_CHAT_HISTORY';
       throw err;
     }
-    const filePath = chatHistoryPath(projectPath);
+    const filePath = chatHistoryPath(projectPath, identity);
     const saved = await forProject(projectPath, async () => {
       await cleanupStaleTemps(filePath);
       const entries = await readHistoryFile(filePath);
@@ -269,7 +270,7 @@ function createChatPersistence({ fsOps = fs, userDataRoot = config.USER_DATA_ROO
       return merged;
     });
     // The write landed. A failing listener must not turn it into a failed write.
-    if (typeof onHistoryUpdated === 'function') {
+    if (typeof onHistoryUpdated === 'function' && identity === projectContextIdentity(projectPath)) {
       try { onHistoryUpdated(projectPath || '', saved); }
       catch (error) { console.warn(`[chat-history] update notice failed: ${error.message}`); }
     }

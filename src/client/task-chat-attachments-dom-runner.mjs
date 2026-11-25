@@ -12,6 +12,9 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'esbuild';
 import { Window } from 'happy-dom';
+import { marked } from 'marked';
+
+globalThis.marked = marked;
 
 const window = new Window({ url: 'http://localhost:4455/?projectPath=%2Fproj%2Fa' });
 for (const key of [
@@ -140,7 +143,7 @@ try {
   // 2. Embed ▸ Image goes in at that caret: right after the first image, not at the end.
   query('.task-chat-embed-slot .embed-menu-trigger').click();
   const rows = [...document.querySelectorAll('.task-chat-embed-slot .import-submenu-item')];
-  assert.equal(rows.length, 2, 'Image / Other file');
+  assert.equal(rows.length, 3, 'Image / Other file / Project artifact');
   rows[0].click();
   const picker = query('.task-chat-embed-slot .embed-image-input');
   Object.defineProperty(picker, 'files', { value: [png('b.png')], configurable: true });
@@ -251,7 +254,54 @@ try {
   assert.equal(send.disabled, false);
   assert.match(input.value, /\[a\.txt\]\(http:\/\/127\.0\.0\.1:4454\/api\/projects\/2\/files\/1\)/);
   assert.match(input.value, /\[b\.txt\]\(http:\/\/127\.0\.0\.1:4454\/api\/projects\/2\/files\/2\)/);
+  // Two links from one reply. A slow attachment must fill only its original tab, and
+  // closing that tab mid-request must never reopen it or replace a newer chat's contents.
+  let answerAttachment;
+  let attachmentSignal;
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (url, opts) => {
+    requests.push(url);
+    if (url === '/api/files/2/1') {
+      attachmentSignal = opts.signal;
+      return new Promise(resolve => { answerAttachment = () => resolve(new Response('Attached notes', { headers: { 'Content-Type': 'text/plain' } })); });
+    }
+    if (url === '/api/project/file-preview?path=reports%2Fcheck.sql') {
+      return Promise.resolve(Response.json({ kind: 'text', content: 'select 1;\nselect 2;' }));
+    }
+    return originalFetch(url, opts);
+  };
+  chat.frame({ type: 'chat-history-reset', messages: [
+    { role: 'user', content: '[a.txt](/api/files/2/1)' },
+    { role: 'assistant', content: '[a.txt](/api/files/2/1) and [check.sql](reports/check.sql#L2)' },
+  ] });
+  const links = query('.task-chat-md').querySelectorAll('a');
+  links[0].click();
+  links[1].click();
+  answerAttachment();
+  await settle();
+  const tabs = () => [...document.querySelectorAll('.preview-drawer [role="tab"]')];
+  assert.deepEqual(tabs().map(tab => tab.title), ['a.txt', 'reports/check.sql']);
+  assert.equal(tabs()[1].getAttribute('aria-selected'), 'true');
+  assert.equal(query('.preview-drawer-panel:not([hidden]) code').textContent, 'select 1;\nselect 2;');
+  query('.task-chat-attach--file').click();
+  assert.equal(query('.preview-drawer-panel:not([hidden]) code').textContent, 'Attached notes');
+  assert.equal(requests.filter(url => url === '/api/files/2/1').length, 1);
+  input.value = 'Keep going';
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  send.click();
+  assert.equal(chat.sent.at(-1).content, 'Keep going');
+  chat.frame({ type: 'objective-result', content: 'Done.' });
+  assert.equal(tabs().length, 2);
+  query('.preview-drawer-tab--active .preview-drawer-tab-close').click();
+  assert.equal(attachmentSignal.aborted, true);
+  links[0].click();
+  const pending = attachmentSignal;
   taskChat.close();
+  answerAttachment();
+  await settle();
+  assert.equal(pending.aborted, true);
+  assert.equal(document.querySelectorAll('.preview-drawer').length, 0);
   console.log('TPT9279_INLINE_IMAGES_PASS');
 } catch (err) {
   console.error(err);

@@ -2,9 +2,11 @@
 
 // Task chat widgets — turns what a provider streams during a task-chat turn into typed frames a
 // client can draw: `task-chat-dialog` (the agent asks the user to choose), `task-chat-tool` (a
-// tool call and how it ended) and, through the session's onTaskChatMutation hook,
-// `task-chat-task` (a task the agent created or updated). Shared by the Claude, Codex and Pi
-// turn loops, which only translate their own stream events into the calls below. No I/O.
+// tool call and how it ended), `task-chat-segment` (one run of the agent's text ended and the
+// next begins: a progress note before its tool calls, then the answer) and, through the
+// session's onTaskChatMutation hook, `task-chat-task` (a task the agent created or updated).
+// Shared by the Claude, Codex and Pi turn loops, which only translate their own stream events
+// into the calls below. No I/O.
 
 const crypto = require('node:crypto');
 
@@ -99,7 +101,9 @@ function parseAskUserBlocks(text) {
 
 function turnState(session) {
   if (!session._taskChatTurn) {
-    session._taskChatTurn = { dialogs: [], tools: [], taskEvents: [], sent: new Map(), inputs: new Map() };
+    session._taskChatTurn = {
+      dialogs: [], tools: [], taskEvents: [], breaks: [], separatePending: false, sent: new Map(), inputs: new Map(),
+    };
   }
   return session._taskChatTurn;
 }
@@ -129,6 +133,10 @@ function taskFrame(session, event) {
   return { type: 'task-chat-task', taskKey: session.taskKey, action: event.action, toolId: event.toolId, task: event.task };
 }
 
+function segmentFrame(session, at) {
+  return { type: 'task-chat-segment', taskKey: session.taskKey, at };
+}
+
 // Scan the turn's text and send a frame for each dialog not sent yet this turn.
 function emitDialogs(session, send = sessionSender(session)) {
   const found = parseAskUserBlocks(session.turnBuffer);
@@ -140,6 +148,45 @@ function emitDialogs(session, send = sessionSender(session)) {
     send(dialogFrame(session, dialog));
   }
   return fresh;
+}
+
+// ── Text segments ─────────────────────────────────────────────────────────────
+
+// The agent's text arrives in runs: what it writes before calling tools ("I'll check…") and what
+// it writes after them ("Yes. The wizard…"). A segment boundary is the offset in the turn text
+// (`session.turnBuffer`) where one run ends and the next begins. It is marked when a tool call
+// starts after text written since the previous boundary (toolStarted(), every provider), and
+// when Codex begins another whole message (codex-session.js). The turn keeps the offsets in
+// `breaks`, the client gets each as a `task-chat-segment` frame and the assistant message keeps
+// them (attachTaskChatWidgets()), so a client can show every run as its own block.
+const RUN_SEPARATOR = '\n\n';
+
+function turnText(session) {
+  return typeof session.turnBuffer === 'string' ? session.turnBuffer : '';
+}
+
+// Mark a boundary at the end of the turn text, unless no text came since the previous one
+// (a turn that opens with a tool call, or a second call in a row). Returns its offset or null.
+function markSegmentBoundary(session, send = sessionSender(session)) {
+  const text = turnText(session);
+  const turn = turnState(session);
+  const previous = turn.breaks.length ? turn.breaks[turn.breaks.length - 1] : 0;
+  if (text.length <= previous) return null;
+  turn.breaks.push(text.length);
+  turn.separatePending = true;
+  send(segmentFrame(session, text.length));
+  return text.length;
+}
+
+// The text a provider is about to append to the turn: the first text after a boundary opens
+// with a blank line, so the stored reply never glues two runs ("…read them.Yes.") for anything
+// that reads it as one string — a provider handoff, the history search data, a client that
+// draws it whole. The boundary offset stays at the end of the earlier run.
+function separateTextRun(session, text) {
+  const turn = session._taskChatTurn;
+  if (!turn || !turn.separatePending || typeof text !== 'string' || !text) return text;
+  turn.separatePending = false;
+  return `${RUN_SEPARATOR}${text}`;
 }
 
 // ── Tools ─────────────────────────────────────────────────────────────────────
@@ -190,17 +237,22 @@ function setInput(turn, record, input) {
 }
 
 // A tool call began, or (same id again) its arguments are now known. One frame per change.
+// A new call ends the run of text before it (markSegmentBoundary(), sent ahead of the tool's
+// own frame) and records where it happened: `at`, the offset in the turn text, so a client
+// draws its chip between the run before it and the run after it.
 function toolStarted(session, send, { id, name, server, tool, input } = {}) {
+  const sender = send || sessionSender(session);
   const turn = turnState(session);
   const identity = toolIdentity({ name, server, tool });
   const toolId = id || `${identity.name}#${turn.tools.length + 1}`;
   let record = turn.tools.find(t => t.id === toolId);
   if (!record) {
-    record = { id: toolId, ...identity, status: 'running' };
+    markSegmentBoundary(session, sender);
+    record = { id: toolId, ...identity, status: 'running', at: turnText(session).length };
     turn.tools.push(record);
   }
   if (record.input === undefined) setInput(turn, record, input);
-  sendTool(session, send || sessionSender(session), turn, record);
+  sendTool(session, sender, turn, record);
   return record;
 }
 
@@ -305,20 +357,25 @@ function toolFinished(session, send, { id, name, server, tool, input, isError, r
 
 // ── History and reconnect ─────────────────────────────────────────────────────
 
-// Hang the turn's widgets on its assistant message so `chat-history-reset` carries them. The
-// arrays are shared, not copied: a task event that resolves after the turn closed still lands.
+// Hang the turn's widgets and segment boundaries on its assistant message so
+// `chat-history-reset` carries them (`breaks` are offsets into that message's `content`, the
+// turn text). The arrays are shared, not copied: a task event that resolves after the turn
+// closed still lands.
 function attachTaskChatWidgets(session, assistantMsg) {
   const turn = session._taskChatTurn;
   if (!turn || !assistantMsg) return;
   assistantMsg.dialogs = turn.dialogs;
   assistantMsg.tools = turn.tools;
   assistantMsg.taskEvents = turn.taskEvents;
+  assistantMsg.breaks = turn.breaks;
 }
 
-// Re-send the running turn's widgets to a client that attached mid-turn.
+// Re-send the running turn's widgets to a client that attached mid-turn, right after the
+// `data` replay of its text: the boundaries first, so each chip lands between its runs.
 function replayTaskChatTurn(session, send = sessionSender(session)) {
   const turn = session._taskChatTurn;
   if (!turn) return;
+  for (const at of turn.breaks) send(segmentFrame(session, at));
   for (const tool of turn.tools) send(toolFrame(session, tool));
   for (const event of turn.taskEvents) send(taskFrame(session, event));
   for (const dialog of turn.dialogs) send(dialogFrame(session, dialog));
@@ -443,6 +500,9 @@ module.exports = {
   resetTaskChatTurn,
   sessionSender,
   emitDialogs,
+  markSegmentBoundary,
+  separateTextRun,
+  RUN_SEPARATOR,
   toolStarted,
   toolFinished,
   classifyTaskMutation,

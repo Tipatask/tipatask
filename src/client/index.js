@@ -48,6 +48,8 @@ import * as mergeBranchesModal from './merge-branches-modal.js'; // (TPT345) Mer
 import * as taskFetch from './task-fetch.js'; // (TPT672) template.html's Objective hand-off + parent-pane task reads
 import { handleProjectExportStatus } from './project-export.js';
 import * as firstProjectPrompt from './first-project-prompt.js'; // (TPT9319) a new project's first-open prompt
+import * as objectiveModal from './objective-modal.js'; // (TPT9389) Create modal shell; template.html renders New Objective / New Task into it
+import * as createFlyout from './create-flyout.js'; // (TPT9390) the left menu's Create flyout; template.html mounts it on the Create item
 
 notifications.requestPermission();
 // (TPT484) Shared alert registry: click/dismiss bridge plus main's surface decision for this window.
@@ -59,6 +61,8 @@ window.electronAPI?.onProjectExport?.((msg) => handleProjectExportStatus(msg));
 // Expose modules globally so the inline <script> in template.html can access them.
 window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, wsClient, objectiveTabs, subtaskCount, subtaskChain, taskCard, taskBoard, ...consoleModal, ...recipeSidebar, chatUI, chatTaskPreview, specChat, taskChat, setupModal, notifications, attentionNotifications, completionNotifications, humanTaskRows, attentionWs, attentionState, taskActivity, activityNotifications, notificationCenter, apiConnection, projectCreationWizard, projectOpenFlow, dialogFocus, audioRecorder, perfLog, tagMatch, statusFilterSelect, newTaskSprint, agentQuota, mergeBranchesModal, taskFetch };
 window.TipTask.agentAssignee = agentAssignee;
+window.TipTask.objectiveModal = objectiveModal;
+window.TipTask.createFlyout = createFlyout;
 // Terminal task-title links need a page-level bridge: task-board.js owns the modal,
 // while template.html owns loadAndRender() and can select Project Board first.
 window.TipTask.openTaskEditModal = taskBoard.openTaskEditModalFromTerminal;
@@ -124,8 +128,7 @@ window.addEventListener('create-project', async (e) => {
   // opens locked (no Escape / ×) and every way out of it — Cancel, or a failed link/create
   // after Confirm already closed it — reopens Get Started through template.html's
   // 'show-get-started' listener. A window with a project keeps the dismissible wizard.
-  // (TPT9318) The Open Project entry runs the wizard without its Preset step: a new project
-  // is always created in compose-as-you-go mode. Create Project keeps the A/B/C choice.
+  // Open Project locks onboarding to compose-as-you-go. Both entries collect work presets.
   const unbound = !window.electronAPI?.getProjectPath?.();
   const showGetStarted = () => { if (unbound) window.dispatchEvent(new CustomEvent('show-get-started')); };
   const folder = e?.detail?.projectPath || await window.electronAPI?.selectFolder?.();
@@ -149,7 +152,7 @@ window.addEventListener('create-project', async (e) => {
           projectPath: detail.projectPath,
           apiBaseUrl: detail.apiBaseUrl,
           userToken: detail.userToken,
-          apiProject: { id: detail.apiProject.id, name: detail.apiProject.name },
+          apiProject: detail.apiProject,
           deviceName: detail.deviceName,
           taskAgent: pref.taskAgent || 'claude',
           availableAgents: Array.isArray(pref.availableAgents) && pref.availableAgents.length ? pref.availableAgents : ['claude'],

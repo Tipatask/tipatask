@@ -615,8 +615,9 @@ function spawnPiTurn(session, taskId, emitFn, deps = {}) {
         event.assistantMessageEvent &&
         event.assistantMessageEvent.type === 'text_delta'
       ) {
-        // Streaming text delta
-        const text = event.assistantMessageEvent.delta || '';
+        // Streaming text delta. A task chat's first text after a tool call opens a new run.
+        const delta = event.assistantMessageEvent.delta || '';
+        const text = session.type === 'taskChat' ? taskChatWidgets.separateTextRun(session, delta) : delta;
         if (text) {
           if (config.OBJECTIVE_TIMING_ENABLED && !session.timingMilestones.firstChunk) {
             session.timingMilestones.firstChunk = Date.now();

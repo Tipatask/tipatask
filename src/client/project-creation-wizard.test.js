@@ -2,7 +2,20 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fs from 'node:fs';
 
-const { setupAuthWeb, visibleSteps } = await import('./project-creation-wizard.js');
+const { presetIcon, setupAuthWeb, visibleSteps } = await import('./project-creation-wizard.js');
+
+test('each work preset has distinct decorative artwork that inherits its card color', () => {
+  const ids = ['software', 'science', 'marketing', 'sales', 'finance', 'health', 'home', 'personal-growth'];
+  const icons = ids.map(presetIcon);
+  for (const [index, icon] of icons.entries()) {
+    assert.match(icon, /^<svg\b/, ids[index]);
+    assert.match(icon, /stroke="currentColor"/);
+    assert.match(icon, /aria-hidden="true"/);
+    assert.match(icon, /focusable="false"/);
+  }
+  assert.equal(new Set(icons).size, ids.length);
+  assert.equal(presetIcon('unknown'), '');
+});
 
 test('setupAuthWeb reports an actionable IPC failure and allows an immediate retry', async () => {
   let attempts = 0;
@@ -87,39 +100,13 @@ test('Agent step shows the credential hint only after a blocked Next click', () 
   assert.match(step4, /onChange:[\s\S]*?msgEl\.textContent = '';[\s\S]*?onReCheck/);
 });
 
-// (TPT557) The wizard is the single entry for an unconfigured folder: its Create Project step
-// either creates a new API project (6 steps, Preset included) or links an existing one (5 steps —
-// nothing to seed, so the Preset step is skipped and the Confirm button reads "Open Project").
-test('visibleSteps: a new project walks all six steps, an existing one skips Preset (5)', () => {
-  assert.deepEqual(visibleSteps(), [1, 2, 3, 4, 5, 6]);
-  assert.deepEqual(visibleSteps({ existing: false }), [1, 2, 3, 4, 5, 6]);
-  assert.deepEqual(visibleSteps({ existing: true }), [1, 2, 3, 4, 6]);
-});
-
-// (TPT9318) The Open Project entry locks the preset to compose-as-you-go: no Preset step for a
-// new project either.
-test('visibleSteps: a preset-locked run skips Preset for a new and an existing project', () => {
-  assert.deepEqual(visibleSteps({ presetLocked: true }), [1, 2, 3, 4, 6]);
-  assert.deepEqual(visibleSteps({ existing: false, presetLocked: true }), [1, 2, 3, 4, 6]);
-  assert.deepEqual(visibleSteps({ existing: true, presetLocked: true }), [1, 2, 3, 4, 6]);
-  assert.deepEqual(visibleSteps({ existing: false, presetLocked: false }), [1, 2, 3, 4, 5, 6]);
-});
-
-test('existing-project pick skips Preset on both Next and Back, and emits preset: null', () => {
-  const src = fs.readFileSync(new URL('./project-creation-wizard.js', import.meta.url), 'utf8');
-  // Dots come from visibleSteps(), never a fixed six.
-  assert.match(src, /visibleSteps\(\{ existing: _isExisting\(\), presetLocked: _presetLocked \}\)\.map\(/);
-  // Agent → (Preset | Confirm), Confirm Back → (Preset | Agent) — one rule for an existing
-  // project and a locked preset (TPT9318).
-  assert.match(src, /function _skipsPreset\(\) \{\n\s+return _isExisting\(\) \|\| _presetLocked;/);
-  const step4 = src.slice(src.indexOf('function _renderStep4('), src.indexOf('// ── Step 5'));
-  assert.match(step4, /_goto\(_skipsPreset\(\) \? 6 : 5\)/);
-  const step6 = src.slice(src.indexOf('function _renderStep6('));
-  assert.match(step6, /_goto\(_skipsPreset\(\) \? 4 : 5\)/);
-  // Captions + payload branch on the same flag.
-  assert.match(step6, /existing \? t\('wizard\.confirmExistingProject'\) : t\('wizard\.confirmNewProject'\)/);
-  assert.match(step6, /existing \? t\('wizard\.openProjectBtn'\) : t\('wizard\.createProjectBtn'\)/);
-  assert.match(step6, /preset: existing \|\| !_preset \? null : \{ letter: _preset\.letter/);
+test('visibleSteps keeps work selection on both create entries and gates software onboarding', () => {
+  assert.deepEqual(visibleSteps(), [1, 2, 'profile', 3, 4, 5, 7]);
+  assert.deepEqual(visibleSteps({ software: true }), [1, 2, 'profile', 3, 4, 5, 6, 7]);
+  assert.deepEqual(visibleSteps({ software: true, presetLocked: true }), [1, 2, 'profile', 3, 4, 5, 7]);
+  for (const presetLocked of [true, false]) {
+    assert.deepEqual(visibleSteps({ existing: true, software: true, presetLocked }), [1, 2, 'profile', 3, 4, 7]);
+  }
 });
 
 test('index.js links an existing pick through project:open-existing without adopting the window', () => {

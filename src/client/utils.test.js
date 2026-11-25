@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { JSDOM } from 'jsdom';
+import { getLocale, setLocale } from './i18n.js';
+
+import { showProgressToast, showToast } from './utils.js';
 
 const { parseObjectiveResult, buildUsedIds, upsertTaskEntry, buildObjectivePrompt, isPristineObjectiveTab, captureSubtaskCtx, tabSubtaskContext, subtaskCtxFromChatState, pushSubtaskCrumb, createLiveInserter, insertAtCursor, setValueKeepingCaret, isSubmitShortcut, submitShortcutLabel, canSubmitObjective, renderMarkdown, truncateMarkdownAtParagraph, computeTooltipAnchor, isRectClipped, loadErrorGuidance, taskOpenErrorLabel, TODO_SERVER_CMD, TODO_SERVER_URL } = await import('./utils.js');
 
@@ -14,6 +17,129 @@ function installRendererWindow() {
     else globalThis.window = prior;
   };
 }
+
+function installToastRenderer(context) {
+  const { mock } = context;
+  const restoreWindow = installRendererWindow();
+  globalThis.document = window.document;
+  globalThis.requestAnimationFrame = (callback) => callback();
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  mock.method(window, 'setTimeout', globalThis.setTimeout);
+  mock.method(window, 'clearTimeout', globalThis.clearTimeout);
+  mock.method(window.performance, 'now', () => Date.now());
+  const locale = getLocale();
+  setLocale('en');
+  context.after(() => {
+    setLocale(locale);
+    delete globalThis.document;
+    delete globalThis.requestAnimationFrame;
+    restoreWindow();
+  });
+}
+
+test('showToast gives errors 30 seconds even with a shorter duration option', (context) => {
+  installToastRenderer(context);
+  const { timers } = context.mock;
+  showToast('Default error', 'error');
+  showToast('Short override', 'error', { durationMs: 8000 });
+  const toasts = [...document.querySelectorAll('.tt-toast--error')];
+  const values = () => toasts.map((toast) => toast.querySelector('.toast-countdown').textContent);
+  assert.deepEqual(values(), ['30 sec', '30 sec']);
+  timers.tick(8000);
+  assert.deepEqual(values(), ['22 sec', '22 sec']);
+  timers.tick(21999);
+  assert.deepEqual(values(), ['1 sec', '1 sec']);
+  assert.ok(toasts.every((toast) => toast.style.opacity === '1' && toast.isConnected));
+  timers.tick(1);
+  assert.deepEqual(values(), ['0 sec', '0 sec']);
+  assert.ok(toasts.every((toast) => toast.style.opacity === '0'));
+  timers.tick(300);
+  assert.ok(toasts.every((toast) => !toast.isConnected));
+});
+
+test('showToast pauses on hover and resumes from the exact remaining time', (context) => {
+  installToastRenderer(context);
+  const { timers } = context.mock;
+  showToast('Paused error', 'error');
+  const toast = document.querySelector('.tt-toast--error');
+  const countdown = toast.querySelector('.toast-countdown');
+  timers.tick(2500);
+  toast.dispatchEvent(new window.MouseEvent('mouseenter'));
+  timers.tick(31000);
+  assert.equal(countdown.textContent, '28 sec');
+  assert.equal(toast.style.opacity, '1');
+  toast.dispatchEvent(new window.MouseEvent('mouseleave'));
+  timers.tick(499);
+  assert.equal(countdown.textContent, '28 sec');
+  timers.tick(1);
+  assert.equal(countdown.textContent, '27 sec');
+  timers.tick(27000);
+  assert.equal(countdown.textContent, '0 sec');
+});
+
+test('showToast localizes the close button and timer and dismisses a focused error immediately', (context) => {
+  installToastRenderer(context);
+  const { timers } = context.mock;
+  document.body.innerHTML = '<button type="button">Invoker</button>';
+  const invoker = document.querySelector('button');
+  for (const [locale, closeLabel, timerLabel] of [
+    ['en', 'Dismiss error notification', 'Time remaining'],
+    ['uk', 'Закрити сповіщення про помилку', 'Залишилося часу'],
+    ['zh', '关闭错误通知', '剩余时间'],
+    ['es', 'Cerrar la notificación de error', 'Tiempo restante'],
+  ]) {
+    setLocale(locale);
+    invoker.focus();
+    showToast('An error occurred', 'error');
+    const toast = document.querySelector('.tt-toast--error');
+    const close = toast.querySelector('button.toast-close');
+    const countdown = toast.querySelector('[role="timer"]');
+    assert.equal(toast.querySelector('[role="alert"]').textContent, 'An error occurred');
+    assert.equal(countdown.closest('[aria-live]'), null);
+    assert.equal(close.getAttribute('aria-label'), closeLabel);
+    assert.equal(countdown.getAttribute('aria-label'), timerLabel);
+    assert.equal(close.tabIndex, 0);
+    close.focus();
+    assert.equal(document.activeElement, close);
+    timers.tick(31000);
+    assert.equal(toast.style.opacity, '1');
+    close.click();
+    assert.equal(toast.isConnected, false);
+    assert.equal(document.activeElement, invoker);
+  }
+});
+
+test('showToast keeps the existing default and custom hold for other variants', (context) => {
+  installToastRenderer(context);
+  const { timers } = context.mock;
+  showToast('Saved', 'success');
+  showToast('Information', 'info', { durationMs: 4000 });
+  const success = document.querySelector('.tt-toast--success');
+  const info = document.querySelector('.tt-toast--info');
+  assert.equal(document.querySelector('.toast-close, .toast-countdown'), null);
+  timers.tick(2000);
+  assert.equal(success.style.opacity, '0');
+  assert.equal(info.style.opacity, '1');
+  timers.tick(2000);
+  assert.equal(success.isConnected, false);
+  assert.equal(info.style.opacity, '0');
+});
+
+test('a failed progress toast uses the error countdown and close button', (context) => {
+  installToastRenderer(context);
+  const progress = showProgressToast('Working');
+  const running = document.querySelector('.tt-toast--info');
+  assert.equal(running.querySelector('.toast-close'), null);
+  progress.fail('Could not finish');
+  assert.equal(running.isConnected, false);
+  const toast = document.querySelector('.tt-toast--error');
+  assert.equal(toast.querySelector('[role="alert"]').textContent, 'Could not finish');
+  assert.equal(toast.querySelector('.toast-countdown').textContent, '30 sec');
+  context.mock.timers.tick(3000);
+  assert.equal(toast.querySelector('.toast-countdown').textContent, '27 sec');
+  toast.querySelector('.toast-close').click();
+  assert.equal(toast.isConnected, false);
+});
 
 // Minimal fake <textarea>-shaped object — createLiveInserter only ever touches .value,
 // .selectionStart/.selectionEnd, and .dispatchEvent(), so no real DOM is needed here.

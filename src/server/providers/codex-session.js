@@ -28,6 +28,14 @@ const CODEX_TOOL_FENCE =
   'claims a placeholder id, it never creates/mutates real task content). get_task is allowed ' +
   '(read-only) to load an existing task\'s full description before proposing a modified one.\n\n' +
   CODEX_OBJECTIVE_PROFILE.fileReadInstructions + '\n\n' +
+  'When proposing new work, decide the scope before reserving keys. Use the supplied context and ' +
+  'read the relevant source or runbook to find what must happen first, what each step delivers, ' +
+  'how success will be verified, and who can authorize or perform the next step. ' +
+  'Give a handoff its own card when another task needs its output, evidence from a rehearsal, ' +
+  'or a human decision. Name the deliverable and its acceptance check on the card that produces it. ' +
+  'Use HUMAN for work only a person can perform. Link each consumer to its prerequisites by task key ' +
+  'in dependencies and schedule it in a later sprint. Independent work can share a sprint. ' +
+  'Keep a self-contained change and its routine verification on one card.\n\n' +
   'Callable Tipatask tools for this objective: ' + CODEX_OBJECTIVE_PROFILE.remoteEnabledTools.join(', ') +
   '; tipatask-local: ' + CODEX_OBJECTIVE_PROFILE.localEnabledTools.join(', ') + '. ' +
   'Other MCP servers are disabled. Source files and real task content must remain unchanged.';
@@ -538,8 +546,16 @@ function spawnCodexTurn(session, taskId) {
               session.timingMilestones.firstChunk = Date.now();
               if (!session.timingMilestones.firstStdoutAt) session.timingMilestones.firstStdoutAt = Date.now();
             }
-            session.turnBuffer += item.text;
-            emit({ type: 'data', data: item.text });
+            let text = item.text;
+            if (session.type === 'taskChat') {
+              // Codex sends each message whole: a progress note ("I'll check…"), the shell
+              // commands or tool calls it announced, then another message. Every message after
+              // the first opens a new text run, with or without a tool frame between them.
+              taskChatWidgets.markSegmentBoundary(session, emit);
+              text = taskChatWidgets.separateTextRun(session, text);
+            }
+            session.turnBuffer += text;
+            emit({ type: 'data', data: text });
             if (session.type === 'taskChat') taskChatWidgets.emitDialogs(session, emit);
             else extractCards(session, emit);
           } else {

@@ -339,6 +339,8 @@ function registerApiHandlers() {
   // ws-handlers.js — that route reads the forked server's process-global backend, wrong
   // project in a multi-window Electron session (same reasoning api:statuses.list above
   // already follows). Keep this shape identical to ws-handlers.js's GET /api/project/settings.
+  ipcMain.handle('api:project.profile', event => b(event)?.getDesktopProjectProfile() ?? null);
+
   ipcMain.handle('api:project.settings', async (event) => {
     const backend = b(event);
     const project = backend && typeof backend.getProjectSettings === 'function' ? await backend.getProjectSettings() : null;
@@ -380,10 +382,10 @@ function registerApiHandlers() {
   // ws-handlers.js resolves the forked server's process-global backend, wrong project in
   // a multi-window Electron session. A backend.updateProject() failure surfaces as a
   // rejected IPC promise the renderer already handles (same as api:statuses.create etc).
-  ipcMain.handle('api:project.update', async (event, { fields }) => {
+  ipcMain.handle('api:project.update', async (event, { fields, expectedContext }) => {
     const backend = b(event);
     if (!backend) throw new Error('No project loaded');
-    const project = await backend.updateProject(fields);
+    const project = await backend.updateProject(fields, expectedContext);
     return { project };
   });
 

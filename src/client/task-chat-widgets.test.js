@@ -72,6 +72,7 @@ function harness(t, { topLayer = () => true, draftStorage = new Map(), projectPa
     CHAT_BUBBLE_SVG: '<svg class="chat-bubble"></svg>',
     state: { objectiveProviders: [], objectiveModel: '' },
     showActionConfirm: async () => true,
+    createPreviewDrawer: () => ({ destroy() {} }),
     activateDialogFocus: () => ({ close() {}, focusFirst() {}, isTop: topLayer }),
     // English reads as the bare key; any other locale is prefixed, so a relabel is visible.
     t: (key, params) => (locale === 'en' ? '' : `${locale}:`) + (params ? `${key}:${Object.values(params).join(',')}` : key),
@@ -794,8 +795,13 @@ test('a task frame draws the board card with its badge; a click opens the edit m
   assert.equal(preview.textContent, 'New task, renamed');
   assert.equal(card.getAttribute('role'), 'button');
   assert.equal(card.tabIndex, 0);
-  const groups = [...h.$$('.task-chat-widgets').at(-1).children].map(el => el.className);
-  assert.deepEqual(groups, ['task-chat-tools', 'task-chat-tasks'], 'chips first, then cards');
+  const reply = h.$$('.task-chat-msg--assistant').at(-1);
+  const order = [...reply.children].map(el => el.className.split(' ')[0]);
+  assert.deepEqual(order.filter(c => c !== 'task-chat-msg-copy'),
+    ['task-chat-author', 'task-chat-flow', 'task-chat-widgets', 'task-chat-status'], 'chips in the reply, then the cards');
+  assert.ok(reply.querySelector('.task-chat-flow > .task-chat-tools > .task-chat-widget--tool'));
+  const groups = [...reply.querySelector('.task-chat-widgets').children].map(el => el.className);
+  assert.deepEqual(groups, ['task-chat-tasks'], 'the widget slot holds the cards');
 
   click(card);
   assert.equal(h.opened.length, 1);
@@ -1596,4 +1602,125 @@ test('(TPT9134) a language switch relabels the Copy buttons', (t) => {
     ['task-chat-msg-copy', 'uk:taskChat.copy.message', 'uk:taskChat.copy.message'],
     ['task-chat-copy', 'uk:taskChat.copy.button', 'uk:taskChat.copy.button'],
   ]);
+});
+
+// ── (TPT9383) Progress notes and the answer ──
+// The reported turn: the agent says what it will check, calls two tools (one fails), then answers.
+// The note and the answer used to share one block ("…read them.Yes. The wizard…") with the chips
+// under both; each is its own block now, the chips between them.
+
+const NOTE = "I'll check how the wizard saves preset selections and how the planner and task agents read them.";
+const ANSWER = 'Yes. The wizard sends projectPresets through the existing POST /api/projects endpoint.';
+const LIST_TAGS = { id: 'toolu_1', name: 'mcp__tipatask__list_system_tags', server: 'tipatask', tool: 'list_system_tags', at: NOTE.length };
+const KB_DOC = { id: 'toolu_2', name: 'mcp__tipatask__get_tag_architecture', server: 'tipatask', tool: 'get_tag_architecture', at: NOTE.length, input: { tag_name: 'tt-api-projects' } };
+const STORED_REPLY = {
+  role: 'assistant', content: `${NOTE}\n\n${ANSWER}`, breaks: [NOTE.length],
+  tools: [{ ...LIST_TAGS, status: 'done' }, { ...KB_DOC, status: 'error', error: 'not found' }], dialogs: [], taskEvents: [],
+};
+const SPLIT = ['task-chat-note task-chat-md task-chat-step', 'task-chat-tools task-chat-step', 'task-chat-body task-chat-md'];
+
+const flowOf = reply => [...reply.querySelector(':scope > .task-chat-flow').children];
+const classesOf = reply => flowOf(reply).map(el => el.className);
+
+test('(TPT9383) the screenshot turn: the note, then its tool chips, then the answer — separate blocks', async (t) => {
+  const h = copyHarness(t);
+  h.start();
+  h.turn('Does the API take preset selections?');
+  h.feed({ type: 'data', data: NOTE.slice(0, 40) });
+  h.feed({ type: 'data', data: NOTE.slice(40) });
+  const reply = h.$$('.task-chat-msg--assistant').at(-1);
+  assert.deepEqual(classesOf(reply), ['task-chat-body task-chat-md'], 'one block while the first run streams');
+
+  // What every provider loop sends when the agent calls a tool after writing text.
+  h.feed({ type: 'task-chat-segment', taskKey: 'TPT1', at: NOTE.length });
+  h.feed({ type: 'task-chat-tool', taskKey: 'TPT1', tool: { ...LIST_TAGS, status: 'running' } });
+  h.feed({ type: 'task-chat-tool', taskKey: 'TPT1', tool: { ...LIST_TAGS, status: 'done' } });
+  h.feed({ type: 'task-chat-tool', taskKey: 'TPT1', tool: { ...KB_DOC, status: 'running' } });
+  h.feed({ type: 'task-chat-tool', taskKey: 'TPT1', tool: { ...KB_DOC, status: 'error', error: 'not found' } });
+  assert.deepEqual(classesOf(reply), SPLIT, 'the note is closed and its chips follow it');
+  const [note, tools, answer] = flowOf(reply);
+  assert.equal(note.textContent, NOTE);
+  assert.deepEqual([...tools.children].map(el => [el.dataset.widgetId, el.dataset.status]), [['toolu_1', 'done'], ['toolu_2', 'error']]);
+  assert.ok(answer.querySelector('.chat-typing-indicator'), 'the answer is on its way');
+  assert.equal(answer.hidden, false);
+  const chip = tools.firstElementChild;
+
+  // The provider opens the answer on a blank line.
+  h.feed({ type: 'data', data: `\n\n${ANSWER.slice(0, 12)}` });
+  h.feed({ type: 'data', data: ANSWER.slice(12) });
+  assert.equal(flowOf(reply)[2].textContent, ANSWER, 'later text starts a new block');
+  assert.ok(flowOf(reply)[0] === note && tools.firstElementChild === chip, 'the note and its chips stay as drawn while the answer streams');
+
+  // Claude's result is the streamed text, trimmed: the split stays.
+  h.feed({ type: 'objective-result', content: `${NOTE}\n\n${ANSWER}`.trim() });
+  h.feed({ type: 'chat-ready' });
+  assert.deepEqual(classesOf(reply), SPLIT);
+  assert.deepEqual([flowOf(reply)[0].textContent, flowOf(reply)[2].textContent], [NOTE, ANSWER]);
+  assert.doesNotMatch(reply.textContent, /them\.Yes/, 'never glued');
+  assert.equal(reply.querySelector('.task-chat-widgets').children.length, 0, 'no chips under both blocks');
+
+  // Copy takes the final answer only, and says so.
+  const whole = reply.querySelector(':scope > .task-chat-msg-copy');
+  assert.equal(whole.hidden, false);
+  assert.equal(whole.title, 'taskChat.copy.answer');
+  click(whole);
+  await settleCopy();
+  assert.deepEqual(h.copies, [ANSWER]);
+});
+
+test('(TPT9383) reopening a chat splits its stored replies again', (t) => {
+  const h = copyHarness(t);
+  h.env.open('TPT1');
+  h.feed({
+    type: 'chat-history-reset',
+    running: false,
+    messages: [
+      { role: 'user', content: 'seed', seed: true },
+      { role: 'assistant', content: 'Hello.' },
+      { role: 'user', content: 'Does the API take preset selections?' },
+      STORED_REPLY,
+    ],
+  });
+  h.feed({ type: 'config', objectiveProviders: [] });
+  const [hello, reply] = h.$$('.task-chat-msg--assistant');
+  assert.deepEqual(classesOf(hello), ['task-chat-body task-chat-md'], 'a reply without tool calls stays one block');
+  assert.deepEqual(classesOf(reply), SPLIT);
+  assert.equal(flowOf(reply)[0].textContent, NOTE);
+  assert.equal(flowOf(reply)[2].textContent, ANSWER);
+  assert.deepEqual([...flowOf(reply)[1].children].map(el => el.dataset.widgetId), ['toolu_1', 'toolu_2']);
+  assert.equal(reply.querySelector(':scope > .task-chat-msg-copy').title, 'taskChat.copy.answer');
+  assert.equal(hello.querySelector(':scope > .task-chat-msg-copy').title, 'taskChat.copy.message');
+});
+
+test('(TPT9383) a chat resumed from history shows the read-back note and answer as separate blocks', (t) => {
+  const h = copyHarness(t);
+  h.env.open('TPT1');
+  h.feed({ type: 'config', objectiveProviders: [] });
+  h.feed({
+    type: 'chat-history-resumed', historyId: 'h1', taskKey: 'TPT1', provider: 'claude', transcriptUnavailable: false,
+    messages: [
+      { role: 'user', content: 'Does the API take preset selections?', restored: true },
+      { role: 'assistant', content: `${NOTE}\n\n${ANSWER}`, breaks: [NOTE.length], restored: true },
+    ],
+  });
+  const reply = h.$('.task-chat-msg--assistant.task-chat-msg--restored');
+  assert.deepEqual(classesOf(reply), ['task-chat-note task-chat-md task-chat-step', 'task-chat-body task-chat-md'],
+    'the provider\'s file keeps no tool calls: the note and the answer, without chips');
+  assert.equal(flowOf(reply)[0].textContent, NOTE);
+  assert.equal(flowOf(reply)[1].textContent, ANSWER);
+});
+
+test('(TPT9383) a reply whose tools ran after its last text keeps that text as the answer, chips after it', (t) => {
+  const h = copyHarness(t);
+  h.start();
+  h.turn('Rename it.');
+  h.feed({ type: 'data', data: 'Renaming TPT1 now.' });
+  h.feed({ type: 'task-chat-segment', taskKey: 'TPT1', at: 18 });
+  h.feed({ type: 'task-chat-tool', taskKey: 'TPT1', tool: { id: 'u1', name: 'mcp__tipatask__update_task', server: 'tipatask', tool: 'update_task', at: 18, status: 'done' } });
+  const reply = h.$$('.task-chat-msg--assistant').at(-1);
+  assert.deepEqual(classesOf(reply), SPLIT, 'while it streams, the text is a note: more may follow');
+  h.feed({ type: 'chat-ready' });
+  assert.deepEqual(classesOf(reply), ['task-chat-body task-chat-md', 'task-chat-tools'], 'done: the last text is the answer');
+  assert.equal(flowOf(reply)[0].textContent, 'Renaming TPT1 now.');
+  assert.equal(reply.querySelector(':scope > .task-chat-msg-copy').title, 'taskChat.copy.message');
 });

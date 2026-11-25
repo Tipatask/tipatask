@@ -28,7 +28,7 @@ function _evictOldest() {
  *
  * @param {{ taskId: string, task: object|null, tasks: object[], userText: string, projectPath?: string, provider?: string, model?: string }} opts
  */
-function buildKey({ taskId, task, tasks, userText, projectPath, provider, model }) {
+function buildKey({ taskId, task, tasks, userText, projectPath, provider, model, presetRules }) {
   const status = task ? task.status : null;
   const tags = task ? (task.tags || []).map(t => t.toLowerCase()).sort() : [];
 
@@ -41,7 +41,7 @@ function buildKey({ taskId, task, tasks, userText, projectPath, provider, model 
   // v3 (C1029): include provider+model — the chat-model-selector means a first-turn
   // re-ask with the same text but a different model must NOT replay the other model's
   // cached answer. v2 kept projectPath so per-project responses never collide across windows.
-  const payload = JSON.stringify({ v: 3, taskId, status, tags, counts, userTextSha, projectPath: projectPath || '', provider: provider || '', model: model || '' });
+  const payload = JSON.stringify({ v: 3, taskId, status, tags, counts, userTextSha, projectPath: projectPath || '', provider: provider || '', model: model || '', presetRules: presetRules || undefined });
   return crypto.createHash('sha256').update(payload).digest('hex');
 }
 

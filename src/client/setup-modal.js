@@ -1,6 +1,6 @@
 // Setup wizard — modal to link an existing Tipatask project to a project directory
-// (setup mode: 5 steps, no API URL — the host is a fixed default, not user-entered) or
-// to re-authenticate one (reauth mode: 4 steps, no device step — a re-auth never
+// (setup mode: 6 steps, including project identity and policy) or
+// to re-authenticate one (reauth mode: 5 steps, no device step — a re-auth never
 // registers a new device). Triggered when open-project IPC returns { needsSetup: true }.
 // (TPT161) Rebuilt on project-creation-wizard.js's layout/helpers: same header, same
 // footer buttons, same Device name step, same t('wizard.*')-keyed device copy.
@@ -8,7 +8,8 @@
 // project name, folder and agents, then main's project:import-from-wizard does the rest.
 import { renderAgentSelect, piCredentialsMissing, normalizePiModels, computePiSaveRows, loadAgents } from './agent-select.js';
 import { recheckAgents, notifyServerAgentsSaved } from './agent-recheck.js';
-import { headerHtml, fitHeaderPath } from './setup-modal-header.js';
+import { identityMarkup, policyMarkup, renderSetupProfile } from './project-profile.js';
+import { headerHtml, fitHeaderPath, escapeHtml as _esc } from './setup-modal-header.js';
 import { DEFAULT_API_BASE_URL } from './constants.js';
 import { isUnboundWindow } from './project-open-flow.js';
 import { activateDialogFocus } from './dialog-focus.js';
@@ -22,8 +23,8 @@ import { t, tc, getLocale } from './i18n.js';
 // to unit-test there. The one piece of real navigation logic is the forward jump from
 // 'signin': reauth with an already-known project (API_PROJECT_ID on existingConfig) skips
 // the project picker entirely and goes straight to 'agent'.
-const SETUP_STEPS = ['signin', 'project', 'device', 'agent', 'confirm'];
-const REAUTH_STEPS = ['signin', 'project', 'agent', 'confirm'];
+const SETUP_STEPS = ['signin', 'project', 'profile', 'device', 'agent', 'confirm'];
+const REAUTH_STEPS = ['signin', 'project', 'profile', 'agent', 'confirm'];
 // 'account' — openReauth({ accountOnly: true }): app-level account swap with no project
 // (Change Account on the default empty window). Sign-in runs setup:reauth-account, which
 // authenticates and saves the account store itself; Confirm only summarizes the result.
@@ -41,8 +42,9 @@ export function stepsFor(mode) {
 export function nextStep(mode, from, { skipProject = false } = {}) {
   if (mode === 'account') return 'confirm';
   if (mode === 'import') return IMPORT_STEPS[IMPORT_STEPS.indexOf(from) + 1] || 'confirm';
-  if (from === 'signin') return skipProject ? 'agent' : 'project';
-  if (from === 'project') return mode === 'reauth' ? 'agent' : 'device';
+  if (from === 'signin') return skipProject ? 'profile' : 'project';
+  if (from === 'project') return 'profile';
+  if (from === 'profile') return mode === 'reauth' ? 'agent' : 'device';
   if (from === 'device') return 'agent';
   return 'confirm';
 }
@@ -168,6 +170,7 @@ let _userToken = null;
 let _userInfo = null;
 let _projects = [];
 let _selectedProject = null;
+let _profile = null;
 let _deviceName = '';
 let _onComplete = null;
 let _overlay = null;
@@ -365,6 +368,7 @@ function _escapeHandler(e) {
 }
 
 export function close() {
+  _profile = null;
   const wasOpen = !!_overlay;
   const completed = _completed; // capture before reset
   const accountDone = wasOpen && completed && _mode === 'account' ? _accountResult : null;
@@ -434,7 +438,7 @@ function _render() {
 
   const STEP_LABELS = {
     signin: t('setup.stepSignIn'), project: t('setup.stepProject'), device: t('wizard.stepDevice'),
-    name: t('import.stepName'), folder: t('import.stepFolder'),
+    profile: t('profile.title'), name: t('import.stepName'), folder: t('import.stepFolder'),
     agent: t('setup.stepAgent'), confirm: t('setup.stepConfirm'),
   };
   const title = _mode === 'account' ? t('reauth.accountHeaderTitle')
@@ -484,6 +488,9 @@ function _renderStep() {
   }
   if (_step === 'signin') _renderSignIn(body, footer);
   else if (_step === 'project') _renderProject(body, footer);
+  else if (_step === 'profile') renderSetupProfile({ body, footer, prefix: 'setup', baseUrl: _apiBaseUrl,
+    token: _userToken, project: _selectedProject, loaded: profile => { _profile = profile; },
+    back: _back, next: () => _goto(nextStep(_mode, 'profile')) });
   else if (_step === 'device') _renderDevice(body, footer);
   else if (_step === 'name') _renderImportName(body, footer);
   else if (_step === 'folder') _renderImportFolder(body, footer);
@@ -533,6 +540,14 @@ function _renderSignIn(body, footer) {
     footer.querySelector('#setup-switch-btn').addEventListener('click', () => {
       _userToken = null;
       _userInfo = null;
+      _profile = null;
+      if (_mode === 'setup') {
+        _selectedProject = null;
+        _deviceName = '';
+        _taskAgent = '';
+        _availableAgents = [];
+        _piModels = [{ model: '', apiKey: '' }];
+      }
       _chooseAccount = true; // the user explicitly wants another account — don't auto-reuse the browser session
       _render();
     });
@@ -710,17 +725,26 @@ function _renderProject(body, footer) {
     }
 
     list.innerHTML = _projects.map((p) => `
-      <div class="setup-modal-project-card" data-id="${_esc(String(p.id))}" data-name="${_esc(p.name || '')}">
+      <div class="setup-modal-project-card" data-id="${_esc(String(p.id))}">
         <span class="setup-modal-project-name">${_esc(p.name || t('setup.unnamedProject'))}</span>
         <span class="setup-modal-project-id">#${_esc(String(p.id))}</span>
       </div>
     `).join('');
 
-    list.querySelectorAll('.setup-modal-project-card').forEach((card) => {
+    list.querySelectorAll('.setup-modal-project-card').forEach((card, index) => {
       card.addEventListener('click', () => {
         list.querySelectorAll('.setup-modal-project-card').forEach(c => c.classList.remove('is-selected'));
         card.classList.add('is-selected');
-        _selectedProject = { id: Number(card.dataset.id), name: card.dataset.name };
+        const { id, name, projectPresets } = _projects[index];
+        if (_selectedProject && id !== _selectedProject.id) {
+          _profile = null;
+          _deviceName = '';
+          _taskAgent = '';
+          _availableAgents = [];
+          _piModels = [{ model: '', apiKey: '' }];
+          _history = ['signin'];
+        }
+        _selectedProject = { id, name, projectPresets };
         nextBtn.disabled = false;
       });
     });
@@ -814,6 +838,7 @@ function _renderAgent(body, footer) {
   if (!agentContainer) return;
 
   const applyAgents = (agents) => {
+    if (!agentContainer.isConnected) return;
     // Seed from reauth existing config or auto-init on first visit.
     // Guard: skip seeding when _taskAgent already set (reauth pre-fills from existingConfig).
     if (!_taskAgent) {
@@ -883,10 +908,11 @@ function _renderConfirm(body, footer) {
 
   body.innerHTML = `
     <p class="setup-modal-label">${_esc(titleLabel)}</p>
+    ${policyMarkup(_profile?.policy)}
     <table class="setup-modal-summary">
       <tr><td class="setup-modal-summary-key">${_esc(t('wizard.summaryFolder'))}</td><td class="setup-modal-summary-val">${_esc(_projectPath || '—')}</td></tr>
       <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryAccount'))}</td><td class="setup-modal-summary-val">${_esc(email)}</td></tr>
-      <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryProject'))}</td><td class="setup-modal-summary-val">${_esc(projName)} <span class="setup-modal-project-id">#${_esc(String(projId))}</span></td></tr>
+      <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryProject'))}</td><td class="setup-modal-summary-val">${identityMarkup(projName, _profile, {}, true)} <span class="setup-modal-project-id">#${_esc(String(projId))}</span></td></tr>
       ${deviceRow}
       <tr><td class="setup-modal-summary-key">${_esc(t('setup.summaryAgent'))}</td><td class="setup-modal-summary-val">${_esc(agentLabel)}</td></tr>
       ${modelRow}
@@ -914,6 +940,13 @@ function _renderConfirm(body, footer) {
     msg.className = 'setup-modal-msg setup-modal-msg--muted';
     try {
       const baseCfg = isReauth && _existingConfig ? { ..._existingConfig } : {};
+      if (baseCfg.API_PROJECT_ID && String(baseCfg.API_PROJECT_ID) !== String(_selectedProject.id)) {
+        // The config writer merges a renderer patch. An explicit empty array clears
+        // the previous binding's stored models and legacy key on a relink.
+        baseCfg.PI_MODELS = [];
+        delete baseCfg.PI_MODEL;
+        delete baseCfg.OPENROUTER_API_KEY;
+      }
       let savedConfig;
       const piSaveRows = piEnabled ? computePiSaveRows(_piModels) : [];
 
@@ -935,7 +968,7 @@ function _renderConfirm(body, footer) {
             projectPath: _projectPath,
             apiBaseUrl: _apiBaseUrl,
             userToken: _userToken,
-            apiProject: { id: _selectedProject.id, name: _selectedProject.name },
+            apiProject: _selectedProject,
             deviceName: _deviceName,
             taskAgent: _taskAgent,
             availableAgents: _availableAgents,
@@ -1292,12 +1325,4 @@ async function _refreshSelectedProjectName() {
     const match = projects.find(p => Number(p.id) === Number(_selectedProject.id));
     if (match && match.name) _selectedProject = { ..._selectedProject, name: match.name };
   } catch { /* non-fatal — keep cached name */ }
-}
-
-function _esc(str) {
-  return String(str ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 }

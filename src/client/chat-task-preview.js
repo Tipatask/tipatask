@@ -6,7 +6,7 @@ import { collapseCard, renderAgentBadge, renderCard as renderBoardCard, dependen
 import { api } from './api-client.js';
 import {
   getUnsavedAcceptedCountForMsg, getConfirmedTaskIds,
-  captureCardEdits, saveChatState, saveChatDraft, syncDiscussLocks, repaintAfterSavedChatClosed,
+  captureCardEdits, saveChatState, saveChatDraft, syncDiscussLocks, repaintAfterSavedChatClosed, syncObjectiveStage,
 } from './chat-ui.js';
 import { cleanupChat } from './console-modal.js';
 import { showActionConfirm } from './action-confirm.js';
@@ -23,12 +23,17 @@ import { t as translate, tc, getLocale } from './i18n.js';
 import { groupTitle, groupNoun, getObjectiveGroupingEnabled } from './group-label.js';
 import { countPendingSubtaskCards } from './subtask-preview.js';
 import { normalizeSingleItemList } from './description-list.js';
+import { noteObjectiveSaved } from './objective-stage.js';
 // Re-exported so template.html's inline script (reached only via the window.TipTask.chatTaskPreview
 // namespace, no direct ES import) can hydrate proposal.task itself in the compareTaskId fallback
 // path (C1109's onCompareTaskResolved callback) without a second import wire-up.
 export { hydrateModifiedCard };
 
+// (TPT9389) Same rule as chat-ui.js's reload(): with the Create modal up the repaint stays in the
+// modal (template.html's repaintCreateModal(), a fresh read that leaves the board behind it
+// alone); otherwise the page reloads.
 function reload() {
+  if (typeof window !== 'undefined' && window.TipTask?.repaintCreateModal?.()) return;
   document.dispatchEvent(new Event('tiptask:reload'));
 }
 
@@ -304,6 +309,22 @@ export function getLockedCardTarget(msg, cardIdx, cs = state.chatState) {
   return target && isLockedTargetStatus(target.status) ? target : null;
 }
 
+// ── (TPT9391) A proposal card's state chip ──
+// `state` is 'included' | 'rejected' | 'saving'. setCardState() rewrites the chip of a mounted
+// card, since Accept and Reject change it without a repaint.
+function cardStateChipHtml(cardState) {
+  return `<span class="preview-card-state" data-state="${cardState}">${escapeAttr(translate(`chat.card.state.${cardState}`))}</span>`;
+}
+
+function setCardState(card, cardState) {
+  const chip = card?.querySelector?.('.preview-card-state');
+  if (chip) {
+    chip.dataset.state = cardState;
+    chip.textContent = translate(`chat.card.state.${cardState}`);
+  }
+  card?.querySelector?.('.btn-reject-card')?.setAttribute?.('aria-pressed', String(cardState === 'rejected'));
+}
+
 // ── Render card HTML for a single assistant message ──
 export function renderCardHtml(msg, msgIdx) {
   if (!msg.cards || msg.cards.length === 0) return '';
@@ -415,13 +436,23 @@ export function renderCardHtml(msg, msgIdx) {
     // (TPT303) Status + sprint share one non-wrapping .preview-meta-controls group, so they stay
     // on a single line under the title; only deps and the agent badge may wrap below it.
     const metaHtml = `<span class="preview-meta-controls"><span class="status card-ctl" style="--status-color:${statusColor(displayStatus)}" data-status-role="${statusRoleToken(displayStatus)}">${statusLabel(displayStatus)}</span>${stepSelector}</span>${deps}${renderAgentBadge(t)}`;
+    // (TPT9391) The card's foot says where the proposal stands and names both controls. The
+    // state chip reads Included (Save Tasks will write it), Rejected, or Saving while its own
+    // Accept is being written; a locked target has its badge in the head instead. Accept writes
+    // this one task now; Reject is a toggle (aria-pressed) that leaves it out of the save.
+    const cardState = lockedTarget ? '' : (mask[cardIdx] === false ? 'rejected' : 'included');
     const footHtml = isConfirmed ? '' : `<div class="preview-card-actions">
-          <button class="btn-accept-card${accepted ? ' active' : ''}" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" title="${escapeAttr(lockedError || 'Accept')}"${lockedTarget ? ' disabled aria-disabled="true"' : ''}>
-            <svg viewBox="0 0 16 16" fill="none"><polyline points="3 8 6.5 11.5 13 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          ${cardState ? cardStateChipHtml(cardState) : ''}
+          <span class="preview-card-buttons">
+          <button type="button" class="btn-accept-card${accepted ? ' active' : ''}" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" title="${escapeAttr(lockedError || translate('chat.card.acceptTitle'))}"${lockedTarget ? ' disabled aria-disabled="true"' : ''}>
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><polyline points="3 8 6.5 11.5 13 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span class="preview-card-action-label">${escapeAttr(translate('chat.card.accept'))}</span>
           </button>
-          <button class="btn-reject-card${mask[cardIdx] === false ? ' active' : ''}" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" title="Reject">
-            <svg viewBox="0 0 16 16" fill="none"><line x1="4" y1="4" x2="12" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="12" y1="4" x2="4" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <button type="button" class="btn-reject-card${mask[cardIdx] === false ? ' active' : ''}" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" title="${escapeAttr(translate('chat.card.rejectTitle'))}" aria-pressed="${mask[cardIdx] === false}">
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><line x1="4" y1="4" x2="12" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="12" y1="4" x2="4" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <span class="preview-card-action-label">${escapeAttr(translate('chat.card.reject'))}</span>
           </button>
+          </span>
         </div>`;
     const cardTask = {
       ...t,
@@ -450,13 +481,13 @@ export function renderCardHtml(msg, msgIdx) {
 
   const cardsIntro = subtaskParentKey
     ? escapeAttr(translate('chat.subtaskCardsIntro', { key: subtaskParentKey }))
-    : 'Proposed tasks:';
+    : escapeAttr(translate('chat.cardsIntro'));
   let html = `<div class="chat-cards-intro">${cardsIntro}</div><div class="chat-cards-grid">${cardsHtml}</div>`;
   if (msg.filesAddressed && msg.filesAddressed.length > 0) {
     const items = msg.filesAddressed.map(f => `<li class="files-addressed-item">${escapeAttr(f)}</li>`).join('');
     html += `<div class="chat-files-addressed collapsed">
       <div class="files-addressed-header">
-        <span class="files-addressed-label">Files Addressed (${msg.filesAddressed.length})</span>
+        <span class="files-addressed-label">${escapeAttr(translate('chat.filesAddressed', { n: msg.filesAddressed.length }))}</span>
         <span class="files-addressed-chevron"></span>
       </div>
       <ul class="files-addressed-list">${items}</ul>
@@ -469,7 +500,7 @@ export function renderCardHtml(msg, msgIdx) {
     }).join('');
     html += `<div class="chat-doc-updates collapsed">
       <div class="doc-updates-header">
-        <span class="doc-updates-label">Agent edits during analysis (${msg.docUpdates.length})</span>
+        <span class="doc-updates-label">${escapeAttr(translate('chat.docUpdates', { n: msg.docUpdates.length }))}</span>
         <span class="doc-updates-chevron"></span>
       </div>
       <ul class="doc-updates-list">${items}</ul>
@@ -511,22 +542,32 @@ export function renderDiscussPreviewHtml(taskKey, entry) {
 }
 
 // ── Render save bar HTML for a single message ──
+// (TPT9391) The bar with Save Tasks and Discard is the last element of its reply bubble and is
+// pinned to the bottom edge of the transcript while that reply is on screen (styles.css
+// `.chat-save-bar`), so the count and both buttons stay in reach under any number of proposals.
+// A resolved bar (Saved, Discarded) is one line of text and scrolls with the reply.
+function saveBarCountText(count) {
+  return tc('chat.saveBar.ready', count);
+}
+
 export function renderSaveBarHtml(msg, msgIdx) {
   if (!msg.cards || msg.cards.length === 0) return '';
 
   const msgCount = getUnsavedAcceptedCountForMsg(msg);
+  const discardBtn = `<button type="button" class="btn-discard chat-discard-btn" data-msg-idx="${msgIdx}">${escapeAttr(translate('chat.saveBar.discard'))}</button>`;
+  const saveLabel = escapeAttr(translate('chat.saveBar.save'));
 
   if (msg.discarded) {
     return `<div class="chat-save-bar resolved" data-msg-idx="${msgIdx}">
-      <span class="save-bar-status">Discarded</span>
+      <span class="save-bar-status">${escapeAttr(translate('chat.saveBar.discarded'))}</span>
     </div>`;
   }
 
   if (msgCount > 0) {
     return `<div class="chat-save-bar" data-msg-idx="${msgIdx}">
-      <span class="save-bar-count">${msgCount} task${msgCount !== 1 ? 's' : ''} ready to save</span>
-      <button class="btn-discard chat-discard-btn" data-msg-idx="${msgIdx}">Discard</button>
-      <button class="btn-done chat-save-btn" data-msg-idx="${msgIdx}">Save Tasks</button>
+      <span class="save-bar-count">${escapeAttr(saveBarCountText(msgCount))}</span>
+      ${discardBtn}
+      <button type="button" class="btn-done chat-save-btn" data-msg-idx="${msgIdx}">${saveLabel}</button>
     </div>`;
   }
 
@@ -536,15 +577,15 @@ export function renderSaveBarHtml(msg, msgIdx) {
     const error = escapeAttr(translate('chat.lockedTargetError', { id: target.id, status: statusLabel(target.status) }));
     return `<div class="chat-save-bar" data-msg-idx="${msgIdx}">
       <span class="save-bar-status">${error}</span>
-      <button class="btn-discard chat-discard-btn" data-msg-idx="${msgIdx}">Discard</button>
-      <button class="btn-done chat-save-btn" data-msg-idx="${msgIdx}" disabled title="${error}">Save Tasks</button>
+      ${discardBtn}
+      <button type="button" class="btn-done chat-save-btn" data-msg-idx="${msgIdx}" disabled title="${error}">${saveLabel}</button>
     </div>`;
   }
 
   const anyConfirmed = (msg.confirmedMask || []).some(v => v);
   if (anyConfirmed) {
     return `<div class="chat-save-bar resolved" data-msg-idx="${msgIdx}">
-      <span class="save-bar-status">\u2713 Saved</span>
+      <span class="save-bar-status">\u2713 ${escapeAttr(translate('chat.saveBar.saved'))}</span>
     </div>`;
   }
 
@@ -622,6 +663,7 @@ export function attachCardHandlers() {
         card.dataset.accepted = 'true';
         acceptBtn.classList.add('active');
         card.querySelector('.btn-reject-card').classList.remove('active');
+        setCardState(card, 'saving');
 
         // Read user edits from contenteditable fields
         const titleEl = card.querySelector('.preview-title');
@@ -677,6 +719,7 @@ export function attachCardHandlers() {
           checkAllCardsHandled(cs);
         } catch (err) {
           buttons.forEach(b => b.disabled = false);
+          setCardState(card, 'included');
           console.error('[save] single-card save failed:', err);
           showToast(translate('chat.errSaveTask', { msg: err.message }), 'error', { durationMs: SAVE_ERROR_TOAST_MS });
         }
@@ -689,6 +732,7 @@ export function attachCardHandlers() {
         card.dataset.accepted = 'false';
         rejectBtn.classList.add('active');
         card.querySelector('.btn-accept-card').classList.remove('active');
+        setCardState(card, 'rejected');
         updateSaveBar(msgIdx);
         saveChatState();
         checkAllCardsHandled(cs);
@@ -727,6 +771,7 @@ export function attachCardHandlers() {
       msg._inFlight = true;
       saveBtn.disabled = true;
       showSavingIndicator();
+      syncObjectiveStage(); // (TPT9391) the stage line reads "Saving" for as long as the write runs
 
       try {
         try {
@@ -842,6 +887,8 @@ export function attachCardHandlers() {
                 taskId: c.taskId, taskStep: c.taskStep, depId: c.depId, depStep: c.depStep, next: c.depStep + 1,
               })));
               saveBtn.disabled = false;
+              msg._inFlight = false; // nothing was written: the bar is live again for a retry
+              syncObjectiveStage();
               await showActionConfirm({
                 okOnly: true,
                 message: `<strong>${escapeAttr(translate('chat.pinnedStepConflictTitle'))}</strong><br>${conflictLines.join('<br>')}`,
@@ -979,6 +1026,7 @@ export function attachCardHandlers() {
         } catch (err) {
           msg._inFlight = false;
           saveBtn.disabled = false;
+          syncObjectiveStage();
           console.error('[save] bulk save failed:', err);
           showToast(translate('chat.errSaveTasks', { msg: err.message }), 'error', { durationMs: SAVE_ERROR_TOAST_MS });
           return;
@@ -999,6 +1047,8 @@ export function attachCardHandlers() {
         }
 
         showSaveToast(acceptedChanges.length);
+        // (TPT9391) This chat closes below, so the "Saved" stage is shown by the next paint.
+        if (cs === state.chatState) noteObjectiveSaved(acceptedChanges.length);
 
         // (TPT19) Discard every OTHER assistant message's still-live proposal cards from
         // earlier, now-superseded suggestion iterations BEFORE saveChatState() below —
@@ -1380,6 +1430,7 @@ export function refreshSubtaskSummary() {
 export function updateSaveBar(targetMsgIdx) {
   if (!state.chatState) return;
   refreshSubtaskSummary();
+  syncObjectiveStage(); // (TPT9391) the count in the stage line follows every accept / reject
 
   if (targetMsgIdx !== undefined) {
     const msg = state.chatState.messages[targetMsgIdx];
@@ -1391,7 +1442,7 @@ export function updateSaveBar(targetMsgIdx) {
     if (msg.discarded) {
       if (bar) {
         bar.classList.add('resolved');
-        bar.innerHTML = '<span class="save-bar-status">Discarded</span>';
+        bar.innerHTML = `<span class="save-bar-status">${escapeAttr(translate('chat.saveBar.discarded'))}</span>`;
       }
       return;
     }
@@ -1411,7 +1462,7 @@ export function updateSaveBar(targetMsgIdx) {
       if (bar) {
         if (anyConfirmed) {
           bar.classList.add('resolved');
-          bar.innerHTML = '<span class="save-bar-status">\u2713 Saved</span>';
+          bar.innerHTML = `<span class="save-bar-status">\u2713 ${escapeAttr(translate('chat.saveBar.saved'))}</span>`;
         } else {
           bar.remove();
         }
@@ -1421,7 +1472,7 @@ export function updateSaveBar(targetMsgIdx) {
 
     if (bar) {
       const countEl = bar.querySelector('.save-bar-count');
-      if (countEl) countEl.textContent = `${count} task${count !== 1 ? 's' : ''} ready to save`;
+      if (countEl) countEl.textContent = saveBarCountText(count);
     } else if (count > 0) {
       reload();
     }

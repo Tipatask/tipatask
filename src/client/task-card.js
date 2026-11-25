@@ -821,6 +821,14 @@ function unlockBodyScroll() {
   document.body.style.paddingRight = '';
 }
 
+// (TPT9389) Where a pinned card's backdrop goes. A proposal or Discuss card sits in the Create
+// modal: its backdrop joins that dialog's stacking context (a body-level one would paint behind
+// the dialog and never take the dismissing click), and the page behind the dialog is already
+// held still, so the card takes no scroll lock of its own. Board cards keep <body>.
+function overlayHost(card) {
+  return card.closest('.objective-modal') || document.body;
+}
+
 // (TPT456) Detaches the expanded overlay's placement listeners (ResizeObserver, window resize +
 // scroll). The scroll handler also stays on state.hoverScrollHandler for collapseCard()'s
 // existing removal, but setupCardInteractions() blanks that field on re-render without removing
@@ -871,7 +879,7 @@ export function expandCard(card, mode = 'pinned', { instant = false } = {}) {
   if (mode === 'pinned') {
     const backdrop = document.createElement('div');
     backdrop.className = 'card-overlay-backdrop';
-    document.body.appendChild(backdrop);
+    overlayHost(card).appendChild(backdrop);
     backdrop.addEventListener('click', () => {
       state.selectedCardId = null;
       clearHighlights();
@@ -880,7 +888,7 @@ export function expandCard(card, mode = 'pinned', { instant = false } = {}) {
       collapseCard();
     });
     // Board focus keeps the page scrollable; only a chat preview locks it.
-    if (isPreviewOverlay) lockBodyScroll();
+    if (isPreviewOverlay && overlayHost(card) === document.body) lockBodyScroll();
   }
   card.classList.add('card-expanded');
   card.style.position = 'fixed';
@@ -2433,7 +2441,7 @@ export function setupCardInteractions(appEl) {
         hoverCollapseTimer = null;
         const backdrop = document.createElement('div');
         backdrop.className = 'card-overlay-backdrop';
-        document.body.appendChild(backdrop);
+        overlayHost(card).appendChild(backdrop);
         backdrop.addEventListener('click', () => {
           state.selectedCardId = null;
           clearHighlights();
@@ -2441,7 +2449,7 @@ export function setupCardInteractions(appEl) {
           clearFocusActive();
           collapseCard();
         });
-        if (card.matches('.card--preview, .preview-card')) lockBodyScroll();
+        if (card.matches('.card--preview, .preview-card') && overlayHost(card) === document.body) lockBodyScroll();
         if (!isPreviewCard) {
           clearFocusActive();
           state.selectedCardId = id;

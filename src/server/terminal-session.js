@@ -26,6 +26,7 @@ const { getApiCredentials } = require('./api-credentials');
 const { connectDeviceRelay, terminalEvents, captureSessionOwner, remoteApprovalRequest } = require('./device-relay');
 const { getTaskAgent } = require('./task-agent');
 const BaseTaskAgent = require('./task-agent/base-agent');
+const { readProjectHarness } = require('./project-seeder');
 const { buildLegacyPatternTable, sanitizePromptText, isClaudeReplReady, matchClaudeBgAgentsLine, CODEX_COMPOSER_PLACEHOLDERS, CODEX_EMPTY_COMPOSER_RE } = require('./task-agent/prompt-detect');
 const { reflowChunk, carveReflowLines, resetReflow } = require('./screen-reflow');
 const { matchClaudePlanOutcomeLine, trackTypedLine, classifyTypedSubmission, trackClaudeScreen } = require('./plan-approval-detect'); // (TPT654, TPT9136)
@@ -2101,6 +2102,9 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
   // compose project's CODING kickoffs carry the KB discovery directive
   // (BaseTaskAgent#buildKbDiscoveryDirective()). null for every other project.
   const kbMode = BaseTaskAgent.resolveKbMode(session.projectPath || config.PROJECT_ROOT);
+  // The VCS read above has already warmed this project detail row. Providers use
+  // the checkout selection when the backend has no work-domain metadata.
+  const { harness } = await readProjectHarness(opts.backend, session.projectPath || config.PROJECT_ROOT);
   // (TPT9225) Desktop control for this run, from an adapter that wires it
   // (BaseTaskAgent#detectComputerUse(), computer-use.js). Optional: a failed probe starts the run
   // without it.
@@ -2122,7 +2126,7 @@ async function _spawnTerminal(session, prompt, taskId, taskTags = [], opts = {})
     });
     session._permissionGate.locale = sessionLocale(session);
   }
-  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, kbMode, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode && !session.parentPreparation, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate, backend: opts.backend, cowboyChain: session.cowboyChain, objectiveChain: session.objectiveChain, parentPreparation: session.parentPreparation, computerUse });
+  const spec = await agent.getSpawnSpec(config, finalPrompt, taskId, { taskTags, cachedTags, taskCommentsBlock, statusRoles, statusNames, vcsSettings, vcsContext, tagDescriptions, parentTaskBlock, agentLimits, kbMode, harness, projectPath: session.projectPath, model: opts.model, discovery: opts.discovery, designMode: opts.designMode && !session.parentPreparation, task: opts.task || null, agentSessionId, permissionPolicy: session.permissionPolicy, permissionGate: session._permissionGate, backend: opts.backend, cowboyChain: session.cowboyChain, objectiveChain: session.objectiveChain, parentPreparation: session.parentPreparation, computerUse });
   if (session.objectiveChain && !session.parentPreparation) {
     // Admission can queue a child for some time. Recheck its tree after all launch gates.
     const parent = await opts.backend.getTask(session.objectiveChain.rootTaskId);

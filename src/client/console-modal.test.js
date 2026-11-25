@@ -205,10 +205,10 @@ test('terminal links in rendered xterm output open through the confirmed platfor
         window.electronAPI = { openExternal };
         click(taskTerm, 4, row);
         confirmLink();
-        await until(() => document.querySelector('.tt-saving-indicator--toast[role="alert"]'), 'error toast');
-        const toast = document.querySelector('.tt-saving-indicator--toast[role="alert"]');
-        assert.ok(toast.textContent.includes('Could not open the link. Please try again.'));
-        toast.remove();
+        await until(() => document.querySelector('.tt-toast--error [role="alert"]'), 'error toast');
+        const alert = document.querySelector('.tt-toast--error [role="alert"]');
+        assert.ok(alert.textContent.includes('Could not open the link. Please try again.'));
+        alert.parentElement.querySelector('.toast-close').click();
       }
       assert.deepEqual(browserOpened, [], 'failed Electron opens do not launch a popup');
       window.electronAPI = electronAPI;

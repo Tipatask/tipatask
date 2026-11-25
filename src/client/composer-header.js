@@ -2,14 +2,17 @@
 import state from './state.js';
 import { t } from './i18n.js';
 import { escapeAttr } from './utils.js';
+import { createMode } from './create-modes.js';
 
+// (TPT9390) The header names the Create mode the modal is showing; it does not switch it. The
+// mode is picked in the left menu's Create flyout (create-flyout.js), which uses the same name,
+// hint and icon (create-modes.js). `trailingHtml` is the Objective view's console toggle and
+// History button; `tabBarHtml` is its session tab bar.
 export function renderComposerHeader(trailingHtml = '', tabBarHtml = '') {
-  const modes = [
-    { tab: 'objective', label: t('nav.objective'), sub: t('nav.objectiveSub') },
-    { tab: 'new_task', label: t('nav.task'), sub: t('nav.taskSub') },
-  ];
-  const nav = `<div class="composer-header-nav" role="tablist" aria-label="${escapeAttr(t('nav.create'))}">${modes.map(m =>
-    `<button type="button" role="tab" aria-selected="${state.activeTab === m.tab ? 'true' : 'false'}" class="composer-header-btn${state.activeTab === m.tab ? ' is-active' : ''}" data-tab="${m.tab}"><span class="composer-header-label">${escapeAttr(m.label)}</span><span class="composer-subheader">${escapeAttr(m.sub)}</span></button>`
-  ).join('')}</div>`;
-  return `<div class="composer-header"><div class="composer-header-inner">${nav}${trailingHtml ? `<div class="composer-header-actions">${trailingHtml}</div>` : ''}</div>${tabBarHtml}</div>`;
+  const mode = createMode(state.activeTab);
+  const title = `<div class="composer-header-title" data-mode="${mode.mode}">`
+    + `<span class="composer-header-icon">${mode.icon}</span>`
+    + `<div class="composer-header-text"><h2 class="composer-header-heading">${escapeAttr(t(mode.labelKey))}</h2>`
+    + `<p class="composer-subheader">${escapeAttr(t(mode.hintKey))}</p></div></div>`;
+  return `<div class="composer-header"><div class="composer-header-inner">${title}${trailingHtml ? `<div class="composer-header-actions">${trailingHtml}</div>` : ''}</div>${tabBarHtml}</div>`;
 }

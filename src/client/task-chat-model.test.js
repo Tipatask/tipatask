@@ -484,6 +484,100 @@ test('visibleHistory: hides the generated seed and carries the widget arrays', (
   assert.deepEqual(m.visibleHistory(undefined), []);
 });
 
+// ── (TPT9383) Reply segments ──
+
+const NOTE = "I'll check how the wizard saves preset selections and how the planner and task agents read them.";
+const ANSWER = 'Yes. The wizard sends `projectPresets` through the existing `POST /api/projects` endpoint.';
+const chip = (id, at, extra = {}) => ({ id, name: `mcp__tipatask__${id}`, server: 'tipatask', tool: id, status: 'done', at, ...extra });
+// Blocks as [kind, text or tool ids, step] — what the window draws, in order.
+const layout = message => m.replyBlocks(message).map(b => [b.kind, b.kind === 'tools' ? b.tools.map(t => t.id) : b.text, b.step]);
+
+test('(TPT9383) replyBlocks: the note, the chips of the calls after it, then the answer', () => {
+  const reply = { role: 'assistant', content: `${NOTE}\n\n${ANSWER}`, breaks: [NOTE.length], tools: [chip('list_system_tags', NOTE.length), chip('get_tag_architecture', NOTE.length)] };
+  assert.deepEqual(layout(reply), [
+    ['note', NOTE, true],
+    ['tools', ['list_system_tags', 'get_tag_architecture'], true],
+    ['answer', ANSWER, false],
+  ]);
+  assert.equal(m.replyAnswer(reply), ANSWER);
+  assert.equal(m.messageCopyText(reply), ANSWER, 'Copy takes the final answer only');
+  assert.equal(m.replyHasNotes(reply), true);
+  assert.deepEqual(m.replyBlocks(reply).map(b => b.key), [`note:0`, 'tools:list_system_tags', 'answer']);
+});
+
+test('(TPT9383) replyBlocks: a reply with no boundary is one answer, as before', () => {
+  assert.deepEqual(layout({ role: 'assistant', content: 'Just text.' }), [['answer', 'Just text.', false]]);
+  assert.deepEqual(layout({ role: 'assistant', content: 'Read it.', tools: [{ id: 'old', name: 'Read', status: 'done' }] }),
+    [['answer', 'Read it.', false], ['tools', ['old'], false]], 'a call with no `at` goes after the text');
+  assert.deepEqual(layout({ role: 'assistant', content: '' }), [['answer', '', false]], 'always one answer block');
+  assert.deepEqual(layout(null), [['answer', '', false]]);
+  assert.equal(m.replyHasNotes({ role: 'assistant', content: 'Just text.' }), false);
+});
+
+test('(TPT9383) replyBlocks while streaming: a closed run is a note, the open run is the answer, even empty', () => {
+  const streaming = { role: 'assistant', streaming: true, content: NOTE, breaks: [NOTE.length], tools: [chip('get_task', NOTE.length, { status: 'running' })] };
+  assert.deepEqual(layout(streaming), [['note', NOTE, true], ['tools', ['get_task'], true], ['answer', '', false]]);
+  streaming.content += '\n\nYes';
+  assert.deepEqual(layout(streaming), [['note', NOTE, true], ['tools', ['get_task'], true], ['answer', 'Yes', false]]);
+  // The turn ends with the call: its last text is the answer, the chips after it.
+  const done = { role: 'assistant', content: 'Renaming it.', breaks: [12], tools: [chip('update_task', 12)] };
+  assert.deepEqual(layout(done), [['answer', 'Renaming it.', false], ['tools', ['update_task'], false]]);
+  assert.equal(m.replyHasNotes(done), false);
+});
+
+test('(TPT9383) replyBlocks: calls before any text come first; calls with no text between share a group', () => {
+  assert.deepEqual(layout({ role: 'assistant', content: ANSWER, tools: [chip('a', 0), chip('b', 0)] }),
+    [['tools', ['a', 'b'], true], ['answer', ANSWER, false]]);
+  // A run of blank lines is no block: the chips around it read as one group.
+  const content = `${NOTE}\n\n\n\n${ANSWER}`;
+  const blank = NOTE.length + 2;
+  assert.deepEqual(layout({ role: 'assistant', content, breaks: [NOTE.length, blank], tools: [chip('a', NOTE.length), chip('b', blank)] }),
+    [['note', NOTE, true], ['tools', ['a', 'b'], true], ['answer', ANSWER, false]]);
+  // Two notes, then the answer.
+  const two = `One.\n\nTwo.\n\n${ANSWER}`;
+  assert.deepEqual(layout({ role: 'assistant', content: two, breaks: [4, 10], tools: [chip('a', 4), chip('b', 10)] }),
+    [['note', 'One.', true], ['tools', ['a'], true], ['note', 'Two.', true], ['tools', ['b'], true], ['answer', ANSWER, false]]);
+});
+
+test('(TPT9383) replyBlocks: the ask_user fence leaves the answer; boundaries past the text are pulled back', () => {
+  const asked = { role: 'assistant', content: `${NOTE}\n\nPick one.\n\n\`\`\`ask_user\n{"question":"Which?"}\n\`\`\`\n`, breaks: [NOTE.length], tools: [chip('a', NOTE.length)] };
+  assert.deepEqual(layout(asked), [['note', NOTE, true], ['tools', ['a'], true], ['answer', 'Pick one.', false]]);
+  assert.deepEqual(layout({ role: 'assistant', content: 'Short.', breaks: [99], tools: [chip('a', 99)] }),
+    [['answer', 'Short.', false], ['tools', ['a'], false]]);
+  assert.deepEqual(m.segmentBreaks([30, 'x', 0, -2, 30, 12, 1.5], 20), [12, 20]);
+  assert.deepEqual(m.withBreak([12], 30), [12, 30]);
+  assert.deepEqual(m.withBreak([12, 30], 30), [12, 30], 'a replayed boundary adds nothing');
+  assert.deepEqual(m.withBreak(undefined, 0), []);
+});
+
+test('(TPT9383) visibleHistory keeps the boundaries: reopen and resume split a reply as it streamed', () => {
+  const tools = [chip('list_system_tags', NOTE.length), chip('get_tag_architecture', NOTE.length, { status: 'error' })];
+  const reopened = m.visibleHistory([
+    { role: 'user', content: 'seed', seed: true },
+    { role: 'user', content: 'Does the API take preset selections?', breaks: [3] },
+    { role: 'assistant', content: `${NOTE}\n\n${ANSWER}`, breaks: [NOTE.length, 'bad'], tools },
+  ]);
+  assert.deepEqual(reopened[0].breaks, [], 'a user turn has none');
+  assert.deepEqual(reopened[1].breaks, [NOTE.length]);
+  assert.deepEqual(layout(reopened[1]), [
+    ['note', NOTE, true],
+    ['tools', ['list_system_tags', 'get_tag_architecture'], true],
+    ['answer', ANSWER, false],
+  ]);
+  assert.equal(m.messageCopyText(reopened[1]), ANSWER);
+
+  // Resumed from the provider's own session: the read-back keeps the boundary, not the calls.
+  const resumed = m.visibleHistory([
+    { role: 'user', content: 'Does the API take preset selections?', restored: true },
+    { role: 'assistant', content: `${NOTE}\n\n${ANSWER}`, breaks: [NOTE.length], restored: true },
+    { role: 'user', content: '', seed: true, resumed: true, provider: 'codex' },
+  ]);
+  assert.deepEqual(layout(resumed[1]), [['note', NOTE, true], ['answer', ANSWER, false]]);
+  assert.equal(m.messageCopyText(resumed[1]), ANSWER);
+  // A stored reply from before boundaries existed reads as one answer.
+  assert.deepEqual(layout(m.visibleHistory([{ role: 'assistant', content: 'Old reply.' }])[0]), [['answer', 'Old reply.', false]]);
+});
+
 test('upsertById: replaces a re-sent record in place and appends a new one', () => {
   const list = [{ id: 'a', status: 'running' }];
   m.upsertById(list, { id: 'a', status: 'done' });
@@ -689,5 +783,18 @@ test('i18n: the Discuss strings exist in every locale with their placeholders', 
       assert.equal(table[k], undefined, `${locale}.${k} went with the card menu`);
     }
     assert.ok(table['taskChat.start.launchUnavailable'].includes('{model}'), `${locale}.taskChat.start.launchUnavailable keeps {model}`);
+  }
+});
+
+test('fileRefFromHref recognizes project files, attachments and pinned revisions', () => {
+  assert.deepEqual(m.fileRefFromHref('./reports/My%20file.sql#L209'), { path: 'reports/My file.sql', line: 209 });
+  assert.deepEqual(m.fileRefFromHref('LICENSE'), { path: 'LICENSE', line: null });
+  assert.deepEqual(m.fileRefFromHref(PDF + '#L8'), { href: '/api/files/2/7', line: 8 });
+  assert.deepEqual(m.fileRefFromHref('/api/images/2/41'), { href: '/api/images/2/41', line: null });
+  const artifact = '/api/projects/2/files/artifacts/12/revisions/3/content';
+  assert.deepEqual(m.fileRefFromHref(artifact), { href: artifact, line: null });
+  for (const ordinary of ['https://example.com/docs.md#L2', '//example.com/file.pdf', 'mailto:a@b.com',
+    '#task-1', '?page=2', '/tasks', '../outside', 'x/%2E%2E/y', 'C:/data.txt', 'a%00', '%zz', 'file:///a']) {
+    assert.equal(m.fileRefFromHref(ordinary), null, ordinary);
   }
 });
