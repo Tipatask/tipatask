@@ -267,6 +267,13 @@ export const api = {
       if (ipc) return ipc.project.profile();
       return _http('GET', '/api/project/profile');
     },
+    // Replace the project owner's policy layer (Settings ▸ Policy). `base` is the layer the
+    // editor opened with; a newer one is refused with a `policy_stale` message.
+    async savePolicy(rules, base, expectedContext) {
+      if (ipc) return ipc.project.savePolicy(rules, base, expectedContext);
+      const headers = expectedContext ? { 'x-tipatask-settings-context': expectedContext } : {};
+      return _http('PUT', '/api/project/policy', { rules, base }, headers);
+    },
     async settings() {
       if (ipc) return ipc.project.settings();
       return _http('GET', '/api/project/settings');

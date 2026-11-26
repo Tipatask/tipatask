@@ -98,6 +98,9 @@ export function ensureFileLinkHandler() {
   document.addEventListener('click', (e) => {
     const link = e.target.closest?.('a.file-attachment-link');
     if (!link) return;
+    // (TPT9411) A project artifact chip downloads in this window (`download`, attachment-markup.js):
+    // its address needs the window's own project session, which the system browser lacks.
+    if (link.hasAttribute('download')) return;
     e.preventDefault();
     const href = link.href;
     if (window.electronAPI?.openExternal) {

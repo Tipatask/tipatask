@@ -9,8 +9,11 @@ const ALLOWED_TAGS = [
   'tbody', 'td', 'th', 'thead', 'tr', 'ul',
 ];
 const ALLOWED_ATTR = [
-  'align', 'alt', 'checked', 'class', 'disabled', 'href', 'src', 'start', 'title', 'type',
+  'align', 'alt', 'checked', 'class', 'disabled', 'href', 'loading', 'src', 'start', 'title', 'type',
 ];
+// A project artifact revision's download address (attachment-markup.js), with the optional source
+// line anchor a link may carry.
+const ARTIFACT_CONTENT_RE = /^\/api\/projects\/\d+\/files\/artifacts\/\d+\/revisions\/\d+\/content(?:#L[1-9]\d*)?$/;
 const PURIFIERS = new WeakMap();
 
 function permittedUrl(value, attribute, win) {
@@ -29,11 +32,12 @@ function permittedUrl(value, attribute, win) {
 function permittedClasses(tag, value) {
   const classes = String(value).split(/\s+/).filter(Boolean);
   if (tag === 'CODE') return classes.filter(c => /^language-[\w-]+$/.test(c)).join(' ');
+  // (TPT9411) An image block and a file chip's icon and name: attachment-markup.js.
   const names = {
     A: ['file-attachment-link'],
     DIV: ['trello-appendix'],
     MARK: ['mention', 'mention--agent'],
-    SPAN: ['file-ref'],
+    SPAN: ['file-ref', 'md-image', 'file-attachment-icon', 'file-attachment-name'],
   }[tag] || [];
   return classes.filter(c => names.includes(c)).join(' ');
 }
@@ -57,6 +61,8 @@ function getPurifier(win) {
       data.keepAttr = tag === 'A' || tag === 'IMG';
     } else if (name === 'alt') {
       data.keepAttr = tag === 'IMG';
+    } else if (name === 'loading') {
+      data.keepAttr = tag === 'IMG' && data.attrValue === 'lazy';
     } else if (name === 'align') {
       data.keepAttr = (tag === 'TH' || tag === 'TD') && /^(left|center|right)$/.test(data.attrValue);
     } else if (name === 'start') {
@@ -67,7 +73,7 @@ function getPurifier(win) {
   });
   purifier.addHook('afterSanitizeAttributes', (node) => {
     // Same-origin artifact downloads stay in the authenticated project window.
-    if (node.nodeName === 'A' && /^\/api\/projects\/\d+\/files\/artifacts\/\d+\/revisions\/\d+\/content$/.test(node.getAttribute('href'))) {
+    if (node.nodeName === 'A' && ARTIFACT_CONTENT_RE.test(node.getAttribute('href'))) {
       node.setAttribute('download', '');
     }
     if (node.nodeName.toUpperCase() === 'INPUT') {

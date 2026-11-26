@@ -86,6 +86,8 @@ function harness(t, { topLayer = () => true, draftStorage = new Map(), projectPa
     attachFileDrop: (target, textarea, opts) => uploads.drops.push({ target, textarea, opts }),
     attachImagePaste: (textarea, _ws, opts) => uploads.pastes.push({ textarea, opts }),
     closeOpenEmbedMenu: () => {},
+    // (TPT9410) The composer's attachment strip: the real one is covered by attachment-strip.test.js.
+    renderAttachmentStrip: () => null,
     setValueKeepingCaret,
     attachAudioRecorder: () => null,
     ...model,
@@ -1250,7 +1252,7 @@ test('the composer gets the shared Embed control, paste and panel drop, all into
   assert.equal(h.uploads.drops[0].textarea, input);
 });
 
-test('Send waits for an upload; the sent turn carries the reference and shows the image inline', (t) => {
+test('Send waits for an upload; the sent turn carries the reference and shows the image on its own lines', (t) => {
   const h = harness(t);
   h.start();
   const { opts } = h.uploads.pastes[0];
@@ -1268,31 +1270,36 @@ test('Send waits for an upload; the sent turn carries the reference and shows th
   assert.equal(h.sent.at(-1).type, WS_SEND_TYPES.TASK_CHAT_MESSAGE);
   assert.equal(h.sent.at(-1).content, 'See ![img](http://h/api/projects/2/images/5)');
   const bubble = h.$$('.task-chat-msg--user').at(-1);
-  assert.equal(bubble.querySelector('.task-chat-user-text').textContent, 'See ');
-  assert.equal(bubble.querySelector('.task-chat-user-text > a.task-chat-inline-image img').getAttribute('src'), '/api/images/2/5');
-  assert.equal(bubble.querySelector('.task-chat-attachments'), null, 'an image is no strip thumbnail');
+  assert.equal(bubble.querySelector('.task-chat-user-text').textContent, 'See');
+  const link = bubble.querySelector('.task-chat-user-text > .md-image > a.md-image-link');
+  assert.equal(link.getAttribute('href'), '/api/images/2/5', 'the image opens in the file viewer');
+  assert.equal(link.querySelector('img').getAttribute('src'), '/api/images/2/5');
 });
 
 // The user text row of a bubble, as [node kind, content] pairs in document order.
 function bubbleNodes(bubble) {
-  return [...bubble.querySelector('.task-chat-user-text').childNodes].map(n => (n.nodeType === 3
-    ? ['text', n.textContent]
-    : [n.className, n.querySelector('img').getAttribute('src')]));
+  return [...bubble.querySelector('.task-chat-user-text').childNodes].map((n) => {
+    if (n.nodeType === 3) return ['text', n.textContent];
+    if (n.classList.contains('md-image')) return ['image', n.querySelector(':scope > a.md-image-link > img').getAttribute('src')];
+    return [n.className, n.getAttribute('href')];
+  });
 }
 
-test('(TPT9279) a turn with text, image, text shows the image between the two texts, live and restored', (t) => {
+test('(TPT9411) a turn with one image and one file shows both inline, live and restored', (t) => {
   const h = harness(t);
-  const content = 'Before ![img](http://h/api/projects/2/images/5) after\n[spec.pdf](http://h/api/projects/2/files/7)';
+  const content = 'Before ![img](http://h/api/projects/2/images/5) after\nsee [spec.pdf](http://h/api/projects/2/files/7) now';
   const expected = [
-    ['text', 'Before '],
-    ['file-attachment-link task-chat-inline-image', '/api/images/2/5'],
-    ['text', ' after'],
+    ['text', 'Before'],
+    ['image', '/api/images/2/5'],
+    ['text', 'after\nsee '],
+    ['file-attachment-link', '/api/files/2/7'],
+    ['text', ' now'],
   ];
   h.start();
   h.turn(content);
   const live = h.$$('.task-chat-msg--user').at(-1);
   assert.deepEqual(bubbleNodes(live), expected);
-  assert.equal(live.querySelector('.task-chat-attach--file').getAttribute('href'), '/api/files/2/7');
+  assert.equal(live.querySelector('a.file-attachment-link .file-attachment-name').textContent, 'spec.pdf');
   // The same turn restored from the server's history renders the same way.
   h.feed({ type: 'chat-history-reset', messages: [
     { role: 'user', content: 'seed', seed: true },
@@ -1302,7 +1309,6 @@ test('(TPT9279) a turn with text, image, text shows the image between the two te
   const restored = h.$$('.task-chat-msg--user');
   assert.equal(restored.length, 1);
   assert.deepEqual(bubbleNodes(restored[0]), expected);
-  assert.equal(restored[0].querySelector('.task-chat-attach--file').getAttribute('href'), '/api/files/2/7');
 });
 
 test('a failed image upload drops its placeholder; a file upload holds Send until it settles', async (t) => {
@@ -1334,9 +1340,9 @@ test('restored history shows attachments of a user turn; a notice stays plain te
     { role: 'user', content: '[spec.pdf](https://h/api/projects/2/files/7)' },
   ] });
   h.feed({ type: 'config', objectiveProviders: [] });
-  const chip = h.$('.task-chat-msg--user .task-chat-attach--file');
+  const chip = h.$('.task-chat-msg--user .task-chat-user-text > a.file-attachment-link');
   assert.equal(chip.getAttribute('href'), '/api/files/2/7');
-  assert.equal(h.$('.task-chat-msg--user .task-chat-user-text'), null);
+  assert.equal(chip.textContent, 'spec.pdf');
 });
 
 test('the start gate holds only the model select and Cancel / Start; Embed waits in the composer', (t) => {

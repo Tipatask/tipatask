@@ -49,6 +49,18 @@ let _objectiveGroupingEnabled = true;
 // task-board.js's renderBoardContent()/renderListContent(). Default 'asc' matches
 // migration 064's column default (ascending, lowest sprint first).
 let _sprintSortOrder = 'asc';
+// (TPT9407) The board header's Oldest first / Newest first switch (saveSprintSortOrder()):
+// _savedSprintSortOrder is the order the API last confirmed for this project — the one a failed
+// save goes back to. Saves run one after another on _sprintSortOrderSaves, so the last pick is
+// the one stored; _sprintSortOrderSeq numbers the picks so only the latest one may roll back;
+// _sprintSortOrderPending counts saves not yet settled (loadGroupLabel() keeps the shown order
+// while any is); _sprintSortOrderEpoch changes on a project switch, so a save started for one
+// project never touches the next project's order or sends its request on that project's behalf.
+let _savedSprintSortOrder = 'asc';
+let _sprintSortOrderSaves = Promise.resolve();
+let _sprintSortOrderSeq = 0;
+let _sprintSortOrderPending = 0;
+let _sprintSortOrderEpoch = 0;
 // (TPT632) This project's CODING task-key prefix — project.task_prefix, already run through
 // the server's resolveCodingPrefix(). Same settings bundle/load-trigger reasoning as the
 // flags above. Read SYNCHRONOUSLY by nextTaskKeyGuess() below (the New Task Preview's id
@@ -132,18 +144,72 @@ export function resetObjectiveGroupingEnabled() {
 
 // (C1577) Sets sprint_sort_order. Only the literal 'desc' opts into the legacy
 // highest-first board order; anything else (unknown/null/undefined/'asc') -> 'asc' —
-// mirrors setSprintsEnabled()'s "never adopt invalid" discipline.
+// mirrors setSprintsEnabled()'s "never adopt invalid" discipline. (TPT9407) The value
+// adopted here is the project's stored order (loadGroupLabel()), so it is also what a failed
+// saveSprintSortOrder() rolls back to.
 export function setSprintSortOrder(value) {
-  _sprintSortOrder = value === 'desc' ? 'desc' : 'asc';
+  _sprintSortOrder = _normalizeSprintSortOrder(value);
+  _savedSprintSortOrder = _sprintSortOrder;
+}
+
+function _normalizeSprintSortOrder(value) {
+  return value === 'desc' ? 'desc' : 'asc';
 }
 
 export function getSprintSortOrder() {
   return _sprintSortOrder;
 }
 
-// Project switch -> back to default (ascending) until loadGroupLabel() resolves.
+// Project switch -> back to default (ascending) until loadGroupLabel() resolves. (TPT9407)
+// Also detaches the previous project's board-switch saves: they settle without changing this
+// project's order, one still queued never sends its request, and this project's first save
+// does not wait behind them.
 export function resetSprintSortOrder() {
   _sprintSortOrder = 'asc';
+  _savedSprintSortOrder = 'asc';
+  _sprintSortOrderEpoch++;
+  _sprintSortOrderPending = 0;
+  _sprintSortOrderSaves = Promise.resolve();
+}
+
+// (TPT9407) The board header's Oldest first / Newest first switch. Shows `value` at once —
+// getSprintSortOrder() returns it before this resolves, so the caller re-renders straight
+// away — and saves it as this project's sprint_sort_order through the project settings PATCH
+// (api.project.update() -> PATCH /api/project or the api:project.update IPC ->
+// backend.updateProject() -> the API's PATCH /settings). Saves run one after another, so the
+// last pick is the one stored. When the latest pick's save fails, the order goes back to the
+// one the API last confirmed and the result says `rolledBack` — the caller re-renders and
+// shows the error. Never rejects. Resolves one of:
+//   { ok: true, changed: false, order }                 `value` is already the shown order
+//   { ok: true, changed: true, order }                  saved
+//   { ok: false, rolledBack: true, order, error }       latest pick failed; `order` is the restored one
+//   { ok: false, superseded: true, order, error }       failed, but a later pick is still on its way
+//   { ok: true|false, stale: true, order }              a project switch happened meanwhile
+export function saveSprintSortOrder(value) {
+  const order = _normalizeSprintSortOrder(value);
+  if (order === _sprintSortOrder) return Promise.resolve({ ok: true, changed: false, order });
+  const epoch = _sprintSortOrderEpoch;
+  const seq = ++_sprintSortOrderSeq;
+  _sprintSortOrder = order;
+  _sprintSortOrderPending++;
+  const run = _sprintSortOrderSaves.then(async () => {
+    if (epoch !== _sprintSortOrderEpoch) return { ok: false, stale: true, order: _sprintSortOrder };
+    try {
+      await api.project.update({ sprint_sort_order: order });
+      if (epoch !== _sprintSortOrderEpoch) return { ok: true, stale: true, order: _sprintSortOrder };
+      _savedSprintSortOrder = order;
+      return { ok: true, changed: true, order };
+    } catch (error) {
+      if (epoch !== _sprintSortOrderEpoch) return { ok: false, stale: true, order: _sprintSortOrder, error };
+      if (seq !== _sprintSortOrderSeq) return { ok: false, superseded: true, order: _sprintSortOrder, error };
+      _sprintSortOrder = _savedSprintSortOrder;
+      return { ok: false, rolledBack: true, order: _sprintSortOrder, error };
+    } finally {
+      if (epoch === _sprintSortOrderEpoch) _sprintSortOrderPending--;
+    }
+  });
+  _sprintSortOrderSaves = run;
+  return run;
 }
 
 // (TPT632) Sets task_prefix. Adopts only a derived-prefix shape (2-8 capitals, what
@@ -192,21 +258,23 @@ export async function fetchNextTaskKey(category) {
 // sprint_sort_order + task_prefix + agent_permission_mode via api.project.settings() (IPC in
 // Electron, same-origin GET /api/project/settings in browser — see ws-handlers.js). Never
 // throws — a failed read falls back to every default (mirrors getProjectSettings()'s fail-open
-// contract server-side).
+// contract server-side). (TPT9407) While a board-switch save is unsettled the shown sprint
+// order stays: a read racing that save can return the order it replaces, and the save's own
+// outcome (kept or rolled back) is the one that counts.
 export async function loadGroupLabel() {
   try {
     const result = await api.project.settings();
     setGroupLabel(result?.taskGroupLabel);
     setSprintsEnabled(result?.sprintsEnabled);
     setObjectiveGroupingEnabled(result?.useObjectiveGrouping);
-    setSprintSortOrder(result?.sprintSortOrder);
+    if (_sprintSortOrderPending === 0) setSprintSortOrder(result?.sprintSortOrder);
     setTaskPrefix(result?.taskPrefix);
     setProjectPermissionMode(result?.agentPermissionMode);
   } catch {
     setGroupLabel(null); // -> DEFAULT
     setSprintsEnabled(null); // -> true
     setObjectiveGroupingEnabled(null); // -> true
-    setSprintSortOrder(null); // -> 'asc'
+    if (_sprintSortOrderPending === 0) setSprintSortOrder(null); // -> 'asc'
     setTaskPrefix(null); // -> 'C'
     setProjectPermissionMode(null); // -> Not set
   }

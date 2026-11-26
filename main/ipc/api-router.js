@@ -342,6 +342,20 @@ function registerApiHandlers() {
   // already follows). Keep this shape identical to ws-handlers.js's GET /api/project/settings.
   ipcMain.handle('api:project.profile', event => b(event)?.getDesktopProjectProfile() ?? null);
 
+  // Settings ▸ Policy editor: replace the project owner's rule layer on the per-window
+  // backend. Same shape as ws-handlers.js's PUT /api/project/policy ({ policy }).
+  ipcMain.handle('api:project.savePolicy', async (event, { rules, base, expectedContext } = {}) => {
+    const backend = b(event);
+    if (!backend || typeof backend.saveOwnerPolicy !== 'function') throw new Error('No project loaded');
+    try {
+      return { policy: await backend.saveOwnerPolicy(rules, { base, expectedContext }) };
+    } catch (err) {
+      // The message is all that crosses IPC; keep the API's rule-conflict field in it.
+      if (err?.code === 'policy_conflict' && err.field) throw new Error(`policy_conflict:${err.field}`);
+      throw err;
+    }
+  });
+
   ipcMain.handle('api:project.settings', async (event) => {
     const backend = b(event);
     const project = backend && typeof backend.getProjectSettings === 'function' ? await backend.getProjectSettings() : null;
@@ -375,6 +389,9 @@ function registerApiHandlers() {
       // /api/project/settings (one of the five canonical modes, else null = "Not set").
       agentPermissionMode: ['plan', 'always_ask', 'accept_edits', 'auto', 'bypass'].includes(project?.agent_permission_mode)
         ? project.agent_permission_mode : null,
+      // TPT9422 — the identity's brand colors (window accents), kept identical to
+      // ws-handlers.js's GET /api/project/settings: [] = none, null = identity unknown.
+      brandColors: require('../../src/brand-colors.mjs').identityBrandColors(project?.identity),
     };
   });
 

@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { readAccount, decodeTokenPayload, normalizeBaseUrl, userDataRoot, assertTokenProject } = require('./account-store');
+const { identityBrandColors } = require('../brand-colors.mjs');
 
 const PROJECT_SETTING_FIELDS = Object.freeze([
   'language', 'vcs_type', 'vcs_worktree_enabled', 'vcs_commit_enabled',
@@ -36,11 +37,21 @@ function pickSettings(settings) {
     .map(field => [field, settings[field]]));
 }
 
+// Shared project identity, kept with its brand colors as a clean list (TPT9422): the window
+// paints them as accent colors at startup from this mirror, before the API answers. An API
+// older than the list sends only `brand_color`, kept as a one-entry list.
+function identityResult(identity) {
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return null;
+  const colors = identityBrandColors(identity);
+  return { ...identity, brand_color: colors[0] ?? null, brand_colors: colors };
+}
+
 function settingsResult(data) {
   if (!data?.settings || typeof data.settings !== 'object' || Array.isArray(data.settings)
     || !['global', 'personal'].includes(data.source) || typeof data.is_creator !== 'boolean') return null;
+  const identity = identityResult(data.identity);
   return { settings: pickSettings(data.settings), source: data.source, is_creator: data.is_creator,
-    ...(data.policy && { policy: data.policy }), ...(data.identity && { identity: data.identity }) };
+    ...(data.policy && { policy: data.policy }), ...(identity && { identity }) };
 }
 
 function readSettingsCache(cfg) {
@@ -69,10 +80,14 @@ function writeSettingsCache(cfg, data) {
 
 // Legacy language/theme mirrors cannot be attributed to an account. A configured
 // checkout uses only its current account's mirror, otherwise neutral defaults.
+// `brandColors` (TPT9422) is the mirrored identity's list, or null when this account has no
+// mirror yet: unknown, so the window keeps what it painted instead of clearing its accents.
 function displayPreferences(cfg = {}) {
   if (!cfg.API_BASE_URL || !cfg.API_PROJECT_ID) return { language: cfg.language || 'en', theme: cfg.theme || '' };
-  const settings = readSettingsCache(cfg)?.settings;
-  return { language: settings?.language || 'en', theme: settings?.color_scheme === 'default' ? '' : settings?.color_scheme || '' };
+  const cached = readSettingsCache(cfg);
+  const settings = cached?.settings;
+  return { language: settings?.language || 'en', theme: settings?.color_scheme === 'default' ? '' : settings?.color_scheme || '',
+    brandColors: identityBrandColors(cached?.identity) };
 }
 
 module.exports = { PROJECT_SETTING_FIELDS, settingsContext, settingsResult, pickSettings, readSettingsCache, writeSettingsCache, displayPreferences };

@@ -14,6 +14,7 @@ import { MERGE_DOT, mergeButtonHtml } from './task-merge.js';
 import { FINISH_DOT, finishButtonHtml } from './task-finish.js';
 import { permissionButtonHtml } from './task-permission-mode.js';
 import { discussButtonHtml } from './card-discuss.js';
+import { taskEditLocked, taskEditLockText } from './task-edit-rule.js';
 
 function extract(text, name) {
   const start = text.indexOf(`function ${name}(`);
@@ -40,13 +41,14 @@ function cardEnv(overrides = {}) {
     isTaskDiscussing: () => false, lockIntentOf: () => null, discussOverlayHtml: () => '<div class="card-discuss-overlay"></div>',
     permissionButtonHtml, // (TPT9063) the real renderer: board cards carry the permission-mode button
     discussButtonHtml, // (TPT9268) the real renderer: board cards carry the Discuss button
+    taskEditLocked, taskEditLockText, // (TPT9417) the real rule: isTaskReadOnly()/statusLockAttrs() below read them
     // (TPT9216) task-card.js dependencyKeysMarkup()'s shape: each key in its own span, comma-joined.
     dependencyKeysMarkup: keys => keys.map(k => `<span class="dependency-key" data-dependency-key="${esc(k)}">${esc(k)}</span>`).join(', '),
     Date, JSON, Set, Map, String, Number,
     ...overrides,
   };
   vm.createContext(env);
-  for (const fn of ['startButtonClass', 'startButtonHtml', 'renderCard']) {
+  for (const fn of ['startButtonClass', 'startButtonHtml', 'isTaskReadOnly', 'taskEditLockReason', 'statusLockAttrs', 'renderCard']) {
     vm.runInContext(extract(read('task-card.js'), fn), env);
   }
   return env;

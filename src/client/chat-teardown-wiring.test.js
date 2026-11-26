@@ -60,7 +60,10 @@ test('Accept closes the chat it was clicked in, never whichever chat is visible 
   // Per-card accept/reject capture the clicked chat before awaiting the save and hand it on.
   // (The synchronous Discard handler further down still uses the visible chat — it never awaits.)
   const fromCapture = sliceFrom(preview, 'const cs = state.chatState;', 8000);
-  const perCard = fromCapture.slice(0, fromCapture.indexOf('// Reject') + 600);
+  // The per-card handler ends where the Save Tasks handler starts.
+  const perCardEnd = fromCapture.indexOf('// ── Per-message Save Tasks button ──');
+  assert.ok(perCardEnd > 0, 'the Save Tasks handler follows the per-card one');
+  const perCard = fromCapture.slice(0, perCardEnd);
   const calls = perCard.match(/checkAllCardsHandled\([^)]*\);/g) || []; // statements, not comment mentions
   assert.ok(calls.length >= 2, 'accept and reject both check completion');
   for (const call of calls) assert.equal(call, 'checkAllCardsHandled(cs);');

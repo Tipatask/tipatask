@@ -221,6 +221,37 @@ test('an Escape another handler already consumed is left alone', () => {
   assert.deepEqual(calls, []);
 });
 
+test('(TPT9405) the open guide popover takes the first Escape; the next one closes the dialog', async () => {
+  const guide = await import('./objective-stage.js');
+  const { renderComposerHeader } = await import('./composer-header.js');
+  const { default: state } = await import('./state.js');
+  const calls = reset();
+  const previous = state.activeTab;
+  state.activeTab = 'objective';
+  try {
+    fill(`<div class="chat-container">${renderComposerHeader('<button id="btn-archive">History</button>', '',
+      { helpHtml: guide.renderObjectiveGuideHtml() })}<textarea id="chat-input"></textarea></div>`);
+  } finally {
+    state.activeTab = previous;
+  }
+  guide.bindObjectiveGuideDismiss(document);
+  const help = document.getElementById('objective-help-btn');
+
+  key(help, 'Escape');
+  assert.deepEqual(calls, ['escape'], 'closed, the popover leaves Escape to the dialog');
+  calls.length = 0;
+
+  guide.setObjectiveGuideOpen(document, true);
+  const example = document.querySelector('.objective-example');
+  example.focus();
+  key(example, 'Escape');
+  assert.deepEqual(calls, [], 'the popover closed and the dialog stayed');
+  assert.equal(guide.objectiveGuideOpen(document), false);
+  assert.equal(is(document.activeElement, help), true, 'focus is back on the (?) button');
+  key(help, 'Escape');
+  assert.deepEqual(calls, ['escape'], 'the next Escape is the dialog\'s');
+});
+
 // ── Tab cycle and focus ─────────────────────────────────────────────────────────────────────
 
 test('Tab walks the dialog, then the left menu, and wraps — never into the board', () => {

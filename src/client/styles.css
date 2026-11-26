@@ -112,6 +112,15 @@
     --c-voice-wave-from: #8467d8;
     --c-voice-wave-to: #c2549c;
     --c-voice-stop: #9e4a82;
+    /* (TPT9422) Secondary brand accents. brand-accents.js sets them inline on <html> from a
+       project's second and third brand colors (the first one drives the whole --c-primary
+       family); unset, each falls back to the accent before it, so a project without brand
+       colors paints exactly as before. The -border variants clear 3:1 on every surface, like
+       --c-primary-border. */
+    --c-accent-2: var(--c-primary);
+    --c-accent-2-border: var(--c-primary-border);
+    --c-accent-3: var(--c-accent-2);
+    --c-accent-3-border: var(--c-accent-2-border);
   }
 
   /* C1267 — the pre-TPT220 default (violet on cool grey), kept as a first-class named
@@ -677,6 +686,43 @@
     --c-danger: #f28b7e;
     --c-danger-bg: rgba(242, 139, 126, 0.14);
     --c-danger-border: rgba(242, 139, 126, 0.45);
+  }
+
+  /* ── (TPT9422) Brand accents ──
+     brand-accents.js paints a project's brand colors (identity.brand_colors) into the accent
+     tokens inline on <html> and marks it data-brand-accents="1|2|3". The first color drives the
+     whole --c-primary family, so buttons, accent text, focus rings and the selected nav row
+     follow it with no rule here. The second and third colors are the secondary accents: the
+     selection markers below (the selected row's bar, active tab underlines) take
+     --c-accent-2-border, and the palette bar under the project identity in the left menu shows
+     every color in order. Without brand colors none of these rules apply. */
+  html[data-brand-accents] .left-nav-btn.active,
+  html[data-brand-accents] .left-nav-btn--primary.active,
+  html[data-brand-accents] .active-session-item.active,
+  html[data-brand-accents] .create-flyout-item.is-current {
+    box-shadow: inset 3px 0 0 var(--c-accent-2-border);
+  }
+  html[data-brand-accents] .nav-tabs button.active,
+  html[data-brand-accents] .nav-objective-tabs .nav-tab-objective-wrap.active,
+  html[data-brand-accents] .modal-tab-btn.active {
+    border-bottom-color: var(--c-accent-2-border);
+  }
+  html[data-brand-accents] #sidebar-project-identity:not([hidden])::after {
+    content: '';
+    display: block;
+    height: 3px;
+    margin: 0.35rem 0.2rem 0;
+    border-radius: 3px;
+    background: var(--c-primary);
+  }
+  html[data-brand-accents="2"] #sidebar-project-identity:not([hidden])::after {
+    background: linear-gradient(90deg, var(--c-primary) 0 50%, var(--c-accent-2) 50% 100%);
+  }
+  html[data-brand-accents="3"] #sidebar-project-identity:not([hidden])::after {
+    background: linear-gradient(90deg, var(--c-primary) 0 33.34%, var(--c-accent-2) 33.34% 66.67%, var(--c-accent-3) 66.67% 100%);
+  }
+  @media (forced-colors: active) {
+    html[data-brand-accents] #sidebar-project-identity:not([hidden])::after { display: none; }
   }
 
   /* ── Scrollbars (TPT171) — themed, thin, always-visible. Sibling of the web app's TPT112
@@ -2609,6 +2655,87 @@
     border-color: var(--c-text-muted);
   }
 
+  /* (TPT9407) Board header — opens the Board and List sprint views (renderBoardContent()/
+     renderListContent() _boardHeaderHtml()). It holds the sprint order switch, drawn as the
+     app's segmented control (Settings' .settings-segmented): an outlined track as tall as the
+     top-nav controls, the order in force in the primary tint and ink with a primary ring. The
+     track takes the card colour: the muted label of the other order keeps 4.5:1 on it in every
+     palette, which the page and sub-nav colours do not. */
+  .board-header {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0 0 0.75rem;
+  }
+  .sprint-order {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    max-width: 100%;
+    gap: 2px;
+    padding: 2px;
+    box-sizing: border-box;
+    border: 1.5px solid var(--c-border-input);
+    border-radius: 8px;
+    background: var(--c-bg-card);
+  }
+  /* flex-grow only matters once a narrow window wraps the pair: each order then fills its own
+     row of the track instead of leaving the second row ragged. */
+  .sprint-order-btn {
+    flex: 1 1 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: calc(var(--nav-ctl-h) - 7px);
+    padding: 0 12px 0 10px;
+    box-sizing: border-box;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--c-text-muted);
+    font-family: inherit;
+    font-size: 0.8rem;
+    font-weight: 600;
+    line-height: 1.2;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+  }
+  .sprint-order-icon {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+  .sprint-order-btn:hover:not([aria-pressed="true"]) {
+    color: var(--c-text);
+    background: var(--c-primary-lighter);
+  }
+  .sprint-order-btn[aria-pressed="true"] {
+    background: var(--c-primary-light);
+    color: var(--c-primary-text);
+    box-shadow: inset 0 0 0 1px var(--c-primary-border);
+    cursor: default;
+  }
+  .sprint-order-btn:focus-visible {
+    outline: 2px solid var(--c-primary-border);
+    outline-offset: 1px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .sprint-order-btn { transition: none; }
+  }
+  /* Forced colours drop the tint and the inset ring (the track keeps its border): the order in
+     force takes the system highlight instead. forced-color-adjust: none keeps the browser from
+     drawing its Canvas backplate behind the label, which would hide HighlightText text. */
+  @media (forced-colors: active) {
+    .sprint-order-btn[aria-pressed="true"] {
+      forced-color-adjust: none;
+      background: Highlight;
+      color: HighlightText;
+      box-shadow: none;
+    }
+  }
+
   /* Category badge colors */
   .id-badge.coding { background: #e0e7ff; color: #3730a3; }
   .id-badge.human  { background: #fce7f3; color: #9d174d; }
@@ -3682,6 +3809,27 @@
   .card-status-select:hover { border-color: rgba(0,0,0,0.2); }
 
   .card-status-select { min-width: 60px; }
+
+  /* (TPT9417) A task the user may not change (the API's can_edit false): the card's status select
+     is disabled and its chevron becomes a padlock in the same currentColor strokes, two layers
+     like the chevron — a shackle ring cut at its middle, then the body — so the pill keeps its
+     width and its ink's contrast. No opacity: the name stays at the pill's AA contrast. The card
+     tooltip (data-tip) names the rule. */
+  .task-card-hover-controls .card-status-select:disabled {
+    cursor: not-allowed;
+    opacity: 1;
+    border-color: transparent;
+    background-image:
+      radial-gradient(circle at 50% 100%, transparent 1.9px, currentColor 2.2px 3.1px, transparent 3.4px),
+      linear-gradient(currentColor, currentColor);
+    background-size: 7px 4px, 7px 5px;
+    background-position: right 9px top calc(50% - 2.5px), right 9px top calc(50% + 2px);
+  }
+  @media (forced-colors: active) {
+    /* Forced colours drop the padlock strokes, like the chevron; the native arrow would read as
+       a working dropdown, so the locked select keeps none, as the read-only modal header does. */
+    .task-card-hover-controls .card-status-select:disabled { appearance: none; -webkit-appearance: none; }
+  }
 
   /* (C1187) Was 10 hardcoded per-name rules (5 light + 5 dark, see the .theme-dark block
      below) keyed on a `.s-<status-name>` class — broke for any renamed/custom status.
@@ -5577,6 +5725,45 @@
     color: var(--c-text, #e2e8f0);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
+  }
+  /* (TPT9417) How many selected tasks the user may not change; bulk changes skip them. A quiet
+     outlined pill in the secondary ink, which clears AA on the bar's card ground. */
+  .bulk-view-only {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 24px;
+    box-sizing: border-box;
+    padding: 0 9px 0 7px;
+    border: 1px solid var(--bulk-divider);
+    border-radius: 999px;
+    color: var(--c-text-secondary, #94a3b8);
+    font-size: 0.75rem;
+    font-weight: 500;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+    cursor: default;
+  }
+  .bulk-view-only[hidden] { display: none; }
+  .bulk-view-only svg { flex-shrink: 0; }
+  /* Stacked bar (≤1300px): the selection row keeps the count and the chip together on the left. */
+  .bulk-group--selection > .bulk-view-only { margin-right: auto; }
+  @media (min-width: 1301px) {
+    /* One-row bar: the chip goes on a second line under the count and Clear, so the selection
+       cluster keeps its width and the edit fields their room (task-board.js toggles
+       .has-view-only with the chip). */
+    .bulk-group--selection.has-view-only {
+      display: grid;
+      grid-template-columns: auto auto;
+      grid-template-areas: "count clear" "chip chip";
+      align-content: center;
+      align-items: center;
+      column-gap: 12px;
+      row-gap: 4px;
+    }
+    .bulk-group--selection.has-view-only > .bulk-count { grid-area: count; }
+    .bulk-group--selection.has-view-only > .bulk-clear { grid-area: clear; justify-self: start; }
+    .bulk-group--selection.has-view-only > .bulk-view-only { grid-area: chip; justify-self: start; margin-right: 0; }
   }
   .bulk-field {
     display: flex;
@@ -8102,6 +8289,22 @@
     color: var(--c-danger);
     background: var(--c-danger-bg);
   }
+  /* (TPT9409) The one explicit Save in Settings (Project identity): filled once there is an
+     edit to save, faded like every disabled row button until then. */
+  .settings-row-btn-primary {
+    border-color: var(--c-primary);
+    background: var(--c-primary);
+    color: var(--c-on-primary);
+  }
+  .settings-row-btn-primary:hover:not(:disabled) {
+    border-color: var(--c-primary-hover);
+    background: var(--c-primary-hover);
+    color: var(--c-on-primary);
+  }
+  .settings-row-btn-primary:focus-visible {
+    outline: 2px solid var(--c-primary-border);
+    outline-offset: 2px;
+  }
 
   /* ── Voice tab (C1178, merged engine list C1195): the AssemblyAI row and every local model
      row (_voiceModelRowHtml(), task-board.js) are .settings-rows sharing one radio group —
@@ -8378,18 +8581,40 @@
   }
 
   /* ── Accept / Reject card controls ── */
+  /* (TPT9406) Accept and Reject never move when the state chip appears or goes: their group sits
+     at the row end (.preview-card-buttons) and the lines wrap in reverse, so on a card too
+     narrow for the chip beside them the chip takes a line under the buttons instead of pushing
+     them down. */
   .preview-card-actions {
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
+    flex-wrap: wrap-reverse;
     gap: 6px;
     margin-top: 0.35rem;
     padding-top: 0.5rem;
     border-top: 1px solid var(--c-border);
   }
 
-  /* (TPT9391) State chip at the start of the foot: Included / Rejected / Saving. On the card
-     surface colour, not a status tint, because a NEW card's own ground is --c-success-bg. */
+  /* (TPT9403) The expanded proposal overlay scrolls as a whole (expandCard()), so its foot is
+     pinned to the overlay's bottom edge: Accept, Reject and any state chip stay in view while a
+     long description scrolls under them, on the expanded card's own opaque ground. Sticky offsets
+     count from the scroller's content edge, so `bottom` reaches through the card's 0.875rem
+     bottom padding (`.card.preview-card`) to the overlay's edge; the foot's own padding keeps the
+     buttons that far above it, and the negative margin gives the padding back to the flow, so a
+     fully scrolled overlay ends on the foot exactly as a resting card does. A hover on the foot
+     never opens the overlay (setupCardInteractions()). */
+  .preview-card.card-expanded > .preview-card-actions {
+    position: sticky;
+    bottom: -0.875rem;
+    z-index: 1;
+    margin-bottom: -0.875rem;
+    padding-bottom: 0.875rem;
+    background: var(--c-bg-card);
+  }
+
+  /* (TPT9391) State chip at the start of the foot, shown only for a state other than the default
+     (TPT9406): Rejected, or Saving while the card's own Accept is written. On the card surface
+     colour, not a status tint, because a NEW card's own ground is --c-success-bg. */
   .preview-card-state {
     display: inline-flex;
     align-items: center;
@@ -8402,10 +8627,6 @@
     font-weight: 700;
     line-height: 1.2;
     white-space: nowrap;
-  }
-  .preview-card-state[data-state="included"] {
-    border-color: var(--c-success-border);
-    color: var(--c-success);
   }
   .preview-card-state[data-state="rejected"] {
     border-color: var(--c-danger-border);
@@ -8436,7 +8657,8 @@
   }
 
   /* (TPT9391) Both controls carry their name next to the icon, so the pill is as wide as its
-     label and never narrower than the board's 32px square. */
+     label and never narrower than the board's 32px square. (TPT9406) The group is right-aligned
+     (margin-left: auto) with or without the state chip ahead of it. */
   .preview-card-buttons {
     display: inline-flex;
     gap: 6px;
@@ -8637,10 +8859,12 @@
     box-sizing: border-box;
     padding: 20px 0;
   }
-  /* The header row keeps clear of the close button. */
+  /* The header row keeps clear of the close button. (TPT9405) --composer-header-end is that
+     clearance; New Objective's guide popover lines up with the row's buttons by it. */
   .objective-modal-body .composer-header-inner,
   .objective-modal-body .objective-header {
-    padding-right: 36px;
+    --composer-header-end: 36px;
+    padding-right: var(--composer-header-end);
   }
   /* New Task scrolls under its header, which then stays where Objective's is. */
   .objective-modal-body > .objective-form > .composer-header,
@@ -8832,117 +9056,122 @@
     box-shadow: none;
   }
 
-  /* Stage line: the four steps of a run and one sentence on the current one
-     (objective-stage.js). #objective-stage-slot is always mounted; it is empty while there is
-     no stage, and the save paths patch the line in it between paints. */
+  /* Stage line: one borderless row under the heading — a dot, the current stage's name, its
+     place among the four as "2/4", and one short sentence that gives way first and ends in an
+     ellipsis, so the line never wraps (objective-stage.js). #objective-stage-slot is always
+     mounted; it is empty while there is no stage, and the save paths patch the line in it
+     between paints. */
   .objective-stage-slot { flex-shrink: 0; }
   .objective-stage-slot:empty { display: none; }
   .objective-stage {
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
-    gap: 0.4rem 1rem;
-    margin-bottom: 0.75rem;
-    padding: 0.6rem 0.875rem;
-    border: 1px solid var(--objective-edge);
-    border-radius: 12px;
-    background: var(--c-bg-card);
-  }
-  .objective-stage-steps {
-    display: flex;
-    align-items: center;
-    flex: 0 0 auto;
-    margin: 0;
-    padding: 0;
-    list-style: none;
-  }
-  .objective-stage-step {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
+    gap: 0.5rem;
+    min-width: 0;
+    margin: 0 0 0.5rem;
     font-size: 0.82rem;
-    font-weight: 600;
-    line-height: 1.2;
+    line-height: 1.4;
     white-space: nowrap;
     color: var(--c-text-secondary);
   }
-  .objective-stage-step + .objective-stage-step::before {
-    content: '';
-    width: 1.25rem;
-    height: 1px;
-    margin: 0 0.5rem;
-    background: var(--objective-edge);
-  }
+  /* The accent's non-text shade (3:1 on the modal) while a run is open; the success colour once
+     the tasks are saved. */
   .objective-stage-dot {
-    box-sizing: border-box;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
     flex-shrink: 0;
-    width: 1.375rem;
-    height: 1.375rem;
-    border: 1.5px solid currentColor;
+    width: 0.5rem;
+    height: 0.5rem;
     border-radius: 50%;
-    font-size: 0.7rem;
-    font-weight: 700;
-    line-height: 1;
+    background: var(--c-primary-border);
   }
-  .objective-stage-dot svg { width: 12px; height: 12px; }
-  .objective-stage-step.is-current { color: var(--c-text); }
-  .objective-stage-step.is-current .objective-stage-dot {
-    border-color: var(--c-primary);
-    background: var(--c-primary);
-    color: var(--c-on-primary);
-  }
-  .objective-stage-step.is-done { color: var(--c-text); }
-  .objective-stage-step.is-done .objective-stage-dot {
-    border-color: var(--c-success-border);
-    background: var(--c-success-bg);
-    color: var(--c-success);
-  }
-  /* A step that is running (planning, saving) pulses; the two resting stages do not. */
-  .objective-stage[data-stage="planning"] .is-current .objective-stage-dot,
-  .objective-stage[data-stage="saving"] .is-current .objective-stage-dot {
+  .objective-stage[data-stage="saved"] .objective-stage-dot { background: var(--c-success); }
+  /* A stage that is running (planning, saving) pulses; the two resting stages do not. */
+  .objective-stage[data-stage="planning"] .objective-stage-dot,
+  .objective-stage[data-stage="saving"] .objective-stage-dot {
     animation: objective-stage-pulse 1.4s ease-in-out infinite;
   }
   @keyframes objective-stage-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c-primary) 45%, transparent); }
-    50% { box-shadow: 0 0 0 5px transparent; }
+    0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c-primary-border) 45%, transparent); }
+    50% { box-shadow: 0 0 0 4px transparent; }
+  }
+  .objective-stage-name {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 600;
+    color: var(--c-text);
+  }
+  .objective-stage-count {
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  /* "Step 2 of 4" for screen readers: the visible "2/4" is aria-hidden. */
+  .objective-stage-count-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
   .objective-stage-detail {
-    flex: 1 1 16rem;
+    flex: 1 1 0;
     min-width: 0;
     margin: 0;
-    font-size: 0.82rem;
-    line-height: 1.4;
-    color: var(--c-text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  @media (max-width: 640px) {
-    /* Only the current step keeps its name; the others are their numbered dots. */
-    .objective-stage-step:not(.is-current) .objective-stage-name { display: none; }
-    .objective-stage-step + .objective-stage-step::before { width: 0.75rem; margin: 0 0.35rem; }
+  /* A short rule between the counter and the sentence. */
+  .objective-stage-detail::before {
+    content: '';
+    display: inline-block;
+    width: 1px;
+    height: 0.9em;
+    margin-right: 0.5rem;
+    vertical-align: -0.12em;
+    background: var(--objective-edge);
   }
   @media (prefers-reduced-motion: reduce) {
     .objective-stage .objective-stage-dot { animation: none !important; }
   }
   @media (forced-colors: active) {
-    .objective-stage-step.is-current .objective-stage-dot {
-      background: Highlight;
-      border-color: Highlight;
-      color: HighlightText;
+    /* Every stage's dot, the saved one included: a system colour, and no theme-coloured ring. */
+    .objective-stage[data-stage] .objective-stage-dot {
+      background: CanvasText;
+      animation: none;
       forced-color-adjust: none;
     }
   }
 
   /* Empty-state guide: what happens after Send, and example objectives that fill the composer
-     (objective-stage.js renderObjectiveGuideHtml()). It sits between the heading row and the
-     composer card, which still takes all the height that is left. */
+     (objective-stage.js renderObjectiveGuideHtml()). (TPT9405) A popover behind the (?) button in
+     the heading row (.objective-help-btn), `hidden` until that button opens it, so the empty view
+     is the heading and the composer card, which takes all the height under it. It hangs from the
+     row (.composer-header-inner is its containing block): just under it, flush with the right
+     edge of its buttons (--composer-header-end, the row's clearance for the modal's close
+     button), over the composer. At most 30rem wide and never wider than the row; at most as tall
+     as the dialog leaves under the row, and it scrolls past that. */
   .objective-guide {
-    flex-shrink: 0;
+    position: absolute;
+    top: calc(100% + 0.5rem);
+    right: var(--composer-header-end, 0px);
+    z-index: 5;
+    box-sizing: border-box;
+    width: min(30rem, calc(100% - var(--composer-header-end, 0px)));
+    max-height: min(34rem, calc(100vh - 9rem));
+    overflow-y: auto;
+    overscroll-behavior: contain;
     display: grid;
     gap: 0.5rem;
-    margin-bottom: 0.75rem;
+    padding: 0.85rem 1rem 1rem;
+    border: 1px solid var(--objective-edge);
+    border-radius: 12px;
+    background: var(--c-bg-card);
+    box-shadow: 0 18px 44px var(--c-shadow), 0 2px 8px var(--c-shadow);
+    text-align: start;
   }
+  /* `display: grid` above would otherwise outrank the hidden attribute's own display: none. */
+  .objective-guide[hidden] { display: none; }
   .objective-guide-heading,
   .chat-cards-intro {
     margin: 0;
@@ -8955,46 +9184,39 @@
   .objective-guide-steps,
   .objective-guide-examples {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 0.75rem;
+    gap: 0.4rem;
     margin: 0;
     padding: 0;
     list-style: none;
   }
   .objective-guide-steps { margin-bottom: 0.35rem; }
+  /* A step is its number, then one run of text: the title, then what happens. */
   .objective-guide-step {
     display: flex;
     align-items: flex-start;
-    gap: 0.6rem;
-    padding: 0.75rem;
-    border: 1px solid var(--objective-edge);
-    border-radius: 12px;
-    background: var(--c-bg-card);
+    gap: 0.55rem;
   }
   .objective-guide-num {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    width: 1.5rem;
-    height: 1.5rem;
+    width: 1.2rem;
+    height: 1.2rem;
     border-radius: 50%;
     background-color: var(--left-nav-active-bg);
     color: var(--left-nav-active-fg);
-    font-size: 0.78rem;
+    font-size: 0.7rem;
     font-weight: 700;
     line-height: 1;
   }
   .objective-guide-step-text {
-    display: grid;
-    gap: 0.15rem;
     min-width: 0;
     font-size: 0.82rem;
     line-height: 1.4;
     color: var(--c-text-secondary);
   }
   .objective-guide-step-text strong {
-    font-size: 0.88rem;
     font-weight: 600;
     color: var(--c-text);
   }
@@ -9002,9 +9224,9 @@
     display: block;
     width: 100%;
     margin: 0;
-    padding: 0.7rem 0.75rem;
+    padding: 0.5rem 0.65rem;
     border: 1px dashed var(--c-border-input);
-    border-radius: 12px;
+    border-radius: 8px;
     background: transparent;
     color: var(--c-text-secondary);
     font: inherit;
@@ -9017,7 +9239,7 @@
   .objective-example:hover {
     border-style: solid;
     border-color: var(--c-primary-border);
-    background: var(--c-bg-card);
+    background: var(--c-primary-lighter);
     color: var(--c-text);
   }
   .objective-example:focus-visible {
@@ -9028,22 +9250,8 @@
   .objective-example-text {
     display: -webkit-box;
     -webkit-box-orient: vertical;
-    -webkit-line-clamp: 3;
+    -webkit-line-clamp: 2;
     overflow: hidden;
-  }
-  @media (max-width: 760px) {
-    .objective-guide-steps,
-    .objective-guide-examples { grid-template-columns: minmax(0, 1fr); gap: 0.5rem; }
-    .objective-guide-step { padding: 0.5rem 0.75rem; }
-    .objective-example-text { -webkit-line-clamp: 2; }
-  }
-  /* A short window keeps the composer usable: the steps go first, then the examples. */
-  @media (max-height: 760px) {
-    .objective-guide-steps,
-    #objective-guide-next { display: none; }
-  }
-  @media (max-height: 560px) {
-    .objective-guide { display: none; }
   }
 
   /* ── Composer header: the Create modal's heading row ──
@@ -9063,7 +9271,9 @@
     padding: 0 0 0.75rem;
     flex-shrink: 0;
   }
+  /* Positioned: New Objective's guide popover (.objective-guide) hangs from this row. */
   .composer-header-inner {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -9078,6 +9288,41 @@
     justify-content: flex-end;
     gap: 0.5rem;
     flex: 0 0 auto;
+  }
+  /* (TPT9405) The (?) button ahead of History that opens New Objective's guide popover. Icon
+     only, as tall as History beside it; while the popover is open it keeps the accent tint. */
+  .objective-help-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    align-self: stretch;
+    flex-shrink: 0;
+    min-width: 1.9rem;
+    padding: 0 0.4rem;
+    border: 1.5px solid var(--c-border-input);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--c-text-secondary);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .objective-help-btn svg { width: 16px; height: 16px; }
+  .objective-help-btn:hover,
+  .objective-help-btn[aria-expanded="true"] {
+    border-color: var(--c-primary-border);
+    background: var(--c-primary-light);
+    color: var(--c-primary-text);
+  }
+  .objective-help-btn:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--c-primary-border);
+  }
+  @media (forced-colors: active) {
+    .objective-help-btn[aria-expanded="true"] {
+      background: Highlight;
+      color: HighlightText;
+      forced-color-adjust: none;
+    }
   }
 
   .composer-header-title {
@@ -10931,80 +11176,14 @@
   }
 
   .task-chat-msg--user .task-chat-user-text { white-space: pre-wrap; }
-  .task-chat-msg--user .task-chat-user-text + .task-chat-attachments { margin-top: 0.45rem; }
 
-  /* A user turn's attachment links are .file-attachment-link (C1246, further down): an inline-flex
-     box with a paperclip ::before, for links in rendered markdown. The turn draws its own markers
-     — an image's frame, a chip's file icon — so these rules out-rank that one rather than follow
-     it, and the paperclip stays off. */
-  .task-chat-msg--user .file-attachment-link::before { content: none; }
-
-  /* An image of a user turn sits in its text, where its reference was inserted: a thumbnail on
-     the text line, bottom-aligned with it, that wraps like a word. The width bound is fixed on
-     the link (a percentage would not cap the bubble's own sizing); a bubble narrower than it
-     shrinks the link, and the image follows through its 100%. */
-  .task-chat-user-text .task-chat-inline-image {
-    display: inline-block;
-    max-width: 240px;
-    margin: 0.2rem 0.15rem;
-    vertical-align: bottom;
-    border: 1px solid var(--c-border);
-    border-radius: 8px;
-    background: var(--c-bg-card);
-    overflow: hidden;
-  }
-  .task-chat-user-text .task-chat-inline-image:hover { border-color: var(--c-primary); }
-  .task-chat-user-text .task-chat-inline-image:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
-
-  .task-chat-user-text .task-chat-inline-image img {
-    display: block;
-    max-width: 100%;
-    max-height: 160px;
-  }
-
-  .task-chat-attachments {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-    min-width: 0;
-    max-width: 100%;
-    white-space: normal;
-  }
-
-  .task-chat-attach {
-    display: inline-flex;
-    align-items: center;
-    max-width: 100%;
-    min-width: 0;
-    border: 1px solid var(--c-border);
-    border-radius: 8px;
-    background: var(--c-bg-card);
-    color: var(--c-text);
-    text-decoration: none;
-    overflow: hidden;
-  }
-  .task-chat-attach:hover { border-color: var(--c-primary); }
-  .task-chat-attach:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
-
-  .task-chat-attach--file {
-    gap: 0.4rem;
-    padding: 0.3rem 0.6rem;
-    font-size: 0.8rem;
-  }
-  .task-chat-attach-icon {
-    flex-shrink: 0;
-    width: 0.8rem;
-    height: 1rem;
-    border: 1.5px solid currentColor;
-    border-radius: 2px 5px 2px 2px;
-    color: var(--c-primary-border);
-  }
-  .task-chat-attach-name {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
+  /* (TPT9411) A user turn draws its images and files with the read-only attachment markup of
+     descriptions and comments (§ Read-only attachments, further down): an image on lines of its
+     own, a file as a chip in the text — the objective chat's user bubbles too (chat-ui.js). Its
+     images are thumbnails. The width bound is fixed on the block (a percentage would not cap the
+     bubble's own sizing); a bubble narrower than it shrinks the image through its 100%. */
+  .task-chat-user-text .md-image { max-width: 240px; }
+  .task-chat-user-text .md-image img { max-height: 160px; }
 
   @media (max-width: 640px) {
     .task-chat-panel {
@@ -11021,8 +11200,8 @@
     .task-chat-hint { display: none; }
     .task-chat-selector-slot { flex: 1; }
     .task-chat-embed-slot .embed-menu-label { display: none; }
-    .task-chat-user-text .task-chat-inline-image { max-width: 180px; }
-    .task-chat-user-text .task-chat-inline-image img { max-height: 120px; }
+    .task-chat-user-text .md-image { max-width: 180px; }
+    .task-chat-user-text .md-image img { max-height: 120px; }
     .task-chat-widget--dialog { padding: 0.6rem 0.65rem; }
     .task-chat-dialog-actions { flex-direction: column; align-items: stretch; }
     .task-chat-dialog-submit { margin-left: 0; }
@@ -11281,16 +11460,25 @@
   .preview-drawer--resizing .preview-drawer-panels { pointer-events: none; }
 
   /* The chat panel with the drawer open: the hostClass a chat panel host passes. Transcript and
-     composer on the left, the drawer on the right. The standalone window widens to make room
-     for it, to a fixed size so the handle follows the pointer while the split moves; the
-     workspace pane keeps its size and splits. */
+     composer on the left, the drawer on the right at the width it publishes — until the user
+     moves the handle, all of the panel but MIN_TRANSCRIPT_WIDTH (360px): a slim chat column
+     beside the document. The standalone window fills the whole app window while the drawer is
+     open (its size does not depend on the split, so the handle follows a drag exactly) and goes
+     back to its centred card when the last tab closes; the workspace pane keeps its size and
+     splits. */
   .task-chat-panel.task-chat-panel--with-drawer {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     grid-template-rows: auto minmax(0, 1fr) auto;
   }
 
-  .task-chat-modal > .task-chat-panel--with-drawer { width: min(1440px, 94vw); }
+  .task-chat-modal > .task-chat-panel--with-drawer {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
 
   /* The window's transcript sits on the card surface, so there the drawer takes the page
      surface: the document reads as its own pane in every palette, not only where --c-border
@@ -11317,6 +11505,29 @@
   .task-chat-panel--embedded.task-chat-panel--with-drawer > .task-chat-scroll { grid-row: 1; }
   .task-chat-panel--embedded.task-chat-panel--with-drawer > .task-chat-footer { grid-row: 2; }
   .task-chat-panel--embedded.task-chat-panel--with-drawer > .preview-drawer { grid-row: 1 / 3; }
+
+  /* A slim chat column beside the drawer gets the phone-width chat's compact composer and
+     widgets (the ≤ 640 px block of the Task Chat window): no hint or File label in the action
+     row, so the model pill keeps its room; tool rows and dialog actions stack. A container
+     query on the column's own width, so a column the user widens with the handle gets the full
+     layout back. */
+  .task-chat-panel--with-drawer > .task-chat-scroll,
+  .task-chat-panel--with-drawer > .task-chat-footer { container: task-chat-column / inline-size; }
+
+  @container task-chat-column (max-width: 36rem) {
+    .task-chat-hint { display: none; }
+    .task-chat-selector-slot { flex: 1; }
+    .task-chat-embed-slot .embed-menu-label { display: none; }
+    .task-chat-user-text .md-image { max-width: 180px; }
+    .task-chat-user-text .md-image img { max-height: 120px; }
+    .task-chat-widget--dialog { padding: 0.6rem 0.65rem; }
+    .task-chat-dialog-actions { flex-direction: column; align-items: stretch; }
+    .task-chat-dialog-submit { margin-left: 0; }
+    .task-chat-tool-row { grid-template-columns: minmax(0, 1fr); gap: 0; }
+    .task-chat-widget--task .card--preview { padding: 0.6rem 0.7rem; }
+    .task-chat-start-actions { flex-direction: column-reverse; }
+    .task-chat-start-cancel, .task-chat-start-go { width: 100%; }
+  }
 
   @media (hover: none) {
     .preview-drawer-tab:not(.preview-drawer-tab--active) .preview-drawer-tab-close { visibility: visible; }
@@ -11555,37 +11766,6 @@
     align-items: flex-start;
     gap: 0.5rem;
   }
-  .new-obj-img-preview {
-    display: block;
-    max-height: 140px;
-    object-fit: cover;
-    border: 1px solid var(--c-border);
-  }
-  .new-obj-img-preview-wrap {
-    position: relative;
-  }
-  .new-obj-img-preview-remove {
-    position: absolute;
-    top: 2px;
-    right: 2px;
-    width: 20px;
-    height: 20px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    border: 1px solid var(--c-border);
-    border-radius: 50%;
-    background: var(--c-bg-card);
-    color: var(--c-text-muted);
-    cursor: pointer;
-    font-weight: 700;
-    line-height: 1;
-  }
-  .new-obj-img-preview-remove:hover {
-    color: var(--c-danger);
-    border-color: var(--c-danger-border);
-  }
   .new-obj-upload-error {
     display: flex;
     align-items: center;
@@ -11757,6 +11937,165 @@
     flex-shrink: 0;
     opacity: 0.7;
   }
+  /* ── Attachment strip (TPT9410) — embed-menu.js renderAttachmentStrip() ──
+     Under every textarea that takes attachments, while it is edited: one 44px row of tiles that
+     wraps — a square thumbnail per image, a chip (icon, name, kind) per file or project artifact.
+     The tile whose reference the pointer is over in the text (syncStripHover()) takes the accent
+     border: --c-primary-border, the 3:1 non-text accent, doubled by a 1px ring so it reads as a
+     state, not a hover tint. An image's × shows on hover or focus (always on touch); a chip's ×
+     always sits at its end. Spacing under each host's textarea is set per host below. */
+  .attachment-strip {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .attachment-strip[hidden] { display: none; }
+  .attachment-tile {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    height: 44px;
+    max-width: 100%;
+    min-width: 0;
+    border: 1px solid var(--c-border-input);
+    border-radius: 8px;
+    background: var(--c-bg-card);
+    color: var(--c-text);
+    cursor: pointer;
+    transition: border-color 0.12s, box-shadow 0.12s;
+  }
+  .attachment-tile:hover {
+    border-color: color-mix(in srgb, var(--c-primary-border) 45%, var(--c-border-input));
+  }
+  .attachment-tile.attachment-tile--hover {
+    border-color: var(--c-primary-border);
+    box-shadow: 0 0 0 1px var(--c-primary-border), 0 0 0 4px var(--c-primary-light);
+  }
+  .attachment-tile--image {
+    width: 44px;
+    justify-content: center;
+    overflow: hidden;
+    background: var(--c-bg-sub-nav);
+  }
+  .attachment-tile-thumb {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .attachment-tile--pending .attachment-tile-thumb {
+    opacity: 0.55;
+    animation: attachment-tile-pending 1.4s ease-in-out infinite;
+  }
+  @keyframes attachment-tile-pending {
+    50% { opacity: 0.3; }
+  }
+  .attachment-tile-fallback { display: none; }
+  .attachment-tile--broken .attachment-tile-thumb { display: none; }
+  .attachment-tile--broken .attachment-tile-fallback {
+    display: flex;
+    color: var(--c-text-secondary);
+  }
+  .attachment-tile-fallback svg { width: 18px; height: 18px; }
+  .attachment-tile--file {
+    gap: 8px;
+    max-width: min(260px, 100%);
+    padding: 0 4px 0 10px;
+  }
+  .attachment-tile-icon {
+    display: flex;
+    flex-shrink: 0;
+    color: var(--c-primary-text);
+  }
+  .attachment-tile-icon svg { width: 18px; height: 18px; }
+  .attachment-tile-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    line-height: 1.25;
+  }
+  .attachment-tile-name,
+  .attachment-tile-kind {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .attachment-tile-name { font-size: 0.78rem; font-weight: 600; }
+  .attachment-tile-kind {
+    font-size: 0.68rem;
+    letter-spacing: 0.02em;
+    color: var(--c-text-secondary);
+  }
+  .attachment-tile-remove {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--c-text-secondary);
+    cursor: pointer;
+    transition: color 0.12s, background 0.12s, border-color 0.12s, opacity 0.12s;
+  }
+  .attachment-tile-remove svg { width: 12px; height: 12px; }
+  .attachment-tile-remove:hover {
+    color: var(--c-danger);
+    background: var(--c-danger-bg);
+    border-color: var(--c-danger-border);
+  }
+  .attachment-tile-remove:focus-visible {
+    outline: 2px solid var(--c-primary-border);
+    outline-offset: 1px;
+  }
+  .attachment-tile--image .attachment-tile-remove {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 18px;
+    height: 18px;
+    border-color: var(--c-border-input);
+    background: var(--c-bg-card);
+    box-shadow: 0 1px 3px var(--c-shadow);
+    opacity: 0;
+  }
+  .attachment-tile--image .attachment-tile-remove svg { width: 10px; height: 10px; }
+  .attachment-tile--image:hover .attachment-tile-remove,
+  .attachment-tile--image:focus-within .attachment-tile-remove,
+  .attachment-tile--image.attachment-tile--hover .attachment-tile-remove { opacity: 1; }
+  @media (hover: none) {
+    .attachment-tile--image .attachment-tile-remove { opacity: 1; }
+  }
+  .attachment-strip--locked .attachment-tile-remove { display: none; }
+  .attachment-strip--locked .attachment-tile--file { padding-right: 12px; }
+  @media (prefers-reduced-motion: reduce) {
+    .attachment-tile,
+    .attachment-tile-remove { transition: none; }
+    .attachment-tile--pending .attachment-tile-thumb { animation: none; }
+  }
+  @media (forced-colors: active) {
+    .attachment-tile { border-color: CanvasText; }
+    /* Forced colours drop box-shadow: an outline carries the lit state there. */
+    .attachment-tile.attachment-tile--hover {
+      border-color: Highlight;
+      outline: 2px solid Highlight;
+      outline-offset: 1px;
+    }
+  }
+  /* Per host: the strip's place under its textarea. The objective composer (.chat-input-area) and
+     the comment composer (.comment-compose) space it with their own flex gap. The description
+     editor's strip sits 8px under the editor (its 12px bottom margin, less 4px) and keeps the
+     editor's 12px below, which the File row under it tucks 6px into. */
+  .task-chat-composer > .attachment-strip { margin: 0.5rem 0 0.1rem; }
+  .new-task-field > .attachment-strip { margin-top: 0.3rem; }
+  .modal-desc-edit-wrap > .attachment-strip { flex: 0 0 auto; margin: -4px 0 12px; }
 
   /* ── Image lightbox overlay ── */
   .img-lightbox-overlay {
@@ -12736,6 +13075,10 @@
 .todo-item .agent-badge--codex  { background: var(--c-info-bg); color: var(--c-info); }
 .todo-item .agent-badge--pi     { background: #ece5fd; color: #8a63f2; }
 .todo-check { width: 15px; height: 15px; cursor: pointer; flex-shrink: 0; }
+/* (TPT9417) A task the user may not change: the done box and the drawer's status select are
+   disabled, their title names the rule. */
+.todo-check:disabled,
+.drawer-status:disabled { cursor: not-allowed; }
 .todo-item-id { font-size: 0.72rem; color: var(--c-text-muted); font-weight: 600; flex-shrink: 0; }
 .todo-title { flex: 1; font-size: 0.9rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .todo-title.done { text-decoration: line-through; color: var(--c-todo-done-title); }
@@ -14372,7 +14715,7 @@ body.left-nav-collapsed .task-edit-overlay--rail { left: 56px; }
   border-left: 2px solid var(--c-border-input);
 }
 /* Collapsed, the one line is text: an image in the quote waits for Show quote. */
-.comment-citation:not(.is-expanded) .comment-citation-text img { display: none; }
+.comment-citation:not(.is-expanded) .comment-citation-text .md-image { display: none; }
 .comment-citation-toggle {
   grid-area: toggle;
   display: inline-flex;
@@ -14510,6 +14853,27 @@ mark.mention--agent {
   outline: none;
   border-color: var(--c-primary-border);
 }
+/* (TPT9410) Under the comment box, right-aligned like the description's: "Uploading attachment…"
+   while an upload runs, the File control (task-edit-modal.js _attachCommentUploads(), the
+   description's compact trigger, its menu right-aligned under it), Submit. The width / flex
+   overrides keep the trigger compact under the composer's narrow breakpoints, which stretch every
+   .embed-menu-trigger to its row. */
+.comment-compose-actions {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+}
+.comment-compose-actions .embed-menu-wrap { flex: 0 0 auto; margin-left: auto; }
+.comment-compose-actions .embed-menu-trigger {
+  width: auto; justify-content: flex-start;
+  min-height: 28px; padding: 0 10px; border-radius: 6px; font-size: 0.76rem;
+}
+.comment-compose-actions .embed-menu-trigger:focus-visible {
+  outline: 2px solid var(--c-primary-border); outline-offset: 2px;
+}
+.comment-compose-status {
+  flex: 1 1 auto; min-width: 0; font-size: 0.72rem; color: var(--c-primary-text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.comment-compose-status[hidden] { display: none; }
 .comment-submit {
   align-self: flex-end;
   padding: 6px 14px;
@@ -15463,47 +15827,50 @@ button.setup-modal-project-card { background: transparent; color: inherit; font:
   font-size: 0.8rem;
 }
 
-/* (TPT9388) Inside the wizards: the project-identity fields line up on one row of equal-height
-   controls, and the policy list is a quiet card like the summary. Settings keeps its own look. */
+/* (TPT9388, rebuilt TPT9409) Inside the wizards the identity fields sit side by side — Initials,
+   Brand colors, Project logo — each label above its control and its hint and error below, and the
+   policy list is a quiet card like the summary. Settings lays the same fields out as rows.
+   (TPT9422) Brand colors and Project logo share the free width (3:2): the color chips wrap as
+   whole chips and a long logo file name ellipsizes, so neither field pushes the other out. */
+.setup-modal .project-identity-preview { margin: 0 0 1rem; }
 .setup-modal .project-identity-fields {
-  align-items: flex-end;
-  gap: 0.75rem 1rem;
-  margin: 1rem 0 0;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 3fr) minmax(0, 2fr);
+  align-items: start;
+  gap: 0.9rem 1.75rem;
+  margin: 0;
 }
-.setup-modal .project-identity-fields label {
+.project-identity-field {
+  display: grid;
+  align-content: start;
   gap: 0.3rem;
+  min-width: 0;
+}
+.setup-modal .project-identity-field > label,
+.setup-modal .project-identity-field > span:first-child {
   font-size: 0.78rem;
   font-weight: 600;
   color: var(--c-text-secondary);
 }
-.setup-modal .project-identity-fields .setup-modal-input {
+.project-identity-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.setup-modal .project-identity-field .setup-modal-input {
+  flex: none;
   box-sizing: border-box;
+  width: 7rem;
   height: 2.25rem;
   background: var(--c-bg-card);
   font-family: inherit;
   font-size: 0.9rem;
 }
-.setup-modal .project-identity-fields input[type=color] {
-  box-sizing: border-box;
-  width: 3rem;
-  height: 2.25rem;
-  padding: 0.2rem;
-  border: 1px solid var(--setup-edge-strong, var(--c-border));
-  border-radius: 6px;
-  background: var(--c-bg-sub-nav);
-  cursor: pointer;
-}
-.setup-modal .project-identity-fields input[type=file] {
-  font: inherit;
-  font-size: 0.8rem;
-  font-weight: 400;
-  color: var(--c-text-muted);
-}
-.setup-modal .project-identity-fields input[type=file]::file-selector-button,
-.setup-modal .project-identity-fields .setup-modal-btn {
+.setup-modal .project-identity-field .setup-modal-btn {
   box-sizing: border-box;
   height: 2.25rem;
-  margin-right: 0.6rem;
   padding: 0 0.95rem;
   border: 1px solid var(--setup-edge-strong, var(--c-border));
   border-radius: 6px;
@@ -15514,13 +15881,23 @@ button.setup-modal-project-card { background: transparent; color: inherit; font:
   font-weight: 500;
   cursor: pointer;
 }
-.setup-modal .project-identity-fields .setup-modal-btn { margin-right: 0; }
-.setup-modal .project-identity-fields input[type=file]:hover::file-selector-button,
-.setup-modal .project-identity-fields .setup-modal-btn:not(:disabled):hover { background: var(--c-bg-sub-nav); }
-.setup-modal .project-identity-fields input[type=file]:focus-visible {
-  outline: 2px solid var(--c-primary-border);
-  outline-offset: 2px;
-  border-radius: 6px;
+.setup-modal .project-identity-field .setup-modal-btn:not(:disabled):hover { background: var(--c-bg-sub-nav); }
+.setup-modal .project-identity-field .project-swatch { border-color: var(--setup-edge-strong, var(--c-border-input)); }
+.project-identity-hint {
+  margin: 0;
+  font-size: 0.74rem;
+  line-height: 1.4;
+  color: var(--c-text-muted);
+}
+.project-identity-error {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--c-danger);
+}
+.project-identity-error:empty { display: none; }
+@media (max-width: 720px) {
+  .setup-modal .project-identity-fields { grid-template-columns: minmax(0, 1fr); }
 }
 .setup-modal .project-rules {
   margin: 0.85rem 0 0;
@@ -15555,10 +15932,24 @@ button.setup-modal-project-card { background: transparent; color: inherit; font:
   font-size: 0.78rem;
   color: var(--c-text-muted);
 }
-.setup-modal .project-rules p {
-  margin: 0.35rem 0 0;
-  color: var(--c-text-muted);
+/* (TPT9409) Create Project: the creator's own policy rules — label, rule names and the button
+   to the policy dialog on one quiet row under the company mandates. */
+.setup-modal-owner-rules {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  margin: 0.85rem 0 0;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--setup-edge, var(--c-border));
+  border-radius: 8px;
+  font-size: 0.85rem;
 }
+.setup-modal-owner-rules[hidden] { display: none; }
+.setup-modal-owner-rules-text { display: grid; gap: 0.15rem; min-width: 0; }
+.setup-modal-owner-rules-text strong { font-size: 0.78rem; font-weight: 600; color: var(--c-text-secondary); }
+.setup-modal-owner-rules-text span { overflow-wrap: anywhere; }
+.setup-modal-owner-rules .setup-modal-btn { flex: none; }
 /* setup-modal.js lists the policy above its summary. */
 .setup-modal .project-rules + .setup-modal-summary { margin-top: 0.6rem; }
 @media (prefers-reduced-motion: reduce) {
@@ -15664,19 +16055,83 @@ button.setup-modal-project-card { background: transparent; color: inherit; font:
   outline: 2px solid var(--c-primary-border);
   outline-offset: -2px;
 }
-/* (C1246) task_files download links rendered from `[name](url)` markdown — paperclip marker so
-   an attachment link reads distinctly from a regular hyperlink at a glance. */
-.file-attachment-link {
+/* ── Read-only attachments (TPT9411) — attachment-markup.js ──
+   Text shown without editing it — descriptions, comments and chat replies (renderMarkdown()),
+   chat user turns (userMessageHtml()) — draws every image as .md-image, a block on lines of its
+   own, and every uploaded file or project artifact as .file-attachment-link, a chip in the line
+   of text. Each surface keeps its own image size bound (.modal-desc-display img, .comment-item
+   img, .task-chat-user-text .md-image); these rules give one look to all of them. */
+.md-image {
+  display: flex;
+  align-items: flex-start;
+  max-width: 100%;
+  margin: 0.4em 0;
+}
+/* The outlines of an image and a chip are the text colour thinned, so they show on light and dark
+   palettes alike (dark palettes paint --c-border and --c-border-input close to the card). */
+.md-image img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid color-mix(in srgb, var(--c-text) 16%, transparent);
+  border-radius: 8px;
+  background: var(--c-bg-card);
+}
+/* The chat links an uploaded image to its file viewer (task-chat.js linkTranscriptImages()). */
+.md-image > .md-image-link {
+  display: block;
+  max-width: 100%;
+  border-radius: 8px;
+}
+.md-image > .md-image-link:hover img { border-color: var(--c-primary); }
+.md-image > .md-image-link:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
+
+/* A file: its icon, then its name, ellipsized when the line is too short for it. Baseline-aligned
+   with the text around it through the name; the icon is centred. A selector of an element and a
+   class, so it out-ranks a surface's own link rule (.task-chat-md a) that comes before it. */
+a.file-attachment-link {
   display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
+  align-items: baseline;
+  gap: 0.35em;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 0 0.5em 0 0.4em;
+  border: 1px solid color-mix(in srgb, var(--c-text) 22%, transparent);
+  border-radius: 6px;
+  background: var(--c-bg-card);
+  color: var(--c-text);
+  font-size: 0.92em;
+  font-weight: 500;
+  line-height: 1.45;
+  text-decoration: none;
+  white-space: nowrap;
+  vertical-align: baseline;
 }
-.file-attachment-link::before {
-  content: '📎';
-  font-size: 0.85em;
+a.file-attachment-link:hover { border-color: var(--c-primary); }
+a.file-attachment-link:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
+.file-attachment-icon {
+  flex: none;
+  align-self: center;
+  width: 1em;
+  height: 1em;
+  color: var(--c-primary-text);
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z'/%3E%3Cpath d='M14 3v5h5'/%3E%3C/svg%3E") center / contain no-repeat;
+          mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z'/%3E%3Cpath d='M14 3v5h5'/%3E%3C/svg%3E") center / contain no-repeat;
 }
-.file-attachment-link:hover {
-  text-decoration: underline;
+/* A project artifact revision (it downloads in this window, `download`): a package. */
+a.file-attachment-link[download] .file-attachment-icon {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z'/%3E%3Cpath d='M3.3 7 12 12l8.7-5M12 22V12'/%3E%3C/svg%3E");
+          mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z'/%3E%3Cpath d='M3.3 7 12 12l8.7-5M12 22V12'/%3E%3C/svg%3E");
+}
+.file-attachment-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (forced-colors: active) {
+  a.file-attachment-link { border-color: LinkText; }
+  .file-attachment-icon { forced-color-adjust: none; background-color: LinkText; }
 }
 
 /* ── Settings modal ── */
@@ -16487,6 +16942,103 @@ input.sma-pi-tools {
   justify-content: center;
 }
 
+/* (TPT9409) Settings ▸ Policy — the project policy dialog (project-policy-modal.js): the same
+   positioning shell and tier as Edit Agents above, on the setup-modal panel chrome. A read-only
+   layer (company mandates; the owner's rules for everyone else) is a label | value list; the
+   owner's own layer is a rule editor — label | value control | Remove — and an "Add a rule…"
+   select below it. */
+.policy-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 3300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.policy-modal-body {
+  display: grid;
+  align-content: start;
+  gap: 1.1rem;
+}
+.policy-modal-body > .setup-modal-hint,
+.policy-modal-body > .setup-modal-msg { margin: 0; }
+.policy-modal-body > .setup-modal-msg:empty { display: none; }
+.policy-modal-layer { display: grid; gap: 0.5rem; }
+.policy-modal-owner { display: grid; gap: 0.75rem; }
+.policy-modal-layer-title {
+  margin: 0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1.3;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--c-text-muted);
+}
+.policy-modal-scope {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--c-text-muted);
+}
+.policy-modal-list {
+  display: grid;
+  margin: 0;
+  border: 1px solid var(--setup-edge, var(--c-border));
+  border-radius: 8px;
+}
+.policy-modal-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0.25rem 1rem;
+  padding: 0.5rem 0.75rem;
+}
+.policy-modal-item + .policy-modal-item { border-top: 1px solid var(--setup-edge, var(--c-border)); }
+.policy-modal-item dt { font-size: 0.85rem; font-weight: 600; overflow-wrap: anywhere; }
+.policy-modal-item dd { margin: 0; font-size: 0.85rem; color: var(--c-text-secondary); overflow-wrap: anywhere; }
+.policy-modal-item dd small { display: block; font-size: 0.74rem; color: var(--c-text-muted); }
+.policy-modal-empty { margin: 0; font-size: 0.85rem; color: var(--c-text-muted); }
+.policy-modal-rules { display: grid; gap: 0.5rem; }
+.policy-modal-rule {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(9rem, 12rem) auto;
+  align-items: center;
+  gap: 0.4rem 0.75rem;
+}
+.policy-modal-rule label { font-size: 0.85rem; font-weight: 600; overflow-wrap: anywhere; }
+.policy-modal-lock { display: block; font-size: 0.74rem; font-weight: 400; color: var(--c-text-muted); }
+.policy-modal-rule select,
+.policy-modal-rule input,
+.policy-modal-add,
+.policy-modal-remove {
+  box-sizing: border-box;
+  height: 2rem;
+  border: 1px solid var(--setup-edge-strong, var(--c-border-input));
+  border-radius: 6px;
+  background: var(--c-bg-card);
+  color: var(--c-text);
+  font: inherit;
+  font-size: 0.85rem;
+}
+.policy-modal-rule select,
+.policy-modal-rule input,
+.policy-modal-add { width: 100%; padding: 0 0.6rem; }
+.policy-modal-rule select,
+.policy-modal-add { cursor: pointer; }
+.policy-modal-add { justify-self: start; width: auto; min-width: 12rem; max-width: 100%; }
+.policy-modal-remove { padding: 0 0.75rem; cursor: pointer; }
+.policy-modal-remove:not(:disabled):hover { background: var(--c-bg-sub-nav); }
+.policy-modal-rule select:focus-visible,
+.policy-modal-rule input:focus-visible,
+.policy-modal-add:focus-visible {
+  outline: 2px solid var(--c-primary-border);
+  outline-offset: 1px;
+}
+@media (max-width: 520px) {
+  .policy-modal-rule { grid-template-columns: minmax(0, 1fr) auto; }
+  .policy-modal-rule label { grid-column: 1 / -1; }
+  .policy-modal-item { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* ── Native <select>s in the inline agent forms: the Pi Provider and (TPT637) the Claude/Codex
    Model. Both also sit in a `.setup-modal-agent-form-fields` track, which sets their height. ── */
 .setup-modal-agent-form select {
@@ -17100,14 +17652,127 @@ input.sma-pi-tools {
 .terminal-permission-request pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; margin: 8px 0; }
 .terminal-permission-request button { margin-right: 8px; }
 
+/* ── Project identity (TPT9352, rebuilt TPT9409) ──
+   One mark wherever a project is shown (sidebar badge, Settings preview, setup summaries): the
+   logo when there is one, otherwise the initials. A brand color fills the tile behind either;
+   without one the tile is neutral — a faint mix of the text colour on the card — never the app
+   accent, so an unset color never passes for a chosen one. project-profile.js renderProfile()
+   lays the fields out two ways: Settings rows (.project-identity-row, on the § Settings sections
+   and rows grid) and the setup wizards' side-by-side fields (.project-identity-field, scoped
+   under .setup-modal below the wizard rules). */
 .project-identity { display: inline-flex; align-items: center; gap: .65rem; min-width: 0; }
 .project-identity strong { overflow-wrap: anywhere; }
-.project-monogram { display: inline-grid; place-items: center; flex: none; width: 2.75rem; height: 2.75rem; border-radius: .55rem; overflow: hidden; background: var(--c-primary); color: var(--c-on-primary); font-weight: 700; }
+.project-monogram {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  box-sizing: border-box;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: .55rem;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--c-text) 8%, var(--c-bg-card));
+  color: var(--c-text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c-text) 12%, transparent);
+  font-weight: 700;
+}
 .project-monogram img { width: 100%; height: 100%; object-fit: contain; }
-.project-identity-fields { display: flex; flex-wrap: wrap; gap: .65rem; align-items: end; margin: .8rem 0; }
-.project-identity-fields label { display: grid; gap: .25rem; font-size: .85rem; }
-.project-identity-fields input[type=text] { width: 7rem; }
-.project-identity-fields input[type=file] { max-width: 100%; }
+.project-identity-preview:empty { display: none; }
+/* The brand color well: the real <input type=color> fills it invisibly (it opens the picker and
+   takes keyboard focus); the well paints the color, or one diagonal across an empty well while
+   no color is chosen. */
+.project-swatch {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  box-sizing: border-box;
+  width: 2.5rem;
+  height: 2.25rem;
+  border: 1.5px solid var(--c-border-input);
+  border-radius: 6px;
+  background: var(--swatch, transparent);
+  forced-color-adjust: none;
+}
+.project-swatch.is-unset {
+  background:
+    linear-gradient(to top right, transparent calc(50% - 0.75px), var(--c-text-muted) calc(50% - 0.75px) calc(50% + 0.75px), transparent calc(50% + 0.75px)),
+    var(--c-bg);
+}
+.project-swatch:hover { border-color: var(--c-primary-border); }
+.project-swatch:has(input:focus-visible) { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
+.project-swatch input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.project-swatch-value {
+  font-family: var(--c-mono, monospace);
+  font-size: .78rem;
+  color: var(--c-text-secondary);
+  white-space: nowrap;
+}
+.project-upload-btn { display: inline-flex; align-items: center; gap: 6px; }
+.project-upload-icon { flex: none; width: 14px; height: 14px; }
+.project-upload-name {
+  min-width: 0;
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: .8rem;
+  color: var(--c-text-secondary);
+}
+.project-identity-control > [hidden],
+.project-identity-row .settings-row-control > [hidden] { display: none; }
+
+/* Settings ▸ General: the preview above the rows, then Initials / Brand color / Project logo on
+   the shared label | control grid, and Save in the control column of the last row
+   (#settings-identity-save-row, template.html). A field's error is a notice under its row. */
+#settings-project-profile .project-identity-preview { padding: 2px 0 14px; }
+#settings-project-profile .project-identity-preview .project-monogram {
+  width: 3rem;
+  height: 3rem;
+  border-radius: .65rem;
+  font-size: 1.05rem;
+}
+#settings-project-profile .project-identity-preview strong { font-size: .95rem; }
+.project-identity-fields--rows { display: block; }
+.project-identity-row .project-identity-input {
+  box-sizing: border-box;
+  width: 6.5rem;
+  height: var(--settings-control-h);
+  padding: 0 .6rem;
+  border: 1.5px solid var(--c-border-input);
+  border-radius: 6px;
+  background-color: var(--c-bg);
+  color: var(--c-text);
+  font: inherit;
+  font-size: .82rem;
+  font-weight: 600;
+  letter-spacing: .04em;
+  outline: none;
+  transition: border-color .15s;
+}
+.project-identity-row .project-identity-input::placeholder { color: var(--c-text-muted); font-weight: 500; }
+.project-identity-row .project-identity-input:hover { border-color: var(--c-primary-border); }
+.project-identity-row .project-identity-input:focus {
+  border-color: var(--c-primary-border);
+  box-shadow: 0 0 0 3px var(--c-primary-light);
+}
+.project-identity-row .project-identity-input[aria-invalid="true"] { border-color: var(--c-danger-border); }
+.project-identity-row .project-swatch { width: 2.75rem; height: var(--settings-control-h); }
+.project-identity-row .settings-row-btn,
+#settings-identity-save-row .settings-row-btn { box-sizing: border-box; height: var(--settings-control-h); }
+.settings-row > .settings-notice.project-identity-error:empty { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .project-identity-row .project-identity-input { transition: none; }
+}
 .project-rules { margin-block: .75rem; }
 .project-rules ul, .project-rules p { margin: .3rem 0; }
 .project-rules ul { padding-inline-start: 1.3rem; }
@@ -17115,3 +17780,93 @@ input.sma-pi-tools {
 #sidebar-project-identity { padding: .3rem; }
 #sidebar-project-identity .project-monogram { width: 2rem; height: 2rem; font-size: .78rem; }
 body.left-nav-collapsed #sidebar-project-identity strong { display: none; }
+
+/* (TPT9422) Brand colors field (brand-color-picker.js): one chip per color — the .project-swatch
+   well over its native picker, a Primary/Secondary caption, the hex code and a remove button —
+   or, with none, a highlighted "Not selected" chip: a dashed outline around the empty,
+   struck-through well, on the sub-nav ground, so no color ever reads as chosen by default.
+   Add color follows while there are fewer than three. */
+.brand-colors { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; min-width: 0; }
+.brand-colors-items { display: contents; }
+.brand-colors-none,
+.brand-color {
+  display: inline-flex;
+  align-items: center;
+  gap: .55rem;
+  box-sizing: border-box;
+  white-space: nowrap;
+  min-height: var(--settings-control-h, 2.25rem);
+  padding: .2rem .7rem .2rem .2rem;
+  border-radius: 8px;
+}
+.brand-colors-none {
+  border: 1.5px dashed var(--c-text-faint);
+  background: var(--c-bg-sub-nav);
+  color: var(--c-text);
+  font-size: .82rem;
+  font-weight: 600;
+}
+.brand-colors-none .project-swatch,
+.brand-color .project-swatch { width: 1.9rem; height: 1.6rem; border-radius: 5px; }
+.brand-color {
+  padding-right: .2rem;
+  border: 1px solid var(--c-border-input);
+  background: var(--c-bg-card);
+}
+.brand-color-meta { display: inline-flex; flex-direction: column; gap: 1px; line-height: 1.15; }
+.brand-color-role {
+  font-size: .66rem;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--c-text-muted);
+}
+.brand-color--primary .brand-color-role { color: var(--c-text-secondary); }
+.brand-color .project-swatch-value { font-size: .76rem; color: var(--c-text); }
+.brand-color-remove {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--c-text-muted);
+  cursor: pointer;
+}
+.brand-color-remove svg { width: .8rem; height: .8rem; }
+.brand-color-remove:hover { background: var(--c-bg-sub-nav); color: var(--c-danger); }
+.brand-color-remove:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 1px; }
+.brand-colors-add {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  box-sizing: border-box;
+  min-height: var(--settings-control-h, 2.25rem);
+  padding: 0 .8rem;
+  border: 1.5px dashed var(--c-primary-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--c-primary-text);
+  font: inherit;
+  font-size: .8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.brand-colors-add-icon { width: .85rem; height: .85rem; flex: none; }
+.brand-colors-add:hover { background: var(--c-primary-lighter); }
+.brand-colors-add:focus-visible { outline: 2px solid var(--c-primary-border); outline-offset: 2px; }
+.brand-colors-full { font-size: .78rem; color: var(--c-text-muted); }
+.brand-colors-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+@media (forced-colors: active) {
+  .brand-colors-none, .brand-color, .brand-colors-add { border-color: CanvasText; }
+}

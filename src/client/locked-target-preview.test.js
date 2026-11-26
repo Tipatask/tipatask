@@ -41,6 +41,7 @@ function fixture(targetStatus, { type = 'modified', confirmed = false, origin = 
     dependencyKeysMarkup: keys => keys.map(esc).join(', '), // (TPT9216) renderCard + proposal "Deps:" labels
     _measureTitle: () => 10, _CHAT_SVG: '', _WAND_SVG: '', getSprintsEnabled: () => true,
     renderSprintBadgeLabel: empty, buildSubtasksLabel: empty,
+    isTaskReadOnly: () => false, statusLockAttrs: empty, // (TPT9417) board-card lock, never reached by a proposal
     projectHeader: () => ({}), captureCardEdits() {},
     fetchWithRetry: async (...args) => { writes.push(args); throw new Error('Unexpected write'); },
     api: { tasks: { get: async (...args) => { writes.push(args); throw new Error('Unexpected read'); } } },

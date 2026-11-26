@@ -38,8 +38,9 @@ workflow fails on purpose when `vX.Y.Z` and `package.json` disagree.
    installer plus `SHA256SUMS` to a **draft** GitHub Release whose body is
    `docs/releases/vX.Y.Z.md` from the tagged tree. A tag without that file still gets a
    draft, with a one-line placeholder body and a workflow warning. Nothing is published
-   automatically. If only the `Draft release` job is red, run it again: see
-   [The Draft release job failed](#the-draft-release-job-failed).
+   automatically. If a build job was cancelled before it ran a step, see
+   [A build job never started](#a-build-job-never-started). If only the `Draft release` job is
+   red, run it again: see [The Draft release job failed](#the-draft-release-job-failed).
 7. Open **Releases**, review the draft, and tick **Set as a pre-release** while the builds
    are unsigned. Download and smoke-test at least one installer per OS, then click
    **Publish release**. Prefer fixing the text in `docs/releases/vX.Y.Z.md` over editing the
@@ -88,6 +89,26 @@ Conventions the generator and the workflow rely on:
 branch and keeps the installers as run artifacts for 14 days. It does not create a Release.
 Use it to check a packaging change before tagging.
 
+## A build job never started
+
+A build job is red although it ran nothing: its page shows **This job was cancelled** and no
+steps, and the run's annotations say `The job was not acquired by Runner of type hosted even
+after multiple attempts`. GitHub could not give the job a hosted runner and cancelled it. For the
+macOS job a notice about capacity for macOS arm64 runners can stand beside it. `Draft release` is
+skipped, because it needs all three build jobs. The tag, the workflow and the jobs that passed
+are fine, and their installers are kept.
+
+Run the failed jobs again: **Re-run jobs ▸ Re-run failed jobs** on the run's page, or
+
+```bash
+gh run rerun <run-id> --failed -R Tipatask/tipatask
+```
+
+Only the job that did not run is built again. When the `release` environment requires a review,
+approve the job once more: a re-run waits for it like the first run. `Draft release` starts by
+itself when the job is green. If GitHub still has no runner, the job is cancelled the same way:
+run it again later.
+
 ## The Draft release job failed
 
 The three build jobs passed and only `Draft release` is red. The installers exist as run
@@ -131,6 +152,14 @@ request, the HTTP status and GitHub's message.
 
    Use the id: `gh release delete vX.Y.Z` goes by tag, and the duplicates share it. Deleting a
    draft does not delete the tag.
+5. A draft whose tag reads `untagged-…` in that list has lost its tag: GitHub takes it from a
+   draft that is updated through the API without `tag_name`. The job names the tag in its own
+   updates, and a hand-written `gh api -X PATCH` on a draft must do the same. Give the tag back;
+   the body and the files stay:
+
+   ```bash
+   gh api -X PATCH repos/Tipatask/tipatask/releases/<id> -f tag_name=vX.Y.Z
+   ```
 
 The job refuses to run for a tag whose release is already published. It fills drafts only and
 never changes a published release.

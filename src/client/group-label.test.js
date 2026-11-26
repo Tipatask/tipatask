@@ -11,7 +11,7 @@ const {
   groupPluralFor, isGeneratedGroupName,
   setSprintsEnabled, getSprintsEnabled, resetSprintsEnabled,
   setObjectiveGroupingEnabled, getObjectiveGroupingEnabled, resetObjectiveGroupingEnabled,
-  setSprintSortOrder, getSprintSortOrder, resetSprintSortOrder,
+  setSprintSortOrder, getSprintSortOrder, resetSprintSortOrder, saveSprintSortOrder,
   setTaskPrefix, getTaskPrefix, resetTaskPrefix, nextTaskKeyGuess, fetchNextTaskKey,
 } = await import('./group-label.js');
 
@@ -221,6 +221,148 @@ test('resetGroupLabel also resets sprintSortOrder', () => {
   setSprintSortOrder('desc');
   resetGroupLabel();
   assert.equal(getSprintSortOrder(), 'asc');
+});
+
+// (TPT9407) The board header's Oldest first / Newest first switch saves through
+// saveSprintSortOrder(): the pick shows at once, the save is the project settings PATCH
+// (api.project.update({ sprint_sort_order })), saves run one after another, and only the
+// latest pick's failure rolls the order back — to the one the API last confirmed.
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+const flush = () => new Promise(resolve => setImmediate(resolve));
+
+async function withProjectUpdate(update, body) {
+  const original = api.project.update;
+  api.project.update = update;
+  try {
+    await body();
+  } finally {
+    api.project.update = original;
+    resetGroupLabel();
+  }
+}
+
+test('saveSprintSortOrder shows the pick at once and saves it as sprint_sort_order', async () => {
+  const calls = [];
+  await withProjectUpdate(async fields => { calls.push(fields); return null; }, async () => {
+    resetGroupLabel();
+    const saving = saveSprintSortOrder('desc');
+    assert.equal(getSprintSortOrder(), 'desc', 'shown before the save settles');
+    assert.deepEqual(await saving, { ok: true, changed: true, order: 'desc' });
+    assert.deepEqual(calls, [{ sprint_sort_order: 'desc' }]);
+    assert.equal(getSprintSortOrder(), 'desc');
+  });
+});
+
+test('saveSprintSortOrder: the order already in force sends nothing', async () => {
+  const calls = [];
+  await withProjectUpdate(async fields => { calls.push(fields); }, async () => {
+    setSprintSortOrder('desc');
+    assert.deepEqual(await saveSprintSortOrder('desc'), { ok: true, changed: false, order: 'desc' });
+    setSprintSortOrder(undefined);
+    assert.deepEqual(await saveSprintSortOrder('asc'), { ok: true, changed: false, order: 'asc' });
+    assert.deepEqual(calls, []);
+  });
+});
+
+test('saveSprintSortOrder rolls a failed save back to the order the API last confirmed', async () => {
+  await withProjectUpdate(async () => { throw new Error('offline'); }, async () => {
+    setSprintSortOrder('asc');
+    const saving = saveSprintSortOrder('desc');
+    assert.equal(getSprintSortOrder(), 'desc');
+    const result = await saving;
+    assert.equal(result.ok, false);
+    assert.equal(result.rolledBack, true);
+    assert.equal(result.order, 'asc');
+    assert.equal(result.error.message, 'offline');
+    assert.equal(getSprintSortOrder(), 'asc');
+  });
+});
+
+test('saveSprintSortOrder runs saves one after another, and a superseded failure changes nothing', async () => {
+  const first = deferred();
+  const second = deferred();
+  const calls = [];
+  await withProjectUpdate(fields => { calls.push(fields); return calls.length === 1 ? first.promise : second.promise; }, async () => {
+    setSprintSortOrder('asc');
+    const a = saveSprintSortOrder('desc');
+    const b = saveSprintSortOrder('asc');
+    assert.equal(getSprintSortOrder(), 'asc', 'the latest pick shows');
+    await flush();
+    assert.deepEqual(calls, [{ sprint_sort_order: 'desc' }], 'the second save waits for the first');
+    first.reject(new Error('timeout'));
+    const ra = await a;
+    assert.equal(ra.superseded, true);
+    assert.equal(ra.rolledBack, undefined);
+    assert.equal(getSprintSortOrder(), 'asc', 'a later pick is on its way: nothing rolls back');
+    await flush();
+    assert.deepEqual(calls, [{ sprint_sort_order: 'desc' }, { sprint_sort_order: 'asc' }]);
+    second.resolve(null);
+    assert.deepEqual(await b, { ok: true, changed: true, order: 'asc' });
+    assert.equal(getSprintSortOrder(), 'asc');
+  });
+});
+
+test('saveSprintSortOrder: a failed pick after a saved one goes back to the saved one', async () => {
+  let n = 0;
+  await withProjectUpdate(async () => { if (++n === 2) throw new Error('rejected'); return null; }, async () => {
+    setSprintSortOrder('asc');
+    assert.equal((await saveSprintSortOrder('desc')).ok, true);
+    const result = await saveSprintSortOrder('asc');
+    assert.equal(result.rolledBack, true);
+    assert.equal(result.order, 'desc');
+    assert.equal(getSprintSortOrder(), 'desc');
+  });
+});
+
+test('a project switch detaches unsettled sprint order saves', async () => {
+  const hanging = deferred();
+  const calls = [];
+  await withProjectUpdate(fields => { calls.push(fields); return calls.length === 1 ? hanging.promise : Promise.resolve(null); }, async () => {
+    setSprintSortOrder('asc');
+    const a = saveSprintSortOrder('desc');
+    const b = saveSprintSortOrder('asc'); // queued behind a
+    await flush();
+    assert.equal(calls.length, 1, 'a is in flight, b waits');
+    resetGroupLabel(); // project switch
+    setSprintSortOrder('desc'); // the next project's stored order
+    const c = saveSprintSortOrder('asc'); // the next project's own pick does not wait behind a
+    assert.deepEqual(await c, { ok: true, changed: true, order: 'asc' });
+    hanging.reject(new Error('offline'));
+    assert.equal((await a).stale, true);
+    assert.equal((await b).stale, true);
+    assert.equal(getSprintSortOrder(), 'asc', 'the old project never rolls the new one back');
+    assert.deepEqual(calls, [{ sprint_sort_order: 'desc' }, { sprint_sort_order: 'asc' }],
+      'the queued save of the old project never sent its request');
+  });
+});
+
+test('loadGroupLabel keeps the shown sprint order while a save is unsettled, then reads the stored one', async () => {
+  const pending = deferred();
+  const originalSettings = api.project.settings;
+  try {
+    await withProjectUpdate(() => pending.promise, async () => {
+      setSprintSortOrder('asc');
+      api.project.settings = async () => ({ sprintSortOrder: 'asc' });
+      const saving = saveSprintSortOrder('desc');
+      await loadGroupLabel();
+      assert.equal(getSprintSortOrder(), 'desc', 'a read racing the save does not undo the pick');
+      pending.resolve(null);
+      await saving;
+      api.project.settings = async () => ({ sprintSortOrder: 'desc' });
+      await loadGroupLabel(); // an app restart reads the saved order back
+      assert.equal(getSprintSortOrder(), 'desc');
+      api.project.settings = async () => ({ taskGroupLabel: 'Sprints' });
+      await loadGroupLabel(); // a project with no saved value
+      assert.equal(getSprintSortOrder(), 'asc');
+    });
+  } finally {
+    api.project.settings = originalSettings;
+  }
 });
 
 // (TPT632) task_prefix — the settings route already ran it through resolveCodingPrefix();

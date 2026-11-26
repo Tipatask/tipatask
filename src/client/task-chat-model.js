@@ -2,8 +2,14 @@
 // merge-branches-model.js: everything that can be unit-tested under plain node lives here
 // (provider filtering, selection choice, transcript shaping, ask_user fence handling, a reply's
 // progress notes and answer, and the markup + answer rules of the dialog / tool / task widgets,
-// a user turn's inline images and file chips), the window only renders and wires. No imports on
-// purpose — the test imports this module directly.
+// a user turn's images and file chips), the window only renders and wires. The one import is the
+// pure, import-free attachment-markup.js — the test imports this module directly under node.
+
+import { attachmentFromUrl, fileChipHtml, fileRefFromHref, imageBlockHtml } from './attachment-markup.js';
+
+// The attachment URL reader moved to attachment-markup.js (TPT9411); task-chat.js and
+// embed-menu.js keep importing it from here.
+export { fileRefFromHref };
 
 // Providers that can enforce the task-chat tool fence. Mirrors the server's profile list
 // (providers/tool-profiles.js); gemini is refused there, so it is never offered here even
@@ -459,110 +465,66 @@ export function shortToolName(name) {
 }
 
 // ── Attachments in user messages ──
-// The composer's Embed / paste / drop insert the objective chat's references at the caret:
-// `![img](<base>/api/projects/<p>/images/<i>)` for an image,
-// `[name](<base>/api/projects/<p>/files/<i>)` for a file. In the transcript an image is drawn
-// inline, at the place its reference holds in the text; files show as chips below the text. The
-// URLs are rewritten to the same-origin proxies, as renderMarkdown() (utils.js) does for rendered
-// markdown.
-const ATTACHMENT_REF_RE = /(!?)\[([^\]\n]*)\]\(\s*<?([^()\s<>]+)>?(?:\s+"[^"\n]*")?\s*\)/g;
-// Read the authored href, before the browser resolves it against the Task App's URL.
-export function fileRefFromHref(href) {
-  if (typeof href !== 'string' || !href || /[\x00-\x1f\x7f\\]/.test(href)) return null;
-  const lineMatch = /#L([1-9]\d*)$/.exec(href);
-  const line = lineMatch ? Number(lineMatch[1]) : null;
-  if (line !== null && !Number.isSafeInteger(line)) return null;
-  const raw = lineMatch ? href.slice(0, lineMatch.index) : href;
-  const attachment = /^(?:https?:\/\/[^/?#\s]+)?\/api\/projects\/(\d+)\/(files|images)\/(\d+)(?:\?[^#]*)?$/i.exec(raw);
-  if (attachment) return { href: '/api/' + attachment[2] + '/' + attachment[1] + '/' + attachment[3], line };
-  if (/^\/api\/(?:files|images)\/\d+\/\d+$/.test(raw)) return { href: raw, line };
-  const artifact = /^(?:https?:\/\/[^/?#\s]+)?(\/api\/projects\/\d+\/files\/artifacts\/\d+\/revisions\/\d+\/content)$/i.exec(raw);
-  if (artifact) return { href: artifact[1], line };
-  if (/[?#]/.test(raw)) return null;
-  let path;
-  try { path = decodeURIComponent(raw); } catch { return null; }
-  if (!path.trim() || /^(?:\/|[a-z][a-z0-9+.-]*:)|[\x00-\x1f\x7f\\]/i.test(path) || path.endsWith('/')) return null;
-  const parts = path.split('/');
-  if (parts.includes('..')) return null;
-  path = parts.filter(part => part && part !== '.').join('/');
-  return path ? { path, line } : null;
-}
+// The composer's File control, paste and drop insert the objective chat's references at the
+// caret: `![img](<base>/api/projects/<p>/images/<i>)` for an image, `[name](<base>/api/projects/
+// <p>/files/<i>)` for a file. A sent turn draws each one where its reference stood, in the markup
+// rendered Markdown uses for descriptions and comments (attachment-markup.js, TPT9411): an image
+// as a block on lines of its own, a file as a chip in the line of text, both at the same-origin
+// address. A label may carry `\]` escapes (the artifact rows escape brackets in file names); a
+// link title is allowed and ignored.
+const ATTACHMENT_REF_RE = /!?\[((?:\\.|[^\]\\\n])*)\]\(\s*<?([^()\s<>]+)>?(?:\s+"[^"\n]*")?\s*\)/g;
 
-function attachmentRef(name, url) {
-  const ref = fileRefFromHref(url);
-  if (!ref?.href) return null;
-  const href = ref.href + (ref.line ? '#L' + ref.line : '');
-  return ref.href.startsWith('/api/images/')
-    ? { kind: 'image', name: name.trim(), src: ref.href, href }
-    : { kind: 'file', name: name.trim(), href };
-}
-
-// Taking a reference out of the text leaves its line's trailing blanks and an extra blank line.
-function tidyGaps(text) {
-  return text
-    .split('\n').map(line => line.replace(/[ \t]+$/, '')).join('\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-// A user message as the transcript draws it: `{ parts, files }`. `parts` is its text in order,
-// split at every image reference into `{ kind: 'text', text }` and `{ kind: 'image', name, src,
-// href }` entries, so each image is drawn exactly where it was inserted. `files` are its file
-// references (`{ kind: 'file', name, href }`), taken out of the text for the chips below it, the
-// gaps they leave tidied. Other links, and an image still uploading (`blob:` URL), stay text.
+// A user message as the transcript draws it: its text in order, split at every attachment
+// reference into `{ kind: 'text', text }`, `{ kind: 'image', name, src }` and `{ kind: 'file',
+// name, href, artifact }` parts, so each attachment is drawn exactly where it was inserted. An
+// image is a block of its own lines: the text next to it loses the blanks and line breaks that
+// touch it, and text left with nothing is dropped. Other links, and an image still uploading
+// (`blob:` URL), stay text.
 export function userMessageParts(text) {
   const source = typeof text === 'string' ? text : '';
-  if (!source.includes('/api/')) return { parts: source ? [{ kind: 'text', text: source }] : [], files: [] };
-  const files = [];
-  const withoutFiles = source.replace(ATTACHMENT_REF_RE, (whole, _bang, name, url) => {
-    const ref = attachmentRef(name, url);
-    if (!ref || ref.kind !== 'file') return whole;
-    files.push(ref);
-    return '';
-  });
-  const rest = files.length ? tidyGaps(withoutFiles) : source;
   const parts = [];
   let last = 0;
-  for (const match of rest.matchAll(ATTACHMENT_REF_RE)) {
-    const ref = attachmentRef(match[2], match[3]);
-    if (!ref || ref.kind !== 'image') continue;
-    if (match.index > last) parts.push({ kind: 'text', text: rest.slice(last, match.index) });
-    parts.push(ref);
-    last = match.index + match[0].length;
+  if (source.includes('/api/')) {
+    for (const match of source.matchAll(ATTACHMENT_REF_RE)) {
+      const attachment = attachmentFromUrl(match[2]);
+      if (!attachment) continue;
+      if (match.index > last) parts.push({ kind: 'text', text: source.slice(last, match.index) });
+      const name = match[1].replace(/\\(.)/g, '$1').trim();
+      parts.push(attachment.kind === 'image'
+        ? { kind: 'image', name, src: attachment.src }
+        : { kind: 'file', name, href: attachment.href, artifact: attachment.artifact });
+      last = match.index + match[0].length;
+    }
   }
-  if (last < rest.length) parts.push({ kind: 'text', text: rest.slice(last) });
-  return { parts, files };
+  if (last < source.length) parts.push({ kind: 'text', text: source.slice(last) });
+  return parts
+    .map((part, i) => {
+      if (part.kind !== 'text') return part;
+      let value = part.text;
+      if (parts[i - 1] && parts[i - 1].kind === 'image') value = value.replace(/^\s+/, '');
+      if (parts[i + 1] && parts[i + 1].kind === 'image') value = value.replace(/\s+$/, '');
+      return { kind: 'text', text: value };
+    })
+    .filter(part => part.kind !== 'text' || part.text);
 }
 
-// One image of a user message, in its text: a bounded thumbnail linking to the image. It is a
-// transcript attachment link, handled by the chat's file viewer.
-function inlineImageHtml(image, tr) {
-  // A pasted image carries the alt text `img`; name it plainly instead.
-  const name = image.name && image.name !== 'img' ? image.name : tr('taskChat.embed.image');
-  return `<a class="file-attachment-link task-chat-inline-image" href="${esc(image.href)}" title="${esc(name)}">`
-    + `<img src="${esc(image.src)}" alt="${esc(name)}" loading="lazy"></a>`;
-}
-
-// File chips in a user message share the transcript's delegated preview handler.
-export function attachmentsHtml(files, { t } = {}) {
-  const tr = typeof t === 'function' ? t : key => key;
-  const items = (Array.isArray(files) ? files : []).map((a) => {
-    if (!a || a.kind !== 'file') return '';
-    const name = a.name || tr('taskChat.embed.file');
-    return `<a class="file-attachment-link task-chat-attach task-chat-attach--file" href="${esc(a.href)}" title="${esc(name)}">`
-      + '<span class="task-chat-attach-icon" aria-hidden="true"></span>'
-      + `<span class="task-chat-attach-name">${esc(name)}</span></a>`;
-  }).join('');
-  return items ? `<div class="task-chat-attachments">${items}</div>` : '';
-}
-
-// A user message's body: its text (escaped, newlines kept by CSS) with each image drawn inline
-// where its reference was, then the chips of its files.
+// A user message's body: its text (escaped; newlines kept by CSS) with every image and file drawn
+// where its reference was. A pasted image is named `img`, and a file link may have no label: both
+// get their kind's plain name, the one the composer's attachment strip shows (embed-menu.js).
+// The task and project chat (task-chat.js) and the objective chat (chat-ui.js) draw user turns
+// with it; the task chat then links each image to its file viewer.
 export function userMessageHtml(text, { t } = {}) {
   const tr = typeof t === 'function' ? t : key => key;
-  const { parts, files } = userMessageParts(text);
-  const body = parts.map(part => (part.kind === 'image' ? inlineImageHtml(part, tr) : esc(part.text))).join('');
-  return (body ? `<div class="task-chat-user-text">${body}</div>` : '') + attachmentsHtml(files, { t });
+  const body = userMessageParts(text).map((part) => {
+    if (part.kind === 'image') {
+      return imageBlockHtml({ src: part.src, alt: part.name && part.name !== 'img' ? part.name : tr('embed.image') });
+    }
+    if (part.kind === 'file') {
+      return fileChipHtml({ href: part.href, name: part.name || tr('embed.strip.file'), artifact: part.artifact });
+    }
+    return esc(part.text);
+  }).join('');
+  return body ? `<div class="task-chat-user-text">${body}</div>` : '';
 }
 
 // An image whose upload failed leaves its `![…](blob:…)` placeholder behind: drop every one once

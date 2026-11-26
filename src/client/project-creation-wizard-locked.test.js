@@ -535,8 +535,9 @@ test('presetLocked chain: the created project has KB_MODE compose and no seeded 
     assert.equal($('#wiz-next-btn').disabled, true);
     initials.value = 'UX';
     initials.dispatchEvent(new Event('input'));
-    $('[data-color]').value = '#134789';
-    $('[data-color]').dispatchEvent(new Event('input'));
+    $('[data-brand-colors-add]').click();
+    $('[data-brand-color-input="0"]').value = '#134789';
+    $('[data-brand-color-input="0"]').dispatchEvent(new Event('input', { bubbles: true }));
     assert.equal($('.project-monogram').textContent, 'UX');
     const picker = $('[data-file]');
     Object.defineProperty(picker, 'files', { value: [new window.File([Buffer.from(png, 'base64')], 'brand.png', { type: 'image/png' })] });
@@ -568,7 +569,7 @@ test('presetLocked chain: the created project has KB_MODE compose and no seeded 
     './src/cli/setup': {
       createApiProject: async ({ name, projectPresets, identity, settings }) => {
         assert.equal(identity.display_initials, 'UX');
-        assert.equal(identity.brand_color, '#134789');
+        assert.deepEqual(identity.brand_colors, ['#134789']);
         assert.equal(identity.logo, expectedLogo);
         assert.equal(settings.language, 'uk');
         assert.deepEqual(projectPresets, ['health', 'home']);

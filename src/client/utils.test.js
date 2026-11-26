@@ -299,7 +299,8 @@ test('renderMarkdown preserves mailto href and image src containing @', async ()
   await withRealMarked(() => {
     const html = renderMarkdown('[mail](mailto:alice@example.com) ![image](https://example.test/@assets/icon.png)');
     assert.match(html, /<a href="mailto:alice@example\.com">mail<\/a>/);
-    assert.match(html, /<img src="https:\/\/example\.test\/@assets\/icon\.png" alt="image">/);
+    // (TPT9411) Every image is a block of its own (attachment-markup.js imageBlockHtml()).
+    assert.match(html, /<span class="md-image"><img src="https:\/\/example\.test\/@assets\/icon\.png" alt="image" loading="lazy"><\/span>/);
     assert.doesNotMatch(html, /file-ref/);
   });
 });

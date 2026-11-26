@@ -2,25 +2,31 @@
 // task / project chat panel), so several documents can stay open beside the conversation. It
 // takes ready content and knows nothing about chats or fetching (tt-task-chat.md § Stacking).
 //
-//   const drawer = createPreviewDrawer(host, { onClose, hostClass });
+//   const drawer = createPreviewDrawer(host, { onClose, onLayoutChange, hostClass });
 //   drawer.open({ id, title, body })  → { id, panel } — a new tab, or the open tab with this id
 //   drawer.close(id) / drawer.closeAll() — closing the last tab closes the drawer, then onClose()
 //
 // No backdrop and no focus trap: the host stays fully usable beside the drawer. While open the
 // drawer is the host's last child, `hostClass` (if given) is on the host so the host's own CSS
 // can make room for it, and the drawer's width is published on the host as --preview-drawer-width.
+// `onLayoutChange()` runs just before the drawer docks into the host or leaves it (the host's
+// layout switches); a function it returns runs right after, with the new layout in place.
+// Until the user picks a width the drawer fills the host: all of it but MIN_TRANSCRIPT_WIDTH.
 // The handle on its left edge resizes it; the width is clamped so the rest of the host keeps
 // MIN_TRANSCRIPT_WIDTH (again after every host or window resize) and the width the user picks
-// is remembered in localStorage. Escape while focus is inside the drawer closes the focused tab
-// from a window capture-phase listener, ahead of every document-level Escape handler (the chat
-// window's, the task workspace's).
+// is remembered in localStorage — the widest one as "fill" again. Escape while focus is inside
+// the drawer closes the focused tab from a window capture-phase listener, ahead of every
+// document-level Escape handler (the chat window's, the task workspace's).
 import { t, getLocale } from './i18n.js';
 
 export const PREVIEW_DRAWER_WIDTH_KEY = 'tipatask-preview-drawer-width';
 export const PREVIEW_DRAWER_WIDTH_VAR = '--preview-drawer-width';
+// Shown only while the host cannot be measured yet and no width is stored; a measured host
+// with no stored width gets the fill width instead (clampDrawerWidth()).
 export const DEFAULT_DRAWER_WIDTH = 480;
 export const MIN_DRAWER_WIDTH = 280;
 // A readable chat column: the messages, the composer and its action row still fit beside it.
+// Also the chat column's width while the drawer fills the host.
 export const MIN_TRANSCRIPT_WIDTH = 360;
 const KEY_STEP = 16;
 const KEY_STEP_LARGE = 64;
@@ -33,11 +39,15 @@ let drawerSeq = 0;
 
 // The drawer width shown for a wanted `width` in a host `available` px wide: never under
 // MIN_DRAWER_WIDTH, never so wide that the rest of the host drops under MIN_TRANSCRIPT_WIDTH.
-// An unmeasured host (0, hidden or not laid out) only applies the drawer's own minimum. When the
-// host is too narrow for both minimums the drawer keeps its own (at ≤ 640 px it covers the host).
+// No wanted width (null: nothing stored) fills the host — everything but MIN_TRANSCRIPT_WIDTH,
+// so the chat beside it is a slim column and the document gets the rest. An unmeasured host
+// (0, hidden or not laid out) only applies the drawer's own minimum, and shows
+// DEFAULT_DRAWER_WIDTH when nothing is wanted. When the host is too narrow for both minimums the
+// drawer keeps its own (at ≤ 640 px it covers the host).
 export function clampDrawerWidth(width, available) {
-  const want = Number.isFinite(width) ? width : DEFAULT_DRAWER_WIDTH;
-  return Math.round(Math.min(Math.max(want, MIN_DRAWER_WIDTH), maxDrawerWidth(available)));
+  const max = maxDrawerWidth(available);
+  const want = Number.isFinite(width) ? width : (Number.isFinite(max) ? max : DEFAULT_DRAWER_WIDTH);
+  return Math.round(Math.min(Math.max(want, MIN_DRAWER_WIDTH), max));
 }
 
 function maxDrawerWidth(available) {
@@ -46,18 +56,23 @@ function maxDrawerWidth(available) {
     : Infinity;
 }
 
-// The width the user last picked, or the default. Storage can be blocked: never throws.
+// The width the user last picked, or null when there is none: the drawer fills its host.
+// Storage can be blocked: never throws.
 export function readStoredDrawerWidth() {
   let raw = null;
   try { raw = localStorage.getItem(PREVIEW_DRAWER_WIDTH_KEY); } catch { /* storage unavailable */ }
   const n = Number(raw);
   return raw !== null && raw !== '' && Number.isFinite(n) && n > 0
     ? Math.max(MIN_DRAWER_WIDTH, Math.round(n))
-    : DEFAULT_DRAWER_WIDTH;
+    : null;
 }
 
+// Stores a picked width; null forgets it, so drawers fill their host again.
 function storeDrawerWidth(px) {
-  try { localStorage.setItem(PREVIEW_DRAWER_WIDTH_KEY, String(px)); } catch { /* storage unavailable */ }
+  try {
+    if (px === null) localStorage.removeItem(PREVIEW_DRAWER_WIDTH_KEY);
+    else localStorage.setItem(PREVIEW_DRAWER_WIDTH_KEY, String(px));
+  } catch { /* storage unavailable */ }
 }
 
 function nameControl(el, text) {
@@ -65,7 +80,7 @@ function nameControl(el, text) {
   el.setAttribute('aria-label', text);
 }
 
-export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } = {}) {
+export function createPreviewDrawer(host, { onClose, onSelect, onLayoutChange, hostClass = '' } = {}) {
   if (!host || typeof host.appendChild !== 'function') throw new Error('createPreviewDrawer needs a host element');
   const seq = ++drawerSeq;
   const hostClasses = String(hostClass || '').split(/\s+/).filter(Boolean);
@@ -76,8 +91,8 @@ export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } 
   let panels = null;
   let handle = null;          // the resize separator
   let closeBtn = null;
-  let preferred = readStoredDrawerWidth(); // the width the user picked; the shown one may be clamped
-  let applied = preferred;
+  let preferred = readStoredDrawerWidth(); // the width the user picked (null: fill the host); the shown one may be clamped
+  let applied = clampDrawerWidth(preferred, 0);
   let available = 0;          // host width at the last clamp (0 = unmeasured)
   let opener = null;          // where focus goes back to when the drawer closes with focus inside it
   let labelledLocale = '';
@@ -131,12 +146,34 @@ export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } 
 
   // ── Open / close ──
 
+  // The host's layout switches when the drawer docks into it or leaves it (`hostClass` comes or
+  // goes): onLayoutChange() runs before, and the function it returns after, so the host can keep
+  // what it shows across the switch — the chat its transcript position. A failing callback never
+  // stops the drawer opening or closing.
+  function beforeLayoutChange() {
+    if (typeof onLayoutChange !== 'function') return null;
+    try {
+      const after = onLayoutChange();
+      return typeof after === 'function' ? after : null;
+    } catch (err) {
+      console.error('[preview-drawer] onLayoutChange failed:', err);
+      return null;
+    }
+  }
+
+  function afterLayoutChange(after) {
+    if (!after) return;
+    try { after(); } catch (err) { console.error('[preview-drawer] onLayoutChange failed:', err); }
+  }
+
   function attach() {
     if (!root) build();
     if (labelledLocale !== getLocale()) relabel();
+    const after = beforeLayoutChange();
     host.appendChild(root);
     if (hostClasses.length) host.classList.add(...hostClasses);
     applyWidth();
+    afterLayoutChange(after);
     window.addEventListener('keydown', onWindowKeydown, true);
     window.addEventListener('resize', scheduleClamp);
     document.addEventListener('tiptask:reload', onReload);
@@ -304,7 +341,8 @@ export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } 
     return true;
   }
 
-  function teardown({ hadFocus = false, notify = true } = {}) {
+  // `relayout: false` when the host itself is going away (destroy()): nothing left to keep.
+  function teardown({ hadFocus = false, notify = true, relayout = true } = {}) {
     stopDrag(false);
     cancelAnimationFrame(frame);
     frame = 0;
@@ -312,6 +350,7 @@ export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } 
     window.removeEventListener('resize', scheduleClamp);
     document.removeEventListener('tiptask:reload', onReload);
     if (observer) { observer.disconnect(); observer = null; }
+    const after = relayout && host.isConnected ? beforeLayoutChange() : null;
     for (const item of items.values()) { item.lifetime.abort(); item.tab.remove(); item.panel.remove(); }
     items.clear();
     activeId = null;
@@ -321,6 +360,7 @@ export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } 
     }
     if (hostClasses.length) host.classList.remove(...hostClasses);
     host.style.removeProperty(PREVIEW_DRAWER_WIDTH_VAR);
+    afterLayoutChange(after);
     const back = opener;
     opener = null;
     if (hadFocus && back && back.isConnected && !back.closest('[hidden], [inert]')) back.focus({ preventScroll: true });
@@ -329,7 +369,7 @@ export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } 
 
   function destroy() {
     if (destroyed) return;
-    if (isOpen()) teardown({ hadFocus: focusInside(), notify: true });
+    if (isOpen()) teardown({ hadFocus: focusInside(), notify: true, relayout: false });
     destroyed = true;
     root = null;
   }
@@ -397,8 +437,9 @@ export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } 
     return host.clientWidth || 0;
   }
 
-  // Shows the preferred width, clamped to the host as it is now. Never stores anything: a narrow
-  // window shrinks the drawer for now, and a wider one gives the remembered width back.
+  // Shows the preferred width, clamped to the host as it is now — or, with none picked, the fill
+  // width for the host as it is now. Never stores anything: a narrow window shrinks the drawer
+  // for now, and a wider one gives the remembered width back.
   function applyWidth() {
     if (!root || !root.isConnected) return;
     available = measureHost();
@@ -415,7 +456,16 @@ export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } 
     preferred = Math.max(MIN_DRAWER_WIDTH, Math.round(px));
     applyWidth();
     preferred = applied;
-    if (remember) storeDrawerWidth(applied);
+    if (remember) rememberWidth();
+  }
+
+  // The widest width the host allows — the chat at its minimum — is remembered as "fill", so a
+  // window that grows later still gives the document all the room. (A host too narrow for both
+  // minimums has no such choice: its one width is stored as it is.)
+  function rememberWidth() {
+    const widest = available > 0 && applied > MIN_DRAWER_WIDTH && applied >= maxDrawerWidth(available);
+    preferred = widest ? null : applied;
+    storeDrawerWidth(preferred);
   }
 
   function scheduleClamp() {
@@ -450,7 +500,7 @@ export function createPreviewDrawer(host, { onClose, onSelect, hostClass = '' } 
     root?.classList.remove('preview-drawer--resizing');
     document.body.classList.remove('preview-drawer-resizing');
     if (commit) {
-      storeDrawerWidth(applied);
+      rememberWidth();
     } else {
       preferred = ended.startPreferred;
       applyWidth();

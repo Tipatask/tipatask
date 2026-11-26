@@ -7,6 +7,7 @@ import { getLocale, t, tc } from './i18n.js';
 import { startName, inProgressName, completeName, canceledName, statusNames, activeNames, isLockedTargetStatus } from './status-registry.js';
 import { groupTitle, groupNewLabel } from './group-label.js';
 import { sanitizeMarkdownHtml } from './markdown-sanitize.js';
+import { attachmentFromUrl, escapeHtml, fileChipHtml, imageBlockHtml, tidyImageBlocks } from './attachment-markup.js';
 
 const { describeProposalResult } = proposalResults;
 
@@ -177,6 +178,14 @@ export function shortModelName(model) {
 // same renderers as the first one.
 const _configuredMarkdownParsers = new WeakSet();
 const FILE_REF_RE = /(^|[^\w.@/-])@([\w./-]+\.\w+)(?![\w./@-])/g;
+// marked's own URL cleaning, for the images its replaced image renderer still draws itself.
+function cleanMarkdownUrl(href) {
+  try {
+    return encodeURI(href).replace(/%25/g, '%');
+  } catch {
+    return null;
+  }
+}
 function configureMarked() {
   if (typeof marked === 'undefined' || _configuredMarkdownParsers.has(marked)) return;
   const linkTextTokens = new WeakSet();
@@ -195,6 +204,32 @@ function configureMarked() {
     },
     renderer: {
       html({ text }) { return escapeAttr(text); },
+      // (TPT9411) Attachments read the same in every read-only view (attachment-markup.js): an
+      // image is a block on lines of its own, an uploaded file or project artifact an inline chip
+      // with its name, both at the same-origin address. The URL decides which one a reference is,
+      // whether it was written as an image or as a link; other links keep marked's own markup.
+      image(token) {
+        const alt = token.tokens ? this.parser.parseInline(token.tokens, this.parser.textRenderer) : token.text;
+        const attachment = attachmentFromUrl(token.href);
+        if (attachment && attachment.kind === 'file') {
+          return fileChipHtml({ href: attachment.href, name: alt, title: token.title || alt, artifact: attachment.artifact });
+        }
+        const src = attachment ? attachment.src : cleanMarkdownUrl(token.href);
+        if (src === null) return escapeHtml(alt);
+        return imageBlockHtml({ src, alt, title: token.title || '' });
+      },
+      link(token) {
+        const attachment = attachmentFromUrl(token.href);
+        if (!attachment) return false;
+        const text = this.parser.parseInline(token.tokens, this.parser.textRenderer);
+        if (attachment.kind === 'image') return imageBlockHtml({ src: attachment.src, alt: text, title: token.title || '' });
+        return fileChipHtml({
+          href: attachment.href,
+          nameHtml: this.parser.parseInline(token.tokens),
+          title: token.title || text,
+          artifact: attachment.artifact,
+        });
+      },
       text(token) {
         if (token.type !== 'text' || token.tokens || linkTextTokens.has(token)) return false;
         const source = token.text;
@@ -245,19 +280,12 @@ export function renderMarkdown(text, opts) {
   }
   try {
     configureMarked();
-    let html = marked.parse(text, { breaks: true, gfm: true });
-    html = html.replace(
-      /\bsrc="(?:https?:\/\/[^/"?#\s]+)?\/api\/projects\/(\d+)\/images\/(\d+)(?:[?#][^"]*)?"/gi,
-      'src="/api/images/$1/$2"'
-    );
-    // (C1246) task_files download links — same absolute→same-origin-proxy rewrite as images
-    // above, plus a marker class so the delegated click handler (file-attach.js
-    // ensureFileLinkHandler) can route the click through electronAPI.openExternal instead of
-    // letting an in-app anchor click navigate the Electron renderer away from the app.
-    html = html.replace(
-      /\bhref="(?:https?:\/\/[^/"?#\s]+)?\/api\/projects\/(\d+)\/files\/(\d+)(?:\?[^"#]*)?(#L[1-9]\d*)?(?:#[^"]*)?"/gi,
-      'class="file-attachment-link" href="/api/files/$1/$2$3"'
-    );
+    // Uploaded images and files already point at the same-origin proxies (/api/images/…,
+    // /api/files/…): the image and link renderers above rewrite them. A file chip carries the
+    // `file-attachment-link` class, so the delegated click handler (file-attach.js
+    // ensureFileLinkHandler) routes the click through electronAPI.openExternal instead of letting
+    // an in-app anchor click navigate the Electron renderer away from the app (C1246).
+    let html = tidyImageBlocks(marked.parse(text, { breaks: true, gfm: true }));
     html = html.replace(
       /<!-- trello:start -->([\s\S]*?)<!-- trello:end -->/g,
       '<div class="trello-appendix">$1</div>'

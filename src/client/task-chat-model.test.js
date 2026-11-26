@@ -597,34 +597,43 @@ test('shortToolName: strips the mcp server prefix', () => {
 const IMG = 'http://127.0.0.1:4454/api/projects/2/images/41';
 const PDF = 'https://web.tipatask.com/api/projects/2/files/7';
 
-test('(TPT9279) userMessageParts: an image stays where it was inserted, between the text around it', () => {
-  const image = { kind: 'image', name: 'img', src: '/api/images/2/41', href: '/api/images/2/41' };
-  assert.deepEqual(m.userMessageParts(`Look at this![img](${IMG}) and tell me`), {
-    parts: [{ kind: 'text', text: 'Look at this' }, image, { kind: 'text', text: ' and tell me' }],
-    files: [],
-  });
+test('(TPT9411) userMessageParts: every image and file stays where it was inserted', () => {
+  assert.deepEqual(m.userMessageParts(`Look at this ![img](${IMG}) and [spec.pdf](${PDF}) here`), [
+    { kind: 'text', text: 'Look at this' },
+    { kind: 'image', name: 'img', src: '/api/images/2/41' },
+    { kind: 'text', text: 'and ' },
+    { kind: 'file', name: 'spec.pdf', href: '/api/files/2/7', artifact: false },
+    { kind: 'text', text: ' here' },
+  ]);
   // Two images in a row, one opening the message: each in place, nothing merged or dropped.
-  assert.deepEqual(m.userMessageParts(`![img](${IMG})![shot](/api/projects/3/images/9)\nwhy?`).parts, [
-    image,
-    { kind: 'image', name: 'shot', src: '/api/images/3/9', href: '/api/images/3/9' },
-    { kind: 'text', text: '\nwhy?' },
+  assert.deepEqual(m.userMessageParts(`![img](${IMG})![shot](/api/projects/3/images/9)\nwhy?`), [
+    { kind: 'image', name: 'img', src: '/api/images/2/41' },
+    { kind: 'image', name: 'shot', src: '/api/images/3/9' },
+    { kind: 'text', text: 'why?' },
+  ]);
+  // A link to an uploaded image is an image; image syntax naming an uploaded file is a file. A
+  // line anchor stays on the file's address, an artifact revision is marked, `\]` escapes read.
+  assert.deepEqual(m.userMessageParts('[chart](/api/images/2/5) ![a.pdf](/api/projects/2/files/8#L3) [r \\[1\\] · r2](/api/projects/2/files/artifacts/4/revisions/2/content)'), [
+    { kind: 'image', name: 'chart', src: '/api/images/2/5' },
+    { kind: 'file', name: 'a.pdf', href: '/api/files/2/8#L3', artifact: false },
+    { kind: 'text', text: ' ' },
+    { kind: 'file', name: 'r [1] · r2', href: '/api/projects/2/files/artifacts/4/revisions/2/content', artifact: true },
   ]);
 });
 
-test('(TPT9279) userMessageParts: file refs leave the text for the chips, the gaps they leave tidied', () => {
-  const { parts, files } = m.userMessageParts(`one\n\n![img](${IMG})\n\n\ntwo   \n[spec.pdf](${PDF})`);
-  assert.deepEqual(parts.map(p => (p.kind === 'text' ? p.text : p.src)), ['one\n\n', '/api/images/2/41', '\n\ntwo']);
-  assert.deepEqual(files, [{ kind: 'file', name: 'spec.pdf', href: '/api/files/2/7' }]);
-  // Without a file ref the text is left exactly as it was.
-  assert.deepEqual(m.userMessageParts(`a  \n\n\n![img](${IMG})`).parts[0], { kind: 'text', text: 'a  \n\n\n' });
+test('(TPT9411) userMessageParts: an image takes the blanks and line breaks next to it; a file keeps them', () => {
+  const parts = m.userMessageParts(`one\n\n![img](${IMG})\n\n\ntwo   \n[spec.pdf](${PDF})\nthree`);
+  assert.deepEqual(parts.map(p => (p.kind === 'text' ? p.text : p.kind)), ['one', 'image', 'two   \n', 'file', '\nthree']);
+  // Text that held nothing but the blanks around an image is gone.
+  assert.deepEqual(m.userMessageParts(`a  \n\n\n![img](${IMG})  \n `).map(p => p.kind), ['text', 'image']);
 });
 
 test('(TPT9279) userMessageParts: other links and an uploading blob stay text; no text gives no parts', () => {
   const plain = 'see [docs](https://example.com/api/projects/x) and ![img](blob:http://x/1)';
-  assert.deepEqual(m.userMessageParts(plain), { parts: [{ kind: 'text', text: plain }], files: [] });
-  assert.deepEqual(m.userMessageParts('no refs'), { parts: [{ kind: 'text', text: 'no refs' }], files: [] });
-  assert.deepEqual(m.userMessageParts(null), { parts: [], files: [] });
-  assert.deepEqual(m.userMessageParts(''), { parts: [], files: [] });
+  assert.deepEqual(m.userMessageParts(plain), [{ kind: 'text', text: plain }]);
+  assert.deepEqual(m.userMessageParts('no refs'), [{ kind: 'text', text: 'no refs' }]);
+  assert.deepEqual(m.userMessageParts(null), []);
+  assert.deepEqual(m.userMessageParts(''), []);
 });
 
 // The text row of a userMessageHtml() render, as [node kind, content] pairs in document order.
@@ -632,57 +641,65 @@ function userTextNodes(html) {
   const doc = new Window().document;
   doc.body.innerHTML = html;
   const row = doc.querySelector('.task-chat-user-text');
-  return { doc, row, nodes: row ? [...row.childNodes].map(n => (n.nodeType === 3 ? ['text', n.textContent] : [n.className, n.querySelector('img')?.getAttribute('src')])) : [] };
+  const describe = (n) => {
+    if (n.nodeType === 3) return ['text', n.textContent];
+    if (n.classList.contains('md-image')) return ['image', n.querySelector('img').getAttribute('src')];
+    return [n.className, n.getAttribute('href')];
+  };
+  return { doc, row, nodes: row ? [...row.childNodes].map(describe) : [] };
 }
 
-test('(TPT9279) userMessageHtml: text, image, text render in that order, the image an inline link to the proxy', () => {
+test('(TPT9411) userMessageHtml: one image and one file show inline — the image a block of its own lines, the file a chip in the text', () => {
   const tr = key => LOCALES.en[key] || key;
-  const { doc, nodes } = userTextNodes(m.userMessageHtml(`Before ![img](${IMG}) after`, { t: tr }));
+  const { doc, nodes } = userTextNodes(m.userMessageHtml(`Before ![img](${IMG}) after [spec.pdf](${PDF}) end`, { t: tr }));
   assert.deepEqual(nodes, [
-    ['text', 'Before '],
-    ['file-attachment-link task-chat-inline-image', '/api/images/2/41'],
-    ['text', ' after'],
+    ['text', 'Before'],
+    ['image', '/api/images/2/41'],
+    ['text', 'after '],
+    ['file-attachment-link', '/api/files/2/7'],
+    ['text', ' end'],
   ]);
-  const link = doc.querySelector('a.task-chat-inline-image');
-  assert.equal(link.getAttribute('href'), '/api/images/2/41');
-  const img = link.querySelector('img');
-  assert.equal(img.getAttribute('alt'), LOCALES.en['taskChat.embed.image'], 'a pasted image is named plainly');
+  const img = doc.querySelector('.md-image > img');
+  assert.equal(img.getAttribute('alt'), LOCALES.en['embed.image'], 'a pasted image is named plainly');
   assert.equal(img.getAttribute('loading'), 'lazy');
-  assert.equal(link.getAttribute('title'), LOCALES.en['taskChat.embed.image']);
-  assert.equal(doc.querySelector('.task-chat-attachments'), null, 'no strip without a file');
-  // An image's own name is its alt text.
+  const chip = doc.querySelector('a.file-attachment-link');
+  assert.equal(chip.querySelector('.file-attachment-name').textContent, 'spec.pdf');
+  assert.equal(chip.querySelector('.file-attachment-icon').textContent, '', 'the icon is drawn by CSS');
+  assert.equal(chip.getAttribute('title'), 'spec.pdf');
+  assert.equal(chip.hasAttribute('download'), false);
+  // An image's own name is its alt text; a file link with no label gets the strip's plain name.
   assert.equal(userTextNodes(m.userMessageHtml(`![chart.png](${IMG})`)).doc.querySelector('img').getAttribute('alt'), 'chart.png');
+  assert.equal(userTextNodes(m.userMessageHtml(`[](${PDF})`, { t: tr })).doc.querySelector('.file-attachment-name').textContent, LOCALES.en['embed.strip.file']);
 });
 
-test('(TPT9279) userMessageHtml: escaped text with its images inline; file chips stay in the strip below', () => {
-  const tr = key => LOCALES.en[key] || key;
-  const html = m.userMessageHtml(`<b>hi</b>\n![img](${IMG})![x" onerror="alert(1)](${IMG}) [r&d.pdf](${PDF})`, { t: tr });
+test('(TPT9411) userMessageHtml: the same markup rendered Markdown gives descriptions and comments', async () => {
+  const markup = await import('./attachment-markup.js');
+  const html = m.userMessageHtml(`a ![shot](${IMG}) b [spec.pdf](${PDF}) c [s · r2](/api/projects/2/files/artifacts/4/revisions/2/content)`);
+  assert.ok(html.includes(markup.imageBlockHtml({ src: '/api/images/2/41', alt: 'shot' })));
+  assert.ok(html.includes(markup.fileChipHtml({ href: '/api/files/2/7', name: 'spec.pdf' })));
+  assert.ok(html.includes(markup.fileChipHtml({ href: '/api/projects/2/files/artifacts/4/revisions/2/content', name: 's · r2', artifact: true })));
+  assert.match(html, /<a class="file-attachment-link" href="\/api\/projects\/2\/files\/artifacts\/4\/revisions\/2\/content" title="s · r2" download>/,
+    'an artifact downloads in its window');
+});
+
+test('(TPT9279) userMessageHtml: escaped text; names escaped; plain text alone', () => {
+  const html = m.userMessageHtml(`<b>hi</b>\n![x" onerror="alert(1)](${IMG}) [r&d.pdf](${PDF})`);
   const { doc, row, nodes } = userTextNodes(html);
   assert.equal(doc.querySelector('b'), null);
-  assert.deepEqual(nodes.map(([kind]) => kind), ['text', 'file-attachment-link task-chat-inline-image', 'file-attachment-link task-chat-inline-image']);
-  assert.equal(row.textContent, '<b>hi</b>\n');
-  assert.equal(doc.querySelectorAll('img')[1].getAttribute('alt'), 'x" onerror="alert(1)');
-  assert.equal(doc.querySelectorAll('img')[1].getAttribute('onerror'), null);
-  const chips = doc.querySelectorAll('.task-chat-attachments > a');
-  assert.equal(chips.length, 1);
-  assert.ok(chips[0].classList.contains('file-attachment-link') && chips[0].classList.contains('task-chat-attach--file'));
-  assert.equal(chips[0].getAttribute('href'), '/api/files/2/7');
-  assert.equal(chips[0].textContent, 'r&d.pdf');
-  assert.equal(row.nextElementSibling, doc.querySelector('.task-chat-attachments'), 'the strip follows the text');
-});
-
-test('(TPT9279) userMessageHtml: plain text alone; an image-only turn keeps its image in the text row; a file-only turn has none', () => {
+  assert.deepEqual(nodes.map(([kind]) => kind), ['text', 'image', 'file-attachment-link']);
+  assert.equal(row.firstChild.textContent, '<b>hi</b>');
+  assert.equal(doc.querySelector('img').getAttribute('alt'), 'x" onerror="alert(1)');
+  assert.equal(doc.querySelector('img').getAttribute('onerror'), null);
+  assert.equal(doc.querySelector('.file-attachment-name').textContent, 'r&d.pdf');
   assert.equal(m.userMessageHtml('a < b'), '<div class="task-chat-user-text">a &lt; b</div>');
-  assert.match(m.userMessageHtml(`![img](${IMG})`), /^<div class="task-chat-user-text"><a class="file-attachment-link task-chat-inline-image"[^>]*><img [^>]*><\/a><\/div>$/);
-  assert.doesNotMatch(m.userMessageHtml(`[a.txt](${PDF})`), /task-chat-user-text/);
-  assert.equal(m.attachmentsHtml([]), '');
-  assert.equal(m.attachmentsHtml([{ kind: 'image', name: 'img', src: '/x', href: '/x' }]), '', 'images are never chips');
+  assert.equal(m.userMessageHtml(''), '');
+  assert.equal(doc.querySelector('.task-chat-attachments'), null, 'files are no longer a strip below the text');
 });
 
-test('(TPT9279) messageCopyText: a turn drawn with an inline image copies its original references', () => {
+test('(TPT9279) messageCopyText: a turn drawn with its attachments copies its original references', () => {
   const content = `Before ![img](${IMG}) after [spec.pdf](${PDF})`;
   assert.equal(m.messageCopyText({ role: 'user', content }), content);
-  assert.match(m.userMessageHtml(content), /task-chat-inline-image/, 'while the transcript draws it inline');
+  assert.match(m.userMessageHtml(content), /class="md-image"/, 'while the transcript draws the image');
 });
 
 test('stripPendingImageRefs: drops blob placeholders and keeps uploaded refs', () => {

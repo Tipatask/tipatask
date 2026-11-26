@@ -17,7 +17,7 @@ import { renderCard } from './task-card.js';
 import { openTaskEditModal } from './task-edit-modal.js';
 import { attachImagePaste } from './task-board.js';
 import { attachAudioRecorder } from './audio-recorder.js';
-import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu } from './embed-menu.js';
+import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu, renderAttachmentStrip } from './embed-menu.js';
 import { createPreviewDrawer } from './preview-drawer.js';
 import { renderPreview } from './preview-renderers.js';
 import { writeClipboardText } from './clipboard-write.js';
@@ -457,7 +457,7 @@ function renderWindow() {
     </div>`;
   (host || document.body).appendChild(root);
   viewer = createPreviewDrawer(root.querySelector('.task-chat-panel'), {
-    hostClass: 'task-chat-panel--with-drawer', onSelect: scrollToFileLine,
+    hostClass: 'task-chat-panel--with-drawer', onSelect: scrollToFileLine, onLayoutChange: keepTranscriptPosition,
   });
   listEl().addEventListener('click', onFileLinkClick);
 
@@ -548,7 +548,8 @@ function renderWindow() {
 }
 
 function onFileLinkClick(event) {
-  const link = event.target.closest?.('.task-chat-md a[href], .task-chat-msg--user a.file-attachment-link');
+  // A reply's links, and a user turn's file chips and image links (linkTranscriptImages()).
+  const link = event.target.closest?.('.task-chat-md a[href], .task-chat-msg--user a[href]');
   if (!link) return;
   const ref = fileRefFromHref(link.getAttribute('href'));
   if (!ref) return;
@@ -575,6 +576,58 @@ async function loadFilePreview(ref, signal) {
     return { kind: markdown ? 'markdown' : 'text', mime, content: await response.text() };
   }
   return { kind: mime, mime, blob: await response.blob() };
+}
+
+// The drawer docking or leaving switches the panel's layout — the standalone window grows to
+// the whole app window with the chat in a slim column, and back — and the transcript reflows at
+// its new width. A transcript at its end stays at its end; otherwise the line being read stays
+// where it was in the transcript's view. The composer re-measures its text at the new width.
+function keepTranscriptPosition() {
+  const scroller = root && root.querySelector('.task-chat-scroll');
+  if (!scroller) return null;
+  const stick = stickToBottom;
+  const anchor = stick ? null : transcriptAnchor(scroller);
+  return () => {
+    if (!root || !root.contains(scroller)) return;
+    if (!composerHidden) growInput();
+    if (stick) {
+      scrollToBottom(false);
+    } else if (anchor && anchor.el.isConnected) {
+      const r = anchor.el.getBoundingClientRect();
+      // An element cut by the top edge keeps the same share of it above the edge: it has a new
+      // height at the new width, so its top alone would move what is in view.
+      const offset = anchor.offset < 0 ? -anchor.above * r.height : anchor.offset;
+      scroller.scrollTop += r.top - scroller.getBoundingClientRect().top - offset;
+    }
+  };
+}
+
+// What the reader is looking at, and where it sits in the transcript's view: the focused element
+// when it is in the transcript and in view (the file link just clicked), else the innermost
+// in-flow element at the top of the view. `offset` is its top below the view's top edge;
+// `above` is the share of it above that edge when the edge cuts it.
+function transcriptAnchor(scroller) {
+  const list = listEl();
+  if (!list) return null;
+  const view = scroller.getBoundingClientRect();
+  const inView = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.height > 0 && r.bottom > view.top && r.top < view.bottom;
+  };
+  const inFlow = (el) => !/^(absolute|fixed)$/.test(getComputedStyle(el).position);
+  const focused = document.activeElement;
+  let el = focused && focused !== list && list.contains(focused) && inView(focused) ? focused : null;
+  if (!el) {
+    for (let at = list, depth = 0; depth < 8; depth++) {
+      const next = [...at.children].find((child) => inFlow(child) && inView(child));
+      if (!next) break;
+      el = at = next;
+    }
+  }
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  const offset = r.top - view.top;
+  return { el, offset, above: offset < 0 ? -offset / r.height : 0 };
 }
 
 function scrollToFileLine(panel) {
@@ -1128,10 +1181,13 @@ function buildMessageEl(m) {
   } else {
     el.innerHTML = '<div class="task-chat-body"></div>';
     const body = el.querySelector('.task-chat-body');
-    // A user turn shows its images inline, where they were inserted, and its files as chips; a
-    // notice is plain text.
-    if (m.role === 'user') body.innerHTML = userMessageHtml(m.content, { t });
-    else body.textContent = m.content;
+    // A user turn shows each image and file where it was inserted, as descriptions and comments
+    // do: an image on lines of its own, a file as a chip in the text (TPT9411). A notice is plain
+    // text.
+    if (m.role === 'user') {
+      body.innerHTML = userMessageHtml(m.content, { t });
+      linkTranscriptImages(body);
+    } else body.textContent = m.content;
     if (m.retry) {
       const btn = document.createElement('button');
       btn.type = 'button';
@@ -1206,9 +1262,16 @@ function paintBlock(el, sig, html) {
   if (blockSig.get(el) === sig) return;
   blockSig.set(el, sig);
   el.innerHTML = typeof html === 'function' ? html() : html;
+  linkTranscriptImages(el);
+}
+
+// An uploaded image in the transcript, a reply's or a user turn's, opens in the file viewer
+// (onFileLinkClick()): it becomes a link to itself, unless the text already links it.
+function linkTranscriptImages(el) {
   for (const image of el.querySelectorAll('img[src^="/api/images/"]')) {
     if (image.closest('a')) continue;
     const link = document.createElement('a');
+    link.className = 'md-image-link';
     link.href = image.getAttribute('src');
     link.title = image.alt || t('taskChat.embed.image');
     image.replaceWith(link);
@@ -1719,9 +1782,13 @@ function wireAttachments(input) {
 }
 
 // The input's height follows its text (the composer has no resize handle), up to 30% of the window.
+// (TPT9410) So does the attachment strip under it (embed-menu.js): it follows typing by itself,
+// and this brings it up to date after a write with no input event — a restored draft, a send.
 function growInput() {
   const input = root && root.querySelector('.task-chat-input');
-  if (input) autoGrowTextarea(input, Math.round(window.innerHeight * 0.3));
+  if (!input) return;
+  autoGrowTextarea(input, Math.round(window.innerHeight * 0.3));
+  renderAttachmentStrip(input);
 }
 
 // The composer is display: none while the first connect is still deciding between restore and the

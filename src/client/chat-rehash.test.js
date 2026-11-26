@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 import { buildObjectivePrompt, escapeAttr, BLANK_SUBTASK_BRIEF } from './utils.js';
 import { t, tc } from './i18n.js';
+import { userMessageHtml } from './task-chat-model.js';
 
 const source = readFileSync(new URL('./chat-ui.js', import.meta.url), 'utf8');
 const read = name => readFileSync(new URL('./' + name, import.meta.url), 'utf8');
@@ -48,6 +49,8 @@ function chat() {
     effectiveObjectiveModel: () => null,
     // (TPT9007) The real i18n lookups — the composer copy (placeholder, word count) is translated now.
     OBJECTIVE_HISTORY_PAGE_MESSAGES: 20, escapeAttr, t, tc,
+    // (TPT9411) A user bubble's images and files (renderObjectiveContent()).
+    userMessageHtml,
     objectiveIsStreaming: () => false,
     renderComposerHeader: () => '', _buildTabBarInnerHtml: () => '',
     // (TPT9391) The stage line and the empty-state guide have their own tests (objective-stage.test.js).

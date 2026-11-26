@@ -13,4 +13,7 @@ test('task chat images go in at the caret and show inline in the sent and restor
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.match(result.stdout, /TPT9279_INLINE_IMAGES_PASS/);
+  // (TPT9410) The composer's attachment strip follows the draft: a tile while an image uploads, the
+  // same tile once it lands, none after the send.
+  assert.match(result.stdout, /TPT9410_TASK_CHAT_STRIP_PASS/);
 });

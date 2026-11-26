@@ -32,6 +32,7 @@ import { applyTierSelectAll, syncTierSelectAll } from './sprint-selection.js';
 import { cardVariant, cardMaxWidthPx, estimateTextWidth, TITLE_CHAR_PX } from './card-width.js';
 import { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps, taskIndexStatus } from './dependency-status.js';
 import { expandedCardMaxHeight, clampExpandedTop, resolveAnchorTop, shouldRestoreExpansion } from './card-placement.js';
+import { taskEditLocked, taskEditLockText } from './task-edit-rule.js';
 export { isDragStateStale, resolveDropTier, shouldDeferForDrag };
 export { hasUnmetDeps, unmetDependencyKeys, hasTaskSession, startBlockedByDeps };
 
@@ -218,13 +219,50 @@ export function canStartTaskCard(t) {
   return Number(t.assignee) === Number(state.currentUserId);
 }
 
-// (C1407) Is this a teammate's task, opened via the People filter's All-Tasks scope (or
-// subtask drill-down, or — before C1407's board scoping — the API's owner exemption)?
-// Drives the Task Edit Modal's read-only lock (_applyModalLockState(), task-board.js).
-// Same fail-OPEN discipline as canStartTaskCard() above: an unknown current user never
-// locks a task that might actually be the viewer's own.
+// (TPT9417) May this user not change the task? The API's task edit rule answers per task row
+// (can_edit, TPT9415, mapped to `canEdit` by fromApi()) — this replaces the old assignee
+// comparison (C1407), which locked a teammate's task even for its creator, the project owner or
+// a higher role, and locked nothing on the board card or in the bulk bar. Drives the Task Edit
+// modal's read-only lock (_isModalReadOnly(), task-edit-modal.js) and the card's locked status
+// select (renderCard() / refreshCard() below). A task without the flag is not locked
+// (task-edit-rule.js); the API refuses a write the rule forbids either way.
 export function isTaskReadOnly(t) {
-  return t.assignee != null && state.currentUserId != null && Number(t.assignee) !== Number(state.currentUserId);
+  return taskEditLocked(t);
+}
+
+// (TPT9417) The localized reason a read-only task shows on its status controls: the card's select,
+// the To-Do tab's checkbox and drawer select (task-board.js, template.html).
+export function taskEditLockReason(t) {
+  return taskEditLockText(t, state.currentUserId, translate);
+}
+
+// (TPT9417) The card's status select while the task is read-only for this user: disabled, with
+// the localized reason as its card tooltip and accessible description. The card root carries
+// data-edit-locked="1" too, which the bulk bar reads to leave the task out (task-board.js).
+function statusLockAttrs(t) {
+  if (!isTaskReadOnly(t)) return '';
+  const reason = escapeAttr(taskEditLockReason(t));
+  return ` disabled data-tip="${reason}" aria-description="${reason}"`;
+}
+
+// (TPT9417) refreshCard()'s half of statusLockAttrs(): a patch that carries canEdit locks or
+// unlocks the select in place; one without it (a row from an API without the flag, a partial
+// patch) leaves the card as it was.
+function syncStatusLock(card, sel, t) {
+  if (typeof t.canEdit !== 'boolean') return;
+  const locked = isTaskReadOnly(t);
+  if (locked) card.dataset.editLocked = '1';
+  else delete card.dataset.editLocked;
+  if (!sel) return;
+  sel.disabled = locked;
+  if (locked) {
+    const reason = taskEditLockReason(t);
+    sel.setAttribute('data-tip', reason);
+    sel.setAttribute('aria-description', reason);
+  } else {
+    sel.removeAttribute('data-tip');
+    sel.removeAttribute('aria-description');
+  }
 }
 
 // Backward-compatible name used throughout the board. The underlying predicate also
@@ -251,9 +289,43 @@ export function pickFirstStartableChild(children) {
 }
 
 // ── Module-level interaction state ──
+// A card's pending 250ms hover expansion; the entry is deleted when the timer fires or is
+// cancelled, so has(card) says whether one is armed.
 const hoverExpandTimers = new WeakMap();
 let hoverCollapseTimer = null;
 let _titleTooltip = null;
+
+function cancelHoverExpand(card) {
+  clearTimeout(hoverExpandTimers.get(card));
+  hoverExpandTimers.delete(card);
+}
+
+// Closes the hover overlay 200ms after the pointer left it, unless a card cancels the timer first.
+function scheduleHoverCollapse() {
+  clearTimeout(hoverCollapseTimer);
+  hoverCollapseTimer = setTimeout(() => {
+    hoverCollapseTimer = null;
+    if (state.expandedCardMode === 'hover') collapseCard();
+  }, 200);
+}
+
+// (TPT9403) Whether a pointer event on a proposal card is on its foot (Included / Accept /
+// Reject): inside `.preview-card-actions`, or on the card's own box level with or below the
+// foot's top edge — the padding under the buttons and the empty band a taller grid row leaves
+// below them.
+function pointerOnPreviewFoot(card, e) {
+  const foot = card.querySelector(':scope > .preview-card-actions');
+  if (!foot) return false;
+  if (e.target && foot.contains(e.target)) return true;
+  return e.target === card && e.clientY >= foot.getBoundingClientRect().top;
+}
+
+// The original guard: focus in the card (a sprint select, an edited field) holds off its hover
+// expansion. Focus a click left on the foot's own buttons does not.
+function focusHoldsPreviewCard(card) {
+  const active = document.activeElement;
+  return !!active && active.closest('.preview-card') === card && !active.closest('.preview-card-actions');
+}
 
 // ── Drag-to-reorder state ──
 let _isDragging = false;
@@ -762,7 +834,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
     ? (proposal.rootAttrs || '')
     : preview
     ? `data-preview-task="${escapeAttr(t.id)}" data-status="${escapeAttr(t.status)}" data-status-role="${statusRoleToken(t.status)}" data-objective="${t.isObjective ? '1' : ''}"`
-    : `data-id="${escapeAttr(t.id)}" data-status="${t.status}" data-status-role="${statusRoleToken(t.status)}" data-priority="${t.priority ?? ''}" data-sprint-label="${escapeAttr(sprintBadgeLabel)}" data-assignee="${t.assignee ?? ''}" data-agent-assignee="${escapeAttr(t.agentAssignee || '')}" data-pi-model="${escapeAttr(t.piModel || '')}" data-objective="${t.isObjective ? '1' : ''}" data-db-id="${escapeAttr(t.dbId ?? '')}" data-parent-db-id="${escapeAttr(t.parentDbId ?? '')}" data-deps='${JSON.stringify(t.dependencies)}' data-tags='${JSON.stringify(t.tags || [])}'${depsBlocked ? ' data-deps-blocked="1"' : ''}${lockIntent ? ` data-lock-intent="${lockIntent}"` : ''}`;
+    : `data-id="${escapeAttr(t.id)}" data-status="${t.status}" data-status-role="${statusRoleToken(t.status)}" data-priority="${t.priority ?? ''}" data-sprint-label="${escapeAttr(sprintBadgeLabel)}" data-assignee="${t.assignee ?? ''}" data-agent-assignee="${escapeAttr(t.agentAssignee || '')}" data-pi-model="${escapeAttr(t.piModel || '')}" data-objective="${t.isObjective ? '1' : ''}" data-db-id="${escapeAttr(t.dbId ?? '')}" data-parent-db-id="${escapeAttr(t.parentDbId ?? '')}" data-deps='${JSON.stringify(t.dependencies)}' data-tags='${JSON.stringify(t.tags || [])}'${depsBlocked ? ' data-deps-blocked="1"' : ''}${lockIntent ? ` data-lock-intent="${lockIntent}"` : ''}${isTaskReadOnly(t) ? ' data-edit-locked="1"' : ''}`;
   const previewMetaHtml = proposal
     ? `<div class="card-preview-meta">${proposal.metaHtml || ''}</div>`
     : `<div class="card-preview-meta"><span class="status" style="--status-color:${statusColor(t.status)}" data-status-role="${statusRoleToken(t.status)}">${escapeAttr(statusLabel(t.status))}</span>${t.dependencies.length ? `<span class="card-preview-deps" title="Deps: ${escapeAttr(t.dependencies.join(', '))}">Deps: ${dependencyKeysMarkup(t.dependencies)}</span>` : ''}${previewBadges ? `<span class="preview-meta-badges">${previewBadges}</span>` : ''}</div>`;
@@ -783,7 +855,7 @@ export function renderCard(t, { preview = false, proposal = null } = {}) {
         ${preview ? previewMetaHtml : `<div class="task-card-hover-controls">
           <div class="hover-controls-inner">
             <div class="controls-row">
-              <select class="card-status-select card-ctl" style="--status-color:${statusColor(t.status)}" data-task-id="${escapeAttr(t.id)}" data-current="${t.status}">
+              <select class="card-status-select card-ctl" style="--status-color:${statusColor(t.status)}" data-task-id="${escapeAttr(t.id)}" data-current="${t.status}"${statusLockAttrs(t)}>
                 ${statusNames().map(s => `<option value="${s}" ${s === t.status ? 'selected' : ''}>${statusLabel(s)}</option>`).join('')}
               </select>
               ${deviceBadge}${permissionBtn}${discussBtn}
@@ -1836,6 +1908,7 @@ export function refreshCard(t) {
     sel.className = 'card-status-select card-ctl';
     sel.style.setProperty('--status-color', statusColor(t.status));
   }
+  syncStatusLock(card, sel, t); // (TPT9417) the API's can_edit after this change
 
   // title (skip while user has inline-edited the element)
   const titleEl = card.querySelector('.card-title');
@@ -2172,6 +2245,8 @@ export function setupCardInteractions(appEl) {
   });
 
   // ── Hover-controls status select ──
+  // (TPT9417) A read-only task's select is disabled (statusLockAttrs()); a change that still
+  // lands — the select locked by a patch while its list was open — is put back, never confirmed.
   appEl.querySelectorAll('.card-status-select').forEach(sel => {
     sel.addEventListener('change', (e) => {
       const select = e.target;
@@ -2180,6 +2255,7 @@ export function setupCardInteractions(appEl) {
       const next = select.value;
       if (next === prev) return;
       select.value = prev;
+      if (select.disabled) return;
       if (_onShowConfirmModal) _onShowConfirmModal(taskId, prev, next);
     });
   });
@@ -2339,46 +2415,68 @@ export function setupCardInteractions(appEl) {
     let cardPeekTimer = null;
     let cardExpandTimer = null;
 
-    card.addEventListener('mouseenter', () => {
-      if (_isDragging) return;
-      if (!isPreviewCard && !state.selectedCardId) highlightCardAndDeps(card.dataset.id);
-      if (isPreviewCard && document.activeElement && document.activeElement.closest('.preview-card') === card) return;
-      if (isPreviewCard && card.classList.contains('confirmed')) return;
-      if (state.expandedCardMode !== 'pinned') {
+    // Arms this card's hover expansion. Entering a card also keeps an overlay the pointer just
+    // left from closing: the expansion about to start replaces it.
+    const armHoverExpand = () => {
+      clearTimeout(hoverCollapseTimer);
+      hoverCollapseTimer = null;
+      cancelHoverExpand(card);
+      const timer = setTimeout(() => {
+        hoverExpandTimers.delete(card);
+        // (TPT9023) Already open — e.g. re-opened by a board re-render under the pointer, which
+        // fires this mouseenter; expanding again would rewind its description scroll.
+        if (state.expandedCardMode === 'pinned' || card.classList.contains('card-expanded')) return;
+        if (isPreviewCard && card.classList.contains('confirmed')) return; // accepted, fading out
+        expandCard(card, 'hover');
+      }, 250);
+      hoverExpandTimers.set(card, timer);
+    };
+
+    // (TPT9403) A proposal card follows the element under the pointer, on entry and on every
+    // mouseover inside it: its title, description and tags open the overlay, its foot never
+    // does. Opening it from the foot would carry Included / Accept / Reject to the bottom of the
+    // tall overlay, away from the pointer that was about to click them.
+    const previewHoverIntent = (e) => {
+      if (_isDragging || state.expandedCardMode === 'pinned') return;
+      if (card.classList.contains('card-expanded')) {
+        // Back on its own open overlay, foot included: it stays open.
         clearTimeout(hoverCollapseTimer);
         hoverCollapseTimer = null;
-        clearTimeout(hoverExpandTimers.get(card));
-        const timer = setTimeout(() => {
-          // (TPT9023) Already open — e.g. re-opened by a board re-render under the pointer, which
-          // fires this mouseenter; expanding again would rewind its description scroll.
-          if (state.expandedCardMode !== 'pinned' && !card.classList.contains('card-expanded')) {
-            expandCard(card, 'hover');
-          }
-        }, 250);
-        hoverExpandTimers.set(card, timer);
+        return;
       }
-      if (!isPreviewCard) {
-        clearTimeout(cardPeekTimer);
-        clearTimeout(cardExpandTimer);
-        cardPeekTimer = setTimeout(() => {
-          if (state.expandedCardMode !== 'pinned') card.classList.add('card-peek');
-        }, 350);
-        cardExpandTimer = setTimeout(() => {
-          if (state.expandedCardMode !== 'pinned') card.classList.add('card-hover-expanded');
-        }, 800);
+      if (pointerOnPreviewFoot(card, e)) {
+        cancelHoverExpand(card);
+        // An overlay another card left open still closes, as it would have without this card.
+        if (state.expandedCardMode === 'hover' && !hoverCollapseTimer) scheduleHoverCollapse();
+        return;
       }
+      if (focusHoldsPreviewCard(card) || card.classList.contains('confirmed')) return;
+      if (!hoverExpandTimers.has(card)) armHoverExpand();
+    };
+    if (isPreviewCard) card.addEventListener('mouseover', previewHoverIntent);
+
+    card.addEventListener('mouseenter', (e) => {
+      if (_isDragging) return;
+      if (isPreviewCard) {
+        previewHoverIntent(e);
+        return;
+      }
+      if (!state.selectedCardId) highlightCardAndDeps(card.dataset.id);
+      if (state.expandedCardMode !== 'pinned') armHoverExpand();
+      clearTimeout(cardPeekTimer);
+      clearTimeout(cardExpandTimer);
+      cardPeekTimer = setTimeout(() => {
+        if (state.expandedCardMode !== 'pinned') card.classList.add('card-peek');
+      }, 350);
+      cardExpandTimer = setTimeout(() => {
+        if (state.expandedCardMode !== 'pinned') card.classList.add('card-hover-expanded');
+      }, 800);
     });
 
     card.addEventListener('mouseleave', () => {
       if (!isPreviewCard && !state.selectedCardId) clearHighlights();
-      clearTimeout(hoverExpandTimers.get(card));
-      if (state.expandedCardMode === 'hover') {
-        hoverCollapseTimer = setTimeout(() => {
-          if (state.expandedCardMode === 'hover') {
-            collapseCard();
-          }
-        }, 200);
-      }
+      cancelHoverExpand(card);
+      if (state.expandedCardMode === 'hover') scheduleHoverCollapse();
       if (!isPreviewCard) {
         clearTimeout(cardPeekTimer);
         clearTimeout(cardExpandTimer);

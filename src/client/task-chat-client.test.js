@@ -431,48 +431,46 @@ test('chat-ui.js: the objective chat uses the same shared File control', () => {
 
 test('styles.css: attachments and the drop state are styled inside the Task Chat block', () => {
   const block = styles.slice(styles.indexOf('/* ── Task Chat window ──'), styles.indexOf('/* ── end Task Chat window ── */'));
-  for (const sel of ['.task-chat-attachments', '.task-chat-inline-image', '.task-chat-inline-image img', '.task-chat-attach--file', '.task-chat-panel--drop::after', '.task-chat-upload-status']) {
+  for (const sel of ['.task-chat-user-text .md-image', '.task-chat-user-text .md-image img', '.task-chat-panel--drop::after', '.task-chat-upload-status']) {
     assert.ok(block.includes(sel), `styled: ${sel}`);
   }
   assert.ok(!styles.includes('.task-chat-start-embed') && !styles.includes('.task-chat-start-attachments'), 'the start gate has no Embed styles');
-  assert.ok(!styles.includes('.task-chat-attach--image'), 'images are inline, never strip thumbnails');
+  // (TPT9411) A user turn's files are chips in its text, its images blocks of the shared markup:
+  // no strip of chips below the text, no chat-only image or chip classes.
+  for (const gone of ['.task-chat-attachments', '.task-chat-attach', '.task-chat-inline-image']) {
+    assert.ok(!styles.includes(gone), `no longer styled: ${gone}`);
+  }
 });
 
-// (TPT9279) The inline image of a user turn: a bounded thumbnail on the text line, palette tokens
-// only, that a narrow bubble shrinks instead of overflowing.
-test('styles.css: the inline image is bounded, shrinks with the bubble and uses palette tokens only', () => {
+// (TPT9411) A user turn's image is a block of the read-only attachment markup (attachment-markup.js),
+// bounded as a thumbnail: a fixed width bound on the block (a percentage would not cap the bubble's
+// own sizing) and a height bound on the image, smaller on a narrow window or a slim chat column.
+test("(TPT9411) styles.css: a user turn's image is a bounded block thumbnail; images and file chips share one global look", () => {
   const block = styles.slice(styles.indexOf('/* ── Task Chat window ──'), styles.indexOf('/* ── end Task Chat window ── */'));
-  const rule = (sel, from = 0) => {
-    const at = block.indexOf(`${sel} {`, from);
-    assert.ok(at >= 0, `rule: ${sel}`);
-    return block.slice(at, block.indexOf('}', at) + 1);
-  };
-  const link = rule('.task-chat-inline-image');
-  const img = rule('.task-chat-inline-image img');
-  assert.match(link, /display: inline-block;/);
-  assert.match(link, /max-width: \d+px;/, 'a fixed bound: a percentage would not cap the bubble\'s own sizing');
-  assert.match(link, /vertical-align: bottom;/);
-  assert.match(link, /overflow: hidden;/);
-  assert.match(img, /max-width: 100%;/, 'the image follows a link the bubble shrank');
-  assert.match(img, /max-height: \d+px;/);
+  assert.match(block, /\n {2}\.task-chat-user-text \.md-image \{ max-width: 240px; \}/);
+  assert.match(block, /\n {2}\.task-chat-user-text \.md-image img \{ max-height: 160px; \}/);
   const narrow = block.slice(block.indexOf('@media (max-width: 640px)'));
-  assert.match(narrow, /\.task-chat-inline-image \{ max-width: \d+px; \}/);
-  assert.match(narrow, /\.task-chat-inline-image img \{ max-height: \d+px; \}/);
-  // The global .file-attachment-link rule (an inline-flex box with a paperclip ::before) comes
-  // after this block with one class of specificity: the chat's rules must out-rank it, not follow it.
-  const fileLink = styles.search(/^\.file-attachment-link::before \{/m);
-  assert.ok(fileLink > styles.indexOf('/* ── end Task Chat window ── */'), 'the global rule is the later one');
-  assert.match(block, /\n {2}\.task-chat-user-text \.task-chat-inline-image \{\n {4}display: inline-block;/);
-  assert.match(narrow, /\.task-chat-user-text \.task-chat-inline-image \{ max-width: \d+px; \}/);
-  assert.match(narrow, /\.task-chat-user-text \.task-chat-inline-image img \{ max-height: \d+px; \}/);
-  assert.match(block, /\n {2}\.task-chat-msg--user \.file-attachment-link::before \{ content: none; \}/, 'no paperclip on a user turn\'s images and chips');
-  const all = block.match(/\.task-chat-inline-image[^{]*\{[^}]*\}/g).join('\n');
-  assert.doesNotMatch(all, /#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(/i, 'colors come from palette tokens');
-  for (const color of all.match(/(?:border|background|outline)[^:]*:[^;]*;/g)) {
-    if (/\b(?:border|outline):|background:|border-color:/.test(color) && !/\bvar\(--c-/.test(color)) {
-      assert.fail(`palette token expected: ${color}`);
-    }
-  }
+  assert.match(narrow, /\.task-chat-user-text \.md-image \{ max-width: 180px; \}/);
+  assert.match(narrow, /\.task-chat-user-text \.md-image img \{ max-height: 120px; \}/);
+  const column = styles.slice(styles.indexOf('@container task-chat-column (max-width: 36rem) {'));
+  assert.match(column.slice(0, column.indexOf('\n  }')), /\.task-chat-user-text \.md-image \{ max-width: 180px; \}/);
+  // The global rules come after the chat block, so a chip out-ranks `.task-chat-md a` (same
+  // specificity, later) and a reply's or a turn's image takes the shared frame.
+  const shared = styles.indexOf('/* ── Read-only attachments (TPT9411)');
+  assert.ok(shared > styles.indexOf('/* ── end Task Chat window ── */'), 'the shared rules are the later ones');
+  const rule = (sel) => {
+    const at = styles.indexOf(`\n${sel} {`, shared);
+    assert.ok(at >= 0, `rule: ${sel}`);
+    return styles.slice(at, styles.indexOf('}', at) + 1);
+  };
+  assert.match(rule('.md-image'), /display: flex;/, 'an image is a block: it starts on a new line');
+  assert.match(rule('.md-image img'), /max-width: 100%;/);
+  const chip = rule('a.file-attachment-link');
+  assert.match(chip, /display: inline-flex;/, 'a file is a chip in the line of text');
+  assert.match(chip, /white-space: nowrap;/);
+  assert.ok(!/\.file-attachment-link::before/.test(styles), 'no paperclip: the chip draws its own icon');
+  const shapes = styles.slice(shared, styles.indexOf('@media (forced-colors: active)', shared));
+  assert.doesNotMatch(shapes.replace(/url\("data:[^"]*"\)/g, ''), /#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(/i, 'colors come from palette tokens');
 });
 
 test('(TPT539) task-chat.js: the history picker resumes by historyId and never falls back to a fresh chat', () => {

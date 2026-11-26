@@ -188,13 +188,22 @@ test('the width clamps so the transcript keeps its minimum', () => {
   assert.equal(clampDrawerWidth(900, 1000), 1000 - MIN_TRANSCRIPT_WIDTH, 'the transcript keeps its minimum');
   assert.equal(clampDrawerWidth(500, 500), MIN_DRAWER_WIDTH, 'too narrow for both: the drawer keeps its own minimum');
   assert.equal(clampDrawerWidth(700, 0), 700, 'an unmeasured host clamps only to the minimum');
-  assert.equal(clampDrawerWidth(Number.NaN, 2000), DEFAULT_DRAWER_WIDTH);
   assert.equal(clampDrawerWidth(512.6, 2000), 513);
+});
+
+// (TPT9408) No picked width: the drawer fills its host, leaving the chat a slim column.
+test('with no picked width the drawer fills the host but the transcript minimum', () => {
+  assert.equal(clampDrawerWidth(null, 1280), 1280 - MIN_TRANSCRIPT_WIDTH);
+  assert.equal(clampDrawerWidth(null, 2560), 2560 - MIN_TRANSCRIPT_WIDTH);
+  assert.equal(clampDrawerWidth(undefined, 1000), 1000 - MIN_TRANSCRIPT_WIDTH);
+  assert.equal(clampDrawerWidth(Number.NaN, 2000), 2000 - MIN_TRANSCRIPT_WIDTH, 'not a number counts as none');
+  assert.equal(clampDrawerWidth(null, 500), MIN_DRAWER_WIDTH, 'too narrow for both: the drawer keeps its own minimum');
+  assert.equal(clampDrawerWidth(null, 0), DEFAULT_DRAWER_WIDTH, 'an unmeasured host has no room to fill: the default');
 });
 
 test('the width follows the host, a window resize re-clamps it and the picked width is remembered', async () => {
   reset();
-  assert.equal(readStoredDrawerWidth(), DEFAULT_DRAWER_WIDTH, 'nothing stored: the default');
+  assert.equal(readStoredDrawerWidth(), null, 'nothing stored: no picked width');
   localStorage.setItem(PREVIEW_DRAWER_WIDTH_KEY, '900');
   const { host, size } = makeHost(1000);
   const drawer = createPreviewDrawer(host, { hostClass: HOST_CLASS });
@@ -241,7 +250,14 @@ test('the width follows the host, a window resize re-clamps it and the picked wi
   assert.equal(shownWidth(host), `${1600 - MIN_TRANSCRIPT_WIDTH}px`, 'dragging stops at the transcript minimum');
   pointer(handle, 'pointerup', 100);
   assert.equal(document.body.classList.contains('preview-drawer-resizing'), false);
-  assert.equal(localStorage.getItem(PREVIEW_DRAWER_WIDTH_KEY), String(1600 - MIN_TRANSCRIPT_WIDTH));
+  assert.equal(localStorage.getItem(PREVIEW_DRAWER_WIDTH_KEY), null, 'the widest width is remembered as "fill"');
+  size.width = 2000;
+  window.dispatchEvent(new Event('resize'));
+  await frame();
+  assert.equal(shownWidth(host), `${2000 - MIN_TRANSCRIPT_WIDTH}px`, 'so a wider window is filled too');
+  size.width = 1600;
+  window.dispatchEvent(new Event('resize'));
+  await frame();
   pointer(handle, 'pointerdown', 500);
   pointer(handle, 'pointermove', 1500);
   assert.equal(shownWidth(host), `${MIN_DRAWER_WIDTH}px`, 'and at the drawer minimum the other way');
@@ -274,39 +290,152 @@ test('the width follows the host, a window resize re-clamps it and the picked wi
   assert.equal(localStorage.getItem(PREVIEW_DRAWER_WIDTH_KEY), String(MIN_DRAWER_WIDTH + 64));
   key(handle, 'End');
   assert.equal(shownWidth(host), `${1600 - MIN_TRANSCRIPT_WIDTH}px`);
+  assert.equal(localStorage.getItem(PREVIEW_DRAWER_WIDTH_KEY), null, 'End is "fill" again');
   key(handle, 'Home');
   assert.equal(shownWidth(host), `${MIN_DRAWER_WIDTH}px`);
+  assert.equal(localStorage.getItem(PREVIEW_DRAWER_WIDTH_KEY), String(MIN_DRAWER_WIDTH));
   key(handle, 'ArrowRight');
   assert.equal(shownWidth(host), `${MIN_DRAWER_WIDTH}px`, 'never under the minimum');
-  key(handle, 'End');
+  key(handle, 'ArrowLeft', { shiftKey: true });
+  assert.equal(localStorage.getItem(PREVIEW_DRAWER_WIDTH_KEY), String(MIN_DRAWER_WIDTH + 64));
   drawer.destroy();
   assert.equal(shownWidth(host), '', 'a closed drawer leaves no width on the host');
 
-  // The next drawer starts at the remembered width.
+  // The next drawer starts at the remembered width; after End (fill) it fills its own host.
   const { host: next } = makeHost(1600);
   const again = createPreviewDrawer(next);
   again.open({ id: 'x', title: 'X', body: 'x' });
-  assert.equal(shownWidth(next), `${1600 - MIN_TRANSCRIPT_WIDTH}px`);
+  assert.equal(shownWidth(next), `${MIN_DRAWER_WIDTH + 64}px`);
+  key(handleOf(next), 'End');
   again.destroy();
+  const { host: wide } = makeHost(2400);
+  const filling = createPreviewDrawer(wide);
+  filling.open({ id: 'x', title: 'X', body: 'x' });
+  assert.equal(shownWidth(wide), `${2400 - MIN_TRANSCRIPT_WIDTH}px`);
+  filling.destroy();
 
-  // Blocked storage (a private window, cleared site data) still opens at the default width.
+  // A host too narrow for both minimums has one width: it is stored as it is, not as "fill".
+  const { host: narrow } = makeHost(500);
+  const cramped = createPreviewDrawer(narrow);
+  cramped.open({ id: 'n', title: 'N', body: 'n' });
+  assert.equal(shownWidth(narrow), `${MIN_DRAWER_WIDTH}px`);
+  key(handleOf(narrow), 'Home');
+  assert.equal(localStorage.getItem(PREVIEW_DRAWER_WIDTH_KEY), String(MIN_DRAWER_WIDTH));
+  cramped.destroy();
+
+  // Blocked storage (a private window, cleared site data) still opens, filling its host.
   const storage = globalThis.localStorage;
   const blocked = () => { throw new Error('blocked'); };
   Object.defineProperty(globalThis, 'localStorage', {
-    configurable: true, writable: true, value: { getItem: blocked, setItem: blocked },
+    configurable: true, writable: true, value: { getItem: blocked, setItem: blocked, removeItem: blocked },
   });
   try {
-    assert.equal(readStoredDrawerWidth(), DEFAULT_DRAWER_WIDTH);
+    assert.equal(readStoredDrawerWidth(), null);
     const { host: blockedHost } = makeHost(1600);
     const quiet = createPreviewDrawer(blockedHost);
     quiet.open({ id: 'q', title: 'Q', body: 'q' });
-    assert.equal(shownWidth(blockedHost), `${DEFAULT_DRAWER_WIDTH}px`);
-    key(handleOf(blockedHost), 'ArrowLeft');
-    assert.equal(shownWidth(blockedHost), `${DEFAULT_DRAWER_WIDTH + 16}px`, 'resizing works without storage');
+    assert.equal(shownWidth(blockedHost), `${1600 - MIN_TRANSCRIPT_WIDTH}px`);
+    key(handleOf(blockedHost), 'ArrowRight');
+    assert.equal(shownWidth(blockedHost), `${1600 - MIN_TRANSCRIPT_WIDTH - 16}px`, 'resizing works without storage');
+    key(handleOf(blockedHost), 'End');
+    assert.equal(shownWidth(blockedHost), `${1600 - MIN_TRANSCRIPT_WIDTH}px`, 'and back to fill');
     quiet.destroy();
   } finally {
     Object.defineProperty(globalThis, 'localStorage', { configurable: true, writable: true, value: storage });
   }
+});
+
+// (TPT9408) A fresh drawer fills its host — the chat keeps MIN_TRANSCRIPT_WIDTH — and keeps
+// filling it through window and host resizes, down to the drawer's own minimum.
+test('with nothing stored the drawer fills the host and follows its resizes', async () => {
+  reset();
+  const { host, size } = makeHost(1280);
+  const drawer = createPreviewDrawer(host, { hostClass: HOST_CLASS });
+  drawer.open({ id: 'a', title: 'A', body: doc('a') });
+  const handle = handleOf(host);
+  assert.equal(shownWidth(host), `${1280 - MIN_TRANSCRIPT_WIDTH}px`, 'a 1280 px window: 920 px document beside a 360 px chat');
+  assert.equal(handle.getAttribute('aria-valuenow'), String(1280 - MIN_TRANSCRIPT_WIDTH));
+  assert.equal(handle.getAttribute('aria-valuemax'), String(1280 - MIN_TRANSCRIPT_WIDTH));
+  for (const [width, shown] of [[2560, 2560 - MIN_TRANSCRIPT_WIDTH], [1000, 1000 - MIN_TRANSCRIPT_WIDTH], [500, MIN_DRAWER_WIDTH]]) {
+    size.width = width;
+    window.dispatchEvent(new Event('resize'));
+    await frame();
+    assert.equal(shownWidth(host), `${shown}px`, `a ${width} px host`);
+  }
+  size.width = 1600;
+  observers.at(-1).callback([]);
+  await frame();
+  assert.equal(shownWidth(host), `${1600 - MIN_TRANSCRIPT_WIDTH}px`, 'a host resize re-fills it too');
+  assert.equal(localStorage.getItem(PREVIEW_DRAWER_WIDTH_KEY), null, 'filling stores nothing');
+
+  // Closing and reopening fills again, at the host's size then.
+  drawer.close('a');
+  size.width = 1440;
+  drawer.open({ id: 'b', title: 'B', body: doc('b') });
+  assert.equal(shownWidth(host), `${1440 - MIN_TRANSCRIPT_WIDTH}px`);
+  drawer.destroy();
+});
+
+// (TPT9408) The host's layout switches when the drawer docks or leaves: onLayoutChange() runs
+// just before, the function it returns right after (new layout in place) — on the first open and
+// the last close only, never on destroy(), and a failing callback never blocks the drawer.
+test('onLayoutChange brackets the layout switch on the first open and the last close', () => {
+  reset();
+  const { host } = makeHost(1280);
+  const calls = [];
+  const drawer = createPreviewDrawer(host, {
+    hostClass: HOST_CLASS,
+    onLayoutChange() {
+      calls.push(['before', host.classList.contains(HOST_CLASS), !!host.querySelector('.preview-drawer')]);
+      return () => calls.push(['after', host.classList.contains(HOST_CLASS), !!host.querySelector('.preview-drawer'), shownWidth(host)]);
+    },
+  });
+  drawer.open({ id: 'a', title: 'A', body: doc('a') });
+  assert.deepEqual(calls, [['before', false, false], ['after', true, true, `${1280 - MIN_TRANSCRIPT_WIDTH}px`]],
+    'before: the old layout; after: docked, with its width on the host');
+  calls.length = 0;
+  drawer.open({ id: 'b', title: 'B', body: doc('b') });
+  drawer.open({ id: 'a' });
+  drawer.close('b');
+  assert.deepEqual(calls, [], 'tabs coming and going inside an open drawer switch no layout');
+  drawer.close('a');
+  assert.deepEqual(calls, [['before', true, true], ['after', false, false, '']], 'the last close switches back');
+  calls.length = 0;
+  drawer.open({ id: 'c', title: 'C', body: doc('c') });
+  host.querySelector('.preview-drawer-close').click();
+  assert.equal(calls.length, 4, 'the drawer Close switches back too');
+  calls.length = 0;
+  drawer.open({ id: 'd', title: 'D', body: doc('d') });
+  calls.length = 0;
+  drawer.destroy();
+  assert.deepEqual(calls, [], 'destroy(): the host is going away, nothing to keep');
+
+  // A callback that throws, or returns a restorer that throws, never stops the drawer.
+  const errors = [];
+  const consoleError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    const { host: other } = makeHost(1280);
+    let closed = 0;
+    const throwing = createPreviewDrawer(other, { hostClass: HOST_CLASS, onClose: () => { closed++; }, onLayoutChange() { throw new Error('boom'); } });
+    throwing.open({ id: 'x', title: 'X', body: doc('x') });
+    assert.equal(throwing.isOpen(), true);
+    assert.ok(other.classList.contains(HOST_CLASS));
+    throwing.close('x');
+    assert.equal(throwing.isOpen(), false);
+    assert.equal(closed, 1);
+    assert.equal(other.classList.contains(HOST_CLASS), false);
+    const restorerThrows = createPreviewDrawer(other, { hostClass: HOST_CLASS, onLayoutChange: () => () => { throw new Error('late'); } });
+    restorerThrows.open({ id: 'y', title: 'Y', body: doc('y') });
+    assert.equal(restorerThrows.isOpen(), true);
+    restorerThrows.closeAll();
+    assert.equal(restorerThrows.isOpen(), false);
+    throwing.destroy();
+    restorerThrows.destroy();
+  } finally {
+    console.error = consoleError;
+  }
+  assert.equal(errors.length, 4, 'each failure is logged');
 });
 
 test('Escape inside the drawer closes the focused tab before the chat sees the key', () => {
@@ -512,8 +641,20 @@ test('styles.css lays the drawer out beside the chat, and over it at phone width
   assert.match(block('.preview-drawer-panel'), /overflow:\s*auto/, 'each tab body scrolls');
   assert.match(block('.preview-drawer-resize'), /cursor:\s*col-resize/);
   assert.match(block('.task-chat-panel.task-chat-panel--with-drawer'), /display:\s*grid/, 'the chat panel splits');
-  assert.match(block('.task-chat-modal > .task-chat-panel--with-drawer'), /width:\s*min\(1440px/, 'the standalone window widens');
+  // (TPT9408) The standalone window fills the whole app window while a document is open.
+  const full = block('.task-chat-modal > .task-chat-panel--with-drawer');
+  assert.match(full, /width:\s*100%/, 'the standalone window takes the full width');
+  assert.match(full, /height:\s*100%/, 'and the full height');
+  assert.match(full, /border-radius:\s*0/, 'edge to edge: no card corners');
+  assert.doesNotMatch(css, /min\(1440px/, 'no fixed widened window any more');
   assert.match(block('.task-chat-panel--embedded.task-chat-panel--with-drawer'), /grid-template-rows/, 'the workspace pane splits');
+  // The slim column gets the compact composer through a container query on its own width.
+  assert.match(css, /\.task-chat-panel--with-drawer > \.task-chat-scroll,\s*\.task-chat-panel--with-drawer > \.task-chat-footer \{ container: task-chat-column \/ inline-size; \}/);
+  const slim = css.match(/@container task-chat-column \(max-width: 36rem\) \{[^@]*?\n {2}\}/);
+  assert.ok(slim, 'a slim-column block');
+  for (const rule of ['.task-chat-hint { display: none; }', '.task-chat-embed-slot .embed-menu-label { display: none; }', '.task-chat-selector-slot { flex: 1; }']) {
+    assert.ok(slim[0].includes(rule), `slim column: ${rule}`);
+  }
   const phone = css.match(/@media \(max-width: 640px\) \{\s*\.preview-drawer,[^@]*/);
   assert.ok(phone, 'a phone-width block for the drawer');
   assert.match(phone[0], /inset:\s*0/, 'at ≤ 640 px the drawer covers the chat');

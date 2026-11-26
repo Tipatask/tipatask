@@ -270,10 +270,12 @@ function rendererPiModels(cfg) {
 function rendererProjectConfig(cfg = {}) {
   cfg = { ...cfg, ...require('./project-settings-cache').displayPreferences(cfg) };
   const safe = {};
+  // brandColors (TPT9422) is read-only here: the account's mirror of identity.brand_colors,
+  // which the window paints as its accents before the API answers. Never written to config.
   for (const key of [
     'TASK_BACKEND', 'API_BASE_URL', 'API_PROJECT_ID', 'projectName', 'DEVICE_ID',
     'DEVICE_NAME', 'TASK_AGENT', 'LAST_AGENT', 'AVAILABLE_AGENTS', 'CLAUDE_MODEL',
-    'CODEX_MODEL', 'theme', 'language', 'voicePreset', 'voiceLocalModel',
+    'CODEX_MODEL', 'theme', 'language', 'brandColors', 'voicePreset', 'voiceLocalModel',
     'voiceInputDeviceId', 'voiceShortcut', 'voiceMode', 'boardFilters', 'debugPerfLog',
     'MCP_BROWSER_TOOLS',
   ]) {

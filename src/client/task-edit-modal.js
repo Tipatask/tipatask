@@ -10,6 +10,7 @@ import { hasTaskSession } from './dependency-status.js';
 import { escapeAttr, insertAtCursor, setValueKeepingCaret, caretMapper, renderMarkdown, renderSprintCombobox, initSprintCombobox, showToast, showBoardLoader, hideBoardLoader, showActionBanner, hideActionBanner, taskOpenErrorLabel, sprintRecordMax } from './utils.js';
 import { api, isTransportError, errorDetail } from './api-client.js';
 import { isTaskDiscussing, lockIntentOf, lockMessageKey } from './discuss-lock.js';
+import { taskEditLockKey, isTaskEditRefusal } from './task-edit-rule.js';
 import { buildMentionCandidates, highlightMentionsInHtml, AGENT_HANDLES } from './mention-highlight.js';
 import { parseReplyCitation, buildReplyCitation } from './comment-reply.js';
 import { sanitizeMarkdownHtml } from './markdown-sanitize.js';
@@ -26,8 +27,9 @@ import { showActionConfirm } from './action-confirm.js';
 import { buildTaskModeOptions, normalizePermissionMode, effectivePermissionMode, normalizeCowboyScope, cowboyModeOptions } from './permission-mode.js';
 import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
 import { activateDialogFocus } from './dialog-focus.js';
-import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu } from './embed-menu.js';
+import { embedMenuHtml, attachEmbedMenu, attachFileDrop, closeOpenEmbedMenu, renderAttachmentStrip } from './embed-menu.js';
 import { stripPendingImageRefsAt } from './task-chat-model.js';
+import { tidyImageBlocks } from './attachment-markup.js';
 import { isTaskKeyLike } from '../server/task-key-format.js';
 
 let commands;
@@ -500,6 +502,8 @@ function _renderDescriptionHtml(raw) {
 // image until the upload lands. Show the picked image itself instead, dimmed: each placeholder
 // becomes a token while `render` runs, then an <img> of this page's own blob URL (nothing else is
 // let through). replaceModalImageBlobUrl() swaps the real URL in once the board socket answers.
+// (TPT9411) The <img> sits in the image block every rendered image gets (attachment-markup.js), on
+// lines of its own, so it does not jump to a new line when the upload lands.
 const _PENDING_IMAGE_REF_RE = /!\[[^\]\n]*\]\((blob:[^)\s]+)\)/g;
 function _ownBlobUrl(url) {
   try {
@@ -518,9 +522,9 @@ function _withPendingImages(raw, render) {
   });
   let html = render(text);
   blobs.forEach((url, i) => {
-    html = html.split(`TIPATASKPENDINGIMAGE${i}X`).join(`<img class="modal-desc-pending-image" src="${escapeAttr(url)}" alt="">`);
+    html = html.split(`TIPATASKPENDINGIMAGE${i}X`).join(`<span class="md-image"><img class="modal-desc-pending-image" src="${escapeAttr(url)}" alt=""></span>`);
   });
-  return html;
+  return blobs.length ? tidyImageBlocks(html) : html;
 }
 
 // (TPT9337) The end marker of an auto-posted agent exit comment (exit-resolution.js), where it is
@@ -1422,7 +1426,7 @@ function _renderTaskEditModal() {
   const depsHtml = (draft.dependencies || []).map(_renderDepChip).join('');
   const readOnlyBannerHtml = readOnly
     ? `<div class="modal-readonly-banner">${escapeAttr(commands.isTaskReadOnly(draft)
-        ? t('modal.readOnlyAssignee', { name: commands._memberLabelFor(draft.assignee) })
+        ? _editLockBannerText(draft)
         : t('modal.readOnlyDiscuss'))}</div>`
     : '';
 
@@ -1562,7 +1566,11 @@ function _renderTaskEditModal() {
             <div class="comments-list"></div>
             <div class="comment-compose">
               <textarea id="modal-comment-input" class="comment-input" placeholder="${escapeAttr(t('comments.placeholder'))}"></textarea>
-              <button class="comment-submit" type="button">${t('btn.submit')}</button>
+              <div class="comment-compose-actions">
+                <span class="comment-compose-status" role="status" aria-live="polite" hidden></span>
+                ${embedMenuHtml({ title: t('comments.embedTooltip') })}
+                <button class="comment-submit" type="button">${t('btn.submit')}</button>
+              </div>
             </div>
           </div>
         </div>
@@ -1813,10 +1821,20 @@ function _caretOffsetFromClick(evt, rawMarkdown) {
   }
 }
 
-// (TPT179) Single predicate for every read-only lock in the edit modal: a teammate's task
-// (C1407, assignee-derived) OR an explicit callbacks.readOnly opt-in from the opener.
+// (TPT179) Single predicate for every read-only lock in the edit modal: a task this user may not
+// change (commands.isTaskReadOnly — (TPT9417) the API's can_edit, task-edit-rule.js; was an
+// assignee comparison, C1407) OR an explicit callbacks.readOnly opt-in from the opener.
 function _isModalReadOnly(draft) {
   return commands.isTaskReadOnly(draft) || !!_modalState?.callbacks?.readOnly || !!_modalState?.discussLocked;
+}
+
+// (TPT9417) The banner of a task the API's task edit rule makes read-only: another member's task
+// names its assignee and who may change it; a locked task that is unassigned or the user's own can
+// only be locked by a project role that cannot change tasks.
+function _editLockBannerText(draft) {
+  return taskEditLockKey(draft, state.currentUserId) === 'task.editLockedRole'
+    ? t('modal.readOnlyRole')
+    : t('modal.readOnlyAssignee', { name: commands._memberLabelFor(draft.assignee) });
 }
 
 function _applyModalLockState(modal, draft) {
@@ -1921,6 +1939,12 @@ function _isModalDirty() {
 // 403, an auth failure on open — gets `key` ("Save failed", "Comment failed", "Could not open
 // task", …) with errorDetail(err): the server's text without Electron's IPC wrapper.
 function _toastWriteFailure(err, key, opts) {
+  // (TPT9417) The API's task edit rule refused the write (the task changed hands since it opened):
+  // name the rule, not the raw 403.
+  if (isTaskEditRefusal(err)) {
+    showToast(t('task.editLocked'), 'error', opts);
+    return;
+  }
   showToast(t(isTransportError(err) ? 'common.networkError' : key, { msg: errorDetail(err) }), 'error', opts);
 }
 
@@ -2116,6 +2140,9 @@ function _attachModalHandlers(modal) {
   // edited now.
   const editDescription = (evt, { focus = true, caret = null } = {}) => {
     if (!_modalState) return null; // modal torn down mid-flight — draft below would throw
+    // (TPT9411) A link in the rendered description — a file chip, a web link — does what a link
+    // does (file-attach.js downloads a chip); it never also opens the editor.
+    if (evt && evt.target !== descDisplay && evt.target?.closest?.('a[href]')) return null;
     if (isInProgressName(_modalState.draft.status)) return null;
     if (_isModalReadOnly(_modalState.draft)) return null; // (C1470) was CSS-only (.field-locked pointer-events) before
     if (descDisplay.dataset.diffSide === 'old') return null; // defensive — old side never has this listener (selector at top of fn), but never let it click-to-edit if it ever does
@@ -2157,6 +2184,10 @@ function _attachModalHandlers(modal) {
     const micWrap = ta.closest('.audio-rec-wrap');
     // (TPT499) The wrap stands in for the display in .modal-scroll-body's flex column.
     micWrap?.classList.add('modal-desc-edit-wrap');
+    // (TPT9410) The images and files the description references, in a strip under the editor
+    // (embed-menu.js) — inside the wrap, so the height pin below counts it and it leaves with the
+    // editor.
+    const strip = renderAttachmentStrip(ta, { container: micWrap });
     if (micWrap) {
       const overhead = micWrap.getBoundingClientRect().height - ta.getBoundingClientRect().height;
       ta.style.height = Math.max(0, displayHeight - overhead) + 'px';
@@ -2214,12 +2245,13 @@ function _attachModalHandlers(modal) {
         descDisplay.style.display = '';
         wrap.remove();
       }
+      strip?.remove(); // (TPT9410) gone with the wrap already, unless the editor had none
       _applyScrollRatio(descDisplay, editorScrollRatio);
       _syncDescCollapse(modal); // (TPT9340) back to the clamp on Comments / Notifications
       upd();
       if (restoreDisplayFocus) descDisplay.focus();
     };
-    ta.addEventListener('blur', () => {
+    ta.addEventListener('blur', (e) => {
       if (closed || _modalState !== st || !ta.isConnected) return;
       st.draft.description = ta.value;
       // (C1212) mic click blurs field (mousedown preventDefault stops focus-steal, but
@@ -2228,7 +2260,21 @@ function _attachModalHandlers(modal) {
       // the native file dialog the Embed control opens: some engines blur the field while it is
       // up, and the picked file goes in at this editor's caret.
       if (micHandle?.isActive || st._descPickerOpen) { upd(); return; }
+      // (TPT9410) Tab onto a tile's × in the attachment strip keeps the editor open.
+      if (e.relatedTarget && strip?.contains(e.relatedTarget)) { upd(); return; }
       editor.close();
+    });
+    // (TPT9410) Leaving the strip for anywhere but the editor closes it as a blur would; Escape
+    // there closes it as Escape in the editor does.
+    strip?.addEventListener('focusout', (e) => {
+      if (closed || _modalState !== st || !ta.isConnected) return;
+      if (e.relatedTarget && (e.relatedTarget === ta || strip.contains(e.relatedTarget))) return;
+      if (micHandle?.isActive || st._descPickerOpen) return;
+      editor.close();
+    });
+    strip?.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault(); e.stopPropagation(); restoreDisplayFocus = true; editor.close();
     });
     ta.addEventListener('keydown', (e) => {
       // stopPropagation: without it, Escape also reaches template.html's document-level
@@ -2245,6 +2291,8 @@ function _attachModalHandlers(modal) {
   descDisplay.addEventListener('click', editDescription);
   descDisplay.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
+    // (TPT9411) Enter on a focused link follows it: the editor opens from the description itself.
+    if (e.target !== descDisplay && e.target?.closest?.('a[href]')) return;
     e.preventDefault();
     editDescription(e);
   });
@@ -2512,6 +2560,9 @@ function _attachModalHandlers(modal) {
         }
       }
     }
+    // (TPT9417) A save can change who may edit the task (a reassignment): the draft takes the API's
+    // fresh can_edit before the card patch below, so the card's status select follows it.
+    if (typeof updateResult?.canEdit === 'boolean') draft.canEdit = updateResult.canEdit;
     // Patch card in-place so title/description/tags/status update immediately.
     // Required in Electron mode where the board WS is not connected and
     // task:updated broadcasts never reach the renderer. Safe no-op when the
@@ -2674,21 +2725,31 @@ function _descUploadsPending(st) {
 // `session` until it settles — an image from detection to the board socket's answer, a file until
 // its upload promise settles. A failed image toasts like the board's own path does.
 function _descUploadOptions(st, session) {
+  return _countedUploadOptions(st, session, {
+    onChange: () => _syncDescUploadStatus(st, session),
+    onIdle: () => _dropPendingImageRefs(st, session),
+  });
+}
+
+// (TPT9410) The counting behind _descUploadOptions(), shared with the comment composer:
+// `onChange` after every start and settle, `onIdle` once nothing is pending any more (before
+// `session.waiters` resolve).
+function _countedUploadOptions(st, session, { onChange, onIdle }) {
   const taskKey = _uploadTaskKey(st);
   const begin = () => {
     const gen = session.gen || 0;
     session.pending += 1;
-    _syncDescUploadStatus(st, session);
+    onChange();
     let done = false;
     return () => {
       if (done || (session.gen || 0) !== gen) return; // abandoned by a save that gave up waiting
       done = true;
       session.pending -= 1;
       if (!session.pending) {
-        _dropPendingImageRefs(st, session);
+        onIdle();
         session.waiters.splice(0).forEach(resolve => resolve(true));
       }
-      _syncDescUploadStatus(st, session);
+      onChange();
     };
   };
   const settleImage = (file) => {
@@ -2838,42 +2899,40 @@ function _syncDescEmbed(modal) {
   row.hidden = locked || (tab !== 'general' && !editing);
 }
 
-async function _uploadModalImage(file, taskKey = null) {
-  const data = await new Promise(res => {
-    const r = new FileReader();
-    r.onload = e => res(e.target.result.split(',')[1]);
-    r.readAsDataURL(file);
+// (TPT9410) The comment composer takes attachments the way the description does: the File
+// control under it (embed-menu.js, its menu on <body> like the description's), files dropped on it
+// and images pasted into it, uploaded through the shared paths and linked to the task, with the
+// strip of what the comment references under it. Submit waits while an upload runs — a comment
+// never posts an image's `blob:` placeholder — and a failed image's placeholder goes once nothing
+// is pending, the caret staying on its text.
+function _attachCommentUploads(modal, textarea, onChange) {
+  const st = _modalState;
+  const session = { pending: 0, waiters: [], images: new Map() };
+  const target = () => (_modalState === st && textarea.isConnected ? textarea : null);
+  const uploads = _countedUploadOptions(st, session, {
+    onChange: () => {
+      const status = modal.querySelector('.comment-compose-status');
+      if (status) {
+        status.hidden = !session.pending;
+        status.textContent = session.pending ? t('modal.embedUploading') : '';
+      }
+      onChange();
+    },
+    onIdle: () => {
+      if (!target()) return;
+      const { text, offsets } = stripPendingImageRefsAt(textarea.value, [textarea.selectionStart, textarea.selectionEnd]);
+      if (text === textarea.value) return;
+      textarea.value = text;
+      textarea.setSelectionRange(offsets[0], offsets[1]);
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    },
   });
-  return api.images.upload(file.name, file.type, data, taskKey); // { id, url }
-}
-
-function _insertMarkdownImage(textarea, url, name) {
-  insertAtCursor(textarea, `![${name}](${url})`);
-}
-
-function _attachImageHandlers(textarea) {
-  const taskKey = _modalState?.taskId || null;
-  commands.attachImagePaste(textarea, null, { taskKey });
-  const handle = async (file) => {
-    try {
-      const { url } = await _uploadModalImage(file, taskKey);
-      _insertMarkdownImage(textarea, url, file.name);
-    } catch (err) {
-      showToast(t('common.errImageUpload', { msg: err.message }), 'error');
-    }
-  };
-  textarea.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    textarea.classList.add('img-drop-active');
-  });
-  textarea.addEventListener('dragleave', () => textarea.classList.remove('img-drop-active'));
-  textarea.addEventListener('drop', (e) => {
-    e.preventDefault();
-    textarea.classList.remove('img-drop-active');
-    Array.from(e.dataTransfer.files || [])
-      .filter(f => f.type.startsWith('image/'))
-      .forEach(handle);
-  });
+  commands.attachImagePaste(textarea, null, uploads.imageOpts);
+  const embedWrap = modal.querySelector('.comment-compose .embed-menu-wrap');
+  if (embedWrap) attachEmbedMenu(embedWrap, target, { ...uploads, portal: true, keepFocus: true });
+  attachFileDrop(textarea, target, uploads);
+  renderAttachmentStrip(textarea);
+  return session;
 }
 
 // (TPT17) Subscribed checkbox — toggling calls PUT .../subscription, reverts + toasts on
@@ -2905,15 +2964,20 @@ function _attachModalCommentHandlers(modal) {
   const submitBtn = modal.querySelector('.comment-submit');
   if (!textarea || !submitBtn) return;
 
-  _attachImageHandlers(textarea);
+  // (TPT9410) Submit is off while a comment posts or an attachment still uploads.
+  let posting = false;
+  let uploads = null;
+  const syncSubmit = () => { submitBtn.disabled = posting || (uploads?.pending || 0) > 0; };
+  uploads = _attachCommentUploads(modal, textarea, syncSubmit);
   attachAudioRecorder(textarea); // (C1212) mic → dictate into comment box via createLiveInserter
   _attachMentionTypeahead(textarea);
 
   submitBtn.addEventListener('click', async () => {
-    if (!_modalState) return;
+    if (!_modalState || uploads.pending > 0) return;
     const content = textarea.value.trim();
     if (!content) return;
-    submitBtn.disabled = true;
+    posting = true;
+    syncSubmit();
     try {
       const comment = await api.tasks.comments.create(_modalState.taskId, content);
       _modalState.comments = _sortModalComments([comment, ...(_modalState.comments || [])]);
@@ -2921,12 +2985,14 @@ function _attachModalCommentHandlers(modal) {
       _modalState.commentsLoading = false;
       _modalState.commentsError = '';
       textarea.value = '';
+      renderAttachmentStrip(textarea); // (TPT9410) the posted comment's tiles go with its text
       _removeMentionDropdown();
       _renderModalComments(modal);
     } catch (err) {
       _toastWriteFailure(err, 'modal.errCommentPost');
     } finally {
-      submitBtn.disabled = false;
+      posting = false;
+      syncSubmit();
     }
   });
 }
@@ -3032,6 +3098,7 @@ function replyToComment(modal, item) {
     text: _cleanCommentMarkdown(comment.content),
   });
   textarea.value = _replyComposerText(textarea.value, citation);
+  renderAttachmentStrip(textarea); // (TPT9410) a quoted comment's images and files show in the strip
   _removeMentionDropdown();
   textarea.focus();
   textarea.setSelectionRange(textarea.value.length, textarea.value.length);

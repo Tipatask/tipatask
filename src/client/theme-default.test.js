@@ -329,7 +329,6 @@ const PRIMARY_BORDER_ICON_SELECTORS = [
   '.audio-rec-btn.voice-btn-emphasis',
   '.audio-rec-btn.voice-btn-emphasis:disabled:hover',
   '.task-chat-start-mark',
-  '.task-chat-attach-icon',
   '.chat-console-toggle:hover',
   '.task-modal-empty-mark',
 ];

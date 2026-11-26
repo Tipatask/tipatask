@@ -21,9 +21,14 @@
 //   permissionMode    'plan' | 'auto' | 'bypass' | null (Project Default clears the override)
 //   cowboyScope       'disabled' | 'related' | 'project'; (TPT9322) only beside permissionMode
 //                     'bypass', so Apply always saves it together with Bypass
+//
+// (TPT9417) The record applies only to the selected tasks this user may change: a task whose
+// canEdit (the API's can_edit, task-edit-rule.js) is false gets no PATCH, and Apply reports it as
+// skipped — splitBulkEditable(), bulkApplyWrites().
 
 import { normalizeCowboyScope, effectivePermissionMode } from './permission-mode.js';
 import { EFFORT_LEVELS } from './constants.js';
+import { taskEditLocked } from './task-edit-rule.js';
 
 export const BULK_CHANGE_FIELDS = Object.freeze(['priority', 'status', 'agent', 'assignee', 'permissionMode', 'cowboyScope']);
 
@@ -204,4 +209,33 @@ export function bulkPatchBody(changes, { priority, reassign = true, model = chan
     if (changes.agent === 'claude') body.claude_design_mode = changes.claudeDesignMode === true;
   }
   return body;
+}
+
+// (TPT9417) The selected tasks split by the API's task edit rule, ids in selection order:
+// `viewOnly` holds every task whose canEdit is false (taskEditLocked()) — another member's task of
+// the same or a higher role, or any task when the user's role cannot write — and `editable` the
+// rest, a task without the flag (an API from before TPT9415) included. `tasks` are `{ id, canEdit }`
+// rows; one without an id is dropped.
+export function splitBulkEditable(tasks) {
+  const editable = [];
+  const viewOnly = [];
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    if (task?.id == null || task.id === '') continue;
+    (taskEditLocked(task) ? viewOnly : editable).push(task.id);
+  }
+  return { editable, viewOnly };
+}
+
+// (TPT9417) Apply's writes: one `{ id, body }` per editable selected task with something to save
+// (bulkPatchBody()), never one for a view-only task, which comes back in `skipped` for the bar to
+// report. `reassignable` is the Set of ids whose agent may change (not in progress or canceled);
+// without one, every task may.
+export function bulkApplyWrites(changes, tasks, { priority, reassignable = null, model = changes?.model } = {}) {
+  const { editable, viewOnly } = splitBulkEditable(tasks);
+  const writes = [];
+  for (const id of editable) {
+    const body = bulkPatchBody(changes, { priority, reassign: !reassignable || reassignable.has(id), model });
+    if (Object.keys(body).length) writes.push({ id, body });
+  }
+  return { writes, skipped: viewOnly };
 }

@@ -3,9 +3,11 @@
 // scripts/draft-release.js against a stand-in GitHub API on a loopback port. The stand-in keeps
 // the behaviors the script exists for: several drafts may share one tag, a release's own
 // `assets` array hides partial (`starter`) uploads that the assets listing shows, and an
-// upload under a name that already has a record is refused with 422 already_exists. Two more
-// behaviors cover the worst case, whether or not GitHub shows them: a `starter` record refuses
-// its name too, and a request can be answered 5xx although its effect was stored.
+// upload under a name that already has a record is refused with 422 already_exists, and a draft
+// updated without `tag_name` loses its tag (the field becomes the `untagged-…` of its address)
+// while naming the tag moves the draft to a new address. Two more behaviors cover the worst
+// case, whether or not GitHub shows them: a `starter` record refuses its name too, and a request
+// can be answered 5xx although its effect was stored.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -52,12 +54,13 @@ async function startGithub(t) {
     name: release.name,
     body: release.body,
     draft: release.draft,
-    html_url: `https://github.test/${REPO}/releases/tag/${release.draft ? `untagged-${release.id}` : release.tag_name}`,
+    html_url: `https://github.test/${REPO}/releases/tag/${release.draft ? release.slug : release.tag_name}`,
     upload_url: `${base}/uploads/repos/${REPO}/releases/${release.id}/assets{?name,label}`,
     assets: release.assets.filter((record) => record.state === 'uploaded').map(asset),
   });
   const addRelease = (fields) => {
-    const release = { id: state.nextId += 1, tag_name: TAG, name: TAG, body: 'old body', draft: true, assets: [], ...fields };
+    const id = state.nextId += 1;
+    const release = { id, slug: `untagged-${id}`, moves: 0, tag_name: TAG, name: TAG, body: 'old body', draft: true, assets: [], ...fields };
     state.releases.push(release);
     return release;
   };
@@ -92,7 +95,8 @@ async function startGithub(t) {
     const api = url.pathname.startsWith(`/repos/${REPO}/`) ? url.pathname.slice(`/repos/${REPO}`.length) : null;
     const route = upload ? 'UPLOAD' : `${req.method} ${String(api).replace(/\d+/g, ':id')}`;
     const uploadName = upload ? url.searchParams.get('name') : null;
-    state.calls.push({ route, name: uploadName, query: url.search, agent: req.headers['user-agent'], contentType: req.headers['content-type'] });
+    const call = { route, name: uploadName, query: url.search, agent: req.headers['user-agent'], contentType: req.headers['content-type'] };
+    state.calls.push(call);
 
     if (req.headers.authorization !== `Bearer ${TOKEN}`) {
       await readBody(req);
@@ -128,9 +132,10 @@ async function startGithub(t) {
     }
 
     const body = await readBody(req);
+    const json = body.length ? JSON.parse(body.toString('utf8')) : {};
+    call.json = json;
     const fault = takeFault(route);
     if (fault && !fault.commit) return send(res, fault.status, fault.body || '', fault.headers);
-    const json = body.length ? JSON.parse(body.toString('utf8')) : {};
     const id = Number((api || '').match(/\d+/) || 0);
     const release = state.releases.find((candidate) => candidate.id === id);
 
@@ -141,6 +146,12 @@ async function startGithub(t) {
     }
     if (route === 'PATCH /releases/:id' && release) {
       Object.assign(release, json);
+      if (release.draft) {
+        // As GitHub does: a draft keeps its tag only when the update names it, and naming it
+        // moves the draft to a new address.
+        if (json.tag_name === undefined) release.tag_name = release.slug;
+        else release.slug = `untagged-${release.id}-${release.moves += 1}`;
+      }
       return send(res, 200, view(release));
     }
     if (route === 'GET /releases/:id/assets' && release) return send(res, 200, page(release.assets.map(asset), url));
@@ -280,11 +291,46 @@ test('a re-run reuses the draft, keeps identical assets and rewrites a changed b
   assert.equal(result.bodyUpdated, true);
   assert.equal(github.drafts()[0].body, 'edited notes\n');
 
+  // GitHub takes the tag from a draft updated without it: the rewrite named the tag, so the
+  // draft is still the tag's release, and the result carries the address the update moved it to.
+  const [release] = github.state.releases;
+  assert.equal(release.tag_name, TAG);
+  assert.equal(result.release.tag_name, TAG);
+  assert.equal(result.release.html_url, `https://github.test/${REPO}/releases/tag/untagged-${release.id}-1`);
+
   // Same notes, apart from the line endings the web editor saves: no rewrite.
   github.drafts()[0].body = 'edited notes\r\n';
   const again = await (await publish(github, dir, { body: 'edited notes\n' })).run;
   assert.equal(again.bodyUpdated, false);
   assert.equal(github.count('PATCH /releases/:id'), 1);
+  assert.deepEqual([again.created, again.release.id], [false, release.id], 'the run after the rewrite found the same draft');
+  assert.equal(github.state.releases.length, 1);
+});
+
+test('a draft updated without its tag is no longer the tag\'s release, so the rewrite must name the tag', async (t) => {
+  const github = await startGithub(t);
+  const release = github.addRelease({});
+  const client = createGithub({ token: TOKEN, repo: REPO, apiUrl: github.url, retryDelays: [] });
+
+  // The stand-in follows GitHub here: this is the request the script must never send.
+  const dropped = await client.updateRelease(release.id, { body: 'only the body' });
+  assert.equal(dropped.tag_name, `untagged-${release.id}`);
+  assert.equal(github.drafts().length, 0, 'a lookup by tag misses the draft');
+  const restored = await client.updateRelease(release.id, { tag_name: TAG });
+  assert.deepEqual([restored.tag_name, restored.body], [TAG, 'only the body']);
+  assert.notEqual(restored.html_url, dropped.html_url, 'naming the tag moves the draft');
+
+  // An answer that does not carry the tag fails the run before anything is uploaded.
+  github.fail({ route: 'PATCH /releases/:id', status: 200, body: JSON.stringify({ id: release.id, tag_name: `untagged-${release.id}`, draft: true }) });
+  const { run } = await publish(github, makeDir(t, { SHA256SUMS: 'sums\n' }));
+  await assert.rejects(run, (error) => {
+    assert.equal(error.message, `updating draft release ${release.id} did not keep its tag ${TAG}: GitHub answered tag_name "untagged-${release.id}" for release ${release.id}`);
+    assert.ok(!error.transient);
+    return true;
+  });
+  assert.equal(github.count('UPLOAD'), 0);
+  const sent = github.state.calls.filter((call) => call.route === 'PATCH /releases/:id').map((call) => call.json);
+  assert.deepEqual(sent[sent.length - 1], { body: 'release notes\n', tag_name: TAG }, 'the rewrite sends the tag with the body');
 });
 
 test('partial uploads and assets with other content are deleted and uploaded again', async (t) => {

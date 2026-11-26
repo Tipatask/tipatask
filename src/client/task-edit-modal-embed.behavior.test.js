@@ -17,6 +17,9 @@ test('Task Edit description: Embed, drop and paste insert at the caret, link to 
   assert.match(result.stdout, /TPT9346_DESCRIPTION_EMBED_PASS/);
   // (TPT9361) Several images and files in one pick: one reference per line, all linked to the task.
   assert.match(result.stdout, /TPT9361_MULTI_PICK_PASS/);
+  // (TPT9410) The attachment strip under the description editor and the comment composer, and the
+  // comment composer's File control, drop and paste.
+  assert.match(result.stdout, /TPT9410_ATTACHMENT_STRIP_PASS/);
 });
 
 const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
@@ -24,16 +27,26 @@ const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
 test('the modal reuses the shared Embed control and upload helpers — no upload code of its own', () => {
   const modal = read('./task-edit-modal.js');
   assert.match(modal, /import \{[^}]*\bembedMenuHtml\b[^}]*\battachEmbedMenu\b[^}]*\battachFileDrop\b[^}]*\} from '\.\/embed-menu\.js'/);
-  assert.equal(modal.match(/embedMenuHtml\(/g).length, 1, 'one Embed control');
+  // (TPT9410) Two File controls: the description's and the comment composer's.
+  assert.equal(modal.match(/embedMenuHtml\(/g).length, 2, 'the description and the comment composer');
   // Images through the board's attachImagePaste() / uploadImageFile(), files through file-attach.js —
   // both reached via embed-menu.js; the description editor no longer uploads dropped images itself.
   const editDescription = modal.slice(modal.indexOf('const editDescription = ('), modal.indexOf('formState._openDescEditor = editDescription;'));
   assert.match(editDescription, /commands\.attachImagePaste\(ta, null, descUploads\.imageOpts\)/);
   assert.match(editDescription, /attachFileDrop\(ta, descTarget, descUploads\)/);
   assert.ok(!editDescription.includes('_attachImageHandlers('), 'no second, direct image upload path');
-  for (const own of ['api.files.upload', "'upload-image'", 'createObjectURL']) {
+  for (const own of ['api.files.upload', "'upload-image'", 'createObjectURL', 'api.images.upload']) {
     assert.ok(!modal.includes(own), `task-edit-modal.js does not implement ${own} itself`);
   }
+  // (TPT9410) The comment composer uploads through the same helpers, and both the description
+  // editor and the composer show the attachment strip.
+  const comments = modal.slice(modal.indexOf('function _attachCommentUploads('), modal.indexOf('// (TPT17) Subscribed checkbox'));
+  assert.match(comments, /commands\.attachImagePaste\(textarea, null, uploads\.imageOpts\)/);
+  assert.match(comments, /attachEmbedMenu\(embedWrap, target, \{ \.\.\.uploads, portal: true, keepFocus: true \}\)/);
+  assert.match(comments, /attachFileDrop\(textarea, target, uploads\)/);
+  assert.match(comments, /renderAttachmentStrip\(textarea\)/);
+  assert.match(editDescription, /renderAttachmentStrip\(ta, \{ container: micWrap \}\)/);
+  assert.ok(!modal.includes('_attachImageHandlers'), 'no second, direct image upload path');
 });
 
 test('styles.css: the description Embed row is compact, and the portaled menu stacks above the modal', () => {

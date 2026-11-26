@@ -76,7 +76,8 @@ try {
     ['TPT1', task('TPT1')],
     ['TPT2', task('TPT2')],
     ['LOCKED', task('LOCKED', { status: 'in_progress', agentAssignee: 'codex' })],
-    ['OTHER', task('OTHER', { assignee: 2 })],
+    // (TPT9417) A teammate's task this user may not change: the API's can_edit is false.
+    ['OTHER', task('OTHER', { assignee: 2, canEdit: false })],
     ['BLOCKED', task('BLOCKED', { dependencies: ['TPT2'], agentAssignee: 'codex' })],
     ['HUMAN', task('HUMAN', { agentAssignee: 'human' })],
   ]);
@@ -193,7 +194,7 @@ try {
   };
   tasks.set('COW', task('COW', { agentPermissionMode: null, cowboyMode: false }));
   tasks.set('STALE', task('STALE', { agentPermissionMode: 'auto', cowboyMode: true }));
-  tasks.set('OTHERCOW', task('OTHERCOW', { assignee: 2, agentPermissionMode: 'bypass', cowboyMode: true }));
+  tasks.set('OTHERCOW', task('OTHERCOW', { assignee: 2, canEdit: false, agentPermissionMode: 'bypass', cowboyMode: true }));
   const cowboyCard = document.createElement('div');
   cowboyCard.innerHTML = cards.renderCard(tasks.get('COW'));
   document.body.appendChild(cowboyCard);

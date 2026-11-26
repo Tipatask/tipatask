@@ -13,7 +13,7 @@ const { withProjectLock } = require('./project-mutex');
 const { isReservationPlaceholder } = require('./reservation-placeholder');
 const { isTaskKeyLike } = require('./task-key-format');
 const { readProjectConfig } = require('./project-config');
-const PROJECT_IDENTITY_FIELDS = ['display_initials', 'brand_color', 'logo'];
+const PROJECT_IDENTITY_FIELDS = ['display_initials', 'brand_color', 'brand_colors', 'logo'];
 const { PROJECT_SETTING_FIELDS, settingsResult, readSettingsCache, writeSettingsCache } = require('./project-settings-cache');
 const { buildSpecCommentBody, stripSpecCommentHeader } = require('./spec-comment');
 const { readOriginSpecSnapshot, postOriginSpecComment } = require('./origin-spec-capture');
@@ -752,13 +752,19 @@ async function apiRequest(method, urlPath, body, opts = {}) {
     // comment-edit gate, api/src/routes/tasks.js) must NOT: latching would take the entire
     // Task App session to `unauthorized` just because a user clicked Edit on someone else's
     // comment. Only a caller that opts in via `opts.allowForbidden` gets the non-latching
-    // path below — every existing caller's behavior is unchanged.
-    if (opts.allowForbidden || (urlPath === '/settings' && res.data?.capability === 'settings:manage')) {
+    // path below — every existing caller's behavior is unchanged. (TPT9415) The API's task
+    // edit rule refusal (`reason: 'task_role_rank'`: another member's task, same or higher
+    // role) is such a business 403 on every task write, so it never latches either.
+    if (opts.allowForbidden || res.data?.reason === 'task_role_rank'
+      || (urlPath === '/settings' && res.data?.capability === 'settings:manage')) {
       const detail = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
       const err = new Error(`API 403: ${detail}`);
       err.statusCode = 403;
       err.body = res.data;
       err.forbidden = true;
+      // (TPT9417) The rule's refusal as a code too: the IPC error envelope and the local HTTP task
+      // routes carry `code`, not the body, so the board and the edit modal can name the reason.
+      if (res.data?.reason === 'task_role_rank') err.code = 'task_role_rank';
       throw err;
     }
     _markUnauthorized('Access denied — this project may not belong to your account', token);
@@ -887,6 +893,12 @@ function fromApi(t) {
     // claudeDesignMode above. Was missing entirely until now — toApi()/_rawUpdateTask()
     // never forwarded it either, so nothing could set or read it back.
     isObjective: !!t.is_objective,
+    // (TPT9417) The API's task edit rule answer for this user (can_edit, TPT9415): false on another
+    // member's task assigned to someone of the same or a higher role who did not create it, and on
+    // every task for a role without write access. Read-only — toApi() never sends it back. Only
+    // when the API sent it: a row from an older API stays without the key, and nothing is locked
+    // (client/task-edit-rule.js).
+    ...(t.can_edit != null ? { canEdit: t.can_edit === true || t.can_edit === 1 } : {}),
   };
 }
 
@@ -1691,7 +1703,48 @@ const backend = {
     const { readProjectLogo } = require('../project-profile.mjs');
     const logo = await readProjectLogo(credentials.baseUrl, credentials.token, credentials.projectId, project.identity);
     assertCurrent();
-    return { context: encodeURIComponent(projectContextIdentity(_projectRoot)), name: project.name, policy: project.policy, identity: project.identity, logo, editable: project.canManageIdentity };
+    return { context: encodeURIComponent(projectContextIdentity(_projectRoot)), name: project.name, policy: project.policy, identity: project.identity, logo,
+      editable: project.canManageIdentity, policyEditable: project.canManagePolicy === true };
+  },
+
+  // Replace the project owner's policy layer (Settings ▸ Policy, project-policy-modal.js).
+  // `base` is the owner layer the editor opened with: a rule set changed since then is
+  // refused as `policy_stale` instead of being overwritten. The API allows only the owner
+  // (`policy:manage`); its 403 must not latch the whole session as unauthorized.
+  async saveOwnerPolicy(rules, { base, expectedContext } = {}) {
+    if (expectedContext !== undefined && expectedContext !== encodeURIComponent(projectContextIdentity(_projectRoot))) {
+      throw Object.assign(new Error('Project settings context changed; reload settings'), { statusCode: 409 });
+    }
+    if (!rules || typeof rules !== 'object' || Array.isArray(rules)) {
+      throw Object.assign(new Error('Policy rules must be an object'), { statusCode: 400 });
+    }
+    const assertCurrent = _settingsRequestContext(false);
+    const policyError = (err) => {
+      const code = err?.body?.error;
+      if (err?.statusCode === 403 || code === 'forbidden') return Object.assign(new Error('forbidden'), { statusCode: 403, code: 'forbidden' });
+      if (code === 'policy_conflict') {
+        return Object.assign(new Error('policy_conflict'), { statusCode: 409, code, field: err.body.field || null });
+      }
+      return unwrapStatusesApiError(err);
+    };
+    try {
+      if (base && typeof base === 'object') {
+        const latest = await apiRequest('GET', '/policy', undefined, { allowForbidden: true });
+        assertCurrent();
+        const current = latest?.owner_rules || {};
+        const keys = Object.keys(current);
+        if (keys.length !== Object.keys(base).length || keys.some(key => !Object.hasOwn(base, key) || base[key] !== current[key])) {
+          throw Object.assign(new Error('policy_stale'), { statusCode: 409, code: 'policy_stale' });
+        }
+      }
+      const policy = await apiRequest('PUT', '/policy', { rules }, { allowForbidden: true });
+      assertCurrent();
+      _invalidateSettings();
+      return policy;
+    } catch (err) {
+      if (err?.code === 'policy_stale' || err?.contextChanged) throw err;
+      throw policyError(err);
+    }
   },
 
   async saveEffectiveProjectSettings(fields) {
@@ -1746,6 +1799,7 @@ const backend = {
         if (effective?.policy) row.policy = effective.policy;
         if (effective?.identity) row.identity = effective.identity;
         row.canManageIdentity = !!effective?.identity && data.capabilities?.includes('settings:manage') === true;
+        row.canManagePolicy = !!effective?.policy && data.capabilities?.includes('policy:manage') === true;
       }
       _projectSettingsEntry = { row, at: Date.now(), fallback: !row };
       return row;

@@ -24,6 +24,24 @@
     document.documentElement.setAttribute('data-theme', t);
     if (DARK[t]) document.documentElement.classList.add('theme-dark');
   })();
+  // (TPT9422) The project's brand accents before the first frame. brand-accents.js caches the
+  // accent tokens it last derived for this project window (brandAccentStorageKey()) with the
+  // palette they were derived for; they apply only while that palette is the one painted above.
+  (function() {
+    try {
+      var root = document.documentElement;
+      var key = 'tiptask-brand-accents';
+      var project = new URLSearchParams(location.search).get('projectPath');
+      if (project) key += ':' + project;
+      var cached = JSON.parse(localStorage.getItem(key) || 'null');
+      if (!cached || !cached.tokens || cached.theme !== root.getAttribute('data-theme')) return;
+      for (var name in cached.tokens) {
+        var value = String(cached.tokens[name]);
+        if (/^--(c|left-nav)-[\w-]+$/.test(name) && /^(#[0-9a-f]{6}|rgba\([\d.,]+\))$/i.test(value)) root.style.setProperty(name, value);
+      }
+      root.setAttribute('data-brand-accents', String(cached.count));
+    } catch (e) {}
+  })();
 </script>
 <link rel="stylesheet" href="/bundle.css">
 </head>
@@ -64,12 +82,34 @@
          (agents, permission mode, voice models, Version Control) use the same classes — see
          styles.css § Settings sections and rows. -->
     <div class="settings-body modal-tab-panel" data-tab="general">
+      <!-- (TPT9409) Project identity: one preview (logo, else initials on the brand color), then
+           Initials / Brand color / Project logo rows built by project-profile.js renderProfile()
+           ({ layout: 'rows' }), and Save in the control column of the last row. The policy has
+           its own section below: a summary row whose button opens project-policy-modal.js. -->
       <section class="settings-section" id="settings-profile-section" hidden>
         <h3 class="settings-section-title" id="settings-profile-title"></h3>
         <div id="settings-profile-body">
           <div id="settings-project-profile"></div>
-          <button type="button" id="settings-identity-save" class="settings-row-btn" hidden></button>
+          <div class="settings-row" id="settings-identity-save-row" hidden>
+            <div class="settings-row-label"></div>
+            <div class="settings-row-control">
+              <button type="button" id="settings-identity-save" class="settings-row-btn settings-row-btn-primary" hidden></button>
+            </div>
+          </div>
           <p class="settings-notice" id="settings-profile-msg" role="status" hidden></p>
+        </div>
+      </section>
+      <section class="settings-section" id="settings-policy-section" hidden>
+        <h3 class="settings-section-title" id="settings-policy-title"></h3>
+        <div class="settings-row" id="settings-policy-row">
+          <div class="settings-row-label">
+            <span id="settings-policy-label"></span>
+            <p class="settings-row-hint" id="settings-policy-hint"></p>
+          </div>
+          <div class="settings-row-control">
+            <span class="settings-row-value" id="settings-policy-summary"></span>
+            <button type="button" class="settings-row-btn" id="settings-policy-open" aria-describedby="settings-policy-label settings-policy-summary"></button>
+          </div>
         </div>
       </section>
       <section class="settings-section">
@@ -512,14 +552,15 @@ const {
   clearHighlights, clearChainHighlights,
   applyChainHighlight, applyObjectiveHighlight, applyRelatedHighlight, setupCardInteractions, registerCardCallbacks,
   isDragging, isDropInProgress, shouldDeferForDrag, markDropRenderCommitted, applyTaskPatch, removeCardFromDom, applyDiscussLock,
-  dependencyKeysMarkup,
+  dependencyKeysMarkup, isTaskReadOnly, taskEditLockReason,
 } = taskCard;
 
 const {
   renderBoardContent, renderFlatBoardContent, renderListContent, renderBacklogContent, renderTodoContent, renderEmptyBoardContent, renderNewTaskForm, sortTier,
   currentActiveSprintPriority,
-  computeStatusCounts, renderStatusFilter, statusFilterActive,
-  computeAssigneeCounts, renderPeopleFilter, assigneeFilterActive,
+  computeStatusCounts, statusFilterActive,
+  computeAssigneeCounts, assigneeFilterActive,
+  renderFilterBar,
   taskHasNullSprint, tasksForActiveTab, taskHiddenByGrouping, tasksVisibleUnderGrouping, renderBacklogHintHtml,
   applySearchFilter, clearSearchQuery, showConfirmModal, showDeleteConfirmModal, showSplitModal, showReiterateModal,
   spawnSplitObjectiveTab,
@@ -534,6 +575,7 @@ const {
   applyProjectBoardFilters, persistBoardFilters, onBoardFiltersChanged,
   refreshFilterBarChrome, refreshBoardForFilters, computeVisibleTiers, anyNarrowingFilterActive,
   FILTERED_TIER_PAGE_SIZE,
+  bindSprintOrderSwitch,
   applyProjectDebugPerfLog, writeDebugPerfLog,
   applyProjectBrowserTools, writeProjectBrowserTools,
   handleVoiceModelMessage,
@@ -2844,27 +2886,8 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
           return isBoardTab ? [btn, `<span class="nav-objective-tabs" id="nav-objective-tabs">${renderObjectiveNavTabsHtml()}</span>`] : [btn];
         }).join('')}
       </div>` : ''}
-      ${isTasksSection ? `<div class="search-group">
-        ${state.activeTagFilters.size > 0 ? `<div class="tag-filter-chips">${[...state.activeTagFilters].map(tag => `<button class="tag-chip" data-tag="${escapeAttr(tag)}">${escapeAttr(tag)} <span class="tag-chip-close">\u00d7</span></button>`).join('')}</div>` : ''}
-        <div class="tag-filter-wrap">
-          <button class="btn-tag-filter${state.activeTagFilters.size > 0 ? ' active' : ''}" title="Filter by tag">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
-          </button>
-        </div>
-        ${renderPeopleFilter(assigneeCounts)}
-        ${renderStatusFilter(statusCounts)}
-        <div class="search-input-wrap">
-          <div class="search-field">
-            <input type="text" class="search-input" placeholder="Search tasks..." value="${escapeAttr(state.searchQuery)}" />
-            <button type="button" class="search-clear-btn" title="${escapeAttr(t('filter.clearSearch'))}" aria-label="${escapeAttr(t('filter.clearSearch'))}"${state.searchQuery ? '' : ' hidden'}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
-            </button>
-          </div>
-          <button class="search-reset-btn" id="search-reset-btn"${(!state.activeTagFilters.size && !state.humanFilterActive && state.assigneeScope !== 'all' && !assigneeFilterActive() && !statusFilterActive() && !state.searchQuery.trim()) ? ' disabled' : ''}>Clear</button>
-        </div>
-        <button id="btn-board-refresh" class="btn-board-refresh" title="Refresh board" aria-label="Refresh board"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></button>
-      </div>` : ''}
-      <button class="burger-btn" aria-label="Menu" aria-expanded="${state.mobileMenuOpen ? 'true' : 'false'}">
+      ${isTasksSection ? /* the .search-group filter bar, localized (TPT9414) */ renderFilterBar(assigneeCounts, statusCounts) : ''}
+      <button class="burger-btn" aria-label="${escapeAttr(t('nav.menu'))}" aria-expanded="${state.mobileMenuOpen ? 'true' : 'false'}">
         <span></span><span></span><span></span>
       </button>
       <div class="mobile-menu${state.mobileMenuOpen ? ' open' : ''}">
@@ -3708,7 +3731,7 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   const taskTitleEl = newTaskForm?.querySelector('#new-task-title');
   const taskDescEl = newTaskForm?.querySelector('#new-task-desc');
   if (taskDescEl) {
-    const { attachEmbedMenu, attachFileDrop } = window.TipTask.embedMenu;
+    const { attachEmbedMenu, attachFileDrop, renderAttachmentStrip } = window.TipTask.embedMenu;
     const target = () => taskDescEl.isConnected ? taskDescEl : null;
     attachEmbedMenu(newTaskForm.querySelector('.new-task-file .embed-menu-wrap'), target, {
       portal: true,
@@ -3716,6 +3739,8 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
     });
     attachFileDrop(taskDescEl, target);
     attachImagePaste(taskDescEl);
+    // (TPT9410) The description's images and files, in a strip under it (embed-menu.js).
+    renderAttachmentStrip(taskDescEl);
   }
   if (taskTitleEl) attachAudioRecorder(taskTitleEl);
   if (taskDescEl) attachAudioRecorder(taskDescEl);
@@ -4133,6 +4158,10 @@ async function _loadAndRenderImpl(options = {}, renderGeneration = _loadAndRende
   // Setup card interactions (status selects, claude/delete/chain buttons, hover/click, tier labels, description editing)
   setupCardInteractions(app);
 
+  // (TPT9407) Board header's Oldest first / Newest first switch (Board and List with sprints
+  // on): saves the project's sprint_sort_order and repaints from the cached snapshot.
+  bindSprintOrderSwitch(app, () => loadAndRender());
+
   // Update button labels for active sessions
   updateClaudeButtons();
 
@@ -4249,12 +4278,15 @@ function openTodoDrawer(task) {
   const statusOpts = statusNames().map(s =>
     `<option value="${s}"${s === task.status ? ' selected' : ''}>${statusLabel(s)}</option>`
   ).join('');
+  // (TPT9417) A task this user may not change (the API's can_edit false): the status select is
+  // locked with the reason, like the board card's.
+  const statusLock = isTaskReadOnly(task) ? ` disabled title="${escapeAttr(taskEditLockReason(task))}"` : '';
   drawer.innerHTML = `
     <button class="todo-drawer-close" aria-label="Close">&times;</button>
     <div class="drawer-id">${escapeAttr(task.id)}</div>
     <h2 class="drawer-title">${escapeAttr(task.title)}</h2>
     <div class="drawer-meta">
-      <select class="drawer-status" style="--status-color:${statusColor(task.status)}">${statusOpts}</select>
+      <select class="drawer-status" style="--status-color:${statusColor(task.status)}"${statusLock}>${statusOpts}</select>
       <span class="drawer-cat">${escapeAttr(task.category || '')}</span>
       <span class="drawer-sprint">${escapeAttr(groupTitle(task.priority ?? '?'))}</span>
     </div>
@@ -4647,6 +4679,8 @@ async function _loadInitialTaskActivity() {
 
 async function init() {
   TipTask.notifications.requestPermission();
+  // (TPT9422) Brand accents first: the local mirror paints them before the API-bound reads below.
+  window.TipTask.taskBoard.applyProjectBrandAccents?.();
   try {
     // (C1392) Was header-less — see api-client.js _http() for why this matters in browser mode.
     const r = await fetch('./api/agent-config', { headers: { 'Cache-Control': 'no-cache', ...projectHeader() } });
@@ -5249,6 +5283,8 @@ if (window.electronAPI) {
     if (!window.electronAPI?.api) {
       try { await fetch(`/api/project-switch?path=${encodeURIComponent(dir)}`); } catch {}
     }
+    // (TPT9422) Project A's brand accents leave now, not after the render below.
+    window.TipTask.taskBoard.applyProjectBrandAccents?.();
     // Language must be applied before render (strings bake into the HTML);
     // theme is CSS-only so it can follow after. Status registry too — fetched fresh for
     // the new project before the first render.

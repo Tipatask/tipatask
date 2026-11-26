@@ -12,6 +12,9 @@
  *     whether GitHub created the release, so after a failed attempt the script waits, looks for
  *     a draft again and only then posts again. A PUBLISHED release of the tag is never touched:
  *     the run fails instead.
+ *   - Body. A reused draft whose body differs from the notes file gets the file's text. That
+ *     update repeats the tag: GitHub takes the tag away from a draft updated without `tag_name`
+ *     (it becomes `untagged-<hash>`), and the draft would no longer be the tag's release.
  *   - Assets, one file at a time. An asset that is already uploaded with the file's size and
  *     SHA-256 is kept. Anything else under that name is deleted first: an asset with other
  *     content, or the `starter` record a failed upload leaves behind. Then the file is
@@ -504,6 +507,20 @@ async function ensureDraft(ctx) {
   }
 }
 
+// GitHub takes the tag away from a draft on every update that leaves `tag_name` out: the field
+// turns into the `untagged-<hash>` of the draft's address, the draft stops being the tag's
+// release, and a later run would not find it and create a second one. Every update therefore
+// repeats the tag. Resolves with the draft as GitHub answers it: naming the tag also moves the
+// draft to a new address (html_url).
+async function updateDraft(ctx, release, fields) {
+  const updated = await ctx.github.updateRelease(release.id, { ...fields, tag_name: ctx.tag });
+  if (!updated || updated.id !== release.id || updated.tag_name !== ctx.tag) {
+    throw new Error(`updating draft release ${release.id} did not keep its tag ${ctx.tag}: GitHub answered `
+      + (updated ? `tag_name ${JSON.stringify(updated.tag_name)} for release ${updated.id}` : 'without the release'));
+  }
+  return { ...release, ...updated };
+}
+
 async function ensureAsset(ctx, release, file) {
   const { github, dryRun, retryDelays, sleep, report } = ctx;
   let uploads = 0;
@@ -572,18 +589,18 @@ async function draftRelease({ github, tag, body, files, dryRun = false, sleep = 
     if (dryRun) {
       report.info('Would rewrite the draft body from the notes file.');
     } else {
-      await github.updateRelease(draft.release.id, { body });
+      result.release = await updateDraft(ctx, draft.release, { body });
       report.info('Rewrote the draft body from the notes file.');
     }
     result.bodyUpdated = true;
   }
 
-  for (const file of files) result.assets.push(await ensureAsset(ctx, draft.release, file));
+  for (const file of files) result.assets.push(await ensureAsset(ctx, result.release, file));
 
   // Each file is proven above (kept after a matching listing, or stored with a matching answer).
   // The two reads below only report leftovers, so their failure never fails a complete release.
   try {
-    const assets = await github.listAssets(draft.release.id);
+    const assets = await github.listAssets(result.release.id);
     result.extras = assets.filter((asset) => !files.some((file) => assetMatches(asset, file)))
       .map((asset) => ({ id: asset.id, name: asset.name, state: asset.state }));
   } catch (error) {
@@ -591,7 +608,7 @@ async function draftRelease({ github, tag, body, files, dryRun = false, sleep = 
   }
   try {
     const { drafts } = await findReleases(ctx);
-    result.duplicates = drafts.filter((other) => other.id !== draft.release.id)
+    result.duplicates = drafts.filter((other) => other.id !== result.release.id)
       .map((other) => ({ id: other.id, html_url: other.html_url, assets: uploadedCount(other) }));
   } catch (error) {
     report.info(`note: could not look for other drafts of ${tag}: ${describe(error)}`);

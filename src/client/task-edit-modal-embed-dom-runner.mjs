@@ -110,7 +110,8 @@ try {
   const tasks = new Map([
     ['TPT1', task('TPT1')],
     ['LOCKED', task('LOCKED', { status: 'in_progress', agentAssignee: 'codex' })],
-    ['OTHER', task('OTHER', { assignee: 2 })],
+    // (TPT9417) A teammate's task this user may not change: the API's can_edit is false.
+    ['OTHER', task('OTHER', { assignee: 2, canEdit: false })],
   ]);
   const writes = [];
   const fileUploads = [];
@@ -443,6 +444,122 @@ try {
   await settle();
   assert.equal(writes.at(-1).patch.description, 'Description TPT1\n[survey.csv · r1](' + earlier.url + ')');
   board.closeTaskEditModal(true);
+
+  // 16. (TPT9410) The description editor shows the strip of what the description references,
+  // inside the editor's wrap; it follows the text, an upload's tile carries on from its
+  // placeholder, × takes a reference out with the editor still open. Tab onto a × keeps the editor
+  // open, Escape there closes it; leaving the tiles for another field closes it too, strip and all.
+  // A page with a microphone, as in the app: attachAudioRecorder() puts each field in its mic wrap.
+  Object.defineProperty(window.navigator, 'mediaDevices', { value: { getUserMedia: async () => ({ getTracks: () => [] }) }, configurable: true });
+  globalThis.MediaRecorder = class {};
+  tasks.set('STRIP', task('STRIP', { description: `Intro\n![img](${API}/images/5)\n[spec.pdf](${API}/files/6)` }));
+  await board.openTaskEditModal('STRIP');
+  const descStrip = () => modal().querySelector('.modal-desc-edit-wrap > .attachment-strip');
+  const tilesOf = strip => [...strip.querySelectorAll('.attachment-tile')];
+  assert.equal(descStrip() === null, true, 'no strip while the description is rendered');
+  click(display());
+  ta = editor();
+  assert.equal(descStrip().previousElementSibling === ta, true, 'right under the editor, in its wrap');
+  assert.deepEqual(tilesOf(descStrip()).map(t => t.dataset.key), ['/api/images/2/5', '/api/files/2/6']);
+  ta.setSelectionRange('Intro'.length, 'Intro'.length);
+  const stripPaste = new Event('paste', { bubbles: true, cancelable: true });
+  Object.defineProperty(stripPaste, 'clipboardData', { value: { files: [png('e.png')], items: [] } });
+  ta.dispatchEvent(stripPaste);
+  const pendingTile = tilesOf(descStrip())[0];
+  assert.equal(pendingTile.classList.contains('attachment-tile--pending'), true);
+  await settle();
+  answerImage(lastImageUpload().blobUrl, 90);
+  assert.equal(tilesOf(descStrip())[0] === pendingTile, true, 'the same tile, now the image');
+  assert.equal(pendingTile.dataset.key, '/api/images/2/90');
+  click(tilesOf(descStrip())[2].querySelector('.attachment-tile-remove'));
+  assert.equal(ta.isConnected, true, '× leaves the editor open');
+  assert.equal(ta.value, `Intro![img](${API}/images/90)\n![img](${API}/images/5)`);
+  assert.equal(tilesOf(descStrip()).length, 2);
+  ta.value = 'Intro';
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  assert.equal(descStrip().hidden, true, 'a reference deleted from the text takes its tile along');
+  ta.value = `Intro\n![img](${API}/images/5)`;
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  const stripRemove = tilesOf(descStrip())[0].querySelector('.attachment-tile-remove');
+  stripRemove.focus();
+  assert.equal(ta.isConnected, true, 'Tab onto a tile keeps the editor open');
+  key(stripRemove, 'Escape');
+  assert.equal(editor() === null, true);
+  assert.equal(descStrip() === null, true, 'the strip leaves with the editor');
+  assert.equal(document.activeElement === display(), true, 'Escape gives the focus back to the description');
+  assert.equal(modal().hidden, false, 'only the editor closed');
+  click(display());
+  tilesOf(descStrip())[0].querySelector('.attachment-tile-remove').focus();
+  modal().querySelector('.modal-title-input').focus();
+  assert.equal(editor() === null, true, 'leaving the tiles for another field closes the editor');
+  assert.equal(modal().querySelectorAll('.attachment-strip').length, 1, 'only the comment composer\'s strip is left');
+  board.closeTaskEditModal(true);
+
+  // 17. (TPT9410) The comment composer takes attachments the description's way: its File control
+  // (menu on <body>), file drop and image paste, uploads linked to the task, the strip of what the
+  // comment references. Submit waits for an upload and never posts a `blob:` placeholder; a
+  // failed image's placeholder goes; the posted comment's tiles go with its text.
+  const posted = [];
+  api.tasks.comments.create = async (id, content) => {
+    posted.push({ id, content });
+    return { id: 900 + posted.length, content, created_at: '2026-11-26T10:00:00.000Z', updated_at: null, comment_type: 'comment', user: { id: 1, name: 'Alice' } };
+  };
+  await board.openTaskEditModal('TPT1');
+  click(modal().querySelector('.modal-tab-btn[data-tab="comments"]'));
+  const compose = modal().querySelector('.comment-compose');
+  const commentInput = compose.querySelector('.comment-input');
+  const commentTrigger = compose.querySelector('.comment-compose-actions .embed-menu-trigger');
+  const commentStrip = compose.querySelector('.attachment-strip');
+  const submit = compose.querySelector('.comment-submit');
+  const commentStatus = compose.querySelector('.comment-compose-status');
+  assert.equal(commentTrigger.title, 'Attach a file, image, or project artifact to the comment');
+  assert.equal(commentStrip.nextElementSibling.classList.contains('comment-compose-actions'), true, 'between the box and its actions');
+  assert.equal(commentStrip.hidden, true);
+  assert.equal(press(commentTrigger, 'mousedown').defaultPrevented, true);
+  press(commentTrigger, 'click');
+  assert.equal(document.querySelector('.import-submenu').parentElement === document.body, true, 'the menu is a <body> child');
+  click(menuRows()[1]);
+  pick(compose.querySelector('.embed-file-input'), [txt('log.txt')]);
+  await settle();
+  assert.deepEqual(fileUploads.at(-1), { filename: 'log.txt', mimeType: 'text/plain', taskKey: 'TPT1' });
+  const logRef = `[log.txt](${API}/files/${40 + fileUploads.length})`;
+  assert.equal(commentInput.value, logRef);
+  assert.deepEqual([...commentStrip.querySelectorAll('.attachment-tile-name')].map(n => n.textContent), ['log.txt']);
+  commentInput.setSelectionRange(commentInput.value.length, commentInput.value.length);
+  const commentPaste = new Event('paste', { bubbles: true, cancelable: true });
+  Object.defineProperty(commentPaste, 'clipboardData', { value: { files: [png('f.png')], items: [] } });
+  commentInput.dispatchEvent(commentPaste);
+  assert.equal(commentPaste.defaultPrevented, true);
+  assert.equal(submit.disabled, true, 'Submit waits for the upload');
+  assert.equal(commentStatus.hidden, false);
+  assert.equal(commentStatus.textContent, 'Uploading attachment…');
+  assert.equal(commentStrip.querySelector('.attachment-tile--pending') !== null, true);
+  submit.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  await settle();
+  assert.equal(posted.length, 0, 'nothing posts while the image uploads');
+  assert.equal(lastImageUpload().taskKey, 'TPT1');
+  answerImage(lastImageUpload().blobUrl, 95);
+  assert.equal(submit.disabled, false);
+  assert.equal(commentStatus.hidden, true);
+  click(submit);
+  await settle();
+  assert.deepEqual(posted.at(-1), { id: 'TPT1', content: `${logRef}![img](${API}/images/95)` });
+  assert.equal(commentInput.value, '');
+  assert.equal(commentStrip.hidden, true, 'the posted comment takes its tiles along');
+  assert.equal(drop(commentInput, [txt('drop2.txt')]).defaultPrevented, true);
+  await settle();
+  assert.deepEqual(fileUploads.at(-1), { filename: 'drop2.txt', mimeType: 'text/plain', taskKey: 'TPT1' });
+  assert.match(commentInput.value, /^\[drop2\.txt\]\(/);
+  const failedComment = new Event('paste', { bubbles: true, cancelable: true });
+  Object.defineProperty(failedComment, 'clipboardData', { value: { files: [png('g.png')], items: [] } });
+  commentInput.dispatchEvent(failedComment);
+  await settle();
+  boardSocket().frame({ type: 'image-upload-error', blobUrl: lastImageUpload().blobUrl, error: 'Too large' });
+  assert.equal(commentInput.value.includes('blob:'), false, 'a failed image leaves no placeholder');
+  assert.equal(submit.disabled, false);
+  assert.equal(commentStrip.querySelectorAll('.attachment-tile').length, 1);
+  board.closeTaskEditModal(true);
+  console.log('TPT9410_ATTACHMENT_STRIP_PASS');
 } catch (err) {
   console.error(err);
   exitCode = 1;

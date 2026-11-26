@@ -14,12 +14,13 @@ import {
   seedStatuses,
 } from './status-registry.js';
 import { refreshDesktopProfile, syncPolicyControls } from './desktop-project-profile.js';
+import { setBrandColors, paintBrandAccents, followBrandProject } from './brand-accents.js';
 export { refreshDesktopProfile };
 import { escapeAttr, insertAtCursor, setValueKeepingCaret, markTruncatedCards, loadDraft, saveDraft, clearDraft, getObjectiveDraftKey, renderMarkdown, renderSprintCombobox, initSprintCombobox, refreshSprintComboboxItems, showToast, showProgressToast, sprintRecordMax, showSavingIndicator, hideSavingIndicator, shortModelName, pushSubtaskCrumb, renderTagBadge } from './utils.js';
 import { computeTierWindow, HIDE_CLASS } from './sprint-tier-visibility.js';
 import { isStatusRowChecked } from './status-filter-select.js';
 import { buildWsUrl, terminateTaskSession, resumePausedTaskSession } from './ws-client.js';
-import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, renderEffortBadge, renderMemberBadge, renderSprintBadgeLabel, renderCard, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys, hasTaskSession, deferUntilDragEnds, syncExpandedOverlay, dependencyKeyMarkup, dependencyKeysMarkup, syncDependencyKeys } from './task-card.js';
+import { CLAUDE_SVG, CLAUDE_BADGE_SVG, CODEX_BADGE_SVG, PI_BADGE_SVG, HUMAN_BADGE_SVG, renderAgentBadge, renderEffortBadge, renderMemberBadge, renderSprintBadgeLabel, renderCard, refreshCard, regroupCardToSprint, regroupMovedCard, regroupNeedsReload, canStartTaskCard, isTaskReadOnly, taskEditLockReason, applyTaskPatch, removeCardFromDom, isDepsBlocked, hasUnmetDeps, unmetDependencyKeys, hasTaskSession, deferUntilDragEnds, syncExpandedOverlay, dependencyKeyMarkup, dependencyKeysMarkup, syncDependencyKeys } from './task-card.js';
 import { buildSubtasksLabel, closedDelta, applyChildStatusDelta, countChildProgress } from './subtask-count.js';
 import { sessionButtonMode, SESSION_BUTTON_MODES } from './session-button-state.js';
 import { createMemberCache } from './member-cache.js';
@@ -37,7 +38,7 @@ import { setVoiceInputAvailability, setVoiceInputDeviceId, isAnyVoiceCaptureActi
 import { filterAudioInputs, labelsUnlocked, buildInputDeviceOptions } from './voice-devices.js';
 import { VOICE_SHORTCUT_OPTIONS, DEFAULT_VOICE_SHORTCUT, normalizeVoiceShortcut } from './voice-shortcut.js';
 import { VOICE_MODE_OPTIONS, DEFAULT_VOICE_MODE, normalizeVoiceMode, voiceModeOption } from './voice-mode.js';
-import { groupNoun, groupTitle, groupShowMore, groupLoadMore, groupEmpty, groupPriorityFieldLabel, TASK_GROUP_LABELS, DEFAULT_TASK_GROUP_LABEL, getGroupLabel, setGroupLabel, loadGroupLabel, groupPluralFor, getSprintsEnabled, setSprintsEnabled, getObjectiveGroupingEnabled, setObjectiveGroupingEnabled, getSprintSortOrder, isGeneratedGroupName } from './group-label.js';
+import { groupNoun, groupTitle, groupShowMore, groupLoadMore, groupEmpty, groupPriorityFieldLabel, TASK_GROUP_LABELS, DEFAULT_TASK_GROUP_LABEL, getGroupLabel, setGroupLabel, loadGroupLabel, groupPluralFor, getSprintsEnabled, setSprintsEnabled, getObjectiveGroupingEnabled, setObjectiveGroupingEnabled, getSprintSortOrder, saveSprintSortOrder, isGeneratedGroupName } from './group-label.js';
 // The Create header is shared by Objective chat and New Task without a board/chat import cycle.
 import { renderComposerHeader } from './composer-header.js';
 import { showActionConfirm } from './action-confirm.js';
@@ -52,7 +53,8 @@ import { formSprintValue } from './new-task-sprint.js';
 import { VCS_TYPES, VCS_GIT_FLAGS, buildVcsPatchBody } from './vcs-form.js';
 import { shouldTypeToFilter } from './type-to-filter.js';
 import { piTaskModelIds, piOnlyToolLess, piTaskPinHint } from './pi-task-models.js';
-import { hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkModel, stageBulkEffort, stageBulkDesignMode, resolveBulkAgentModel, bulkPatchBody, bulkCowboyBlockedTaskIds, BULK_EFFORT_AGENTS } from './bulk-changes.js';
+import { hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkModel, stageBulkEffort, stageBulkDesignMode, resolveBulkAgentModel, bulkApplyWrites, splitBulkEditable, bulkCowboyBlockedTaskIds, BULK_EFFORT_AGENTS } from './bulk-changes.js';
+import { taskEditLocked, isTaskEditRefusal } from './task-edit-rule.js';
 import { projectPermissionMode, setProjectPermissionMode } from './group-label.js';
 import { buildProjectModeOptions, buildTaskModeOptions, effectivePermissionMode, permissionModeIcon, permissionModeTip, isAgentPermissionMode, cowboyModeOptions, normalizeCowboyScope } from './permission-mode.js';
 import { renderPermissionModeSelect, bindPermissionModeSelect } from './permission-mode-select.js';
@@ -227,6 +229,15 @@ export function anyNarrowingFilterActive() {
   );
 }
 
+// Whether the filter bar's Clear button has anything to reset: a narrowing filter, or the bare
+// All Tasks scope (not narrowing — see above — but a non-default state Clear resets to My
+// Tasks). The one rule renderFilterBar(), refreshFilterBarChrome() and applySearchFilter() set
+// #search-reset-btn's disabled state from (TPT9414: applySearchFilter() used to leave the scope
+// out, so every full render disabled Clear under All Tasks again).
+function filtersCanBeCleared() {
+  return anyNarrowingFilterActive() || state.assigneeScope === 'all';
+}
+
 // (C1293) Full board renders capture this revision before any asynchronous task fetch.
 // Filter changes increment it so an older render cannot put stale cards back into #app.
 export function invalidateBoardRenderState() {
@@ -372,7 +383,7 @@ export function computeAssigneeCounts(tasks) {
 
 // (C1441) Decorative person glyph on the People-filter trigger — aria-hidden, the button's
 // own title/aria-label (filter.byPeople) already names it, so no new i18n key. Same house
-// Feather-icon style as .btn-tag-filter's inline SVG (template.html).
+// Feather-icon style as .btn-tag-filter's TAG_FILTER_ICON_SVG (renderFilterBar() below).
 const PEOPLE_FILTER_ICON_SVG = '<svg class="people-filter-icon" aria-hidden="true" '
   + 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
   + 'stroke-linecap="round" stroke-linejoin="round">'
@@ -433,6 +444,56 @@ export function renderPeopleFilter(counts) {
       + `<span>${escapeAttr(t('filter.humanTasks'))}</span>`
     + `</label>`
     + '</div></div>';
+}
+
+// ── Top-nav filter bar (C1155) ──
+// The board top nav's .search-group, rendered by template.html's _loadAndRenderImpl() on the
+// tasks-section tabs: active tag chips, the tag filter button, the People and Status filters,
+// the search field with its inline clear X, the Clear button that resets every filter, and the
+// board refresh button. Every label resolves through t() at render time (TPT9414), so a
+// language change — Settings dispatches tiptask:reload, a full render — repaints the bar in the
+// new locale. refreshFilterBarChrome() and updateSearchInputWidth() patch only state on these
+// nodes (active/disabled/hidden/width, tag chips), never their labels. Classes and ids are the
+// contract the template.html bindings and board-filter-dom-runner.mjs select by.
+const TAG_FILTER_ICON_SVG = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" '
+  + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+  + '<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/>'
+  + '<line x1="7" y1="7" x2="7.01" y2="7"/></svg>';
+const SEARCH_CLEAR_ICON_SVG = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" '
+  + 'stroke="currentColor" stroke-width="2.4" stroke-linecap="round">'
+  + '<line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>';
+const BOARD_REFRESH_ICON_SVG = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" '
+  + 'stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
+  + '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>'
+  + '<path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
+
+export function renderFilterBar(assigneeCounts, statusCounts) {
+  const tags = [...state.activeTagFilters];
+  const tagChips = tags.length
+    ? `<div class="tag-filter-chips">${tags.map(tag =>
+      `<button class="tag-chip" data-tag="${escapeAttr(tag)}">${escapeAttr(tag)} <span class="tag-chip-close">×</span></button>`
+    ).join('')}</div>`
+    : '';
+  const byTag = escapeAttr(t('filter.byTag'));
+  const clearSearch = escapeAttr(t('filter.clearSearch'));
+  const refreshBoard = escapeAttr(t('nav.refreshBoard'));
+  const canClear = filtersCanBeCleared();
+  return '<div class="search-group">'
+    + tagChips
+    + '<div class="tag-filter-wrap">'
+      + `<button class="btn-tag-filter${tags.length ? ' active' : ''}" title="${byTag}" aria-label="${byTag}">${TAG_FILTER_ICON_SVG}</button>`
+    + '</div>'
+    + renderPeopleFilter(assigneeCounts)
+    + renderStatusFilter(statusCounts)
+    + '<div class="search-input-wrap">'
+      + '<div class="search-field">'
+        + `<input type="text" class="search-input" placeholder="${escapeAttr(t('filter.searchPlaceholder'))}" value="${escapeAttr(state.searchQuery)}" />`
+        + `<button type="button" class="search-clear-btn" title="${clearSearch}" aria-label="${clearSearch}"${state.searchQuery ? '' : ' hidden'}>${SEARCH_CLEAR_ICON_SVG}</button>`
+      + '</div>'
+      + `<button class="search-reset-btn" id="search-reset-btn"${canClear ? '' : ' disabled'}>${escapeAttr(t('filter.clearAll'))}</button>`
+    + '</div>'
+    + `<button id="btn-board-refresh" class="btn-board-refresh" title="${refreshBoard}" aria-label="${refreshBoard}">${BOARD_REFRESH_ICON_SVG}</button>`
+    + '</div>';
 }
 
 // ── Compute which tiers to show (hide fully-done + card-less sprints, C1578) ──
@@ -690,6 +751,8 @@ export function renderBoardContent(tierKeys, tiers, sortTierFn, renderCardFn, re
   const ascending = getSprintSortOrder() === 'asc';
   const orderedKeys = ascending ? [...mergedKeys] : [...mergedKeys].reverse();
   const loadMoreHtml = _loadMoreButtonHtml(hiddenCount);
+  // (TPT9407) The board header — the Oldest first / Newest first switch — opens the view.
+  const headerHtml = _boardHeaderHtml(keys, tiers);
 
   const timelineHtml = orderedKeys.map(p => {
     let sorted = sortTierFn(tiers[p] || []);
@@ -747,11 +810,13 @@ export function renderBoardContent(tierKeys, tiers, sortTierFn, renderCardFn, re
   // tell the user why the board looks blank instead of leaving an unexplained gap.
   if (visibleKeys.length === 0 && keys.length > 0) {
     return `
+      ${headerHtml}
       ${loadMoreHtml}
       <div class="timeline">${timelineHtml}</div>
       <div class="board-no-sprint-tasks">${t('board.noSprintTasks')}</div>`;
   }
   return `
+    ${headerHtml}
     ${ascending ? loadMoreHtml : ''}
     <div class="timeline">${timelineHtml}</div>
     ${ascending ? '' : loadMoreHtml}`;
@@ -797,13 +862,16 @@ export function renderListContent(tierKeys, tiers, sortTierFn, renderCardFn) {
   const ascending = getSprintSortOrder() === 'asc';
   const orderedKeys = ascending ? [...visibleKeys] : [...visibleKeys].reverse();
   const loadMoreHtml = _loadMoreButtonHtml(hiddenCount);
+  // (TPT9407) Same board header as renderBoardContent(); absent with sprints off.
+  const headerHtml = _boardHeaderHtml(keys, tiers);
   // (C1578) List has no drag/drop and no post-render DOM filter pass of its own (List
   // cards live in .list-group-cards, never matched by applySearchFilter's selector) — a
   // card-less group is skipped outright rather than rendered hidden.
   if (orderedKeys.length === 0 && keys.length > 0) {
-    return `${loadMoreHtml}<div class="board-no-sprint-tasks">${t('board.noSprintTasks')}</div>`;
+    return `${headerHtml}${loadMoreHtml}<div class="board-no-sprint-tasks">${t('board.noSprintTasks')}</div>`;
   }
   return `
+    ${headerHtml}
     ${ascending ? loadMoreHtml : ''}
     <div class="list-view">
       ${orderedKeys.map(p => {
@@ -841,6 +909,72 @@ export function renderListContent(tierKeys, tiers, sortTierFn, renderCardFn) {
       }).join('')}
     </div>
     ${ascending ? '' : loadMoreHtml}`;
+}
+
+// ── Board header: sprint order switch (TPT9407) ──
+// Two buttons, the order in force pressed: Oldest first ('asc', the default — the oldest sprint
+// on top, the newest at the bottom) and Newest first ('desc'). The pick is the project's
+// sprint_sort_order (group-label.js saveSprintSortOrder(), wired by bindSprintOrderSwitch()), so
+// the web app's sprint board shows the same order. Each icon is the sort glyph for its order:
+// a down arrow beside bars that grow (ascending) or shrink (descending) down the list.
+const SPRINT_ORDER_OPTIONS = [
+  { order: 'asc', labelKey: 'board.sprintOrderAsc', hintKey: 'board.sprintOrderAscHint', bars: ['M9 3.5h2.5', 'M9 8h4.5', 'M9 12.5h6.5'] },
+  { order: 'desc', labelKey: 'board.sprintOrderDesc', hintKey: 'board.sprintOrderDescHint', bars: ['M9 3.5h6.5', 'M9 8h4.5', 'M9 12.5h2.5'] },
+];
+
+function _sprintOrderIcon(bars) {
+  return `<svg class="sprint-order-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 2.5v11"/><path d="M1.75 11.25 4 13.5l2.25-2.25"/>${bars.map(d => `<path d="${d}"/>`).join('')}</svg>`;
+}
+
+// Drawn on the sprint views only (Board and List with sprints on — renderFlatBoardContent() has
+// no sprints to order), and only where the order can change what they show: two sprints holding
+// tasks, or older sprints still behind the sprint window, which Load Earlier brings in above or
+// below. Counted on the unfiltered tiers, so a filter change never makes the switch come and go.
+function _boardHeaderHtml(keys, tiers) {
+  if (!getSprintsEnabled()) return '';
+  let filled = 0;
+  for (const k of keys) if ((tiers[k] || []).length > 0) filled++;
+  const olderOnServer = !state.allStepsLoaded && !!(state.boardWindow && state.boardWindow.has_older);
+  if (filled < 2 && !olderOnServer) return '';
+  const current = getSprintSortOrder();
+  const buttons = SPRINT_ORDER_OPTIONS.map(({ order, labelKey, hintKey, bars }) =>
+    `<button type="button" class="sprint-order-btn" data-sprint-order="${order}" aria-pressed="${order === current}" title="${escapeAttr(t(hintKey))}">`
+    + `${_sprintOrderIcon(bars)}<span class="sprint-order-label">${escapeAttr(t(labelKey))}</span></button>`
+  ).join('');
+  return `<div class="board-header"><div class="sprint-order" role="group" aria-label="${escapeAttr(t('board.sprintOrder'))}">${buttons}</div></div>`;
+}
+
+// Wires the switch _boardHeaderHtml() drew (template.html calls this after every render).
+// A pick shows at once: saveSprintSortOrder() changes the order before its save settles, and
+// `rerender` repaints the board from its cached snapshot (template.html passes loadAndRender(),
+// a cache hit — no fetch). A failed save puts back the order the API last confirmed, repaints and
+// says why in an error toast. Keyboard focus on a switch button moves to its copy in the new
+// markup, so the pick stays one key press from a retry.
+export function bindSprintOrderSwitch(appEl, rerender) {
+  if (!appEl) return;
+  appEl.querySelectorAll('.sprint-order-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const order = btn.dataset.sprintOrder;
+      if (order === getSprintSortOrder()) return;
+      const focusOrder = document.activeElement === btn ? order : null;
+      const saving = saveSprintSortOrder(order);
+      await _repaintSprintOrder(rerender, focusOrder);
+      const result = await saving;
+      if (!result.rolledBack) return;
+      await _repaintSprintOrder(rerender, document.activeElement?.closest?.('.sprint-order-btn')?.dataset.sprintOrder || null);
+      showToast(t('board.sprintOrderFailed', { msg: errorDetail(result.error) }), 'error');
+    });
+  });
+}
+
+async function _repaintSprintOrder(rerender, focusOrder) {
+  try {
+    await rerender();
+  } catch (err) {
+    console.error('[board] Sprint order repaint failed:', err?.message || err);
+  }
+  if (!focusOrder) return;
+  document.querySelector(`.sprint-order-btn[data-sprint-order="${focusOrder}"]`)?.focus({ preventScroll: true });
 }
 
 // ── Backlog view HTML ──
@@ -952,9 +1086,12 @@ export function renderTodoContent(allTasks, tierKeys) {
       agentBadge = `<span class="agent-badge agent-badge--${escapeAttr(aa)}" title="${escapeAttr(label)}">${icon}</span>`;
     }
     const itemClass = `todo-item todo-item--${task.status}${agentLocked ? ' agent-assigned' : ''}`;
+    // (TPT9417) A task this user may not change (the API's can_edit false): its done box is locked
+    // like the board card's status select, with the same reason as its tooltip.
+    const editLocked = isTaskReadOnly(task);
     return `
     <div class="${itemClass}" data-task-id="${escapeAttr(task.id)}" data-status-role="${statusRoleToken(task.status)}">
-      <input type="checkbox" class="todo-check" data-task-id="${escapeAttr(task.id)}"${isCompleteName(task.status) ? ' checked' : ''}${agentLocked ? ' disabled' : ''}>
+      <input type="checkbox" class="todo-check" data-task-id="${escapeAttr(task.id)}"${isCompleteName(task.status) ? ' checked' : ''}${agentLocked || editLocked ? ' disabled' : ''}${editLocked ? ` title="${escapeAttr(taskEditLockReason(task))}"` : ''}>
       ${agentBadge}
       <span class="todo-item-id">${escapeAttr(task.id)}</span>
       <span class="todo-title${isCompleteName(task.status) ? ' done' : ''}">${escapeAttr(task.title)}</span>
@@ -970,7 +1107,6 @@ export function updateSearchInputWidth() {
   const input = document.querySelector('.search-input');
   if (!wrap || !input) return;
   const resetBtn = document.getElementById('search-reset-btn');
-  const hasClear = !!(resetBtn && resetBtn.classList.contains('visible'));
 
   // (C1384) Inline X clear button lives inside .search-field, right on top of the input's
   // own right edge. Sync its visibility here — this fn already runs from every path that can
@@ -982,8 +1118,15 @@ export function updateSearchInputWidth() {
   const MIN = 180;
   const MAX = 320; // (C1155) bar is nowrap now — 420 fought the status select + reload for room
 
+  // (TPT9414) The wrap holds the field AND the Clear button beside it, which is always laid out
+  // (only disabled when there is nothing to reset) and whose label width follows the locale —
+  // "Clear" is about 57px wide, "Очистити" about 85px. So the field is sized from its own text
+  // and the Clear button's rendered width is added on top: a longer translation widens the wrap
+  // instead of clipping the placeholder. The field never narrows below its localized placeholder,
+  // so it holds still when typing starts and grows once the phrase is longer. Hidden on narrow
+  // screens (offsetWidth 0), the Clear button reserves nothing.
   let desired = MIN;
-  if (input.value) {
+  if (input.value || input.placeholder) {
     if (!_searchMeasurer) {
       _searchMeasurer = document.createElement('span');
       _searchMeasurer.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;top:-9999px;left:-9999px;pointer-events:none;';
@@ -992,14 +1135,19 @@ export function updateSearchInputWidth() {
     const cs = getComputedStyle(input);
     _searchMeasurer.style.font = cs.font;
     _searchMeasurer.style.letterSpacing = cs.letterSpacing;
-    _searchMeasurer.textContent = input.value;
+    const textWidth = (text) => {
+      _searchMeasurer.textContent = text;
+      return _searchMeasurer.offsetWidth;
+    };
     // (C1384) was 24 (2 * 0.6rem padding + 2 * 1.5px border) — .search-input now reserves an
     // extra 1.6rem on the right for the inline X gutter (styles.css), so text stops sliding
     // under the icon once the auto-width kicks in.
     const paddingX = 40;
-    const buffer = 16;   // keep cursor off the edge
-    let contentWidth = _searchMeasurer.offsetWidth + paddingX + buffer;
-    if (hasClear && resetBtn.offsetWidth > 0) {
+    let contentWidth = Math.max(
+      input.placeholder ? textWidth(input.placeholder) + paddingX + 4 : 0, // 4: rounding slack
+      input.value ? textWidth(input.value) + paddingX + 16 : 0, // 16: keep the caret off the edge
+    );
+    if (resetBtn && resetBtn.offsetWidth > 0) {
       const gap = 6; // .search-input-wrap gap: 0.35rem ≈ 5.6px
       contentWidth += resetBtn.offsetWidth + gap;
     }
@@ -1041,7 +1189,6 @@ export function applySearchFilter() {
   const humanFilter = state.humanFilterActive;
   const assigneeFilter = assigneeFilterActive();
   const statusFilter = statusFilterActive();
-  const hasActiveFilters = Boolean(state.activeTagFilters.size > 0 || humanFilter || assigneeFilter || statusFilter || state.searchQuery.trim());
   const cardSelector = '.tier .card[data-id], .backlog-section .card[data-id]';
 
   if (!needle) {
@@ -1080,10 +1227,7 @@ export function applySearchFilter() {
     updateBacklogEmptyState();
     updateShowMoreButton();
 
-    if (resetBtn) {
-      resetBtn.disabled = !hasActiveFilters;
-      resetBtn.classList.toggle('visible', hasActiveFilters);
-    }
+    if (resetBtn) resetBtn.disabled = !filtersCanBeCleared();
     updateSearchInputWidth();
     // (C1258) markTruncatedCards() call removed here — template.html's wire tail already calls
     // it exactly once per render (after this function returns), covering both branches of this
@@ -1120,10 +1264,7 @@ export function applySearchFilter() {
     card.classList.toggle('search-match', matches);
   });
 
-  if (resetBtn) {
-    resetBtn.disabled = !hasActiveFilters;
-    resetBtn.classList.toggle('visible', hasActiveFilters);
-  }
+  if (resetBtn) resetBtn.disabled = !filtersCanBeCleared();
   updateSearchInputWidth();
 
   // Tag filter pass (runs after search + human filter)
@@ -1325,14 +1466,8 @@ export function refreshFilterBarChrome(app = document.getElementById('app'), rer
   }
 
   const resetBtn = app.querySelector('#search-reset-btn');
-  if (resetBtn) {
-    // (C1442) anyNarrowingFilterActive() covers 5 of the 6 dimensions; the bare
-    // assigneeScope === 'all' (All Tasks, no member ticked) is added back here on purpose —
-    // it isn't a "narrowing" filter (see that helper's comment) but IS a non-default state
-    // the Reset button should still be able to clear.
-    const hasActiveFilters = anyNarrowingFilterActive() || state.assigneeScope === 'all';
-    resetBtn.disabled = !hasActiveFilters;
-  }
+  // (C1442) filtersCanBeCleared(): the five narrowing dimensions plus the bare All Tasks scope.
+  if (resetBtn) resetBtn.disabled = !filtersCanBeCleared();
 }
 
 // Filters affect tier visibility at render time, so a DOM-only pass cannot reveal
@@ -1540,8 +1675,13 @@ export function applyParentSprintFollow(entries) {
 // (TPT660) Failure toast for the board's task writes (status confirm, delete). "Network error"
 // only when the request got no answer (isTransportError); anything the server answered gets
 // `key` with errorDetail(err) — the server's text without Electron's IPC wrapper. Same rule as
-// task-edit-modal.js's _toastWriteFailure.
+// task-edit-modal.js's _toastWriteFailure. (TPT9417) A write the API's task edit rule refused
+// (another member's task — the card's can_edit was stale) names the rule instead of the raw 403.
 function _toastWriteFailure(err, key) {
+  if (isTaskEditRefusal(err)) {
+    showToast(t('task.editLocked'), 'error');
+    return;
+  }
   showToast(t(isTransportError(err) ? 'common.networkError' : key, { msg: errorDetail(err) }), 'error');
 }
 
@@ -2202,13 +2342,7 @@ export async function openTrelloWizard(onLoadAndRender) {
         ta.style.height = 'auto';
         ta.style.height = Math.min(ta.scrollHeight, window.innerHeight * 0.5) + 'px';
         saveDraft(getObjectiveDraftKey(), { text: prompt, height: ta.style.height });
-        ta.focus();
-      }
-      // Emit preview events so chat-ui's thumbnail strip populates (same as paste path)
-      for (const img of uploadedImages) {
-        document.dispatchEvent(new CustomEvent('tiptask:obj-image-preview', {
-          detail: { name: img.name || 'attachment', url: img.url },
-        }));
+        ta.focus(); // (TPT9410) the composer's attachment strip reads the images from this text
       }
       showToast(t('toast.loadedIntoObjective'));
     });
@@ -3255,6 +3389,25 @@ function _findTaskForBulkStart(id) {
   };
 }
 
+// (TPT9417) The selected tasks as `{ id, canEdit }` rows for splitBulkEditable() (bulk-changes.js):
+// a mounted card's data-edit-locked, which renderCard()/refreshCard() keep on the API's can_edit
+// (task-edit-rule.js), else the board snapshot's task. Every bulk change leaves out the tasks it
+// marks view only.
+function _bulkEditRows(ids) {
+  return ids.map((id) => {
+    const card = document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
+    const locked = card ? card.dataset.editLocked === '1' : taskEditLocked(_findTaskForBulkStart(id));
+    return { id, canEdit: !locked };
+  });
+}
+
+// (TPT9417) After a bulk change: how many selected tasks it left alone because this user may not
+// change them — view only up front, or refused by the API's task edit rule at write time — with
+// their keys. A plain (not error) toast: the other tasks were saved.
+function _toastBulkViewOnly(ids) {
+  if (ids.length) showToast(tc('bulk.skippedViewOnly', ids.length, { ids: ids.join(', ') }), undefined, { durationMs: 8000 });
+}
+
 function _patchBulkStartTask(t, body) {
   return api.tasks.update(t.id, body);
 }
@@ -3340,9 +3493,12 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // (TPT9385) Placement is CSS only: no inline width or left offset here. styles.css bounds the
   // bar to the board area right of #left-nav-panel and wraps the .bulk-field units, the
   // .bulk-apply-actions pair and the actions cluster as whole units.
+  // (TPT9417) .bulk-view-only names how many selected tasks this user may not change (the API's
+  // can_edit); every bulk change leaves them out. Hidden while there are none.
   bar.innerHTML = `
     <div class="bulk-group bulk-group--selection">
       <span class="bulk-count"></span>
+      <span class="bulk-view-only" hidden><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.25" y="5.25" width="7.5" height="5.25" rx="1.25"/><path d="M4 5.25V3.75a2 2 0 0 1 4 0v1.5"/></svg><span class="bulk-view-only-text"></span></span>
       <button type="button" class="bulk-clear bulk-btn bulk-btn--ghost" title="${escapeAttr(t('btn.clearSelection'))}" aria-label="${escapeAttr(t('btn.clearSelection'))}"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg><span class="bulk-clear-text">${t('bulk.clear')}</span></button>
     </div>
     <div class="bulk-group bulk-group--edit">
@@ -3372,8 +3528,15 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   });
 
   bar.querySelector('.bulk-delete').addEventListener('click', async () => {
-    const ids = [...state.selectedCardIds];
-    if (!ids.length) return;
+    const selected = [...state.selectedCardIds];
+    if (!selected.length) return;
+    // (TPT9417) View-only tasks are not deleted; the API also refuses a task whose subtree holds
+    // one, so a refusal joins them in the report.
+    const { editable: ids, viewOnly } = splitBulkEditable(_bulkEditRows(selected));
+    if (!ids.length) {
+      showToast(t('bulk.allViewOnly'), 'error');
+      return;
+    }
     const confirmed = await showActionConfirm({
       message: tc('bulk.confirmDelete', ids.length),
       confirmLabel: t('btn.delete'),
@@ -3382,9 +3545,10 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     });
     if (!confirmed) return;
     showSavingIndicator();
+    const refused = [];
     try {
       for (const id of ids) {
-        await api.tasks.delete(id).catch(() => {});
+        await api.tasks.delete(id).catch((err) => { if (isTaskEditRefusal(err)) refused.push(id); });
       }
       state.selectedCardIds.clear();
       updateBulkActionBar();
@@ -3392,6 +3556,7 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     } finally {
       hideSavingIndicator();
     }
+    _toastBulkViewOnly([...viewOnly, ...refused]);
   });
 
   // (TPT9159) Picking a status only stages it; the placeholder option unstages it.
@@ -3487,8 +3652,14 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   bar.querySelector('.btn-bulk-deps').addEventListener('click', () => {
     // (TPT9159) Its save clears the selection, which would drop the staged edits unsaved.
     if (hasBulkChanges(_bulkChanges)) return;
-    const ids = [...state.selectedCardIds];
-    if (!ids.length) return;
+    const selected = [...state.selectedCardIds];
+    if (!selected.length) return;
+    // (TPT9417) Only the tasks this user may change get the new dependencies.
+    const { editable: ids, viewOnly } = splitBulkEditable(_bulkEditRows(selected));
+    if (!ids.length) {
+      showToast(t('bulk.allViewOnly'), 'error');
+      return;
+    }
     showBulkDepsModal(ids, async (picked) => {
       const msg = picked.length
         ? tc('bulk.confirmSetDeps', ids.length, { deps: escapeAttr(picked.join(', ')) })
@@ -3498,13 +3669,14 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
       if (!(await showActionConfirm({ message: msg, confirmLabel: t('btn.confirm'), danger: true, overlayClass: 'modal-overlay--over-board' }))) return;
       showSavingIndicator();
       const failed = [];
+      const refused = [];
       try {
         for (const id of ids) {
           const next = picked.filter(d => d !== id); // belt & braces: no task depends on itself
           try {
             await api.tasks.update(id, { dependencies: next });
-          } catch {
-            failed.push(id);
+          } catch (err) {
+            (isTaskEditRefusal(err) ? refused : failed).push(id);
           }
         }
         state.selectedCardIds.clear();
@@ -3514,6 +3686,7 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
         hideSavingIndicator();
       }
       if (failed.length) showToast(t('bulk.errDepsFailed', { ids: failed.join(', ') }), 'error');
+      _toastBulkViewOnly([...viewOnly, ...refused]);
     });
   });
 
@@ -3527,12 +3700,21 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
   // (TPT9159) Writes every staged field to every selected task in one pass — one PATCH per
   // task carrying all of them — then closes the bar. A locked task (in progress, canceled)
   // keeps its agent and Design mode, as when the agent picker saved on its own.
+  // (TPT9417) A view-only task (the API's can_edit false) gets no PATCH at all (bulkApplyWrites()),
+  // and one the API refuses at write time (its can_edit was stale) is no failure: both are
+  // reported as skipped once the other tasks are saved.
   async function applyBulkChanges() {
     if (_bulkApplying) return;
     bar._flushBulkAssignee?.();
-    const ids = [...state.selectedCardIds];
+    const selected = [...state.selectedCardIds];
     const changes = { ..._bulkChanges };
-    if (!ids.length || !hasBulkChanges(changes)) return;
+    if (!selected.length || !hasBulkChanges(changes)) return;
+    const rows = _bulkEditRows(selected);
+    const ids = splitBulkEditable(rows).editable;
+    if (!ids.length) {
+      showToast(t('bulk.allViewOnly'), 'error');
+      return;
+    }
 
     const needsBypass = bulkCowboyBlockedTaskIds(changes, ids.map(_findTaskForBulkStart), projectPermissionMode());
     if (needsBypass.length) {
@@ -3578,14 +3760,14 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     syncBulkChanges();
     showSavingIndicator();
     const failed = [];
+    const refused = [];
+    const { writes, skipped } = bulkApplyWrites(changes, rows, { priority: newPriority, reassignable, model });
     try {
       // TPT3 — keep each PATCH response: a moved subtask can carry its objective parent
       // along (parentRescheduled), applied to the board below like the child's own move.
       const results = [];
       const saved = [];
-      for (const id of ids) {
-        const body = bulkPatchBody(changes, { priority: newPriority, reassign: reassignable.has(id), model });
-        if (!Object.keys(body).length) continue;
+      for (const { id, body } of writes) {
         try {
           const result = await api.tasks.update(id, body);
           // The API can normalize an enabled scope to Disabled if permissions changed since
@@ -3596,16 +3778,19 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
           }
           results.push(result);
           saved.push(id);
-        } catch {
-          failed.push(id);
+        } catch (err) {
+          (isTaskEditRefusal(err) ? refused : failed).push(id);
         }
       }
       // Nothing saved (offline browser tab, a rejected value): keep the bar and its staged edits
-      // so Apply can be retried; the toast below names the tasks.
+      // so Apply can be retried; the toast below names the tasks. (TPT9417) A refusal means the
+      // board's can_edit is stale: a fresh board marks those cards view only.
       if (!saved.length) {
         _bulkApplying = false;
         syncBulkChanges();
         if (failed.length) showToast(t('bulk.errApplyFailed', { ids: failed.join(', ') }), 'error');
+        _toastBulkViewOnly([...skipped, ...refused]);
+        if (refused.length && _bulkOnLoadAndRender) await _bulkOnLoadAndRender({ forceFresh: true });
         return;
       }
       // Selection Set and card markers go first: renderCard() reads selectedCardIds at markup time.
@@ -3633,12 +3818,13 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
       // snapshot: a desktop-app write broadcasts no task:updated, and a cache entry younger
       // than BOARD_TASK_REFRESH_MIN_AGE_MS could otherwise repaint the pre-Apply values.
       const movedOnly = stagedBulkFields(changes).every(key => key === 'priority');
-      if (_bulkOnLoadAndRender && (needsReload || !movedOnly)) await _bulkOnLoadAndRender({ forceFresh: true });
+      if (_bulkOnLoadAndRender && (needsReload || !movedOnly || refused.length)) await _bulkOnLoadAndRender({ forceFresh: true });
     } finally {
       _bulkApplying = false;
       hideSavingIndicator();
     }
     if (failed.length) showToast(t('bulk.errApplyFailed', { ids: failed.join(', ') }), 'error');
+    _toastBulkViewOnly([...skipped, ...refused]);
   }
 
   // (TPT9159) Picking an agent only stages it; the "Change agent…" option unstages it. A
@@ -3852,9 +4038,19 @@ export function initBulkActionBar(onLoadAndRender, opts = {}) {
     designMode.hidden = _bulkChanges.agent !== 'claude';
     designModeInput.checked = _bulkChanges.claudeDesignMode === true;
     designMode.classList.toggle('is-checked', designModeInput.checked);
+    // (TPT9417) The selection's view-only tasks (the API's can_edit false): the bar names how many,
+    // and with nothing else selected Apply has nothing it could save.
+    const selected = [...state.selectedCardIds];
+    const { editable, viewOnly } = splitBulkEditable(_bulkEditRows(selected));
+    const allViewOnly = selected.length > 0 && editable.length === 0;
+    const viewOnlyChip = bar.querySelector('.bulk-view-only');
+    viewOnlyChip.hidden = viewOnly.length === 0;
+    bar.querySelector('.bulk-group--selection').classList.toggle('has-view-only', viewOnly.length > 0);
+    viewOnlyChip.querySelector('.bulk-view-only-text').textContent = t('bulk.viewOnly', { n: viewOnly.length });
+    viewOnlyChip.title = viewOnly.length ? tc('bulk.viewOnlyHint', viewOnly.length) : '';
     const apply = bar.querySelector('.btn-bulk-apply');
-    apply.disabled = !dirty || _bulkApplying;
-    apply.title = dirty ? t('bulk.applyHint') : t('bulk.applyIdle');
+    apply.disabled = !dirty || _bulkApplying || allViewOnly;
+    apply.title = allViewOnly ? t('bulk.allViewOnly') : dirty ? t('bulk.applyHint') : t('bulk.applyIdle');
     bar.querySelector('.btn-bulk-reset').hidden = !dirty;
     for (const btn of bar.querySelectorAll('.btn-bulk-start, .btn-bulk-deps')) {
       if (dirty) {
@@ -5940,6 +6136,9 @@ const _SETTINGS_TEXT = [
   ['settings-memory-tab-btn', 'settings.memory.tab'],
   ['settings-vcs-tab-btn', 'settings.vcs.tab'],
   ['settings-profile-title', 'profile.title'],
+  ['settings-policy-title', 'policy.sectionTitle'],
+  ['settings-policy-label', 'policy.label'],
+  ['settings-policy-hint', 'policy.hint'],
   ['settings-display-title', 'settings.sectionDisplay'],
   ['settings-language-label', 'settings.language'],
   ['settings-language-note', 'settings.projectWide'],
@@ -6057,6 +6256,8 @@ function applyThemeClass(val) {
     if (val) localStorage.setItem('tiptask-theme', val);
     else localStorage.removeItem('tiptask-theme');
   } catch { /* ignore */ }
+  // (TPT9422) The project's brand accent tokens are derived against the painted palette.
+  paintBrandAccents();
 }
 
 // Read theme from the local project config only (Electron: IPC; browser: HTTP GET).
@@ -6078,10 +6279,36 @@ async function _readLocalConfigTheme() {
   return '';
 }
 
+// (TPT9422) Brand colors from the local mirror: the account's cached identity, served with the
+// project config (no API round trip). null = unknown (no mirror yet, or no project config).
+async function _readLocalConfigBrandColors() {
+  try {
+    if (window.electronAPI?.api) {
+      const ctx = await window.electronAPI.api.project.config();
+      return Array.isArray(ctx?.config?.brandColors) ? ctx.config.brandColors : null;
+    }
+    const r = await fetch('/api/project-config', { cache: 'no-store' });
+    if (r.ok) {
+      const data = await r.json();
+      return Array.isArray(data.config?.brandColors) ? data.config.brandColors : null;
+    }
+  } catch { /* ignore — the API read below still answers */ }
+  return null;
+}
+
+// One api.project.settings() read for the callers that start together (applyProjectTheme()'s
+// theme and brand colors); the next call reads again.
+let _projectSettingsRead = null;
+function _readProjectSettings() {
+  _projectSettingsRead ??= Promise.resolve().then(() => api.project.settings())
+    .finally(() => { _projectSettingsRead = null; });
+  return _projectSettingsRead;
+}
+
 // Project color_scheme wins unless 'default'; fall back to local config. Never throws.
 async function readProjectTheme() {
   try {
-    const settings = await api.project.settings();
+    const settings = await _readProjectSettings();
     const scheme = settings?.colorScheme;
     if (scheme && scheme !== 'default') return scheme;
   } catch { /* ignore — fall through to local config */ }
@@ -6143,11 +6370,34 @@ async function setTheme(val) {
 // Called once on init, again on every project switch, and on every Settings-modal open
 // (C1305 — so opening Settings re-syncs with a color_scheme changed elsewhere, e.g. the
 // web app or another Task App instance). Never writes.
+// (TPT9422) It also paints the project's brand colors as the window's accents.
 export async function applyProjectTheme() {
+  const brand = applyProjectBrandAccents();
   const val = await readProjectTheme();
   applyThemeClass(val);
   const sel = document.getElementById('settings-theme-select');
   if (sel) sel.value = _normalizeTheme(val); // see setTheme()'s comment above
+  await brand;
+}
+
+// (TPT9422) The project's brand colors as the window's accent colors (brand-accents.js): first
+// what was last painted for this project, then the local mirror's colors, then the API's
+// identity.brand_colors, which replace them. Only the newest call paints; a null answer
+// (unknown) keeps what is painted. template.html also calls it at init and right after a project
+// switch binds, ahead of the reads that wait on the API. Never writes.
+let _brandAccentRead = 0;
+export async function applyProjectBrandAccents() {
+  const read = ++_brandAccentRead;
+  followBrandProject();
+  let answered = false;
+  _readLocalConfigBrandColors().then(colors => {
+    if (read === _brandAccentRead && !answered && colors) setBrandColors(colors);
+  });
+  const colors = await _readProjectSettings().then(settings => settings?.brandColors ?? null, () => null);
+  if (read === _brandAccentRead && Array.isArray(colors)) {
+    answered = true;
+    setBrandColors(colors);
+  }
 }
 
 // Read this project's saved `boardFilters` from project config (Electron: IPC,
@@ -7969,6 +8219,12 @@ export function initSettingsModal() {
   _settingsModalWired = true;
   document.addEventListener('tiptask:policy-conflict', () => {
     if (document.getElementById('settings-modal')?.classList.contains('open')) openSettingsModal();
+  });
+  // (TPT9409) The owner saved new policy rules (project-policy-modal.js): every locked row and
+  // its value may have changed, and so may the project's language or theme.
+  document.addEventListener('tiptask:policy-saved', () => {
+    if (document.getElementById('settings-modal')?.classList.contains('open')) openSettingsModal();
+    applyProjectLanguage().catch(() => {});
   });
   // (C1199) Fire at boot, independent of whether #settings-modal markup exists — mics on the
   // board (New Task title/desc, New Objective chat input, any open terminal) need their

@@ -1709,6 +1709,35 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
       return;
     }
 
+    // Settings ▸ Policy editor (project-policy-modal.js): replace the project owner's rule
+    // layer. Body { rules, base }; the API itself allows only the project owner.
+    if (req.method === 'PUT' && urlPath === '/api/project/policy') {
+      const body = await readTextBody(req, res);
+      if (body === null) return;
+      let parsed;
+      try { parsed = JSON.parse(body); } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+      if (typeof backend.saveOwnerPolicy !== 'function') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Project policy requires API backend' }));
+      }
+      try {
+        const policy = await backend.saveOwnerPolicy(parsed?.rules, {
+          base: parsed?.base, expectedContext: req.headers['x-tipatask-settings-context'],
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ policy }));
+      } catch (err) {
+        // Same message the IPC route throws, so the editor reads one shape on both transports.
+        const error = err.code === 'policy_conflict' && err.field ? `policy_conflict:${err.field}` : err.message;
+        res.writeHead(err.statusCode || 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error }));
+      }
+      return;
+    }
+
     if (req.method === 'GET' && urlPath === '/api/project/settings') {
       const project = typeof backend.getProjectSettings === 'function' ? await backend.getProjectSettings() : null;
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store' });
@@ -1762,6 +1791,10 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         // dialog (task-permission-mode.js) through group-label.js's settings bundle.
         agentPermissionMode: ['plan', 'always_ask', 'accept_edits', 'auto', 'bypass'].includes(project?.agent_permission_mode)
           ? project.agent_permission_mode : null,
+        // TPT9422 — the project identity's 0–3 brand colors, which the window paints as its
+        // accent colors (brand-accents.js); [] = none selected, null = identity unknown (no
+        // project, or an offline row without identity), so the window keeps what it painted.
+        brandColors: require('../brand-colors.mjs').identityBrandColors(project?.identity),
       }));
     }
 
@@ -2230,7 +2263,9 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         }
         patch[field] = parsed[field];
       }
-      for (const field of ['display_initials', 'brand_color', 'logo']) {
+      // TPT9422 — brand_colors (0–3 #RRGGBB, [] = none) replaces the single brand_color; the
+      // API validates both.
+      for (const field of ['display_initials', 'brand_color', 'brand_colors', 'logo']) {
         if (Object.hasOwn(parsed, field)) patch[field] = parsed[field];
       }
       if (parsed.agent_permission_mode !== undefined) {
@@ -3514,7 +3549,10 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         // api-backend.js's _rawUpdateTask()'s `_parentRescheduled` meta field. `undefined`
         // when absent (no cascade fired, or the offline-queued `fresh` re-fetch above never
         // carries it) drops out of JSON.stringify on its own — no `if (…) {}` needed here.
-        res.end(JSON.stringify({ ok: true, id, status: fresh.status, description: fresh.description, title: fresh.title, priority: fresh.priority, tags: fresh.tags, order: fresh.order, assignee: fresh.assignee, agentAssignee: fresh.agentAssignee, claudeModel: fresh.claudeModel, codexModel: fresh.codexModel, piModel: fresh.piModel, effort: fresh.effort ?? null, agentPermissionMode: fresh.agentPermissionMode ?? null, claudeDesignMode: fresh.claudeDesignMode, cowboyMode: fresh.cowboyMode, dependencies: fresh.dependencies, dbId: fresh.dbId, parentDbId: fresh.parentDbId, parentRescheduled: fresh._parentRescheduled }));
+        // (TPT9417) canEdit — the API's task edit rule answer after this write (a reassignment can
+        // change it); refreshCard() locks or unlocks the card's status select from it. Absent when
+        // the API sends no can_edit, which leaves the card as it was.
+        res.end(JSON.stringify({ ok: true, id, status: fresh.status, description: fresh.description, title: fresh.title, priority: fresh.priority, tags: fresh.tags, order: fresh.order, assignee: fresh.assignee, agentAssignee: fresh.agentAssignee, claudeModel: fresh.claudeModel, codexModel: fresh.codexModel, piModel: fresh.piModel, effort: fresh.effort ?? null, agentPermissionMode: fresh.agentPermissionMode ?? null, claudeDesignMode: fresh.claudeDesignMode, cowboyMode: fresh.cowboyMode, dependencies: fresh.dependencies, dbId: fresh.dbId, parentDbId: fresh.parentDbId, parentRescheduled: fresh._parentRescheduled, canEdit: fresh.canEdit }));
         // (C1259) Project-scoped when the client's project is known (Electron: main.js's
         // onBeforeSendHeaders injects x-tipatask-project on every request automatically, no
         // client change needed — see resolveBackend() above) — a card update now sends one
@@ -3526,8 +3564,11 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         // that one browser-mode case narrows the broadcast too, same as Electron.
         websocket.emitTaskUpdated(fresh, { assigneeChanged: assignee !== undefined, agentAssigneeChanged: agent_assignee !== undefined }, req.headers['x-tipatask-project']);
       } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
+        // (TPT9417) The API's task edit rule refusal keeps its 403 and code, so the board and the
+        // edit modal name the reason (client/task-edit-rule.js isTaskEditRefusal()).
+        const refused = err?.code === 'task_role_rank';
+        res.writeHead(refused ? 403 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(refused ? { error: err.message, code: err.code } : { error: err.message }));
       }
       return;
     }
@@ -3545,8 +3586,10 @@ function createHttpHandler(sessions, getActiveBackend, registryOps = null) {
         res.end(JSON.stringify({ ok: true, id }));
         websocket.emitTaskDeleted(id, req.headers['x-tipatask-project']); // (C1259) project-scoped — see PATCH handler above
       } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
+        // (TPT9417) Same as PATCH: the task edit rule refusal keeps its 403 and code.
+        const refused = err?.code === 'task_role_rank';
+        res.writeHead(refused ? 403 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(refused ? { error: err.message, code: err.code } : { error: err.message }));
       }
       return;
     }

@@ -174,3 +174,35 @@ test('expired JWT stays hard-latched — never re-verified, no request reaches t
     }
   );
 });
+
+// (TPT9415) The API refuses a write to another member's task (same or higher role) with
+// 403 { error: 'forbidden', reason: 'task_role_rank' }. That is a business rule on an
+// authenticated request: the write fails, the session stays connected, nothing is queued.
+test('a task_role_rank 403 fails the write without latching the session', () => withFakeApi(
+  'opaque-token',
+  (req, res) => {
+    if (req.method === 'GET' && req.url.endsWith('/tasks')) return json(res, 200, { tasks: [] });
+    if (req.method === 'DELETE' && req.url.endsWith('/tasks/TST1')) {
+      return json(res, 403, { error: 'forbidden', reason: 'task_role_rank', blocked_by: ['TST1'] });
+    }
+    if (req.method === 'GET' && req.url.endsWith('/sprints')) return json(res, 200, { sprints: [] });
+    return json(res, 404, {});
+  },
+  async (projectRoot) => {
+    const backend = createApiBackend(null, projectRoot);
+    const states = [];
+    backend.onConnectionStateChange((s) => states.push(s));
+    await backend.init();
+    await assert.rejects(backend.deleteTask('TST1'), (err) => {
+      assert.equal(err.statusCode, 403);
+      assert.equal(err.forbidden, true);
+      assert.deepEqual(err.body, { error: 'forbidden', reason: 'task_role_rank', blocked_by: ['TST1'] });
+      assert.equal(err.networkError, undefined);
+      return true;
+    });
+    assert.equal(backend.getConnectionState(), 'connected');
+    assert.deepEqual(states, ['connected']);
+    // The next request still reaches the API.
+    assert.deepEqual(await backend.getSprints(), []);
+  }
+));

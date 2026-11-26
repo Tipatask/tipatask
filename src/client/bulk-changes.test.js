@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   hasBulkChanges, stagedBulkFields, stageBulkField, stageBulkAgent, stageBulkModel, stageBulkEffort, stageBulkDesignMode, resolveBulkAgentModel,
   bulkPatchBody, bulkCowboyBlockedTaskIds, agentHasEffort, BULK_MODEL_FIELDS, BULK_EFFORT_AGENTS,
+  splitBulkEditable, bulkApplyWrites,
 } from './bulk-changes.js';
 import { CODEX_MODELS, CLAUDE_MODELS, EFFORT_LEVELS, normalizeAgentModels } from './constants.js';
 
@@ -359,4 +360,42 @@ test('mixed inherited Bypass and explicit Plan or Auto reports only the blocking
   assert.deepEqual(bulkCowboyBlockedTaskIds({ cowboyScope: 'related' }, tasks, 'bypass'), ['plan']);
   tasks.push({ id: 'auto', agent_permission_mode: 'auto' });
   assert.deepEqual(bulkCowboyBlockedTaskIds({ cowboyScope: 'project' }, tasks, 'bypass'), ['plan', 'auto']);
+});
+
+// (TPT9417) The API's task edit rule: a selected task whose canEdit (the API's can_edit) is false
+// gets no Apply write and comes back as skipped; a task without the flag (an older API) is written.
+test('splitBulkEditable separates view-only tasks in selection order', () => {
+  const tasks = [
+    { id: 'A', canEdit: true }, { id: 'X', canEdit: false }, { id: 'B' },
+    { id: 'Y', canEdit: false }, { id: 'C', canEdit: null }, { canEdit: false }, null,
+  ];
+  assert.deepEqual(splitBulkEditable(tasks), { editable: ['A', 'B', 'C'], viewOnly: ['X', 'Y'] });
+  assert.deepEqual(splitBulkEditable([]), { editable: [], viewOnly: [] });
+  assert.deepEqual(splitBulkEditable(undefined), { editable: [], viewOnly: [] });
+});
+
+test('bulkApplyWrites leaves view-only tasks out of the Apply body and reports them as skipped', () => {
+  const tasks = [{ id: 'A', canEdit: true }, { id: 'X', canEdit: false }, { id: 'B' }, { id: 'Y', canEdit: false }];
+  const changes = stageBulkField({}, 'status', 'completed');
+  const { writes, skipped } = bulkApplyWrites(changes, tasks);
+  assert.deepEqual(writes, [{ id: 'A', body: { status: 'completed' } }, { id: 'B', body: { status: 'completed' } }]);
+  assert.deepEqual(skipped, ['X', 'Y']);
+  assert.ok(!writes.some(write => write.id === 'X' || write.id === 'Y'), 'a view-only task gets no PATCH');
+});
+
+test('bulkApplyWrites keeps the sprint, agent lock and model rules of bulkPatchBody for the editable tasks', () => {
+  const tasks = [{ id: 'A', canEdit: true }, { id: 'L', canEdit: true }, { id: 'X', canEdit: false }];
+  let changes = stageBulkAgent({}, 'claude');
+  changes = stageBulkField(changes, 'status', 'on_fire');
+  const { writes, skipped } = bulkApplyWrites(changes, tasks, { priority: 0, reassignable: new Set(['A']), model: 'claude-opus-5' });
+  assert.deepEqual(writes, [
+    { id: 'A', body: { sprint_id: null, status: 'on_fire', agent_assignee: 'claude', claude_model: 'claude-opus-5', claude_design_mode: false } },
+    // Agent-locked (in progress, canceled): every staged field except the agent.
+    { id: 'L', body: { sprint_id: null, status: 'on_fire' } },
+  ]);
+  assert.deepEqual(skipped, ['X']);
+  // Every selected task view only: nothing to write.
+  assert.deepEqual(bulkApplyWrites(changes, [{ id: 'X', canEdit: false }]), { writes: [], skipped: ['X'] });
+  // An agent-only change on an agent-locked task has nothing to save, so no empty PATCH either.
+  assert.deepEqual(bulkApplyWrites(stageBulkAgent({}, 'codex'), [{ id: 'L' }], { reassignable: new Set() }), { writes: [], skipped: [] });
 });

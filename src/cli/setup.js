@@ -804,7 +804,10 @@ async function createApiProject({ apiBaseUrl, token, name, description, projectP
   const { status, data } = await request(`${apiBaseUrl}/api/projects`, {
     headers: { Authorization: `Bearer ${token}` },
     body: { name, description: description || undefined, projectPresets, ...acknowledged,
-      display_initials: identity.display_initials, brand_color: identity.brand_color, logo: identity.logo },
+      display_initials: identity.display_initials, logo: identity.logo,
+      // TPT9422 — the identity form sends the 0–3 color list; a single brand_color is the
+      // older form's. The API refuses both together when they disagree.
+      ...(Array.isArray(identity.brand_colors) ? { brand_colors: identity.brand_colors } : { brand_color: identity.brand_color }) },
   });
   if (status >= 400) {
     throw new Error(`Failed to create project: ${JSON.stringify(data)}`);
@@ -816,6 +819,24 @@ async function createApiProject({ apiBaseUrl, token, name, description, projectP
     throw new Error(`Project #${project.id} was created, but the API did not save the selected work presets. Check the API version before continuing setup.`);
   }
   return project;
+}
+
+/**
+ * Replace a project's owner policy layer (`PUT /api/projects/:id/policy`, the project owner
+ * only). The project creation wizard sends the rules its creator set right after the project
+ * exists; the API refuses a rule that conflicts with a company mandate.
+ */
+async function saveProjectOwnerPolicy({ apiBaseUrl, token, projectId, rules }) {
+  const { status, data } = await request(`${apiBaseUrl}/api/projects/${Number(projectId)}/policy`, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${token}` },
+    body: { rules },
+  });
+  if (status >= 400) {
+    const reason = data && typeof data === 'object' && data.error ? data.error + (data.field ? ` (${data.field})` : '') : `HTTP ${status}`;
+    throw new Error(`Policy rules were not saved: ${reason}`);
+  }
+  return data;
 }
 
 /**
@@ -1374,4 +1395,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { registerDevice, createApiProject, associateDeviceProject, initializeProjectSettings, analyzeSetupState, runSyncSetupStep, configureMcpServers, readEnv };
+module.exports = { registerDevice, createApiProject, saveProjectOwnerPolicy, associateDeviceProject, initializeProjectSettings, analyzeSetupState, runSyncSetupStep, configureMcpServers, readEnv };

@@ -1734,6 +1734,7 @@ function registerIpcHandlers() {
       // 2. Project ID
       const { selectedPresetIds, copyTemplates, callSeedPresetTasks, presetConfigFields, presetSeedsTasks, COMPOSE_PRESET } = require('./src/server/project-seeder');
       let projectId;
+      let policyError = null;
       const projectPresets = apiProject.isNew ? (apiProject.projectPresets ?? ['software']) : selectedPresetIds(apiProject.projectPresets);
       if (apiProject.isNew) {
         const proj = await createApiProject({
@@ -1741,6 +1742,18 @@ function registerIpcHandlers() {
           identity: apiProject.identity, settings: apiProject.settings,
         });
         projectId = proj.id;
+        // (TPT9409) The creator's own policy rules, set in the wizard's policy dialog. The
+        // project exists either way: a refused save is reported to the renderer, not a failed
+        // creation, and the owner can set the rules again in Settings ▸ Policy.
+        const ownerRules = apiProject.ownerRules && typeof apiProject.ownerRules === 'object' ? apiProject.ownerRules : {};
+        if (Object.keys(ownerRules).length) {
+          try {
+            await require('./src/cli/setup').saveProjectOwnerPolicy({ apiBaseUrl, token: userToken, projectId, rules: ownerRules });
+          } catch (err) {
+            console.warn('[wizard] owner policy save failed:', err.message);
+            policyError = err.message;
+          }
+        }
       } else {
         projectId = apiProject.id;
       }
@@ -1849,7 +1862,7 @@ function registerIpcHandlers() {
         console.warn('[codex-config] wizard write failed:', e.message);
       }
 
-      return { ok: true, projectPath, presetSeed };
+      return { ok: true, projectPath, presetSeed, policyError };
     } catch (err) {
       console.error('[wizard] project:create-from-wizard failed:', err.message);
       return { ok: false, error: err.message };

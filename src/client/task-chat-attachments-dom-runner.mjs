@@ -3,7 +3,8 @@
 // from node:test globals. Each path inserts its image reference at the composer's caret; the
 // board socket's blob-to-URL swap keeps the caret where it was, so the next image goes in after
 // the last one instead of at the end of the text; a failed upload's placeholder goes and the caret
-// stays. The sent turn shows each image inline, where it was inserted — live and restored.
+// stays. The sent turn shows each image where it was inserted, on lines of its own (TPT9411), linked
+// to the chat's file viewer — live and restored.
 // (TPT9361) The Embed pickers take several files at once, and Send waits for every upload.
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -25,6 +26,12 @@ for (const key of ['window', 'self']) Object.defineProperty(globalThis, key, { v
 Object.defineProperty(globalThis, 'navigator', { value: window.navigator, configurable: true });
 globalThis.requestAnimationFrame ??= callback => setTimeout(callback, 0);
 globalThis.cancelAnimationFrame ??= handle => clearTimeout(handle);
+
+// Node's (and so happy-dom's) blob URLs carry no origin (`blob:nodedata:…`); a browser's carry the
+// page's, which the composer's attachment strip checks before showing an image as uploading.
+let blobSeq = 0;
+URL.createObjectURL = () => `blob:http://localhost:4455/${String(++blobSeq).padStart(8, '0')}-0000-4000-8000-000000000000`;
+URL.revokeObjectURL = () => {};
 
 // The upload helper reads the pasted file as a data URL; node has no FileReader.
 globalThis.FileReader = class {
@@ -130,6 +137,14 @@ try {
   const blobA = BLOB_REF_RE.exec(input.value)[1];
   assert.equal(input.value, `Look at this chart ![img](${blobA})and tell me why it dips`, 'pasted at the caret');
   assert.equal(send.disabled, true, 'Send waits for the upload');
+  // (TPT9410) The composer's attachment strip, between the input and its actions, shows the image
+  // still uploading.
+  const strip = query('.task-chat-composer > .attachment-strip');
+  assert.equal(strip.previousElementSibling === input && strip.nextElementSibling === query('.task-chat-actions'), true);
+  const stripTiles = () => [...strip.querySelectorAll('.attachment-tile')];
+  assert.equal(strip.hidden, false);
+  const tileA = stripTiles()[0];
+  assert.equal(tileA.classList.contains('attachment-tile--pending'), true);
   await settle();
   assert.equal(lastUpload().blobUrl, blobA);
   assert.equal(lastUpload().taskKey, 'TPT1', 'a task chat links the image to its task');
@@ -139,6 +154,9 @@ try {
   assert.equal(input.value, `Look at this chart ${refA}and tell me why it dips`);
   assert.deepEqual(caret(input), [afterChart + refA.length, afterChart + refA.length], 'the swap keeps the caret');
   assert.equal(send.disabled, false);
+  assert.equal(stripTiles()[0] === tileA, true, 'the placeholder tile carries on as the image');
+  assert.equal(tileA.classList.contains('attachment-tile--pending'), false);
+  assert.equal(tileA.dataset.key, '/api/images/2/77');
 
   // 2. Embed ▸ Image goes in at that caret: right after the first image, not at the end.
   query('.task-chat-embed-slot .embed-menu-trigger').click();
@@ -172,24 +190,32 @@ try {
   assert.equal(input.value, content);
   assert.deepEqual(caret(input), Array(2).fill(beforeWhy + refC.length));
 
-  // 4. Send: the turn carries the references, and shows every image where it was inserted.
+  assert.deepEqual(stripTiles().map(tile => tile.dataset.key), ['/api/images/2/77', '/api/images/2/78', '/api/images/2/79']);
+
+  // 4. Send: the turn carries the references, and shows every image where it was inserted: a block
+  // of its own lines (TPT9411), its text around it without the blanks that touched it.
   send.click();
+  assert.equal(strip.hidden, true, 'the sent text takes its tiles along');
+  assert.equal(stripTiles().length, 0);
+  console.log('TPT9410_TASK_CHAT_STRIP_PASS');
   assert.deepEqual(chat.sent.at(-1), { type: 'task-chat-message', content, model: 'claude:sonnet' });
-  const nodes = bubble => [...bubble.querySelector('.task-chat-user-text').childNodes].map(n => (n.nodeType === 3
-    ? n.textContent
-    : `${n.tagName.toLowerCase()}.${[...n.classList].join('.')}>${n.querySelector('img').getAttribute('src')}`));
+  const nodes = bubble => [...bubble.querySelector('.task-chat-user-text').childNodes].map((n) => {
+    if (n.nodeType === 3) return n.textContent;
+    const link = n.querySelector(':scope > a.md-image-link');
+    return `${n.tagName.toLowerCase()}.${[...n.classList].join('.')}>${link ? 'a.md-image-link>' : ''}${n.querySelector('img').getAttribute('src')}`;
+  });
   const expected = [
-    'Look at this chart ',
-    'a.file-attachment-link.task-chat-inline-image>/api/images/2/77',
-    'a.file-attachment-link.task-chat-inline-image>/api/images/2/78',
-    'and tell me ',
-    'a.file-attachment-link.task-chat-inline-image>/api/images/2/79',
+    'Look at this chart',
+    'span.md-image>a.md-image-link>/api/images/2/77',
+    'span.md-image>a.md-image-link>/api/images/2/78',
+    'and tell me',
+    'span.md-image>a.md-image-link>/api/images/2/79',
     'why it dips',
   ];
   const live = [...document.querySelectorAll('.task-chat-msg--user')].at(-1);
-  assert.deepEqual(nodes(live), expected, 'live: each image inline, in order');
-  assert.equal(live.querySelector('.task-chat-attachments'), null, 'no thumbnail strip');
+  assert.deepEqual(nodes(live), expected, 'live: each image on lines of its own, in order');
   assert.equal(live.querySelector('img').getAttribute('alt'), 'Image');
+  assert.equal(live.querySelector('img').getAttribute('loading'), 'lazy');
   chat.frame({ type: 'objective-result', content: 'It dips on Mondays.' });
   chat.frame({ type: 'chat-ready' });
   await settle();
@@ -218,7 +244,7 @@ try {
   await settle();
   const restored = [...document.querySelectorAll('.task-chat-msg--user')];
   assert.equal(restored.length, 1);
-  assert.deepEqual(nodes(restored[0]), expected, 'restored: each image inline, in order');
+  assert.deepEqual(nodes(restored[0]), expected, 'restored: each image on lines of its own, in order');
 
   // 7. (TPT9361) Both pickers take several files at once: each one uploads on its own, every
   // reference lands, and Send waits for the last upload.
@@ -252,6 +278,8 @@ try {
   await settle();
   assert.deepEqual(fileUploads.map(f => f.filename), ['a.txt', 'b.txt']);
   assert.equal(send.disabled, false);
+  assert.deepEqual(stripTiles().map(tile => tile.querySelector('.attachment-tile-name')?.textContent ?? tile.dataset.key),
+    ['/api/images/2/90', '/api/images/2/91', '/api/images/2/92', 'a.txt', 'b.txt']);
   assert.match(input.value, /\[a\.txt\]\(http:\/\/127\.0\.0\.1:4454\/api\/projects\/2\/files\/1\)/);
   assert.match(input.value, /\[b\.txt\]\(http:\/\/127\.0\.0\.1:4454\/api\/projects\/2\/files\/2\)/);
   // Two links from one reply. A slow attachment must fill only its original tab, and
@@ -284,7 +312,8 @@ try {
   assert.deepEqual(tabs().map(tab => tab.title), ['a.txt', 'reports/check.sql']);
   assert.equal(tabs()[1].getAttribute('aria-selected'), 'true');
   assert.equal(query('.preview-drawer-panel:not([hidden]) code').textContent, 'select 1;\nselect 2;');
-  query('.task-chat-attach--file').click();
+  // (TPT9411) The user turn's file chip, in its text, opens in the viewer too.
+  query('.task-chat-msg--user .task-chat-user-text > a.file-attachment-link').click();
   assert.equal(query('.preview-drawer-panel:not([hidden]) code').textContent, 'Attached notes');
   assert.equal(requests.filter(url => url === '/api/files/2/1').length, 1);
   input.value = 'Keep going';

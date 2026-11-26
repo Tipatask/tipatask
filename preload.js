@@ -268,6 +268,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       // (C1235) Project scalars from the remote API row (today: taskGroupLabel).
       settings: () => inv('api:project.settings'),
       profile: () => inv('api:project.profile'),
+      // Settings ▸ Policy editor: replace the project owner's rule layer.
+      savePolicy: (rules, base, expectedContext) => inv('api:project.savePolicy', { rules, base, expectedContext }),
       // (TPT659) The key the API would allocate next for a category — New Task Preview badge.
       nextTaskKey: (category) => inv('api:project.nextTaskKey', { category }),
       // (C1271) Write project scalars (language/task_group_label) — per-window backend,

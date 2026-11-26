@@ -13,6 +13,7 @@
 import { renderAgentSelect, loadAgents, piCredentialsMissing, computePiSaveRows, getAgentDisplayLabel } from './agent-select.js';
 import { recheckAgents } from './agent-recheck.js';
 import { identityMarkup, policyMarkup, renderSetupProfile } from './project-profile.js';
+import { openProjectPolicyModal, policySummary } from './project-policy-modal.js';
 import { headerHtml, fitHeaderPath, escapeHtml as _esc } from './setup-modal-header.js';
 import { DEFAULT_API_BASE_URL } from './constants.js';
 import { activateDialogFocus } from './dialog-focus.js';
@@ -79,12 +80,16 @@ let _userInfo = null;
 let _apiProject = null;
 let _profile = null;
 let _identityDraft = {};
+// (TPT9409) A new project's own policy rules, set in the policy dialog on the profile step and
+// saved right after the project is created (main.js project:create-from-wizard).
+let _ownerRules = {};
 let _targetKey = null;
 
 function resetProjectChoices(key) {
   _targetKey = key;
   _profile = null;
   _identityDraft = {};
+  _ownerRules = {};
   _taskAgent = '';
   _availableAgents = [];
   _piModels = [{ model: '', apiKey: '' }];
@@ -162,6 +167,43 @@ function _renderProgress() {
 // (TPT9388) Every step opens the same way: its heading, then an optional hint under it. `aside`
 // sits at the far end of the heading row (Work presets' Select all). The heading's id labels the
 // step's own field or card group; the hint's id describes it.
+// (TPT9409) A new project's policy as it will start: the company mandates, then the rules its
+// creator set here (a company mandate wins on a field both set).
+function _draftPolicy() {
+  const policy = _profile?.policy || { rules: {} };
+  const companyRules = Object.fromEntries(Object.entries(policy.rules || {})
+    .filter(([, rule]) => rule.source === 'company').map(([field, rule]) => [field, rule.value]));
+  const ownerRules = Object.fromEntries(Object.entries(_ownerRules).map(([field, value]) => [field, { value, source: 'owner' }]));
+  return { ...policy, company_rules: companyRules, owner_rules: { ..._ownerRules },
+    rules: { ...ownerRules, ...Object.fromEntries(Object.entries(policy.rules || {}).filter(([, rule]) => rule.source === 'company')) } };
+}
+
+// The profile step's "Project owner rules" row: the rules by name and a button to the policy
+// dialog, which keeps them as a draft here instead of saving them.
+function _paintOwnerRules(container) {
+  const slot = container.querySelector('.setup-modal-owner-rules');
+  if (!slot || !_profile) return;
+  const owned = { rules: Object.fromEntries(Object.keys(_ownerRules).map(field => [field, { value: _ownerRules[field], source: 'owner' }])) };
+  slot.hidden = false;
+  slot.innerHTML = `<div class="setup-modal-owner-rules-text"><strong id="wiz-owner-rules-label">${_esc(t('policy.ownerRules'))}</strong>
+      <span id="wiz-owner-rules-summary">${_esc(policySummary(owned))}</span></div>
+    <button type="button" class="setup-modal-btn setup-modal-btn--secondary" id="wiz-owner-rules-btn"
+      aria-describedby="wiz-owner-rules-label wiz-owner-rules-summary">${_esc(t('policy.edit'))}</button>`;
+  slot.querySelector('#wiz-owner-rules-btn').onclick = () => openProjectPolicyModal({
+    profile: { policy: _draftPolicy(), policyEditable: true },
+    save: async rules => {
+      _ownerRules = { ...rules };
+      return { policy: _draftPolicy() };
+    },
+    // After the dialog has closed: repaint the row and keep keyboard focus on its button.
+    onSaved: () => {
+      if (!slot.isConnected) return;
+      _paintOwnerRules(container);
+      slot.querySelector('#wiz-owner-rules-btn')?.focus();
+    },
+  });
+}
+
 function stepHead(heading, { hint = '', hintHtml = '', aside = '', center = false } = {}) {
   const hintMarkup = hintHtml || _esc(hint);
   return `
@@ -328,9 +370,10 @@ function _renderStep() {
   else if (_step === 2) _renderStep2(body, footer);
   else if (_step === 'profile') {
     // The shared profile renderer fills its own host, so the step's heading stays above it.
-    body.innerHTML = stepHead(t('profile.title'), { hint: t('wizard.profileHint') }) + '<div class="setup-modal-profile"></div>';
+    body.innerHTML = stepHead(t('profile.title'), { hint: t('wizard.profileHint') }) + '<div class="setup-modal-profile"></div>'
+      + (_apiProject?.isNew ? '<div class="setup-modal-owner-rules" hidden></div>' : '');
     renderSetupProfile({ body: body.querySelector('.setup-modal-profile'), footer, prefix: 'wiz', baseUrl: _apiBaseUrl,
-      token: _userToken, project: _apiProject, draft: _identityDraft, loaded: profile => { _profile = profile; },
+      token: _userToken, project: _apiProject, draft: _identityDraft, loaded: profile => { _profile = profile; _paintOwnerRules(body); },
       back: () => _move(-1), next: () => _move(1) });
   }
   else if (_step === 3) _renderStep3(body, footer);
@@ -826,7 +869,7 @@ function _renderConfirm(body, footer) {
       ${modelRow}
       ${presetRow}
     </table>
-    ${policyMarkup(_profile?.policy)}
+    ${policyMarkup(existing ? _profile?.policy : _draftPolicy())}
     <div class="setup-modal-msg" id="wiz-confirm-msg"></div>
   `;
 
@@ -845,8 +888,10 @@ function _renderConfirm(body, footer) {
       userInfo: _userInfo,
       apiProject: {
         ..._apiProject, projectPresets: [...projectPresets],
-        ...(!existing && { identity: { ..._identityDraft },
-          settings: Object.fromEntries(Object.entries(_profile.policy.rules).map(([field, rule]) => [field, rule.value])) }),
+        // A new project starts with the values its own rules lock (company mandates win), and
+        // ownerRules is saved as its owner policy layer once the project exists.
+        ...(!existing && { identity: { ..._identityDraft }, ownerRules: { ..._ownerRules },
+          settings: { ..._ownerRules, ...Object.fromEntries(Object.entries(_profile.policy.rules).map(([field, rule]) => [field, rule.value])) } }),
       },
       deviceName: _deviceName,
       agentPreference: {

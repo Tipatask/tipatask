@@ -164,8 +164,8 @@ export function buildInitialAcceptedMask(cs, cards) {
 // as the heading when title is blank.
 // Description is carried VERBATIM — do not reformat, escape, truncate, or strip it.
 // Embedded markdown image/file refs (![…](/api/projects/N/images/M), file-attachment
-// links) must survive untouched, or both the planner and the composer's own
-// rebuildObjectiveImagePreviews() thumbnail strip (chat-ui.js) lose them.
+// links) must survive untouched, or both the planner and the composer's attachment
+// strip (embed-menu.js renderAttachmentStrip()) lose them.
 export function buildObjectiveSeed(task, fallbackKey) {
   const title = (task && task.title) || fallbackKey || '';
   const description = (task && task.description) || '';

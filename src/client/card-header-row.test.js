@@ -368,6 +368,58 @@ test('proposal meta keeps status + sprint on one line and the overlay stays alig
   assert.match(placement, /return isPreview \? full :/);
 });
 
+// (TPT9403) The proposal foot (Included / Accept / Reject) is a hover dead zone: an overlay opened
+// under the pointer would carry the buttons to the bottom of the tall expanded card. The decision
+// runs on entry and on every mouseover, so moving up onto the title, description or tags still
+// opens it. Behaviour: proposal-card-foot.behavior.test.js.
+test('a proposal foot never starts a hover expansion', () => {
+  const fnStart = cardJs.indexOf('function pointerOnPreviewFoot(card, e) {');
+  assert.ok(fnStart > 0, 'pointerOnPreviewFoot() not found');
+  const fn = cardJs.slice(fnStart, cardJs.indexOf('\n}\n', fnStart));
+  assert.match(fn, /card\.querySelector\(':scope > \.preview-card-actions'\)/);
+  assert.match(fn, /if \(e\.target && foot\.contains\(e\.target\)\) return true;/);
+  // The card's own box level with or below the foot (padding, a stretched grid row's empty band).
+  assert.match(fn, /return e\.target === card && e\.clientY >= foot\.getBoundingClientRect\(\)\.top;/);
+
+  const start = cardJs.indexOf('const previewHoverIntent = (e) => {');
+  assert.ok(start > 0, 'previewHoverIntent not found');
+  const intent = cardJs.slice(start, cardJs.indexOf("card.addEventListener('click'", start));
+  // On the foot: cancel this card's pending expansion, never arm one; another card's open hover
+  // overlay still gets its collapse.
+  assert.match(intent, /if \(pointerOnPreviewFoot\(card, e\)\) \{\s*cancelHoverExpand\(card\);\s*(?:\/\/[^\n]*\n\s*)*if \(state\.expandedCardMode === 'hover' && !hoverCollapseTimer\) scheduleHoverCollapse\(\);\s*return;\s*\}/);
+  const footBranch = intent.slice(intent.indexOf('if (pointerOnPreviewFoot(card, e)) {'), intent.indexOf('return;', intent.indexOf('if (pointerOnPreviewFoot(card, e)) {')));
+  assert.doesNotMatch(footBranch, /armHoverExpand|expandCard/);
+  // Its own open overlay stays open on the pinned foot.
+  assert.ok(intent.indexOf("card.classList.contains('card-expanded')") < intent.indexOf('pointerOnPreviewFoot(card, e)'));
+  assert.match(intent, /if \(!hoverExpandTimers\.has\(card\)\) armHoverExpand\(\);/);
+  // Wired on every element boundary inside the card and on entry; preview cards skip the board path.
+  assert.match(intent, /if \(isPreviewCard\) card\.addEventListener\('mouseover', previewHoverIntent\);/);
+  assert.match(intent, /card\.addEventListener\('mouseenter', \(e\) => \{\s*if \(_isDragging\) return;\s*if \(isPreviewCard\) \{\s*previewHoverIntent\(e\);\s*return;\s*\}/);
+  // A click on the foot never pins the card either.
+  assert.match(cardJs, /if \(isPreviewCard\) \{\s*if \(e\.target\.closest\('\.editing'\)\) return;\s*if \(e\.target\.closest\('\.preview-card-actions'\)\) return;/);
+});
+
+// (TPT9403) Expanded, the overlay scrolls as a whole; the foot sticks to its bottom edge on an
+// opaque ground. Sticky offsets count from the scroller's content edge, so bottom, margin and
+// padding all equal the card's own bottom padding.
+test('an expanded proposal pins its foot to the overlay\'s bottom edge', () => {
+  const body = ruleBody(/\n\s*\.preview-card\.card-expanded > \.preview-card-actions/);
+  assert.match(body, /position:\s*sticky/);
+  assert.match(body, /z-index:\s*1;/);
+  assert.match(body, /background:\s*var\(--c-bg-card\)/);
+  assert.match(ruleBody(/\n\s*\.preview-card\.new-task\.card-expanded,\s*\.preview-card\.modified-task\.card-expanded,\s*\.preview-card\.card-expanded/),
+    /background:\s*var\(--c-bg-card\)/, 'the foot matches the expanded card\'s own ground');
+  const [, padBottom] = /(?:^|[\s;])padding:\s*([\d.]+rem)\s+[\d.]+rem;/.exec(ruleBody(/\n\s*\.card\.preview-card/)) || [];
+  assert.ok(padBottom, '.card.preview-card padding not found');
+  const pad = padBottom.replace('.', String.raw`\.`);
+  assert.match(body, new RegExp(String.raw`(^|[\s;])bottom:\s*-${pad};`));
+  assert.match(body, new RegExp(String.raw`margin-bottom:\s*-${pad};`));
+  assert.match(body, new RegExp(String.raw`padding-bottom:\s*${pad};`));
+  // The overlay itself is the scroller the foot sticks in.
+  assert.match(ruleBody(/\n\s*\.preview-card\.card-expanded,\s*\.card--preview\.card-expanded/), /overflow-y:\s*auto/);
+  assert.match(cardJs, /if \(isPreviewOverlay\) card\.style\.overflowY = 'auto';/);
+});
+
 test('proposal accept/reject match the board .card-btn-group button pill', () => {
   const board = ruleBody(/\n\s*\.card-btn-group button/);
   const pill = ruleBody(/\n\s*\.preview-card-actions \.btn-accept-card,\s*\.preview-card-actions \.btn-reject-card/);

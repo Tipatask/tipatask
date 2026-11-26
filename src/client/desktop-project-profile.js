@@ -1,6 +1,9 @@
 import { api } from './api-client.js';
 import { identityMarkup, policySource, renderProfile } from './project-profile.js';
+import { openProjectPolicyModal, policySummary } from './project-policy-modal.js';
 import { t } from './i18n.js';
+import { setBrandColors } from './brand-accents.js';
+import { identityBrandColors } from '../brand-colors.mjs';
 
 let readVersion = 0;
 let current = null;
@@ -38,9 +41,34 @@ function paintBadge() {
   badge.innerHTML = badge.hidden ? '' : identityMarkup(current.name, current);
 }
 
+// Settings ▸ General ▸ Policy: its own section under the identity rows — the locked fields by
+// name and a button to the policy dialog. A member who can neither see a rule nor edit one
+// gets no section at all.
+function paintPolicy(profile) {
+  const section = document.getElementById('settings-policy-section');
+  if (!section) return;
+  const rules = Object.keys(profile?.policy?.rules || {});
+  const editable = !!profile?.policyEditable;
+  section.hidden = !profile?.policy || (!rules.length && !editable);
+  if (section.hidden) return;
+  document.getElementById('settings-policy-summary').textContent = policySummary(profile.policy);
+  const open = document.getElementById('settings-policy-open');
+  open.textContent = t(editable ? 'policy.edit' : 'policy.view');
+  open.onclick = () => openProjectPolicyModal({
+    profile,
+    onSaved: () => {
+      if (profile !== current) return;
+      // The new rules change effective settings across the whole dialog (and maybe the
+      // window's language or theme): task-board.js repopulates Settings and reapplies both.
+      document.dispatchEvent(new CustomEvent('tiptask:policy-saved'));
+    },
+  });
+}
+
 function paintSettings(profile) {
   const section = document.getElementById('settings-profile-section');
   const host = document.getElementById('settings-project-profile');
+  const saveRow = document.getElementById('settings-identity-save-row');
   const save = document.getElementById('settings-identity-save');
   const msg = document.getElementById('settings-profile-msg');
   if (!host) return;
@@ -48,25 +76,44 @@ function paintSettings(profile) {
   host.replaceChildren();
   msg.hidden = true;
   msg.textContent = '';
+  msg.classList.remove('settings-notice--success');
+  msg.removeAttribute('tabindex');
   save.disabled = true;
+  if (saveRow) saveRow.hidden = !profile?.editable;
   save.hidden = !profile?.editable;
+  paintPolicy(profile);
   if (!profile) return;
   save.textContent = t('btn.save');
   const draft = {};
-  renderProfile(host, { name: profile.name, profile, draft, editable: profile.editable,
+  renderProfile(host, { name: profile.name, profile, draft, editable: profile.editable, layout: 'rows', policy: false,
     onValidity: valid => { save.disabled = !valid || !Object.keys(draft).length; } });
   save.onclick = async () => {
-    if (profile !== current) return;
+    if (profile !== current || save.disabled) return;
     save.disabled = true;
     host.inert = true;
+    const colorsChanged = Object.hasOwn(draft, 'brand_colors');
     try {
       await api.project.update({ ...draft }, profile.context);
-      if (profile === current) await refreshDesktopProfile(true);
+      if (profile !== current) return;
+      await refreshDesktopProfile(true);
+      // (TPT9422) The window's accent colors follow the saved brand colors at once.
+      if (colorsChanged && current) setBrandColors(identityBrandColors(current.identity) ?? []);
+      // The fields repaint from the saved identity; Save stays disabled until the next edit,
+      // so keyboard focus moves to the confirmation instead of falling to the page.
+      const done = document.getElementById('settings-profile-msg');
+      if (done && current && document.getElementById('settings-modal')?.classList.contains('open')) {
+        done.hidden = false;
+        done.classList.add('settings-notice--success');
+        done.textContent = t('profile.saved');
+        done.tabIndex = -1;
+        done.focus();
+      }
     } catch (err) {
       if (profile === current) {
         msg.hidden = false;
         msg.textContent = t('common.error', { msg: err.message });
         save.disabled = false;
+        save.focus();
       }
     } finally {
       host.inert = false;

@@ -39,7 +39,7 @@ import { initApiConnection } from './api-connection.js';
 import * as apiConnection from './api-connection.js'; // (TPT662) template.html needs handleMutationsDropped()
 import * as perfLog from './perf-log.js';
 import { ensureFileLinkHandler } from './file-attach.js';
-import { attachEmbedMenu, attachFileDrop } from './embed-menu.js';
+import { attachEmbedMenu, attachFileDrop, renderAttachmentStrip } from './embed-menu.js';
 import * as tagMatch from './tag-match.js';
 import * as statusFilterSelect from './status-filter-select.js';
 import * as newTaskSprint from './new-task-sprint.js'; // (TPT624) manual New Task sprint selection rules, used by template.html's Preview handler
@@ -64,7 +64,7 @@ window.TipTask = { constants, i18n, statusRegistry, groupLabel, state, utils, ws
 window.TipTask.agentAssignee = agentAssignee;
 window.TipTask.objectiveModal = objectiveModal;
 window.TipTask.createFlyout = createFlyout;
-window.TipTask.embedMenu = { attachEmbedMenu, attachFileDrop };
+window.TipTask.embedMenu = { attachEmbedMenu, attachFileDrop, renderAttachmentStrip };
 // Terminal task-title links need a page-level bridge: task-board.js owns the modal,
 // while template.html owns loadAndRender() and can select Project Board first.
 window.TipTask.openTaskEditModal = taskBoard.openTaskEditModalFromTerminal;
@@ -183,6 +183,14 @@ window.addEventListener('create-project', async (e) => {
       if (seedReport) {
         utils.showToast(seedReport.title, 'error');
         notificationCenter.pushNotification({ tag: 'preset-seed-failed', title: seedReport.title, body: seedReport.body, category: 'attention' });
+      }
+      // (TPT9409) The project exists, but the policy rules its creator set in the wizard were not
+      // saved: say so, and where to set them again.
+      if (res.policyError) {
+        const title = i18n.t('project.policyFailedTitle');
+        utils.showToast(title, 'error');
+        notificationCenter.pushNotification({ tag: 'project-policy-failed', title,
+          body: i18n.t('project.policyFailedBody', { msg: res.policyError }), category: 'attention' });
       }
     },
   });

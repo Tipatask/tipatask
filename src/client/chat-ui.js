@@ -12,7 +12,10 @@ import {
 } from './utils.js';
 import { t, tc } from './i18n.js';
 import { renderComposerHeader } from './composer-header.js';
-import { objectiveStageInfo, renderObjectiveStageHtml, syncObjectiveStageSlot, renderObjectiveGuideHtml, applyObjectiveExample } from './objective-stage.js';
+import {
+  objectiveStageInfo, renderObjectiveStageHtml, syncObjectiveStageSlot, renderObjectiveGuideHtml, applyObjectiveExample,
+  objectiveGuideOpen, setObjectiveGuideOpen, captureObjectiveGuide, restoreObjectiveGuide, bindObjectiveGuideDismiss,
+} from './objective-stage.js';
 export { renderComposerHeader };
 import { buildWsUrl } from './ws-client.js';
 import { cleanupChat, closeConsoleIfOpen } from './console-modal.js';
@@ -22,12 +25,13 @@ import { saveRecipe } from './recipe-sidebar.js';
 import { renderCardHtml, ensureExistingSnapshot, renderDiscussPreviewHtml, getLockedCardTarget } from './chat-task-preview.js';
 import { countPendingSubtaskCards, hasProposalCards } from './subtask-preview.js';
 import { attachImagePaste } from './task-board.js';
-import { DROPDOWN_CARET_SVG, embedMenuHtml, attachEmbedMenu, closeOpenEmbedMenu } from './embed-menu.js';
+import { DROPDOWN_CARET_SVG, embedMenuHtml, attachEmbedMenu, closeOpenEmbedMenu, renderAttachmentStrip } from './embed-menu.js';
 import { openTaskEditModal } from './task-edit-modal.js';
 import { showActionConfirm } from './action-confirm.js';
 import { api } from './api-client.js';
 import { countUnresolvedCards } from './chat-finalize.js';
 import { ensureFileLinkHandler } from './file-attach.js';
+import { userMessageHtml } from './task-chat-model.js';
 import { requestPermission, notify, clearDebounce, objectiveTag, isNotifyEnabled } from './notifications.js';
 import { pushNotification, dismissNotification } from './notification-center.js';
 import { attachAudioRecorder, matchesVoiceShortcut, resolveVoiceTarget } from './audio-recorder.js';
@@ -1766,38 +1770,6 @@ function updateProgressChip() {
   chip.textContent = label;
 }
 
-function _toProxyImageUrl(url) {
-  return String(url).replace(
-    /^.*?\/api\/projects\/(\d+)\/images\/(\d+).*$/,
-    '/api/images/$1/$2'
-  );
-}
-
-let _lightboxOverlay = null;
-function openImageLightbox(src, alt) {
-  if (_lightboxOverlay) return; // already open
-  const overlay = document.createElement('div');
-  overlay.className = 'img-lightbox-overlay';
-  const img = document.createElement('img');
-  img.className = 'img-lightbox-img';
-  img.src = src;
-  img.alt = alt || t('modal.imagePreview');
-  overlay.appendChild(img);
-  document.body.appendChild(overlay);
-  _lightboxOverlay = overlay;
-  const close = () => {
-    overlay.remove();
-    _lightboxOverlay = null;
-    document.removeEventListener('keydown', onKey);
-  };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
-  overlay.addEventListener('click', close);
-  document.addEventListener('keydown', onKey);
-}
-
-// Guard so we only register the tiptask:obj-image-preview listener once across re-renders.
-let _objImgPreviewListenerRegistered = false;
-
 // (TPT19) Guard so we only register the tiptask:chat-persist-purged listener once. Dispatched
 // by cleanupChat() (console-modal.js) after it re-points state.chatState to a surviving tab —
 // chat-draft/chat-state are one file PER PROJECT, not per tab, so the purge that just ran also
@@ -1871,72 +1843,6 @@ export function registerVoiceShortcut() {
 // does nothing" report be triaged from the packaged app with no DevTools. Not used by app code.
 export function isVoiceShortcutBound() { return _voiceShortcutRegistered; }
 
-function appendNewObjectiveImagePreview(file, url) {
-  const area = document.getElementById('new-obj-image-feedback');
-  if (!area || !url) return;
-  // Idempotent: the render-cycle rebuild and the one-shot tiptask:obj-image-preview
-  // event can both fire for the same URL — never show duplicate thumbnails.
-  const existing = area.querySelectorAll('.new-obj-img-preview');
-  for (const el of existing) {
-    if (el.dataset.uploadedUrl === url) return;
-  }
-  const wrap = document.createElement('div');
-  wrap.className = 'new-obj-img-preview-wrap';
-  wrap.style.marginTop = '6px';
-  wrap.style.display = 'none';
-  const img = document.createElement('img');
-  img.className = 'new-obj-img-preview';
-  img.alt = file?.name ? t('chat.image.previewAlt', { name: file.name }) : t('chat.image.uploadedAlt');
-  img.style.maxWidth = '180px';
-  img.style.borderRadius = '6px';
-  img.dataset.uploadedUrl = url;
-  img.style.cursor = 'zoom-in';
-  img.onload = () => wrap.style.removeProperty('display');
-  img.onerror = () => wrap.remove();
-  img.src = _toProxyImageUrl(url);
-  img.addEventListener('click', () => openImageLightbox(img.src, img.alt));
-  const removeBtn = document.createElement('button');
-  removeBtn.type = 'button';
-  removeBtn.className = 'new-obj-img-preview-remove';
-  removeBtn.title = t('chat.image.remove');
-  removeBtn.setAttribute('aria-label', t('chat.image.remove'));
-  removeBtn.textContent = '×';
-  removeBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    // Direct removal covers previews whose URL isn't in the textarea
-    // (e.g. Trello-import event); markdown strip covers the rest.
-    wrap.remove();
-    const chatInput = document.getElementById('chat-input');
-    if (chatInput) {
-      const escaped = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const next = chatInput.value.replace(new RegExp(`!\\[[^\\]]*\\]\\(${escaped}\\)`, 'g'), '');
-      if (next !== chatInput.value) {
-        chatInput.value = next;
-        chatInput.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-    }
-  });
-  wrap.appendChild(img);
-  wrap.appendChild(removeBtn);
-  area.appendChild(wrap);
-}
-
-// Re-populate the preview strip from image markdown already in the chat input.
-// Every loadAndRender rebuilds app.innerHTML with an empty #new-obj-image-feedback
-// while the draft text survives — without this rebuild, thumbnails vanish on the
-// ~1s background board-snapshot refresh (and the 5s Electron poll).
-function rebuildObjectiveImagePreviews(chatInput) {
-  if (!chatInput || !chatInput.value) return;
-  const mdImageRe = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
-  let m;
-  while ((m = mdImageRe.exec(chatInput.value)) !== null) {
-    const url = m[2];
-    if (/\/api\/projects\/\d+\/images\/\d+/.test(url) || url.startsWith('/api/trello/image-proxy?')) {
-      appendNewObjectiveImagePreview({ name: m[1] || null }, url);
-    }
-  }
-}
-
 function appendNewObjectiveUploadError(file, err) {
   const area = document.getElementById('new-obj-image-feedback');
   if (!area) return;
@@ -1967,7 +1873,10 @@ function appendNewObjectiveUploadError(file, err) {
 function captureObjectiveViewState() {
   const input = document.getElementById('chat-input');
   const messages = document.getElementById('chat-messages');
+  // (TPT9405) The guide popover a repaint should open again, with focus where it was; null closed.
+  const guide = document.getElementById('objective-guide');
   return {
+    guide: guide && !guide.hidden ? captureObjectiveGuide(document) : null,
     composer: input ? {
       value: input.value,
       height: input.style.height,
@@ -2012,6 +1921,7 @@ function restoreObjectiveViewState(viewState) {
       try { input.setSelectionRange(start, end, composer.selectionDirection || 'none'); } catch {}
     }
   }
+  if (viewState.guide) restoreObjectiveGuide(document, viewState.guide);
   // (TPT9086) The saved place survives only a repaint that brought nothing new. A view without
   // one (TPT525's composer-only restore) leaves the transcript alone.
   const messages = document.getElementById('chat-messages');
@@ -2082,7 +1992,8 @@ export function renderObjectiveContent(options = {}) {
         // an empty grey pill. The planner still gets BLANK_SUBTASK_BRIEF via the prompt payload.
         if (!msg.content) return '';
         const expandedCls = expanded ? ' chat-bubble--expanded' : '';
-        return `<div class="chat-msg chat-msg--user"><div class="chat-bubble chat-bubble--user${expandedCls}"><div class="chat-bubble-body">${escapeAttr(msg.content)}</div>${bubbleExpandBtnHtml(key, expanded)}</div></div>`;
+        // (TPT9411) Its images and files show where they were inserted, as the task chat's do.
+        return `<div class="chat-msg chat-msg--user"><div class="chat-bubble chat-bubble--user${expandedCls}"><div class="chat-bubble-body">${userMessageHtml(msg.content, { t })}</div>${bubbleExpandBtnHtml(key, expanded)}</div></div>`;
       }
       if (msg.role === 'system') {
         return `<div class="chat-msg chat-msg--system"><div class="chat-bubble chat-bubble--system">${escapeAttr(msg.content)}</div></div>`;
@@ -2210,7 +2121,8 @@ export function renderObjectiveContent(options = {}) {
 
   // (TPT9391) The empty-state guide: what happens after Send and example objectives. Only a plain
   // new objective gets it — a split, a web-origin plan and a Discuss chat each open on a task that
-  // already says what the chat is about.
+  // already says what the chat is about. (TPT9405) It is a closed popover behind the heading's (?)
+  // button, so the composer takes the whole view under the heading.
   const guideHtml = !state.chatState && !discussKey && !subtaskCtx && !originTaskKey
     ? renderObjectiveGuideHtml() : '';
 
@@ -2219,13 +2131,12 @@ export function renderObjectiveContent(options = {}) {
       ${renderComposerHeader(`${consoleToggle}<button class="btn-archive" id="btn-archive">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
             ${escapeAttr(t('chat.historyButton'))}
-          </button>`, tabBarHtml)}
+          </button>`, tabBarHtml, { helpHtml: guideHtml })}
       ${subtaskBannerHtml}
       ${subtaskSummaryHtml}
       ${originBannerHtml}
       ${discussPreviewHtml}
       <div class="objective-stage-slot" id="objective-stage-slot">${renderObjectiveStage()}</div>
-      ${guideHtml}
       <div class="chat-body">
       <div class="chat-messages" id="chat-messages" data-active-tab="${escapeAttr(state.chatState && state.chatState.taskId ? String(state.chatState.taskId) : '')}" ${transcriptStampAttrs(state.chatState)}>
         ${historyBannerHtml}
@@ -2321,13 +2232,6 @@ export function ensureGlobalChatBindings() {
   // A background board refresh can run while the Task Edit picker is open. Only the
   // host that a render actually replaced needs its portaled menu and listeners removed.
   closeOpenEmbedMenu({ detachedOnly: true });
-  if (!_objImgPreviewListenerRegistered) {
-    _objImgPreviewListenerRegistered = true;
-    document.addEventListener('tiptask:obj-image-preview', e => {
-      const { name, url } = e.detail || {};
-      if (url) appendNewObjectiveImagePreview({ name: name || null }, url);
-    });
-  }
   if (!_chatPersistPurgedListenerRegistered) {
     _chatPersistPurgedListenerRegistered = true;
     // (TPT20) saveChatState() as well as the draft — the purge also removed sessionStorage
@@ -2384,25 +2288,16 @@ export function attachChatHandlers() {
   let chatVoiceRec = null;
   if (chatInput) {
     requestObjectiveNotificationPermission();
-    rebuildObjectiveImagePreviews(chatInput);
+    // (TPT9410) The images and files the draft references, in a strip under the composer
+    // (embed-menu.js) — read from the text on every render, since a render rebuilds the composer.
+    renderAttachmentStrip(chatInput);
     attachImagePaste(chatInput, null, {
       onFileDetected: file => console.debug('[NewObj:paste]', file.name, file.size, file.type),
       onFileSkipped: file => console.warn('[NewObj:paste] skipped non-image', file.name, file.size, file.type),
-      onUploaded: (file, url) => appendNewObjectiveImagePreview(file, url),
       onUploadError: (file, err) => {
         console.error('[NewObj:upload] failed', err);
         appendNewObjectiveUploadError(file, err);
       },
-    });
-    // Remove stale previews when user edits/deletes the image markdown
-    chatInput.addEventListener('input', () => {
-      document.querySelectorAll('#new-obj-image-feedback .new-obj-img-preview')
-        .forEach(img => {
-          const u = img.dataset.uploadedUrl;
-          if (u && !chatInput.value.includes(u)) {
-            (img.closest('.new-obj-img-preview-wrap') || img).remove();
-          }
-        });
     });
     // (C1241, listener-leak fixed C1248) Embed dropdown — embed-menu.js; every close path tears
     // down its document-level outside-click/Escape listeners (closeOpenEmbedMenu() also runs on
@@ -2413,7 +2308,6 @@ export function attachChatHandlers() {
         imageOpts: {
           onFileDetected: file => console.debug('[NewObj:file]', file.name, file.size, file.type),
           onFileSkipped: file => console.warn('[NewObj:file] skipped non-image', file.name, file.size, file.type),
-          onUploaded: (file, url) => appendNewObjectiveImagePreview(file, url),
           onUploadError: (file, err) => {
             console.error('[NewObj:file] upload failed', err);
             appendNewObjectiveUploadError(file, err);
@@ -2444,12 +2338,20 @@ export function attachChatHandlers() {
     }
     // (TPT9391) Empty-state guide: an example fills the composer. The `input` event runs the
     // composer's own listeners (draft save, word count, auto-grow), as typing the text would.
+    // (TPT9405) The guide is a popover behind the heading's (?) button: the button toggles it, a
+    // picked example closes it, and bindObjectiveGuideDismiss() closes it on Escape, on a press
+    // outside it and when keyboard focus moves on past it.
     const guide = document.getElementById('objective-guide');
     if (guide) {
+      document.getElementById('objective-help-btn')?.addEventListener('click', () => {
+        setObjectiveGuideOpen(document, !objectiveGuideOpen(document));
+      });
+      bindObjectiveGuideDismiss(document);
       guide.addEventListener('click', (e) => {
         const btn = e.target.closest('.objective-example');
         if (!btn || chatInput.disabled) return;
         const next = applyObjectiveExample(chatInput.value, Number(btn.dataset.example));
+        setObjectiveGuideOpen(document, false);
         if (next !== chatInput.value) {
           chatInput.value = next;
           chatInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -2581,8 +2483,8 @@ export function attachChatHandlers() {
 
     // (TPT16) Apply a seed queued by spawnObjectiveTab() now that this IS the live composer
     // and every input listener above (word count, autoGrow+draft-save, prewarm) is bound, and
-    // rebuildObjectiveImagePreviews() above has already rebuilt the thumbnail strip from the
-    // draft text. One-shot: cleared immediately so a later render of the same tab (background
+    // renderAttachmentStrip() above has already read the attachment strip from the draft text.
+    // One-shot: cleared immediately so a later render of the same tab (background
     // board-snapshot refresh, switching back to this tab) never re-steals focus or re-fires
     // the prewarm. The dispatched 'input' event is what actually runs those listeners — the
     // draft-restored `value` alone (rendered from state, above) never fires them.
@@ -2793,6 +2695,11 @@ export function attachChatHandlers() {
       btn.textContent = nowExpanded ? t('chat.bubble.showLess') : t('chat.bubble.showMore');
       if (!nowExpanded) bubble.scrollIntoView({ block: 'nearest' });
     });
+    // (TPT9411) An image in a sent message loads after the clamp was measured and can make the
+    // bubble overflow it. `load` does not bubble: listen in the capture phase.
+    chatMessagesEl.addEventListener('load', (e) => {
+      if (e.target && e.target.tagName === 'IMG') syncBubbleClamps();
+    }, true);
   }
   syncBubbleClamps();
 

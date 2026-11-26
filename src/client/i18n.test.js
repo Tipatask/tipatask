@@ -194,6 +194,21 @@ test('agentSelector.title and agentSelector.remember are translated in every loc
   }
 });
 
+// (TPT9414) The board top nav's tag filter, search placeholder, Clear and refresh labels and the
+// burger button's name were hard-coded English. The parity checks can't catch a key dropped from
+// every table at once, nor a "translation" left in English; filter-bar-i18n.test.js renders them.
+test('top-nav filter bar and menu labels are translated in every locale', () => {
+  const keys = ['filter.byTag', 'filter.searchPlaceholder', 'filter.clearAll', 'nav.refreshBoard', 'nav.menu'];
+  for (const key of keys) {
+    for (const [locale, table] of Object.entries(LOCALES)) {
+      assert.ok(table[key]?.trim(), `${locale}.${key} must be a non-empty string`);
+      if (locale !== 'en') assert.notEqual(table[key], LOCALES.en[key], `${locale}.${key} must not be the English text`);
+    }
+  }
+  assert.equal(LOCALES.en['filter.searchPlaceholder'], 'Search tasks…');
+  assert.equal(LOCALES.en['filter.clearAll'], 'Clear');
+});
+
 // (TPT9161) Cowboy-coding mode: the Task Edit label and hint, and the card shield tip marker.
 test('Cowboy-coding mode label, hint and marker are translated in every locale', () => {
   for (const key of ['field.cowboyMode', 'cowboyMode.hint', 'cowboyMode.marker']) {

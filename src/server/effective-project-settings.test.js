@@ -25,7 +25,7 @@ const token = id => `header.${Buffer.from(JSON.stringify({ id })).toString('base
 
 async function fixture(t) {
   const state = { global: { '10': { ...defaults }, '11': { ...defaults, language: 'en', color_scheme: 'paper' } },
-    personal: new Map(), calls: [], fail: null, hold: null };
+    personal: new Map(), calls: [], fail: null, hold: null, identity: {} };
   const server = http.createServer(async (req, res) => {
     const userId = JSON.parse(Buffer.from(req.headers.authorization.split('.')[1], 'base64url')).id;
     const projectId = req.url.split('/')[3];
@@ -36,13 +36,21 @@ async function fixture(t) {
     const key = `${projectId}:${userId}`;
     if (userId !== 1 && !state.personal.has(key)) state.personal.set(key, { ...state.global[projectId] });
     const settings = userId === 1 ? state.global[projectId] : state.personal.get(key);
-    const data = { settings: { ...settings }, source: userId === 1 ? 'global' : 'personal', is_creator: userId === 1 };
+    const data = { settings: { ...settings }, source: userId === 1 ? 'global' : 'personal', is_creator: userId === 1,
+      ...(state.identity[projectId] && { identity: { ...state.identity[projectId] } }) };
     if (state.fail) return json(state.fail, { error: 'settings rejected' });
     if (req.url.endsWith('/settings')) {
       if (req.method === 'PATCH') {
         let body = '';
         for await (const chunk of req) body += chunk;
         const patch = JSON.parse(body);
+        // Shared identity (TPT9422): brand_colors replaces the list; brand_color is its first entry.
+        if (Object.hasOwn(patch, 'brand_colors')) {
+          const colors = (patch.brand_colors || []).map(color => color.toUpperCase());
+          state.identity[projectId] = { ...state.identity[projectId], brand_colors: colors, brand_color: colors[0] ?? null };
+          data.identity = { ...state.identity[projectId] };
+          delete patch.brand_colors;
+        }
         Object.assign(settings, patch);
         data.settings = { ...settings };
       }
@@ -247,8 +255,13 @@ test('browser and Electron editors use the same preferences and preserve window 
     return result;
   }
   const event = id => ({ sender: { id } });
+  f.state.identity['10'] = { brand_color: '#123456', brand_colors: ['#123456', '#ABCDEF'] };
   await web('PATCH', '/api/project', { language: 'fr', task_group_label: 'Jars' });
   assert.deepEqual(await web('GET', '/api/project/settings'), await handlers.get('api:project.settings')(event(1)));
+  assert.deepEqual((await web('GET', '/api/project/settings')).brandColors, ['#123456', '#ABCDEF'], 'both transports report the brand colors');
+  await web('PATCH', '/api/project', { brand_colors: ['#0e8377'] });
+  assert.deepEqual(f.state.identity['10'].brand_colors, ['#0E8377'], 'the browser editor saves the list');
+  assert.deepEqual((await handlers.get('api:project.settings')(event(1))).brandColors, ['#0E8377']);
   await handlers.get('api:project.update')(event(2), { fields: { language: 'de', color_scheme: 'slate' } });
   assert.equal((await handlers.get('api:project.settings')(event(2))).language, 'de');
   assert.equal((await web('GET', '/api/project/settings')).language, 'fr');
@@ -267,4 +280,46 @@ test('browser and Electron editors use the same preferences and preserve window 
   assert.equal(Object.hasOwn(raw, 'theme'), false);
   assert.equal(f.state.global['10'].language, 'uk', 'member saves never change creator defaults');
   assert.equal(f.state.personal.get('11:2').language, 'de');
+});
+
+// (TPT9422) The window paints a project's brand colors as its accents before the API answers,
+// from this account's mirror of identity.brand_colors served with the project config.
+test('the account mirror keeps identity.brand_colors for the window to paint before the API answers', async t => {
+  const f = await fixture(t);
+  const { readSettingsCache } = require('./project-settings-cache');
+  const mirrored = () => rendererProjectConfig(readProjectConfig(f.root)).brandColors;
+  assert.equal(mirrored(), null, 'no mirror yet: unknown, not "none selected"');
+
+  f.state.identity['10'] = { display_initials: null, initials: 'P', brand_color: '#0e8377',
+    brand_colors: ['#0e8377', '#ff6600', '#FF6600'], logo_url: null };
+  await f.backend.getEffectiveProjectSettings();
+  assert.deepEqual(readSettingsCache(f.cfg).identity, { display_initials: null, initials: 'P', brand_color: '#0E8377',
+    brand_colors: ['#0E8377', '#FF6600'], logo_url: null }, 'identity kept whole, its list cleaned');
+  assert.deepEqual(mirrored(), ['#0E8377', '#FF6600']);
+
+  const saved = await f.backend.updateProject({ brand_colors: ['#7C3AED', '#0E8377', '#FF6600'] });
+  assert.deepEqual(saved.identity.brand_colors, ['#7C3AED', '#0E8377', '#FF6600'], 'the settings editor save returns the identity');
+  assert.deepEqual(mirrored(), ['#7C3AED', '#0E8377', '#FF6600']);
+
+  // A restart while the API is down: a fresh process reads the mirror and sends no request.
+  f.state.fail = 503;
+  const requests = f.state.calls.length;
+  const configModule = JSON.stringify(path.join(__dirname, 'project-config'));
+  const child = execFileSync(process.execPath, ['-e', `const c = require(${configModule});
+    process.stdout.write(JSON.stringify(c.rendererProjectConfig(c.readProjectConfig(process.argv[1])).brandColors))`, f.root],
+  { encoding: 'utf8' });
+  assert.equal(child, '["#7C3AED","#0E8377","#FF6600"]');
+  assert.equal(f.state.calls.length, requests, 'the mirror read sends no API request');
+  f.state.fail = null;
+
+  await f.backend.updateProject({ brand_colors: [] });
+  assert.deepEqual(mirrored(), [], 'cleared: none selected');
+
+  // An API that predates the list sends only brand_color: one accent.
+  f.state.identity['10'] = { initials: 'P', brand_color: '#123ABC' };
+  await f.backend.getEffectiveProjectSettings({ refresh: true });
+  assert.deepEqual(mirrored(), ['#123ABC']);
+
+  f.signIn(3);
+  assert.equal(mirrored(), null, "another account never sees this account's mirror");
 });

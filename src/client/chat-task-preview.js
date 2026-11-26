@@ -310,17 +310,27 @@ export function getLockedCardTarget(msg, cardIdx, cs = state.chatState) {
 }
 
 // ── (TPT9391) A proposal card's state chip ──
-// `state` is 'included' | 'rejected' | 'saving'. setCardState() rewrites the chip of a mounted
-// card, since Accept and Reject change it without a repaint.
+// `state` is 'included' (the default: the next Save Tasks writes it), 'rejected', or 'saving'
+// while the card's own Accept is being written. (TPT9406) Only a state other than the default
+// gets a chip, so a fresh card's foot holds just Accept and Reject. setCardState() adds,
+// rewrites or removes the chip of a mounted card, since Accept and Reject change it without a
+// repaint.
+const CHIP_CARD_STATES = new Set(['rejected', 'saving']);
+
 function cardStateChipHtml(cardState) {
+  if (!CHIP_CARD_STATES.has(cardState)) return '';
   return `<span class="preview-card-state" data-state="${cardState}">${escapeAttr(translate(`chat.card.state.${cardState}`))}</span>`;
 }
 
 function setCardState(card, cardState) {
   const chip = card?.querySelector?.('.preview-card-state');
-  if (chip) {
+  if (!CHIP_CARD_STATES.has(cardState)) {
+    chip?.remove?.();
+  } else if (chip) {
     chip.dataset.state = cardState;
     chip.textContent = translate(`chat.card.state.${cardState}`);
+  } else {
+    card?.querySelector?.('.preview-card-actions')?.insertAdjacentHTML?.('afterbegin', cardStateChipHtml(cardState));
   }
   card?.querySelector?.('.btn-reject-card')?.setAttribute?.('aria-pressed', String(cardState === 'rejected'));
 }
@@ -436,13 +446,13 @@ export function renderCardHtml(msg, msgIdx) {
     // (TPT303) Status + sprint share one non-wrapping .preview-meta-controls group, so they stay
     // on a single line under the title; only deps and the agent badge may wrap below it.
     const metaHtml = `<span class="preview-meta-controls"><span class="status card-ctl" style="--status-color:${statusColor(displayStatus)}" data-status-role="${statusRoleToken(displayStatus)}">${statusLabel(displayStatus)}</span>${stepSelector}</span>${deps}${renderAgentBadge(t)}`;
-    // (TPT9391) The card's foot says where the proposal stands and names both controls. The
-    // state chip reads Included (Save Tasks will write it), Rejected, or Saving while its own
-    // Accept is being written; a locked target has its badge in the head instead. Accept writes
-    // this one task now; Reject is a toggle (aria-pressed) that leaves it out of the save.
-    const cardState = lockedTarget ? '' : (mask[cardIdx] === false ? 'rejected' : 'included');
+    // (TPT9391) The card's foot names both controls: Accept writes this one task now; Reject is
+    // a toggle (aria-pressed) that leaves it out of the save. (TPT9406) A state chip ahead of them
+    // only when the proposal is not in the next Save Tasks as proposed: Rejected, or Saving while
+    // its own Accept is being written. A locked target's head badge says why Accept is off.
+    const cardState = mask[cardIdx] === false ? 'rejected' : 'included';
     const footHtml = isConfirmed ? '' : `<div class="preview-card-actions">
-          ${cardState ? cardStateChipHtml(cardState) : ''}
+          ${cardStateChipHtml(cardState)}
           <span class="preview-card-buttons">
           <button type="button" class="btn-accept-card${accepted ? ' active' : ''}" data-msg-idx="${msgIdx}" data-card-idx="${cardIdx}" title="${escapeAttr(lockedError || translate('chat.card.acceptTitle'))}"${lockedTarget ? ' disabled aria-disabled="true"' : ''}>
             <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><polyline points="3 8 6.5 11.5 13 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -633,6 +643,9 @@ export function attachCardHandlers() {
     }
 
     // ── Accept / Reject individual cards ──
+    // (TPT9403) Both work on a collapsed card, whose foot never opens the hover overlay
+    // (task-card.js setupCardInteractions()), and on an expanded one: each collapseCard() below
+    // runs only when the click was made inside an open overlay.
     const acceptBtn = e.target.closest('.btn-accept-card');
     const rejectBtn = e.target.closest('.btn-reject-card');
     if (acceptBtn || rejectBtn) {
@@ -724,15 +737,19 @@ export function attachCardHandlers() {
           showToast(translate('chat.errSaveTask', { msg: err.message }), 'error', { durationMs: SAVE_ERROR_TOAST_MS });
         }
       } else {
-        // Reject
-        msg.acceptedMask[cardIdx] = false;
+        // Reject is a toggle (aria-pressed): a click on a rejected card puts it back into the
+        // save, the default state, which shows no chip (TPT9406).
+        const rejecting = msg.acceptedMask[cardIdx] !== false;
+        msg.acceptedMask[cardIdx] = !rejecting;
         // Collapse if this card is currently expanded
-        if (card.classList.contains('card-expanded')) collapseCard();
-        card.classList.add('rejected');
-        card.dataset.accepted = 'false';
-        rejectBtn.classList.add('active');
-        card.querySelector('.btn-accept-card').classList.remove('active');
-        setCardState(card, 'rejected');
+        if (rejecting && card.classList.contains('card-expanded')) collapseCard();
+        card.classList.toggle('rejected', rejecting);
+        // Same rule as the render: a locked target's Accept never reads as active.
+        const included = !rejecting && !getLockedCardTarget(msg, cardIdx, cs);
+        card.dataset.accepted = String(included);
+        rejectBtn.classList.toggle('active', rejecting);
+        card.querySelector('.btn-accept-card').classList.toggle('active', included);
+        setCardState(card, rejecting ? 'rejected' : 'included');
         updateSaveBar(msgIdx);
         saveChatState();
         checkAllCardsHandled(cs);
